@@ -487,15 +487,22 @@ class TuneStage:
                         except (OSError, ValueError) as exc:
                             self.log(f"[tune] {slug}: unreadable decision on resume ({exc}); dispatching")
                     base = camp.state.best_commit or "HEAD"
-                    wt = open_candidate(s.repo, worktrees, slug, base, prefix=self.branch_prefix)
-                    req = render_request(
-                        self._context(self._standings()), slug=slug, worktree=wt, base=base,
-                        branch=f"{self.branch_prefix}/{slug}",
-                        hypothesis=str(item.get("hypothesis", "")), job_prefix=slug[:12],
-                        deliverables=str(item.get("deliverables", "Commits, entry tests, micro-bench, decision.yaml.")),
-                        modeling_edits=bool(item.get("modeling_edits", True)),
-                    )  # fmt: skip
-                    futures[slug] = pool.submit(self.dispatch, "tuner", slug, turn_prompt(PACKAGE, req))
+                    standings = self._standings()
+
+                    def start(slug: str = slug, item: Mapping = item, base: str = base, standings: str = standings) -> str:
+                        # The worktree checkout (minutes on a parallel filesystem) runs in the turn's
+                        # own thread, so turns start side by side instead of one checkout at a time.
+                        wt = open_candidate(s.repo, worktrees, slug, base, prefix=self.branch_prefix)
+                        req = render_request(
+                            self._context(standings), slug=slug, worktree=wt, base=base,
+                            branch=f"{self.branch_prefix}/{slug}",
+                            hypothesis=str(item.get("hypothesis", "")), job_prefix=slug[:12],
+                            deliverables=str(item.get("deliverables", "Commits, entry tests, micro-bench, decision.yaml.")),
+                            modeling_edits=bool(item.get("modeling_edits", True)),
+                        )  # fmt: skip
+                        return self.dispatch("tuner", slug, turn_prompt(PACKAGE, req))
+
+                    futures[slug] = pool.submit(start)
                 for slug, fut in list(futures.items()):
                     if fut.done():
                         del futures[slug]

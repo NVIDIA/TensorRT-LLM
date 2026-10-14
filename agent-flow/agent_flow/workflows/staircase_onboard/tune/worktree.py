@@ -44,17 +44,22 @@ def repo_lock(repo: Path):
 
 
 def add_worktree(repo: Path, tree: Path, *args: str) -> None:
-    """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt."""
+    """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt.
+
+    Only the registration holds the lock (``--no-checkout``); the checkout, the slow part, runs
+    outside it against the worktree's own index, so several candidates check out at once."""
     with repo_lock(repo):
         for attempt in (1, 2):
-            out = subprocess.run(["git", "-C", str(repo), "worktree", "add", *args], capture_output=True, text=True)
+            out = subprocess.run(["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
+                                 capture_output=True, text=True)
             if out.returncode == 0:
-                return
+                break
             _git(repo, "worktree", "remove", "--force", str(tree), check=False)
             _git(repo, "worktree", "prune", check=False)
             if attempt == 2:
                 raise RuntimeError(f"git worktree add {' '.join(args)}: {out.stderr.strip()}")
             time.sleep(5)
+    _git(tree, "reset", "--hard", "-q")
 
 
 def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD", prefix: str = "tune") -> Path:
