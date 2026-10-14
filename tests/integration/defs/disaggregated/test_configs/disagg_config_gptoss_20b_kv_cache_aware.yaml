@@ -1,0 +1,40 @@
+model: gpt_oss/gpt-oss-20b
+hostname: localhost
+backend: pytorch
+cuda_graph_config: null
+disable_overlap_scheduler: true
+enable_autotuner: false
+context_servers:
+  num_instances: 1
+  router:
+    type: kv_cache_aware
+  max_batch_size: 8
+  max_num_tokens: 3000
+  max_seq_len: 4096
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  trust_remote_code: true
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: false
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.3
+  cache_transceiver_config:
+    backend: DEFAULT
+generation_servers:
+  num_instances: 1
+  router:
+    type: kv_cache_aware
+  max_batch_size: 8
+  max_num_tokens: 4096
+  max_seq_len: 4096
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  trust_remote_code: true
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: false
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.3
+  cache_transceiver_config:
+    backend: DEFAULT
