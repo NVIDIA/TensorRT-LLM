@@ -1256,6 +1256,11 @@ class KVCacheManagerV2(BaseResourceManager):
     # decode, which reads as ordinary sampling variation rather than as a bug.
     _supports_partial_reuse = True
 
+    @property
+    def requires_synchronized_admission(self) -> bool:
+        """Whether rank-local allocation results must agree before model execution."""
+        return False
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -6409,13 +6414,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
-            history_length = (
-                None
-                # Reuse (history's consumer) is disabled under helix, and
-                # max_beam_num_tokens mixes rank-local and global counts.
-                if self.kv_compression_manages_history or self._has_cp_helix
-                else req.max_beam_num_tokens - 1
-            )
+            history_length = self._completed_generation_history(req)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
@@ -6424,6 +6423,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"{history_length} tokens at generation update"
                 )
             self._allocated_draft_lens.pop(req.py_request_id, None)
+
+    def _completed_generation_history(self, req: LlmRequest) -> int | None:
+        """Completed KV, excluding the sampled token that has not run through the model."""
+        # Helix subclasses must translate the mixed local/global request counts
+        # into their native cache's token units before enabling history tracking.
+        if self.kv_compression_manages_history or self._has_cp_helix:
+            return None
+        return req.max_beam_num_tokens - 1
 
     def copy_batch_block_offsets(
         self,

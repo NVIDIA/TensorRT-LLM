@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _GUARD_PAGE_REQUEST_ID,
@@ -50,6 +51,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     BufferId,
+    CacheTier,
     CudaStream,
     DataRole,
     KVCacheDesc,
@@ -340,12 +342,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         self._enable_kv_cache_offload = sparse_attn_config.enable_kv_cache_offload
         if self._enable_kv_cache_offload:
-            # The attention adapter is connected; enable only after validating
-            # the real runtime's transfer, addressing, and scratch contracts.
-            raise NotImplementedError(
-                "DeepSeek-V4 KV cache offload requires the KVCM v2 sparse runtime "
-                "and validated fetch addressing, scratch lifetime, and transfer ordering."
-            )
+            if kv_cache_config.host_cache_size is None or kv_cache_config.host_cache_size <= 0:
+                raise ValueError("DeepSeek-V4 sparse offload requires a positive host_cache_size")
+            if dtype not in (DataType.BF16, DataType.FP8) or kv_cache_config.dtype == "fp8_ds_mla":
+                raise NotImplementedError(
+                    "DeepSeek-V4 sparse offload supports BF16/per-tensor FP8 KV only"
+                )
+            if (
+                max_beam_width != 1
+                or kwargs.get("spec_config") is not None
+                or kwargs.get("is_draft", False)
+            ):
+                raise NotImplementedError(
+                    "DeepSeek-V4 sparse offload requires single-beam, non-speculative execution"
+                )
+            if kwargs.get("is_disagg", False) or kwargs.get("kv_connector_manager") is not None:
+                raise NotImplementedError(
+                    "DeepSeek-V4 sparse offload does not support disaggregation or KV connectors"
+                )
+            if kwargs.get("cold_page_codec_provider") is not None:
+                raise NotImplementedError(
+                    "DeepSeek-V4 sparse offload requires the default page codec"
+                )
 
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
@@ -424,6 +442,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
+
+        if self._enable_kv_cache_offload:
+            sparse_groups = {
+                self.impl.get_layer_group_id(layer_id)
+                for (layer, attn_type), layer_id in self._layer_attn_to_layer_id.items()
+                if self._compress_ratios[layer] == DEEPSEEK_V4_SPARSE_RATIO
+                and attn_type == DeepseekV4AttentionType.COMPRESS
+            }
+            has_host_storage = True
+            if sparse_groups:
+                if CacheTier.HOST_MEM not in self.impl.cache_tier_list:
+                    has_host_storage = False
+                else:
+                    host_groups = self.impl.get_life_cycle_pool_group_indices(1)
+                    host_stats = self.impl.get_storage_statistics(1)
+                    has_host_storage = all(
+                        host_stats[host_groups[group]].total > 0 for group in sparse_groups
+                    )
+            if not Distributed.get(mapping).allreduce(int(has_host_storage), op=ReduceOp.MIN):
+                self.shutdown()
+                raise ValueError(
+                    "DeepSeek-V4 sparse offload requires host slots on every sparse rank"
+                )
 
         # DeepSeek-V4 expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
@@ -1110,7 +1151,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 if is_sparse:
                     buffer = BufferConfig(role=attn_type.role, size=size, is_sparse=True)
                 else:
-                    # The current runtime does not yet accept the sparse keyword.
                     buffer = BufferConfig(role=attn_type.role, size=size)
                 buffers.append(buffer)
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
@@ -1663,41 +1703,96 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             raise NotImplementedError("Sparse offload does not support chunked prefill")
         super().prepare_resources(scheduled_batch)
 
+    @property
+    def requires_synchronized_admission(self) -> bool:
+        return self._enable_kv_cache_offload
+
+    def _wait_for_sparse_model_work(self) -> None:
+        if self._enable_kv_cache_offload:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
+            caller_stream = torch.cuda.current_stream(self._stream.device)
+            if self._stream != caller_stream:
+                self._stream.wait_stream(caller_stream)
+
     def _validate_sparse_history_policy(self) -> None:
-        """Check fixed history policies during attention metadata initialization."""
-        if (
-            self.enable_block_reuse
-            or self.kv_compression_manages_history
-            or self._has_cp_helix
-            or self.is_draft
-        ):
+        """Reject history policies unsupported by sparse offload."""
+        if self.kv_compression_manages_history or self.is_draft:
             raise NotImplementedError(
-                "Sparse offload requires block reuse, KV compression, CP Helix, and draft caches disabled"
+                "Sparse offload requires KV compression and draft caches disabled"
             )
 
-    def _order_sparse_history_update(self, requests: Iterable[llm_request.LlmRequest]) -> None:
+    def _order_sparse_history_update(
+        self, requests: Iterable[llm_request.LlmRequest], *, include_suspended: bool = False
+    ) -> None:
         """Order demotion after all model producers and attention readers.
 
-        The non-overlap executor orders its calling stream after model forward.
-        Join it onto the cache stream before resize may demote/recycle pages.
-        prepare_sparse_offload() supplies the reverse dependency for the next
-        forward. No host/device synchronization or per-layer history mutation
-        is needed. Other executor schedules remain behind the inference guard.
+        PyExecutor._forward_step orders the caller after every submitted forward,
+        including a later overlap batch or pipeline microbatch. Joining that stream
+        orders demotion and slot recycling without blocking the CPU.
         """
         if not self._enable_kv_cache_offload:
             return
-        active = False
+        self._validate_sparse_history_policy()
+        needs_wait = False
         for request in requests:
             cache = self.kv_cache_map.get(request.py_request_id)
-            if cache is None or not cache.is_active:
+            if cache is None or (not cache.is_active and not include_suspended):
                 continue
-            if cache.cuda_stream != self._stream.cuda_stream:
+            if cache.is_active and cache.cuda_stream != self._stream.cuda_stream:
                 raise RuntimeError("Sparse history updates require the manager's cache stream")
-            active = True
-        if active:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
-            self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
+            needs_wait = True
+        if needs_wait:
+            self._wait_for_sparse_model_work()
+
+    def try_allocate_generation(self, req: llm_request.LlmRequest) -> bool:
+        self._order_sparse_history_update((req,), include_suspended=True)
+        cache = self.kv_cache_map.get(req.py_request_id)
+        if self._enable_kv_cache_offload and cache is not None and not cache.is_active:
+            if not cache.resume(self._stream.cuda_stream, is_decoding=True):
+                return False
+            self._restore_page_index_bufs(req.py_request_id, cache)
+            # Sampling can finish while the overlap scheduler has suspended the
+            # cache. Account for that completed forward before the next admission.
+            completed = self._completed_generation_history(req)
+            if completed is not None and completed > cache.history_length:
+                if not cache.resize(None, completed):
+                    cache.suspend()
+                    return False
+        return super().try_allocate_generation(req)
+
+    def _completed_generation_history(self, req: llm_request.LlmRequest) -> int | None:
+        if self._enable_kv_cache_offload and self._has_cp_helix and not req.is_dummy_request:
+            completed = req.total_input_len_cp + req.max_beam_num_tokens - req.prompt_len - 1
+            return self._helix_local_len(completed)
+        return super()._completed_generation_history(req)
+
+    def prepare_context_cache(
+        self, req: llm_request.LlmRequest, reuse_limit: int | None = None
+    ) -> int | None:
+        self._wait_for_sparse_model_work()
+        return super().prepare_context_cache(req, reuse_limit)
+
+    def suspend_request(self, req: llm_request.LlmRequest) -> None:
+        self._order_sparse_history_update((req,))
+        super().suspend_request(req)
+
+    def resume_request(self, req: llm_request.LlmRequest) -> bool:
+        self._order_sparse_history_update((req,), include_suspended=True)
+        return super().resume_request(req)
+
+    def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False) -> None:
+        self._order_sparse_history_update((request,))
+        super().free_resources(request, pin_on_release)
+
+    def release_index_slot(self, request_id: int) -> None:
+        self._wait_for_sparse_model_work()
+        super().release_index_slot(request_id)
+
+    def _publish_sparse_metadata(self) -> None:
+        if self.sparse_metadata_batch is not None:
+            self._wait_for_sparse_model_work()
+            super()._publish_sparse_metadata()
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
         self._order_sparse_history_update(scheduled_batch.context_requests)
@@ -1971,8 +2066,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         num_seqs: int,
     ) -> None:
         """Build the COMPRESS block table for one compression ratio and copy it to the destination."""
-        if self._enable_kv_cache_offload and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
-            raise RuntimeError("Use prepare_sparse_offload() for the mixed-tier ratio-4 table")
+        if (
+            self._enable_kv_cache_offload
+            and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
+            and (
+                num_contexts != num_seqs
+                or any(self.kv_cache_map[request_id].is_decoding for request_id in request_ids)
+            )
+        ):
+            raise NotImplementedError(
+                "DeepSeek-V4 decode attention with sparse offload requires refetch"
+            )
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         staging = self._host_compress_block_tables_staging[compress_ratio]
