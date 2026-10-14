@@ -352,14 +352,77 @@ class TuneStage:
                 "can remove; `sources` names where the idea and its kernel options come from (`profile`, `code-reading`, "
                 "`flashinfer`, `repo-prior-art`, `sister-engine`, `kernel-choices`, each with a reference). Then write the "
                 "decision file `" + str(self.spec.workdir / f"{what}-decision.yaml")
-                + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`." + again
+                + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`." + self._ledger_ask(what) + again
                 + "\n\n" + self._roadmap_paths()
                 + "\n\n## Standings\n\n" + self._standings() + "\n\n" + self._sources_note() + self._sisters_line() + "\n"
             )
             self.dispatch("tuner", what, turn_prompt(PACKAGE, request))
         if not path.exists():
             return []
-        return [dict(r) for r in yaml.safe_load(path.read_text()) or []]
+        items = [dict(r) for r in yaml.safe_load(path.read_text()) or []]
+        if items and self._ledger_mode() != "off" and not self.t.get(f"{what}_ledger_checked"):
+            errors = self._check_ledger(what, items)
+            if errors:
+                # One fix turn with the validator's own words; the campaign proceeds either way.
+                fix = self.spec.workdir / f"{what}-ledger-request.md"
+                fix.write_text(
+                    f"# Tuner request: {what}-ledger\n\nThe kernel ledger of `{path}` does not validate. Fix "
+                    f"`{self._ledger_path(what)}` (and add roadmap items to `{path}` where a kernel's answer is a "
+                    "new item); re-profile only if a share is missing. Then write `"
+                    + str(self.spec.workdir / f"{what}-ledger-decision.yaml") + "` with `decision: CANDIDATE`.\n\n"
+                    + "## Problems\n\n" + "\n".join(f"- {e}" for e in errors) + "\n" + self._ledger_ask(what) + "\n"
+                )
+                self.dispatch("tuner", f"{what}-ledger", turn_prompt(PACKAGE, fix))
+                items = [dict(r) for r in yaml.safe_load(path.read_text()) or []]
+                errors = self._check_ledger(what, items)
+            if errors:
+                self.log(f"[tune] {what}: kernel ledger still incomplete; the campaign proceeds ({errors[0][:240]})")
+                self.ledger.append("kernel_ledger", roadmap=what, errors=errors)
+            self.t[f"{what}_ledger_checked"] = True
+            self.checkpoint()
+        return items
+
+    def _ledger_mode(self) -> str:
+        return str(self.spec.campaign.get("kernel_ledger", "require"))
+
+    def _ledger_path(self, what: str) -> Path:
+        return self.spec.workdir / f"{what}-kernel_ledger.yaml"
+
+    def _ledger_ask(self, what: str) -> str:
+        """perf_optimize's kernel ledger, asked of every roadmap: the exhaustiveness proof behind it."""
+        if self._ledger_mode() == "off":
+            return ""
+        from agent_flow.workflows.perf_optimize import kernel_ledger
+
+        target = float(self.spec.campaign.get("kernel_coverage_pct", 80.0))
+        return (
+            f"\n\nAlso write `{self._ledger_path(what)}`: the agent-flow perf_optimize **kernel ledger** (schema and "
+            f"example in the docstring of `{kernel_ledger.__file__}`). One row per kernel (or kernel family) of the "
+            f"best tree's decode profile, down the ranking until the rows cover >= {target:g}% of GPU time "
+            "(`nsys_summary.py --top 40`); each row answers elimination / faster / fusion / overlap with a "
+            "roadmap slug (`disposition: item`) or an evidence-backed dismissal. Without an ncu pass, write "
+            "`ncu: \"unavailable: nsys-only roadmap turn\"` and the estimated `bound` on the row. The stage "
+            "validates it with perf_optimize's own `load_ledger` + `cross_validate`."
+        )
+
+    def _check_ledger(self, what: str, items: Sequence[Mapping]) -> list[str]:
+        """Validate the roadmap's kernel ledger with perf_optimize's validator; returns the problems."""
+        from agent_flow.workflows.perf_optimize.kernel_ledger import QUESTIONS, LedgerError, cross_validate, load_ledger
+
+        try:
+            ledger = load_ledger(self._ledger_path(what))
+        except LedgerError as exc:
+            return [str(exc)]
+        target = float(self.spec.campaign.get("kernel_coverage_pct", 80.0))
+        errors = cross_validate(ledger, {"items": [{"id": r.get("slug")} for r in items]}, target)
+        if not errors:
+            rows = ledger.get("kernels") or []
+            answers = {q: sum(1 for r in rows if (r.get(q) or {}).get("disposition") == "item") for q in QUESTIONS}
+            self.ledger.append("kernel_ledger", roadmap=what, rows=len(rows),
+                               enumerated_share_pct=(ledger.get("coverage") or {}).get("enumerated_share_pct"),
+                               items_per_question=answers)
+            self.log(f"[tune] {what}: kernel ledger valid ({len(rows)} kernels, items per question {answers})")
+        return errors
 
     def campaign(self) -> None:
         s, cfg = self.spec, self.spec.campaign

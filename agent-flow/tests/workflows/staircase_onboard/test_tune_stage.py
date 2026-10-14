@@ -85,6 +85,24 @@ class FakeRunner:
         return done
 
 
+def _kernel_ledger(item_slug: str) -> dict:
+    """A perf_optimize kernel ledger: two kernels, the hot one's 'faster' answered by ``item_slug``."""
+
+    def row(kernel, share, faster):
+        overlap = {"disposition": "dismissed", "concurrent_with": "serialized on the main stream", "ref": "no independent work"}
+        return {"kernel": kernel, "full_name": f"void {kernel}_kernel", "share_pct": share,
+                "ncu": "unavailable: nsys-only roadmap turn", "bound": "memory",
+                "elimination": {"disposition": "dismissed", "why_it_runs": "its output feeds the next layer", "ref": "mandatory"},
+                "faster": faster,
+                "fusion": {"disposition": "dismissed", "neighbors": "norm -> THIS -> gemm", "ref": "multi-consumer"},
+                "overlap": overlap}
+
+    return {"version": 1, "source": "profiles/roadmap", "coverage": {"enumerated_share_pct": 90.0, "other_share_pct": 10.0,
+            "min_share_pct": 1.0, "gpu_busy_pct": 97.0},
+            "kernels": [row("moe_gemm", 60.0, {"disposition": "item", "ref": item_slug}),
+                        row("rmsnorm", 30.0, {"disposition": "dismissed", "ref": "at its bandwidth floor"})]}
+
+
 def _effect(config, tree):
     lat, thr = 100.0, 2000.0
     if config.get("modeling_v2") == "off":
@@ -132,6 +150,7 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
                 {"slug": "fast-path", "kind": "fusion", "hypothesis": "make it fast"},
                 {"slug": "no-op", "kind": "kernel", "hypothesis": "a source that does not win"},
             ]))
+            (spec.workdir / "roadmap-kernel_ledger.yaml").write_text(yaml.safe_dump(_kernel_ledger("fast-path")))
             return "roadmap written"
         out = spec.workdir / "candidates" / what
         wt = spec.workdir / "worktrees" / what
@@ -152,6 +171,8 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
     records = [json.loads(line) for line in (spec.workdir / "perf_ledger.jsonl").read_text().splitlines()]
     used = [r["sources"] for r in records if r["kind"] == "tuner_decision" and r.get("slug") == "fast-path"]
     assert used and used[0][0]["source"] == "flashinfer"  # the ledger keeps where each candidate came from
+    kl = [r for r in records if r["kind"] == "kernel_ledger"]
+    assert kl and kl[0]["rows"] == 2 and kl[0]["items_per_question"]["faster"] == 1  # perf_optimize's ledger, validated
     assert state["phase"] == "done"
     assert state["ladder_kept"] == ["cg-padding"]
     assert state["kept"] == ["fast-path"]
@@ -246,7 +267,8 @@ def test_a_candidate_that_conflicts_with_a_keep_is_rebased_and_retried(tmp_path)
         "trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
         "perf": {"identity_configs": [str(identity)], "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
                  "spools": ["s1"], "env_script": "/env.sh", "reference": "none", "ladder": {"enabled": False},
-                 "campaign": {"max_parallel_tuners": 1, "accuracy": {"task": "gsm8k", "anchor": 96.36}}},
+                 "campaign": {"max_parallel_tuners": 1, "kernel_ledger": "off",
+                              "accuracy": {"task": "gsm8k", "anchor": 96.36}}},
     }
     spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
     turns = []
@@ -895,3 +917,43 @@ def test_the_noise_repeats_run_on_the_baselines_host(tmp_path):
     where = {k: v for r in runners for k, v in getattr(r, "where", {}).items()}
     assert where["t-baseline-r1"] == where["t-baseline-r2"] == where["t-baseline"]
     assert where["t-reference"] != where["t-baseline"]  # the reference still runs beside the baseline
+
+
+def test_an_incomplete_kernel_ledger_gets_one_fix_turn_with_perf_optimizes_findings(tmp_path):
+    """The roadmap owes perf_optimize's kernel ledger (every hot kernel: elimination / faster / fusion /
+    overlap). The stage validates it with perf_optimize's validator; a ledger that does not validate gets
+    one fix turn carrying the validator's findings, and the campaign proceeds either way."""
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(identity)], "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
+                     "spools": ["s1"], "env_script": "/env.sh", "reference": "none", "ladder": {"enabled": False},
+                     "campaign": {"max_iterations": 1, "max_roadmaps": 1, "accuracy": {"task": "gsm8k", "anchor": 96.36}}}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+    turns, asks = [], {}
+
+    def dispatch(role, what, prompt):
+        turns.append(what)
+        ws = spec.workdir
+        if what == "roadmap":
+            asks["roadmap"] = (ws / "roadmap-request.md").read_text()
+            (ws / "roadmap.yaml").write_text(yaml.safe_dump([{"slug": "fast-path", "hypothesis": "h"}]))
+            # its 'faster' answer names a roadmap item that does not exist
+            (ws / "roadmap-kernel_ledger.yaml").write_text(yaml.safe_dump(_kernel_ledger("ghost-item")))
+        elif what == "roadmap-ledger":
+            asks["fix"] = (ws / "roadmap-ledger-request.md").read_text()
+            (ws / "roadmap-kernel_ledger.yaml").write_text(yaml.safe_dump(_kernel_ledger("fast-path")))
+        else:
+            (ws / "candidates" / what / "decision.yaml").write_text(yaml.safe_dump({"decision": "DROPPED"}))
+        return ""
+
+    state: dict = {}
+    stage = TuneStage(spec, state, dispatch=dispatch, checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
+    assert stage.run() == "tuned"
+    assert turns[:2] == ["roadmap", "roadmap-ledger"] and turns.count("roadmap-ledger") == 1
+    assert "kernel_ledger.py" in asks["roadmap"] and "overlap" in asks["roadmap"]
+    assert "'ghost-item'" in asks["fix"] and "does not match any roadmap item id" in asks["fix"]
+    records = [json.loads(line) for line in (spec.workdir / "perf_ledger.jsonl").read_text().splitlines()]
+    assert [r["rows"] for r in records if r["kind"] == "kernel_ledger"] == [2]
