@@ -445,6 +445,7 @@ def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> 
         "k_block_size": 16,
         "qk_quant_dtype": torch.float8_e4m3fn,
         "smooth_k": True,
+        "smooth_v": False,
     }
     assert sage_quantize.call_count == 1
 
@@ -465,11 +466,18 @@ def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> 
     assert actual.k_summary_scale is summary.k_scale
     sage_quantize.side_effect = None
 
-    # Dense calls and calls with a KV cache keep the attention op's quantization, and a layer
-    # without a library that takes quantized inputs quantizes nothing.
+    # Dense calls keep the attention op's quantization unless they need V smoothing, which
+    # the attention op cannot apply.
     sage_quantize.reset_mock()
     _set_block_sparse_inputs(args, None)
     assert quantize() is None
+    args.sage_attn_smooth_v = True
+    assert quantize() is quantized
+    assert sage_quantize.call_args.kwargs["smooth_v"]
+
+    # Calls with a KV cache, and layers without a library that takes quantized inputs,
+    # quantize nothing.
+    sage_quantize.reset_mock()
     _set_block_sparse_inputs(args, proxy)
     attention._fmha_manager.fmha_libs = []
     assert quantize() is None
@@ -486,6 +494,38 @@ def test_contiguous_sage_requires_inputs_quantized_by_the_attention_core() -> No
     reason = fmha._contiguous_unsupported_reason(q, k, v, metadata, args)
 
     assert reason == "SageAttention requires inputs quantized by the attention core"
+
+
+def test_dense_sage_with_v_smoothing_runs_on_a_dense_plan() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_block_sparse_inputs(args, None)
+    _set_sage_recipe(args)
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert not supported
+    assert reason == "block-sparse forward inputs are required"
+
+    args.sage_attn_smooth_v = True
+    args.sage_quantized = Mock()
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert supported, reason
+    key = fmha._make_plan_key(
+        q.view(2, 64, 2, 128),
+        None,
+        batch_size=2,
+        seq_len_q=64,
+        kv_capacity=256,
+        page_size=None,
+        mask_type="dense",
+        sage=block_sparse_fmha._sage_recipe(args),
+    )
+    assert not key.use_block_sparse
+    assert (key.q_block_size, key.kv_block_size, key.max_blocks_per_row) == (128, 128, None)
+    assert key.sage.v_mean
+    assert key.unsupported_reason() is None
 
 
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:

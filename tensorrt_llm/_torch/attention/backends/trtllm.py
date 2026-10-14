@@ -2047,11 +2047,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Optional[SageQuantized]:
-        """Quantize the SageAttention inputs of a block-sparse call.
+        """Quantize the Sage inputs of block-sparse and V-smoothing calls.
 
-        The attention op quantizes dense SageAttention inside its kernels, so
-        only block-sparse calls are quantized here, for the FMHA libraries that
-        take quantized inputs: separate Q, K, and V without a KV cache.
+        The attention op quantizes dense SageAttention inside its kernels and
+        cannot add a V mean back, so only block-sparse calls and calls with V
+        smoothing are quantized here, for the FMHA libraries that take
+        quantized inputs: separate Q, K, and V without a KV cache.
         """
         qk_quant_dtype = forward_args.sage_attn_qk_dtype
         if (qk_quant_dtype is None or k is None or v is None
@@ -2060,7 +2061,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                            for fmha in self._fmha_manager.fmha_libs)):
             return None
         inputs = forward_args.sparse_runtime_params.block_sparse_inputs
-        if inputs is None:
+        if inputs is None and not forward_args.sage_attn_smooth_v:
             return None
         num_seqs = metadata.num_contexts
         # Device lengths add no host-to-device copy during CUDA Graph capture.
@@ -2082,12 +2083,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             k_block_size=forward_args.sage_attn_num_elts_per_blk_k,
             qk_quant_dtype=qk_quant_dtype,
             smooth_k=forward_args.sage_attn_smooth_k,
+            smooth_v=forward_args.sage_attn_smooth_v,
         )
-        if not inputs.use_proxy_routes:
+        if inputs is None or not inputs.use_proxy_routes:
             return quantized
         # The K/V block means of proxy routes dequantize like the keys and
         # values they stand for: every mean is a key of its sequence with a
-        # scale of its own, and reuses the V scales and K mean of this call.
+        # scale of its own, and reuses the V scales and means of this call.
         batch, blocks = inputs.k_summary.shape[:2]
         cu_seqlens_blocks = torch.arange(0, (batch + 1) * blocks,
                                          blocks,

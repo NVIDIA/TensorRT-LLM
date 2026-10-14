@@ -74,6 +74,14 @@ struct SageQuantParams
     // PrimTS block-sparse kernel expect; otherwise one [numHeadsV, headDim] row set covers the
     // whole batch, as the trtllm-gen kernels expect.
     int const* ptrCuSeqLensV{nullptr};
+    // Optional V smoothing, with the layout of the V scales. ptrVMean is collected at vStage==1 and
+    // subtracted from V at vStage==2. A smoothed V's scales cover V minus its mean, which is final
+    // only after the whole vStage==1 launch, so that launch collects the signed per-channel extrema
+    // into ptrVMax/ptrVMin (filled with -inf/+inf beforehand) instead of writing ptrVScale, and the
+    // vStage==2 launch derives ptrVScale from them. Without ptrVMax, vStage==2 reads ptrVScale.
+    float* ptrVMean{nullptr};
+    float* ptrVMax{nullptr};
+    float* ptrVMin{nullptr};
     // Hardware info. Required.
     int smCount{};
     cudaStream_t stream{};

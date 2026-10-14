@@ -244,7 +244,13 @@ routes get one scale per K mean and reuse the original V channel scales and K
 mean. `PrimsTSBlockSparseFmha` serves Sage only with these inputs and passes
 all scales to PrimTS; the attention op ignores them and quantizes dense
 SageAttention inside its kernels. The recipe and quantized dtypes are part of
-the plan key. Paged block-sparse attention rejects Sage.
+the plan key. Paged block-sparse attention rejects Sage. With
+`sage_attn_smooth_v`, V and its summaries also subtract the per-sequence V
+mean, which PrimTS adds back to the output. The attention op cannot, so the
+core also quantizes dense contiguous calls with V smoothing, and
+`PrimsTSBlockSparseFmha` serves dense calls with core-quantized inputs through
+a dense plan; the attention op serves the rest without V smoothing and logs a
+warning once.
 
 `PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
 (`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and

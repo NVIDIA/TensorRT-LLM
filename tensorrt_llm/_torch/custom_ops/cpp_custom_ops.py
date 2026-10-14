@@ -966,6 +966,7 @@ def _register_fake():
           k_scale: torch.Tensor,
           v_scale: torch.Tensor,
           k_mean: Optional[torch.Tensor],
+          v_mean: Optional[torch.Tensor],
           q_block_size: int,
           k_block_size: int,
           reuse_stats: bool = False) -> None:

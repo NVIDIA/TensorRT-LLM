@@ -178,14 +178,15 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
     @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
-    def test_smooth_k_rejected_without_sage_recipe(self, backend):
+    def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
-            with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):
+            with pytest.raises(ValidationError, match="are SageAttention options"):
                 AttentionConfig(
                     backend=backend,
                     quant_attention_config=QuantAttentionConfig(
-                        qk_dtype="bf16", v_dtype="fp8", smooth_k=True
+                        qk_dtype="bf16", v_dtype="fp8", **{smoothing: True}
                     ),
                 )
 

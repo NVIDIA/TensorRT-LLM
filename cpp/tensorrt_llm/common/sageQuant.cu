@@ -64,11 +64,41 @@ __device__ inline SageStatRange getSageStatRange(
     return {headIdx, ptrCuSeqLensV[seqIdx], ptrCuSeqLensV[seqIdx + 1], seqIdx * numHeadsV + headIdx};
 }
 
+// Float atomic maximum and minimum through the integer orderings of IEEE-754 bit patterns: floats
+// with a clear sign bit order like signed integers, floats with a set sign bit (-0.0 included)
+// reversed like unsigned integers.
+__device__ inline void sageAtomicMax(float* address, float value)
+{
+    if (__float_as_int(value) >= 0)
+    {
+        atomicMax(reinterpret_cast<int*>(address), __float_as_int(value));
+    }
+    else
+    {
+        atomicMin(reinterpret_cast<unsigned int*>(address), __float_as_uint(value));
+    }
+}
+
+__device__ inline void sageAtomicMin(float* address, float value)
+{
+    if (__float_as_int(value) >= 0)
+    {
+        atomicMin(reinterpret_cast<int*>(address), __float_as_int(value));
+    }
+    else
+    {
+        atomicMax(reinterpret_cast<unsigned int*>(address), __float_as_uint(value));
+    }
+}
+
 // SageAttention quantization kernel. Tensors are interpreted as column-major [D, H, S], which is
 // the same physical layout as contiguous PyTorch [S, H, D]. Each launch quantizes Q or K. It can
 // simultaneously collect V scales (VStage=1) or quantize V using scales collected by an earlier
 // launch (VStage=2). When SmoothK is enabled, the VStage=1 launch also collects a per-head-per-
-// channel K mean and the VStage=2 launch uses it to perform K-smoothing before quantization.
+// channel K mean and the VStage=2 launch uses it to perform K-smoothing before quantization. When
+// SmoothV is enabled, the VStage=1 launch collects the per-channel V mean and signed extrema instead
+// of the V scales; the VStage=2 launch derives the scales from them when ptrVMax is given and
+// subtracts ptrVMean from V whenever it is given.
 //
 // Which tokens share a scale is a template parameter: Partition is a CuTe layout
 // ((intra...), (group...)) -> token offset inside a tile (see sagePartition.h). Contiguous blocks
@@ -82,10 +112,12 @@ __device__ inline SageStatRange getSageStatRange(
 //
 // V scales and the K mean are reduced per sequence when ptrCuSeqLensV is given (row
 // seqIdx * numHeadsV + headIdx) and over the whole batch otherwise (row headIdx).
-template <typename Element, typename ElementQuantized, typename Partition, int HeadDim, bool SmoothK, int VStage>
+template <typename Element, typename ElementQuantized, typename Partition, int HeadDim, bool SmoothK, bool SmoothV,
+    int VStage>
 __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* ptrCuSeqLensQk, void const* ptrQk,
     void* ptrQkQuant, float* ptrQkScale, void const* ptrKForMean, float* ptrKMean, int sumSeqLensV, int numHeadsV,
-    void const* ptrV, void* ptrVQuant, float* ptrVScale, int const* ptrCuSeqLensV)
+    void const* ptrV, void* ptrVQuant, float* ptrVScale, int const* ptrCuSeqLensV, float* ptrVMean, float* ptrVMax,
+    float* ptrVMin)
 {
     using namespace cute;
     using namespace cutlass;
@@ -94,6 +126,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
     constexpr int ScalesPerTile = Traits::ScalesPerTile;
     constexpr int TileTokens = Traits::TileTokens;
     static_assert(!SmoothK || VStage != 0, "K smoothing requires V staging");
+    static_assert(!SmoothV || VStage == 1, "V smoothing only changes the statistics launch");
     static_assert(std::is_same_v<ElementQuantized, float_e4m3_t> || std::is_same_v<ElementQuantized, std::int8_t>,
         "Unrecognized target dtype for quantization");
     constexpr float TypeMax = cute::is_same_v<ElementQuantized, float_e4m3_t> ? 448.0f : static_cast<float>(126.9f);
@@ -349,7 +382,63 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
             Tensor gVSeqQuant = gVQuant(_, threadInTokIdx, headIdx, _);
             Tensor gVSeqScale = gVScale(_, threadInTokIdx);
 
-            if constexpr (VStage == 1)
+            if constexpr (VStage == 1 && SmoothV)
+            {
+                int const numWarpsToUse = cutlass::fast_min(numWarps, 256);
+                int const numToksPerWave = numWarpsToUse * numToksPerWarp;
+                if (warpId >= numWarpsToUse)
+                {
+                    return;
+                }
+                // Per-channel sum and signed extrema, in FP32.
+                float rSum[BestVL];
+                float rMax[BestVL];
+                float rMin[BestVL];
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < BestVL; ++i)
+                {
+                    rSum[i] = 0.0f;
+                    rMax[i] = -INFINITY;
+                    rMin[i] = INFINITY;
+                }
+                for (; tokIdx < range.tokEnd; tokIdx += numToksPerWave)
+                {
+                    cute::copy(AutoVectorizingCopy{}, gVSeq(_, tokIdx), rV);
+                    cute::transform(rV_x2, rVCompute_x2, NumericArrayConverter<float, Element, 2>::convert);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < BestVL; ++i)
+                    {
+                        rSum[i] += rVCompute(i);
+                        rMax[i] = ::fmaxf(rMax[i], rVCompute(i));
+                        rMin[i] = ::fminf(rMin[i], rVCompute(i));
+                    }
+                }
+                for (int delta = threadsPerHead; delta < 32; delta <<= 1)
+                {
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < BestVL; ++i)
+                    {
+                        rSum[i] += __shfl_xor_sync(0xffffffffu, rSum[i], delta);
+                        rMax[i] = ::fmaxf(rMax[i], __shfl_xor_sync(0xffffffffu, rMax[i], delta));
+                        rMin[i] = ::fminf(rMin[i], __shfl_xor_sync(0xffffffffu, rMin[i], delta));
+                    }
+                }
+                // A smoothed V's scales cover V minus its mean, which is final only after this launch, so
+                // the caller derives them from the mean and the extrema.
+                if (threadInTokIdx == thrId && range.tokBegin < range.tokEnd)
+                {
+                    int64_t const statOffset = static_cast<int64_t>(range.row) * HeadDim + threadInTokIdx * BestVL;
+                    float const invNumTokens = 1.0f / (range.tokEnd - range.tokBegin);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < BestVL; ++i)
+                    {
+                        atomicAdd(ptrVMean + statOffset + i, rSum[i] * invNumTokens);
+                        sageAtomicMax(ptrVMax + statOffset + i, rMax[i]);
+                        sageAtomicMin(ptrVMin + statOffset + i, rMin[i]);
+                    }
+                }
+            }
+            else if constexpr (VStage == 1)
             {
                 int const numWarpsToUse = cutlass::fast_min(numWarps, 256);
                 int const numToksPerWave = numWarpsToUse * numToksPerWarp;
@@ -389,13 +478,50 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
             else if constexpr (VStage == 2)
             {
                 int const numToksPerWave = numWarps * numToksPerWarp;
-                cute::copy(AutoVectorizingCopy{}, gVSeqScale, rVScale);
+                int64_t const statOffset = static_cast<int64_t>(range.row) * HeadDim + threadInTokIdx * BestVL;
+                // This thread's channel slice of the V mean, zero without V smoothing.
+                Tensor rVMean = make_tensor<float>(Shape<VL>{});
+                clear(rVMean);
+                if (ptrVMean != nullptr)
+                {
+                    cute::copy(
+                        AutoVectorizingCopy{}, make_tensor(make_gmem_ptr(ptrVMean + statOffset), Shape<VL>{}), rVMean);
+                }
+                if (ptrVMax != nullptr)
+                {
+                    // A smoothed V's scales cover its largest distance from the mean, with the floor of the
+                    // unsmoothed scales. One thread per channel slice writes them for the consumer.
+                    Tensor rVLargest = make_tensor<float>(Shape<VL>{});
+                    Tensor rVSmallest = make_tensor<float>(Shape<VL>{});
+                    cute::copy(AutoVectorizingCopy{}, make_tensor(make_gmem_ptr(ptrVMax + statOffset), Shape<VL>{}),
+                        rVLargest);
+                    cute::copy(AutoVectorizingCopy{}, make_tensor(make_gmem_ptr(ptrVMin + statOffset), Shape<VL>{}),
+                        rVSmallest);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < BestVL; ++i)
+                    {
+                        rVScale(i)
+                            = ::fmaxf(::fmaxf(rVLargest(i) - rVMean(i), rVMean(i) - rVSmallest(i)), 1e-3f) / 448.0f;
+                    }
+                    if (warpId == 0 && threadInTokIdx == thrId)
+                    {
+                        cute::copy(AutoVectorizingCopy{}, rVScale, gVSeqScale);
+                    }
+                }
+                else
+                {
+                    cute::copy(AutoVectorizingCopy{}, gVSeqScale, rVScale);
+                }
                 cute::transform(rVScale_x2, rVScale_x2, cutlass::reciprocal_approximate<Array<float, 2>>{});
                 for (; tokIdx < range.tokEnd; tokIdx += numToksPerWave)
                 {
                     cute::copy(AutoVectorizingCopy{}, gVSeq(_, tokIdx), rV);
                     cute::transform(rV_x2, rVCompute_x2, cutlass::NumericArrayConverter<float, Element, 2>::convert);
-                    cute::transform(rVCompute_x2, rVScale_x2, rVCompute_x2, cutlass::multiplies<Array<float, 2>>{});
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < BestVL; ++i)
+                    {
+                        rVCompute(i) = (rVCompute(i) - rVMean(i)) * rVScale(i);
+                    }
                     cute::transform(
                         rVCompute_x4, rVQuant_x4, cutlass::NumericArrayConverter<ElementQuantizedV, float, 4>::convert);
                     cute::copy(AutoVectorizingCopy{}, rVQuant, gVSeqQuant(_, tokIdx));
@@ -490,6 +616,9 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
         "Invalid SageQuant K-smoothing parameters");
     TLLM_CHECK_WITH_INFO(
         params.ptrCuSeqLensV == nullptr || params.vStage != 0, "SageQuant per-sequence V statistics require V staging");
+    TLLM_CHECK_WITH_INFO(params.ptrVMean == nullptr
+            || (params.vStage != 0 && (params.vStage != 1 || (params.ptrVMax != nullptr && params.ptrVMin != nullptr))),
+        "Invalid SageQuant V-smoothing parameters");
 
     auto invokeKernel = [&](auto headDimStatic, auto partitionStatic)
     {
@@ -499,22 +628,24 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
         void* kernelArgs[] = {&kernelParams.sumSeqLensQk, &kernelParams.batchSize, &kernelParams.ptrCuSeqLensQk,
             &kernelParams.ptrQk, &kernelParams.ptrQkQuant, &kernelParams.ptrQkScale, &kernelParams.ptrKForMean,
             &kernelParams.ptrKMean, &kernelParams.sumSeqLensV, &kernelParams.numHeadsV, &kernelParams.ptrV,
-            &kernelParams.ptrVQuant, &kernelParams.ptrVScale, &kernelParams.ptrCuSeqLensV};
+            &kernelParams.ptrVQuant, &kernelParams.ptrVScale, &kernelParams.ptrCuSeqLensV, &kernelParams.ptrVMean,
+            &kernelParams.ptrVMax, &kernelParams.ptrVMin};
 
-        auto launchKernel = [&](auto smoothKStatic, auto vStageStatic)
+        auto launchKernel = [&](auto smoothKStatic, auto smoothVStatic, auto vStageStatic)
         {
             constexpr bool SmoothK_ = decltype(smoothKStatic)::value;
+            constexpr bool SmoothV_ = decltype(smoothVStatic)::value;
             constexpr int VStage_ = vStageStatic;
             void const* kernelFunc = nullptr;
             if (params.quantType == DATA_TYPE_E4M3)
             {
-                kernelFunc = reinterpret_cast<void const*>(
-                    sageQuantQkvKernel<Element, cutlass::float_e4m3_t, Partition_, HeadDim_, SmoothK_, VStage_>);
+                kernelFunc = reinterpret_cast<void const*>(sageQuantQkvKernel<Element, cutlass::float_e4m3_t,
+                    Partition_, HeadDim_, SmoothK_, SmoothV_, VStage_>);
             }
             else if (params.quantType == DATA_TYPE_INT8)
             {
                 kernelFunc = reinterpret_cast<void const*>(
-                    sageQuantQkvKernel<Element, std::int8_t, Partition_, HeadDim_, SmoothK_, VStage_>);
+                    sageQuantQkvKernel<Element, std::int8_t, Partition_, HeadDim_, SmoothK_, SmoothV_, VStage_>);
             }
             else
             {
@@ -530,29 +661,39 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
             TLLM_CHECK_WITH_INFO(status == cudaSuccess, "%s", cudaGetErrorString(status));
         };
 
+        // K smoothing needs V staging, and V smoothing only changes what the VStage==1 launch
+        // collects, so only those combinations are instantiated.
+        auto launchWithSmoothKV = [&](auto vStageStatic)
+        {
+            constexpr int VStage_ = vStageStatic;
+            auto launchWithSmoothV = [&](auto smoothKStatic)
+            {
+                if constexpr (VStage_ == 1)
+                {
+                    if (params.ptrVMean != nullptr)
+                    {
+                        launchKernel(smoothKStatic, cute::true_type{}, vStageStatic);
+                        return;
+                    }
+                }
+                launchKernel(smoothKStatic, cute::false_type{}, vStageStatic);
+            };
+            if constexpr (VStage_ != 0)
+            {
+                if (params.kSmooth)
+                {
+                    launchWithSmoothV(cute::true_type{});
+                    return;
+                }
+            }
+            launchWithSmoothV(cute::false_type{});
+        };
+
         switch (params.vStage)
         {
-        case 0: launchKernel(cute::false_type{}, Int<0>{}); return;
-        case 1:
-            if (params.kSmooth)
-            {
-                launchKernel(cute::true_type{}, Int<1>{});
-            }
-            else
-            {
-                launchKernel(cute::false_type{}, Int<1>{});
-            }
-            return;
-        case 2:
-            if (params.kSmooth)
-            {
-                launchKernel(cute::true_type{}, Int<2>{});
-            }
-            else
-            {
-                launchKernel(cute::false_type{}, Int<2>{});
-            }
-            return;
+        case 0: launchWithSmoothKV(Int<0>{}); return;
+        case 1: launchWithSmoothKV(Int<1>{}); return;
+        case 2: launchWithSmoothKV(Int<2>{}); return;
         default: TLLM_THROW("Unsupported SageQuantV stage %d", params.vStage);
         }
     };
