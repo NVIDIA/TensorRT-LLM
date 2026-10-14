@@ -1815,6 +1815,19 @@ class SpecWorkerBase(nn.Module, ABC):
                                          dtype=torch.int,
                                          device=logits.device)
 
+        if (getattr(attn_metadata.kv_cache_manager, "use_gdn_mtp_replay", False)
+                and batch_size > num_contexts):
+            state_indices = attn_metadata.mamba_metadata.state_indices
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=state_indices,
+            )
+            if self._auxiliary_state_handlers:
+                self.commit_auxiliary_speculative_states(
+                    num_accepted_tokens, state_indices[:batch_size],
+                    num_contexts)
+
         next_draft_tokens = torch.zeros((batch_size, 0),
                                         dtype=torch.int,
                                         device=logits.device)

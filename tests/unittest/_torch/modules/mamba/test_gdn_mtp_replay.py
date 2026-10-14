@@ -143,11 +143,18 @@ def _replay_reference(
     return output, raw_x.contiguous()
 
 
-def test_gdn_mtp_replay_matches_reference():
+@pytest.mark.parametrize(
+    "width,configured_width,history_length",
+    [(4, 6, 11), (1, 4, 0), (1, 4, 15), (1, 4, 16)],
+    ids=["mtp3", "zero-draft-empty", "zero-draft-near-full", "zero-draft-full"],
+)
+def test_gdn_mtp_replay_matches_reference(
+    width: int, configured_width: int, history_length: int
+) -> None:
     from tensorrt_llm._torch.custom_ops.cute_dsl_gdn_mtp_replay import gdn_mtp_replay
 
     torch.manual_seed(7)
-    batch, slots, width, configured_width = 2, 5, 4, 6
+    batch, slots = 2, 5
     key_heads, value_heads = 1, 2
     channels = (2 * key_heads + value_heads) * DIM
     qkvz_width = channels + value_heads * DIM
@@ -180,7 +187,7 @@ def test_gdn_mtp_replay_matches_reference():
     )
     history_G = history_G_storage[:, :, :capacity]
     state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    history_len = torch.tensor([2, 7, 4, 11, 1], device="cuda", dtype=torch.int32)
+    history_len = torch.tensor([2, 7, 4, history_length, 1], device="cuda", dtype=torch.int32)
     is_dummy = torch.tensor([False, True], device="cuda")
     A_log = _randn((value_heads,), 0.35, -0.25).clamp_(-1.0, 0.5)
     dt_bias = _randn((value_heads,), 0.65, -2.5).clamp_(-5.0, 0.5)
@@ -334,7 +341,16 @@ def _make_state_storage(indirect, layers, slots, value_heads, channels):
 
 
 @pytest.mark.parametrize("indirect", [False, True], ids=["affine", "indirect"])
-def test_gdn_mtp_commit_matches_reference(indirect):
+@pytest.mark.parametrize(
+    "accepted_counts,starting_lengths",
+    [((3, 2, 1), (15, 10, 16)), ((1, 1, 1), (16, 15, 0))],
+    ids=["mtp3", "zero-draft"],
+)
+def test_gdn_mtp_commit_matches_reference(
+    indirect: bool,
+    accepted_counts: tuple[int, int, int],
+    starting_lengths: tuple[int, int, int],
+) -> None:
     from tensorrt_llm._torch.custom_ops.cute_dsl_gdn_mtp_commit import gdn_mtp_commit
 
     torch.manual_seed(11)
@@ -358,9 +374,9 @@ def test_gdn_mtp_commit_matches_reference(indirect):
         -(_randn((layers, slots, value_heads, capacity), 0.025).abs() + 0.002),
         dim=-1,
     )
-    accepted_tokens = torch.tensor([3, 2, 1], device="cuda", dtype=torch.int32)
+    accepted_tokens = torch.tensor(accepted_counts, device="cuda", dtype=torch.int32)
     is_dummy = torch.tensor([False, False, True], device="cuda")
-    starts = torch.tensor([15, 10, 16], device="cuda", dtype=torch.int32)
+    starts = torch.tensor(starting_lengths, device="cuda", dtype=torch.int32)
     positions = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32)
     slot_for_position = torch.tensor([1, 3, 4], device="cuda", dtype=torch.int32)
     selected_slots = slot_for_position[positions.long()]
@@ -373,7 +389,11 @@ def test_gdn_mtp_commit_matches_reference(indirect):
         ),
         dim=1,
     ).contiguous()
-    history_len = torch.tensor([4, 15, 2, 10, 16], device="cuda", dtype=torch.int32)
+    history_len = torch.tensor(
+        [4, starting_lengths[0], 2, starting_lengths[1], starting_lengths[2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
 
     reference_u = history_u.clone()
     reference_k = history_k.clone()
