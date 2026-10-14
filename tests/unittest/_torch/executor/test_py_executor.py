@@ -2797,6 +2797,49 @@ def test_non_adp_admission_keeps_counting_requests_that_are_not_retiring():
     assert seen == {"live": 3, "active": 2, "all_ranks": None}
 
 
+@pytest.mark.parametrize(
+    ("exclude_retiring_requests", "expected_admitted_ids"),
+    [(True, [10, 11, 12, 13]), (False, [])],
+)
+def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
+    exclude_retiring_requests, expected_admitted_ids
+):
+    """Run the real waiting-queue pop: 4 retiring, 4 waiting, capacity 4.
+
+    With the overlap headroom the whole waiting batch is admitted beside the
+    retiring requests; without it the retiring requests fill every seat. Either
+    way the retiring requests still count as live for the idle wait.
+    """
+    retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests(RequestQueueItem(10 + i) for i in range(4))
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=4,
+        is_benchmark_disagg=False,
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
+        _should_exclude_last_generation_logits=lambda: False,
+    )
+    for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
+        setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
+    live = []
+    stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        side_effect=lambda new_requests, **_: list(new_requests),
+    ):
+        admitted = PyExecutor._fetch_new_requests(stub, waiting_queue, retiring)
+
+    assert [item.id for item in admitted] == expected_admitted_ids
+    assert [item.id for item in waiting_queue] == [10, 11, 12, 13][len(expected_admitted_ids) :]
+    assert live == [4]
+    assert stub.num_fetch_requests == len(expected_admitted_ids)
+
+
 def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     # The generic non-PP path must give both ranks a non-empty scheduled batch:
     # one rank schedules its real request, while the terminal-only rank
