@@ -48,6 +48,12 @@ def _hf_reference_precision() -> Iterator[None]:
         torch.backends.mkldnn.matmul.fp32_precision = mkldnn_precision
 
 
+def _prepare_hf_reference(model: torch.nn.Module) -> None:
+    """Match FP16 checkpoint parameters while retaining FP32 reference math."""
+    for parameter in model.parameters():
+        parameter.data = parameter.data.half().float()
+
+
 async def generate_batch_async(
     hf_model: RefHFModel,
     input_ids: torch.Tensor,
@@ -129,8 +135,8 @@ def test_accuracy_with_allreduce_strategy(
 ) -> None:
     """Test accuracy with different allreduce strategies.
 
-    This test validates that both NCCL and AUTO allreduce strategies produce
-    correct logprobs compared to HuggingFace reference implementation.
+    This test validates FP16 NCCL and AUTO logprobs against an FP32
+    HuggingFace reference using the same FP16-rounded checkpoint parameters.
 
     Expected behavior:
         - allreduce_strategy="NCCL": Accuracy assertion PASSES
@@ -160,6 +166,8 @@ def test_accuracy_with_allreduce_strategy(
     llm = LLM(
         model=model_dir,
         backend="pytorch",
+        dtype="float16",
+        model_kwargs={"dtype": "float16"},
         orchestrator_type="ray",
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         kv_cache_config=kv_cache_config,
@@ -197,8 +205,8 @@ def test_accuracy_with_allreduce_strategy(
     dp_hf_models = []
     for device_id in range(num_gpus):
         hf_model = RefHFModel(model_dir, device_id)
-        # Preserve the loaded BF16 weights while computing the reference in FP32.
-        hf_model.model.float()
+        # Keep RoPE buffers unchanged while matching FP16 model parameters.
+        _prepare_hf_reference(hf_model.model)
         dp_hf_models.append(hf_model)
 
     # Split input data and responses into chunks for each GPU
