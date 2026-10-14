@@ -233,8 +233,76 @@ def test_pool_scores_max_kv_len_bounds_scored_pools(rows_per_program, precision)
     for r, num_pools in enumerate((kv_lens // KPOOL).tolist()):
         assert torch.equal(got[r, :num_pools], unbounded[r, :num_pools])
         torch.testing.assert_close(got[r, :num_pools], want[r, :num_pools], atol=2e-3, rtol=2e-3)
-    # No row has a complete pool: nothing is launched.
-    assert score(KPOOL - 1).shape == (n, num_pools_max)
+
+
+def test_pool_scores_max_kv_len_without_complete_pools_selects_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A bound below one complete pool launches nothing, and the unwritten scores
+    never reach the indexer's pool top-k, which scans kv_len // kpool columns."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import kernels
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
+
+    config = SimpleNamespace(
+        hidden_size=256,
+        q_lora_rank=128,
+        index_n_heads=32,
+        index_head_dim=HD,
+        index_topk=2048,
+        index_kpool=KPOOL,
+        index_kpool_always_select_tail=True,
+    )
+    with torch.device("meta"):
+        indexer = Glm5NextIndexer(config, layer_idx=0)
+
+    gen = torch.Generator(device="cuda").manual_seed(31)
+    heads, num_pools_max = 8, 520
+    pages = num_pools_max * KPOOL // TPB
+    pool = _strided_index_pool(pages + 8, gen)
+    tables = _paged_tables(1, pages, pages + 8, gen)
+    # One context request whose first KPOOL - 1 tokens complete no pool.
+    kv_lens = torch.arange(1, KPOOL, device="cuda")
+    n = kv_lens.shape[0]
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+
+    class _NoLaunch:
+        def __getitem__(self, grid):
+            raise AssertionError(f"kpool_score launched grid {grid} without a complete pool")
+
+    monkeypatch.setattr(kernels, "_kpool_score_kernel", _NoLaunch())
+    scores = kpool_score(
+        q,
+        w,
+        pool,
+        tables,
+        kv_lens,
+        TPB,
+        num_pools_max=num_pools_max,
+        head_dim=HD,
+        kpool=KPOOL,
+        q_scale=HD**-0.5,
+        w_scale=heads**-0.5,
+        precision="bf16",
+        rows_per_program=16,
+        request_ids=torch.zeros(n, dtype=torch.int32, device="cuda"),
+        max_kv_len=int(kv_lens.max()),
+    )
+    assert scores.shape == (n, num_pools_max)
+
+    num_cand = (kv_lens // KPOOL).to(torch.int32)
+    for candidate_scores in (scores, torch.full_like(scores, float("inf"))):
+        selected = torch.empty(n, indexer.select_k, dtype=torch.int32, device="cuda")
+        indexer.pool_top_k(
+            candidate_scores,
+            selected,
+            is_prefill=False,
+            sequence_lengths=num_cand,
+            scan_lengths=num_cand,
+        )
+        assert torch.equal(selected, torch.full_like(selected, -1))
 
 
 @pytest.mark.parametrize("layout", ["generation", "prefill_shared", "prefill_boundary"])
