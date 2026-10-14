@@ -33,7 +33,7 @@ def _function_body(source: str, name: str, next_name: str) -> str:
 class InfraDryRunPipelineTest(unittest.TestCase):
     def test_dry_run_allows_only_the_synthetic_pytest_target(self) -> None:
         expected = "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
-        targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
+        targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "isValidSlurmJobId")
 
         self.assertEqual(DRY_RUN_DB.count("::test_"), 1)
         self.assertIn(expected, DRY_RUN_DB)
@@ -51,7 +51,14 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("runInDockerOnNodeMultiStage", agent)
         self.assertIn("runInEnrootOnNode", agent)
         self.assertIn("testList = INFRA_DRY_RUN_TEST_CONTEXT", sbatch)
-        self.assertIn("pytestCommandParts += getInfraDryRunPytestTargets", sbatch)
+        self.assertIn(
+            "def infraDryRunTargets = getInfraDryRunPytestTargets(testListPathLocal)", sbatch
+        )
+        # eval launches append the targets to the pytest command; run_tests.py
+        # launches pass them through slurm_run.sh as --pytest-target.
+        self.assertIn("pytestCommandParts += infraDryRunTargets", sbatch)
+        self.assertIn('export pytestTargets="$pytestTargets"', sbatch)
+        self.assertIn('runTestsArgs+=(--pytest-target "$target")', SLURM_RUN)
         self.assertIn(
             'if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]',
             SLURM_RUN,
