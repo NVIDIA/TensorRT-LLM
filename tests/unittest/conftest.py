@@ -392,12 +392,8 @@ def torch_empty_cache() -> None:
 
 @pytest.fixture(autouse=True)
 def verify_skipped_device_copies(monkeypatch) -> None:
-    """Check that every buffer copy_to_device_if_changed skips holds the values.
-
-    A test in which anything else writes such a buffer then fails.
-    """
-    monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies",
-                        True)
+    monkeypatch.setattr(
+        "tensorrt_llm._device_copy._verify_skipped_device_copies", True)
 
 
 @pytest.fixture(scope="module")

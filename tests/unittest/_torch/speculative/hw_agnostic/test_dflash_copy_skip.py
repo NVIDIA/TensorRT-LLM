@@ -1,20 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU unit tests for the DFlash worker's per-step slot buffers and copy_to_device_if_changed.
-
-DFlashSpecMetadata.prepare writes batch_indices_cuda and the worker's _batch_to_slot, and the
-worker's post-prefill rebuild writes _batch_to_slot again. Both buffers go through
-copy_to_device_if_changed, which skips a copy whose values equal the last ones it copied. The
-tests check that each buffer always holds the latest mapping, including a step whose mapping
-returns to an earlier one after the rebuild wrote another, and that an unchanged step enqueues
-no copy.
-"""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 
 pytestmark = pytest.mark.cpu_only
@@ -30,7 +22,7 @@ def _worker(req_to_slot):
         _free_slots=[],
         _graph_dummy_id_floor=1 << 30,
         _dummy_slot=DUMMY_SLOT,
-        _batch_to_slot=torch.zeros(8, dtype=torch.long),
+        _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long)),
         _write_ctx_len=lambda updates: None,
     )
     # Generation requests are already assigned in these tests; prepare assigns nothing.
@@ -39,12 +31,14 @@ def _worker(req_to_slot):
 
 
 def _metadata(worker, request_ids, num_generations):
-    return SimpleNamespace(
+    metadata = SimpleNamespace(
         request_ids=list(request_ids),
         num_generations=num_generations,
         batch_indices_cuda=torch.full((8,), -1, dtype=torch.int),
         _dflash_worker=worker,
     )
+    metadata._batch_indices_buffer = DeviceCopyBuffer(metadata.batch_indices_cuda)
+    return metadata
 
 
 def _prepare(metadata, request_ids, num_generations):
@@ -63,15 +57,15 @@ def test_mapping_that_returns_after_a_rebuild_is_written_again():
     worker = _worker({5: 1})
     metadata = _metadata(worker, [8, 5], num_generations=1)
     _prepare(metadata, [8, 5], num_generations=1)
-    assert worker._batch_to_slot[:2].tolist() == [DUMMY_SLOT, 1]
+    assert worker._batch_to_slot_buffer.tensor[:2].tolist() == [DUMMY_SLOT, 1]
     worker._req_to_slot[8] = 4
     _rebuild(worker, [8, 5])
-    assert worker._batch_to_slot[:2].tolist() == [4, 1]
+    assert worker._batch_to_slot_buffer.tensor[:2].tolist() == [4, 1]
     # Request 8 is gone and context request 9 takes its row: prepare maps [dummy, 1] again, the
     # values it copied two writes ago. The buffer must hold them, not the rebuild's [4, 1].
     del worker._req_to_slot[8]
     _prepare(metadata, [9, 5], num_generations=1)
-    assert worker._batch_to_slot[:2].tolist() == [DUMMY_SLOT, 1]
+    assert worker._batch_to_slot_buffer.tensor[:2].tolist() == [DUMMY_SLOT, 1]
 
 
 def test_rebuild_then_prepare_back_to_back_keep_the_latest_mapping():
@@ -79,9 +73,9 @@ def test_rebuild_then_prepare_back_to_back_keep_the_latest_mapping():
     metadata = _metadata(worker, [5, 6], num_generations=2)
     for request_ids, slots in (([5, 6], [1, 2]), ([6, 5], [2, 1]), ([5, 6], [1, 2])):
         _rebuild(worker, request_ids)
-        assert worker._batch_to_slot[:2].tolist() == slots
+        assert worker._batch_to_slot_buffer.tensor[:2].tolist() == slots
         _prepare(metadata, request_ids, num_generations=2)
-        assert worker._batch_to_slot[:2].tolist() == slots
+        assert worker._batch_to_slot_buffer.tensor[:2].tolist() == slots
 
 
 def test_batch_indices_hold_the_batch_rows():
@@ -108,4 +102,4 @@ def test_an_unchanged_step_enqueues_no_copy(monkeypatch):
     _prepare(metadata, [5, 6], num_generations=2)
     monkeypatch.undo()
     assert copies == []
-    assert worker._batch_to_slot[:2].tolist() == [1, 2]
+    assert worker._batch_to_slot_buffer.tensor[:2].tolist() == [1, 2]

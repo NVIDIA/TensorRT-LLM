@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
@@ -1442,7 +1443,7 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     mgr = object.__new__(CppMambaHybridCacheManager)
     mgr.local_num_mamba_layers = 1
     mgr._use_replay_state_update = True
-    mgr._dummy_request_mask = torch.tensor([False, True])
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, True]))
     mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
     mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
     mgr.replay_step_width = 4
@@ -2104,11 +2105,11 @@ def test_cpp_hybrid_state_indices_skip_context_placeholders(
     mgr.recurrent_states_pool_index = 0
     mgr.blocks_per_window = {LinearCacheType.RECURRENT_STATES.value: (1264, 0)}
     mgr._host_state_indices = torch.zeros(1, dtype=torch.int32)
-    mgr.cuda_state_indices = torch.zeros(1, dtype=torch.int32)
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(1, dtype=torch.int32))
     mgr._row_indices = torch.arange(1, dtype=torch.long)
     mgr._request_id_to_state_index = {}
     mgr._request_id_to_is_dummy = {}
-    mgr._dummy_request_mask = None
+    mgr._dummy_request_mask_buffer = None
 
     mgr._setup_state_indices()
 
@@ -3990,7 +3991,7 @@ def test_v2_kda_replay_records_acceptance_and_skips_dummy_rows():
     mgr._use_kda_replay_update = True
     mgr._use_replay_state_update = False
     mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
-    mgr._dummy_request_mask = torch.tensor([False, False, True])
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, False, True]))
 
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=3, num_contexts=1),
@@ -4005,7 +4006,7 @@ def test_v2_kda_replay_resets_context_slots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = True
     mgr._use_replay_state_update = False
-    mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.tensor([2, 1], dtype=torch.int32))
     mgr.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
     mgr.mamba_ssm_rand_seed = None
 
@@ -4088,8 +4089,8 @@ def _v2_kda_replay_stub(num_slots=4):
     mgr._kda_replay_acceptance_pending = set()
     mgr._kda_replay_unseeded = set()
     mgr._host_state_indices = torch.zeros(num_slots, dtype=torch.int32)
-    mgr.cuda_state_indices = torch.zeros(num_slots, dtype=torch.int32)
-    mgr._dummy_request_mask = None
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int32))
+    mgr._dummy_request_mask_buffer = None
     mgr.mamba_ssm_rand_seed = None
     mgr.kv_cache_map = {}
     mgr.ssm_layer_group_id = 0
@@ -4677,7 +4678,7 @@ def test_v2_state_index_setup_skips_unchanged_uploads(monkeypatch):
     keep values the host never sent. A changed step uploads both again."""
     # The test writes the buffers behind _setup_state_indices to see the skip, which the check of skipped copies
     # reports.
-    monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", False)
+    monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", False)
 
     class StateCache:
         def __init__(self, slot: int) -> None:
@@ -5054,7 +5055,7 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
     mgr.prev_num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int32)
     mgr.cache_buf_idx = torch.zeros(batch_size, dtype=torch.int32)
     mgr.intermediate_state_indices = torch.arange(batch_size, dtype=torch.int32)
-    mgr._dummy_request_mask = torch.zeros(batch_size, dtype=torch.bool)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(batch_size, dtype=torch.bool))
     mgr.all_conv_states = [torch.empty(0)]
     mgr._stacked_conv_states = None
     mgr.intermediate_conv_states = torch.empty(0)
@@ -5094,7 +5095,7 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
         102: True,
         103: False,
     }
-    mgr._dummy_request_mask = torch.zeros(4, dtype=torch.bool)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.bool))
     mgr._dummy_request_mask_host = torch.zeros(4, dtype=torch.bool)
     mgr._use_replay_state_update = True
     mgr.replay_step_width = 5

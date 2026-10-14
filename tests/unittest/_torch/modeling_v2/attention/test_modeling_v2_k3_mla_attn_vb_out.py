@@ -77,11 +77,25 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 def _no_cluster(num_requests: int, heads: int) -> bool:
     """Whether a call of R requests takes the no-cluster mode: more 16-CTA clusters than co-reside, all of whose CTAs
     fit on the SMs at once."""
+    import cuda.bindings.driver as cuda_driver
+
     from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import k3_mla_attn_kernel as kernel
 
     clusters = num_requests * heads // H
-    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    return clusters > kernel.CLUSTER_WAVE and clusters * kernel.CLUSTER <= sms
+    if clusters <= kernel.CLUSTER_WAVE:
+        return False
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    sm_type = cuda_driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+    query = getattr(cuda_driver, "cuStreamGetDevResource", None)
+    if query is None:
+        status, context = cuda_driver.cuStreamGetCtx(stream)
+        assert status == cuda_driver.CUresult.CUDA_SUCCESS
+        status, resource = cuda_driver.cuCtxGetDevResource(context, sm_type)
+    else:
+        status, resource = query(stream, sm_type)
+    assert status == cuda_driver.CUresult.CUDA_SUCCESS
+    assert resource.type == sm_type and resource.sm.smCount > 0
+    return clusters * kernel.CLUSTER <= resource.sm.smCount
 
 
 class _MlaCache:

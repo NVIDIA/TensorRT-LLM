@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -79,13 +80,7 @@ from tensorrt_llm._torch.utils import (
     set_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import (
-    copy_to_device_if_changed,
-    global_mpi_rank,
-    maybe_pin_memory,
-    nvtx_range,
-    prefer_pinned,
-)
+from tensorrt_llm._utils import global_mpi_rank, maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -455,11 +450,9 @@ class DecoderRunner(ScheduledModelRunner):
             self.draft_tokens_cuda = torch.empty(
                 (max_num_draft_tokens,), dtype=torch.int, device="cuda"
             )
-            # Only copy_to_device_if_changed writes this buffer: it skips
-            # values it already copied here, so another write would leave
-            # stale values.
-            self.gather_ids_cuda = torch.empty(
-                (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
+            self._gather_ids_buffer = DeviceCopyBuffer(
+                torch.empty((self._config.max_num_tokens,), dtype=torch.int, device="cuda"),
+                pin_memory=prefer_pinned(),
             )
             self.previous_pos_indices_cuda = torch.empty(
                 (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
@@ -4221,9 +4214,7 @@ class DecoderRunner(ScheduledModelRunner):
             final_position_ids = self.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
         if enable_spec_decode:
-            copy_to_device_if_changed(
-                self.gather_ids_cuda, torch.tensor(gather_ids, dtype=torch.int)
-            )
+            self._gather_ids_buffer.update(torch.tensor(gather_ids, dtype=torch.int))
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -4461,7 +4452,7 @@ class DecoderRunner(ScheduledModelRunner):
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:total_draft_lens]
             spec_metadata.request_ids = request_ids
-            spec_metadata.gather_ids = self.gather_ids_cuda[: len(gather_ids)]
+            spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
             spec_metadata.host_position_ids = host_position_ids
@@ -4561,7 +4552,9 @@ class DecoderRunner(ScheduledModelRunner):
                     "use_mrope": _use_mrope,
                 }
 
-        gather_ids_device = self.gather_ids_cuda[: len(gather_ids)] if enable_spec_decode else None
+        gather_ids_device = (
+            self._gather_ids_buffer.tensor[: len(gather_ids)] if enable_spec_decode else None
+        )
         return inputs, gather_ids_device, runtime_draft_len
 
     @nvtx_range("_prepare_inputs")

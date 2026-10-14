@@ -39,6 +39,16 @@ the same values in the same order in both modes, so the outputs do not depend on
 computed as the one-request call on its own rows, pages and length would compute them (the op test,
 `test_k3_mla_attn.py`).
 
+The no-cluster admission checks the actual launch stream's SM resource, never the physical-device SM count.
+Missing `cuStreamGetDevResource` in CUDA 13.0 bindings uses `cuStreamGetCtx` followed by
+`cuCtxGetDevResource` on that stream's converted context. Query failures, invalid resource types and unknown
+counts raise before launch. There is no device-wide fallback or stream-pointer capacity cache. Cluster mode
+is refused on green-context streams because a 16-CTA cluster's feasibility is not established by an SM count.
+The whole-grid co-residency bound and compile-cache mode key are unchanged. CPU admission tests cover the
+binding compatibility and resource/error decisions; actual restricted-stream numerical/progress/capture
+qualification and host-query overhead measurement remain pending. Historical SM100 receipts above do not
+qualify this new admission path. Graph replay must remain in its qualified resource domain.
+
 Accuracy (certified bound): every request's output within `1e-2` (max relative, per request) of a float64
 reference: the attention in float64 with the causal mask above, rounded to bf16; v_b in float64; the gate applied
 to the bf16-rounded product.
