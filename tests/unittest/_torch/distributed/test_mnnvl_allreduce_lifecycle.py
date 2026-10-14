@@ -328,7 +328,9 @@ def test_workspace_growth_during_capture_preserves_existing_workspace(monkeypatc
     monkeypatch.setattr(ops_module, "MnnvlWorkspace", _FakeMcastBuffer)
     workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="workspace creation or growth during CUDA graph capture"):
+    with pytest.raises(
+        RuntimeError, match="workspace creation or growth during CUDA graph capture"
+    ):
         get_or_scale_allreduce_mnnvl_workspace(
             mapping, torch.float32, workspace["buffer_size_bytes"] + 32
         )
