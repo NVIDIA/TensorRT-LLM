@@ -412,6 +412,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             Indexer.prepare(metadata=self)
 
+    def _can_defer_decode_metadata_writes(self) -> bool:
+        """The runner refreshes these device outputs before decode consumes them."""
+        return (
+            self.defer_indexer_decode_prepare
+            and self.num_contexts == 0
+            and self.num_generations > 0
+            and self.num_tokens > 0
+            and self.kv_cache_manager is not None
+            and not self.enable_ragged_verification
+        )
+
     def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         """Bound host-side KV extents until device-selected windows are installed."""
         if self.device_windows_mode and self.is_ragged_verify:
@@ -882,6 +893,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int64,
             capture_graph=capture_graph,
         )
+        # Eager decode refresh writes [1:] only; the prefix stays zero for every batch.
+        self.gen_cached_token_indptr[:1].zero_()
         self.host_gen_cached_token_indptr = torch.zeros_like(
             self.gen_cached_token_indptr,
             device="cpu",
@@ -894,6 +907,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int64,
             capture_graph=capture_graph,
         )
+        self.gen_kv_indptr[:1].zero_()
         self.host_gen_kv_indptr = torch.zeros_like(
             self.gen_kv_indptr,
             device="cpu",
@@ -1766,9 +1780,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 num_tokens = self.num_generations * expand_factor
                 gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(expand_factor)
                 self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
-                self.kv_lens_expanded_cuda[:num_tokens].copy_(
-                    self.kv_lens_expanded_host[:num_tokens], non_blocking=True
-                )
+                if not self._can_defer_decode_metadata_writes():
+                    self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                        self.kv_lens_expanded_host[:num_tokens], non_blocking=True
+                    )
                 self._refresh_expanded_block_table(expand_factor)
         else:
             self.dsl_expand_factor = 1
@@ -2105,9 +2120,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_cached_token_indptr[1 : self.num_generations + 1],
             )
-            self.gen_cached_token_indptr[: self.num_generations + 1].copy_(
-                self.host_gen_cached_token_indptr[: self.num_generations + 1], non_blocking=True
-            )
+            if not self._can_defer_decode_metadata_writes():
+                self.gen_cached_token_indptr[: self.num_generations + 1].copy_(
+                    self.host_gen_cached_token_indptr[: self.num_generations + 1], non_blocking=True
+                )
             # generation kv indptr
             torch.cumsum(
                 kv_lens[self.num_contexts : self.num_seqs],
@@ -2115,9 +2131,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_kv_indptr[1 : self.num_generations + 1],
             )
-            self.gen_kv_indptr[: self.num_generations + 1].copy_(
-                self.host_gen_kv_indptr[: self.num_generations + 1], non_blocking=True
-            )
+            if not self._can_defer_decode_metadata_writes():
+                self.gen_kv_indptr[: self.num_generations + 1].copy_(
+                    self.host_gen_kv_indptr[: self.num_generations + 1], non_blocking=True
+                )
         else:
             self.max_gen_seq_len = 0
 
@@ -2129,7 +2146,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.seq_lens,
             dim=0,
         )
-        self.req_idx_per_token[: self.num_tokens].copy_(
-            self.host_req_idx_per_token[: self.num_tokens],
-            non_blocking=True,
-        )
+        if not self._can_defer_decode_metadata_writes():
+            self.req_idx_per_token[: self.num_tokens].copy_(
+                self.host_req_idx_per_token[: self.num_tokens],
+                non_blocking=True,
+            )
