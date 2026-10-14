@@ -196,14 +196,14 @@ inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t str
 {
     struct KeyHash
     {
-        std::size_t operator()(std::pair<int, cudaStream_t> const& key) const noexcept
+        std::size_t operator()(std::pair<CUcontext, cudaStream_t> const& key) const noexcept
         {
-            return std::hash<int>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
+            return std::hash<CUcontext>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
         }
     };
 
-    thread_local std::unordered_map<std::pair<int, cudaStream_t>, at::Tensor, KeyHash> workspace_tensors;
-    auto key = std::make_pair(device.index(), stream);
+    thread_local std::unordered_map<std::pair<CUcontext, cudaStream_t>, at::Tensor, KeyHash> workspace_tensors;
+    auto key = std::make_pair(getCurrentCudaContext(), stream);
 
     if (workspace_tensors.find(key) == workspace_tensors.end())
     {
