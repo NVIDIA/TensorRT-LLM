@@ -361,6 +361,92 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
     }
 }
 
+def pytestTimeoutEvidenceQueries() {
+    return [[id: "pytest-timeout", allOf: ["TRTLLM_PYTEST_TIMEOUT "]]]
+}
+
+def timeoutEvidenceFile(String stageName) {
+    String safeStageName = stageName.replaceAll(/[^A-Za-z0-9_.-]/, "_")
+    String workspaceTmp = env.WORKSPACE_TMP ?: "${WORKSPACE}@tmp"
+    // Keep transient evidence outside the stage directory so result archives
+    // cannot include it. The start-of-stage cleanup remains authoritative if
+    // an interruption prevents the best-effort final cleanup from running.
+    return "${workspaceTmp}/pytest-timeout-evidence-${safeStageName}.txt"
+}
+
+def clearTimeoutEvidence(String stageName) {
+    try {
+        sh "rm -f '${timeoutEvidenceFile(stageName)}' || true"
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (Exception cleanupError) {
+        echo "Ignorable warning: could not remove timeout evidence for ${stageName}: ${cleanupError.message}"
+    }
+}
+
+def recordTimeoutEvidenceLines(String stageName, Map evidence) {
+    if (evidence?.collectionStatus != "MATCHED") {
+        if (evidence?.collectionStatus == "COLLECTION_ERROR") {
+            echo "Ignorable warning: timeout evidence collection failed for ${stageName}"
+        }
+        return
+    }
+
+    List<String> matchedLines = evidence.matches
+        .collect { Map match -> match.matchedMessage?.toString()?.trim() }
+        .findAll { it }
+    if (matchedLines.isEmpty()) {
+        return
+    }
+
+    String outputFile = timeoutEvidenceFile(stageName)
+    List<String> existing = fileExists(outputFile) ? readFile(outputFile).readLines() : []
+    List<String> merged = (existing + matchedLines).findAll { it?.trim() }.collect { it.trim() }.unique()
+    writeFile(file: outputFile, text: merged.join("\n") + "\n")
+    echo "Recorded ${matchedLines.size()} pytest timeout record(s) for ${stageName} from ${evidence.source}"
+}
+
+def collectOriginatingStepTimeoutEvidence(def pipeline, Throwable error, String stageName) {
+    try {
+        Map evidence = FailureEvidenceCollector.collectOriginatingStepMatchingLines(
+            pipeline, error, pytestTimeoutEvidenceQueries(), 128)
+        recordTimeoutEvidenceLines(stageName, evidence)
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (Exception collectionError) {
+        echo "Ignorable warning: could not collect timeout evidence for ${stageName}: " +
+            collectionError.message
+    }
+}
+
+def collectSlurmTimeoutEvidence(def pipeline, Map remote, String remoteLogPath, String stageName) {
+    try {
+        String evidenceMarker = pytestTimeoutEvidenceQueries()[0].allOf[0]
+        String scanLog = "if [ -f '${remoteLogPath}' ]; then " +
+            "grep -aFi -m 128 -- '${evidenceMarker}' '${remoteLogPath}' 2>/dev/null || true; fi"
+        String candidateText = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(scanLog)),
+            returnStdout: true,
+            retryOnFail: false,
+            noNVDFEvent: true,
+        ) ?: ""
+        List<Map<String, Object>> matches = FailureEvidenceCollector.matchQueryLines(
+            candidateText, pytestTimeoutEvidenceQueries(), 128)
+        Map evidence = [
+            source: "SLURM_JOB_LOG",
+            collectionStatus: matches.isEmpty() ? "NO_MATCH" : "MATCHED",
+            matches: matches,
+        ]
+        recordTimeoutEvidenceLines(stageName, evidence)
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (Exception collectionError) {
+        echo "Ignorable warning: could not collect timeout evidence from ${remoteLogPath} on " +
+            "${remote.host}: ${collectionError.message}"
+    }
+}
+
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
@@ -495,8 +581,8 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(
-                stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
+            collectOriginatingStepTimeoutEvidence(pipeline, e, stageName)
+            def isRerunFailed = rerunFailedTests(pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
             if (isRerunFailed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
@@ -1754,6 +1840,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         perfMode = false
     }
 
+    clearTimeoutEvidence(stageName)
+
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
     // Captured so the finally can suppress this attempt's junit when the failure is
@@ -2656,14 +2744,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         echo "[INFRA-RETRY] ${stageName}: verdict unreadable but sacct reports COMPLETED for ${slurmJobId}; treating as success."
                         return
                     }
-                    // TIMEOUT is a walltime kill -- typed UserFailure so neither
-                    // retry layer re-runs a job that would just time out again.
-                    if (slurmState == "TIMEOUT") {
-                        throw new UserFailure(
-                            "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
-                            "(hit partition walltime ${partition?.time}min); not retrying.",
-                            null)
-                    }
                     // Verdict unreadable but the job is still alive: a transport blip
                     // dropped the monitor while the job kept running, so this is infra,
                     // not a test failure.
@@ -2673,6 +2753,28 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "the monitor lost contact while the job was alive (transient infra), so this is not a " +
                             "test failure.",
                             null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
+                    }
+
+                    // The terminal job log contains structured timeout records
+                    // from every Slurm rank. The XML generator later joins them
+                    // to the final unfinished_test.txt nodeids.
+                    collectSlurmTimeoutEvidence(pipeline, remote, slurmJobLogPath, stageName)
+                    try {
+                        generateTimeoutTestResultXml(pipeline, stageName)
+                    } catch (InterruptedException interruptedError) {
+                        throw interruptedError
+                    } catch (Exception generationError) {
+                        echo "Ignorable warning: could not generate timeout XML for ${stageName}: " +
+                            generationError.message
+                    }
+
+                    // TIMEOUT is a walltime kill -- typed UserFailure so neither
+                    // retry layer re-runs a job that would just time out again.
+                    if (slurmState == "TIMEOUT") {
+                        throw new UserFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
+                            "(hit partition walltime ${partition?.time}min); not retrying.",
+                            null)
                     }
                     def jobFailure = new Exception(
                         "SLURM job ${slurmJobId} for ${stageName} failed with state=" +
@@ -2718,26 +2820,30 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
             deleteProgressArtifact(stageName, postTag)
         } finally {
-            stage("Clean Up Slurm Resource") {
-                // Retry transient cleanup failures before leaving recovery to the sweep.
-                retry(3) {
-                    try {
-                        cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        // retry(3) retries any exception. Keep the cleanup failure typed
-                        // so its cause and scope survive if all attempts fail; the outer
-                        // preservePrimaryFailure then retains any original stage failure.
-                        throw new InfraFailure(
-                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
-                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
+            try {
+                stage("Clean Up Slurm Resource") {
+                    // Retry transient cleanup failures before leaving recovery to the sweep.
+                    retry(3) {
+                        try {
+                            cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
+                        } catch (InterruptedException e) {
+                            throw e
+                        } catch (Exception e) {
+                            // retry(3) retries any exception. Keep the cleanup failure typed
+                            // so its cause and scope survive if all attempts fail; the outer
+                            // preservePrimaryFailure then retains any original stage failure.
+                            throw new InfraFailure(
+                                "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
+                        }
                     }
                 }
+                // Reaching here means cleanup succeeded within its retry budget. If all
+                // attempts fail, the throw skips deregistration and leaves the entry for sweep.
+                deregisterSlurmResource(stageName)
+            } finally {
+                clearTimeoutEvidence(stageName)
             }
-            // Reaching here means cleanup succeeded within its retry budget. If all
-            // attempts fail, the throw skips deregistration and leaves the entry for sweep.
-            deregisterSlurmResource(stageName)
         }
         }
     }
@@ -3511,8 +3617,9 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else if (!fileExists("${stageName}/results-timeout.xml")) {
-                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                } else {
+                    // Regenerate authoritatively after all regular, rerun, and
+                    // isolated test work; an earlier snapshot may be stale.
                     generateTimeoutTestResultXml(pipeline, stageName)
                 }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
@@ -3560,6 +3667,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             }
             }
         }
+        clearTimeoutEvidence(stageName)
 
         // Clean up the workspace
         sh """
@@ -4104,7 +4212,8 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
+    def timeoutEvidencePath = timeoutEvidenceFile(stageName)
+    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --timeout-evidence-file '${timeoutEvidencePath}' --output-file '${outputFilePath}'"""
     if (fileExists(outputFilePath)) {
         return true
     }
@@ -4462,7 +4571,7 @@ def fileHasContent(path) {
 }
 
 // Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
+def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         // No results were ever flushed (e.g. the process was killed before any
         // test finished reporting). test_rerun.py treats a missing xml as "no
@@ -4569,6 +4678,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         } catch(InterruptedException e) {
             throw e
         } catch (Exception e) {
+            collectOriginatingStepTimeoutEvidence(pipeline, e, stageName)
             if (!fileExists(xmlFile)) {
                 echo "The ${testType} tests crashed when rerun attempt."
                 throw e
@@ -4999,6 +5109,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         ls -alh ${env.WORKSPACE}
         ls -alh ${env.WORKSPACE_TMP}
     """
+    clearTimeoutEvidence(stageName)
 
     def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
@@ -5363,8 +5474,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
+                        collectOriginatingStepTimeoutEvidence(pipeline, e, stageName)
                         def isRerunFailed = rerunFailedTests(
-                            stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
+                            pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
                         // Unconditional: a test can crash again during the rerun itself
                         // (isRerunFailed=true), and unfinished_test.txt is the only
                         // record of that crash. junit()'s "results*.xml" glob picks up
@@ -5483,7 +5595,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+        if (generateTimeoutTestResultXml(pipeline, stageName) || fileExists("${stageName}/results-timeout.xml")) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
