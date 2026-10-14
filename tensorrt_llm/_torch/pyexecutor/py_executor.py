@@ -4430,6 +4430,9 @@ class PyExecutor:
             for req in self.kv_connector_manager.take_finished_load_terminations(
             ):
                 self._finish_connector_load_termination(req)
+            failed = self.kv_connector_manager.take_failed_async_load_requests()
+            if failed:
+                self._recover_failed_async_loads(failed)
 
     def _finish_connector_load_termination(self, request: LlmRequest) -> None:
         """Finish a cancelled load or reclaim a load whose error was reported."""
@@ -4464,6 +4467,34 @@ class PyExecutor:
         if not getattr(self, "_is_kv_manager_v2", False):
             return False
         return self.kv_cache_manager.is_preemption_pending(request)
+    def _recover_failed_async_loads(self, failed_ids) -> None:
+        """Restart parked requests whose asynchronous prefix load lost a page.
+
+        The same outcome as `_recover_failed_connector_loads`, reached from a
+        different place: the request was parked outside the batch while its
+        pages were fetched, `get_finished` has just moved it back to context
+        state, and the bytes it was skipped past are not all there. Drop the
+        allocation and progress before the scheduler can admit it; it then
+        restarts from local reuse and the connector is asked afresh.
+        """
+        restarted = []
+        for request_id in failed_ids:
+            req = self.kv_connector_manager.finished_async_loading_requests.pop(
+                request_id, None)
+            if req is None:
+                # Finished or cancelled while parked; that path released the
+                # allocation, and there is nothing left to rewind.
+                continue
+            self.kv_cache_manager.drop_context_allocation(req)
+            draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
+            if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+                draft_kv_cache_manager.free_resources(req)
+            self.kv_connector_manager.forget_request(req)
+            req.state = LlmRequestState.CONTEXT_INIT
+            restarted.append(request_id)
+        logger.warning(
+            f"kv connector: {len(restarted)} parked context request(s) restarted after a "
+            f"failed asynchronous prefix load: {restarted}")
 
     def _resume_preempted_request(self, request: LlmRequest) -> bool:
         """Complete a preemption whose connector saves have now retired.

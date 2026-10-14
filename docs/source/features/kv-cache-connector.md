@@ -514,3 +514,11 @@ These features use the existing `kv_connector_config.mooncake_store` pool/role i
 ### Evicted-prefix recovery
 
 A Mooncake page may disappear between lookup and load. An attention-DP owner or a single-rank worker restarts the affected context request before forward execution, releases its target/draft allocations, and repeats lookup from local reuse. Only successfully loaded staging slots are copied to GPU memory. Saves belonging to the failed request are removed from the bound pass before its pages are released. Other requests in the batch continue. Tensor-parallel load failures remain fatal because shards cannot restart independently.
+
+### Background prefix loading
+
+Set `kv_connector_config.mooncake_store.async_load: true` to park requests while dedicated workers fetch their prefix. The default is `false`. This requires attention DP or a single rank. `async_load_workers` defaults to 1; each worker owns a CUDA stream and staging slots. Failed loads use the same context restart path described above.
+
+`staging_buffer_bytes` accepts a byte count or binary size and defaults to `1GiB`. It bounds each synchronous transfer direction and, when async loading is enabled, one additional budget shared by all load workers. Each worker must fit at least the largest KV page. For role `both` with async loading, the per-rank staging ceiling is three times this value; the node memory check includes all three budgets. Increasing workers does not increase the shared async budget. Capacity-only roles allocate no staging.
+
+Every worker acknowledges CUDA device/stream initialization before registration succeeds. Shutdown retains the store and pinned buffers if a transfer thread has not stopped. Completion is reported only after the worker finishes copying its pages; saves remain pinned until their existing completion path retires them.

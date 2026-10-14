@@ -1269,6 +1269,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         take = getattr(self.worker, "take_failed_load_requests", None)
         return set(take()) if take is not None else set()
 
+    def take_failed_async_load_requests(self) -> set:
+        """Parked requests whose asynchronous load lost a page.
+
+        Reported through `get_finished` like a completed load, so the request
+        leaves its parked state; the executor then drops its allocation and lets
+        it restart. See `PyExecutor._recover_failed_async_loads`.
+        """
+        take = getattr(self.worker, "take_failed_async_load_requests", None)
+        return set(take()) if take is not None else set()
+
     def forget_request(self, request: LlmRequest) -> None:
         """Drop everything keyed to a request that is about to restart from scratch."""
         drop_saves = getattr(self.worker, "drop_bound_saves", None)

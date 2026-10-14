@@ -1985,6 +1985,7 @@ class KVCacheManagerV2(BaseResourceManager):
             index_mapper_capacity, max_beam_width, self.max_copy_beam_width
         )
         self._early_freed_index_requests: set[int] = set()
+        self._connector_pending_allocations: Dict[int, LlmRequest] = {}
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, Tuple[LlmRequest, Tuple["KVCacheManagerV2", ...]]] = {}
@@ -4476,12 +4477,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             served_any |= self._apply_connector_matched_prefix(request)
             request.py_connector_allocation_reported = True
-            # Both forms are offered; the manager picks the one this connector
-            # implements. With several layer groups the flat list is empty,
-            # because a page index is scoped to a group.
-            by_group = self.get_page_indices_by_layer_group(request)
-            flat = by_group[0] if len(by_group) == 1 else []
-            self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            # Draft pages do not exist until their manager prepares this batch.
+            # Defer the allocation callback, which may start background writes,
+            # until report_batch_to_connector can describe every layout group.
+            self._connector_pending_allocations[request.py_request_id] = request
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -4513,6 +4512,19 @@ class KVCacheManagerV2(BaseResourceManager):
             additional_managers = (
                 (draft_kv_cache_manager,) if draft_kv_cache_manager is not None else ()
             )
+            pending = self._connector_pending_allocations
+            for request in scheduled_batch.context_requests:
+                if pending.pop(request.py_request_id, None) is None:
+                    continue
+                by_group = self.get_page_indices_by_layer_group(request)
+                for manager in additional_managers:
+                    by_group.extend(manager.get_page_indices_by_layer_group(request))
+                flat = by_group[0] if len(by_group) == 1 else []
+                # Page allocation/COW belongs to the manager's execution stream,
+                # which need not be the caller's current stream. Async loaders
+                # record their destination-readiness event on this producer.
+                with torch.cuda.stream(self._stream):
+                    self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self, additional_managers
             )
@@ -5844,6 +5856,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        self._connector_pending_allocations.pop(request.py_request_id, None)
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain, and a dead entry here would block every later
         # preemption through has_pending_preemption.
@@ -6150,6 +6163,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._disagg_receive_ready.clear()
+        self._connector_pending_allocations.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies

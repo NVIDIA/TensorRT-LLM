@@ -67,6 +67,7 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 #: rendered config so a vLLM reader of the same file sees the same value.
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 DEFAULT_NAMESPACE = "trtllm"
+DEFAULT_STAGING_BUFFER_BYTES = 1 << 30
 #: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
 #: out of the deployment. An empty connstring is not a form `store.setup`
 #: accepts, so this is the only sensible fallback.
@@ -292,6 +293,10 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. The only transfer path supported today, so a False
     #: here is raised back to True.
     stage_through_host: bool = True
+    #: Ceiling for each synchronous direction and the shared async load pool.
+    staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_BYTES
+    async_load: bool = False
+    async_load_workers: int = 1
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -310,6 +315,12 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("local_buffer_size must be > 0")
         if self.global_segment_size < 0:
             raise ValueError("global_segment_size must be >= 0")
+        if self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be > 0")
+        if type(self.async_load) is not bool:
+            raise ValueError("async_load must be a boolean")
+        if self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be >= 1")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
 
@@ -347,6 +358,11 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", True)),
+            staging_buffer_bytes=parse_size(
+                raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_BYTES), strict_units=True
+            ),
+            async_load=raw.get("async_load", False),
+            async_load_workers=int(raw.get("async_load_workers", 1)),
         )
 
     @staticmethod

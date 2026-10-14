@@ -121,8 +121,6 @@ def validate_node_budget(
     """
     from tensorrt_llm._utils import local_mpi_size
 
-    from .staging import MAX_STAGING_BUFFER_BYTES
-
     if ranks_on_node is None:
         try:
             ranks_on_node = max(1, local_mpi_size())
@@ -134,7 +132,10 @@ def validate_node_budget(
     # DRAM, so it belongs in the sum even when no segment is mounted. One pool
     # per direction, and a capacity-only rank opens neither.
     directions = int(config.role.loads) + int(config.role.saves)
-    staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
+    # Async workers share one extra load-direction budget, in addition to
+    # the synchronous fallback and save pools. Capacity roles allocate none.
+    directions += int(config.async_load and config.role.loads)
+    staging_claim = ranks_on_node * directions * config.staging_buffer_bytes
 
     claimed = segment_claim + staging_claim
     if claimed <= 0:
