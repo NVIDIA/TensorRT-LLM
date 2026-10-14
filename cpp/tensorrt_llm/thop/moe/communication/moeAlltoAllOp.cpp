@@ -40,15 +40,29 @@ namespace torch_ext
 namespace moe_comm
 {
 
-// Process-wide budget copied into subsequent dispatch/combine launch arguments.
+// Process-wide completion-flag budget copied into subsequent dispatch/combine launch arguments,
+// so a captured CUDA graph keeps the budget that was current at capture.
+//
+// No collective separates a rank's first-touch JIT/autotune work from its dispatch launch, so
+// this device-side budget is in effect a deadline on the slowest peer's host-side progress.
+// Python raises it during warmup (tensorrt_llm/_torch/moe/fused_moe/moe_comm_timeout_guard.py).
 static std::atomic<int64_t> gTimeoutCycles{tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles};
 
+// Set the budget of subsequent launches in seconds; 0 restores the default.
 void moeA2ASetTimeoutOp(int64_t timeoutSec)
 {
     constexpr int64_t kMaxTimeoutSec = 24 * 60 * 60;
-    TORCH_CHECK(timeoutSec > 0 && timeoutSec <= kMaxTimeoutSec, "MoE all-to-all timeout must be in 1..", kMaxTimeoutSec,
-        " seconds");
-    gTimeoutCycles.store(timeoutSec * tensorrt_llm::kernels::moe_comm::kAssumedClockHz, std::memory_order_relaxed);
+    TORCH_CHECK(timeoutSec >= 0 && timeoutSec <= kMaxTimeoutSec, "MoE all-to-all timeout must be in 0..",
+        kMaxTimeoutSec, " seconds (0 restores the default), got ", timeoutSec);
+    int64_t const timeoutCycles = timeoutSec == 0 ? tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles
+                                                  : timeoutSec * tensorrt_llm::kernels::moe_comm::kAssumedClockHz;
+    gTimeoutCycles.store(timeoutCycles, std::memory_order_relaxed);
+}
+
+// Return the budget of subsequent launches in seconds.
+int64_t moeA2AGetTimeoutOp()
+{
+    return gTimeoutCycles.load(std::memory_order_relaxed) / tensorrt_llm::kernels::moe_comm::kAssumedClockHz;
 }
 
 static constexpr size_t CACHELINE_ALIGNMENT = 128;
@@ -1083,6 +1097,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, Tensor metainfo, int ep_rank, int ep_size, "
         "int runtime_max_tokens_per_rank, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
+    module.def("moe_a2a_get_timeout() -> int", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetTimeoutOp);
     module.def(
         "moe_a2a_get_workspace_layout(int ep_size, int max_num_tokens_per_rank, int top_k, "
         "int dispatch_payload_bytes, int combine_input_bytes, int combine_recv_bytes, "
