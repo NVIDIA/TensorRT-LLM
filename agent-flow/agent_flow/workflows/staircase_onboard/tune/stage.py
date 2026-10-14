@@ -165,8 +165,10 @@ class TuneStage:
         self.t.setdefault("phase", "ground")
 
     # ------------------------------------------------------------------ helpers
-    def _measure(self, labels: Mapping[str, Sequence[Path]], tree: str | None = None) -> dict[str, Measurement | None]:
-        """Measure every label not yet on disk, as many at once as there are sessions."""
+    def _measure(self, labels: Mapping[str, Sequence[Path]], tree: str | None = None,
+                 on: str | None = None) -> dict[str, Measurement | None]:
+        """Measure every label not yet on disk, as many at once as there are sessions -- or, with
+        ``on``, one after another on that session (same-host repeats) while it lives."""
         bench = self.spec.bench()
         todo = {l: c for l, c in labels.items() if not (self.data / l / "meta.json").exists()}
         for label in todo:
@@ -178,9 +180,18 @@ class TuneStage:
                 if label in queued:
                     continue
                 free = self.perf.free_spools()
+                if on is not None:
+                    if on in free:
+                        free = [on]
+                    elif any(sp == on for sp, _ in self.perf.inflight.values()):
+                        free = []
+                    else:  # its session is gone: any host will do
+                        self.log(f"[tune] {on} is gone; {label} goes to any session")
+                        on = None
                 if not free:
                     break
                 self.perf.submit(free[0], label, bench.command(label, self.data, configs), wall=bench.wall, tree=tree)
+                self.t.setdefault("measured_on", {})[label] = str(free[0])
                 queued.add(label)
                 self.log(f"[tune] measuring {label} on {free[0]}")
             for label, _, rc in self.perf.poll():
@@ -208,13 +219,16 @@ class TuneStage:
         s = self.spec
         stock = _overlay_file(s.workdir, "stock", {"modeling_v2": "off"})
         labels: dict[str, Sequence[Path]] = {"t-baseline": s.identity_configs}
-        labels.update({f"t-baseline-r{i}": s.identity_configs for i in range(1, s.noise_repeats + 1)})
         if s.reference == "stock":
             labels["t-reference"] = [*s.identity_configs, stock]
         got = self._measure(labels)
         if got.get("t-baseline") is None:
             self.log("[tune] the baseline could not be measured; the campaign cannot start")
             return False
+        # The noise floor is a same-host quantity (hosts differ by more than a run repeats): the
+        # repeats follow the baseline onto its session instead of spreading across sessions.
+        repeats = {f"t-baseline-r{i}": s.identity_configs for i in range(1, s.noise_repeats + 1)}
+        got.update(self._measure(repeats, on=(self.t.get("measured_on") or {}).get("t-baseline")))
         repeats = [m for k, m in got.items() if k.startswith("t-baseline") and m]
         noise = NoiseFloor.from_measurements(repeats)
         self.t.update(baseline="t-baseline", reference="t-reference" if s.reference == "stock" else "",

@@ -51,6 +51,8 @@ class FakeRunner:
         name = f"{self.prefix}-{label}"
         self.inflight[name] = (spool, label)
         self.jobs[label] = (command, tree)
+        self.where = getattr(self, "where", {})
+        self.where[label] = spool
         return name
 
     def poll(self):
@@ -870,3 +872,26 @@ def test_without_a_ladder_the_ground_baseline_is_the_first_control(tmp_path):
     assert stage.run() == "tuned"
     camp = json.loads((spec.workdir / "campaign_state.json").read_text())
     assert camp["control_label"] == "t-baseline" and "t-baseline" in camp["controls"].values()
+
+
+def test_the_noise_repeats_run_on_the_baselines_host(tmp_path):
+    """Spreading the baseline repeats across sessions measures host-to-host spread (up to 4% on GB300)
+    as noise and inflates every keep threshold; the repeats follow the baseline onto its session."""
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(identity)], "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
+                     "spools": ["s1", "s2", "s3"], "env_script": "/env.sh", "noise_repeats": 2}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+    runners = []
+
+    def factory(spools, prefix):
+        runners.append(FakeRunner(spools, prefix, _effect))
+        return runners[-1]
+
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None, runner_factory=factory, poll_s=0, log=lambda m: None)
+    assert stage.ground()
+    where = {k: v for r in runners for k, v in getattr(r, "where", {}).items()}
+    assert where["t-baseline-r1"] == where["t-baseline-r2"] == where["t-baseline"]
+    assert where["t-reference"] != where["t-baseline"]  # the reference still runs beside the baseline
