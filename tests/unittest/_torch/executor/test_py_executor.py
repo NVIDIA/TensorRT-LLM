@@ -1173,6 +1173,7 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     executor.enable_attention_dp = False
+    executor.adp_router = Mock(exclude_retiring_requests=False)
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
@@ -2739,6 +2740,8 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
         _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
     )
     seen = {}
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
@@ -2822,6 +2825,8 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
         _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
     )
     for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
