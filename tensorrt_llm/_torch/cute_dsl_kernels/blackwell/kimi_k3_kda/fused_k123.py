@@ -22,23 +22,25 @@ Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
   Total work units = (NT/4) * H * B, distributed round-robin across SMs
   Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
 Block: 992 threads (31 warps), warp-specialized with setmaxnreg:
-  Warps 0-15:  TMA+K1 fused (8×2, vec2, prefetch pipeline) – 4 WGs, 56 regs
-  Warps 16-26: K2 MMA compute (10 active + warp 26 as TMA producer) – 72 regs
+  Warps 0-15:  K1 compute (8×2, vec2) – 4 WGs, 56 regs
+  Warps 16-25: K2 MMA compute – 72 regs
+  Warp 26:     Dedicated TMA producer (TMA_WARP_ID) – 72 regs
   Warps 27-30: Store/Inversion warps – 24 regs
 
 Pipeline (single for_generate, warp groups separated by if-blocks):
   per work unit:
-    Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
-                    TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-    Warps 16-26: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warps 0-15:  wait(tma), K1 cumsum, arrive(k1_done),
+                    Pass 2b Q/K reads and scaling, arrive(stage_reuse)
+    Warps 16-25: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warp 26:     wait(stage_reuse), TMA Q/K/G for each chunk, signal(tma)
     Warps 27-30: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
   All warp-group invariants are computed inside each group's if-block (not hoisted)
   to eliminate cross-group register pressure — same budget as the _all version.
   Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases).
 
 Mbarriers:
-  tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
-  stage_reuse_mbars[2]:  count=320, MMA(10 warps) → warp 0 waits before TMA reuse
+  tma_mbars[2]:          count=1, TMA_WARP_ID (26) lane 0 → K1+MMA wait for TMA data
+  stage_reuse_mbars[2]:  count=832, K1(16)+MMA(10 warps) → TMA waits before reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
   mma_done_mbars[2]:     count=320, MMA(10 warps) → Store waits for sAqk/sAkk ready
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
@@ -1035,8 +1037,11 @@ def fused_kernel123(
     if tidx == 0:
         for s in range(NUM_STAGES):
             cute.arch.mbarrier_init(tma_mbars + s, 1)
-            # TMA warp is waiter (not arriver) on stage_reuse; and it skips mma_done arrive
-            cute.arch.mbarrier_init(stage_reuse_mbars + s, (NUM_MMA_WARPS - 1) * 32)
+            # Both K1 Pass 2b and MMA read Q/K before TMA can reuse a stage.
+            # The dedicated TMA warp does not arrive on either barrier.
+            cute.arch.mbarrier_init(
+                stage_reuse_mbars + s, (NUM_MMA_WARPS - 1 + NUM_K1_TMA_WARPS) * 32
+            )
             cute.arch.mbarrier_init(k1_done_mbars + s, NUM_K1_TMA_WARPS * 32)
             cute.arch.mbarrier_init(mma_done_mbars + s, (NUM_MMA_WARPS - 1) * 32)
             cute.arch.mbarrier_init(store_done_mbars + s, NUM_STORE_WARPS * 32)
@@ -1070,8 +1075,8 @@ def fused_kernel123(
     cute.arch.barrier()
 
     # =====================================================================
-    # Pre-arrive (MMA warps only)
-    # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 10 MMA warps
+    # Pre-arrive before the first TMA load and MMA store
+    # stage_reuse_mbars: pre-arrive all 16 K1 and 10 MMA reader warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
     # =====================================================================
     if (
@@ -1084,6 +1089,10 @@ def fused_kernel123(
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
             if mma_warp_tmp < NUM_STORE_WARPS:
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
+
+    if warp_idx < NUM_K1_TMA_WARPS:
+        for s in range(NUM_STAGES):
+            cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
 
     # =================================================================
     # Persistent outer loop. Single for_generate at top level (required).
@@ -1365,9 +1374,13 @@ def fused_kernel123(
                     else:
                         cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
 
+                # K1 still reads Q/K in Pass 2b after signaling k1_done.
+                # TMA may reuse this stage only once those reads finish too.
+                cute.arch.mbarrier_arrive(stage_reuse_mbars + cur_stage)
+
         # =============================================================
         # Warp 26 (TMA_WARP_ID): dedicated TMA producer.
-        # Waits stage_reuse (gated by MMA arrives), issues TMA for Q/K/G,
+        # Waits stage_reuse (K1 and MMA readers), issues TMA for Q/K/G,
         # signals tma_mbar. Decouples MMA -> TMA dependency from K1 compute.
         # =============================================================
         if warp_idx == TMA_WARP_ID:

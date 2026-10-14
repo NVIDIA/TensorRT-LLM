@@ -147,3 +147,51 @@ async def test_async_context_manager_releases_persistent_client_and_backend():
     assert backend.create_client_calls == 1
     assert backend.client_exit_count == 1
     assert backend.exit_count == 1
+
+
+async def test_required_tools_do_not_reuse_previous_persistent_invocation_calls():
+    from dataclasses import replace
+
+    from agent_flow.hooks import RequiredToolCallError
+    from agent_flow.types import ToolCallEvent
+
+    backend = FakeBackend(
+        [
+            {
+                "turns": [
+                    {"tool_calls": [ToolCallEvent("append_progress", {})]},
+                    {"tool_calls": []},
+                    {"tool_calls": []},
+                ]
+            }
+        ]
+    )
+    config = replace(_config(), print_activity=False, required_tools=("append_progress",))
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            assert await layer.aforward("first task") == "ok"
+            with pytest.raises(RequiredToolCallError, match="append_progress"):
+                await layer.aforward("second task")
+            assert backend.clients[0].closed
+    assert backend.create_client_calls == 1
+    assert backend.clients[0].send_count == 3
+
+
+async def test_persistent_session_requires_stable_prompt_when_first_was_none():
+    from dataclasses import replace
+
+    backend = FakeBackend()
+    prompts = iter([None, "new instructions"])
+    config = replace(_config(), system_prompt=None, print_activity=False)
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(
+            config,
+            prompt_builder=lambda content: AgentRequest(
+                content,
+                system_prompt=next(prompts),
+            ),
+        ) as layer:
+            await layer.aforward("first")
+            with pytest.raises(ValueError, match="stable system prompt"):
+                await layer.aforward("second")
+    assert backend.create_client_calls == 1

@@ -13,6 +13,7 @@ from agent_flow.types import (
     SessionInitEvent,
     ThinkingEvent,
     ToolCallEvent,
+    UsageInfo,
 )
 
 
@@ -29,6 +30,16 @@ def _capture_console(monkeypatch) -> Console:
     monkeypatch.setattr(console_module, "console", fake)
     fake._buffer_text = buffer  # type: ignore[attr-defined]
     return fake
+
+
+def test_usage_labels_thread_estimate_separately_from_actual_cost(monkeypatch):
+    fake = _capture_console(monkeypatch)
+    console_module.print_agent_completed(
+        "planner", usage=UsageInfo(cost_usd=0.25, estimated_thread_cost_usd=1.75)
+    )
+    output = fake._buffer_text.getvalue()  # type: ignore[attr-defined]
+    assert "cost $0.2500" in output
+    assert "estimated thread cost $1.7500" in output
 
 
 def test_main_agent_tool_call_has_no_subagent_badge(monkeypatch):

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from typing import cast
 from unittest.mock import Mock, patch
 
@@ -85,6 +86,8 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn._fmha_manager.select.return_value = fmha
 
     metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.token_major_gen_view.return_value = None
+    metadata.presented_token_major.return_value = nullcontext()
     metadata.is_cross = False
     metadata.enable_flash_mla = False
     metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
@@ -112,6 +115,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
 
     output = TrtllmAttention.forward(attn, q, k, v, metadata, forward_args)
 
+    metadata.presented_token_major.assert_called_once_with(None)
     attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
     fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
     assert not forward_args.is_fused_qkv

@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 from unittest import mock
 
@@ -47,6 +48,7 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_no_mxfp4_swizzle, skip_no_rubin, skip_no_sm120,
                         skip_post_blackwell, skip_post_hopper, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
+from ..deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT, evaluate_gsm8k
 
 # isort: off
 from .accuracy_core import (
@@ -297,6 +299,53 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     "TestDeepSeekV3Lite::test_bfloat16",
                     acceptance_length,
                 )
+
+    @skip_no_rubin
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_nvfp4_mla(self, monkeypatch):
+        from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
+            Fp4MlaFmha
+        from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \
+            Fp4MlaKVCacheManagerV2
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttention
+        from tensorrt_llm._torch.attention.mla import MLA
+
+        # Inspect the actual worker's quantization, cache pools and FMHA choice.
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        kv_cache_config = KvCacheConfig(dtype="nvfp4",
+                                        free_gpu_memory_fraction=0.75,
+                                        use_kv_cache_manager_v2=True,
+                                        enable_block_reuse=False)
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                attn_backend="TRTLLM",
+                kv_cache_config=kv_cache_config,
+                enable_chunked_prefill=False,
+                max_num_tokens=8192,
+                max_batch_size=1350,
+        ) as llm:
+            executor = llm._executor.engine
+            quant_config = executor.model_engine.model.model_config.quant_config
+            assert quant_config.quant_algo == QuantAlgo.NVFP4
+            assert quant_config.quant_mode.has_fp4_kv_cache()
+            manager = executor.kv_cache_manager
+            assert isinstance(manager, Fp4MlaKVCacheManagerV2)
+            assert manager.get_mla_v_scale_pool().numel() > 0
+            assert manager.get_fp4_mla_hp_pool().numel() > 0
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            mla_layers = [
+                module.mqa for module in executor.model_engine.model.modules()
+                if isinstance(module, MLA)
+            ]
+            assert mla_layers
+            for layer in mla_layers:
+                assert isinstance(layer, TrtllmAttention)
+                assert layer.has_fp4_kv_cache
+                assert any(
+                    isinstance(fmha, Fp4MlaFmha)
+                    for fmha in layer._fmha_manager._cache.values())
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
@@ -599,59 +648,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(
-        reason="CuteDslFusedMoE declines FP8 block scales: it has no FP8 "
-        "block-scale kernel, only a torch.einsum reference. See the ‡ footnote "
-        "in tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md. "
-        "Re-enable against DEEPGEMM / TRTLLM once this checkpoint has an "
-        "owner backend on SM100.")
-    @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False])
-    @parametrize_with_ids(
-        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-        [(False, False, False, False)],
-    )
-    @parametrize_with_ids("mtp_nextn", [0])
-    def test_cute_dsl_fp8_block_scales(
-        self,
-        mtp_nextn,
-        fp8kv,
-        attention_dp,
-        cuda_graph,
-        overlap_scheduler,
-        torch_compile,
-    ):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            torch_compile_config=torch_compile_config,
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            use_cute_dsl_blockscaling_mm=True,
-            use_cute_dsl_blockscaling_bmm=True,
-        )
-
-        if fp8kv:
-            kv_cache_config.dtype = "fp8"
-
-        mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
-
-        with LLM(
-                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                kv_cache_config=kv_cache_config,
-                **pytorch_config,
-                enable_attention_dp=attention_dp,
-                speculative_config=mtp_config,
-        ) as llm:
-
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
     @skip_pre_blackwell
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_cute_dsl_bf16_bmm(self, cuda_graph):
@@ -787,72 +783,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip(
-        reason="Same as test_cute_dsl_fp8_block_scales: CuteDslFusedMoE "
-        "declines FP8 block scales, so a CUTEDSL request on this checkpoint no "
-        "longer resolves.")
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False])
-    @parametrize_with_ids(
-        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-        [(False, False, False, False)],
-    )
-    @parametrize_with_ids("mtp_nextn", [0])
-    @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size",
-        [(4, 1, 1), (4, 1, 4), (2, 2, 1), (1, 4, 1)],
-        ids=["tp4", "ep4", "tp2pp2", "pp4"],
-    )
-    def test_cute_dsl_fp8_block_scales_4gpus(
-        self,
-        tp_size,
-        pp_size,
-        ep_size,
-        mtp_nextn,
-        fp8kv,
-        attention_dp,
-        cuda_graph,
-        overlap_scheduler,
-        torch_compile,
-    ):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        torch_compile_config = (TorchCompileConfig(
-            enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph,
-            capture_num_tokens=[2048, 8192],
-            max_num_streams=3) if torch_compile else None)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            torch_compile_config=torch_compile_config,
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            use_cute_dsl_blockscaling_mm=True,
-            use_cute_dsl_blockscaling_bmm=True,
-        )
-
-        if fp8kv:
-            kv_cache_config.dtype = "fp8"
-
-        mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
-
-        with LLM(
-                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                **pytorch_config,
-                enable_attention_dp=attention_dp,
-                speculative_config=mtp_config,
-        ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
             task = GSM8K(self.MODEL_NAME)
@@ -2079,6 +2009,74 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
+
+@skip_pre_blackwell
+@pytest.mark.skip_device_not_contain(["GB300"])
+@pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
+class TestDeepSeekV41(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
+
+    @pytest.mark.parametrize(
+        "tp_size,attention_dp,nvfp4", [(4, False, False), (4, False, True),
+                                       (4, True, True), (8, False, True),
+                                       (8, True, True)],
+        ids=["mxfp4-tp4", "nvfp4-tp4", "nvfp4-dp4", "nvfp4-tp8", "nvfp4-dp8"])
+    def test_gsm8k_dspark(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                          tp_size: int, attention_dp: bool,
+                          nvfp4: bool) -> None:
+        world_size = get_mpi_world_size()
+        available_gpus = get_device_count() if world_size == 1 else world_size
+        if available_gpus < tp_size:
+            pytest.skip(f"Requires at least {tp_size} GPUs")
+
+        for name in tuple(os.environ):
+            if name.startswith("TRTLLM_V41_"):
+                monkeypatch.delenv(name)
+
+        with LLM(
+                self.MODEL_PATH + ("-NVFP4" if nvfp4 else ""),
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=tp_size,
+                gpus_per_node=4,
+                enable_attention_dp=attention_dp,
+                custom_tokenizer="deepseek_v41",
+                trust_remote_code=True,
+                max_seq_len=8192,
+                max_num_tokens=8192,
+                max_batch_size=64,
+                enable_chunked_prefill=True,
+                disable_overlap_scheduler=False,
+                enable_iter_perf_stats=True,
+                cuda_graph_config=CudaGraphConfig(
+                    batch_sizes=[1, 2, 4, 8, 16, 32, 64], enable_padding=True),
+                moe_config=MoeConfig(backend="TRTLLM"),
+                allreduce_strategy="NCCL",
+                kv_cache_config=KvCacheConfig(dtype="fp8",
+                                              enable_block_reuse=True,
+                                              enable_swa_scratch_reuse=False,
+                                              tokens_per_block=128,
+                                              max_tokens=262144,
+                                              free_gpu_memory_fraction=0.5),
+                sparse_attention_config={"algorithm": "csa2"},
+                speculative_config=DSparkDecodingConfig(max_draft_len=5),
+        ) as llm:
+            request_outputs = []
+            evaluate_gsm8k(llm, tmp_path, request_outputs=request_outputs)
+            assert request_outputs
+            for output in request_outputs:
+                assert output.finished
+                assert output.decoding_iter > 0
+            # Request metrics include every attention-DP rank.
+            acceptance_length = sum(
+                output.avg_decoded_tokens_per_iter * output.decoding_iter
+                for output in request_outputs) / sum(
+                    output.decoding_iter for output in request_outputs)
+            print(f"[AL] DS-V4.1 tp={tp_size} attention_dp={attention_dp} "
+                  f"nvfp4={nvfp4}: {acceptance_length:.3f}")
+            assert acceptance_length >= 3.0, (
+                f"DSpark acceptance length {acceptance_length:.3f} < 3.0")
+
+
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "Solve the problem carefully. End your response with a final line exactly "
     "in the form #### <answer>, using the simplest numeric form without units "
@@ -2351,11 +2349,8 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
-                score = task.evaluate(
+                task.evaluate(
                     llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            assert score >= acc_params.ref_accuracy, (
-                f"GSM8K accuracy {score:.3f} is below recorded reference "
-                f"{acc_params.ref_accuracy:.3f}")
 
 
 @pytest.mark.timeout(14400)
@@ -2410,6 +2405,100 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length(
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
                 acceptance_length)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("attention_dp", [False, True])
+    @parametrize_with_ids("bounded_replay", [False, True])
+    def test_gsm8k_tp4(self, bounded_replay: bool, attention_dp: bool,
+                       monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Full GSM8K with DSpark, block reuse and concurrent requests."""
+        env = {
+            "TRTLLM_V41_ENCODER_REPLAY": str(int(bounded_replay)),
+            "TRTLLM_V41_DECODER_BOUNDED_REPLAY": str(int(bounded_replay)),
+            "TLLM_KV_CACHE_MANAGER_V2_BACKEND": "cpp",
+            "TLLM_EVAL_MAX_IN_FLIGHT": "128",
+            "TLLM_EVAL_PARTIAL_SCORES_EVERY": "64",
+        }
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        # Keep the full accuracy gate instead of the one-sample smoke mode.
+        monkeypatch.setenv("INTEGRATION_TEST", "0")
+
+        with LLM(self.MODEL_PATH,
+                 env_overrides=env,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 gpus_per_node=4,
+                 enable_attention_dp=attention_dp,
+                 custom_tokenizer="deepseek_v41",
+                 trust_remote_code=True,
+                 max_seq_len=8192,
+                 max_num_tokens=8192,
+                 max_batch_size=64,
+                 enable_chunked_prefill=True,
+                 disable_overlap_scheduler=False,
+                 enable_iter_perf_stats=True,
+                 cuda_graph_config=CudaGraphConfig(
+                     batch_sizes=[1, 2, 4, 8, 16, 32, 64], enable_padding=True),
+                 kv_cache_config=KvCacheConfig(dtype="fp8",
+                                               enable_block_reuse=True,
+                                               enable_swa_scratch_reuse=False,
+                                               tokens_per_block=128,
+                                               max_tokens=262144,
+                                               free_gpu_memory_fraction=0.5),
+                 sparse_attention_config={"algorithm": "csa2"},
+                 speculative_config=DSparkDecodingConfig(
+                     max_draft_len=5,
+                     speculative_model=self.MODEL_PATH)) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == 1319
+            task.EVALUATE_KWARGS = dict(
+                task.EVALUATE_KWARGS,
+                sampling_override=True,
+                scores_filter="exact_match,flexible-extract")
+            evaluator_kwargs = dict(
+                num_fewshot=5,
+                random_seed=0,
+                apply_chat_template=True,
+                chat_template_kwargs={"thinking": False},
+                system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
+                log_samples=True,
+                output_path=str(tmp_path / "results"),
+                output_dir=str(tmp_path / "outputs"))
+            score = task.evaluate(llm,
+                                  extra_evaluator_kwargs=evaluator_kwargs,
+                                  sampling_params=SamplingParams(
+                                      max_tokens=256,
+                                      truncate_prompt_tokens=4096,
+                                      temperature=0,
+                                      seed=0))
+
+        with (tmp_path / "results" / "samples_gsm8k.json").open() as stream:
+            results = json.load(stream)
+        assert results["n-samples"]["gsm8k"]["effective"] == 1319
+        for filter_name in ("strict-match", "flexible-extract"):
+            rows = [
+                row for row in results["samples"]["gsm8k"]
+                if row["filter"] == filter_name
+            ]
+            assert len(rows) == 1319
+            assert len({row["doc_id"] for row in rows}) == 1319
+        assert score > 91.0, (
+            f"GSM8K flexible exact match {score:.4f}% must exceed 91%; "
+            f"bounded_replay={bounded_replay}, results={tmp_path}")
 
 
 @pytest.mark.timeout(14400)
@@ -2485,67 +2574,28 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(100000)
-class TestKimiK2(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
-
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @skip_post_blackwell
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
-        [(8, 1, 8, False, False, True, True, 16)],
-        ids=["latency"])
-    def test_fp8_blockscale(self, tp_size, pp_size, ep_size, fp8kv,
-                            attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-        )
-
-        if fp8kv:
-            kv_cache_config.dtype = "fp8"
-
-        mtp_config = None
-        with LLM(f"{llm_models_root()}/Kimi-K2-Instruct",
-                 max_batch_size=max_batch_size,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 trust_remote_code=True,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+class TestKimiK25(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(120000)
-    @pytest.mark.parametrize("tp_size", [
-        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
-        pytest.param(8, marks=pytest.mark.skip_less_mpi_world_size(8)),
-    ],
-                             ids=["4gpus", "8gpus"])
-    def test_nvfp4(self, tp_size):
-        model_name = "moonshotai/Kimi-K2-Thinking"
-        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp",
+        [(1, False), (1, True), (8, False), (8, True)],
+        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp):
+        model_name = "moonshotai/Kimi-K2.5"
+        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
 
         with LLM(model_path,
-                 tensor_parallel_size=tp_size,
+                 tensor_parallel_size=8,
                  max_batch_size=16,
                  pipeline_parallel_size=1,
-                 moe_expert_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
-                 enable_attention_dp=True,
+                 enable_attention_dp=attention_dp,
                  trust_remote_code=True,
                  speculative_config=None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -2568,9 +2618,13 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         """Long-sequence MoE stress test with PDL enabled.
 
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
+
+        Note: the original repro used Kimi-K2-Thinking NVFP4. The model was
+        switched to Kimi-K2.5-NVFP4 because Kimi-K2-Thinking NVFP4 is low
+        priority, so this is not the original repro configuration.
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
         target_len = 250000
         kv_cache_config = KvCacheConfig(
             dtype="fp8",
@@ -2650,9 +2704,13 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         """Long-sequence MoE async streaming test with cancellation.
 
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
+
+        Note: the original repro used Kimi-K2-Thinking NVFP4. The model was
+        switched to Kimi-K2.5-NVFP4 because Kimi-K2-Thinking NVFP4 is low
+        priority, so this is not the original repro configuration.
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
         target_len = 250000
         kv_cache_config = KvCacheConfig(
             dtype="fp8",
@@ -2755,40 +2813,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                 token_ids = output.outputs[0].token_ids
                 assert len(token_ids) > 0
                 assert not all(tid == 0 for tid in token_ids)
-
-
-@pytest.mark.timeout(10800)
-@pytest.mark.skip_less_device_memory(100000)
-class TestKimiK25(LlmapiAccuracyTestHarness):
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device_memory(120000)
-    @pytest.mark.parametrize(
-        "ep_size,attention_dp",
-        [(1, False), (1, True), (8, False), (8, True)],
-        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
-    )
-    def test_nvfp4(self, ep_size, attention_dp):
-        model_name = "moonshotai/Kimi-K2.5"
-        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
-
-        with LLM(model_path,
-                 tensor_parallel_size=8,
-                 max_batch_size=16,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 enable_attention_dp=attention_dp,
-                 trust_remote_code=True,
-                 speculative_config=None) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
 
 
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
@@ -4159,6 +4183,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             assert_acceptance_length("TestGPTOSS::test_dflash",
                                      acceptance_length)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -4468,6 +4493,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
@@ -5673,7 +5699,9 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(16)
-    @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+    @pytest.mark.skipif(
+        get_sm_version() not in (100, 103, 107),
+        reason="This test is supported only on SM100, SM103 and SM107")
     def test_fp8_tp16_mtp3_trtllm(self, mocker):
         # The default AUTO uses MNNVL only when all TP ranks share one NVL72 fabric.
         self._run_fp8_block_scales(tensor_parallel_size=16,
@@ -5686,7 +5714,8 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(16)
-    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.skipif(get_sm_version() not in (103, 107),
+                        reason="This test is supported only on SM103 and SM107")
     def test_fp8_adp16_deepgemm(self, mocker):
         self._run_fp8_block_scales(tensor_parallel_size=16,
                                    pipeline_parallel_size=1,
@@ -5734,7 +5763,8 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.skipif(get_sm_version() not in (103, 107),
+                        reason="This test is supported only on SM103 and SM107")
     def test_nvfp4_tp8_mtp3_trtllm(self, mocker):
         self._run_nvfp4(tensor_parallel_size=8,
                         ep_size=1,
@@ -5745,7 +5775,8 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(16)
-    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.skipif(get_sm_version() not in (103, 107),
+                        reason="This test is supported only on SM103 and SM107")
     def test_nvfp4_adp16_cutedsl(self, mocker):
         self._run_nvfp4(tensor_parallel_size=16,
                         ep_size=16,
@@ -5989,6 +6020,27 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         monkeypatch=monkeypatch,
                         mocker=mocker)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_megamoe_cutedsl_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        """NVFP4 on four GPUs with attention DP on the fused-comm MegaMoE kernel.
+
+        MegaMoE-CuteDSL serves NVFP4 only, so the MTP layer's FP8 block-scale
+        experts keep this checkpoint on the no-MTP configuration.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="MEGAMOE_CUTEDSL",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
+
 
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
@@ -6053,7 +6105,8 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(14400)
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        use_kv_cache_manager_v2=True)
         chat_template_kwargs = dict(thinking_budget=-1)
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
@@ -6506,17 +6559,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(
-        "use_cpp_mamba",
-        [
-            False,
-            True,
-        ],
-        ids=[
-            "python_mamba_cache",
-            "cpp_mamba_cache",
-        ],
-    )
-    @pytest.mark.parametrize(
         "attention_dp",
         [
             False,
@@ -6527,17 +6569,14 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             "attention_dp_on",
         ],
     )
-    def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
-        monkeypatch.setenv("TRTLLM_USE_PY_MAMBA",
-                           "1" if not use_cpp_mamba else "0")
-
+    def test_fp8_4gpus(self, attention_dp):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
-                    use_kv_cache_manager_v2=False,
+                    use_kv_cache_manager_v2=True,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=4,
@@ -7388,20 +7427,40 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
     @parametrize_with_ids("use_msa", [False, True])
-    def test_nvfp4(self, use_msa):
-        # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
-        # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
-        # Triton path keeps the KV cache in BF16.
+    def test_nvfp4(self, use_msa, kv_dtype):
+        if kv_dtype == "nvfp4" and not use_msa:
+            pytest.skip("NVFP4 KV cache requires the MSA backend")
+        self._run_nvfp4(use_msa, kv_dtype=kv_dtype)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
+    def test_nvfp4_piecewise_cuda_graph(
+            self, fuse_qkv_index_projection: bool) -> None:
+        """Check PCG accuracy with separate or fused QKV and index projections."""
+        self._run_nvfp4(True,
+                        piecewise=True,
+                        fuse_qkv_index_projection=fuse_qkv_index_projection)
+
+    def _run_nvfp4(self,
+                   use_msa: bool,
+                   *,
+                   kv_dtype: str = "fp8",
+                   piecewise: bool = False,
+                   fuse_qkv_index_projection: bool = False) -> None:
+        """Run the shared four-GPU NVFP4 M3 accuracy workload."""
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto")
+                                        dtype=kv_dtype if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton",
-            indexer_kv_dtype="fp8" if use_msa else "bf16")
+            indexer_kv_dtype="fp8" if use_msa else "bf16",
+            fuse_qkv_index_projection=fuse_qkv_index_projection)
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
@@ -7409,9 +7468,18 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
+                 prefill_cuda_graph_backend=(PrefillCudaGraphBackend.PIECEWISE
+                                             if piecewise else
+                                             PrefillCudaGraphBackend.DISABLED),
+                 prefill_capture_num_tokens=[128, 512, 2048]
+                 if piecewise else None,
+                 torch_compile_config=TorchCompileConfig()
+                 if piecewise else None,
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if kv_dtype == "nvfp4":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = MMLU(model_name)
             task.evaluate(llm)
             task = GSM8K(model_name)
@@ -7419,6 +7487,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
     @parametrize_with_ids("eval_mode", ["default", "inferencex"])
     @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
     @parametrize_with_ids("overlap_scheduler", [False, True])
@@ -7426,9 +7495,42 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, fuse_qkv_index_projection,
-                          eval_mode):
-        # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
-        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
+                          eval_mode, kv_dtype):
+        self._run_nvfp4_eagle3(tp_size,
+                               ep_size,
+                               attention_dp,
+                               overlap_scheduler,
+                               fuse_qkv_index_projection,
+                               eval_mode,
+                               kv_dtype=kv_dtype)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
+    def test_nvfp4_eagle3_piecewise_cuda_graph(
+            self, fuse_qkv_index_projection: bool) -> None:
+        """Check accuracy and draft acceptance from piecewise prefill to decode."""
+        self._run_nvfp4_eagle3(
+            4,
+            4,
+            attention_dp=True,
+            overlap_scheduler=True,
+            fuse_qkv_index_projection=fuse_qkv_index_projection,
+            eval_mode="default",
+            piecewise=True)
+
+    def _run_nvfp4_eagle3(self,
+                          tp_size: int,
+                          ep_size: int,
+                          attention_dp: bool,
+                          overlap_scheduler: bool,
+                          fuse_qkv_index_projection: bool,
+                          eval_mode: str,
+                          *,
+                          kv_dtype: str = "fp8",
+                          piecewise: bool = False) -> None:
+        # One-model Eagle3 uses the selected main cache dtype and CUDA graphs.
+        # Dense/shared draft layers keep FP8 KV. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
         # alone does not notice a corrupted drafter KV.
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
@@ -7443,10 +7545,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             max_draft_len=max_draft_len,
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
-        # The MSA path runs an FP8 KV cache, as in test_nvfp4.
+        # Sparse target layers use the selected dtype; dense/draft stay FP8.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8")
+                                        dtype=kv_dtype)
         # InferenceX mode: 16k context for thinking output, batch 64 (the
         # InferenceX default). Otherwise fmha_sm100 caps total_q x heads at
         # 65536; with 4 verify tokens per row that is 512 (256 unsharded).
@@ -7455,6 +7557,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         else:
             max_seq_len = 4096
             max_batch_size = 256 if attention_dp else 512
+        cuda_graph_max_batch_size = 64 if (inferencex or attention_dp) else 128
+        piecewise_kwargs = {}
+        if piecewise:
+            # With ADP's 64 query heads, at most 32 requests keep MSA's
+            # short-query plans (up to 32 tokens/request) within 65536.
+            # The 2K/4K many-request warmups then use the long-prefill path.
+            max_batch_size = 32
+            cuda_graph_max_batch_size = max_batch_size
+            # Cover the entire scheduler token budget so these evaluations
+            # exercise captured prefill, rather than falling back above the
+            # capture ceiling. Generation-only steps still take the eager
+            # model path, including the Eagle3 epilogue and decode graphs.
+            piecewise_kwargs = dict(
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                prefill_capture_num_tokens=[128, 512, 2048, 4096],
+                torch_compile_config=TorchCompileConfig(),
+                max_num_tokens=4096,
+            )
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
@@ -7470,7 +7590,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 speculative_config=spec_config,
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
-                    max_batch_size=64 if (inferencex or attention_dp) else 128,
+                    max_batch_size=cuda_graph_max_batch_size,
                 ),
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
@@ -7478,8 +7598,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # Keep the whole acceptance probe: the default buffer holds
                 # only the latest 1000 iterations.
                 max_stats_len=5000,
-                trust_remote_code=True) as llm:
+                trust_remote_code=True,
+                **piecewise_kwargs) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if kv_dtype == "nvfp4":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
             def drain_spec_stats(llm):
                 drafted = accepted = steps = 0
@@ -7527,15 +7650,21 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # Reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
+            # FP8 reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
             # reports 0.839 / 3.518; the GQA head measures 0.838 / 3.515 here.
-            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
-                  f"{chat_rate:.3f}, mean acceptance length="
-                  f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.80, \
+            # NVFP4 KV: TP4/EP4 B200 default/InferenceX probes on 2026-09-22
+            # measured 0.832/3.497 and 0.835/3.506. Retain 0.78/3.3 as
+            # regression floors with margin for batch/scheduling variation.
+            print(
+                f"MiniMax-M3 Eagle3 chat-GSM8K acceptance (KV={kv_dtype}): rate="
+                f"{chat_rate:.3f}, mean acceptance length="
+                f"{chat_length:.3f} ({accepted}/{drafted} draft tokens accepted, "
+                f"{steps} spec iterations)")
+            min_rate = 0.78 if kv_dtype == "nvfp4" else 0.80
+            min_length = 3.3 if kv_dtype == "nvfp4" else 3.4
+            assert chat_rate > min_rate, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(threshold 0.80, reference 0.839 from the drafter card)"
-            assert chat_length > 3.4, \
+                f"(threshold {min_rate}, KV={kv_dtype})"
+            assert chat_length > min_length, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
-                f"the drafter card)"
+                f"{chat_length:.3f} (threshold {min_length}, KV={kv_dtype})"

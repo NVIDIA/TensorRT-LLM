@@ -84,6 +84,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
         xml_dir = os.path.dirname(periodic_junit_xmlpath)
         if xml_dir:
             os.makedirs(xml_dir, exist_ok=True)
@@ -96,8 +98,8 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            dump_hang_traceback=periodic_hang_traceback,
         )
-        reporter.pytest_configure(config)
         config.pluginmanager.register(reporter, 'periodic_junit')
         print_info("PeriodicJUnitXML reporter registered (unittest)")
         print_info(f"  XML path: {periodic_junit_xmlpath}")
@@ -211,6 +213,14 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt shortly before a test timeout. "
+        "Only used with --periodic-junit.",
     )
     # S3 upload options — must be registered here so they are recognized when
     # pytest is run with unittest paths (integration test_unittests.py spawns such a run).

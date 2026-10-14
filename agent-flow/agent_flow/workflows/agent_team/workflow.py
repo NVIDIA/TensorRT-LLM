@@ -10,7 +10,6 @@ from agent_flow import (
     AgentLayerConfig,
     BackendConfig,
     SessionConfig,
-    require_tool_call_stop_hook,
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
@@ -49,22 +48,6 @@ _PLAN_STAGES = (STAGE_PLAN_DRAFTER, STAGE_PLAN_REVIEWER, STAGE_PLAN_HUMAN)
 _REPLAN_STAGES = (STAGE_REPLAN, STAGE_REPLAN_REVIEWER, STAGE_REPLAN_HUMAN)
 
 
-def _compose_required_tools_hooks(required_tools: list[str]) -> dict | None:
-    """Compose stop hooks that require *every* listed tool to be called.
-
-    ``require_tool_call_stop_hook`` enforces "at least one of the listed
-    names was called". Stacking one such hook per tool — each independent —
-    yields AND semantics: every per-tool hook must allow the stop, so all
-    listed tools must have been called this turn.
-    """
-    if not required_tools:
-        return None
-    merged: dict[str, list] = {"Stop": []}
-    for name in required_tools:
-        merged["Stop"].extend(require_tool_call_stop_hook([name])["Stop"])
-    return merged
-
-
 def _make_agent(
     name: str,
     system_prompt: str,
@@ -75,13 +58,13 @@ def _make_agent(
     session_mode: str = "persistent",
     human_input_enabled: bool = False,
 ) -> AgentLayer:
-    hooks = _compose_required_tools_hooks(required_tools or [])
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
-            backend=BackendConfig(kind=backend_kind, model=model, tools=tools, hooks=hooks),
+            backend=BackendConfig(kind=backend_kind, model=model, tools=tools),
             session=SessionConfig(mode=session_mode),
+            required_tools=tuple(required_tools or ()),
             human_input_enabled=human_input_enabled,
         )
     )
@@ -341,7 +324,7 @@ class AgentTeamWorkflow:
         """Construct a role agent, honoring the in-process-tools mode.
 
         In no-in-process-MCP mode every role runs with ``tools=None``, no
-        required-tool Stop hooks, and no ``ask_human`` — so neither backend
+        required-tool policy, and no ``ask_human`` — so neither backend
         registers a dynamically configured MCP server. In MCP mode this is a
         passthrough to ``_make_agent``.
         """

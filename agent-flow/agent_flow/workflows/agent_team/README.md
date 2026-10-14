@@ -166,8 +166,9 @@ reads directly to drive control flow:
 - `append_qa_progress` (decisions: `APPROVE` / `REJECT`, plus `weighted_score`)
 
 The Coder and Reviewer additionally have `update_status` and
-`read_status` tools. `update_status` is a required-tool call so the stop
-hook enforces that `status.md` is refreshed alongside `progress.yaml`.
+`read_status` tools. Both backends require the progress and `update_status`
+calls. Missing calls get one corrective turn on the same session; a second
+omission fails the invocation instead of silently continuing with stale state.
 
 The Coder, Reviewer, and QA each have a `read_human_feedback` tool that
 returns the entries in `progress.yaml`'s `human_feedback` list. QA is
@@ -201,7 +202,7 @@ regardless of backend — the claude-code roles and the codex-backed
 PlanDrafter / Reviewer alike — so no dynamically configured server is
 ever created.
 
-Each role then runs with `tools=None`, no required-tool stop hooks, and
+Each role then runs with `tools=None`, no required-tool policy, and
 no `ask_human`; only the backend's own built-in tools remain (reading,
 editing, and running commands are not MCP servers, so they are
 unaffected).

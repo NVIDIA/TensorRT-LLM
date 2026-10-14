@@ -18,10 +18,8 @@
 file(GLOB_RECURSE SRC_CU *.cu)
 add_library(mamba2_mtp_ssm_cache_src OBJECT ${SRC_CU})
 
-target_compile_options(
-  mamba2_mtp_ssm_cache_src
-  PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -std=c++17>
-          $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
+target_compile_options(mamba2_mtp_ssm_cache_src
+                       PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 
 set_property(TARGET mamba2_mtp_ssm_cache_src PROPERTY POSITION_INDEPENDENT_CODE
                                                       ON)

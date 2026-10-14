@@ -27,7 +27,7 @@ def _cleanup_mpi_env():
 
 
 def _init_dist(rank, world_size, port):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)

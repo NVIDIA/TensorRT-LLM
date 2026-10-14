@@ -144,6 +144,43 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
     this->runTest(param);
 };
 
+// The warp kernel runs for numTokens < 4. With a non-zero localExpertsStartIdx, the batch index it
+// writes is only correct if it is mapped into this rank's expert window, and the CTA and padded
+// token counts it reports are only correct if tokens routed to remote experts are excluded from
+// them. The host reference gates both, so an ungated kernel disagrees on "cta idx -> batch idx",
+// "#non exiting CTAs" and "permuted idx size". Scores are drawn from a time-based seed, so which of
+// those three mismatches first depends on the run.
+TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationWithExpertParallelization)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withExpertParallelization(2, 1)
+                     .withTileTokensDim(8)
+                     .withRequiredComputeCapability(8)
+                     .build();
+    this->runTest(param);
+};
+
+// Same path, but with fewer local experts than tokens. This is the regime where a capacity bound
+// taken over the global expert count and one taken over the local count diverge, so it is the shape
+// that decides whether buffers sized from local_num_experts are large enough.
+TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationNarrowLocalExpertWindow)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withExpertParallelization(64, 1)
+                     .withTileTokensDim(8)
+                     .withRequiredComputeCapability(8)
+                     .build();
+    this->runTest(param);
+};
+
 TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 {
     auto param = RoutingKernelTestParam()

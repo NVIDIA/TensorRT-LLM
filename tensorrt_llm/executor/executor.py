@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import faulthandler
 import json
@@ -145,7 +148,8 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
+            prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()
@@ -244,10 +248,10 @@ class GenerationExecutor(ABC):
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
                 # drop logits if users didn't explicitly ask for it, or if it's using PostProcess flow
                 drop_context_logits=(
-                    not request.sampling_params._need_return_context_logits)
+                    not request.sampling_params.return_context_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
-                    not request.sampling_params._need_return_generation_logits)
+                    not request.sampling_params.return_generation_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
                 logprobs_simple_format=request.sampling_params.
                 logprobs_simple_format,
@@ -434,6 +438,14 @@ class GenerationExecutor(ABC):
         Returns:
             dict: Primary/GPU KV cache capacity.
         """
+        return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Get startup OpenEngine node and KV publisher discovery metadata."""
+        return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a non-destructive primary/GPU KV cache load snapshot."""
         return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:

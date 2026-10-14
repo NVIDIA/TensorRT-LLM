@@ -49,7 +49,8 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    bucket_responses_by_frontend, frontend_lane_index,
+                    bucket_responses_by_frontend,
+                    context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
 if TYPE_CHECKING:
@@ -134,7 +135,7 @@ class BaseWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
-        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = self._backend == "pytorch"
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         self._resource_governor_queue = None
 
@@ -178,15 +179,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self._backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import \
-                    LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-                assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args
-                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
@@ -201,7 +193,6 @@ class BaseWorker(GenerationExecutor):
                     _construct_checkpoint_loader
                 partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
@@ -251,6 +242,38 @@ class BaseWorker(GenerationExecutor):
             return self.engine.get_kv_cache_capacity()
 
         return {}
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Read KV capacity directly when this worker serves as the executor."""
+        return self.fetch_kv_cache_capacity()
+
+    def fetch_openengine_discovery(self) -> dict:
+        if self.engine is None:
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_openengine_discovery()
+
+        return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Read OpenEngine discovery directly when this worker serves as the executor."""
+        return self.fetch_openengine_discovery()
+
+    def fetch_kv_cache_load(self) -> dict:
+        if self.engine is None:
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_load()
+
+        return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Read KV load directly when this worker serves as the executor."""
+        return self.fetch_kv_cache_load()
 
     def fetch_kv_cache_events(self) -> list:
         return self.engine.get_latest_kv_cache_events()
@@ -461,11 +484,15 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
-                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                # Reject (never truncate): the prompt leaves no room for even
+                # one generated token. The message reports request-level
+                # totals, not per-CP-rank arithmetic: splited_prompt_len >=
+                # max_seq_len implies len(prompt_token_ids) >= max_seq_len *
+                # cp_size.
                 raise ValueError(
-                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
-                    f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
-                    f" - `splited_prompt_len` ({splited_prompt_len})")
+                    context_length_exceeded_message(
+                        max_context_length=max_seq_len * cp_size,
+                        num_prompt_tokens=len(prompt_token_ids)))
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -504,8 +531,6 @@ class BaseWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
-                multimodal_embedding=None,
                 mrope_config=None,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
@@ -520,6 +545,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
+            executor_request.py_return_routed_experts = (
+                request.sampling_params.return_routed_experts)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
@@ -605,10 +632,6 @@ class BaseWorker(GenerationExecutor):
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
         """
-        # _autodeploy is intentionally excluded: its allocations are not tagged
-        # under sleep_config VMM scopes, so release_with_tag would silently
-        # no-op instead of actually freeing GPU memory.  Use _backend directly
-        # rather than _is_pytorch_backend, which also covers _autodeploy.
         if self._backend != "pytorch":
             raise ValueError(
                 f"{method}() is only available for the PyTorch (TorchLLM) "
@@ -617,6 +640,18 @@ class BaseWorker(GenerationExecutor):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
+
+    def _validate_sleep_tags(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_sleep_tags", None)
+        if validator is not None:
+            validator(tags)
+
+    def _invalidate_v1_prefix_cache_for_sleep(
+            self, tags: list[ExecutorMemoryType]) -> None:
+        invalidator = getattr(self.engine,
+                              "invalidate_v1_prefix_cache_for_sleep", None)
+        if invalidator is not None:
+            invalidator(tags)
 
     def _multi_rank_sleep_wakeup(
         self,
@@ -845,6 +880,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
+                        self._invalidate_v1_prefix_cache_for_sleep(tags)
                         release_with_tag(*tags)
                         torch.cuda.synchronize()
                         gc.collect()
@@ -907,6 +943,55 @@ class BaseWorker(GenerationExecutor):
         finally:
             propagate_hard_kill()
 
+    def get_memory_status(self) -> dict[str, object]:
+        """Return the authoritative runtime-memory state for this worker."""
+        self._check_sleep_wakeup_preconditions("get_memory_status")
+        return self.engine.get_memory_status()
+
+    def _prepare_sleep_tags(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        get_status = getattr(self.engine, "get_memory_status", None)
+        if get_status is None:
+            return tags
+
+        status = get_status()
+        state = status["state"]
+        parked_tags = {ExecutorMemoryType(tag) for tag in status["parked_tags"]}
+        requested_tags = set(tags)
+        if state == "running":
+            return tags
+        if state == "parked":
+            if requested_tags.issubset(parked_tags):
+                return []
+            additional_tags = requested_tags - parked_tags
+            raise RuntimeError(
+                "Runtime memory is already parked; resume it before releasing "
+                f"additional tags: {sorted(tag.value for tag in additional_tags)}"
+            )
+        raise RuntimeError(
+            f"Cannot release runtime memory while state is '{state}'.")
+
+    def _prepare_wakeup_tags(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        get_status = getattr(self.engine, "get_memory_status", None)
+        if get_status is None:
+            return tags
+
+        status = get_status()
+        state = status["state"]
+        if state == "running":
+            return []
+        if state != "parked":
+            raise RuntimeError(
+                f"Cannot resume runtime memory while state is '{state}'.")
+
+        parked_tags = {ExecutorMemoryType(tag) for tag in status["parked_tags"]}
+        return [tag for tag in tags if tag in parked_tags]
+
     def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
@@ -945,6 +1030,10 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.virtual_memory import release_with_tag
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        tags = self._prepare_sleep_tags(tags)
+        if not tags:
+            return
+        self._validate_sleep_tags(tags)
         logger.info(f"Sleep: {tags}")
         self.engine.begin_sleep_transition(tags)
         local_mutation_started = False
@@ -956,6 +1045,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
+                    self._invalidate_v1_prefix_cache_for_sleep(tags)
                     release_with_tag(*tags)
                     torch.cuda.synchronize()
                     gc.collect()
@@ -999,6 +1089,9 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.virtual_memory import materialize_with_tag
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        tags = self._prepare_wakeup_tags(tags)
+        if not tags:
+            return
         logger.info(f"Wakeup: {tags}")
         self.engine.begin_wakeup_transition(tags)
         local_mutation_started = False
@@ -1059,6 +1152,19 @@ class BaseWorker(GenerationExecutor):
             return {}
 
         startup_metrics = {}
+        executor_metrics = dict(getattr(self.engine, "metrics", {}))
+        for model_engine_stage in (
+                "initial_model_engine",
+                "final_model_engine",
+                "initial_draft_model_engine",
+                "final_draft_model_engine",
+        ):
+            model_engine_metrics = executor_metrics.pop(model_engine_stage,
+                                                        None)
+            if model_engine_metrics is not None:
+                startup_metrics[model_engine_stage] = dict(model_engine_metrics)
+        startup_metrics["py_executor"] = executor_metrics
+
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:
@@ -1180,6 +1286,10 @@ class BaseWorker(GenerationExecutor):
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:
         return json.dumps(capacity)
+
+    @staticmethod
+    def _kv_cache_load_serializer(load) -> str:
+        return json.dumps(load)
 
     # Define a Callable to serialize KV cache events
     @staticmethod

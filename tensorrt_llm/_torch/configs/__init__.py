@@ -15,6 +15,11 @@
 
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
+from tensorrt_llm._torch.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4AssistantConfig,
@@ -23,6 +28,12 @@ from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4UnifiedTextConfig,
     Gemma4UnifiedVisionConfig,
 )
+from tensorrt_llm._torch.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
+from tensorrt_llm._torch.configs.k3_dspark import K3DsparkConfig
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
@@ -60,6 +71,17 @@ def _register_custom_configs_with_transformers() -> None:
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
+        # DeepSeek-V4.1 composite multimodal config ("deepseek_v41") plus its two
+        # sub-configs. V4.1 is NOT config-compatible with V4 (the compress_ratios
+        # encoding changed kind, the FP8 block moved to 32x32, the router grew a
+        # second bias, and Engram is reparameterized), so it gets its own family
+        # rather than an alias onto "deepseek_v4".
+        "deepseek_v41": DeepseekV41Config,
+        "deepseek_v41_text": DeepseekV41TextConfig,
+        "deepseek_v41_vision": DeepseekV41VisionConfig,
+        "glm5_next": Glm5NextConfig,
+        "glm5_next_text": Glm5NextTextConfig,
+        "glm5_next_vision": Glm5NextVisionConfig,
         "gemma4_assistant": Gemma4AssistantConfig,
         # Kimi K3 composite multimodal config ("kimi_k3") and its text config
         # ("kimi_linear"). pyexecutor.config_utils.load_pretrained_config keeps
@@ -67,6 +89,9 @@ def _register_custom_configs_with_transformers() -> None:
         # sub-configs and multimodal is not disabled, and otherwise flattens to
         # the text config. Registering both here lets AutoConfig / AutoTokenizer
         # resolve them without trust_remote_code.
+        # The MLA DSpark drafter checkpoint ships no auto_map, so AutoConfig
+        # cannot resolve its model_type on its own.
+        "k3_dspark": K3DsparkConfig,
         "kimi_k3": KimiK3Config,
         "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
@@ -98,12 +123,19 @@ del _register_custom_configs_with_transformers
 __all__ = [
     "Cosmos3Config",
     "DeepseekV3Config",
+    "DeepseekV41Config",
+    "DeepseekV41TextConfig",
+    "DeepseekV41VisionConfig",
     "DeepseekV4Config",
+    "Glm5NextConfig",
+    "Glm5NextTextConfig",
+    "Glm5NextVisionConfig",
     "Gemma4AssistantConfig",
     "Gemma4UnifiedAudioConfig",
     "Gemma4UnifiedConfig",
     "Gemma4UnifiedTextConfig",
     "Gemma4UnifiedVisionConfig",
+    "K3DsparkConfig",
     "KimiK3Config",
     "KimiK3VisionConfig",
     "KimiLinearConfig",

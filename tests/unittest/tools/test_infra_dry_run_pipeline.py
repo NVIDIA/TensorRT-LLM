@@ -139,6 +139,40 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             upload_results.index('sh "tar -czvf results-${stageName}${postTag}.tar.gz'),
         )
 
+    def test_sbatch_final_failure_is_classified_without_scanning_the_whole_step_log(
+        self,
+    ) -> None:
+        sbatch = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "cbtsResizeSplits")
+
+        marker_query = '[[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]'
+        self.assertIn(marker_query, sbatch)
+        self.assertIn("FailureClassifier.classify(finalFailure, InfraFailure.SLURM)", sbatch)
+        self.assertNotIn(
+            "classifyFailure(pipeline, submitEx, InfraFailure.SLURM, retryContext)", sbatch
+        )
+
+    def test_cbts_parser_preserves_coverage_preflight_fields(self) -> None:
+        parser = _function_body(
+            L0_PARENT, "_cbtsParseSelectionResult", "getOssComplianceFileChanged"
+        )
+
+        self.assertIn(
+            "coverage_residual_files: data.coverage_residual_files ?: []",
+            parser,
+        )
+        self.assertIn(
+            'coverage_decline_reason: data.coverage_decline_reason ?: ""',
+            parser,
+        )
+
+    def test_cbts_pin_policy_is_owned_by_python(self) -> None:
+        audit = _function_body(L0_PARENT, "_cbtsCoverageAudit", "_cbtsPrNumber")
+
+        self.assertIn("--resolve-pin cbts_db_pin.json", audit)
+        self.assertIn("pinPlan.pin_upload_required", audit)
+        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertNotIn("curl --noproxy", audit)
+
 
 if __name__ == "__main__":
     unittest.main()

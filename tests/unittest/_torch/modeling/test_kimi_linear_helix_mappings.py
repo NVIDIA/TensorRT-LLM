@@ -84,12 +84,16 @@ def test_setup_helix_mappings_precondition_validation():
         with pytest.raises(ValueError, match="enable_attention_dp"):
             setup(obj, model_config, cfg, None)
 
-    # spec_config not None raises
+    # a non-DSpark spec_config raises: helix now supports DSpark, so the
+    # rejection is mode-specific rather than "any spec_config".
     mapping = _make_helix_mapping(tp_size=4, cp_size=2, enable_attention_dp=False)
     model_config = _make_model_config(mapping)
     cfg = _make_cfg(num_attention_heads=96, kda_num_heads=96)
     obj = _FakeSelf()
-    spec_config = SimpleNamespace()
+    spec_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_dspark=lambda: False),
+        decoding_type="MTP",
+    )
     with patch.object(type(mapping), "has_cp_helix", return_value=True):
         with pytest.raises(ValueError, match="speculative"):
             setup(obj, model_config, cfg, spec_config)

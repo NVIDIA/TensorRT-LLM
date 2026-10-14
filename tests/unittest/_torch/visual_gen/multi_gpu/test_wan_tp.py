@@ -60,7 +60,7 @@ def _cleanup_mpi_env():
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
     """Initialize distributed environment for a worker process."""
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -519,6 +519,55 @@ def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
 # =============================================================================
 # Test classes
 # =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tp_rank", "expected_head_range"),
+    [(0, (0, 8)), (1, (8, 12))],
+)
+def test_wan_vsa_gates_follow_ulysses_aligned_tp_q_shard(
+    monkeypatch: pytest.MonkeyPatch, tp_rank: int, expected_head_range: tuple[int, int]
+) -> None:
+    """VSA gates must select the same TP-local heads as the Q projection."""
+    from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.visual_gen.args import VideoSparseAttentionConfig
+
+    monkeypatch.setattr(
+        attention_module,
+        "wrap_parallel_attention",
+        lambda attention, **_kwargs: attention,
+    )
+    mapping = Mapping(world_size=2, rank=tp_rank, tp_size=2)
+    monkeypatch.setattr(type(mapping), "tp_rank", property(lambda self: self.rank))
+    head_dim = 128
+    model_config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=12 * head_dim,
+            num_attention_heads=12,
+            attention_head_dim=head_dim,
+            ffn_dim=512,
+            eps=1e-6,
+            cross_attn_norm=True,
+        ),
+        mapping=mapping,
+        visual_gen_mapping=SimpleNamespace(ulysses_size=4, cp_size=1),
+        attention=AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.5),
+        ),
+        skip_create_weights_in_init=True,
+    )
+
+    block = WanBlock(model_config, _layer_idx=0)
+
+    expected_shard = tuple(index * head_dim for index in expected_head_range)
+    assert (block.attn1.local_q_dim_start, block.attn1.local_q_dim_end) == expected_shard
+    assert block.to_gate_compress.tp_sharding == expected_shard
+    assert block.to_gate_fine.tp_sharding == expected_shard
+    assert block.to_gate_compress.out_features == block.attn1.local_q_dim
+    assert block.to_gate_fine.out_features == block.attn1.local_q_dim
 
 
 class TestWanT2VTP:
