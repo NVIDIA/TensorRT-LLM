@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from transformers.activations import ACT2FN as HF_ACT2FN
 
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -211,7 +210,9 @@ class Cosmos3EdgeVisionBlock(nn.Module):
         self.self_attn = Cosmos3EdgeVisionAttention(model_config, layer_idx)
         self.mlp = Qwen3VLVisionMLP(model_config, layer_idx)
 
-    def forward(self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(
             hidden_states=self.layer_norm1(hidden_states),

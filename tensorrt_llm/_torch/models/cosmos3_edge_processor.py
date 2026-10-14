@@ -128,7 +128,11 @@ class Cosmos3EdgeImageProcessor(Siglip2ImageProcessor):
         spatial_shapes = []
         for idx, image in enumerate(images):
             image_kwargs = kwargs.copy()
-            if per_image_kwargs is not None and idx < len(per_image_kwargs) and per_image_kwargs[idx]:
+            if (
+                per_image_kwargs is not None
+                and idx < len(per_image_kwargs)
+                and per_image_kwargs[idx]
+            ):
                 image_kwargs.update(per_image_kwargs[idx])
             if do_resize:
                 image = self._resize_image(

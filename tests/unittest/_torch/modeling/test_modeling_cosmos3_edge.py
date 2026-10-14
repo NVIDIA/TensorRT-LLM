@@ -24,6 +24,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionPatchMerger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+
 def cosmos3_edge_checkpoint() -> str:
     """Resolve the Edge checkpoint under LLM_MODELS_ROOT.
 
@@ -73,7 +74,9 @@ def test_edge_mapper_drops_generator_weights_and_renames_reasoner_keys():
     assert "model.visual.encoder.layers.0.self_attn.o_proj.weight" in mapped
     assert "model.visual.encoder.layers.0.mlp.up_proj.weight" in mapped
     assert "model.visual.encoder.layers.0.mlp.down_proj.weight" in mapped
-    assert mapped["model.projector.linear_fc1.weight"] is weights["model.projector.linear_fc1.weight"]
+    assert (
+        mapped["model.projector.linear_fc1.weight"] is weights["model.projector.linear_fc1.weight"]
+    )
     dropped = [
         "layers.0.self_attn.k_norm_und_for_gen.weight",
         "layers.0.self_attn.add_q_proj.weight",
