@@ -255,18 +255,18 @@ The NVFP4 format alone brings a large reduction: a cold page costs 0.5625 bytes 
   <img src="../media/tech_blog29_page_sizes.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 10: Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
+<p align="center"><sub><em>Figure 10: Measured size, in MiB, of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. A page holds 64 tokens for Qwen3.5-397B-A17B and GLM-5.2 and 32 tokens for Qwen3-8B. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
 
 A smaller cold page means **more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate** when the working set does not fit. To show what that buys in practice, we take a large model on a complex agentic workload, GLM-5.2 serving AgentX traces across many GPU counts and concurrencies, and compare the serving Pareto frontier with and without NVFP4 cold pages; we then look at where the gain comes from.
 
-Put together, compression and the cold-page mechanism **move the serving frontier for agentic workloads**. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 and shows, for each, the same configuration with an uncompressed host cache. The gain is largest where the uncompressed tier misses most, **up to 84% more throughput per GPU and 4x the P90 interactivity**, and fades to nothing where it already reads most prefixes; averaged over the ten points it is **+21% throughput and +92% interactivity**.
+Put together, compression and the cold-page mechanism **move the serving frontier for agentic workloads**. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 cold pages and shows, for each, the run of that serving point with an uncompressed FP8 host cache. The gain is largest where the FP8 tier misses most, **up to 84% more throughput per GPU and 4x the P90 interactivity**, and fades to nothing where it already reads most prefixes; averaged over the ten points it is **+21% throughput and +92% interactivity**.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_pareto_frontier.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · the ten highest-throughput NVFP4 points and the uncompressed run of each. Top: each green numbered point is an NVFP4 configuration, the hollow point is the same configuration with an uncompressed host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
+<p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · the ten highest-throughput NVFP4 points and the FP8 host-cache run of each. Top: each green numbered point is a serving point with NVFP4 cold pages, the hollow point is its run with an uncompressed FP8 host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
 
 The gain is not tied to one setup. Figure 12 details the four configurations with the largest gains, across two models (GLM-5.2 and Qwen3.5-397B-A17B), from 8 to 40 GPUs, and from concurrency 128 to 1536: in every one **both the hit rate and the TTFT improve**. The improvement comes from two sources, not one: the smaller cold page lets the tiers **hold more prefixes, so the hit rate rises**, and it also means **fewer bytes to move, so offloading and onboarding themselves get faster**.
 
@@ -275,7 +275,7 @@ The gain is not tied to one setup. Figure 12 details the four configurations wit
   <img src="../media/tech_blog29_pareto_pairs.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 12: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one configuration run with the uncompressed host cache and with the NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
+<p align="center"><sub><em>Figure 12: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one serving point run with an uncompressed FP8 host cache and with an NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
 
 #### Where the Gain Comes From
 
