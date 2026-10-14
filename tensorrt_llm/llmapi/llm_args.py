@@ -3469,14 +3469,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     layers as cross-attention context and drafts a whole block in a single
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
-    head) and predicts an acceptance-confidence per position to truncate the
-    proposed prefix.
+    head). A confidence head can score each draft position for verification
+    scheduling without truncating the proposed block. This configuration selects
+    native full-block drafting and does not expose confidence-scheduling or
+    calibration controls.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
     - Semi-parallel: one block backbone forward + cheap sequential head refine.
-    - Confidence head: truncates the proposed draft length (NOT the accept rule;
-      acceptance stays standard target verification, preserving greedy parity).
+    - Full-block proposals: confidence scoring does not change the draft tokens
+      or the standard target-verification acceptance rule.
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
@@ -3511,14 +3513,6 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "Type of the sequential refinement head used within a block. If None, "
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
-
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
