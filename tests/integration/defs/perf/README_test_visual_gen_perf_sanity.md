@@ -39,24 +39,46 @@ observe a separate generation-complete boundary. Server timings remain
 diagnostic outputs of a detailed benchmark, rather than the regression metric.
 
 New uploaded results carry `s_visual_gen_metric_contract=v2_client_latency` as
-source metadata, not as a match key. The CI history policy accepts this contract
-and the existing unversioned client results whose exact commits are recorded in
-`tests/test_common/visual_gen_client_timing_commits.json`. This offline snapshot
-was verified against each commit's `visual_gen_perf_utils.py` mapping; dates do
-not identify the timing contract for releases/backports. Unverified unversioned
-results are excluded until their source is verified and the snapshot extended.
+source metadata, not as a match key. The CI history policy accepts only records
+with this exact contract; missing and different contracts are excluded. It does
+not infer compatibility from dates or maintain a commit allowlist. Update the
+contract if the benchmark measurement window changes.
 
 The policy applies before selecting the latest main result, extracting threshold
 overrides, and computing the fallback baseline. It drops inherited `d_baseline_*`
 values, including those stored on client results, because CI may have computed
 them from mixed old/new history. Threshold overrides are preserved. Baselines
 are recomputed with the existing daily/rolling-percentile algorithm from
-compatible history and the new measurement. DB records and metric names are
-unchanged, and video cases reuse their already verified client history. With no
-compatible history (currently Flux), the existing pipeline bootstraps from the
-current measurement; a passing first run is not evidence of an established
+compatible history and the new measurement. The lookup does not mutate DB
+records, and metric names remain unchanged. With no compatible history, the
+existing pipeline bootstraps from the current measurement; a passing first run
+is not evidence of an established
 regression baseline. Collect repeated current-window results before treating
 the case as a stable gate.
+
+### Historical metadata backfill and rollout
+
+To preserve the existing client-window baseline, backfill verified historical
+client results before enabling this gate in production. This is a separate,
+reviewed database migration, not a task performed by CI:
+
+1. Export candidate VisualGen documents with their index, document ID, and
+   original source. Verify the actual producer mapping at each commit (including
+   release/backport branches); do not use the merge date as a timing cutoff.
+2. Review a dry-run list of exact document IDs and proposed metadata updates.
+   Only verified client-window records without a contract are eligible. Leave
+   server-window, unknown-source, and already-versioned records untouched.
+3. Add only `s_visual_gen_metric_contract=v2_client_latency`, conditionally on
+   the contract still being absent and the document still matching the reviewed
+   source. Preserve all metrics, baseline fields, timestamps, and result flags;
+   do not re-upload documents through the normal result-upload path.
+4. Read back the changed records and verify the compatible per-case history
+   counts before enabling the gate. Retain the export and migration audit for
+   rollback of only the added metadata.
+
+Without this migration, untagged historical results remain stored and available
+for reference, but CI will bootstrap new baselines even for video cases. Flux
+also needs repeated new client-window samples if no compatible history exists.
 
 ## Match Keys
 
