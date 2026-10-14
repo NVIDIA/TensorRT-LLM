@@ -1033,6 +1033,8 @@ public:
                         "Expecting spec_decoding_bl_tree_mask_offset in trtllm-gen spec-dec mode.");
                     TORCH_CHECK(spec_decoding_bl_tree_mask.has_value(),
                         "Expecting spec_decoding_bl_tree_mask in trtllm-gen spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_bl_tree_mask->is_contiguous() && spec_decoding_bl_tree_mask->numel() > 0,
+                        "spec_decoding_bl_tree_mask must be a non-empty contiguous tensor.");
                     TORCH_CHECK(spec_bl_tree_first_sparse_mask_offset_kv.has_value(),
                         "Expecting spec_bl_tree_first_sparse_mask_offset_kv in trtllm-gen spec-dec mode.");
                     enqueue_params.spec_decoding_bl_tree_mask_offset

@@ -467,3 +467,26 @@ TEST_F(PrepareCustomMaskTest, SwapsMmaAbStaysWithinCapacity)
         }
     }
 }
+
+// The capacity check runs on the host before any launch, so this needs no SM100 GPU.
+TEST(PrepareCustomMaskCapacityTest, RejectsUndersizedBuffer)
+{
+    int32_t const batchSize = 2;
+    int32_t const seqLenQ = 13;
+    int32_t const numHeadsQPerKv = 2;
+    int32_t const tileSizeQ = 8;
+    int32_t const tileSizeKv = 128;
+    int32_t const stepKv = 256;
+
+    TllmGenFmhaRunnerParams runnerParams;
+    runnerParams.mBatchSize = batchSize;
+    runnerParams.mNumHeadsQPerKv = numHeadsQPerKv;
+    runnerParams.mMaxSeqLenQ = seqLenQ;
+    runnerParams.customMaskCapacity = getCustomMaskSizeUpperBound(FmhaKernelType::SwapsMmaAbForGeneration, batchSize,
+                                          seqLenQ, numHeadsQPerKv, tileSizeQ, stepKv, tileSizeQ, tileSizeKv)
+        - 1;
+
+    EXPECT_THROW(runPrepareCustomMask(runnerParams, FmhaKernelType::SwapsMmaAbForGeneration, tileSizeQ, stepKv,
+                     tileSizeQ, tileSizeKv, /* stream */ nullptr),
+        tensorrt_llm::common::TllmException);
+}
