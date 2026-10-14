@@ -22,6 +22,7 @@ By NVIDIA TensorRT LLM Team
   - [The Public API](#the-public-api)
   - [Flexibility in Practice](#flexibility-in-practice)
 - [Current State](#current-state)
+  - [The Implementation Was Python First](#the-implementation-was-python-first)
 - [Future Work](#future-work)
 - [Acknowledgment](#acknowledgment)
 
@@ -33,7 +34,7 @@ TensorRT LLM's original KV cache manager, which we will call V1 throughout this 
 
 KVCacheManagerV2 (KVCM2) is a ground-up redesign built around a single question: *which buffers, across which layers, live and die together?* Answering that question explicitly — instead of assuming the answer is "all of them" — is what lets one manager serve full attention, sliding-window attention, and recurrent state with a single prefix-reuse tree, a narrow public API, and first-class GPU/host/disk storage.
 
-This post describes that design. A companion post, [From Python to C++: Rewriting KVCacheManagerV2 in the Age of Coding Agents](./blog30_From_Python_to_Cpp_Rewriting_KVCacheManagerV2_with_Coding_Agents.md), covers how KVCM2 was built: why we deliberately wrote it in Python first, and what changed to make us translate it to C++.
+This post describes that design.
 
 ## Why a Second KV Cache Manager
 
@@ -360,6 +361,9 @@ panels. (a) GPT-OSS (VSWA): V1 vs V2, isolating the benefit of independently siz
 full-attention pools. (b) Nemotron-H (hybrid Mamba): V1 with prefix reuse disabled — its only correct
 option — vs V2 with prefix reuse enabled, on a multi-turn or agentic trace where reuse matters most. -->
 
+### The Implementation Was Python First
+
+KVCM2 spent its first year as pure Python. That was deliberate: V1 being C++ was a complaint we heard repeatedly from users, product managers and other teams, and Python answered it. The cost was performance, and the machinery to recover it escalated — mypyc compilation, then a custom C extension to replace `weakref`, which mypyc does not support. Coding agents changed the calculus: they made the implementation language a much weaker constraint on who can contribute, while code review — the real bottleneck — still rewards the language a team's reviewers know best. So we translated it to C++, with agents doing most of the typing, and when we put that reasoning to the people who had asked for Python in the first place, none of them objected. The Python implementation stays in the tree as a differential-test oracle, since the same suite runs against both backends.
 
 ## Future Work
 
