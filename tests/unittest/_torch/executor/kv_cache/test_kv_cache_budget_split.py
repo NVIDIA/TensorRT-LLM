@@ -1698,6 +1698,45 @@ class TestPerRequestWeightedSplit:
         with pytest.raises(ValueError, match="insufficient"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
+    def test_draft_gpu_budget_cap_moves_the_excess_to_the_target(self, monkeypatch):
+        """TLLM_DRAFT_KV_GPU_BUDGET_GIB caps the draft's GPU share (above its
+        intercept) and hands the rest of the budget to the target."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "1.5")
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, intercept=GB, bytes_per_request=GB),
+            draft=CacheCost(slope=20, intercept=GB // 2, bytes_per_request=GB),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config.max_gpu_total_bytes == GB // 2 + 3 * GB // 2
+        assert target_config.max_gpu_total_bytes == 10 * GB - 2 * GB
+
+    def test_draft_gpu_budget_cap_keeps_the_allocator_floor(self, monkeypatch):
+        """The cap never goes below the draft's one-request allocator quota."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "0.5")
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, bytes_per_request=GB),
+            draft=CacheCost(slope=20, bytes_per_request=GB, quota_per_request=2 * GB),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config.max_gpu_total_bytes == 2 * GB
+        assert target_config.max_gpu_total_bytes == 8 * GB
+
+    def test_draft_gpu_budget_cap_ignores_offload_budgets(self, monkeypatch):
+        """The cap applies to the GPU budget only."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "0")
+        c = _make_creator(max_gpu_total_bytes=1_000, host_cache_size=1_000)
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("host_cache_size")
+
+        assert draft_config.host_cache_size == 200
+        assert target_config.host_cache_size == 800
+
     def test_fully_covered_target_weight_hands_slope_budget_to_draft(self):
         """A target whose entire retention is intercept-funded reports a zero
         slope-funded weight: the draft takes the remainder, still capped at
