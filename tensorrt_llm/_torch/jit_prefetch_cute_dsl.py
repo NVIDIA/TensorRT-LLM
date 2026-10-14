@@ -534,20 +534,25 @@ class FlashInferNormProvider:
         return list(self.specs)
 
 
-def install_topk_loader(loader: Callable[[str], Optional[Callable]]) -> List[str]:
-    """Route the radix top-k runners' ``_compile`` through ``loader``.
+# The loader the wrapped top-k ``_compile``s consult (None: compile in place).
+_topk_loader: Optional[Callable[[str], Optional[Callable]]] = None
 
-    ``loader(spec)`` returns a helper-exported kernel, which is stored in the
-    runner's ``kernel_cache`` under the key ``_compile`` would have used, or
-    None to compile as before. Returns the names of the wrapped runners.
-    """
+
+def _wrap_topk_runners() -> List[str]:
+    """Wrap each radix top-k runner's ``_compile`` once: under ``_KeyCapture``
+    it records its key and stops the launch; otherwise it consults
+    ``_topk_loader`` before compiling. Returns the names of the runners whose
+    ``_compile`` is wrapped."""
     from .custom_ops import cute_dsl_custom_ops as ops
 
     wrapped = []
     for name in TOPK_RUNNERS:
         runner = getattr(ops, name, None)
         orig = runner.__dict__.get("_compile") if runner is not None else None
-        if orig is None or getattr(orig, "_jitp_wrapped", False):
+        if orig is None:
+            continue
+        if getattr(orig.__func__, "_jitp_wrapped", False):
+            wrapped.append(name)
             continue
         inner = orig.__func__
 
@@ -559,11 +564,13 @@ def install_topk_loader(loader: Callable[[str], Optional[Callable]]) -> List[str
                     raise _KeyCaptured()
                 if key in cls.kernel_cache:
                     return
-                try:
-                    spec = topk_spec(name, key)
-                except TypeError:
-                    spec = None
-                fn = loader(spec) if spec is not None else None
+                loader = _topk_loader
+                fn = None
+                if loader is not None:
+                    try:
+                        fn = loader(topk_spec(name, key))
+                    except TypeError:
+                        fn = None
                 if fn is not None:
                     cls.kernel_cache[key] = fn
                     return
@@ -575,6 +582,18 @@ def install_topk_loader(loader: Callable[[str], Optional[Callable]]) -> List[str
         setattr(runner, "_compile", make())
         wrapped.append(name)
     return wrapped
+
+
+def install_topk_loader(loader: Callable[[str], Optional[Callable]]) -> List[str]:
+    """Route the radix top-k runners' ``_compile`` through ``loader``.
+
+    ``loader(spec)`` returns a helper-exported kernel, which is stored in the
+    runner's ``kernel_cache`` under the key ``_compile`` would have used, or
+    None to compile as before. Returns the names of the wrapped runners.
+    """
+    global _topk_loader
+    _topk_loader = loader
+    return _wrap_topk_runners()
 
 
 class _KeyCaptured(Exception):
@@ -660,6 +679,7 @@ class TopKProvider:
 
         # The ops' Python bodies (CustomOpDef._init_fn): calling the ops on
         # meta tensors would dispatch to their fake implementations.
+        _wrap_topk_runners()  # so their _compile records the key and stops
         decode = getattr(ops.cute_dsl_indexer_topk_decode, "_init_fn", None)
         prefill = getattr(ops.cute_dsl_indexer_topk_prefill_blackwell, "_init_fn", None)
         specs = []

@@ -1156,8 +1156,11 @@ class PyTorchModelEngine(ModelEngine):
         if provider and prefetcher.register("mamba_ssd", provider):
             logger.info(f"[JIT prefetch] Mamba SSD provider: "
                         f"{len(provider.shapes)} distinct layer shape(s)")
-        from ..modules.mamba.jit_prefetch_decode import MambaDecodeProvider
-        decode_provider = MambaDecodeProvider(self.batch_size)
+        from ..modules.mamba import jit_prefetch_decode
+        decode_provider = jit_prefetch_decode.MambaDecodeProvider(
+            self.batch_size)
+        logger.info(f"[JIT prefetch] Mamba decode launches recorded in warmup: "
+                    f"{jit_prefetch_decode.recorded_launchers()}")
         if decode_provider:
             prefetcher.register("mamba_decode", decode_provider)
         # Helpers were started when the prefetcher was created; make sure

@@ -266,24 +266,47 @@ class MambaDecodeProvider:
         return offsets
 
     def plan_all(self) -> List[KernelCall]:
+        from tensorrt_llm.logger import logger
+
         _shim_meta_device_properties()
         with _LOCK:
             records = [(n, r) for n, per_name in _RECORDS.items() for r in per_name.values()]
         calls: List[KernelCall] = []
+        summary = {}
         for name, (launcher, sig, specs) in records:
             every_size = _BATCH_ARGS[name][1]
             offsets = self._row_offsets(specs)
+            planned = failed = 0
             for batch in self._batches(every_size):
                 for r in offsets:
-                    calls.extend(self._replay(launcher, specs, batch, r))
+                    rec, err = self._replay(launcher, specs, batch, r)
+                    if err is not None:
+                        failed += 1
+                        logger.warning_once(
+                            f"[JIT prefetch] cannot replay {name}: {err}",
+                            key=f"jitp_mamba_decode_{name}",
+                        )
+                    planned += len(rec)
+                    calls.extend(rec)
+            done, fails = summary.get(name, (0, 0))
+            summary[name] = (done + planned, fails + failed)
+        logger.info(
+            f"[JIT prefetch] Mamba decode launches planned (calls, failed replays): {summary}"
+        )
         return calls
 
     @staticmethod
-    def _replay(launcher, specs: Dict[str, tuple], batch: int, row_offset: int) -> List[KernelCall]:
+    def _replay(launcher, specs: Dict[str, tuple], batch: int, row_offset: int):
         kwargs = {p: _meta(s, batch, row_offset) for p, s in specs.items()}
         try:
             with shadow_launches() as rec:
                 launcher(**kwargs)
-        except Exception:  # noqa: BLE001 - a replay that cannot run plans nothing
-            return []
-        return list(rec)
+        except Exception as e:  # noqa: BLE001 - a replay that cannot run plans nothing
+            return [], f"{type(e).__name__}: {e}"
+        return list(rec), None
+
+
+def recorded_launchers() -> Dict[str, int]:
+    """Launch classes recorded per launcher name (for logs and tests)."""
+    with _LOCK:
+        return {name: len(per_name) for name, per_name in _RECORDS.items()}
