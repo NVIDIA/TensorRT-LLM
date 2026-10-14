@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -128,6 +129,10 @@ class ADPRouter(ABC):
             kv_cache_manager has block reuse enabled; DefaultADPRouter
             otherwise.
         """
+        # Env modifier for the conversation router (default off): place new conversations by pinned prompt
+        # tokens instead of round-robin / least-queued. Read once here, at router construction.
+        token_aware = os.environ.get(ConversationAwareADPRouter.TOKEN_AWARE_ENV, "0") == "1"
+
         if (
             attention_dp_config is not None
             and attention_dp_config.kv_cache_routing_conversation_affinity
@@ -142,6 +147,17 @@ class ADPRouter(ABC):
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
+                token_aware_placement=token_aware,
+                kv_cache_manager=kv_cache_manager,
+            )
+
+        if token_aware:
+            # Make a misconfigured A/B visible: the modifier only applies to ConversationAwareADPRouter.
+            logger.warning_once(
+                f"{ConversationAwareADPRouter.TOKEN_AWARE_ENV}=1 is set but "
+                "kv_cache_routing_conversation_affinity is off; the token-aware placement modifier "
+                "only applies to ConversationAwareADPRouter and is ignored",
+                key="adp_token_aware_ignored",
             )
 
         if (
@@ -758,11 +774,29 @@ class ConversationAwareADPRouter(ADPRouter):
     the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
     back to the same ``new_conv_placement`` policy.
+
+    Env modifier ``TLLM_ADP_TOKEN_AWARE_PLACEMENT=1`` (default off, read by
+    ``ADPRouter.create``): the ``rank is None`` branch (new conversation,
+    sticky overflow, no ``conversation_id``) picks the rank with the least
+    *pinned prompt tokens* instead of round-robin / least-queued. Pinned load
+    per rank is the sum over its live conversations of the prompt length of
+    their most recent turn (a turn replaces, not adds); a conversation stops
+    counting once its rank has written more than ``window_tokens`` tokens
+    since the conversation's last turn (the two-tier KV capacity in tokens by
+    default; ``TLLM_ADP_TOKEN_AWARE_WINDOW_TOKENS`` overrides, 0 = never) or
+    when it falls out of the LRU session map. Ties go round-robin. The state
+    is a deterministic function of the broadcast inputs, so every DP rank
+    computes the same assignment; the variable must be set identically on all
+    DP ranks of an instance.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
     # bytes each). Bounds memory on long-running servers as conversations churn.
     DEFAULT_MAX_SESSIONS = 1 << 16
+
+    # Env modifier: token-aware placement of new conversations (see class docstring).
+    TOKEN_AWARE_ENV = "TLLM_ADP_TOKEN_AWARE_PLACEMENT"
+    TOKEN_AWARE_WINDOW_ENV = "TLLM_ADP_TOKEN_AWARE_WINDOW_TOKENS"
 
     def __init__(
         self,
@@ -771,6 +805,9 @@ class ConversationAwareADPRouter(ADPRouter):
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
+        token_aware_placement: bool = False,
+        kv_cache_manager=None,
+        token_window_tokens: Optional[int] = None,
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
@@ -782,6 +819,21 @@ class ConversationAwareADPRouter(ADPRouter):
             else "round_robin"
         )
         self._round_robin_cursor = 0
+        self._token_aware = bool(token_aware_placement)
+        if self._token_aware:
+            # Per rank: pinned load (sum of the last-seen prompt length of every live conversation pinned
+            # there), a monotone estimate of KV tokens written, and the live conversations ordered by
+            # their last write mark (front = oldest). Per live conversation: its last-seen prompt length.
+            self._pinned_tokens: List[int] = []
+            self._written_tokens: List[int] = []
+            self._live: List["OrderedDict[str, int]"] = []
+            self._last_isl: Dict[str, int] = {}
+            self._window_tokens = self._resolve_window_tokens(kv_cache_manager, token_window_tokens)
+            logger.info(
+                f"[adp_router][conv] token-aware new-conversation placement enabled "
+                f"({self.TOKEN_AWARE_ENV}=1); window_tokens={self._window_tokens}; "
+                f"overrides new_conv_placement={self._new_conv_placement}"
+            )
 
     def create_rank_state(
         self,
@@ -818,7 +870,116 @@ class ConversationAwareADPRouter(ADPRouter):
         self._conv_to_rank[conv_id] = rank
         self._conv_to_rank.move_to_end(conv_id)
         while len(self._conv_to_rank) > self._max_sessions:
-            self._conv_to_rank.popitem(last=False)
+            evicted_conv, evicted_rank = self._conv_to_rank.popitem(last=False)
+            if self._token_aware:
+                self._forget_conv(evicted_conv, evicted_rank)
+
+    # ---- token-aware placement (TLLM_ADP_TOKEN_AWARE_PLACEMENT=1) -------------------------------------
+    # Every DP rank runs route_requests on identical inputs (allgathered RankState, broadcast requests
+    # incl. num_input_tokens and conversation params) and keeps its own copy of the state below, with no
+    # broadcast of the result. The assignment must therefore be a deterministic function of those inputs
+    # only: never feed rank-local data (local KV statistics, wall-clock time, randomness) into this state,
+    # or ranks disagree on the assignment and the next collective hangs.
+
+    def _resolve_window_tokens(self, kv_cache_manager, override: Optional[int]) -> int:
+        """Write-volume window W after which a conversation stops counting as pinned load.
+
+        W approximates the two-tier (GPU + host) KV capacity in tokens: the host tier is a FIFO ring in
+        tokens written, so once a rank has written ~W tokens after a conversation's last turn, that
+        conversation's blocks have most likely been recycled. 0 disables expiry (only the LRU session
+        cap then drops load).
+        """
+        if override is not None:
+            return max(0, int(override))
+        env = os.environ.get(self.TOKEN_AWARE_WINDOW_ENV)
+        if env is not None:
+            try:
+                return max(0, int(env))
+            except ValueError:
+                logger.warning(
+                    f"[adp_router][conv] token-aware: ignoring non-integer "
+                    f"{self.TOKEN_AWARE_WINDOW_ENV}={env!r}"
+                )
+        # KVCacheManagerV2 has no blocks_in_secondary_pool (its host tiers are cache levels, not a
+        # second pool); it reports the summed GPU + host capacity in tokens directly.
+        capacity = getattr(kv_cache_manager, "kv_capacity_tokens_all_tiers", None)
+        if isinstance(capacity, int) and not isinstance(capacity, bool):
+            return max(0, capacity)
+        primary = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
+        secondary = getattr(kv_cache_manager, "blocks_in_secondary_pool", None)
+        tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", None)
+        if all(
+            isinstance(v, int) and not isinstance(v, bool)
+            for v in (primary, secondary, tokens_per_block)
+        ):
+            return max(0, (primary + secondary) * tokens_per_block)
+        logger.warning(
+            "[adp_router][conv] token-aware: KV pool sizes unavailable; write-volume expiry "
+            f"disabled (set {self.TOKEN_AWARE_WINDOW_ENV})"
+        )
+        return 0
+
+    def _ensure_rank_arrays(self, tp_size: int) -> None:
+        while len(self._pinned_tokens) < tp_size:
+            self._pinned_tokens.append(0)
+            self._written_tokens.append(0)
+            self._live.append(OrderedDict())
+
+    def _expire_stale(self, tp_size: int) -> None:
+        """Drop conversations whose rank has written more than W tokens since their last turn.
+
+        The conversation keeps its rank binding (stickiness survives); only its load is forgotten.
+        """
+        if self._window_tokens <= 0:
+            return
+        for r in range(tp_size):
+            live = self._live[r]
+            while live:
+                conv_id, mark = next(iter(live.items()))
+                if self._written_tokens[r] - mark <= self._window_tokens:
+                    break
+                live.popitem(last=False)
+                self._pinned_tokens[r] -= self._last_isl.pop(conv_id, 0)
+
+    def _note_turn(self, conv_id: str, rank: int, isl: int) -> None:
+        """Account one turn of ``conv_id`` on its home ``rank``: the last-seen prompt length replaces the
+        previous one in the pinned load; only growth counts as newly written KV."""
+        prev = self._last_isl.get(conv_id, 0)
+        delta = isl - prev
+        self._pinned_tokens[rank] += delta
+        self._written_tokens[rank] += max(delta, 0)
+        self._last_isl[conv_id] = isl
+        live = self._live[rank]
+        live[conv_id] = self._written_tokens[rank]
+        live.move_to_end(conv_id)
+
+    def _note_anonymous(self, rank: int, isl: int) -> None:
+        """A request that is not pinned to ``rank`` (no conversation_id, or sticky overflow placed away
+        from home) only adds to the rank's write estimate."""
+        self._written_tokens[rank] += isl
+
+    def _forget_conv(self, conv_id: str, rank: int) -> None:
+        isl = self._last_isl.pop(conv_id, None)
+        if isl is not None:
+            self._pinned_tokens[rank] -= isl
+            self._live[rank].pop(conv_id, None)
+
+    def _least_pinned_rank(self, tp_size: int, active: List[int], soft_cap: int) -> int:
+        """Rank with the least pinned tokens among those under ``soft_cap`` (all ranks if none is);
+        ties go round-robin from the shared cursor, never to the lowest index."""
+        cands = [r for r in range(tp_size) if active[r] < soft_cap] or list(range(tp_size))
+        best = min(self._pinned_tokens[r] for r in cands)
+        cand_set = set(cands)
+        for k in range(tp_size):
+            r = (self._round_robin_cursor + k) % tp_size
+            if r in cand_set and self._pinned_tokens[r] == best:
+                self._round_robin_cursor = (r + 1) % tp_size
+                return r
+        return cands[0]  # not reachable: some candidate holds the minimum
+
+    def pinned_tokens_per_rank(self) -> List[int]:
+        """Read-only view of the pinned load per rank (empty when the modifier is off)."""
+        return list(self._pinned_tokens) if self._token_aware else []
 
     def _assign_new_conversation_explicit_dp_ranks(
         self,
@@ -852,6 +1013,12 @@ class ConversationAwareADPRouter(ADPRouter):
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
+                if self._token_aware:
+                    isl = _num_input_tokens(req_item.request)
+                    if conv_id is not None:
+                        self._note_turn(conv_id, target_dp_rank, isl)
+                    else:
+                        self._note_anonymous(target_dp_rank, isl)
             else:
                 remaining.append(req_item)
         return remaining
@@ -867,6 +1034,9 @@ class ConversationAwareADPRouter(ADPRouter):
             s.rank: [] for s in all_rank_states
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        if self._token_aware:
+            self._ensure_rank_arrays(tp_size)
+            self._expire_stale(tp_size)
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
@@ -937,9 +1107,14 @@ class ConversationAwareADPRouter(ADPRouter):
             self._round_robin_cursor = (rank + 1) % tp_size
             return rank
 
+        def _least_pinned(soft_cap: int) -> int:
+            """Token-aware modifier: least pinned prompt tokens under soft_cap, ties round-robin."""
+            return self._least_pinned_rank(tp_size, all_ranks_num_active_requests, soft_cap)
+
         for req_item in remaining_unscheduled:
             conv_id = self._conversation_id(req_item)
             rank = None
+            kind = None  # sticky | new | overflow | noid (token-aware accounting only)
 
             if conv_id is not None and conv_id in self._conv_to_rank:
                 target_rank = self._conv_to_rank[conv_id]
@@ -951,14 +1126,16 @@ class ConversationAwareADPRouter(ADPRouter):
                 if all_ranks_num_active_requests[target_rank] < max_num_active_requests:
                     rank = target_rank
                     self._record_target_rank(conv_id, target_rank)  # LRU touch
+                    kind = "sticky"
                 # else: target saturated this batch -> fall through to overflow
                 # WITHOUT rebinding, so the conversation returns next batch.
 
             if rank is None:
-                # First turn of a new conversation, sticky-overflow, or no
-                # conversation_id -> spread under the soft cap using the
-                # configured count- or token-based placement strategy.
-                if self._new_conv_placement == "least_tokens":
+                # First turns, sticky overflow and anonymous requests use the
+                # selected placement policy within the existing soft cap.
+                if self._token_aware:
+                    rank = _least_pinned(expected_num_active_requests)
+                elif self._new_conv_placement == "least_tokens":
                     rank = _least_active_tokens(expected_num_active_requests)
                 elif self._new_conv_placement == "least_queued":
                     rank = _least_loaded(expected_num_active_requests)
@@ -967,6 +1144,22 @@ class ConversationAwareADPRouter(ADPRouter):
                 if conv_id is not None and conv_id not in self._conv_to_rank:
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
+                    kind = "new"
+                elif conv_id is not None:
+                    kind = "overflow"
+                else:
+                    kind = "noid"
+
+            if self._token_aware:
+                isl = _num_input_tokens(req_item.request)
+                if kind in ("sticky", "new"):
+                    self._note_turn(conv_id, rank, isl)
+                else:
+                    self._note_anonymous(rank, isl)
+                logger.debug(
+                    f"[adp_router][conv][token_aware] req={req_item.id} conv={conv_id} "
+                    f"kind={kind} rank={rank} isl={isl}"
+                )
 
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
@@ -980,6 +1173,15 @@ class ConversationAwareADPRouter(ADPRouter):
         expected_num_active_requests = max(
             expected_num_active_requests, max(all_ranks_num_active_requests)
         )
+
+        if self._token_aware:
+            logger.debug(
+                f"[adp_router][conv][token_aware] "
+                f"pinned_tokens_per_rank={self._pinned_tokens[:tp_size]} "
+                f"written_tokens_per_rank={self._written_tokens[:tp_size]} "
+                f"live_convs_per_rank={[len(self._live[r]) for r in range(tp_size)]} "
+                f"window={self._window_tokens}"
+            )
 
         logger.debug(
             f"[adp_router][conv] new_reqs_per_rank="
