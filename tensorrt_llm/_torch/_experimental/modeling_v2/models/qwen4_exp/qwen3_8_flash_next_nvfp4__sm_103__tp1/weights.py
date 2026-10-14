@@ -10,8 +10,11 @@ slices, fp32 gating params and NVFP4 scalars are derived in `modeling.py` after 
 Transforms:
 
 * fused shared-expert gate|up: `[gate ; up]` (the half order `flashinfer_silu_and_mul` reads);
-* NVFP4 routed-expert stacks: `[up ; gate]`, interleave, 32-row block shuffle of weight
-  and scale bytes, then 128x4 scale swizzle (FC2: shuffle only);
+* NVFP4 routed-expert stacks, laid out for the trunk's routed backend
+  (`core.trunk_moe_backend`): `[up ; gate]`, then 128x4 scale swizzle. trtllm-gen also
+  interleaves FC1 row by row and 32-row block shuffles weight and scale bytes (FC2:
+  shuffle only); CuteDSL interleaves FC1 in 64-row up/gate groups and leaves FC2 in
+  checkpoint row order;
 * n-gram table: 128 row chunks concatenated into one `[rows, 160]` buffer (the hash
   emits global row indices).
 
@@ -221,8 +224,25 @@ def _interleave_perm(rows: int, device) -> torch.Tensor:
     return p.to(device)
 
 
-def _fc1_perm(rows: int, device) -> torch.Tensor:
-    """Interleave then 32-row block shuffle, composed into one gather."""
+#: The group the CuteDSL FC1 epilogue pairs up and gate rows in: rows `[128k, 128k + 64)`
+#: of the fused operand are up rows and the next 64 their gate rows.
+_CUTEDSL_GATE_UP_GROUP = 64
+
+
+def _group_interleave_perm(rows: int, group: int, device) -> torch.Tensor:
+    """Gather index that interleaves the `[up | gate]` halves of a `2*I` row stack in
+    `group`-row blocks: up[0:g], gate[0:g], up[g:2g], gate[g:2g], ..."""
+    assert rows % (2 * group) == 0, (rows, group)
+    idx = torch.arange(rows, device=device).view(2, rows // (2 * group), group)
+    return idx.transpose(0, 1).reshape(-1)
+
+
+def _fc1_perm(rows: int, device, core) -> torch.Tensor:
+    """The FC1 row gather of the trunk's routed backend. trtllm-gen: interleave then
+    32-row block shuffle, composed into one gather. CuteDSL: the 64-row group
+    interleave alone."""
+    if core.trunk_moe_backend == "CUTEDSL":
+        return _group_interleave_perm(rows, _CUTEDSL_GATE_UP_GROUP, device)
     return _interleave_perm(rows, device)[_block32_perm(rows, device)]
 
 
@@ -243,28 +263,34 @@ def _expert_fc1_w(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
     """(up, gate) packed nibbles -> one expert's FC1 operand."""
     up, gate = t
     w = torch.cat([up, gate], dim=0)
-    return torch.index_select(w, 0, _fc1_perm(w.shape[0], w.device)).contiguous()
+    return torch.index_select(w, 0, _fc1_perm(w.shape[0], w.device, core)).contiguous()
 
 
 def _expert_fc1_s(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
-    """(up, gate) e4m3 scales -> one expert's FC1 scale operand."""
+    """(up, gate) e4m3 scales -> one expert's FC1 scale operand: the weight's own row
+    permutation, then the swizzle."""
     up, gate = t
     s = torch.cat([up.view(torch.uint8), gate.view(torch.uint8)], dim=0)
     rows, cols = s.shape
-    s = torch.index_select(s, 0, _fc1_perm(rows, s.device))
+    s = torch.index_select(s, 0, _fc1_perm(rows, s.device, core))
     return _swizzle(s).reshape(rows, cols)
 
 
 def _expert_fc2_w(t: torch.Tensor, core) -> torch.Tensor:
-    """`down_proj` packed nibbles -> one expert's FC2 operand (no interleave)."""
+    """`down_proj` packed nibbles -> one expert's FC2 operand (no interleave): the
+    32-row block shuffle on trtllm-gen, checkpoint row order on CuteDSL."""
+    if core.trunk_moe_backend == "CUTEDSL":
+        return t.contiguous()
     return torch.index_select(t, 0, _block32_perm(t.shape[0], t.device)).contiguous()
 
 
 def _expert_fc2_s(t: torch.Tensor, core) -> torch.Tensor:
-    """`down_proj` e4m3 scales -> one expert's FC2 scale operand."""
+    """`down_proj` e4m3 scales -> one expert's FC2 scale operand: the weight's own row
+    order, then the swizzle."""
     s = t.view(torch.uint8)
     rows, cols = s.shape
-    s = torch.index_select(s, 0, _block32_perm(rows, s.device))
+    if core.trunk_moe_backend != "CUTEDSL":
+        s = torch.index_select(s, 0, _block32_perm(rows, s.device))
     return _swizzle(s).reshape(rows, cols)
 
 

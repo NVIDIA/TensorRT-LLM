@@ -135,10 +135,12 @@ l0_b300:
   # TIMEOUT measured: 348 cases in 5m34s on one GB300, so 30 is 5x headroom.
   - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
-  # qwen4_exp target: gsm8k; gsm8k with MTP plus the acceptance-length floor, the
-  # only gate that sees a miscomputed draft layer; mmmu with MTP, the only gate
-  # that reaches the vision tower.
+  # qwen4_exp target: gsm8k, and gsm8k with the trunk's routed experts on CuteDSL;
+  # gsm8k with MTP plus the acceptance-length floor, the only gate that sees a
+  # miscomputed draft layer; mmmu with MTP, the only gate that reaches the vision
+  # tower.
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_cutedsl_moe
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu
 - condition:

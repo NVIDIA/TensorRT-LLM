@@ -130,6 +130,23 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_not_sm103
+    def test_gsm8k_cutedsl_moe(self, mocker, monkeypatch):
+        """The text model with the trunk's routed experts on CuteDSL, against the same gsm8k anchor.
+
+        Same as ``test_gsm8k`` with ``moe_config.backend="CUTEDSL"``.
+        """
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        engine = dict(self.ENGINE, moe_config=MoeConfig(backend="CUTEDSL"))
+
+        with LLM(
+            self.MODEL_PATH,
+            **engine,
+            **_require_target(monkeypatch, **_VALIDATE),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_not_sm103
     def test_mtp1_gsm8k_and_acceptance(self, mocker, monkeypatch):
         """MTP with one draft: gsm8k against the MTP reference, plus acceptance length.
 

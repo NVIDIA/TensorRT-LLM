@@ -23,7 +23,11 @@ Differences from other targets:
   prefix; sparse selection replaces the dense core only above it.
 * **PLE.** Decoder layer 1 only (``ple_layer_ids: [2]`` is one-based): an n-gram
   side path over a 320,001,536-row fp8 table (47.68 GiB of a 123.5 GiB checkpoint).
-* **NVFP4 MoE on every layer** (routed experts only); everything else is bf16.
+* **NVFP4 MoE on every layer** (routed experts only); everything else is bf16. The
+  trunk's routed experts run on trtllm-gen's block-scale runner (``TRTLLM``, and what
+  ``AUTO`` selects) or on the CuteDSL sort / grouped-GEMM pipeline (``CUTEDSL``),
+  chosen by ``moe_config.backend``; any other request is refused. The MTP draft
+  layer's FP8 block-scale experts run on trtllm-gen under either.
 
 Integration facts this file depends on:
 
@@ -78,7 +82,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
 
 from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
@@ -95,8 +99,14 @@ from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.embedding.ngram_hash import ngram_hash
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_post_inject import qwen4_exp_post_inject
+from .ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (
+    cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
+)
+from .ops.moe.cute_dsl_nvfp4_grouped_gemm import cute_dsl_nvfp4_grouped_gemm
 from .ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
 from .ops.moe.fused_sigmoid_gate_mul_add import fused_sigmoid_gate_mul_add
+from .ops.moe.moe_sort import moe_sort
+from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
 from .ops.moe.renorm_moe_routing_op import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm import flashinfer_gemma_rmsnorm
 from .ops.norm.layer_norm import layer_norm
@@ -322,6 +332,15 @@ _SF_LINEAR = False
 # kernel launch.
 _ROUTING_METHOD_RENORM = 1
 _ACT_TYPE_SWIGLU = 0
+
+# The trunk's routed-expert backend by the requested `moe_config.backend`
+# (`ModelConfig.moe_backend_requested`; `moe_backend` itself is already resolved,
+# AUTO -> CUTLASS). Any other request is refused at construction. The MTP draft
+# layer's FP8 block-scale experts run on trtllm-gen whatever this says.
+_TRUNK_MOE_BACKENDS = {"AUTO": "TRTLLM", "TRTLLM": "TRTLLM", "CUTEDSL": "CUTEDSL"}
+# The CuteDSL grouped GEMMs' MMA tile M, which is also the tile `moe_sort` pads each
+# expert's rows to: the GEMMs walk the sort's tile tables. sm_103 admits 128 and 256.
+_CUTEDSL_TILE_SIZE = 128
 
 # Skip sentinel the conv ops and paged short conv compare `cache_indices` against
 # (the runtime's mamba `PAD_SLOT_ID`). Never a substitution: the scheduler's slot
@@ -810,7 +829,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # Every layer is MoE; the dense `intermediate_size` is dead config.
         assert getattr(cfg, "decoder_sparse_step", 1) == 1, "every layer must be MoE"
         assert not getattr(cfg, "mlp_only_layers", []), "every layer must be MoE"
-        # trtllm-gen NVFP4 runner operand-width rules and fp4_quantize's block rule.
+        # trtllm-gen NVFP4 runner operand-width rules and fp4_quantize's block rule; they
+        # also cover the CuteDSL FC1 / FC2 rules (K and I in 64-element scale groups, the
+        # gated N in 128-row pairs of 64 up rows and 64 gate rows).
         assert self.hidden % 256 == 0, "fp4_block_scale_moe_runner hidden alignment"
         assert (2 * self.moe_inter) % 128 == 0, "fp4_block_scale_moe_runner 2I alignment"
         assert (self.hidden // _SF_VEC) % 4 == 0 and (self.moe_inter // _SF_VEC) % 4 == 0, (
@@ -818,6 +839,14 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         )
         # flashinfer_silu_and_mul's precondition is on the half width.
         assert (self.shared_inter * 2) % 16 == 0, "flashinfer_silu_and_mul half alignment"
+        # Which kernels run the trunk's routed experts; it also fixes the load-time layout
+        # of the expert stacks (`weights.py`), so it is decided before anything is declared.
+        requested = model_config.moe_backend_requested.upper()
+        assert requested in _TRUNK_MOE_BACKENDS, (
+            f"moe_config.backend={model_config.moe_backend_requested!r} is not implemented by "
+            f"this target; the supported requests are {sorted(_TRUNK_MOE_BACKENDS)}"
+        )
+        self.trunk_moe_backend = _TRUNK_MOE_BACKENDS[requested]
 
         # ---- PLE -----------------------------------------------------------
         ple_ids = list(getattr(cfg, "ple_layer_ids", None) or [])
@@ -1069,16 +1098,32 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             )
             e_isc2 = w[f"l{i}_e_isc2"]
             gate1 = (isc1 * w[f"l{i}_e_ws2_1"]).contiguous()
-            moe_scalars.append(
-                dict(
+            # Routed FC1 activation global scale (one per layer).
+            scalars = dict(global_scale=(1.0 / isc1[:1]).contiguous())
+            if self.trunk_moe_backend == "CUTEDSL":
+                # The CuteDSL FC1 epilogue requantizes with one global scale for the whole
+                # layer, where trtllm-gen folds each expert's `down_proj.input_scale` into
+                # its FC1 scalar; the two agree only if every expert shares one.
+                assert torch.equal(e_isc2.min(), e_isc2.max()), (
+                    f"layer {i}: the routed experts do not share one down_proj.input_scale, "
+                    "so the CuteDSL FC1's single requantization scale would quantize the FC2 "
+                    "input differently from the checkpoint's per-expert scales"
+                )
+                scalars.update(
+                    # [num_experts] each: activation scale times weight scale.
+                    alpha1=gate1,
+                    alpha2=(e_isc2 * w[f"l{i}_e_ws2_2"]).contiguous(),
+                    # The FC2 activation's quantization scale, numel 1.
+                    global_sf=(1.0 / e_isc2[:1]).contiguous(),
+                )
+            else:
+                scalars.update(
                     # [num_experts] each. Swapping the first two is finite and silent.
                     output1_scale_scalar=(gate1 / e_isc2).contiguous(),
                     output1_scale_gate_scalar=gate1,
                     output2_scale_scalar=(e_isc2 * w[f"l{i}_e_ws2_2"]).contiguous(),
-                    # Routed FC1 activation global scale (one per layer).
-                    global_scale=(1.0 / isc1[:1]).contiguous(),
                 )
-            )
+            moe_scalars.append(scalars)
         self._moe_scalars = moe_scalars
         # Both delta-rule entries index A_log and dt_bias as `ptr + head` and certify
         # fp32; the checkpoint is bf16.
@@ -1423,9 +1468,14 @@ class _LayerWeights(NamedTuple):
     fc1_s: torch.Tensor
     fc2_w: torch.Tensor
     fc2_s: torch.Tensor
-    out1_scale: torch.Tensor
-    out1_gate_scale: torch.Tensor
-    out2_scale: torch.Tensor
+    # trtllm-gen scalars; None on CuteDSL.
+    out1_scale: torch.Tensor | None
+    out1_gate_scale: torch.Tensor | None
+    out2_scale: torch.Tensor | None
+    # CuteDSL scalars; None on trtllm-gen.
+    alpha1: torch.Tensor | None
+    alpha2: torch.Tensor | None
+    global_sf: torch.Tensor | None
     sh_gu: torch.Tensor
     sh_dn: torch.Tensor
     sh_gate: torch.Tensor
@@ -1434,6 +1484,12 @@ class _LayerWeights(NamedTuple):
 def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
     """Every trunk layer's `_LayerWeights`, read off the realized weights."""
     w = core.w
+    # The expert stacks are uint8 storage; each backend reads the packed nibbles and the
+    # block scales as its own dtypes.
+    if core.trunk_moe_backend == "CUTEDSL":
+        w_dtype, s_dtype = torch.float4_e2m1fn_x2, torch.uint8
+    else:
+        w_dtype, s_dtype = torch.uint8, torch.float8_e4m3fn
     layers = []
     for i in range(core.num_layers):
         attn: dict = dict(
@@ -1499,13 +1555,16 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
                 **gdn,
                 router=w[f"l{i}_router"].t(),
                 moe_gscale=scalars["global_scale"],
-                fc1_w=w[f"l{i}_fc1_w"],
-                fc1_s=w[f"l{i}_fc1_s"].view(torch.float8_e4m3fn),
-                fc2_w=w[f"l{i}_fc2_w"],
-                fc2_s=w[f"l{i}_fc2_s"].view(torch.float8_e4m3fn),
-                out1_scale=scalars["output1_scale_scalar"],
-                out1_gate_scale=scalars["output1_scale_gate_scalar"],
-                out2_scale=scalars["output2_scale_scalar"],
+                fc1_w=w[f"l{i}_fc1_w"].view(w_dtype),
+                fc1_s=w[f"l{i}_fc1_s"].view(s_dtype),
+                fc2_w=w[f"l{i}_fc2_w"].view(w_dtype),
+                fc2_s=w[f"l{i}_fc2_s"].view(s_dtype),
+                out1_scale=scalars.get("output1_scale_scalar"),
+                out1_gate_scale=scalars.get("output1_scale_gate_scalar"),
+                out2_scale=scalars.get("output2_scale_scalar"),
+                alpha1=scalars.get("alpha1"),
+                alpha2=scalars.get("alpha2"),
+                global_sf=scalars.get("global_sf"),
                 sh_gu=w[f"l{i}_sh_gu"].t(),
                 sh_dn=w[f"l{i}_sh_dn"].t(),
                 sh_gate=w[f"l{i}_sh_gate"].t(),
@@ -1706,47 +1765,117 @@ class PrefillTarget:
             [flashinfer_gemma_rmsnorm(part, w, core.eps) for w, part in zip(weights, parts)], 1
         )
 
-    def _moe_block(self, x: torch.Tensor, L: _LayerWeights, dt: torch.dtype) -> torch.Tensor:
+    def _moe_block(
+        self, x: torch.Tensor, L: _LayerWeights, dt: torch.dtype, routed_out: torch.Tensor | None
+    ) -> torch.Tensor:
         """NVFP4 routed experts (quantized once in the linear block-scale layout, with
         finished top-k ids and weights so the runner's routing arguments are inert)
-        plus a bf16 shared expert folded in by a per-token sigmoid gate."""
+        plus a bf16 shared expert folded in by a per-token sigmoid gate. `routed_out`
+        is the CuteDSL path's `[T, hidden]` output buffer (None on trtllm-gen, whose
+        runner allocates its own)."""
         core = self.core
         # The routing op reads logits from data_ptr() ignoring strides; cublas_mm
         # allocates them contiguous.
         logits = cublas_mm(x, L.router)
-        topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
-        xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-        routed = fp4_block_scale_moe_runner(
-            routing_logits=None,
-            routing_bias=None,
-            hidden_states=xq,
-            hidden_states_scale=xsf.view(torch.float8_e4m3fn),
-            gemm1_weights=L.fc1_w,
-            gemm1_weights_scale=L.fc1_s,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=L.fc2_w,
-            gemm2_weights_scale=L.fc2_s,
-            gemm2_bias=None,
-            output1_scale_scalar=L.out1_scale,
-            output1_scale_gate_scalar=L.out1_gate_scale,
-            output2_scale_scalar=L.out2_scale,
-            num_experts=core.num_experts,
-            top_k=core.topk,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=core.moe_inter,
-            local_expert_offset=0,
-            local_num_experts=core.num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=_ROUTING_METHOD_RENORM,
-            do_finalize=True,
-            act_type=_ACT_TYPE_SWIGLU,
-            topk_weights=topk_w,
-            topk_ids=topk_ids,
-        )[0]
+        if core.trunk_moe_backend == "CUTEDSL":
+            # fp32 weights: the dtype the unpermute scales by.
+            topk_ids, topk_w = renorm_moe_routing_op(
+                logits, topk=core.topk, output_dtype=torch.float32
+            )
+            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
+            # The sort pads each expert's (token, expert) pairs to whole tiles and emits
+            # the tile tables both GEMMs walk.
+            tile_expert, tile_limit, expanded_to_permuted, permuted_to_expanded, _, live_tiles = (
+                moe_sort(
+                    token_selected_experts=topk_ids,
+                    token_final_scales=topk_w,
+                    num_experts=core.num_experts,
+                    top_k=core.topk,
+                    local_expert_offset=0,
+                    local_num_experts=core.num_experts,
+                    tile_tokens_dim=_CUTEDSL_TILE_SIZE,
+                )
+            )
+            # FC1 gathers its rows from the unpermuted activation, applies SwiGLU and
+            # requantizes with the layer's one FC2 input scale. `fp4_quantize` returns the
+            # linear scales flat; the GEMM reads them as [T, hidden / 16].
+            h, h_sf = cute_dsl_nvfp4_gather_grouped_gemm_act_fusion(
+                input=xq.view(torch.float4_e2m1fn_x2),
+                weight=L.fc1_w,
+                input_scale=xsf.view(x.shape[0], core.hidden // _SF_VEC),
+                weight_scale=L.fc1_s,
+                alpha=L.alpha1,
+                tile_idx_to_group_idx=tile_expert,
+                tile_idx_to_mn_limit=tile_limit,
+                permuted_idx_to_expanded_idx=permuted_to_expanded,
+                num_non_exiting_tiles=live_tiles,
+                global_sf=L.global_sf,
+                num_experts=core.num_experts,
+                top_k=core.topk,
+                num_local_experts=core.num_experts,
+                local_expert_offset=0,
+                tile_size=_CUTEDSL_TILE_SIZE,
+                scaling_vector_size=_SF_VEC,
+                activation_type=int(ActivationType.Swiglu),
+            )
+            # FC2 writes one bf16 row per permuted row; the unpermute writes every row of
+            # `routed_out` as the routing-weighted sum of its token's top-k rows.
+            y = cute_dsl_nvfp4_grouped_gemm(
+                input=h,
+                weight=L.fc2_w,
+                input_scale=h_sf,
+                weight_scale=L.fc2_s,
+                alpha=L.alpha2,
+                tile_idx_to_group_idx=tile_expert,
+                num_non_exiting_tiles=live_tiles,
+                num_experts=core.num_experts,
+                top_k=core.topk,
+                num_local_experts=core.num_experts,
+                local_expert_offset=0,
+                tile_size=_CUTEDSL_TILE_SIZE,
+                output_dtype=torch.bfloat16,
+                scaling_vector_size=_SF_VEC,
+            )
+            routed = moe_unpermute_inplace(
+                permuted_input=y,
+                output=routed_out,
+                expanded_idx_to_permuted_idx=expanded_to_permuted,
+                topk_scales=topk_w,
+            )
+        else:
+            topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
+            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
+            routed = fp4_block_scale_moe_runner(
+                routing_logits=None,
+                routing_bias=None,
+                hidden_states=xq,
+                hidden_states_scale=xsf.view(torch.float8_e4m3fn),
+                gemm1_weights=L.fc1_w,
+                gemm1_weights_scale=L.fc1_s,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=L.fc2_w,
+                gemm2_weights_scale=L.fc2_s,
+                gemm2_bias=None,
+                output1_scale_scalar=L.out1_scale,
+                output1_scale_gate_scalar=L.out1_gate_scale,
+                output2_scale_scalar=L.out2_scale,
+                num_experts=core.num_experts,
+                top_k=core.topk,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=core.moe_inter,
+                local_expert_offset=0,
+                local_num_experts=core.num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=_ROUTING_METHOD_RENORM,
+                do_finalize=True,
+                act_type=_ACT_TYPE_SWIGLU,
+                topk_weights=topk_w,
+                topk_ids=topk_ids,
+            )[0]
         shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, L.sh_gu)), L.sh_dn)
         gate_logits = cublas_mm(x, L.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
@@ -2422,6 +2551,13 @@ class PrefillTarget:
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
+        # The CuteDSL routed output, shared by all layers: each layer's unpermute rewrites
+        # every row, and the post-inject consumes it before the next layer's MoE starts.
+        routed_out = (
+            torch.empty([num_tokens, core.hidden], dtype=dt, device=dev)
+            if core.trunk_moe_backend == "CUTEDSL"
+            else None
+        )
 
         # The embedding repeated across the hc_count residual streams.
         hc_count = core.hc_count
@@ -2442,7 +2578,7 @@ class PrefillTarget:
             mixed, inject = qwen4_exp_gated_residual(
                 self._grouped_norm(hc, L.mhc_norm), L.mhc_down, L.mhc_up, L.mhc_inject, hc_count
             )
-            hc = qwen4_exp_post_inject(hc, self._moe_block(mixed, L, dt), inject)
+            hc = qwen4_exp_post_inject(hc, self._moe_block(mixed, L, dt, routed_out), inject)
         # The stack-final mixer with no injection weight is the final norm.
         S = self._stack
         final, _ = qwen4_exp_gated_residual(
@@ -2737,44 +2873,112 @@ class DecodeTarget:
             [flashinfer_gemma_rmsnorm(part, w, core.eps) for w, part in zip(weights, parts)], 1
         )
 
-    def _moe_block(self, x: torch.Tensor, L: _LayerWeights, dt: torch.dtype) -> torch.Tensor:
+    def _moe_block(
+        self, x: torch.Tensor, L: _LayerWeights, dt: torch.dtype, routed_out: torch.Tensor | None
+    ) -> torch.Tensor:
         """See `PrefillTarget._moe_block`."""
         core = self.core
         # The routing op reads logits from data_ptr() ignoring strides.
         logits = cublas_mm(x, L.router)
-        topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
-        xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-        routed = fp4_block_scale_moe_runner(
-            routing_logits=None,
-            routing_bias=None,
-            hidden_states=xq,
-            hidden_states_scale=xsf.view(torch.float8_e4m3fn),
-            gemm1_weights=L.fc1_w,
-            gemm1_weights_scale=L.fc1_s,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=L.fc2_w,
-            gemm2_weights_scale=L.fc2_s,
-            gemm2_bias=None,
-            output1_scale_scalar=L.out1_scale,
-            output1_scale_gate_scalar=L.out1_gate_scale,
-            output2_scale_scalar=L.out2_scale,
-            num_experts=core.num_experts,
-            top_k=core.topk,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=core.moe_inter,
-            local_expert_offset=0,
-            local_num_experts=core.num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=_ROUTING_METHOD_RENORM,
-            do_finalize=True,
-            act_type=_ACT_TYPE_SWIGLU,
-            topk_weights=topk_w,
-            topk_ids=topk_ids,
-        )[0]
+        if core.trunk_moe_backend == "CUTEDSL":
+            # fp32 weights: the dtype the unpermute scales by.
+            topk_ids, topk_w = renorm_moe_routing_op(
+                logits, topk=core.topk, output_dtype=torch.float32
+            )
+            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
+            # The sort pads each expert's (token, expert) pairs to whole tiles and emits
+            # the tile tables both GEMMs walk.
+            tile_expert, tile_limit, expanded_to_permuted, permuted_to_expanded, _, live_tiles = (
+                moe_sort(
+                    token_selected_experts=topk_ids,
+                    token_final_scales=topk_w,
+                    num_experts=core.num_experts,
+                    top_k=core.topk,
+                    local_expert_offset=0,
+                    local_num_experts=core.num_experts,
+                    tile_tokens_dim=_CUTEDSL_TILE_SIZE,
+                )
+            )
+            # FC1 gathers its rows from the unpermuted activation, applies SwiGLU and
+            # requantizes with the layer's one FC2 input scale. `fp4_quantize` returns the
+            # linear scales flat; the GEMM reads them as [T, hidden / 16].
+            h, h_sf = cute_dsl_nvfp4_gather_grouped_gemm_act_fusion(
+                input=xq.view(torch.float4_e2m1fn_x2),
+                weight=L.fc1_w,
+                input_scale=xsf.view(x.shape[0], core.hidden // _SF_VEC),
+                weight_scale=L.fc1_s,
+                alpha=L.alpha1,
+                tile_idx_to_group_idx=tile_expert,
+                tile_idx_to_mn_limit=tile_limit,
+                permuted_idx_to_expanded_idx=permuted_to_expanded,
+                num_non_exiting_tiles=live_tiles,
+                global_sf=L.global_sf,
+                num_experts=core.num_experts,
+                top_k=core.topk,
+                num_local_experts=core.num_experts,
+                local_expert_offset=0,
+                tile_size=_CUTEDSL_TILE_SIZE,
+                scaling_vector_size=_SF_VEC,
+                activation_type=int(ActivationType.Swiglu),
+            )
+            # FC2 writes one bf16 row per permuted row; the unpermute writes every row of
+            # `routed_out` as the routing-weighted sum of its token's top-k rows.
+            y = cute_dsl_nvfp4_grouped_gemm(
+                input=h,
+                weight=L.fc2_w,
+                input_scale=h_sf,
+                weight_scale=L.fc2_s,
+                alpha=L.alpha2,
+                tile_idx_to_group_idx=tile_expert,
+                num_non_exiting_tiles=live_tiles,
+                num_experts=core.num_experts,
+                top_k=core.topk,
+                num_local_experts=core.num_experts,
+                local_expert_offset=0,
+                tile_size=_CUTEDSL_TILE_SIZE,
+                output_dtype=torch.bfloat16,
+                scaling_vector_size=_SF_VEC,
+            )
+            routed = moe_unpermute_inplace(
+                permuted_input=y,
+                output=routed_out,
+                expanded_idx_to_permuted_idx=expanded_to_permuted,
+                topk_scales=topk_w,
+            )
+        else:
+            topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
+            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
+            routed = fp4_block_scale_moe_runner(
+                routing_logits=None,
+                routing_bias=None,
+                hidden_states=xq,
+                hidden_states_scale=xsf.view(torch.float8_e4m3fn),
+                gemm1_weights=L.fc1_w,
+                gemm1_weights_scale=L.fc1_s,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=L.fc2_w,
+                gemm2_weights_scale=L.fc2_s,
+                gemm2_bias=None,
+                output1_scale_scalar=L.out1_scale,
+                output1_scale_gate_scalar=L.out1_gate_scale,
+                output2_scale_scalar=L.out2_scale,
+                num_experts=core.num_experts,
+                top_k=core.topk,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=core.moe_inter,
+                local_expert_offset=0,
+                local_num_experts=core.num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=_ROUTING_METHOD_RENORM,
+                do_finalize=True,
+                act_type=_ACT_TYPE_SWIGLU,
+                topk_weights=topk_w,
+                topk_ids=topk_ids,
+            )[0]
         shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, L.sh_gu)), L.sh_dn)
         gate_logits = cublas_mm(x, L.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
@@ -3261,6 +3465,13 @@ class DecodeTarget:
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
+        # The CuteDSL routed output, shared by all layers: each layer's unpermute rewrites
+        # every row, and the post-inject consumes it before the next layer's MoE starts.
+        routed_out = (
+            torch.empty([num_tokens, core.hidden], dtype=dt, device=dev)
+            if core.trunk_moe_backend == "CUTEDSL"
+            else None
+        )
 
         # The embedding repeated across the hc_count residual streams.
         hc_count = core.hc_count
@@ -3281,7 +3492,7 @@ class DecodeTarget:
             mixed, inject = qwen4_exp_gated_residual(
                 self._grouped_norm(hc, L.mhc_norm), L.mhc_down, L.mhc_up, L.mhc_inject, hc_count
             )
-            hc = qwen4_exp_post_inject(hc, self._moe_block(mixed, L, dt), inject)
+            hc = qwen4_exp_post_inject(hc, self._moe_block(mixed, L, dt, routed_out), inject)
         # The stack-final mixer with no injection weight is the final norm.
         S = self._stack
         final, _ = qwen4_exp_gated_residual(

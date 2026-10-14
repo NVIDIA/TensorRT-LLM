@@ -248,3 +248,30 @@ def test_the_table_declares_what_the_init_block_did(mtp):
     )
     wrong = {k: (got[k], want[k]) for k in got if got[k] != want[k]}
     assert not wrong, list(wrong.items())[:8]
+
+
+def test_cutedsl_fc1_pairs_up_and_gate_rows_in_64_row_groups():
+    """Destination rows `[128k, 128k + 64)` hold up rows `[64k, 64k + 64)` and the next 64
+    hold the matching gate rows, which sit `I` rows later in the `[up ; gate]` stack."""
+    inter = _TEXT["moe_intermediate_size"]
+    core = SimpleNamespace(trunk_moe_backend="CUTEDSL")
+    perm = W._fc1_perm(2 * inter, "cpu", core)
+    assert sorted(perm.tolist()) == list(range(2 * inter))
+    for k in range(inter // 64):
+        assert perm[128 * k : 128 * k + 64].tolist() == list(range(64 * k, 64 * k + 64))
+        assert perm[128 * k + 64 : 128 * k + 128].tolist() == list(
+            range(inter + 64 * k, inter + 64 * k + 64)
+        )
+
+
+def test_cutedsl_fc2_keeps_the_checkpoint_row_order_and_trtllm_gen_shuffles_it():
+    """trtllm-gen's 32-row block shuffle moves source row `4u + v` to destination row
+    `8v + u`; CuteDSL reads `down_proj` as the checkpoint stores it."""
+    rows = torch.arange(64).unsqueeze(1).expand(64, 8).contiguous()
+    kept = W._expert_fc2_w(rows, SimpleNamespace(trunk_moe_backend="CUTEDSL"))
+    assert torch.equal(kept, rows)
+    shuffled = W._expert_fc2_w(rows, SimpleNamespace(trunk_moe_backend="TRTLLM"))
+    for u in range(8):
+        for v in range(4):
+            assert int(shuffled[8 * v + u, 0]) == 4 * u + v
+            assert int(shuffled[32 + 8 * v + u, 0]) == 32 + 4 * u + v
