@@ -14,7 +14,7 @@
 # limitations under the License.
 """CPU-only CuTe DSL compile helper for ``jit_prefetch.py``. Run as a script.
 
-    jit_prefetch_cute_dsl_helper.py <gpu_arch> <out_dir>
+    jit_prefetch_cute_dsl_helper.py <gpu_arch> <out_dir> [<device props JSON>]
 
 Reads one JSON request per stdin line, ``{"tag": int, "spec": str}``, and
 writes ``{"tag": int, "ok": bool, "s": float, "err": str, "built": bool}``.
@@ -25,7 +25,9 @@ The process has no visible GPU and launches nothing. Kernel arguments are
 CuTe fake tensors with the layout the real call passes, the target arch is
 explicit (``--gpu-arch``), and the result is exported with ``export_to_c`` to
 ``<out_dir>/<key>.o``, which the executor loads with
-``cute.runtime.load_module`` instead of compiling.
+``cute.runtime.load_module`` instead of compiling. Device properties that
+kernel constructors read on the host (shared memory per block, SM version)
+come from the executor's device, passed as the third argument.
 """
 
 import glob
@@ -53,6 +55,7 @@ def _preload_runtime():
 
 def main():
     gpu_arch, out_dir = sys.argv[1:3]
+    props = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
     os.makedirs(out_dir, exist_ok=True)
     # Libraries loaded below (UCX via tensorrt_llm, CuTe DSL) print to fd 1.
     # Keep the protocol on a private copy of stdout; send fd 1 to stderr.
@@ -61,6 +64,9 @@ def main():
     sys.stdout = sys.stderr
     _preload_runtime()
     from tensorrt_llm._torch import jit_prefetch_cute_dsl as jcd
+
+    if props:
+        jcd.install_device_shim(props)
 
     out.write(json.dumps({"ready": True}) + "\n")
     out.flush()

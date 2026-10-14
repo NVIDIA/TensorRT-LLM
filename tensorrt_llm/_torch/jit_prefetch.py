@@ -744,21 +744,18 @@ class JitPrefetcher:
             self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND)
         self.stats.plan_s += time.perf_counter() - t0
 
-    def enable_cute_dsl(self, kda_provider) -> bool:
-        """Start CuTe DSL helpers and install the executor-side loader.
-
-        Helpers compile from fake tensors for this rank's arch and export
-        ``<dir>/<key>.o``; at the point the KDA op would call ``cute.compile``
-        the loader loads that file instead, waiting for an in-flight helper
-        compile of the same variant rather than compiling it again.
-        """
+    def _start_cute_dsl_helpers(self) -> bool:
+        """Start the CuTe DSL helper pool once (shared by every CuTe DSL
+        provider). Returns False if prefetch is off."""
+        import json as _json
         import sys
 
         from . import jit_prefetch_cute_dsl as jcd
-        from .custom_ops import cute_dsl_kimi_k3_custom_ops as kda_ops
 
-        if not self.prefetch or self._cd is not None or not kda_provider:
+        if not self.prefetch:
             return False
+        if self._cd_dir is not None:
+            return True
         out_dir = os.environ.get("TLLM_JIT_CUTE_DSL_DIR") or os.path.join(
             os.environ.get("TRITON_CACHE_DIR") or os.path.expanduser("~/.cache"),
             "..",
@@ -781,40 +778,80 @@ class JitPrefetcher:
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_cute_dsl_helper.py"
         )
-        # Each compile is seconds and the variant set is tiny: a few helpers.
+        # Each compile is 0.2 s to seconds and the variant set is small.
         n = max(1, int(os.environ.get("TLLM_JIT_PREFETCH_CD_WORKERS", "2")))
         self._queues[jcd.KIND] = queue.PriorityQueue()
-        self._spawn(jcd.KIND, [sys.executable, "-u", helper, jcd.gpu_arch(), out_dir], env, n)
+        props = _json.dumps(jcd.device_props())
+        self._spawn(
+            jcd.KIND, [sys.executable, "-u", helper, jcd.gpu_arch(), out_dir, props], env, n
+        )
+        self._event(f"CuTe DSL helpers: {n}, exporting to {out_dir}")
+        return True
+
+    def _cute_dsl_load(self, spec: str):
+        """Executor side: the helper-exported kernel for ``spec``, waiting for
+        a helper compile of it already in flight; None to compile in place."""
+        from . import jit_prefetch_cute_dsl as jcd
+
+        ev = self._key_event.get(spec)
+        if ev is not None and not ev.is_set():
+            self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
+            wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
+            t0 = time.perf_counter()
+            ev.wait(wait_timeout_s)
+            dt = time.perf_counter() - t0
+            self.stats.wait_n += 1
+            self.stats.wait_s += dt
+            self._event(f"WAIT for helper cute_dsl {dt * 1e3:.0f} ms")
+        fn = jcd.load(spec, self._cd_dir)
+        if fn is None:
+            # The compile that follows is counted by the cute.compile wrapper.
+            if threading.get_ident() == self._executor_thread:
+                self._event(f"CuTe DSL variant not prefetched: {spec}")
+        else:
+            self.stats.cd_loaded += 1
+        return fn
+
+    def enable_cute_dsl(self, kda_provider) -> bool:
+        """Start CuTe DSL helpers and install the KDA K123 loader.
+
+        Helpers compile from fake tensors for this rank's arch and export
+        ``<dir>/<key>.o``; at the point the KDA op would call ``cute.compile``
+        the loader loads that file instead, waiting for an in-flight helper
+        compile of the same variant rather than compiling it again.
+        """
+        from . import jit_prefetch_cute_dsl as jcd
+        from .custom_ops import cute_dsl_kimi_k3_custom_ops as kda_ops
+
+        if self._cd is not None or not kda_provider or not self._start_cute_dsl_helpers():
+            return False
         self._cd = kda_provider
-        wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
 
         def _loader(cache_key):
             spec = jcd.k123_spec_from_cache_key(cache_key)
-            if spec is None:
-                return None
-            ev = self._key_event.get(spec)
-            if ev is not None and not ev.is_set():
-                self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
-                t0 = time.perf_counter()
-                ev.wait(wait_timeout_s)
-                dt = time.perf_counter() - t0
-                self.stats.wait_n += 1
-                self.stats.wait_s += dt
-                self._event(f"WAIT for helper cute_dsl {dt * 1e3:.0f} ms")
-            fn = jcd.load(spec, out_dir)
-            if fn is None:
-                # The compile that follows is counted by the cute.compile wrapper.
-                if threading.get_ident() == self._executor_thread:
-                    self._event(f"CuTe DSL variant not prefetched: {spec}")
-            else:
-                self.stats.cd_loaded += 1
-            return fn
+            return None if spec is None else self._cute_dsl_load(spec)
 
         kda_ops.k123_loader = _loader
         for spec in kda_provider.enumerate_specs():
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s)")
+        return True
+
+    def enable_flashinfer_norm(self, norm_provider) -> bool:
+        """Compile FlashInfer's CuTe DSL norm variants in the CuTe DSL helpers
+        and have FlashInfer's compiled-kernel getters load them."""
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if not norm_provider or not self._start_cute_dsl_helpers():
+            return False
+        wrapped = jcd.install_flashinfer_norm_loader(self._cute_dsl_load)
+        if not wrapped:
+            return False
+        for spec in norm_provider.enumerate_specs():
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
         self._event(
-            f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s), {n} helper(s), {out_dir}"
+            f"FlashInfer norm prefetch: {len(norm_provider.shapes)} norm shape(s), "
+            f"{len(norm_provider.specs)} variant(s)"
         )
         return True
 

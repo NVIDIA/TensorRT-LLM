@@ -1107,6 +1107,9 @@ class PyTorchModelEngine(ModelEngine):
             kda_provider = jcd.KdaPrefillProvider(self.model)
             if kda_provider:
                 prefetcher.enable_cute_dsl(kda_provider)
+            norm_provider = jcd.FlashInferNormProvider(self.model)
+            if norm_provider:
+                prefetcher.enable_flashinfer_norm(norm_provider)
         from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
         la_provider = LinearAttnProvider(
             self.model,
@@ -1122,6 +1125,12 @@ class PyTorchModelEngine(ModelEngine):
                 DsaDecodeMetadataProvider
             prefetcher.register("dsa_decode_metadata",
                                 DsaDecodeMetadataProvider(self.batch_size))
+        from ..attention.backends.sparse.glm_kpool import kernels as kpool_kernels
+        if kpool_kernels.KPOOL_LAUNCH_TEMPLATE:
+            from ..attention.backends.sparse.glm_kpool.jit_prefetch import \
+                GlmKpoolProvider
+            prefetcher.register("glm_kpool",
+                                GlmKpoolProvider(self.max_num_tokens))
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,

@@ -19,19 +19,28 @@ warm a cache the executor reads. Instead the helper compiles the variant from
 fake tensors with the real call's layout and an explicit ``--gpu-arch``,
 exports it (``export_to_c``) to ``<dir>/<key>.o``, and the executor, at the
 point it would call ``cute.compile``, loads that file with
-``cute.runtime.load_module``: a ~1 ms load replaces a multi-second compile.
+``cute.runtime.load_module``: a ~1 ms load replaces a compile of 0.2 s to
+several seconds.
 
-The first kernel covered is the fused K1+K2+K3 kernel of Kimi K3's KDA
-prefill (``_launch_fused_k123_inv``). Its compiled form depends only on
-constexpr specializers (heads, varlen, bias, safe gate, beta sigmoid, chunk
-alignment ``varlen_pure``, cu/ci dtypes); shapes are runtime arguments. A
-process therefore needs at most a handful of variants, and which one a batch
-needs is known on the host before the forward pass (whether every context
-chunk length is a multiple of 64).
+Covered kernels, each a builder in ``_BUILDERS``:
+
+* the fused K1+K2+K3 kernel of Kimi K3's KDA prefill
+  (``_launch_fused_k123_inv``). Its compiled form depends only on constexpr
+  specializers (heads, varlen, bias, safe gate, beta sigmoid, chunk alignment
+  ``varlen_pure``, cu/ci dtypes); shapes are runtime arguments, and which
+  variant a batch needs is known on the host before the forward pass.
+* FlashInfer's CuTe DSL RMSNorm and fused add + RMSNorm (TVM-FFI kernels).
+  The compiled form depends on dtype, hidden size, weight bias, PDL, SM
+  version and whether the rows are contiguous (``flashinfer.norm``'s own
+  cache key); every combination an engine's norm layers can reach is
+  enumerated once from the model.
 
 A spec is canonical JSON naming the kernel and its compile-time arguments;
 its SHA-1 is the file name, so helper and executor agree without sharing
-state.
+state. The helper runs with no visible GPU: the few device properties kernel
+constructors read (shared memory per block, SM version) are taken from the
+executor's device and answered by a shim (``device_props`` /
+``install_device_shim``).
 """
 
 # No ``from __future__ import annotations``: CuTe DSL reads the scalar
@@ -40,10 +49,12 @@ state.
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Optional
+import types
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 KIND = "cute_dsl"
 _K123 = "kda_fused_k123"
+_FI_NORM = "flashinfer_norm"
 _BT = 64
 _K_DIM = 128
 
@@ -96,6 +107,36 @@ def k123_spec_from_cache_key(cache_key: tuple) -> Optional[str]:
     )
 
 
+def fi_norm_spec(
+    op: str,
+    dtype_str: str,
+    H: int,
+    weight_bias: float,
+    enable_pdl: bool,
+    sm_version: int,
+    contiguous: bool,
+) -> str:
+    """Spec for one FlashInfer CuTe DSL norm variant.
+
+    ``op`` is ``"rmsnorm"`` or ``"fused_add_rmsnorm"``; the other fields are
+    the arguments of FlashInfer's ``_get_compiled_<op>_kernel`` getter, which
+    is FlashInfer's own cache key for the compiled kernel.
+    """
+    return json.dumps(
+        {
+            "kernel": _FI_NORM,
+            "op": op,
+            "dtype": dtype_str,
+            "H": int(H),
+            "weight_bias": float(weight_bias),
+            "pdl": bool(enable_pdl),
+            "sm": int(sm_version),
+            "contiguous": bool(contiguous),
+        },
+        sort_keys=True,
+    )
+
+
 def _cutlass_int(name: str):
     import cutlass
 
@@ -103,7 +144,7 @@ def _cutlass_int(name: str):
 
 
 def _build_k123(s: Dict[str, Any]):
-    """Return (host_fn, fake_args) for one varlen K123 variant.
+    """Return (host_fn, fake_args, compile_options) for one varlen K123 variant.
 
     The fake tensors reproduce the layouts ``_launch_fused_k123_inv`` passes:
     q/k/g [1, T, H, K] bf16, beta [1, T, H], scratch buffers from
@@ -182,10 +223,61 @@ def _build_k123(s: Dict[str, Any]):
         cutlass.Int32(T),
         cute.runtime.make_fake_stream(),
     ]
-    return host_fn, args
+    return host_fn, args, ""
 
 
-_BUILDERS = {_K123: _build_k123}
+def _build_fi_norm(s: Dict[str, Any]):
+    """Return (kernel, fake_args, compile_options) for one FlashInfer norm.
+
+    The kernel object and fake tensors are built exactly as FlashInfer's
+    ``_get_compiled_rmsnorm_kernel`` / ``_get_compiled_fused_add_rmsnorm_kernel``
+    build them (row count symbolic, compact or symbolically strided rows), so
+    the export has the same TVM-FFI signature as the kernel FlashInfer would
+    compile.
+    """
+    import math
+
+    import cutlass.cute as cute
+    from cutlass import Float32, Int64
+    from flashinfer.norm.utils import get_cutlass_dtype
+
+    dtype = get_cutlass_dtype(s["dtype"])
+    H, contiguous = s["H"], s["contiguous"]
+    if s["op"] == "rmsnorm":
+        from flashinfer.norm.kernels.rmsnorm import RMSNormKernel as Kernel
+    elif s["op"] == "fused_add_rmsnorm":
+        from flashinfer.norm.kernels.fused_add_rmsnorm import FusedAddRMSNormKernel as Kernel
+    else:
+        raise ValueError(f"unknown FlashInfer norm op {s['op']!r}")
+    kernel_obj = Kernel(dtype, H, s["weight_bias"], sm_version=s["sm"])
+    sym_m = cute.sym_int(64)
+    if contiguous:
+        align = math.gcd(128, H * (dtype.width // 8))
+
+        def row_tensor():
+            return cute.runtime.make_fake_compact_tensor(
+                dtype, (sym_m, H), stride_order=(1, 0), assumed_align=align
+            )
+    else:
+
+        def row_tensor():
+            stride = cute.sym_int64(divisibility=kernel_obj.vec_size)
+            return cute.runtime.make_fake_tensor(dtype, (sym_m, H), (stride, 1), assumed_align=16)
+
+    a, b = row_tensor(), row_tensor()
+    w = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    if s["op"] == "rmsnorm":
+        args = [a, w, b]  # (input, weight, out)
+    else:
+        args = [a, b, w]  # (input, residual, weight)
+    args += [Int64(1), Float32(1e-6), s["pdl"], stream]
+    return kernel_obj, args, "--enable-tvm-ffi"
+
+
+_BUILDERS = {_K123: _build_k123, _FI_NORM: _build_fi_norm}
+# Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
+_TVM_FFI = {_FI_NORM}
 
 
 def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
@@ -214,10 +306,18 @@ def _compile_export(spec: str, gpu_arch: str, out_dir: str, key: str, final: str
     import cutlass.cute as cute
 
     s = json.loads(spec)
-    host_fn, args = _BUILDERS[s["kernel"]](s)
-    compiled = cute.compile(host_fn, *args, options=f"--gpu-arch {gpu_arch}")
+    fn, args, options = _BUILDERS[s["kernel"]](s)
+    options = f"{options} --gpu-arch {gpu_arch}".strip()
+    compiled = cute.compile(fn, *args, options=options)
     tmp_name = f".{key}.{os.getpid()}"
-    compiled.export_to_c(out_dir, tmp_name, f"p{key}")
+    if s["kernel"] in _TVM_FFI:
+        compiled.export_to_c(
+            os.path.join(out_dir, f"{tmp_name}.o"),
+            function_name=f"p{key}",
+            export_only_tvm_ffi_symbols=True,
+        )
+    else:
+        compiled.export_to_c(out_dir, tmp_name, f"p{key}")
     os.replace(os.path.join(out_dir, f"{tmp_name}.o"), final)
     try:
         os.remove(os.path.join(out_dir, f"{tmp_name}.h"))
@@ -232,7 +332,8 @@ def load(spec: str, out_dir: str):
         return None
     import cutlass.cute as cute
 
-    return cute.runtime.load_module(path)[f"p{spec_key(spec)}"]
+    tvm_ffi = json.loads(spec)["kernel"] in _TVM_FFI
+    return cute.runtime.load_module(path, enable_tvm_ffi=tvm_ffi)[f"p{spec_key(spec)}"]
 
 
 def gpu_arch() -> str:
@@ -240,6 +341,32 @@ def gpu_arch() -> str:
 
     major, minor = torch.cuda.get_device_capability()
     return f"sm_{major}{minor}a"
+
+
+def device_props() -> Dict[str, Any]:
+    """The properties of the executor's device that kernel constructors read
+    on the host (passed to the helpers, which have no visible GPU)."""
+    import torch
+
+    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "major": p.major,
+        "minor": p.minor,
+        "multi_processor_count": p.multi_processor_count,
+        "shared_memory_per_block_optin": p.shared_memory_per_block_optin,
+        "name": p.name,
+    }
+
+
+def install_device_shim(props: Dict[str, Any]) -> None:
+    """In a helper process: answer the device queries of kernel constructors
+    (``torch.cuda.get_device_properties`` and friends) with ``props``."""
+    import torch
+
+    ns = types.SimpleNamespace(**props)
+    torch.cuda.get_device_properties = lambda device=None: ns
+    torch.cuda.current_device = lambda: 0
+    torch.cuda.get_device_capability = lambda device=None: (props["major"], props["minor"])
 
 
 class KdaPrefillProvider:
@@ -289,3 +416,112 @@ class KdaPrefillProvider:
 
     def enumerate_specs(self) -> List[str]:
         return self.specs(True) + self.specs(False)
+
+
+class FlashInferNormProvider:
+    """Every FlashInfer CuTe DSL RMSNorm variant the model's norm layers reach.
+
+    ``RMSNorm`` (``modules/rms_norm.py``) calls FlashInfer's rmsnorm, or its
+    fused add + RMSNorm when given a residual, for bf16/fp16 activations.
+    FlashInfer keys the compiled kernel on (dtype, hidden size, weight bias,
+    PDL, SM version, contiguous rows); a norm's hidden size and dtype are
+    fixed, and PDL and the SM version are fixed per process, so each layer
+    shape reaches at most four variants (plain or fused add, contiguous or
+    strided rows). All of them are enumerated up front; a batch adds nothing.
+    """
+
+    def __init__(self, model):
+        import torch
+
+        from .flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+        from .modules.rms_norm import RMSNorm
+
+        self.specs: List[str] = []
+        if not IS_FLASHINFER_AVAILABLE or not _flashinfer_norm_uses_cute_dsl():
+            return
+        from flashinfer.norm.utils import get_sm_version
+        from flashinfer.utils import device_support_pdl
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        pdl = bool(get_env_enable_pdl()) and device_support_pdl(device)
+        sm = get_sm_version(device)
+        shapes = set()
+        for mod in model.modules():
+            if not isinstance(mod, RMSNorm) or getattr(mod, "use_cuda_tile", False):
+                continue
+            weight = getattr(mod, "weight", None)
+            if weight is None or weight.dtype not in (torch.bfloat16, torch.float16):
+                continue
+            dtype_str = {torch.bfloat16: "bfloat16", torch.float16: "float16"}[weight.dtype]
+            bias = 1.0 if getattr(mod, "use_gemma", False) else 0.0
+            shapes.add((dtype_str, int(weight.shape[-1]), bias))
+        self.shapes = sorted(shapes)
+        for dtype_str, H, bias in self.shapes:
+            for op in ("rmsnorm", "fused_add_rmsnorm"):
+                for contiguous in (True, False):
+                    self.specs.append(fi_norm_spec(op, dtype_str, H, bias, pdl, sm, contiguous))
+
+    def __bool__(self):
+        return bool(self.specs)
+
+    def enumerate_specs(self) -> List[str]:
+        return list(self.specs)
+
+
+def _flashinfer_norm_uses_cute_dsl() -> bool:
+    """Whether FlashInfer's norm dispatch takes its CuTe DSL kernels here."""
+    try:
+        import torch
+        from flashinfer import norm as fi_norm
+    except ImportError:
+        return False
+    use_cuda = getattr(fi_norm, "_use_cuda_norm", None)
+    if use_cuda is None:
+        return False
+    return not use_cuda(torch.device("cuda", torch.cuda.current_device()))
+
+
+def install_flashinfer_norm_loader(
+    loader: Callable[[str], Optional[Callable]],
+) -> List[str]:
+    """Route FlashInfer's compiled-norm getters through ``loader``.
+
+    ``loader(spec)`` returns a helper-exported kernel, or None to let
+    FlashInfer compile it as usual. Each getter keeps FlashInfer's own cache
+    (``functools.cache``), so a variant is resolved once per process either
+    way. Returns the names of the getters that were wrapped.
+    """
+    wrapped = []
+    targets: List[Tuple[Any, str, str]] = []
+    try:
+        from flashinfer.norm.kernels import fused_add_rmsnorm as fa_mod
+        from flashinfer.norm.kernels import rmsnorm as rms_mod
+    except ImportError:
+        return wrapped
+    targets.append((rms_mod, "_get_compiled_rmsnorm_kernel", "rmsnorm"))
+    targets.append((fa_mod, "_get_compiled_fused_add_rmsnorm_kernel", "fused_add_rmsnorm"))
+    for module, name, op in targets:
+        orig = getattr(module, name, None)
+        if orig is None or getattr(orig, "_jitp_wrapped", False):
+            continue
+        inner = getattr(orig, "__wrapped__", orig)
+
+        def make(inner=inner, op=op):
+            import functools
+
+            @functools.cache
+            def getter(dtype_str, H, weight_bias, enable_pdl, sm_version, contiguous=True):
+                spec = fi_norm_spec(
+                    op, dtype_str, H, weight_bias, enable_pdl, sm_version, contiguous
+                )
+                fn = loader(spec)
+                if fn is not None:
+                    return fn
+                return inner(dtype_str, H, weight_bias, enable_pdl, sm_version, contiguous)
+
+            getter._jitp_wrapped = True
+            return getter
+
+        setattr(module, name, make())
+        wrapped.append(name)
+    return wrapped

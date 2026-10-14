@@ -132,6 +132,85 @@ def test_helper_export_is_what_the_op_runs(tmp_path, varlen_pure):
     assert loads == [True], f"op should load the export exactly once, got {loads}"
 
 
+def _helper_build(out_dir, specs):
+    """Run the CPU-only helper on ``specs``; return its replies."""
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
+    lines = "".join(json.dumps({"tag": i, "spec": s}) + "\n" for i, s in enumerate(specs))
+    res = subprocess.run(
+        [sys.executable, "-u", _HELPER, jcd.gpu_arch(), out_dir, json.dumps(jcd.device_props())],
+        input=lines,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    assert res.returncode == 0, res.stderr[-4000:]
+    replies = [json.loads(line) for line in res.stdout.splitlines() if line.startswith("{")]
+    assert replies[0] == {"ready": True}
+    return replies[1:]
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_flashinfer_norm_export_is_what_flashinfer_runs(tmp_path, contiguous):
+    """FlashInfer's RMSNorm and fused add + RMSNorm, compiled by the helper
+    (no visible GPU) and loaded through the wrapped getters, match FlashInfer's
+    own compile bitwise; the getters compile nothing."""
+    fi_norm = pytest.importorskip("flashinfer.norm")
+    from flashinfer.norm.kernels import fused_add_rmsnorm as fa_mod
+    from flashinfer.norm.kernels import rmsnorm as rms_mod
+
+    if fi_norm._use_cuda_norm(torch.device("cuda")):
+        pytest.skip("FlashInfer uses its CUDA norm kernels here")
+    from flashinfer.norm.utils import get_sm_version
+
+    H, eps = 7168, 1e-6
+    sm = get_sm_version(torch.device("cuda"))
+    specs = [
+        jcd.fi_norm_spec(op, "bfloat16", H, 0.0, True, sm, contiguous)
+        for op in ("rmsnorm", "fused_add_rmsnorm")
+    ]
+    out_dir = str(tmp_path / "aot")
+    replies = _helper_build(out_dir, specs)
+    assert all(r["ok"] and r["built"] for r in replies), replies
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    rows = 37
+    width = H if contiguous else 2 * H  # a strided row view: the first H columns
+
+    def rows_of(seed_tensor):
+        return seed_tensor.to(torch.bfloat16)[:, :H]
+
+    x_src = torch.randn(rows, width, generator=g, device="cuda")
+    r_src = torch.randn(rows, width, generator=g, device="cuda")
+    w = torch.randn(H, generator=g, device="cuda").to(torch.bfloat16)
+    assert rows_of(x_src).is_contiguous() is contiguous
+
+    def run():
+        out = fi_norm.rmsnorm(rows_of(x_src), w, eps, enable_pdl=True)
+        x, r = rows_of(x_src), rows_of(r_src)  # fresh copies, updated in place
+        fi_norm.fused_add_rmsnorm(x, r, w, eps, enable_pdl=True)
+        torch.cuda.synchronize()
+        return out, x, r
+
+    saved = (rms_mod._get_compiled_rmsnorm_kernel, fa_mod._get_compiled_fused_add_rmsnorm_kernel)
+    try:
+        ref = run()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, out_dir)
+            loads.append(fn is not None)
+            return fn
+
+        assert len(jcd.install_flashinfer_norm_loader(loader)) == 2
+        got = run()
+    finally:
+        rms_mod._get_compiled_rmsnorm_kernel, fa_mod._get_compiled_fused_add_rmsnorm_kernel = saved
+    assert loads == [True, True], loads
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+
+
 def test_provider_plans_the_variant_the_op_keys_on():
     p = jcd.KdaPrefillProvider(torch.nn.Module())
     p.cfgs = [(H, True, True)]
