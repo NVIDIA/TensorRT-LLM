@@ -15,11 +15,12 @@ from test_common.visual_gen_perf_history import (
 
 pytestmark = pytest.mark.cpu_only
 _PERF_DIR = Path(__file__).resolve().parents[3] / "tests/integration/defs/perf"
-_CLIENT_COMMIT = "6e1cc953c071b8a9055b03ef2ae4ee0bc4c645c4"
-_SERVER_COMMIT = "6e6f506077cb73818e608c8e00f513e1d5523b32"
+_CLIENT_COMMIT = "b" * 40
+_SERVER_COMMIT = "a" * 40
+_Modules = tuple[types.ModuleType, types.ModuleType, types.SimpleNamespace]
 
 
-def _row(commit: str, value: float, timestamp: str, **fields) -> dict:
+def _row(commit: str, value: float, timestamp: str, **fields: object) -> dict:
     return {
         "s_runtime": "visual_gen",
         "s_test_case_name": "flux2",
@@ -32,17 +33,30 @@ def _row(commit: str, value: float, timestamp: str, **fields) -> dict:
     }
 
 
-def test_old_window_is_excluded_even_with_a_new_date():
+def _client_row(value: float, timestamp: str, **fields: object) -> dict:
+    return _row(
+        _CLIENT_COMMIT,
+        value,
+        timestamp,
+        s_visual_gen_metric_contract=VISUAL_GEN_METRIC_CONTRACT,
+        **fields,
+    )
+
+
+def test_old_window_is_excluded_even_with_a_new_date() -> None:
     record = _row(_SERVER_COMMIT, 0.8554, "2026-10-14T00:00:00Z")
     assert transform_visual_gen_history(record) is None
 
 
-def test_existing_unversioned_client_history_is_reused():
+def test_unversioned_client_history_needs_explicit_backfill() -> None:
     record = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z")
+    assert transform_visual_gen_history(record) is None
+    record["s_visual_gen_metric_contract"] = VISUAL_GEN_METRIC_CONTRACT
     assert transform_visual_gen_history(record) == record
 
 
-def test_unknown_release_and_future_contract_are_not_inferred_from_dates():
+@pytest.mark.parametrize("contract", [None, "", "server_generation", "v3_other"])
+def test_missing_or_different_contract_is_excluded(contract: str | None) -> None:
     assert transform_visual_gen_history(_row("f" * 40, 0.94, "2026-10-14T00:00:00Z")) is None
     assert (
         transform_visual_gen_history(
@@ -50,14 +64,14 @@ def test_unknown_release_and_future_contract_are_not_inferred_from_dates():
                 _CLIENT_COMMIT,
                 0.94,
                 "2026-10-14T00:00:00Z",
-                s_visual_gen_metric_contract="v3_other",
+                s_visual_gen_metric_contract=contract,
             )
         )
         is None
     )
 
 
-def test_new_metadata_works_without_git_history():
+def test_new_metadata_works_without_git_history() -> None:
     record = _row(
         "f" * 40,
         0.94,
@@ -67,9 +81,8 @@ def test_new_metadata_works_without_git_history():
     assert transform_visual_gen_history(record) == record
 
 
-def test_mixed_baselines_are_removed_but_thresholds_and_raw_records_survive():
-    record = _row(
-        _CLIENT_COMMIT,
+def test_mixed_baselines_are_removed_but_thresholds_and_raw_records_survive() -> None:
+    record = _client_row(
         0.9433,
         "2026-09-14T00:00:00Z",
         d_baseline_median_generation=0.8554,
@@ -83,13 +96,13 @@ def test_mixed_baselines_are_removed_but_thresholds_and_raw_records_survive():
     assert record["d_baseline_median_generation"] == 0.8554
 
 
-def test_other_runtimes_keep_their_baseline():
+def test_other_runtimes_keep_their_baseline() -> None:
     record = {"s_runtime": "aggr_server", "d_baseline_token_throughput": 123.0}
     assert transform_visual_gen_history(record) == record
 
 
 @pytest.fixture
-def modules(monkeypatch):
+def modules(monkeypatch: pytest.MonkeyPatch) -> _Modules:
     """Load the real CPU logic while replacing only GPU/DB import dependencies."""
     defs = types.ModuleType("defs")
     defs.__path__ = []
@@ -122,11 +135,10 @@ def modules(monkeypatch):
     return loaded[0], loaded[1], search.OpenSearchDB
 
 
-def test_policy_applies_before_latest_baseline_and_exemption_selection(modules):
+def test_policy_applies_before_latest_baseline_and_exemption_selection(modules: _Modules) -> None:
     db, _, search = modules
     old = _row(_SERVER_COMMIT, 0.8554, "2026-10-14T00:00:00Z", d_baseline_median_generation=0.8554)
-    new = _row(
-        _CLIENT_COMMIT,
+    new = _client_row(
         0.9433,
         "2026-09-14T00:00:00Z",
         d_baseline_median_generation=0.8554,
@@ -144,7 +156,7 @@ def test_policy_applies_before_latest_baseline_and_exemption_selection(modules):
     assert baseline[0] == {"d_threshold_post_merge_median_generation": 0.05}
 
 
-def test_default_history_lookup_is_unchanged(modules):
+def test_default_history_lookup_is_unchanged(modules: _Modules) -> None:
     db, _, search = modules
     old = _row(_SERVER_COMMIT, 0.8554, "2026-10-14T00:00:00Z", d_baseline_median_generation=0.8554)
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old]
@@ -154,7 +166,7 @@ def test_default_history_lookup_is_unchanged(modules):
     assert history[0] == [old]
 
 
-def test_empty_compatible_history_and_db_failure_are_distinct(modules):
+def test_empty_compatible_history_and_db_failure_are_distinct(modules: _Modules) -> None:
     db, _, search = modules
     old = _row(_SERVER_COMMIT, 0.8554, "2026-10-14T00:00:00Z")
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old]
@@ -168,12 +180,13 @@ def test_empty_compatible_history_and_db_failure_are_distinct(modules):
 
 
 @pytest.mark.parametrize("post_merge", [False, True])
+@pytest.mark.parametrize("old_value", [0.8554, 1.2])
 def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
-    modules, monkeypatch, post_merge
-):
+    modules: _Modules, monkeypatch: pytest.MonkeyPatch, post_merge: bool, old_value: float
+) -> None:
     _, pipeline, search = modules
-    old = _row(_SERVER_COMMIT, 0.8554, "2026-09-11T00:00:00Z")
-    good = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z", d_baseline_median_generation=0.8554)
+    old = _row(_SERVER_COMMIT, old_value, "2026-10-14T00:00:00Z")
+    good = _client_row(0.9433, "2026-09-14T00:00:00Z", d_baseline_median_generation=0.8554)
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old, good]
     monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": post_merge})
     for value, should_fail in [(0.9433, False), (1.2, True)]:
@@ -201,7 +214,35 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
         assert current["b_is_regression"] == should_fail
 
 
-def test_producer_stamps_metadata_without_changing_match_keys(monkeypatch):
+@pytest.mark.parametrize("post_merge", [False, True])
+def test_untagged_history_bootstraps_without_mutating_stored_results(
+    modules: _Modules, monkeypatch: pytest.MonkeyPatch, post_merge: bool
+) -> None:
+    _, pipeline, search = modules
+    old = _row(_SERVER_COMMIT, 0.8554, "2026-09-11T00:00:00Z")
+    untagged_client = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z")
+    history = [old, untagged_client]
+    originals = [dict(record) for record in history]
+    search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: history
+    monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": post_merge})
+    current = _client_row(0.9433, "2026-10-14T00:00:00Z")
+    pipeline.process_and_upload_test_results(
+        new_data_dict={0: current},
+        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime"],
+        maximize_metrics=[],
+        minimize_metrics=["d_median_generation"],
+        regression_metrics=["d_median_generation"],
+        upload_to_db=False,
+        history_transform=transform_visual_gen_history,
+    )
+    assert current["b_is_regression"] is False
+    assert "baseline=0.9433" in current["s_regression_info"]
+    assert history == originals
+
+
+def test_producer_stamps_metadata_without_changing_match_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     commands = types.ModuleType("tensorrt_llm.commands.utils")
     commands.get_visual_gen_num_gpus = lambda config: 1
     monkeypatch.setitem(sys.modules, "tensorrt_llm.commands.utils", commands)
