@@ -132,7 +132,7 @@ class _DraftArgmaxMailbox:
                 return cls._instances[mapping]
             mailbox = None
             if (
-                1 < mapping.tp_size <= cls.WIDTH // 2
+                mapping.tp_size in (2, 4, 8, 16, 32, 64)
                 and mapping.world_size == mapping.tp_size
                 and not mapping.has_cp()
                 and not mapping.enable_attention_dp
