@@ -536,7 +536,18 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
             while (notifIt != notifs.end())
             {
                 std::stringstream ss(*notifIt);
-                NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
+                std::optional<NotificationInfo> notificationStorage;
+                try
+                {
+                    notificationStorage.emplace(NotificationInfo::deserialize(ss));
+                }
+                catch (std::exception const& e)
+                {
+                    TLLM_LOG_WARNING("Dropping malformed agent notification: %s", e.what());
+                    notifIt = notifs.erase(notifIt);
+                    continue;
+                }
+                auto const& notificationInfo = *notificationStorage;
                 bool erase = false;
                 if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
                 {
@@ -846,7 +857,18 @@ bool AgentConnectionManager::waitForNotification(
             while (notifIt != notifs.end())
             {
                 std::stringstream ss(*notifIt);
-                NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
+                std::optional<NotificationInfo> notificationStorage;
+                try
+                {
+                    notificationStorage.emplace(NotificationInfo::deserialize(ss));
+                }
+                catch (std::exception const& e)
+                {
+                    TLLM_LOG_WARNING("Dropping malformed agent notification: %s", e.what());
+                    notifIt = notifs.erase(notifIt);
+                    continue;
+                }
+                auto const& notificationInfo = *notificationStorage;
                 bool erase = false;
                 if constexpr (std::is_same_v<NotificationType, NotificationSyncInfo>)
                 {

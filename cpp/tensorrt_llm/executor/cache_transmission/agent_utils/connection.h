@@ -73,20 +73,14 @@ struct RequestAndBufferInfo
         auto requestInfo = batch_manager::RequestInfo::deserialize(is);
         auto bufferDescsSize = su::deserialize<decltype(mBufferDescs.size())>(is);
         std::vector<MemoryDesc> bufferDescs;
-        bufferDescs.reserve(bufferDescsSize);
+        TLLM_CHECK_WITH_INFO(bufferDescsSize <= bufferDescs.max_size(), "Invalid serialized buffer descriptor count");
         for (size_t i = 0; i < bufferDescsSize; i++)
         {
             bufferDescs.emplace_back(MemoryDesc::deserialize(is));
         }
         auto metadata = su::deserialize<decltype(mMetadata)>(is);
         auto validConnectionIdx = su::deserialize<decltype(mValidConnectionIdx)>(is);
-        auto bufferKindsSize = su::deserialize<size_t>(is);
-        std::vector<uint8_t> bufferKinds;
-        bufferKinds.reserve(bufferKindsSize);
-        for (size_t i = 0; i < bufferKindsSize; i++)
-        {
-            bufferKinds.push_back(su::deserialize<uint8_t>(is));
-        }
+        auto bufferKinds = su::deserialize<decltype(mBufferKinds)>(is);
         return RequestAndBufferInfo{
             agentName, address, requestInfo, bufferDescs, metadata, validConnectionIdx, bufferKinds};
     }

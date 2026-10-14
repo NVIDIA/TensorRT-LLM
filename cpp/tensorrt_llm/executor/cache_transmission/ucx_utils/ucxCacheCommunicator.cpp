@@ -438,7 +438,22 @@ UcxConnectionManager::UcxConnectionManager()
                     TLLM_CHECK_WITH_INFO(ret, "mZmqRepSocket.recv failed");
                     std::string recvMessage(static_cast<char*>(message.data()), message.size());
                     std::istringstream is(recvMessage);
-                    UcxCmMessage ucxCmessage = UcxCmMessage::deserialize(is);
+                    UcxCmMessage ucxCmessage(UcxCmMessage::MessageType::STOP, std::nullopt);
+                    try
+                    {
+                        ucxCmessage = UcxCmMessage::deserialize(is);
+                        TLLM_CHECK_WITH_INFO(ucxCmessage.mType == UcxCmMessage::MessageType::STOP
+                                || (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS
+                                    && ucxCmessage.mWorkerAddress.has_value()),
+                            "Invalid UCX connection message");
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_WARNING("Dropping malformed UCX connection message: %s", e.what());
+                        // REP sockets must reply before receiving the next message.
+                        mZmqRepSocket.send(zmq::message_t{}, zmq::send_flags::none);
+                        continue;
+                    }
 
                     if (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS)
                     {
