@@ -20,7 +20,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget
 
-# The one GPU architecture these targets are written for. sm is part of a
+# The GPU architecture the MXFP4 targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target. The K3
 # decode kernels (the tcgen05 GEMVs, the fused MoE) are built for GB200 only.
 _SM = (10, 0)
@@ -62,6 +62,35 @@ def _quant_algo(pretrained_config: Any) -> Optional[QuantAlgo]:
     except ValueError:
         return None
     return quant_config.quant_algo
+
+
+def _has_nvfp4_experts(pretrained_config: Any) -> bool:
+    """Require the mixed-precision checkpoint's explicit NVFP4 expert declarations."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    declared = getattr(pretrained_config, "quantization_config", None)
+    if declared is None:
+        return False
+    try:
+        global_quant, layers = ModelConfig.load_hf_quant_config(declared, "TRTLLM")
+    except ValueError:
+        return False
+    if global_quant.quant_algo != QuantAlgo.MIXED_PRECISION or not layers:
+        return False
+    for layer_idx in range(1, 93):
+        names = tuple(
+            f"{prefix}layers.{layer_idx}.{module}.experts"
+            for prefix in ("language_model.model.", "model.", "")
+            for module in ("block_sparse_moe", "mlp")
+        )
+        if any(global_quant.is_module_excluded_from_quantization(name) for name in names):
+            return False
+        matches = [layers[name] for name in names if name in layers]
+        if not matches or any(
+            quant.quant_algo != QuantAlgo.NVFP4 or quant.group_size != 16 for quant in matches
+        ):
+            return False
+    return True
 
 
 def _parallel(m) -> Optional[str]:
@@ -120,6 +149,18 @@ def route(
         compute_capability == _SM and shape == _SHAPE and quant_algo == QuantAlgo.W4A16_MXFP4
     )
 
+    if (
+        compute_capability == (10, 7)
+        and shape == _SHAPE
+        and parallel == "tp16_moetp4ep4"
+        and _has_nvfp4_experts(pretrained_config)
+    ):
+        from .kimi_k3_nvfp4__sm_107__tp16_moetp4ep4.modeling import (
+            ModelingV2KimiK3Nvfp4Sm107Tp16Moetp4ep4,
+        )
+
+        return ModelingV2KimiK3Nvfp4Sm107Tp16Moetp4ep4
+
     if mxfp4_on_sm100 and parallel == "tp16_moetp4ep4":
         from .kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (
             ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4,
@@ -142,5 +183,6 @@ def route(
         f"split_set={getattr(mapping, 'moe_tp_ep_user_specified', False)} "
         f"attention_dp={mapping.enable_attention_dp}; the kimi_k3_vl targets are the MXFP4 "
         "Kimi K3 checkpoint on sm100 (GB200), 16 ranks of tensor-parallel attention, with the "
-        "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1"
+        "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1; "
+        "and group-size-16 NVFP4 Kimi K3 on sm107 with tp16 attention and moe_tp 4 x moe_ep 4"
     )

@@ -1964,6 +1964,93 @@ def test_nvfp4_experts_match_situ_reference(moe_backend, input_scale):
     assert cosine > 0.95, f"cosine={cosine.item()}, rel_l2={rel_l2.item()}"
 
 
+@nvfp4_moe_supported
+@pytest.mark.parametrize("num_tokens", [1, 8, 33])
+def test_modeling_v2_nvfp4_streamed_moe_matches_reference(num_tokens: int) -> None:
+    """Exercise the target's loader and router without allocating the full K3 model."""
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp16_moetp4ep4 import (
+        modeling as target,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("The NVFP4 modeling_v2 target requires SM107")
+    torch.manual_seed(91)
+    cfg = _K3Config(
+        hidden_size=_TP_HIDDEN,
+        num_experts=_TP_EXPERTS,
+        moe_intermediate_size=_TP_INTERMEDIATE,
+        routed_expert_hidden_size=_TP_HIDDEN,
+        num_shared_experts=1,
+        latent_moe_use_norm=True,
+    )
+    pretrained = PretrainedConfig(**dataclasses.asdict(cfg), torch_dtype=torch.bfloat16)
+    config = ModelConfig(
+        pretrained_config=pretrained,
+        mapping=Mapping(),
+        moe_backend="TRTLLM",
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict={
+            "layers.1.mlp.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+        },
+    )
+    runtime = target.KimiK3MoERuntime(
+        config,
+        cfg,
+        layer_idx=1,
+        aux_stream_dict={kind: torch.cuda.Stream() for kind in AuxStreamType},
+    ).cuda()
+    gate = runtime.gate.float()
+    with torch.no_grad():
+        gate.weight.normal_(std=0.05)
+        gate.e_score_correction_bias.normal_(std=0.1)
+    x = torch.randn(num_tokens, _TP_HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.5
+    bank = []
+    for _ in range(_TP_EXPERTS):
+        w1, w3 = [
+            torch.randn(_TP_INTERMEDIATE, _TP_HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05
+            for _ in range(2)
+        ]
+        w2 = torch.randn_like(w1.t()) * 0.05
+        bank.append(_quantize_expert_to_nvfp4(w1, w2.contiguous(), w3, 1.0))
+
+    streamed = runtime.routed_experts
+    # A full model allocates mixed-precision weights in its post-init hook.
+    streamed.create_weights()
+    streamed.cuda()
+    backend = streamed.backend
+    assert "trtllm_gen" in type(backend).__module__
+    backend.quant_method.prepare_streaming_expert_load(backend)
+    spec = runtime.expert_ckpt_spec
+    checkpoint = {
+        f"experts.{expert}.{name}": tensor
+        for expert, tensors in enumerate(bank)
+        for name, tensor in tensors.items()
+    }
+    for expert in range(_TP_EXPERTS):
+        spec.loader(backend, "experts", expert, expert, checkpoint.__getitem__)
+    assert getattr(backend, spec.loaded_slots_attr) == set(range(_TP_EXPERTS))
+    backend.process_weights_after_loading()
+    streamed.post_load_weights()
+
+    whole = _make_nvfp4_moe(gate, moe_backend="TRTLLM")
+    _load_nvfp4_bank_for(whole, bank, "TRTLLM")
+    logits = gate.compute_logits(x)
+    actual = streamed(x, logits).float()
+    torch.testing.assert_close(actual, whole(x, logits).float(), rtol=0, atol=0)
+
+    dequantized = [_dequantize_expert_bank(expert) for expert in bank]
+    w1, w2, w3 = map(list, zip(*dequantized))
+    expected = _situ_reference_moe(
+        x, logits, gate.routing_method, w1, w2, w3, beta=4.0, linear_beta=25.0
+    )
+    relative_l2 = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected)
+    assert torch.isfinite(actual).all()
+    assert relative_l2 < _SITU_NVFP4_REL_L2_MAX, relative_l2.item()
+
+
 def _plain_swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3):
     """Same routing/geometry as the SiTU reference, but plain SwiGLU.
 

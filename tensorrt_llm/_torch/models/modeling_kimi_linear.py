@@ -3107,7 +3107,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             else:
                 attention = layer.self_attn.mixer
             for name, linear in attention.named_children():
-                if isinstance(linear, TrtllmLinear) and linear.has_fp8_block_scales:
+                if (
+                    isinstance(linear, TrtllmLinear)
+                    and linear.has_fp8_block_scales
+                    and not linear.use_cute_dsl_blockscaling_mm
+                    and not linear.disable_deep_gemm
+                ):
+                    # The weight-read specialization always uses DeepGEMM.
+                    # Preserve Linear when another GEMM backend was requested.
                     _swap_linear_to_fp8_weight_read(attention, name, (TrtllmLinear,))
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):

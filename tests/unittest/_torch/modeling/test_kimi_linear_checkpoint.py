@@ -229,7 +229,7 @@ def _model(
     quantized=None,
     alias="language_model.model.",
     excluded=None,
-    cute_mm=True,
+    cute_mm=False,
     q_lora_rank=128,
 ):
     cfg = SimpleNamespace(
@@ -609,3 +609,34 @@ def test_kda_small_checkpoint_fp8_projections_load_as_bf16(tp_size, tp_rank):
         assert isinstance(module, nn.Linear)
         assert module.weight.dtype == torch.bfloat16
         torch.testing.assert_close(module.weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="Kimi CuTe DSL checkpoint tests require SM100/SM103/SM107",
+)
+@pytest.mark.parametrize("kda", [True, False])
+def test_checkpoint_finalization_preserves_cute_dsl_backend(kda):
+    model = _model(kda=kda, cute_mm=True)
+    checkpoint = _checkpoint(model)
+    model.load_weights(checkpoint)
+    layer = model.model.layers[0]
+    attention = layer.linear_attn if kda else layer.self_attn.mixer
+    names = _KDA_PROJECTIONS[:5] if kda else _MLA_PROJECTIONS
+    for name in names:
+        module, _ = _projection(attention, name)
+        assert isinstance(module, Linear)
+        assert module.use_cute_dsl_blockscaling_mm
+    for module in model.modules():
+        if isinstance(module, Linear):
+            module.post_load_weights()
+    hidden = torch.randn(8, 256, dtype=torch.bfloat16, device="cuda")
+    if kda:
+        expected = torch.cat([getattr(attention, name)(hidden) for name in names[:4]], dim=-1)
+        assert torch.isfinite(expected).all()
+        if attention.qkvg_proj is not None:
+            torch.testing.assert_close(attention.qkvg_proj(hidden), expected, rtol=0.02, atol=0.02)
+    else:
+        assert torch.isfinite(attention.kv_a_proj_with_mqa(hidden)).all()
+        assert torch.isfinite(attention.kv_b_proj(hidden)).all()

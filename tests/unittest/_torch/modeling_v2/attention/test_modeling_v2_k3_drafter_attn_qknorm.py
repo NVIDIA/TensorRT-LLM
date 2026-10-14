@@ -7,9 +7,9 @@ import torch
 
 assert torch.cuda.is_available(), "k3_drafter_attn requires a CUDA device"
 
-if torch.cuda.get_device_capability() != (10, 0):
-    # The CuTe DSL kernel uses tcgen05, TMA and clusters; it is certified on sm_100 (B200 / GB200) only.
-    pytest.skip("k3_drafter_attn is certified on sm_100 only", allow_module_level=True)
+if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+    # The CuTe DSL kernel uses tcgen05, TMA and clusters on the K3 target architectures.
+    pytest.skip("k3_drafter_attn requires SM100 or SM107", allow_module_level=True)
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_drafter_attn_qknorm import (  # noqa: E402
     k3_drafter_attn_qknorm,

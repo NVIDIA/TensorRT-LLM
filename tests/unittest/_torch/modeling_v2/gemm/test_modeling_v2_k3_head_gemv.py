@@ -21,9 +21,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_head_gemv imp
 )
 
 assert torch.cuda.is_available(), "k3_head_gemv requires a CUDA device"
-# The receipts are sm_100 ones; CI's other architectures skip this file.
+# Exercise the original SM100 target and the NVFP4 SM107 target with the same references.
 pytestmark = pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 7)), reason="requires SM100 or SM107"
 )
 
 TOL = 8e-3  # max |y - ref| / max |ref|, ref an fp64 product
