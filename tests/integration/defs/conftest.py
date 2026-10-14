@@ -59,7 +59,8 @@ from .test_list_parser import (TestCorrectionMode, apply_waives,
 from .trt_test_alternative import (call, check_output, exists, is_windows,
                                    is_wsl, makedirs, print_info, print_warning,
                                    wsl_to_win_path)
-from .utils.periodic_junit import PeriodicJUnitXML
+from .utils.periodic_junit import (PeriodicJUnitXML,
+                                   register_pytest_timeout_evidence)
 
 try:
     from llm import trt_environment
@@ -1674,6 +1675,10 @@ def pytest_configure(config):
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
         os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
+    periodic = config.getoption("--periodic-junit", default=False)
+    if periodic:
+        register_pytest_timeout_evidence(config)
+
     # xdist worker processes must not register PeriodicJUnitXML: all worker
     # reports are forwarded to the controller via xdist and processed there,
     # so registering on workers causes concurrent writers to the same
@@ -1682,7 +1687,6 @@ def pytest_configure(config):
         return
 
     # Initialize PeriodicJUnitXML reporter if enabled
-    periodic = config.getoption("--periodic-junit", default=False)
     output_dir = config.getoption("--output-dir", default=None)
     periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
                                               default=None)
