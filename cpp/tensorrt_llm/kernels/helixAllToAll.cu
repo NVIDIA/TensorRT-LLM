@@ -539,6 +539,12 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             LL128Proto::protoUnpack(
                 shmem, tail, singlePacked128ByteCount, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
 
+            // protoUnpack restores the words displaced by the LL128 flags through the generic proxy. Make
+            // those writes visible to the async proxy before cp.async.bulk reads the same buffer for S2G;
+            // otherwise the store can copy a flag (the FIFO step) in place of a restored data word.
+            tensorrt_llm::common::fence_view_async_shared();
+            __syncwarp();
+
             // note: fields are already unpacked in shared memory
             s2gAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(params.recvFields, dataIndex, shmem, laneId);
             // wait for data to be read from shared memory

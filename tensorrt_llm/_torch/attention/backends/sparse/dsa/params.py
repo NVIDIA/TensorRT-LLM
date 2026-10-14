@@ -43,6 +43,7 @@ class DSAMetadataParams(SparseMetadataParams):
     mtp_index_share: bool = False
     use_self_sampling_topk: bool = True
     use_gvr_emission: bool = False
+    gvr_deterministic_topk: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,9 @@ class DSAParams(SparseParams):
     # Emission block-skip for the temporal-hint engine; only meaningful with
     # enable_heuristic_topk=True and use_self_sampling_topk=False on FP4.
     use_gvr_emission: bool = False
+    # Deterministic self-sampling GVR: repeatable index set and output order
+    # (only meaningful with enable_heuristic_topk=True, use_self_sampling_topk=True).
+    gvr_deterministic_topk: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True
