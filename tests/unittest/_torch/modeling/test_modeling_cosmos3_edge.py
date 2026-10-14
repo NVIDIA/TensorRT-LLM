@@ -41,6 +41,7 @@ def cosmos3_edge_checkpoint() -> str:
     return os.path.join(root, "Cosmos3-Edge")
 
 
+@pytest.mark.cpu_only
 def test_edge_mapper_drops_generator_weights_and_renames_reasoner_keys():
     mapper = Cosmos3EdgeHfWeightMapper()
     weights = {
@@ -97,6 +98,7 @@ def test_edge_mapper_drops_generator_weights_and_renames_reasoner_keys():
     assert len(mapped) == 12
 
 
+@pytest.mark.cpu_only
 def test_siglip_position_interpolation_keeps_packed_token_count():
     grid = 4
     hidden = 8
@@ -108,6 +110,7 @@ def test_siglip_position_interpolation_keeps_packed_token_count():
     assert packed.dtype == positional.dtype
 
 
+@pytest.mark.cpu_only
 def test_spatial_merge_packs_two_by_two_blocks():
     frames, height, width, hidden = 2, 4, 4, 3
     embeds = torch.arange(frames * height * width * hidden, dtype=torch.float32).reshape(
@@ -118,6 +121,7 @@ def test_spatial_merge_packs_two_by_two_blocks():
     assert merged.shape == (frames * (height // 2) * (width // 2), 2 * 2 * hidden)
 
 
+@pytest.mark.cpu_only
 def test_patch_merger_intermediate_width_is_optional():
     assert Qwen3VLVisionPatchMerger.__init__.__defaults__ is not None
     # (use_postshuffle_norm, merger_intermediate_size, norm_eps)
