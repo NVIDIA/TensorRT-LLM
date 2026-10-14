@@ -576,14 +576,6 @@ class SamplingParams:
             top_p_decay=self.top_p_decay,
         )
 
-    @property
-    def _need_return_context_logits(self) -> bool:
-        return self.return_context_logits
-
-    @property
-    def _need_return_generation_logits(self) -> bool:
-        return self.return_generation_logits
-
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
     ) -> "SamplingParams":

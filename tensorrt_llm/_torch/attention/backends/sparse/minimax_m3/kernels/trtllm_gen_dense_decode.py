@@ -219,11 +219,13 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     if get_pool is None or not layer_offsets:
         return 0
     is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
-    is_subpaged = getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _: False)
+    is_hybrid_draft = getattr(kv_cache_manager, "is_hybrid_draft_layer", lambda _: False)
+    # NVFP4 sparse layers and the hybrid draft layer (read through its own view)
+    # never read the staged table and may sit in pools with another factor.
     factors = {
         int(get_pool(layer_idx, "HND")[1])
         for layer_idx in layer_offsets
-        if not is_nvfp4(layer_idx) and not is_subpaged(layer_idx)
+        if not is_nvfp4(layer_idx) and not is_hybrid_draft(layer_idx)
     }
     return factors.pop() if len(factors) == 1 else 0
 

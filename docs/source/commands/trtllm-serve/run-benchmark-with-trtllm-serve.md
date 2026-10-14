@@ -289,7 +289,13 @@ curl -s -X POST http://127.0.0.1:8000/start_profile \
    :end-before: .. end-note-config-flag-alias
 ```
 
-`trtllm-serve` provides `--config` to **overwrite** the parameters specified by `trtllm-serve`.
+`trtllm-serve` provides `--config` for supplying LLM arguments that do not
+have dedicated command-line options. Explicit dedicated CLI flags override
+conflicting values in the YAML file. To override an individual YAML field
+without editing the file, use the repeatable `--set PATH=YAML_VALUE` option;
+`--set` has the highest precedence. See
+[Configuring with YAML Files and `--set`](./trtllm-serve.rst#configuring-with-yaml-files)
+for its supported scope and reserved paths.
 Generally, we create a YAML file that contains various performance switches. For example:
 
 ```yaml

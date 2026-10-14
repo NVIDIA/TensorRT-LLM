@@ -67,6 +67,24 @@ def _device():
     return _dev_mod
 
 
+_DET_SORTING = (None, "ascending")
+
+
+def _check_det_args(deterministic, sorting) -> bool:
+    if sorting not in _DET_SORTING:
+        raise ValueError(f"sorting must be one of {_DET_SORTING}, got {sorting!r}")
+    if sorting is not None and not deterministic:
+        raise ValueError("sorting requires deterministic=True")
+    return bool(deterministic)
+
+
+def _sort_rows(indices: torch.Tensor) -> None:
+    """Ascending in-place row sort; the -1 pads of short rows stay at the tail."""
+    pad = indices < 0
+    tmp = indices.masked_fill(pad, torch.iinfo(_I32).max).sort(dim=1).values
+    indices.copy_(tmp.masked_fill_(tmp == torch.iinfo(_I32).max, -1))
+
+
 # ===========================================================================
 # ==== dispatch =============================================================
 # ===========================================================================
@@ -770,17 +788,17 @@ def _prefill_bucket(n_env: int) -> int:
     return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
 
 
-def _prefill_cache_key(tier: int, k: int, n_bucket: int):
+def _prefill_cache_key(tier: int, k: int, n_bucket: int, det: bool = False):
     # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
     # to one key so warmup covers them with a single launch.
-    return (tier, k, n_bucket if tier == 0 else 0)
+    return (tier, k, n_bucket if tier == 0 else 0) + ((True,) if det else ())
 
 
-def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
+def _prefill_launcher(tier: int, k: int, n_bucket: int, det: bool = False) -> tuple:
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
     upper bounds; npad is filled per call in ``run_prefill``."""
-    key = _prefill_cache_key(tier, k, n_bucket)
+    key = _prefill_cache_key(tier, k, n_bucket, det)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -794,7 +812,9 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
         raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
     tpl = tuple(plan["tpl"])
     dev = _device()
-    fn = dev.get_compiled(tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True)
+    fn = dev.get_compiled(
+        tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True, det=det, fused_k=k
+    )
     big = tier == 0
     # r_const==1 branch of the _varlen_launcher tuning scalars
     aim_base = (
@@ -818,13 +838,14 @@ def _varlen_launcher(
     cr: int,
     num_sms: int = 148,
     sm_version: int = 100,
+    det: bool = False,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
     profile = _pack_device_profile(num_sms, sm_version)
-    key = (num_rows, npad, k, n_env, next_n, cr, profile)
+    key = (num_rows, npad, k, n_env, next_n, cr, profile) + ((True,) if det else ())
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -849,6 +870,7 @@ def _varlen_launcher(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            det=det,
         )
         lc = ("reg_clus", fn, n_kernel)
         _VARLEN_CACHE[key] = lc
@@ -867,6 +889,7 @@ def _varlen_launcher(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            det=det,
         )
         rt_f = plan_free["rt"]
         lc = (
@@ -893,6 +916,7 @@ def _varlen_launcher(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            det=det,
         )
         lc = (
             "clus",
@@ -908,7 +932,9 @@ def _varlen_launcher(
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True)
+    fn = dev.get_compiled(
+        tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True, det=det, fused_k=k
+    )
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -1185,14 +1211,14 @@ def _device_num_sms(dev_index: int) -> int:
 # ---------------------------------------------------------------------------
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
-def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
+def _build_launcher(b, n, npad, k, num_sms, sm_version=100, det=False):
     rd = route(b, n, npad, k, num_sms, sm_version)
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
     if fam in ("reg", "regimg"):
         dev = _device()
-        raw = dev.get_compiled__reg(tpl)
+        raw = dev.get_compiled__reg(tpl, det=det)
 
         # compiled ABI: (logits, pre_idx, kv_lens, out, n, CMP, QC,
         # smem_total) -- kv_lens is the dead varlen slot in batch-uniform
@@ -1204,7 +1230,7 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
         return (fn, args, False)
     if fam == "main":
         dev = _device()
-        raw = dev.get_compiled(tpl)
+        raw = dev.get_compiled(tpl, det=det, fused_k=k)
 
         # compiled ABI: (logits, pre_idx, out, ws, n, npad, k, SCAP_, CMP_,
         #                R, SMP, TGT, Q, SS2, TGT2,
@@ -1234,7 +1260,7 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
         # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
         #       TGT, Q, SS2, TGT2) -- NO workspace; kv_lens is the dead
         # varlen slot in batch-uniform mode (cached dummy tensor)
-        fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
+        fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"], det=det)
         args = (
             rt["n"],
             rt["npad"],
@@ -1257,7 +1283,7 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
         # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
         # dead varlen slot in batch-uniform mode (cached dummy tensor);
         # smem/k derived in-module
-        fn = dev.get_compiled__regclus(tpl)
+        fn = dev.get_compiled__regclus(tpl, det=det)
         n_arg = rt["n"]
 
         def _call(lg, pi, idx, _fn=fn, _n=n_arg):
@@ -1271,7 +1297,7 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
 # ---------------------------------------------------------------------------
 # shared implementation of the batch-uniform entries
 # ---------------------------------------------------------------------------
-def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
+def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None, det=False, sorting=None):
     if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
         raise RuntimeError("all tensors must be CUDA")
     if logits.dtype is not _F32:
@@ -1366,11 +1392,11 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
 
     dev_index = logits.get_device()
     profile = _device_profile_key(dev_index)
-    key = (b, n, npad, k, profile)
+    key = (b, n, npad, k, profile) + ((True,) if det else ())
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
         num_sms, sm_version = _unpack_device_profile(profile)
-        lc = _build_launcher(b, n, npad, k, num_sms, sm_version)
+        lc = _build_launcher(b, n, npad, k, num_sms, sm_version, **({"det": True} if det else {}))
         _LAUNCH_CACHE[key] = lc
     fn, args, needs_ws = lc
     try:
@@ -1380,6 +1406,8 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
             fn(logits, pre_idx, indices, *args)
     except Exception as e:
         raise RuntimeError(f"gvr_topk launch failed (b={b} n={n} npad={npad} k={k}): {e}") from e
+    if sorting == "ascending":
+        _sort_rows(indices)
     if values is not None:
         # same epilogue as run_varlen: a (never-expected) negative index
         # degrades to -FLT_MAX instead of a context-poisoning device assert
@@ -1397,6 +1425,8 @@ def run(
     n_valid: int,
     indices: torch.Tensor,
     values: torch.Tensor | None = None,
+    deterministic: bool = False,
+    sorting: str | None = None,
 ) -> None:
     """TESTING/BENCH ONLY — production callers must use ``run_varlen`` (per-request
     device kv_lens; this entry assumes one batch-uniform host ``n_valid``,
@@ -1414,7 +1444,8 @@ def run(
     ws = _ws_hot.get(d)
     if ws is None:
         ws = default_workspace(logits)
-    _run_impl(logits, pre_idx, n_valid, indices, ws, values)
+    det = _check_det_args(deterministic, sorting)
+    _run_impl(logits, pre_idx, n_valid, indices, ws, values, det, sorting)
 
 
 def run_ws(
@@ -1424,12 +1455,15 @@ def run_ws(
     indices: torch.Tensor,
     workspace: torch.Tensor,
     values: torch.Tensor | None = None,
+    deterministic: bool = False,
+    sorting: str | None = None,
 ) -> None:
     """TESTING/BENCH ONLY — production callers must use ``run_varlen(workspace=...)``.
 
     Explicit-workspace form for multi-stream callers."""
     validate_run_ws(workspace, logits)
-    _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
+    det = _check_det_args(deterministic, sorting)
+    _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values, det, sorting)
 
 
 def run_varlen(
@@ -1441,8 +1475,14 @@ def run_varlen(
     values: torch.Tensor | None = None,
     max_seq_len: int | None = None,
     workspace: torch.Tensor | None = None,
+    deterministic: bool = False,
+    sorting: str | None = None,
 ) -> None:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
+
+    ``deterministic=True`` selects the deterministic kernels (fixed selected set — ties broken by the
+    smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
+    every row (requires deterministic). The default path is the original kernel, unchanged.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1579,8 +1619,9 @@ def run_varlen(
         # R increment (bounded plans, bounded _VARLEN_CACHE)
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
+    det = _check_det_args(deterministic, sorting)
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile)
+    key = (num_rows, npad, k, n_env, nn, cr, profile) + ((True,) if det else ())
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -1588,7 +1629,9 @@ def run_varlen(
                 "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
             )
         num_sms, sm_version = _unpack_device_profile(profile)
-        lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, num_sms, sm_version)
+        lc = _varlen_launcher(
+            num_rows, npad, k, n_env, nn, cr, num_sms, sm_version, **({"det": True} if det else {})
+        )
     idx = indices
     if idx.shape[1] != k:
         idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -1610,6 +1653,8 @@ def run_varlen(
     else:
         _, fn, pre, tail = lc
         fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
+    if sorting == "ascending":
+        _sort_rows(idx)
     if vals is not None:
         idx64 = idx.to(torch.int64)
         vals.copy_(lg.gather(1, idx64.clamp_min(0)))
@@ -1624,11 +1669,15 @@ def run_prefill(
     indices: torch.Tensor,
     max_row_len: int | None = None,
     workspace: torch.Tensor | None = None,
+    deterministic: bool = False,
+    sorting: str | None = None,
 ) -> None:
     """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
     ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
     with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
-    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1]."""
+    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1].
+    ``deterministic`` / ``sorting`` as in ``run_varlen``."""
+    det = _check_det_args(deterministic, sorting)
     if logits.dtype is not _F32:
         raise RuntimeError(
             f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
@@ -1697,24 +1746,29 @@ def run_prefill(
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
         tier = _prefill_tier(r1 - r0, n_env, k)
-        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, det))
         if lc is None:
             if _is_capturing():
                 raise RuntimeError(
                     "prefill launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _prefill_launcher(tier, k, n_bucket)
+            lc = _prefill_launcher(tier, k, n_bucket, det)
         _, fn, (scap, cmp_), tail = lc
         # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
         # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
         pre = (0, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
         fn(lg[r0:r1], row_ends[r0:r1], indices[r0:r1], ws, *pre, row_starts[r0:r1], *tail)
+    if sorting is not None:
+        _sort_rows(indices)
     return
 
 
 def prefill_ready(
-    logits: torch.Tensor, indices: torch.Tensor, max_row_len: int | None = None
+    logits: torch.Tensor,
+    indices: torch.Tensor,
+    max_row_len: int | None = None,
+    deterministic: bool = False,
 ) -> bool:
     """True iff ``run_prefill(logits, ..., indices, max_row_len)`` would launch
     without compiling — the same (tier, k, envelope bucket) keys it looks up, so
@@ -1731,7 +1785,7 @@ def prefill_ready(
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
-        if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
+        if _prefill_cache_key(tier, k, n_bucket, bool(deterministic)) not in _PREFILL_CACHE:
             return False
     return True
 
@@ -1774,6 +1828,7 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    deterministic: bool = False,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -1857,6 +1912,7 @@ def warmup_varlen(
         tuple(rows_list),
         npad,
         profile,
+        bool(deterministic),
     )
     # The done key covers the GPU band launches only (one per engine compile
     # key). The exact-row launcher population below is keyed by the requested
@@ -1881,6 +1937,7 @@ def warmup_varlen(
                 next_n=nn,
                 compress_ratio=int(compress_ratio),
                 max_seq_len=int(max_seq_len),
+                deterministic=deterministic,
             )
         del logits, kv_lens, out
         torch.cuda.synchronize()
@@ -1899,6 +1956,7 @@ def warmup_varlen(
             int(compress_ratio),
             num_sms,
             sm_version,
+            det=deterministic,
         )
     if not bands_done:
         with _VARLEN_WARMUP_LOCK:
@@ -1914,6 +1972,7 @@ def warmup_prefill(
     max_cols: int,
     num_rows_list: Sequence[int] = (1, 149, 297),
     row_stride: int | None = None,
+    deterministic: bool = False,
 ) -> None:
     """Compile every prefill engine ``run_prefill`` can request before serving:
     the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
@@ -1937,8 +1996,14 @@ def warmup_prefill(
         for bk in buckets:
             for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
                 tier = _prefill_tier(int(rows), n_env, k)
-                keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk, n_env))
-    done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
+                keys.setdefault(_prefill_cache_key(tier, k, bk, deterministic), (tier, bk, n_env))
+    done_key = (
+        dev,
+        k,
+        max_cols,
+        tuple(sorted(int(r) for r in num_rows_list)),
+        row_stride,
+    ) + ((True,) if deterministic else ())
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
@@ -1951,7 +2016,7 @@ def warmup_prefill(
         ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
         ke = torch.full((rows,), n_env, dtype=torch.int32, device=dev)
         out = torch.empty((rows, k), dtype=torch.int32, device=dev)
-        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=n_env)
+        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=n_env, deterministic=deterministic)
         del logits, ks, ke, out
     torch.cuda.synchronize()
     with _PREFILL_WARMUP_LOCK:

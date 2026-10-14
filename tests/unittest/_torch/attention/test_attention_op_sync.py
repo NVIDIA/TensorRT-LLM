@@ -685,10 +685,10 @@ def test_no_sequence_kwargs_at_thop_attention_boundary():
 def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_cache, expected):
     """Do not dispatch requests that the native attention op rejects."""
     fmha = object.__new__(FallbackFmha)
-    # ``helix_position_offsets`` short-circuits the Helix verify-group check
-    # that runs first in ``_is_supported``; None is what the real metadata
-    # carries off the helix path.
-    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None)
+    # ``num_contexts=0`` skips the paged-context kernel gate and
+    # ``helix_position_offsets=None`` the Helix verify-group check; both are
+    # what the real metadata carries for a generation batch off the helix path.
+    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
     forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
 
     assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
@@ -697,7 +697,7 @@ def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_ca
 def test_fallback_rejects_raw_fp8_input():
     """Do not dispatch raw FP8 QKV to the native attention op."""
     fmha = object.__new__(FallbackFmha)
-    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None)
+    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
     forward_args = AttentionForwardArgs(update_kv_cache=True)
     q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
 

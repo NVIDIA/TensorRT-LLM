@@ -33,12 +33,7 @@ namespace kernels
 namespace
 {
 
-// Constants (fixed for DSV3.2 FP4 indexer: head_dim=128, per-block-32 quant).
-//
-// INV_FP4_E2M1_MAX / MIN_AMAX mirror DeepGEMM's per_token_cast_to_fp4 reference
-// (use_ue8m0=True, gran_k=32, use_packed_ue8m0=True) at
-// tensorrt_llm/deep_gemm/utils/math.py. Keep in sync with that helper when
-// bumping DeepGEMM — test_fused_cat_fp4_matches_deepgemm is the guard.
+// Constants for the FP4 indexer: 128-wide rows with block-32 UE8M0 scales.
 constexpr int HEAD_DIM = 128;
 constexpr int WARP_SIZE = 32;
 constexpr int ELEMS_PER_THREAD = 4;                           // 128 / 32 = 4 elements per thread.
@@ -57,13 +52,13 @@ union BF16x4
 };
 
 /// FP4 E2M1 quantize a single scaled value.
-/// Returns a 4-bit code matching DeepGEMM's table:
+/// Returns a 4-bit code with ties rounded toward zero:
 ///   magnitudes {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
 ///   sign bit 3 set iff value < 0 and magnitude code != 0.
 __device__ __forceinline__ uint32_t quantizeFp4E2M1(float scaled)
 {
     float ax = fminf(fabsf(scaled), 6.0f);
-    // Strict `>` matches Triton reference and DeepGEMM (boundary values round down).
+    // Strict `>` selects the lower magnitude at every midpoint.
     uint32_t idx = static_cast<uint32_t>(
         (ax > 0.25f) + (ax > 0.75f) + (ax > 1.25f) + (ax > 1.75f) + (ax > 2.5f) + (ax > 3.5f) + (ax > 5.0f));
     uint32_t code = idx & 0x7u;

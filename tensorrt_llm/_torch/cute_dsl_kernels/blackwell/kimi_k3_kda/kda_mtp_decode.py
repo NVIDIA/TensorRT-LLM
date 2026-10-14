@@ -108,6 +108,7 @@ def kda_decode_mtp_kernel(
     RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
     stage_timing: cute.Tensor,
     PROFILE_STAGES: cutlass.Constexpr[bool],
+    REPLAY_ONLY: cutlass.Constexpr[bool],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -115,6 +116,12 @@ def kda_decode_mtp_kernel(
     with at least ``HV * N * 4`` elements, indexed as
     ``(i_hv * grid_n + i_n) * 4``. With profiling off it is never accessed
     and the host may pass any placeholder tensor.
+
+    With ``REPLAY_ONLY=True`` the kernel runs only the replay steps: it
+    replays the ``num_accepted_tokens[n]`` pending drafts and commits the
+    recurrent state after them to ``ht``. It reads only ``h0``, the conv and
+    replay caches and the metadata, and writes only ``ht``; ``x_*``, ``w_*``,
+    ``g``, ``beta``, ``A_log``, ``dt_bias`` and ``o`` are not accessed.
     """
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % 32
@@ -156,7 +163,10 @@ def kda_decode_mtp_kernel(
         T_loop = 1 + NUM_SPEC
         t_max = 1 + NUM_SPEC
     else:
-        T_loop = commit_len + 1 + NUM_SPEC
+        if cutlass.const_expr(REPLAY_ONLY):
+            T_loop = commit_len
+        else:
+            T_loop = commit_len + 1 + NUM_SPEC
         t_max = 2 * NUM_SPEC + 1
     vec_size = TILE_K // 32
     num_v_tiles = V // TILE_V
@@ -211,35 +221,39 @@ def kda_decode_mtp_kernel(
                         r_state[(KERNEL_WIDTH - 1) * vec_size + w * vec_size + i] = cutlass.Float32(
                             cs_k[slot, hk_off + k_idx, w]
                         )
-                for w in range(KERNEL_WIDTH):
-                    if tidx < K:
-                        if cutlass.const_expr(not USE_REG_Q_WEIGHTS):
-                            sConvW[w * K + tidx] = cutlass.Float32(w_q[hk_off + tidx, w])
-                        sConvW[k_weight_base + w * K + tidx] = cutlass.Float32(
-                            w_k[hk_off + tidx, w]
+                if cutlass.const_expr(not REPLAY_ONLY):
+                    for w in range(KERNEL_WIDTH):
+                        if tidx < K:
+                            if cutlass.const_expr(not USE_REG_Q_WEIGHTS):
+                                sConvW[w * K + tidx] = cutlass.Float32(w_q[hk_off + tidx, w])
+                            sConvW[k_weight_base + w * K + tidx] = cutlass.Float32(
+                                w_k[hk_off + tidx, w]
+                            )
+                    for ld in range(V * KERNEL_WIDTH // NUM_THREADS):
+                        flat = ld * NUM_THREADS + tidx
+                        sConvW[v_weight_base + flat] = cutlass.Float32(
+                            w_v[hv_off + flat % V, flat // V]
                         )
-                for ld in range(V * KERNEL_WIDTH // NUM_THREADS):
-                    flat = ld * NUM_THREADS + tidx
-                    sConvW[v_weight_base + flat] = cutlass.Float32(
-                        w_v[hv_off + flat % V, flat // V]
-                    )
-                if cutlass.const_expr(USE_REG_Q_WEIGHTS):
-                    if warp_idx == 0:
-                        for _w in range(KERNEL_WIDTH):
-                            for _i in range(vec_size):
-                                r_wq[_w * vec_size + _i] = cutlass.Float32(
-                                    w_q[hk_off + _i * 32 + in_warp_tid, _w]
-                                )
+                    if cutlass.const_expr(USE_REG_Q_WEIGHTS):
+                        if warp_idx == 0:
+                            for _w in range(KERNEL_WIDTH):
+                                for _i in range(vec_size):
+                                    r_wq[_w * vec_size + _i] = cutlass.Float32(
+                                        w_q[hk_off + _i * 32 + in_warp_tid, _w]
+                                    )
                 cute.arch.barrier()
                 if cutlass.const_expr(USE_SETMAXREG):
                     cute.arch.warpgroup_reg_dealloc(64)
                 if warp_idx < 3:
-                    if warp_idx == 2:
-                        r_exp_A = cute.math.exp(cutlass.Float32(A_log[i_h]), fastmath=True)
+                    if cutlass.const_expr(not REPLAY_ONLY):
+                        if warp_idx == 2:
+                            r_exp_A = cute.math.exp(cutlass.Float32(A_log[i_h]), fastmath=True)
                     i_t = 0
                     while i_t < T_loop:
                         if cutlass.const_expr(USE_ZERO_ACCEPTED):
                             replay_from_cache = False
+                        elif cutlass.const_expr(REPLAY_ONLY):
+                            replay_from_cache = True
                         else:
                             replay_from_cache = i_t < commit_len
                         if replay_from_cache:
@@ -772,6 +786,18 @@ def kda_decode_mtp_kernel(
                                     row * vec_size + i
                                 ]
                 i_t = i_t + 1
+            if cutlass.const_expr(REPLAY_ONLY):
+                for row in range(NUM_V_ROWS):
+                    v_row = warp_idx * NUM_V_ROWS + row
+                    for i in range(vec_size):
+                        if cutlass.const_expr(USE_FLAT_LAYOUT):
+                            ht[h0_idx, v_base + v_row, i * 32 + in_warp_tid] = r_state[
+                                row * vec_size + i
+                            ]
+                        else:
+                            ht[slot, i_hv, v_base + v_row, i * 32 + in_warp_tid] = r_state[
+                                row * vec_size + i
+                            ]
         if cutlass.const_expr(PROFILE_STAGES):
             cute.arch.barrier()
             t_stage2 = read_globaltimer()

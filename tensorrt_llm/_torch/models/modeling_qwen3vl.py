@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from PIL import Image
@@ -1074,7 +1075,16 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         cos, sin = self.rot_pos_emb(grid_rows)
         pos_embeds = self.fast_pos_embed_interpolate(grid_rows)
 
-        hidden_states = self.patch_embed(pixel_values)
+        # `patch_embed.proj` is a Conv3d with kernel_size == stride == one
+        # patch, and each row of `pixel_values` is one flattened patch, so the
+        # convolution is exactly a linear projection with the same weight and
+        # bias. Run it as a GEMM, which is much faster than the Conv3d kernel.
+        patch_weight = self.patch_embed.proj.weight
+        hidden_states = F.linear(
+            pixel_values.reshape(-1, patch_weight[0].numel()).to(patch_weight.dtype),
+            patch_weight.flatten(1),
+            self.patch_embed.proj.bias,
+        )
         hidden_states += pos_embeds
         hidden_states = hidden_states.flatten(1)
 
@@ -1329,7 +1339,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         vlm_to_llm_arch = {
             "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
-            "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
@@ -1342,7 +1351,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         llm_model_config.pretrained_config = config.text_config
         # The LM attention modules use extra_attrs through the outer wrapper.
         # Share the dict after deepcopy so compiled LM attention lookups see
-        # the same per-layer metadata as model_engine.model_forward.
+        # the same per-layer metadata as DecoderRunner.model_forward.
         # Vision attention unregisters itself from this dict during init,
         # so it does not pollute LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs

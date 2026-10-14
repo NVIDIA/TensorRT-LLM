@@ -962,9 +962,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
 
-        build_script = "trtllm-bench" if self._config.runtime == "bench" else None
-
-        self._build_script = build_script
         self._benchmark_script = benchmark_script
         self._working_dir = working_dir
         self._output_dir = output_dir
@@ -1025,8 +1022,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.model_name in HF_MODEL_PATH.keys():
             tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
         else:
-            tokenizer_dir = os.path.join(llm_models_root(), "llama-models-v2",
-                                         "TinyLlama-1.1B-Chat-v1.0")
+            tokenizer_dir = os.path.join(llm_models_root(), "Qwen3",
+                                         "Qwen3-0.6B")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
 
@@ -1086,7 +1083,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 0
             ostdev = 0
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
-            if self._build_script == 'trtllm-bench':
+            if self._config.runtime == "bench":
                 data_cmd += [
                     "trtllm-bench",
                     f"--model={tokenizer_dir}",
@@ -1104,7 +1101,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 ]
             else:
                 raise RuntimeError(
-                    f"Unsupported build script {self._build_script} for "
+                    f"Unsupported runtime {self._config.runtime} for "
                     "dataset preparation.")
 
         return data_cmd
@@ -1471,11 +1468,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         mpi_cmd.extend(["-x", var])
                 mpi_cmd.append("trtllm-llmapi-launch")
 
-        if self._build_script == "trtllm-bench":
-            return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
-                                           mpi_cmd)
-        else:
-            pytest.skip("only support trtllm-bench and serve runtime")
+        return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
+                                       mpi_cmd)
 
     def get_perf_result(self, outputs: Dict[int, str]) -> float:
         """
@@ -1511,7 +1505,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     metric_values.append(float(value))
 
         if len(metric_values) == 0:
-            if self._build_script == "trtllm-bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
+            if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
                 print_info("skip building process for multi-gpu test"
                            )  #https://nvbugspro.nvidia.com/bug/5210111
                 metric_values = [0.0]
@@ -1545,7 +1539,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     f"Combining up enc builder_perf {enc_metrics} and dec builder_perf {dec_metrics} to {metric_values}."
                 )
             # For other models, builder metric should equal # gpus.
-            elif self._build_script != "trtllm-build" and self._build_script != "trtllm-bench":
+            elif self._config.runtime != "bench":
                 assert len(
                     metric_values
                 ) == num_gpus, f"num of metrics: {len(metric_values)} should match num_gpus: {num_gpus}"

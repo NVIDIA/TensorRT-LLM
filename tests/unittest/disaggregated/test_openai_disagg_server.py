@@ -98,12 +98,15 @@ async def test_http_cluster_storage_request_is_proxied_to_coordinator():
     assert response.body == b'{"result":true}'
 
 
-def test_create_client_does_not_register_with_server_metrics_collector():
+@pytest.mark.parametrize("bounded_replay", [False, True])
+def test_create_client_does_not_register_with_server_metrics_collector(bounded_replay):
     server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
     server._coordinator = SimpleNamespace(get_disagg_request_id=AsyncMock(return_value=1))
     server._req_timeout_secs = 30
     server._collect_perf_metrics = True
-    server._config = SimpleNamespace(internal_request_auth_key="key")
+    server._config = SimpleNamespace(
+        internal_request_auth_key="key", bounded_replay_on_generation=bounded_replay
+    )
     server._perf_metrics_collector = SimpleNamespace()
 
     with patch("tensorrt_llm.serve.openai_disagg_server.OpenAIHttpClient") as mock_client:
@@ -111,6 +114,7 @@ def test_create_client_does_not_register_with_server_metrics_collector():
 
     assert client is mock_client.return_value
     mock_client.assert_called_once()
+    assert mock_client.call_args.kwargs["bounded_replay_on_generation"] is bounded_replay
 
 
 def test_extract_conversation_id_from_headers():

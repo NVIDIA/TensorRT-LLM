@@ -30,13 +30,15 @@ there is no substring that could claim an unrelated entry, and no
 `mtp_nextn=0`-style carve-out is needed.
 
 Outward fallback: not needed, and that is a property of the design
-rather than an accident. Nothing imports this subtree unless
-`TRTLLM_MODELING_V2` is set: `AutoModelForCausalLM._resolve_class` calls
+rather than an accident. Nothing beyond the resolver module is imported
+unless `LLM(modeling_v2=...)` is on: the model loader calls
 `modeling_v2_resolve`, which returns immediately when the switch is off,
-and the routing modules are imported lazily behind it. The one caller
-outside the subtree is `tensorrt_llm/_torch/models/modeling_auto.py`,
-which this rule does not claim -- a PR touching it falls back to
-baseline, which is what a change to the shared resolver deserves.
+and the routing modules are imported lazily behind it. The callers
+outside the subtree are `tensorrt_llm/_torch/pyexecutor/model_loader.py`
+(decides) and `tensorrt_llm/_torch/models/modeling_auto.py` (reads the
+decision off `ModelConfig`), neither of which this rule claims -- a PR
+touching them falls back to baseline, which is what a change to the
+shared resolver deserves.
 
 `.md` exclusion matters more here than for most rules: the catalog
 carries a contract document per entry, so roughly a fifth of the files
@@ -63,6 +65,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
@@ -83,14 +86,15 @@ _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
 def _is_mv2_claim(path: str) -> bool:
     """Decide whether ModelingV2Rule claims `path`.
 
-    `*.md` is excluded so a contract-only edit does not force GPU stages
-    -- `OutOfScopeRule` claims those as noop instead. Other suffixes are
-    NOT excluded: a data file under this subtree could be a fixture, so
-    the rule keeps claiming it and re-runs the stages (safe over-run).
+    Documentation files are excluded so a contract-only edit does not force
+    GPU stages; `DocsRule` routes them to the docs build instead. Other
+    suffixes are NOT excluded: a data file under this subtree could be a
+    fixture, so the rule keeps claiming it and re-runs the stages (safe
+    over-run).
     """
     if not path.startswith(_MV2_SRC_PREFIXES):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 

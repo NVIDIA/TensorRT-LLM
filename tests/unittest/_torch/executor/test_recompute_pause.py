@@ -23,6 +23,8 @@ class _StubRequest:
 
 def _make_executor(handler: Mock | None) -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor._disagg_pp_termination_handler = handler
     executor._pending_recompute_pause_ids = set()
     executor.inflight_req_ids = ReqIdsSet()
