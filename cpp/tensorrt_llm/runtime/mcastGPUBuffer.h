@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -28,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -42,6 +42,22 @@
 
 namespace tensorrt_llm::runtime
 {
+
+//! Recover the allocation owner from multicast tensor storage, including slices and views.
+//! Return an empty owner for tensors whose storage does not carry a multicast allocation.
+inline DeviceMemoryOwner getMcastDevMemBuffer(at::Tensor const& tensor)
+{
+    if (!tensor.defined() || !tensor.has_storage())
+    {
+        return {};
+    }
+    auto const& dataPtr = tensor.storage().data_ptr();
+    if (dataPtr.get_deleter() != deleteMcastDevMemOwner || dataPtr.get_context() == nullptr)
+    {
+        return {};
+    }
+    return *static_cast<DeviceMemoryOwner*>(dataPtr.get_context());
+}
 
 //! \brief Wrapper class for McastDeviceMemory to facilitate PyTorch tensor creation.
 //! It manages a buffer accessible via unicast or multicast for multi-node communication.
@@ -66,7 +82,6 @@ public:
         , mBufSize(mMcastDeviceMemory->getBufferSize())
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
-        registerPointers(groupSize);
     }
 
     //! \brief Constructor taking an explicit host collective backend.
@@ -83,7 +98,6 @@ public:
         , mBufSize(mMcastDeviceMemory->getBufferSize())
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
-        registerPointers(groupSize);
     }
 
     //! \brief Returns the usable logical size after fabric-allocation rounding and signal-pad reservation.
@@ -98,7 +112,7 @@ public:
     //! \param dtype The data type of the tensor elements.
     //! \param storageOffset The offset in elements from the start of the buffer.
     //! \return An ATen tensor wrapping the unicast buffer section.
-    at::Tensor getUCBuffer(uint32_t rank, std::vector<long int> sizes, torch::ScalarType dtype, int64_t storageOffset)
+    at::Tensor getUCBuffer(uint32_t rank, std::vector<int64_t> sizes, torch::ScalarType dtype, int64_t storageOffset)
     {
         TORCH_CHECK(rank < mMcastDeviceMemory->getWorldSize(), "McastGPUBuffer::getUCBuffer: rank ", rank,
             " is outside world size ", mMcastDeviceMemory->getWorldSize());
@@ -111,7 +125,7 @@ public:
     //! \param dtype The data type of the tensor elements.
     //! \param storageOffset The offset in elements from the start of the buffer.
     //! \return An ATen tensor wrapping the multicast buffer section.
-    at::Tensor getMCBuffer(std::vector<long int> sizes, torch::ScalarType dtype, int64_t storageOffset)
+    at::Tensor getMCBuffer(std::vector<int64_t> sizes, torch::ScalarType dtype, int64_t storageOffset)
     {
         return makeTensor(
             mMcastDeviceMemory->getMulticastPtr(), sizes, dtype, storageOffset, "McastGPUBuffer::getMCBuffer");
@@ -150,31 +164,14 @@ public:
     }
 
 private:
-    void registerPointers(uint32_t groupSize)
-    {
-        for (uint32_t rank = 0; rank < groupSize; ++rank)
-        {
-            tensorrt_llm::common::registerMcastDevMemBuffer(
-                mMcastDeviceMemory->getUnicastPtr(rank), mMcastDeviceMemory);
-        }
-        tensorrt_llm::common::registerMcastDevMemBuffer(mMcastDeviceMemory->getMulticastPtr(), mMcastDeviceMemory);
-    }
-
-    using DeviceMemoryOwner = std::shared_ptr<tensorrt_llm::runtime::McastDeviceMemory>;
-
-    static void deleteDeviceMemoryOwner(void* context)
-    {
-        delete static_cast<DeviceMemoryOwner*>(context);
-    }
-
-    at::Tensor makeTensor(void* basePtr, std::vector<long int> const& sizes, torch::ScalarType dtype,
+    at::Tensor makeTensor(void* basePtr, std::vector<int64_t> const& sizes, torch::ScalarType dtype,
         int64_t storageOffset, char const* caller)
     {
         TORCH_CHECK(mMcastDeviceMemory->isMapped(), "McastGPUBuffer handles are not attached");
         TORCH_CHECK(storageOffset >= 0, caller, ": storage offset must be nonnegative, got ", storageOffset);
 
         size_t numel{1};
-        for (long int const size : sizes)
+        for (int64_t const size : sizes)
         {
             TORCH_CHECK(size >= 0, caller, ": dimensions must be nonnegative, got ", size);
             size_t const unsignedSize = static_cast<size_t>(size);
@@ -198,7 +195,7 @@ private:
         auto* owner = new DeviceMemoryOwner(mMcastDeviceMemory);
         auto const options = at::TensorOptions().dtype(dtype).device(mLocalDevice);
         return at::for_blob(dataPtr, c10::IntArrayRef(sizes))
-            .context(owner, deleteDeviceMemoryOwner)
+            .context(owner, deleteMcastDevMemOwner)
             .options(options)
             .target_device(mLocalDevice)
             .make_tensor();
@@ -394,12 +391,12 @@ inline PreflightResult runFabricPreflight(int deviceIdx, CUdevice device)
 }
 
 inline PreflightResult runLocalPreflight(
-    MnnvlTransport transport, int deviceIdx, CUuuid& deviceUuid, std::array<char, 256>& hostName)
+    MnnvlTransport transport, int deviceIdx, CUuuid& deviceUuid, std::array<char, HOST_NAME_MAX + 1>& hostName)
 {
     try
     {
         TLLM_CHECK_WITH_INFO(
-            gethostname(hostName.data(), hostName.size() - 1) == 0, "[MNNVL] Cannot determine local host name");
+            gethostname(hostName.data(), hostName.size()) == 0, "[MNNVL] Cannot determine local host name");
         TLLM_CUDA_CHECK(cudaSetDevice(deviceIdx));
 
         CUdevice device{};
@@ -459,7 +456,7 @@ public:
                                  [localTransport](int32_t value) { return value == localTransport; }),
             "[MNNVL] All ranks must select the same workspace transport");
         CUuuid localDeviceUuid{};
-        std::array<char, 256> localHostName{};
+        std::array<char, HOST_NAME_MAX + 1> localHostName{};
         auto const localPreflight
             = mnnvl_workspace_detail::runLocalPreflight(transport, deviceIdx, localDeviceUuid, localHostName);
         // This agreement covers dispatch qualification only. McastDeviceMemory retains its existing allocation and
@@ -478,7 +475,7 @@ public:
 
         if (transport == MnnvlTransport::kPosixFd)
         {
-            std::vector<std::array<char, 256>> hostNames(groupSize);
+            std::vector<std::array<char, HOST_NAME_MAX + 1>> hostNames(groupSize);
             groupComm->allgather(localHostName.data(), hostNames.data(), localHostName.size());
             if (std::any_of(hostNames.begin(), hostNames.end(),
                     [&localHostName](auto const& hostName) { return hostName != localHostName; }))
@@ -569,7 +566,7 @@ public:
     {
         TORCH_CHECK(mBuffer != nullptr, "MnnvlWorkspace::getLocalBuffer: workspace is unavailable: ", mReason);
         return mBuffer->getUCBuffer(
-            mGroupRank, {static_cast<long int>(mBuffer->getBufferSize() / sizeof(float))}, at::kFloat, 0);
+            mGroupRank, {static_cast<int64_t>(mBuffer->getBufferSize() / sizeof(float))}, at::kFloat, 0);
     }
 
 private:

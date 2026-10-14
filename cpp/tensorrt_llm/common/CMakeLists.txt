@@ -86,7 +86,6 @@ add_library(
   cublasMMWrapper.cpp
   cudaArchitectures.cpp
   cudaFp8Utils.cu
-  mcastDevMemUtils.cpp
   ncclUtils.cpp
   opUtils.cpp
   safetensors.cpp
