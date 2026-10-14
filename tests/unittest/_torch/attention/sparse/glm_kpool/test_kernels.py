@@ -262,6 +262,18 @@ def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
     if not bounded:
         assert torch.equal(got <= FP32_MIN, ~visible)
         return
+    # The indexer's pool top-k scans kv_len // kpool columns, so poisoning the
+    # rest changes no selection (rows without a complete pool select nothing).
+    indexer, num_cand = _meta_indexer(), (kv_lens // KPOOL).to(torch.int32)
+
+    def select(scores):
+        out = torch.empty(n, indexer.select_k, dtype=torch.int32, device="cuda")
+        indexer.pool_top_k(
+            scores, out, is_prefill=False, sequence_lengths=num_cand, scan_lengths=num_cand
+        )
+        return out.sort(dim=-1).values
+
+    assert torch.equal(select(got.masked_fill(~visible, float("inf"))), select(want))
     # The first rows of request 1 complete no pool, so nothing is launched.
     monkeypatch.setattr(kernels, "_kpool_score_kernel", None)
     score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
@@ -554,13 +566,12 @@ def test_pool_scores_offsets_beyond_int32() -> None:
         torch.testing.assert_close(out[-32:, :64], expected, rtol=0, atol=0)
 
 
-def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+def _meta_indexer():
+    """A GLM-5.3-Flash indexer (meta weights) exposing its pool top-k."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch import cute_dsl_utils
     from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
 
-    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
     config = SimpleNamespace(
         hidden_size=256,
         q_lora_rank=128,
@@ -571,7 +582,14 @@ def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatc
         index_kpool_always_select_tail=True,
     )
     with torch.device("meta"):
-        indexer = Glm5NextIndexer(config, layer_idx=0)
+        return Glm5NextIndexer(config, layer_idx=0)
+
+
+def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch import cute_dsl_utils
+
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    indexer = _meta_indexer()
     scores = torch.arange(520, dtype=torch.float32, device="cuda").repeat(3, 1)
     lengths = torch.tensor([0, 3, 513], dtype=torch.int32, device="cuda")
     selected = torch.empty(3, 512, dtype=torch.int32, device="cuda")
