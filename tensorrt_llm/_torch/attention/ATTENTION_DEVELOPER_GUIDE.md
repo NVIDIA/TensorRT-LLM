@@ -234,12 +234,17 @@ only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
 The contiguous block-sparse path also consumes the SageAttention recipe in
-`AttentionForwardArgs`. Prediction sees the original BF16 Q/K/V. The adapter
-then quantizes Q/K/V with FlashInfer's Sage quantizer, quantizes the summaries
-with one scale per K mean and the original V channel scales, and passes all
-scales to PrimTS. The recipe and quantized dtypes are part of the plan key.
-Sage requires BF16 input, because the quantizer's FP16 reciprocal scale can
-overflow on zero or tiny Q/K blocks. Paged block-sparse attention rejects Sage.
+`AttentionForwardArgs`. Prediction sees the original Q/K/V. When a library of
+the layer declares `supports_sage_quantized_inputs`, the attention core then
+quantizes the Q/K/V of a block-sparse call before FMHA selection, with
+TensorRT-LLM's Sage quantization kernel (`attention/kernels/sage_quant.py`),
+and passes the result in `AttentionForwardArgs.sage_quantized`. Q/K get
+per-block scales and V per-sequence channel scales; the summaries of proxy
+routes get one scale per K mean and reuse the original V channel scales and K
+mean. `PrimsTSBlockSparseFmha` serves Sage only with these inputs and passes
+all scales to PrimTS; the attention op ignores them and quantizes dense
+SageAttention inside its kernels. The recipe and quantized dtypes are part of
+the plan key. Paged block-sparse attention rejects Sage.
 
 `PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
 (`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and

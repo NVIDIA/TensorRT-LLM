@@ -46,7 +46,8 @@ struct SageQuantParams
     int batchSize{};
     int numHeads{};
     int headDim{};
-    // Only read when partition == Contiguous; the Hopper partitions fix their own group size.
+    // Only read when partition == Contiguous, where it is 1, 4, 16, or 32; the Hopper
+    // partitions fix their own group size.
     int tokenBlockSize{};
     SageScalePartition partition{SageScalePartition::Contiguous};
     bool kSmooth{false};
@@ -57,7 +58,7 @@ struct SageQuantParams
     kernels::Data_type quantType{kernels::DATA_TYPE_E4M3};
     float* ptrQkScale{nullptr};
     // Optional source and scratch mean used to perform K-smoothing.
-    // (See below) collected at vStage==0, applied at vStage==1.
+    // (See below) collected at vStage==1, applied at vStage==2.
     void const* ptrKForMean{nullptr};
     float* ptrKMean{nullptr};
     // Optional arguments for SageQuantV:
@@ -68,6 +69,11 @@ struct SageQuantParams
     void const* ptrV{nullptr};
     void* ptrVQuant{nullptr};
     float* ptrVScale{nullptr};
+    // Optional cumulative KV sequence lengths, [batchSize + 1]. When set, the V scales and the K
+    // mean are collected per sequence, [batchSize, numHeadsV, headDim], as SageAttention and the
+    // PrimTS block-sparse kernel expect; otherwise one [numHeadsV, headDim] row set covers the
+    // whole batch, as the trtllm-gen kernels expect.
+    int const* ptrCuSeqLensV{nullptr};
     // Hardware info. Required.
     int smCount{};
     cudaStream_t stream{};

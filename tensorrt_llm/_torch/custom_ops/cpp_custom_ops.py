@@ -953,6 +953,24 @@ def _register_fake():
                                 dtype=torch.int32), logits.new_empty(
                                     (batch_size, ), dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::sage_quantize")
+    def _(query: Optional[torch.Tensor],
+          key: torch.Tensor,
+          value: torch.Tensor,
+          cu_seqlens_q: Optional[torch.Tensor],
+          cu_seqlens_kv: torch.Tensor,
+          q_quant: Optional[torch.Tensor],
+          k_quant: torch.Tensor,
+          v_quant: torch.Tensor,
+          q_scale: Optional[torch.Tensor],
+          k_scale: torch.Tensor,
+          v_scale: torch.Tensor,
+          k_mean: Optional[torch.Tensor],
+          q_block_size: int,
+          k_block_size: int,
+          reuse_stats: bool = False) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp8_quantize_1x128")
     def _(input: torch.Tensor, use_ue8m0: bool = False):
         pad_m = fp4_utils.pad_up(input.shape[0], 4)

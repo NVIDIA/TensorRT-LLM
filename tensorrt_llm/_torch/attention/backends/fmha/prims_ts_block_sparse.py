@@ -20,7 +20,6 @@ from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
-from flashinfer import trtllm_sage_attention_quantize
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -35,7 +34,6 @@ from tensorrt_llm._torch.attention.backends.prims_ts.sage import (
     SageAttentionParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
-from tensorrt_llm._torch.attention.kernels.sage_quant import quantize_sage_summaries
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -202,35 +200,16 @@ def _sage_recipe(
     forward_args: AttentionForwardArgs,
 ) -> tuple[SageAttentionConfig, torch.dtype] | None:
     """Return the forward's SageAttention plan config and quantized Q/K dtype, if any."""
-    q_block = forward_args.sage_attn_num_elts_per_blk_q
-    k_block = forward_args.sage_attn_num_elts_per_blk_k
-    if q_block <= 0 and k_block <= 0 and forward_args.sage_attn_num_elts_per_blk_v <= 0:
+    qk_dtype = forward_args.sage_attn_qk_dtype
+    if qk_dtype is None:
         return None
     # Every proxy K summary is quantized with its own scale.
-    config = SageAttentionConfig(q_block_size=q_block, k_block_size=k_block, k_summary_block_size=1)
-    return config, torch.int8 if forward_args.sage_attn_qk_int8 else torch.float8_e4m3fn
-
-
-def _sage_unsupported_reason(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    forward_args: AttentionForwardArgs,
-) -> str | None:
-    """Return why the forward's Sage recipe cannot quantize these contiguous inputs."""
-    if _sage_recipe(forward_args) is None:
-        return None
-    if (
-        forward_args.sage_attn_num_elts_per_blk_q not in (1, 4, 16)
-        or forward_args.sage_attn_num_elts_per_blk_k not in (1, 4, 16)
-        or forward_args.sage_attn_num_elts_per_blk_v != 1
-    ):
-        return "Sage block-sparse attention requires Q/K blocks of 1, 4, or 16 and V block size 1"
-    if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
-        # The quantizer computes reciprocal scales in the input dtype, which
-        # overflows FP16 on zero or tiny Q/K blocks such as VSA padding.
-        return "Sage block-sparse attention requires matching BF16 Q/K/V inputs"
-    return None
+    config = SageAttentionConfig(
+        q_block_size=forward_args.sage_attn_num_elts_per_blk_q,
+        k_block_size=forward_args.sage_attn_num_elts_per_blk_k,
+        k_summary_block_size=1,
+    )
+    return config, qk_dtype
 
 
 class PrimsTSBlockSparseFmha(PrimsTSFmha):
@@ -239,6 +218,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     PLAN_CACHE_KEY = "prims_ts_block_sparse"
 
     supports_block_sparse_inputs = True
+    supports_sage_quantized_inputs = True
 
     def _is_supported(
         self,
@@ -389,13 +369,12 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     ) -> str | None:
         if forward_args.is_fused_qkv or k is None or v is None:
             return "contiguous block-sparse attention requires separate Q, K, and V"
+        if forward_args.sage_attn_qk_dtype is not None and forward_args.sage_quantized is None:
+            return "SageAttention requires inputs quantized by the attention core"
         if self.attn.position_embedding_type != 0 or forward_args.mrope_position_deltas is not None:
             return "contiguous Q/K/V must have position embedding applied before attention"
         if forward_args.cu_q_seqlens is not None or forward_args.cu_kv_seqlens is not None:
             return "packed variable-length Q/KV inputs are not supported"
-        sage_reason = _sage_unsupported_reason(q, k, v, forward_args)
-        if sage_reason is not None:
-            return sage_reason
         inputs = _get_block_sparse_inputs(forward_args)
         assert inputs is not None
         mask_type = self._get_prims_mask_type(forward_args)
@@ -427,7 +406,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         assert inputs is not None
         if inputs.sparse_format != "bsr" or inputs.use_proxy_routes:
             return "paged block-sparse attention only supports BSR exact routes"
-        if _sage_recipe(forward_args) is not None:
+        if forward_args.sage_attn_qk_dtype is not None:
             return "paged block-sparse attention does not support SageAttention"
         if not forward_args.is_fused_qkv:
             return "paged block-sparse attention requires fused QKV input"
@@ -603,56 +582,20 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         wrapper = cast("BlockSparseTSWrapper", self._get_or_plan_wrapper(key, metadata))
         sage_params = None
         if key.sage is not None:
-            # Prediction has consumed the unquantized tensors. Device cumulative
-            # lengths keep the per-sequence scale layout without a host-to-device
-            # copy during CUDA Graph capture.
-            cu_seqlens_q = torch.arange(
-                0,
-                (batch_size + 1) * key.seq_len_q,
-                key.seq_len_q,
-                dtype=torch.int32,
-                device=q.device,
-            )
-            cu_seqlens_kv = torch.arange(
-                0,
-                (batch_size + 1) * key.kv_capacity,
-                key.kv_capacity,
-                dtype=torch.int32,
-                device=q.device,
-            )
-            quantized = trtllm_sage_attention_quantize(
-                query.flatten(0, 1),
-                key_states.flatten(0, 1),
-                value_states.flatten(0, 1),
-                q_block_size=key.sage.q_block_size,
-                k_block_size=key.sage.k_block_size,
-                qk_quant_dtype=key.qk_dtype,
-                cum_seq_lens_q=cu_seqlens_q,
-                cum_seq_lens_kv=cu_seqlens_kv,
-                smooth_k=forward_args.sage_attn_smooth_k,
-            )
-            q_quant, k_quant, v_quant, q_scale, k_scale, v_scale = quantized[:6]
-            query = q_quant.view_as(query)
-            key_states = k_quant.view_as(key_states)
-            value_states = v_quant.view_as(value_states)
-            k_summary_scale = None
+            quantized = forward_args.sage_quantized
+            assert quantized is not None, "Sage inputs are quantized before the FMHA forward"
+            query = quantized.q.view_as(query)
+            key_states = quantized.k.view_as(key_states)
+            value_states = quantized.v.view_as(value_states)
             if inputs.use_proxy_routes:
-                k_summary = inputs.k_summary
-                if forward_args.sage_attn_smooth_k:
-                    # Proxy logits must shift by the same per-row constant as the
-                    # smoothed exact keys, so the summaries subtract the same mean.
-                    k_summary = (k_summary.float() - quantized[6]).to(k_summary.dtype)
-                k_summary, v_summary, k_summary_scale = quantize_sage_summaries(
-                    k_summary, inputs.v_summary, v_scale, key.qk_dtype
+                inputs = replace(
+                    inputs, k_summary=quantized.k_summary, v_summary=quantized.v_summary
                 )
-                inputs = replace(inputs, k_summary=k_summary, v_summary=v_summary)
             sage_params = SageAttentionParams(
-                q_scale=q_scale,
-                k_scale=k_scale,
-                # PrimTS takes one per-channel V scale row per batch entry; the
-                # quantizer collects a single row over the whole batch.
-                v_scale=v_scale.expand(batch_size, -1, -1).contiguous(),
-                k_summary_scale=k_summary_scale,
+                q_scale=quantized.q_scale,
+                k_scale=quantized.k_scale,
+                v_scale=quantized.v_scale,
+                k_summary_scale=quantized.k_summary_scale,
             )
         wrapper.run(
             query,

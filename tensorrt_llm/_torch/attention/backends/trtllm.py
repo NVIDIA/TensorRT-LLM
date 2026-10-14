@@ -42,6 +42,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
+from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.manager import FmhaManager
 from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
 from .fp4_mla.state import Fp4MlaState
@@ -2038,6 +2039,73 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.kv_lora_rank,
         )
 
+    def _quantize_sage_inputs(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[SageQuantized]:
+        """Quantize the SageAttention inputs of a block-sparse call.
+
+        The attention op quantizes dense SageAttention inside its kernels, so
+        only block-sparse calls are quantized here, for the FMHA libraries that
+        take quantized inputs: separate Q, K, and V without a KV cache.
+        """
+        qk_quant_dtype = forward_args.sage_attn_qk_dtype
+        if (qk_quant_dtype is None or k is None or v is None
+                or metadata.kv_cache_manager is not None
+                or not any(fmha.supports_sage_quantized_inputs
+                           for fmha in self._fmha_manager.fmha_libs)):
+            return None
+        inputs = forward_args.sparse_runtime_params.block_sparse_inputs
+        if inputs is None:
+            return None
+        num_seqs = metadata.num_contexts
+        # Device lengths add no host-to-device copy during CUDA Graph capture.
+        cu_seqlens_q = torch.zeros(num_seqs + 1,
+                                   dtype=torch.int32,
+                                   device=q.device)
+        cu_seqlens_kv = torch.zeros_like(cu_seqlens_q)
+        cu_seqlens_q[1:] = metadata.seq_lens_cuda[:num_seqs].cumsum(
+            0, dtype=torch.int32)
+        cu_seqlens_kv[1:] = metadata.seq_lens_kv_cuda[:num_seqs].cumsum(
+            0, dtype=torch.int32)
+        quantized = sage_quantize(
+            q.view(-1, self.num_heads, self.head_dim),
+            k.view(-1, self.num_kv_heads, self.head_dim),
+            v.view(-1, self.num_kv_heads, self.head_dim),
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_block_size=forward_args.sage_attn_num_elts_per_blk_q,
+            k_block_size=forward_args.sage_attn_num_elts_per_blk_k,
+            qk_quant_dtype=qk_quant_dtype,
+            smooth_k=forward_args.sage_attn_smooth_k,
+        )
+        if not inputs.use_proxy_routes:
+            return quantized
+        # The K/V block means of proxy routes dequantize like the keys and
+        # values they stand for: every mean is a key of its sequence with a
+        # scale of its own, and reuses the V scales and K mean of this call.
+        batch, blocks = inputs.k_summary.shape[:2]
+        cu_seqlens_blocks = torch.arange(0, (batch + 1) * blocks,
+                                         blocks,
+                                         dtype=torch.int32,
+                                         device=q.device)
+        summary = sage_quantize(None,
+                                inputs.k_summary.flatten(0, 1),
+                                inputs.v_summary.flatten(0, 1),
+                                None,
+                                cu_seqlens_blocks,
+                                k_block_size=1,
+                                qk_quant_dtype=qk_quant_dtype,
+                                stats=quantized)
+        return quantized._replace(
+            k_summary=summary.k.view(inputs.k_summary.shape),
+            v_summary=summary.v.view(inputs.v_summary.shape),
+            k_summary_scale=summary.k_scale)
+
     def _ensure_rope_table_size(self, required_max_positions: int) -> None:
         floats_per_position = self.rope_params.dim * (
             2 if self.rope_params.duplicate_data else 1)
@@ -2454,6 +2522,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.num_generations == 0
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
+
+        # Sparse prediction has read the unquantized inputs; FMHA support checks
+        # see the quantized ones.
+        forward_args.sage_quantized = self._quantize_sage_inputs(
+            q, k, v, metadata, forward_args)
 
         # On a ragged generation step the attention op is handed
         # one row per query token so its `num_tokens % num_seqs == 0` check

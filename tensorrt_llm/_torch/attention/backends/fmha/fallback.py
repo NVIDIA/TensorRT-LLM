@@ -50,6 +50,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
         "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
         "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
+        "sage_quantized",  # for libraries taking quantized Sage inputs; the op quantizes its own
     }
 )
 

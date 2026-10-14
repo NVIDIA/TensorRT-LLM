@@ -82,6 +82,7 @@ def _backend(
     sparse_config: SolAttentionConfig | VideoSparseAttentionConfig | None = None,
     *,
     k_block_size: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> TrtllmAttention:
     quant_config = None
     if qk_dtype is not None:
@@ -101,7 +102,7 @@ def _backend(
         layer_idx=1,
         num_heads=_HEADS,
         head_dim=_HEAD_DIM,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         attention_config=AttentionConfig(
             backend="TRTLLM",
             quant_attention_config=quant_config,
@@ -169,7 +170,13 @@ def _sparse_wrappers(backend: TrtllmAttention) -> list[BlockSparseTSWrapper]:
     ]
 
 
-def _assert_sparse_sage_active(backend: TrtllmAttention, *, proxy: bool, token_mask: bool) -> None:
+def _assert_sparse_sage_active(
+    backend: TrtllmAttention,
+    *,
+    proxy: bool,
+    token_mask: bool,
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
     wrappers = _sparse_wrappers(backend)
     assert wrappers, "Sage silently bypassed the PrimTS block-sparse FMHA"
     quant_config = backend.quant_attention_config
@@ -182,7 +189,7 @@ def _assert_sparse_sage_active(backend: TrtllmAttention, *, proxy: bool, token_m
         assert state.use_kv_valid_bits == token_mask
         assert state.q_dtype == qk_dtype
         assert state.v_dtype == torch.float8_e4m3fn
-        assert state.output_dtype == torch.bfloat16
+        assert state.output_dtype == dtype
         assert state.sage.q_block_size == quant_config.q_block_size
         assert state.sage.k_block_size == quant_config.k_block_size
 
@@ -345,12 +352,12 @@ def test_sol_sage_cuda_graph_refreshes_inputs_and_scales(qk_dtype: _QuantDtype) 
     _assert_parity(replayed, expected, label=f"SOL {qk_dtype} Sage CUDA Graph replay")
 
 
-def _masked_zero_score_inputs() -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, BlockSparseForwardInputs
-]:
+def _masked_zero_score_inputs(
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, BlockSparseForwardInputs]:
     shape = (_BATCH_SIZE, 131, _HEADS, _HEAD_DIM)
-    magnitudes = torch.tensor([0.0, 1.0e-8], device="cuda", dtype=torch.bfloat16)
-    q = torch.ones(shape, device="cuda", dtype=torch.bfloat16) * magnitudes[:, None, None, None]
+    magnitudes = torch.tensor([0.0, 1.0e-8], device="cuda", dtype=dtype)
+    q = torch.ones(shape, device="cuda", dtype=dtype) * magnitudes[:, None, None, None]
     tokens = torch.arange(shape[1], device=q.device)
     visible = (tokens >= 68) & (tokens < 76)
     # Masked V=4 exposes leaked probability; the eight visible tokens have V=1.
@@ -367,12 +374,15 @@ def _masked_zero_score_inputs() -> tuple[
     return q, -q, v, routes
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("qk_dtype", ["int8", "fp8"])
 @torch.no_grad()
-def test_sage_zero_scores_preserve_token_masks_and_empty_rows(qk_dtype: _QuantDtype) -> None:
+def test_sage_zero_scores_preserve_token_masks_and_empty_rows(
+    qk_dtype: _QuantDtype, dtype: torch.dtype
+) -> None:
     """Zero and tiny Q/K keep token masking and empty rows exact through quantization."""
-    q, k, v, routes = _masked_zero_score_inputs()
-    backends = (_backend(None), _backend(qk_dtype))
+    q, k, v, routes = _masked_zero_score_inputs(dtype)
+    backends = (_backend(None, dtype=dtype), _backend(qk_dtype, dtype=dtype))
     expected, actual = (
         backend.forward(
             q,
@@ -384,7 +394,7 @@ def test_sage_zero_scores_preserve_token_masks_and_empty_rows(qk_dtype: _QuantDt
         ).view_as(q)
         for backend in backends
     )
-    _assert_sparse_sage_active(backends[1], proxy=False, token_mask=True)
+    _assert_sparse_sage_active(backends[1], proxy=False, token_mask=True, dtype=dtype)
     _assert_parity(actual, expected, label=f"{qk_dtype} zero/tiny scores with masked rows")
     assert torch.count_nonzero(actual[:, :64]).item() == 0, "fully masked rows must be zero"
     assert torch.count_nonzero(actual[:, 128:]).item() == 0, "empty route rows must be zero"
