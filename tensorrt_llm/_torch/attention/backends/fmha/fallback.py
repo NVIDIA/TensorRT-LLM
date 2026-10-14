@@ -297,6 +297,12 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
+        if forward_args.sage_attn_smooth_v:
+            logger.warning_once(
+                "The attention op quantizes V without the V smoothing this SageAttention "
+                "recipe requests.",
+                key="fallback_fmha_sage_attn_smooth_v",
+            )
 
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_runtime_params`` for sparse inputs),

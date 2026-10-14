@@ -23,6 +23,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -131,17 +132,19 @@ void launch(SageQuantParams params, torch::Tensor const& input, torch::Tensor co
 //
 // Q and K are quantized to INT8 or FP8 E4M3 with one scale per q_block_size / k_block_size tokens
 // of a sequence, laid out per head as tensorrt_llm::common::getSageScaleHeadStride describes. V is
-// quantized to FP8 E4M3 with one scale per channel of each sequence. The V scales and the K mean
-// are [batch, heads_kv, head_dim]; k_mean is the K-smoothing mean and is filled exactly when given.
+// quantized to FP8 E4M3 with one scale per channel of each sequence. The V scales and the means
+// are [batch, heads_kv, head_dim]; k_mean and v_mean are the K- and V-smoothing means, subtracted
+// before quantization and filled exactly when given; a smoothed V's scales cover V minus its mean.
 //
-// With reuse_stats, only K and V are quantized, with the V scales and the K mean of an earlier call
+// With reuse_stats, only K and V are quantized, with the V scales and the means of an earlier call
 // as inputs, for tensors that must dequantize like that call's K and V, such as the K/V block means
 // of PrimTS proxy routes; K still takes its own scales. The query arguments must then be absent.
 void sage_quantize(std::optional<torch::Tensor> const& query, torch::Tensor const& key, torch::Tensor const& value,
     std::optional<torch::Tensor> const& cu_seqlens_q, torch::Tensor const& cu_seqlens_kv,
     std::optional<torch::Tensor> q_quant, torch::Tensor& k_quant, torch::Tensor& v_quant,
     std::optional<torch::Tensor> q_scale, torch::Tensor& k_scale, torch::Tensor& v_scale,
-    std::optional<torch::Tensor> k_mean, int64_t q_block_size, int64_t k_block_size, bool reuse_stats)
+    std::optional<torch::Tensor> k_mean, std::optional<torch::Tensor> v_mean, int64_t q_block_size,
+    int64_t k_block_size, bool reuse_stats)
 {
     checkKeyValue(key, value, k_quant, v_quant, cu_seqlens_kv);
     int const batchSize = static_cast<int>(cu_seqlens_kv.size(0) - 1);
@@ -152,10 +155,15 @@ void sage_quantize(std::optional<torch::Tensor> const& query, torch::Tensor cons
     {
         checkScale(*k_mean, statRows * key.size(2), "k_mean");
     }
+    if (v_mean.has_value())
+    {
+        checkScale(*v_mean, statRows * value.size(2), "v_mean");
+    }
 
     SageQuantParams params = makeParams(value, v_quant, v_scale, k_quant, batchSize, cu_seqlens_kv.data_ptr<int>());
     params.kSmooth = k_mean.has_value();
     params.ptrKMean = params.kSmooth ? k_mean->data_ptr<float>() : nullptr;
+    params.ptrVMean = v_mean.has_value() ? v_mean->data_ptr<float>() : nullptr;
     if (reuse_stats)
     {
         TORCH_CHECK(!query.has_value() && !cu_seqlens_q.has_value() && !q_quant.has_value() && !q_scale.has_value(),
@@ -176,15 +184,32 @@ void sage_quantize(std::optional<torch::Tensor> const& query, torch::Tensor cons
     TORCH_CHECK(q_quant->scalar_type() == k_quant.scalar_type(), "q_quant and k_quant must share a dtype");
     checkBlockScales(*query, *q_scale, q_block_size, batchSize, "q_scale");
 
-    // The V scales and the K mean are reduced with atomics into zeroed buffers.
-    v_scale.zero_();
+    // The V scales and the means are reduced with atomics into zeroed buffers. A smoothed V's scales
+    // are derived from the extrema instead.
+    if (!v_mean.has_value())
+    {
+        v_scale.zero_();
+    }
     if (k_mean.has_value())
     {
         k_mean->zero_();
     }
+    if (v_mean.has_value())
+    {
+        v_mean->zero_();
+    }
 
     params.ptrKForMean = params.kSmooth ? key.data_ptr() : nullptr;
-    // Q, while collecting the V scales and the K mean; then K (smoothed by the K mean) and V.
+    std::optional<torch::Tensor> v_max;
+    std::optional<torch::Tensor> v_min;
+    if (v_mean.has_value())
+    {
+        v_max = torch::full_like(v_scale, -std::numeric_limits<float>::infinity());
+        v_min = torch::full_like(v_scale, std::numeric_limits<float>::infinity());
+        params.ptrVMax = v_max->data_ptr<float>();
+        params.ptrVMin = v_min->data_ptr<float>();
+    }
+    // Q, while collecting the V statistics and the K mean; then K (smoothed by the K mean) and V.
     launch(params, *query, *cu_seqlens_q, *q_quant, *q_scale, q_block_size, 1);
     launch(params, key, cu_seqlens_kv, k_quant, k_scale, k_block_size, 2);
 }
@@ -194,7 +219,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "sage_quantize(Tensor? query, Tensor key, Tensor value, Tensor? cu_seqlens_q, Tensor cu_seqlens_kv, "
         "Tensor(a!)? q_quant, Tensor(b!) k_quant, Tensor(c!) v_quant, Tensor(d!)? q_scale, Tensor(e!) k_scale, "
-        "Tensor(f!) v_scale, Tensor(g!)? k_mean, int q_block_size, int k_block_size, bool reuse_stats=False) -> ()");
+        "Tensor(f!) v_scale, Tensor(g!)? k_mean, Tensor(h!)? v_mean, int q_block_size, int k_block_size, "
+        "bool reuse_stats=False) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -409,6 +409,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
                     "sage_attn_qk_int8": quant_cfg.qk_dtype == "int8",
                     "sage_attn_smooth_k": quant_cfg.smooth_k,
+                    "sage_attn_smooth_v": quant_cfg.smooth_v,
                     "qk_fp8_per_tensor": quant_cfg.q_block_size == 0
                     and quant_cfg.qk_dtype == "fp8",
                     "v_fp8_per_tensor": quant_cfg.v_block_size == 0 and quant_cfg.v_dtype == "fp8",

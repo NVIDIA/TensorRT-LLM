@@ -969,6 +969,9 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
     sage_attn_smooth_k: bool = False
+    # Subtract the per-channel V mean before quantizing V. Applied by FMHA libraries that add
+    # the mean back to the output; the others quantize V unsmoothed.
+    sage_attn_smooth_v: bool = False
     # SageAttention inputs that the attention core quantized for the FMHA libraries
     # taking quantized inputs; the attention op quantizes inside its kernels.
     sage_quantized: Optional["SageQuantized"] = None

@@ -82,6 +82,7 @@ def _backend(
     sparse_config: SolAttentionConfig | VideoSparseAttentionConfig | None = None,
     *,
     k_block_size: int | None = None,
+    smooth_v: bool = False,
     dtype: torch.dtype = torch.bfloat16,
 ) -> TrtllmAttention:
     quant_config = None
@@ -96,6 +97,7 @@ def _backend(
             q_block_size=1,
             k_block_size=k_block_size,
             v_block_size=1,
+            smooth_v=smooth_v,
         )
     return create_attention(
         backend="TRTLLM",
@@ -113,12 +115,16 @@ def _backend(
 
 
 def _sol(
-    qk_dtype: _QuantDtype | None, *, phase: _SolPhase = "proxy", k_block_size: int | None = None
+    qk_dtype: _QuantDtype | None,
+    *,
+    phase: _SolPhase = "proxy",
+    k_block_size: int | None = None,
+    smooth_v: bool = False,
 ) -> TrtllmAttention:
     sparse_config = SolAttentionConfig(
         tau=-1.0e6 if phase == "exact" else 1.0e6, disabled_until_timestep=0.6
     )
-    return _backend(qk_dtype, sparse_config, k_block_size=k_block_size)
+    return _backend(qk_dtype, sparse_config, k_block_size=k_block_size, smooth_v=smooth_v)
 
 
 def _inputs(seq_len: int, *, seed: int = 20260921) -> tuple[torch.Tensor, ...]:
@@ -192,6 +198,7 @@ def _assert_sparse_sage_active(
         assert state.output_dtype == dtype
         assert state.sage.q_block_size == quant_config.q_block_size
         assert state.sage.k_block_size == quant_config.k_block_size
+        assert state.sage.v_mean == quant_config.smooth_v
 
 
 def _parity_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -324,6 +331,32 @@ def test_sol_sage_matches_unquantized_attention(
         label=f"SOL Sage {qk_dtype}, Kblock={k_block_size}, {phase}",
         qk_dtype=qk_dtype,
     )
+
+
+@pytest.mark.parametrize("case", ["sol_proxy", "sol_dense_timestep", "dense_model"])
+@torch.no_grad()
+def test_sage_smooth_v_matches_unquantized_attention(case: str) -> None:
+    """V smoothing on mixed SOL routes, and on dense calls, which then run on a PrimTS dense plan."""
+    q, k, v = _inputs(131)
+    if case == "dense_model":
+        reference, candidate = _backend(None), _backend("fp8", smooth_v=True)
+        expected, actual = (
+            backend.forward(q=q, k=k, v=v, batch_size=q.shape[0], seq_len=q.shape[1]).view_as(q)
+            for backend in (reference, candidate)
+        )
+    else:
+        phase = "dense" if case == "sol_dense_timestep" else "proxy"
+        reference, candidate = _sol(None, phase=phase), _sol("fp8", phase=phase, smooth_v=True)
+        expected = _forward_sol(reference, q, k, v, phase=phase)
+        actual = _forward_sol(candidate, q, k, v, phase=phase)
+
+    wrappers = _sparse_wrappers(candidate)
+    assert wrappers, "V smoothing bypassed the PrimTS kernels"
+    for wrapper in wrappers:
+        state = wrapper._plan_state
+        assert state.sage is not None and state.sage.v_mean
+        assert state.use_block_sparse == (case == "sol_proxy")
+    _assert_parity(actual, expected, label=f"Sage fp8 smooth_v, {case}", qk_dtype="fp8")
 
 
 @pytest.mark.parametrize("qk_dtype", ["int8", "fp8"])

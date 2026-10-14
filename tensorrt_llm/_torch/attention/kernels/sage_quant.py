@@ -33,11 +33,12 @@ class SageQuantized(NamedTuple):
     """Quantized Q/K/V and their FP32 dequantization scales.
 
     ``q_scale`` and ``k_scale`` are ``[heads, ceil(tokens / block) + batch - 1]``: sequence
-    ``b`` starts at slot ``cu_seqlens[b] // block + b``. ``v_scale`` and ``k_mean`` are
-    ``[batch, heads_kv, head_dim]``; ``k_mean`` is the mean subtracted from K before
-    quantization and is ``None`` without K smoothing. ``q`` and ``q_scale`` are ``None`` when
-    the statistics of an earlier call were reused. The summary fields hold the quantized K/V
-    block means of proxy routes and their per-mean key scales, for calls that have them.
+    ``b`` starts at slot ``cu_seqlens[b] // block + b``. ``v_scale``, ``k_mean``, and
+    ``v_mean`` are ``[batch, heads_kv, head_dim]``; the means are subtracted from K and V
+    before quantization and are ``None`` without K or V smoothing. ``q`` and ``q_scale`` are
+    ``None`` when the statistics of an earlier call were reused. The summary fields hold the
+    quantized K/V block means of proxy routes and their per-mean key scales, for calls that
+    have them.
     """
 
     q: torch.Tensor | None
@@ -47,6 +48,7 @@ class SageQuantized(NamedTuple):
     k_scale: torch.Tensor
     v_scale: torch.Tensor
     k_mean: torch.Tensor | None = None
+    v_mean: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
     k_summary_scale: torch.Tensor | None = None
@@ -72,17 +74,19 @@ def sage_quantize(
     k_block_size: int,
     qk_quant_dtype: torch.dtype,
     smooth_k: bool = False,
+    smooth_v: bool = False,
     stats: SageQuantized | None = None,
 ) -> SageQuantized:
-    """Quantize Q/K/V for SageAttention, with V scales and the K mean per sequence.
+    """Quantize Q/K/V for SageAttention, with V scales and the means per sequence.
 
     Q and K get one scale per ``q_block_size`` / ``k_block_size`` tokens of a sequence (1, 4,
     16, or 32); V gets one FP8 scale per channel of each sequence. With
     ``smooth_k``, every sequence's per-channel K mean is subtracted before K is quantized,
-    which leaves the attention output unchanged.
+    which leaves the attention output unchanged. With ``smooth_v``, the per-channel V mean
+    is subtracted before V is quantized; the attention kernel must add it back.
 
     With ``stats``, the result of an earlier call, only K and V are quantized, with the V
-    scales and the K mean of ``stats``, so that they dequantize like its K and V; K still takes
+    scales and the means of ``stats``, so that they dequantize like its K and V; K still takes
     its own scales. The smoothing follows ``stats``, and the result carries its statistics and
     no Q.
 
@@ -97,11 +101,14 @@ def sage_quantize(
         k_block_size: Key tokens per scale.
         qk_quant_dtype: ``torch.int8`` or ``torch.float8_e4m3fn`` for Q and K.
         smooth_k: Subtract the per-sequence K mean before quantizing K.
+        smooth_v: Subtract the per-sequence V mean before quantizing V.
         stats: ``None``, or an earlier result with the batch, heads, and head dimension of
-            ``key``, whose V scales and K mean to reuse.
+            ``key``, whose V scales and means to reuse.
     """
     _check_qk_quant_dtype(qk_quant_dtype)
-    if stats is not None and (query is not None or cu_seqlens_q is not None or smooth_k):
+    if stats is not None and (
+        query is not None or cu_seqlens_q is not None or smooth_k or smooth_v
+    ):
         raise ValueError("with stats, only K and V are quantized, with the smoothing of stats")
     batch = cu_seqlens_kv.numel() - 1
     heads_kv, head_dim = key.shape[1], key.shape[2]
@@ -126,6 +133,7 @@ def sage_quantize(
             k_scale,
             stats.v_scale,
             stats.k_mean,
+            stats.v_mean,
             0,
             k_block_size,
             reuse_stats=True,
@@ -138,6 +146,7 @@ def sage_quantize(
             k_scale=k_scale,
             v_scale=stats.v_scale,
             k_mean=stats.k_mean,
+            v_mean=stats.v_mean,
         )
 
     q = torch.empty_like(query, dtype=qk_quant_dtype)
@@ -148,6 +157,7 @@ def sage_quantize(
     )
     v_scale = torch.empty((batch, heads_kv, head_dim), dtype=torch.float32, device=value.device)
     k_mean = torch.empty_like(v_scale) if smooth_k else None
+    v_mean = torch.empty_like(v_scale) if smooth_v else None
     torch.ops.trtllm.sage_quantize(
         query,
         key,
@@ -161,6 +171,7 @@ def sage_quantize(
         k_scale,
         v_scale,
         k_mean,
+        v_mean,
         q_block_size,
         k_block_size,
     )
@@ -172,4 +183,5 @@ def sage_quantize(
         k_scale=k_scale,
         v_scale=v_scale,
         k_mean=k_mean,
+        v_mean=v_mean,
     )

@@ -103,6 +103,15 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
+    smooth_v: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel V mean before quantizing V and add it back to the output. "
+            "SageAttention only; applied where the attention runs on the PrimTS kernels, while "
+            "the trtllm-gen kernels quantize V without it."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -207,15 +216,15 @@ class AttentionConfig(StrictBaseModel):
                     f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
                     f"{sorted(recipes)}."
                 )
-            if q_config.smooth_k and q_config.q_block_size == 0:
+            if (q_config.smooth_k or q_config.smooth_v) and q_config.q_block_size == 0:
                 raise ValueError(
-                    "smooth_k is a SageAttention option and does not apply to the per-tensor "
-                    f"recipe {recipe!r}."
+                    "smooth_k and smooth_v are SageAttention options and do not apply to the "
+                    f"per-tensor recipe {recipe!r}."
                 )
-        elif q_config.smooth_k:
+        elif q_config.smooth_k or q_config.smooth_v:
             raise ValueError(
-                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
-                f"backend='{self.backend}'."
+                f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
+                f"got backend='{self.backend}'."
             )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
