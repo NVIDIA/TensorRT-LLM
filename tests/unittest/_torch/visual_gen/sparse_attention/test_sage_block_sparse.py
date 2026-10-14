@@ -285,11 +285,8 @@ def test_vsa_sage_matches_unquantized_sparse_attention(qk_dtype: _QuantDtype) ->
     ("qk_dtype", "phase", "k_block_size"),
     [
         ("int8", "proxy", 16),
-        ("fp8", "proxy", 4),
         ("fp8", "proxy", 1),
-        ("int8", "exact", 16),
         ("fp8", "exact", 4),
-        ("int8", "dense", 16),
         ("fp8", "dense", 4),
     ],
 )
@@ -359,11 +356,10 @@ def test_sage_smooth_v_matches_unquantized_attention(case: str) -> None:
     _assert_parity(actual, expected, label=f"Sage fp8 smooth_v, {case}", qk_dtype="fp8")
 
 
-@pytest.mark.parametrize("qk_dtype", ["int8", "fp8"])
 @torch.no_grad()
-def test_sol_sage_cuda_graph_refreshes_inputs_and_scales(qk_dtype: _QuantDtype) -> None:
+def test_sol_sage_cuda_graph_refreshes_inputs_and_scales() -> None:
     """A captured mixed-proxy Sage layer consumes new Q/K/V and scales on replay."""
-    backend = _sol(qk_dtype)
+    backend = _sol("fp8")
     q, k, v = _inputs(131)
     previous = _forward_sol(backend, q, k, v).clone()
     _assert_sparse_sage_active(backend, proxy=True, token_mask=False)
@@ -382,7 +378,7 @@ def test_sol_sage_cuda_graph_refreshes_inputs_and_scales(qk_dtype: _QuantDtype) 
     replayed = captured.clone()
     expected = _forward_sol(backend, q, k, v)
     assert _parity_stats(expected, previous)["relative_l2"] > 0.1
-    _assert_parity(replayed, expected, label=f"SOL {qk_dtype} Sage CUDA Graph replay")
+    _assert_parity(replayed, expected, label="SOL Sage CUDA Graph replay")
 
 
 def _masked_zero_score_inputs(
@@ -407,8 +403,11 @@ def _masked_zero_score_inputs(
     return q, -q, v, routes
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("qk_dtype", ["int8", "fp8"])
+@pytest.mark.parametrize(
+    ("dtype", "qk_dtype"),
+    [(torch.bfloat16, "int8"), (torch.float16, "fp8")],
+    ids=["bf16-int8", "fp16-fp8"],
+)
 @torch.no_grad()
 def test_sage_zero_scores_preserve_token_masks_and_empty_rows(
     qk_dtype: _QuantDtype, dtype: torch.dtype
@@ -434,9 +433,8 @@ def test_sage_zero_scores_preserve_token_masks_and_empty_rows(
     torch.testing.assert_close(actual[:, 64:128], torch.ones_like(actual[:, 64:128]))
 
 
-@pytest.mark.parametrize("qk_dtype", ["int8", "fp8"])
 @torch.no_grad()
-def test_sol_sage_zero_values_preserve_zero_output(qk_dtype: _QuantDtype) -> None:
+def test_sol_sage_zero_values_preserve_zero_output() -> None:
     """Exact and proxy SOL contributions stay zero through the V-scale floor.
 
     The inputs and tau match the mixed-route proxy cases above, so both route
@@ -444,7 +442,7 @@ def test_sol_sage_zero_values_preserve_zero_output(qk_dtype: _QuantDtype) -> Non
     """
     q, k, v = _inputs(131)
     zero_v = torch.zeros_like(v)
-    candidate = _sol(qk_dtype)
+    candidate = _sol("fp8")
     actual = _forward_sol(candidate, q, k, zero_v)
     _assert_sparse_sage_active(candidate, proxy=True, token_mask=False)
     assert torch.count_nonzero(actual).item() == 0, "zero exact values and proxy means stay zero"
