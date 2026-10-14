@@ -991,3 +991,61 @@ def test_a_finished_job_without_its_result_is_measured_again(tmp_path):
     stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None, runner_factory=factory, poll_s=0, log=lambda m: None)
     assert stage.ground()
     assert (spec.workdir / "data" / "t-baseline" / "meta.json").exists()
+
+
+def _near_campaign(tmp_path, gain_fast, gain_fused):
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    (repo / "attn.py").write_text("FUSED = False\n")
+    _git(repo, "add", "attn.py")
+    _git(repo, "commit", "-q", "-m", "attn")
+
+    def effect(config, tree):
+        lat = 100.0
+        if tree and "FAST = True" in Path(tree, "modeling.py").read_text():
+            lat *= 1 + gain_fast
+        if tree and "FUSED = True" in Path(tree, "attn.py").read_text():
+            lat *= 1 + gain_fused
+        return lat, 2000.0
+
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf, gates = FakeRunner(["s1"], "camp", effect), FakeRunner(["g1"], "campg", effect)
+    work = tmp_path / "camp"
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.0005}), min_gain=0.01, log=lambda m: None)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    for slug, path, text in (("fast-path", "modeling.py", "FAST = True\n"), ("fused-attn", "attn.py", "FUSED = True\n")):
+        wt = open_candidate(repo, work / "wt", slug, "HEAD")
+        (wt / path).write_text(text)
+        _git(wt, "commit", "-q", "-am", slug)
+        d = tmp_path / f"{slug}.yaml"
+        d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+        camp.submit_candidate(slug, d)
+    for _ in range(40):
+        if not camp.step():
+            break
+    kinds = [json.loads(l)["kind"] for l in (work / "perf_ledger.jsonl").read_text().splitlines()]
+    return camp, kinds
+
+
+def test_near_misses_are_stacked_and_kept_when_the_stack_clears_the_floor(tmp_path):
+    """Two real gains under the 1% floor (+0.6% each, noise band 0.15%): neither wins alone, the stack
+    (+1.2%) does, and both are kept after one gate."""
+    camp, kinds = _near_campaign(tmp_path, 0.006, 0.006)
+    assert {s: c.status for s, c in camp.state.candidates.items()} == {"fast-path": "kept", "fused-attn": "kept"}
+    assert "near_stack" in kinds and "batch_kept" in kinds and kinds.count("candidate_gate") == 1
+
+
+def test_a_near_miss_stack_that_stays_under_the_floor_reverts_its_members(tmp_path):
+    """+0.3% each stacks to +0.6%: still under the floor, so both are reverted -- no single is gated."""
+    camp, kinds = _near_campaign(tmp_path, 0.003, 0.003)
+    assert {s: c.status for s, c in camp.state.candidates.items()} == {"fast-path": "reverted", "fused-attn": "reverted"}
+    assert "near_stack_failed" in kinds and "candidate_gate" not in kinds

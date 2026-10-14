@@ -42,7 +42,7 @@ TUNER_DECISIONS = ("CANDIDATE", "DROPPED", "NEED_SMITH", "NEED_RUNTIME", "NEED_R
 @dataclass
 class CandidateState:
     slug: str
-    status: str = "issued"  # issued | e2e | won | waiting | gate | kept | reverted | dropped | blocked | conflict
+    status: str = "issued"  # issued | e2e | won | near | waiting | gate | kept | reverted | dropped | blocked | conflict
     decision: str = ""
     worktree: str = ""
     commits: list[str] = field(default_factory=list)
@@ -68,6 +68,9 @@ class CandidateState:
     # Failed runs of the current e2e label / gate: a session that dies (a full
     # filesystem, a node fault) fails the job without saying anything about it.
     retries: int = 0
+    # A NEUTRAL whose gain is real (above the noise band) but under the keep floor: stacked
+    # with the other near misses on the same best tree and judged as one change.
+    near: bool = False
 
 
 @dataclass
@@ -135,6 +138,8 @@ class Campaign:
         noise_factor: float = 3.0,
         branch_prefix: str = "tune",
         log: Callable[[str], None] = print,
+        stack_near: bool = True,
+        near_min: float | None = None,
     ) -> None:
         self.workdir = workdir
         self.repo = repo
@@ -147,6 +152,8 @@ class Campaign:
         self.noise = noise
         self.min_gain = min_gain
         self.noise_factor = noise_factor
+        self.stack_near = stack_near
+        self.near_min = min_gain / 4 if near_min is None else near_min
         self.log = log
         self.data = workdir / "data"
         self.data.mkdir(parents=True, exist_ok=True)
@@ -486,7 +493,9 @@ class Campaign:
                 # A winner waits for the other measurements on this best tree: several
                 # winners are stacked and measured once (see _batch) instead of being
                 # kept one by one, each keep forcing the rest to re-measure.
-                st.status = "won" if cmp.verdict == "WIN" else "reverted"
+                st.status = "won" if cmp.verdict == "WIN" else ("near" if self._near(cmp) else "reverted")
+                if st.status == "near":
+                    self.log(f"[campaign] {st.slug}: near miss, waits to be stacked with the others")
                 st.retries = 0
             if st.status == "gate":
                 busy = True
@@ -535,6 +544,26 @@ class Campaign:
         self.state.save(self.state_path)
         return busy
 
+    def _near(self, cmp) -> bool:
+        """A NEUTRAL with a real gain: some metric above both the noise band and ``near_min``, none
+        below minus the band."""
+        if not self.stack_near or cmp.verdict != "NEUTRAL":
+            return False
+        band = {k: self.noise_factor * self.noise.of(k) for k in cmp.deltas}
+        up = any(v >= max(self.near_min, band[k]) for k, v in cmp.deltas.items())
+        down = any(v < -max(band[k], 0.002) for k, v in cmp.deltas.items())
+        return up and not down
+
+    def _near_failed(self, b: dict, why: str) -> bool:
+        """A near-miss stack that does not clear the keep rule (or the gate): its members are reverted."""
+        for slug in b.get("members", []):
+            st = self.state.candidates[slug]
+            st.status, st.reason = "reverted", f"near-miss stack {b.get('members')}: {why}"
+        self.ledger.append("near_stack_failed", members=b.get("members"), why=why)
+        self.log(f"[campaign] near-miss stack {b.get('members')} not kept: {why}")
+        self._end_batch(kept=False)
+        return True
+
     def _best_head(self) -> str:
         return git(Path(self.state.best_tree), "rev-parse", "HEAD")
 
@@ -566,6 +595,17 @@ class Campaign:
         if not b:
             waiting = [st for st in cands.values() if st.status == "e2e" and st.eval_base == head and st.e2e_label
                        and self._measurement(st.e2e_label) is None]
+            if not winners and not waiting and self.stack_near:
+                # Several real-but-small gains: stack the compatible near misses and judge the stack
+                # by the same keep rule as any candidate.
+                nears = [st for st in cands.values() if st.status == "near" and st.eval_base == head]
+                chosen = self._compatible_set(head, nears) if len(nears) >= 2 else []
+                if len(chosen) >= 2:
+                    for st in chosen:
+                        st.status, st.near = "won", True
+                    winners = sorted(chosen, key=lambda st: max(st.deltas.values() or [0.0]), reverse=True)
+                    self.ledger.append("near_stack", members=[st.slug for st in winners], base=head)
+                    self.log(f"[campaign] near-miss stack {[st.slug for st in winners]}: measured together")
             if not winners or waiting:
                 return bool(winners)
             if len(winners) == 1:
@@ -610,6 +650,8 @@ class Campaign:
                     continue  # stays `won`: kept alone or re-stacked after the batch
                 members.append(st.slug)
             if len(members) < 2:
+                if all(st.near for st in chosen):
+                    return self._near_failed({"members": [st.slug for st in chosen]}, "the stack does not apply")
                 (cands[members[0]] if members else winners[0]).status = "gate"
                 return True
             import hashlib
@@ -619,7 +661,7 @@ class Campaign:
             label = f"e2e-batch-{git(tree, 'rev-parse', '--short=10', 'HEAD')}-{tag}"
             tip = git(tree, "rev-parse", "HEAD")
             self.state.batch = b = {"members": members, "base": head, "tree": str(tree), "label": label, "status": "e2e",
-                                    "tip": tip}
+                                    "tip": tip, "near": all(cands[m].near for m in members)}
             excluded = [st.slug for st in winners if st.slug not in members]
             for slug in excluded:
                 st = cands[slug]
@@ -657,6 +699,8 @@ class Campaign:
                 for k, v in best_single.items() if v > 0)
             self.ledger.append("batch_e2e", members=b["members"], holds=holds, best_single=best_single, **cmp.as_dict())
             self.log(f"[campaign] batch {b['members']}: {cmp.verdict} {cmp.reason}; holds={holds}")
+            if not holds and b.get("near"):
+                return self._near_failed(b, f"{cmp.verdict} {cmp.reason}")
             if not holds:
                 winners[0].status = "gate"
                 self._end_batch(kept=False)
@@ -679,6 +723,8 @@ class Campaign:
                 return True
             gate = json.loads(result.read_text())
             self.ledger.append("candidate_gate", slug="batch", members=b["members"], **gate)
+            if gate.get("verdict") != "PASS" and b.get("near"):
+                return self._near_failed(b, f"accuracy {gate.get('score')} < floor {gate.get('floor')}")
             if gate.get("verdict") != "PASS":
                 winners[0].status = "gate"  # fall back to the strongest single
                 self._end_batch(kept=False)
@@ -715,6 +761,8 @@ class Campaign:
         if b["retries"] <= (2 if rc in INFRA_RCS else 1):
             self.log(f"[campaign] batch {what} failed (rc={rc}); re-queued")
             return False
+        if b.get("near"):
+            return self._near_failed(b, f"{what} failed {b['retries']} times")
         self.log(f"[campaign] batch {what} failed {b['retries']} times; gating {winners[0].slug} alone")
         winners[0].status = "gate"
         self._end_batch(kept=False)

@@ -439,7 +439,8 @@ class TuneStage:
                                   tests=self._gate_tests(), eval_args=str(acc.get("eval_args", ""))),
             noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}), samples=int(self.t.get("noise_samples", 0))),
             min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)),
-            branch_prefix=self.branch_prefix, log=self.log,
+            branch_prefix=self.branch_prefix, log=self.log, stack_near=bool(cfg.get("stack_near", True)),
+            near_min=float(cfg["near_min"]) if "near_min" in cfg else None,
         )  # fmt: skip
         worktrees = s.workdir / "worktrees"
         if not camp.state.best_tree:
