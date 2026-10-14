@@ -2458,9 +2458,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_max_attempts=6
                     sbatch_attempt=1
                     while true; do
+                        # Silence xtrace around the capture and prints: it would re-echo the
+                        # multi-line sbatch output in every traced command.
+                        { set +x; } 2>/dev/null
                         sbatch_rc=0
                         sbatch_output=\$(${withGpuBudget(platform, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
-                        printf '%s\\n' "\${sbatch_output}"
+                        printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        { set -x; } 2>/dev/null
                         if [ "\${sbatch_rc}" -eq 0 ]; then
                             break
                         fi
