@@ -128,7 +128,8 @@ def _assert_only_default_group(rank, world_size):
 # ---- tests ----
 
 
-def test_reuses_ranks_across_runs(tmp_path):
+def test_reuses_ranks_across_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session")  # what this test asserts
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
