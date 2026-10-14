@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -7,6 +10,8 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.kv_hints import KvHintsInput
+from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
 
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -113,6 +118,7 @@ class GenerationRequest:
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -150,6 +156,7 @@ class GenerationRequest:
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
+        self.kv_hints = snapshot_kv_hints(kv_hints)
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(
@@ -251,6 +258,7 @@ class GenerationRequest:
         return state
 
     def __setstate__(self, state):
+        state.setdefault("kv_hints", None)
         buf = None
         pt = state.get("_prompt_token_ids")
         if type(pt) is tuple and len(
