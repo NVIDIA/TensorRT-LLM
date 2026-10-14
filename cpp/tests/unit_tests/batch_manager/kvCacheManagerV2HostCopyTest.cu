@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 
-// Round-trip tests for copyHostToDevice / copyDeviceToHost in kvCacheManagerV2Utils.cu. Calls of at most
-// hostCopyDmaMaxTasks() tasks at or above hostCopyDmaMinBytes() each take the copy-engine path
-// (cuMemcpy{HtoD,DtoH}Async); smaller tasks or larger batches take the batched copy kernel. Both knobs are read
-// once per process (cached static values), so these tests exercise both branches by choosing sizes and task counts
-// on both sides of them instead of changing the environment variables mid-process.
+// Round-trip tests for copyHostToDevice / copyDeviceToHost in kvCacheManagerV2Utils.cu.
+//
+// A call of at most hostCopyDmaMaxTasks() tasks of at least hostCopyDmaMinBytes() each takes the copy-engine path
+// (cuMemcpy{HtoD,DtoH}Async); smaller tasks or larger batches take the batched copy kernel. Both knobs are read once
+// per process, so instead of changing the environment variables mid-process the tests pick sizes and task counts on
+// both sides of the defaults and reach both branches that way.
 
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
