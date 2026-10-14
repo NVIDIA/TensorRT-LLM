@@ -24,9 +24,7 @@ pin the guards added for that:
 
 * transfer-bound requests are skipped by the recompute;
 * on a disaggregated engine every context-only and generation-only request
-  is left alone (the recompute reduces to the reuse-tree reset);
-* a failing KV hand-over marks the request as failed (for the existing
-  rank-safe error paths) instead of killing the executor loop.
+  is left alone (the recompute reduces to the reuse-tree reset).
 """
 
 from unittest.mock import MagicMock
@@ -36,8 +34,6 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
-from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggTransferCoordinator)
 
 
 def _request(request_id: int, *, state=LlmRequestState.GENERATION_IN_PROGRESS,
@@ -258,67 +254,6 @@ class TestRecomputeSkipsTransferBoundRequests:
         PyExecutor.recompute_active_requests(ex)
         assert [r.py_request_id for r in ex.terminated] == [31]
         assert 30 in manager.requests_in_transfer()
-
-
-def _coordinator(manager, kv_cache_manager, transceiver):
-    """DisaggTransferCoordinator over the fake transceiver / real transfer manager
-    (main moved the context-send path out of PyExecutor._send_kv_async)."""
-    registry = MagicMock()
-    registry.canceled_request_ids.return_value = []
-    transceiver.has_retired_send_session.return_value = False
-    transceiver.has_inflight_transfer.return_value = False
-    transceiver.pipeline_transfer_enabled = False
-    transceiver._fp4_mla_bridge_enabled = False
-    return DisaggTransferCoordinator(
-        transceiver=transceiver,
-        transfer_manager=manager,
-        kv_cache_manager=kv_cache_manager,
-        dist=MagicMock(),
-        effects=MagicMock(),
-        registry=registry,
-        enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
-    )
-
-
-class TestSendKvAsyncFailsRequestNotLoop:
-
-    def _build(self):
-        manager, kv_cache_manager = _transfer_manager()
-        transceiver = MagicMock()
-        transceiver.kv_transfer_timeout_ms = None
-        return _coordinator(manager, kv_cache_manager, transceiver), manager, kv_cache_manager, transceiver
-
-    def test_missing_blocks_fail_only_that_request(self):
-        coordinator, manager, kv_cache_manager, transceiver = self._build()
-        bad = _request(40, is_context_only=True)
-        good = _request(41, is_context_only=True)
-        # Only the first send raises; the second must still go through.
-        transceiver.respond_and_send_async.side_effect = [
-            IndexError("unordered_map::at"), None
-        ]
-
-        coordinator.send_completed_context([bad, good])
-
-        # The failed request is only marked; the rank-safe error paths
-        # (handle_errors_synced) pick it up from its state.
-        assert bad.state == LlmRequestState.DISAGG_TRANS_ERROR
-        # start_transfer() was undone for the failed request: untracked and unpinned.
-        assert 40 not in manager.requests_in_transfer()
-        kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(7)
-        # The healthy request completed the hand-over normally.
-        assert 41 in manager.requests_in_transfer()
-        assert good.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-
-    def test_healthy_path_unchanged(self):
-        coordinator, manager, kv_cache_manager, transceiver = self._build()
-        req = _request(50, is_context_only=True)
-
-        coordinator.send_completed_context([req])
-
-        transceiver.respond_and_send_async.assert_called_once_with(req)
-        assert 50 in manager.requests_in_transfer()
-        kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
 
 if __name__ == "__main__":

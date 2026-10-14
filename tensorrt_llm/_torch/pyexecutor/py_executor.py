@@ -6579,8 +6579,14 @@ class PyExecutor:
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
         # empty iterations.
+        # prefer_cpu=idle: on the idle path non-root ranks park in the probe
+        # for as long as rank 0 blocks on the queue (up to 20 min) -- that
+        # wait must not hold a spinning NCCL kernel under the 600 s watchdog.
+        # The transport choice must be identical on every rank, so `idle` has
+        # to be too: it follows the all-rank live-request count and the
+        # replicated waiting queue.
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests)
+            new_requests, prefer_cpu=idle)
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -9649,8 +9655,18 @@ class PyExecutor:
         everything here is rank-local and issues no TP collectives. Consuming
         an in-flight batch here instead would gather on some attention-DP
         ranks only and deadlock the engine.
+
+        Not supported with pipeline parallelism (``pp_size > 1``): the PP
+        microbatch ring keeps batches in flight across the control action, and
+        a PP-synchronized termination is deferred until all stages agree, so
+        the pause below would re-admit a request whose termination is still
+        pending. Raises ``NotImplementedError`` in that case.
         """
-        if self.dist.pp_size == 1 and self.previous_batch is not None:
+        if self.dist.pp_size > 1:
+            raise NotImplementedError(
+                "recompute_active_requests does not support pipeline "
+                f"parallelism (pp_size={self.dist.pp_size}).")
+        if self.previous_batch is not None:
             raise RuntimeError(
                 "recompute_active_requests requires a quiescent executor (no "
                 "in-flight batch); call it from within control_action(), "
