@@ -1009,15 +1009,18 @@ class TestKVCacheFailuresGen:
 
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
-        victim = make_gen_request(99)  # started, at tail → evictable
+        victim = make_gen_request(99)  # started, at tail → recompute-pause victim
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0, 1]
-        assert ids(out.paused_requests) == [99]
-        mgr.suspend_request.assert_called_once_with(victim)
+        # Single tier: suspension frees nothing, so the victim is recompute-paused instead.
+        assert ids(out.paused_requests) == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.suspend_request.assert_not_called()
+        mgr.free_resources.assert_called_once_with(victim)
 
     def test_gen_alloc_fails_evict_insufficient(self):
-        """gen fails, evict victim, retry still fails → self-evict."""
+        """gen fails, recompute-pause victim, retry still fails → skip (single tier never suspends)."""
         call_count = [0]
 
         def alloc_fn(req):
@@ -1030,8 +1033,10 @@ class TestKVCacheFailuresGen:
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
-        # gen99 evicted as victim for gen1; gen1 self-evicts after
-        assert set(ids(out.paused_requests)) == {1, 99}
+        # gen99 recompute-paused as victim for gen1; gen1 is skipped, not suspended
+        assert ids(out.paused_requests) == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.suspend_request.assert_not_called()
 
     def test_secondary_tier_recompute_pause_retries_immediately(self):
         """Full teardown is retried without conservatively waiting one pass."""
@@ -1101,9 +1106,11 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request([current, victim], set())
 
         assert out.generation_requests == []
-        assert ids(out.paused_requests) == [0]
+        # Single tier: nothing to suspend into, so the current request is skipped.
+        assert ids(out.paused_requests) == []
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
+        mgr.suspend_request.assert_not_called()
 
     def test_recompute_pause_skips_generation_to_complete_victim(self):
         """A finalizing request cannot be replayed by destructive pause."""
@@ -1119,9 +1126,12 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request([current, victim], set())
 
         assert out.generation_requests == []
-        assert ids(out.paused_requests) == [0]
+        # The finalizing victim will free pages without a forward pass: this is
+        # a stall, not a deadlock, and nothing is suspended in a single tier.
+        assert ids(out.paused_requests) == []
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
+        mgr.suspend_request.assert_not_called()
 
     def test_recompute_frontier_survives_ordinary_frontier_shrink(self):
         """Recompute still sees a suspended tail after ordinary eviction skips it."""
@@ -1246,7 +1256,8 @@ class TestKVCacheFailuresGen:
         reqs = [make_gen_request(0), make_gen_request(1), v1, v2]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0, 1]
-        assert len(out.paused_requests) == 2
+        assert out.paused_requests == []
+        assert len(out.recompute_paused_requests) == 2
 
     def test_gen_fail_does_not_break_immediately(self):
         """[gen1_ok, gen2_fail(no victim)] → gen1 scheduled, gen2 causes break."""
@@ -1299,10 +1310,10 @@ class TestKVCacheFailuresGen:
         mgr.kv_cache_map[victim.py_request_id].is_active = False
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
-        # gen0 succeeds, gen1 fails, victim is not evictable (suspended)
-        # → gen1 self-evicts, victim is not in paused list from eviction
+        # gen0 succeeds, gen1 fails, victim is not evictable (suspended);
+        # single tier → nothing is suspended, the victim may be recompute-paused
         assert ids(out.generation_requests) == [0]
-        assert 99 not in ids(out.paused_requests)
+        assert out.paused_requests == []
 
 
 class TestUnpairedDraftAdmission:
@@ -1743,7 +1754,7 @@ class TestEviction:
             call_count[0] += 1
             return call_count[0] != 1  # first fails, retry succeeds
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)  # gen in progress → evictable
         reqs = [make_gen_request(0), victim]
@@ -1758,7 +1769,7 @@ class TestEviction:
             call_count[0] += 1
             return call_count[0] != 1
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         # Non-first ctx chunk is evictable (is_context_init_state=True, is_first=False)
         victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=False)
@@ -1770,6 +1781,7 @@ class TestEviction:
     def test_first_chunk_ctx_not_evictable(self):
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=True)
@@ -1787,7 +1799,7 @@ class TestEviction:
             call_count[0] += 1
             return call_count[0] != 1
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), victim]
@@ -1801,7 +1813,7 @@ class TestEviction:
             call_count[0] += 1
             return call_count[0] != 1
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), victim]
@@ -1811,6 +1823,7 @@ class TestEviction:
     def test_eviction_clears_request_runtime_state(self):
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
         req = make_gen_request(0)
@@ -1823,6 +1836,7 @@ class TestEviction:
         """UNKNOWN state at tail is not evictable; gen0 self-evicts."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
         tail = make_filtered_request(99, state_value=0)
@@ -1841,7 +1855,7 @@ class TestEviction:
             # gen0: fail(1), retry after v2: fail(2), retry after v1: ok(3)
             return call_count[0] == 3
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         v1 = make_gen_request(98)
         v2 = make_gen_request(99)
@@ -1861,7 +1875,7 @@ class TestEviction:
             call_count[0] += 1
             return call_count[0] != 1
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(5)  # at index 1, evictable
         # index 2: first-chunk ctx is NOT evictable, so eviction search
@@ -1876,6 +1890,7 @@ class TestEviction:
         """Gen request self-evicts when alloc fails and no victims exist."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
         # Only one gen req — alloc fails, no victims → self-evicts
@@ -1888,6 +1903,7 @@ class TestEviction:
         """Gen self-evicts when all behind it are first-chunk ctx (not evictable)."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=200)
         reqs = [
@@ -1900,6 +1916,25 @@ class TestEviction:
         # gen0 self-evicts; break stops loop before ctx1, ctx2
         assert ids(out.paused_requests) == [0]
         assert len(out.context_requests) == 0
+
+
+    def test_single_tier_never_suspends(self):
+        """Without a secondary tier suspension frees nothing: no victim is suspended."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] != 1  # first fails, retry succeeds
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        reqs = [make_gen_request(0), victim]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.suspend_request.assert_not_called()
 
 
 # ===========================================================================
