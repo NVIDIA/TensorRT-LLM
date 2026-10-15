@@ -28,7 +28,10 @@ Only the kernel's own module and its sibling modules in the same directory are
 real. Triton's cache key depends on the kernel source, its line number and the
 values of the globals the kernel itself references, so the stand-ins do not
 change the key; a kernel that depends on a stand-in fails to compile here and
-falls back to compiling at its first launch.
+falls back to compiling at its first launch. So does a kernel whose module, or
+a sibling it imports, runs code at import time that a stand-in cannot satisfy
+(iterating an imported constant, for example): such kernels belong in a
+module of their own (e.g. ``pyexecutor/kv_cache/mamba_state_kernels.py``).
 """
 
 import importlib
