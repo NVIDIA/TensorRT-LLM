@@ -1412,3 +1412,48 @@ def test_deepseek_r1_keeps_a_second_close_as_content() -> None:
     result = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1").parse("a</think>b</think><tool_call>f")
     assert result.content == "b</think><tool_call>f"
+
+
+M3_START, M3_END = "<mm:think>", "</mm:think>"
+
+
+@pytest.mark.parametrize(
+    ("text", "content", "reasoning_content"),
+    [
+        (f"{M3_START}a{M3_END}b", "b", "a"),
+        (f"{M3_END}b", "b", ""),
+        ("b", "b", ""),
+        # Reasoning truncated before the closing tag (e.g. by max_tokens).
+        (f"{M3_START}a", "", "a"),
+        (M3_START, "", ""),
+    ])
+def test_minimax_m3_reasoning_parser(text: str, content: str,
+                                     reasoning_content: str) -> None:
+    result = ReasoningParserFactory.create_reasoning_parser("minimax_m3").parse(
+        text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+@pytest.mark.parametrize("text", [
+    f"{M3_START}a{M3_END}b",
+    f"{M3_START}a",
+    M3_START,
+])
+def test_minimax_m3_reasoning_parser_stream_matches_non_stream(
+        text: str) -> None:
+    """Streaming char-by-char then finishing must match a non-streaming parse."""
+    expected = ReasoningParserFactory.create_reasoning_parser(
+        "minimax_m3").parse(text)
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "minimax_m3")
+    content, reasoning_content = "", ""
+    for char in text:
+        result = reasoning_parser.parse_delta(char)
+        content += result.content
+        reasoning_content += result.reasoning_content
+    result = reasoning_parser.finish()
+    content += result.content
+    reasoning_content += result.reasoning_content
+    assert content == expected.content
+    assert reasoning_content == expected.reasoning_content

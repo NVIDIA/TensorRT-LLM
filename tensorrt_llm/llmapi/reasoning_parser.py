@@ -554,7 +554,12 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     def parse(self, text: str) -> ReasoningParserResult:
         end_idx = text.find(self.reasoning_end)
         if end_idx == -1:
-            # No closing tag → no reasoning block in this response.
+            # An opening tag with no closing tag is reasoning cut off (e.g. by
+            # max_tokens); streaming reports it as reasoning, so match that.
+            if text.startswith(self.reasoning_start):
+                return ReasoningParserResult(
+                    reasoning_content=text[len(self.reasoning_start):])
+            # No tags at all → no reasoning block in this response.
             return ReasoningParserResult(content=text)
         reasoning_content = text[:end_idx]
         content = text[end_idx + len(self.reasoning_end):]
