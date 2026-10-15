@@ -10,7 +10,8 @@ import torch
 from blake3 import blake3
 
 from tensorrt_llm._utils import maybe_pin_memory
-from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
+from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
+                                                 BaseModalityData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.logger import logger
 
@@ -176,7 +177,7 @@ def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
     raw modality dictionaries are no longer needed and must not be moved to
     GPU by the subsequent LLM input-preparation path.
     """
-    for modality in ("image", "video", "audio"):
+    for modality in MEDIA_MODALITIES:
         mm_data.pop(modality, None)
 
 
