@@ -54,7 +54,6 @@ option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
-option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
 option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
@@ -135,11 +134,6 @@ endif()
 if(FAST_BUILD)
   add_compile_definitions("FAST_BUILD")
   message(WARNING "Skip some kernels to accelerate compilation")
-endif()
-
-if(INDEX_RANGE_CHECK)
-  add_compile_definitions("INDEX_RANGE_CHECK")
-  message(WARNING "Check index range to detect OOB accesses")
 endif()
 
 # Read the project version
