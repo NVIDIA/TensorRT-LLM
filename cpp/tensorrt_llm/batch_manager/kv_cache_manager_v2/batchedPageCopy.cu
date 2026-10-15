@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -779,7 +780,41 @@ void BatchedPageCopier::computeConfigs()
     // whose descriptors may not cross a registered region. The kernel works on virtual addresses
     // and does not care, so chunking forces the kernel on regardless of link type -- accepting the
     // PCIe slowdown above rather than reintroducing per-page splitting on the CPU.
-    bool const kernelViable = mTopology.coherentLink || HostMem::shouldUseChunkedRegistration();
+    //
+    // TLLM_KV_CACHE_MANAGER_V2_PAGE_COPY_PREFER_COPY_ENGINE=1 opts a coherent link into the copy-engine
+    // path as well. Measured on a GB300 node (NVLink-C2C, 152 SMs, one 217 MB page): idle, the two
+    // paths sit within 5 % of each other at the link ceiling (copy engines 211 GB/s, kernel 201 GB/s
+    // host->device); with every SM thread slot taken by another kernel, the copy engines keep their
+    // 1.0 ms per page while this kernel's CTAs wait for a slot, 1.2 to 2.0 ms under 0.1 ms compute
+    // blocks and 3.8 to 4.5 ms under 5 ms blocks, unchanged by stream priority. The knob trades the
+    // kernel's higher ceiling on wide links (355 GB/s measured on GH200) for copies that need no SM;
+    // it is read when the copier is constructed. Chunked registration still wins: the copy engines
+    // cannot span registration chunks.
+    bool const chunked = HostMem::shouldUseChunkedRegistration();
+    bool const preferCopyEngine = tensorrt_llm::common::getBoolEnv(kPageCopyPreferCopyEngineEnv);
+    bool const kernelViable = chunked || (mTopology.coherentLink && !preferCopyEngine);
+    if (preferCopyEngine)
+    {
+        if (chunked)
+        {
+            TLLM_LOG_WARNING(
+                "%s=1 ignored: this kernel registers pinned host memory in chunks, which the copy engines cannot "
+                "span, so host<->GPU page copies keep the copy kernel",
+                kPageCopyPreferCopyEngineEnv);
+        }
+        else if (mTopology.coherentLink)
+        {
+            TLLM_LOG_INFO(
+                "%s=1: host<->GPU page copies use the copy engines instead of the copy kernel on this "
+                "coherent link",
+                kPageCopyPreferCopyEngineEnv);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("%s=1 has no effect on a PCIe-attached GPU: the copy engines are the default there",
+                kPageCopyPreferCopyEngineEnv);
+        }
+    }
 
     auto build = [&](int stages, double gridMult) -> KernelConfig
     {

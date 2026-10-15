@@ -276,18 +276,22 @@ Hot -> Hot: existing per-pool copy, including defragmentation
 Cold -> Cold: raw one-pool copy
 ```
 
-The default concatenating codec reports `kHost` and consumes the `PageIndexPair` array synchronously. It builds one
-`cuMemcpyBatchAsync` descriptor for each page and hot pool, then submits the complete descriptor array once per codec
-call. Each descriptor copies the full pool contribution for that page. There is no codec-level 2 MiB work size,
-transfer chunking policy, or 16-byte alignment requirement; DMA scheduling and partitioning belong to CUDA.
-Before CUDA 12.8, the version-gated fallback submits the same descriptors as individual stream-ordered
-`cuMemcpyAsync` calls.
+The default concatenating codec delegates each pool's copy to `BatchedPageCopier`, which picks the path once per
+process from the platform. On PCIe-attached GPUs it reports `kHost`, builds one `cuMemcpyBatchAsync` descriptor for
+each page and hot pool and submits the complete descriptor array once per codec call; the batch uses stream-ordered
+source access and sets `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE`, and non-empty calls require a non-legacy CUDA
+stream. On coherent NVLink-C2C links (Grace systems) it reports `kDevice` and runs a multi-CTA copy kernel whose grid
+is sized to the link bandwidth, because the kernel reaches a higher ceiling there. Where `HostMem` registers pinned
+memory in adjacent 2 GiB chunks (Linux 6.11 to 6.13) the kernel is used on every link, since a copy-engine descriptor
+may not cross a registration boundary. There is no codec-level work size, transfer chunking policy, or 16-byte
+alignment requirement beyond the kernel's fast path; a layout that is not 16-byte aligned takes a slower generic
+kernel.
 
-The batch uses stream-ordered source access and sets `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE` to prefer
-copy engines when the platform honors the hint. Non-empty calls require a non-legacy
-CUDA stream, as required by `cuMemcpyBatchAsync`. Host memory may be registered as adjacent 2 GiB regions by
-`HostMem`; a descriptor crossing such a registration boundary is split only to satisfy that allocation constraint.
-This boundary handling is unrelated to page-size or DMA work-unit tuning.
+`TLLM_KV_CACHE_MANAGER_V2_PAGE_COPY_PREFER_COPY_ENGINE=1` selects the copy engines on coherent links as well. The copy
+engines need no SM, so a page copy keeps its latency when another kernel occupies every SM slot, where the copy
+kernel's CTAs have to wait for a slot; on an idle GPU the two paths perform alike at the link ceiling. The variable is
+read when the copier is constructed, has no effect on PCIe-attached GPUs, and is ignored where chunked host
+registration is in force.
 
 The concrete codec, its configuration logic, and its factory live entirely in `coldPageCodec.cpp`. The class remains
 translation-unit-private and needs neither a pImpl nor a CUDA implementation file. Custom codecs remain free to choose

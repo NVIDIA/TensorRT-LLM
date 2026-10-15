@@ -19,11 +19,85 @@
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
 
+#include <cuda_runtime_api.h>
+
+#include <cerrno>
+#include <cstdlib>
+#include <memory>
 #include <optional>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2::test
 {
+
+//! Owning handle for a cudaMalloc allocation.
+struct CudaDeleter
+{
+    void operator()(void* ptr) const noexcept
+    {
+        cudaFree(ptr);
+    }
+};
+
+using CudaAllocation = std::unique_ptr<void, CudaDeleter>;
+
+//! cudaMalloc as an owning handle; empty when the allocation fails.
+inline CudaAllocation allocateCuda(size_t numBytes)
+{
+    void* ptr = nullptr;
+    if (cudaMalloc(&ptr, numBytes) != cudaSuccess)
+    {
+        return CudaAllocation{};
+    }
+    return CudaAllocation{ptr};
+}
+
+//! Sets (or, with std::nullopt, unsets) an environment variable for the lifetime of the object and restores the
+//! previous state afterwards.
+class ScopedEnv
+{
+public:
+    ScopedEnv(char const* name, std::optional<std::string> value)
+        : mName(name)
+    {
+        if (char const* oldValue = std::getenv(name); oldValue != nullptr)
+        {
+            mOldValue = oldValue;
+        }
+        if (value.has_value())
+        {
+            if (::setenv(name, value->c_str(), /*overwrite=*/1) != 0)
+            {
+                throw std::system_error(errno, std::generic_category(), "setenv failed");
+            }
+        }
+        else if (::unsetenv(name) != 0)
+        {
+            throw std::system_error(errno, std::generic_category(), "unsetenv failed");
+        }
+    }
+
+    ~ScopedEnv()
+    {
+        if (mOldValue.has_value())
+        {
+            ::setenv(mName.c_str(), mOldValue->c_str(), /*overwrite=*/1);
+        }
+        else
+        {
+            ::unsetenv(mName.c_str());
+        }
+    }
+
+    ScopedEnv(ScopedEnv const&) = delete;
+    ScopedEnv& operator=(ScopedEnv const&) = delete;
+
+private:
+    std::string mName;
+    std::optional<std::string> mOldValue;
+};
 
 inline KVCacheManagerConfig makeConfig(bool enableStats = true)
 {
