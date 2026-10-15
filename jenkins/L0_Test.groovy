@@ -833,8 +833,9 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
             // Keep the job workspace (job-output.log etc.) for debugging, but drop
-            // the S3 spool and credentials right away.
-            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config || true",
+            // the S3 spool and anything holding credentials right away; the launch
+            // script embeds HF/GitHub tokens and OpenSearch credentials.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh || true",
         ] + staleSlurmOutputCleanupCommands()
         cleanupCommands = cleanupCommands.join(" ; ")
         Utils.exec(
