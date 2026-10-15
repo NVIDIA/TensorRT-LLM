@@ -402,4 +402,4 @@ class BlockHashMixin:
 
     @staticmethod
     def _get_request_cache_salt(request: OpenAIRequest) -> Optional[str]:
-        return request.cache_salt
+        return getattr(request, "cache_salt", None)
