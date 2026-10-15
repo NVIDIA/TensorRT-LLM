@@ -117,13 +117,23 @@ def _wait_for_endpoint_down(
     url: str,
     timeout: int,
     interval: int = 1,
+    required_failures: int = 10,
 ) -> None:
+    """Return once `url` has failed `required_failures` probes in a row.
+
+    One missed probe is not a shutdown: the frontend can be slow to answer while
+    the accuracy run keeps it busy.
+    """
     deadline = time.monotonic() + timeout
+    consecutive_failures = 0
     while time.monotonic() < deadline:
         try:
             requests.get(url, timeout=10)
+            consecutive_failures = 0
         except requests.RequestException:
-            return
+            consecutive_failures += 1
+            if consecutive_failures >= required_failures:
+                return
         time.sleep(interval)
     raise TimeoutError(f"Endpoint {url} remained up after {timeout} seconds")
 
@@ -292,7 +302,9 @@ def _accuracy_llm(
     client = openai.OpenAI(
         api_key=RemoteOpenAIServer.DUMMY_API_KEY,
         base_url=server.url_for("v1"),
-        timeout=1_800_000,
+        # Seconds per request attempt; with the client's default two retries a
+        # stalled request still ends well inside the test timeout.
+        timeout=3600,
     )
     args = LlmArgs(model=MODEL_PATH)
     # Selects the GSM8K reference row; the NVFP4 export declares
