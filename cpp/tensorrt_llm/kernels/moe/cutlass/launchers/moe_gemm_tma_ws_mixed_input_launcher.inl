@@ -268,7 +268,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
     {
-        TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, {} < {}.",
+        TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, {} > {}.",
             gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
     }
 
