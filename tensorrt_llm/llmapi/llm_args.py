@@ -2373,7 +2373,6 @@ class DecodingBaseConfig(StrictBaseModel):
 
     spec_dec_variant: PositiveInt = Field(
         default=1,
-        init=False,
         description=
         "Version of the algorithm within its decoding_type family (e.g. DFlash "
         "1 vs. 2), for versions that share one decoding config. Resolved from "
@@ -2791,7 +2790,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         description="The model architecture of the eagle3 model.")
     spec_dec_variant: PositiveInt = Field(
         default=3,
-        init=False,
         description=
         "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do "
         "not set manually.")
@@ -3503,6 +3501,14 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "disable it with a warning otherwise.")
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
+
+    spec_dec_variant: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Version of the DFlash algorithm: 2 for a DFlash 2 draft checkpoint, "
+        "1 otherwise. None until the draft checkpoint's config.json has been "
+        "read, which for a HF repo id happens only after download. Do not set "
+        "manually.")
 
     attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
         default="VANILLA",
