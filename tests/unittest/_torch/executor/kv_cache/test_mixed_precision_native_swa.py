@@ -3,6 +3,7 @@
 """Local GPU QA for the unchanged native full-history + SWA reuse contract."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -184,3 +185,120 @@ def test_short_sequence_uses_high_values_for_every_page(manager):
         assert all(page >= 0 for page in cache.get_base_page_indices(group))
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("family", ("dsa", "deepseek_v4"))
+@pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
+def test_model_manager_layouts_keep_native_nvfp4_and_auxiliary_buffers(family, high_dtype):
+    """Use the real model managers; this tests allocation, not model inference."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import (
+        DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+    )
+
+    kwargs = dict(
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=128 << 20,
+            host_cache_size=0,
+            enable_block_reuse=True,
+            enable_swa_scratch_reuse=False,
+            block_reuse_config={"policy": "per_request"},
+        ),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_kv_heads=1,
+        tokens_per_block=128,
+        max_seq_len=1024,
+        max_batch_size=2,
+        max_num_tokens=1024,
+        mapping=Mapping(),
+    )
+    if family == "dsa":
+        manager_cls = DSACacheManagerV2
+        kwargs.update(
+            num_layers=1,
+            head_dim=576,
+            sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+            pretrained_config=SimpleNamespace(qk_rope_head_dim=64, num_hidden_layers=1),
+        )
+    else:
+        manager_cls = DeepseekV4CacheManager
+        kwargs.update(
+            num_layers=3,
+            head_dim=512,
+            vocab_size=1024,
+            max_input_len=1024,
+            sparse_attn_config=DeepSeekV4SparseAttentionConfig(
+                index_head_dim=128, window_size=128, compress_ratios=[1, 4, 128]
+            ),
+        )
+
+    def layout(layers):
+        return [
+            (
+                int(layer.layer_id),
+                [(buffer.role, buffer.size, buffer.is_sparse) for buffer in layer.buffers],
+                layer.sliding_window_size,
+                layer.num_sink_tokens,
+                layer.reuse_policy,
+            )
+            for layer in layers
+        ]
+
+    reference = manager_cls(dtype=DataType.NVFP4, **kwargs)
+    try:
+        original = layout(reference.kv_cache_manager_py_config.layers)
+    finally:
+        reference.shutdown()
+
+    mixed_cls = MixedPrecisionKVCacheManager.for_manager(manager_cls)
+    manager = mixed_cls(
+        dtype=high_dtype,
+        low_dtype=DataType.NVFP4,
+        compute_dtype=torch.bfloat16,
+        first_n=128,
+        last_n=128,
+        **kwargs,
+    )
+    cache = None
+    try:
+        assert isinstance(manager, manager_cls)
+        assert mixed_cls.prepare_context_cache is manager_cls.prepare_context_cache
+        configured = manager.kv_cache_manager_py_config.layers
+        assert layout(configured[: len(original)]) == original
+        assert len(manager.high_layouts) == (1 if family == "dsa" else 2)
+        cache = manager.impl.create_kv_cache(None, [])
+        assert cache.resume(torch.cuda.current_stream().cuda_stream) and cache.resize(640)
+        manager.kv_cache_map[0] = cache
+        for layer_id, spec in manager.high_layouts.items():
+            if family == "dsa":
+                assert spec.roles == (Role.KEY,)
+                assert spec.rows_per_block == 128
+                assert spec.head_dim == 576
+            else:
+                assert spec.roles == (DeepseekV4AttentionType.COMPRESS.role,)
+                assert spec.rows_per_block in (32, 1)
+                assert spec.head_dim == 512
+            high_id = manager.high_layers[layer_id]
+            high = configured[high_id]
+            assert high.reuse_policy == kv.AttentionReusePolicy.REQUIRED
+            assert high.num_sink_tokens == 128 and high.sliding_window_size == 129
+            for buffer in high.buffers:
+                assert buffer.size == get_size_in_bytes(
+                    spec.rows_per_block * spec.num_heads * spec.head_dim, high_dtype
+                )
+                pool, tables = manager.get_high_precision_rows(layer_id, buffer.role, [0])
+                assert pool.shape[1:] == (spec.rows_per_block, spec.num_heads, spec.head_dim)
+                assert len(tables[0]) == 5
+                assert all(0 <= index < pool.shape[0] for index in tables[0])
+    finally:
+        manager.kv_cache_map.pop(0, None)
+        if cache is not None:
+            cache.close()
+        manager.shutdown()

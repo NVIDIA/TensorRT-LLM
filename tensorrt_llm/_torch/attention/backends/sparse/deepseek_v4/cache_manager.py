@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
+    MixedPrecisionKVLayout,
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -1247,6 +1248,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layers=layers,
             constraints=constraints,
         )
+
+    def _mixed_precision_kv_layouts(
+        self, config: KVCacheManagerConfigPy
+    ) -> dict[int, MixedPrecisionKVLayout]:
+        role = DeepseekV4AttentionType.COMPRESS
+        return {
+            int(layer_id): MixedPrecisionKVLayout(
+                (role.role,), self.compressed_block_sizes[layer_idx], 1, self.head_dim
+            )
+            for (layer_idx, attn_type), layer_id in self._layer_attn_to_layer_id.items()
+            if attn_type == role
+        }
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
         # Indexer compressor cache layout. Two modes are supported:
