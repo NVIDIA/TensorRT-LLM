@@ -798,8 +798,8 @@ void BatchedPageCopier::computeConfigs()
         if (chunked)
         {
             TLLM_LOG_WARNING(
-                "%s=1 ignored: this kernel registers pinned host memory in chunks, which the copy engines cannot "
-                "span, so host<->GPU page copies keep the copy kernel",
+                "%s=1 ignored: on this Linux kernel pinned host memory is registered in 2 GiB chunks, which the copy "
+                "engines cannot span, so host<->GPU page copies keep the copy kernel",
                 kPageCopyPreferCopyEngineEnv);
         }
         else if (mTopology.coherentLink)
