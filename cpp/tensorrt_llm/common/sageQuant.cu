@@ -40,6 +40,12 @@ using tensorrt_llm::kernels::DATA_TYPE_INT8;
 // Most tokens of one Q/K scale group a thread holds in registers at once.
 constexpr int MaxChunkTokens = 8;
 
+// Largest FP8 E4M3 magnitude. A V scale maps the largest magnitude of its channel onto it, with a
+// floor that keeps the reciprocal of a constant channel's scale finite; the smoothed and unsmoothed
+// V scales share both.
+constexpr float E4M3Max = 448.0f;
+constexpr float VScaleFloor = 1e-3f;
+
 // The V tokens one CTA row reduces for the V scales and the K mean, and the scale row they go to.
 // blockIdx.y is (headIdx * batchSize + seqIdx) when the statistics are per sequence; otherwise
 // rows below numHeadsV each cover one head over the whole batch.
@@ -151,7 +157,7 @@ __global__ void sageMeanFromSumKernel(
     {
         float const mean = __ll2float_rn(vSum[i]) * (1.0f / MeanFixedScale);
         vMean[i] = mean;
-        vScale[i] = ::fmaxf(::fmaxf(vScale[i] - mean, mean - vMin[i]), 1e-3f) / 448.0f;
+        vScale[i] = ::fmaxf(::fmaxf(vScale[i] - mean, mean - vMin[i]), VScaleFloor) / E4M3Max;
     }
 }
 
@@ -208,7 +214,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
     static_assert(!SmoothV || VStage == 1, "V smoothing only changes the statistics launch");
     static_assert(std::is_same_v<ElementQuantized, float_e4m3_t> || std::is_same_v<ElementQuantized, std::int8_t>,
         "Unrecognized target dtype for quantization");
-    constexpr float TypeMax = cute::is_same_v<ElementQuantized, float_e4m3_t> ? 448.0f : static_cast<float>(126.9f);
+    constexpr float TypeMax = cute::is_same_v<ElementQuantized, float_e4m3_t> ? E4M3Max : static_cast<float>(126.9f);
     constexpr int BestVL = 128 / sizeof_bits_v<Element>;
     using VL = Int<BestVL>;
 
@@ -263,7 +269,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
         Tensor rKMean = make_tensor<float>(Shape<VL>{});
         if constexpr (SmoothK && VStage == 2)
         {
-            int const meanRow = ptrCuSeqLensV != nullptr ? seqIdx * numHeads + headIdx : headIdx;
+            int const meanRow = ptrCuSeqLensV != nullptr ? seqIdx * numHeadsV + headIdx : headIdx;
             Tensor gKMean = make_tensor(
                 make_gmem_ptr(ptrKMean + static_cast<int64_t>(meanRow) * HeadDim + threadInScaleIdx * BestVL),
                 Shape<VL>{});
@@ -528,7 +534,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = 0; i < size(rVScale); ++i)
                 {
-                    rVScale(i) = 1e-3f;
+                    rVScale(i) = VScaleFloor;
                 }
                 cute::transform(rVScale_x2, rVMax_x2, cutlass::NumericArrayConverter<Element, float, 2>::convert);
                 for (; tokIdx < range.tokEnd; tokIdx += numToksPerWave)
@@ -538,7 +544,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
                     cute::transform(rV_x2, rVMax_x2, rVMax_x2, cutlass::maximum<Array<Element, 2>>{});
                 }
                 cute::transform(rVMax_x2, rVScale_x2, cutlass::NumericArrayConverter<float, Element, 2>::convert);
-                cute::transform(rVScale_x2, rVScale_x2, cutlass::scale<Array<float, 2>>{1 / 448.0f});
+                cute::transform(rVScale_x2, rVScale_x2, cutlass::scale<Array<float, 2>>{1.0f / E4M3Max});
                 for (int delta = threadsPerHead; delta < 32; delta <<= 1)
                 {
                     cute::transform(rVScale, rVScale,
@@ -673,6 +679,12 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
     TLLM_CHECK_WITH_INFO(params.ptrVMean == nullptr
             || (params.vStage != 0
                 && (params.vStage != 1 || (params.ptrVMeanSum != nullptr && params.ptrVMin != nullptr))),
+        "Invalid SageQuant V-smoothing parameters");
+    // The mean conversion after a VStage=1 launch writes the mean of every sum it is given, and for V
+    // also reads the minimum.
+    TLLM_CHECK_WITH_INFO(
+        params.ptrKMeanSum == nullptr || params.ptrKMean != nullptr, "Invalid SageQuant K-smoothing parameters");
+    TLLM_CHECK_WITH_INFO(params.ptrVMeanSum == nullptr || (params.ptrVMean != nullptr && params.ptrVMin != nullptr),
         "Invalid SageQuant V-smoothing parameters");
 
     if (params.vStage == 1)
