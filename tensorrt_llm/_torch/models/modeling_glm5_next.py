@@ -1253,12 +1253,14 @@ class Glm5NextSparseAttention(nn.Module):
         rows_per_request: int = 1,
         reduce: bool = True,
         request_ids: torch.Tensor | None = None,
+        max_visible: int | None = None,
     ) -> torch.Tensor:
         """Score pools, select members and tail, then attend to paged latent rows.
 
         visible gives each query's prefix length. Packed context uses request_ids;
         verification uses rows_per_request. Single-token decode reads live lengths
         from metadata. All device work uses fixed buffer shapes for graph replay.
+        max_visible is an optional host bound on visible that limits scoring work.
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
@@ -1276,6 +1278,7 @@ class Glm5NextSparseAttention(nn.Module):
             kv_lens=kv_lens,
             rows_per_request=rows_per_request,
             request_ids=request_ids,
+            max_kv_len=max_visible,
         )
         num_cand = (visible // indexer.index_kpool).to(torch.int32)
         selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=scores.device)
@@ -1341,6 +1344,10 @@ class Glm5NextSparseAttention(nn.Module):
                 request_ids=rows.final_request_ids,
             )
         query = self.q_b_proj(q_resid).view(-1, self.num_heads, self.qk_head_dim)
+        max_visible = max(
+            int(cached_lens[i]) + int(cu_seqlens[i + 1]) - int(cu_seqlens[i])
+            for i in range(len(cu_seqlens) - 1)
+        )
         return self._select_and_attend_paged(
             q_resid,
             query,
@@ -1350,6 +1357,7 @@ class Glm5NextSparseAttention(nn.Module):
             AttentionInputType.context_only,
             reduce=reduce,
             request_ids=rows.request_ids,
+            max_visible=max_visible,
         )
 
     def forward_decode(

@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs, _make_single_token_context_graph_batch)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers, DecoderInputPreparer,
-    _get_context_prompt_lookahead_token)
+    _get_context_prompt_lookahead_token, _zero_fill_row_spans)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
     DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import \
@@ -307,6 +307,18 @@ def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
     request.context_chunk_size = 3
     assert (_get_context_prompt_lookahead_token(
         request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
+
+
+def test_zero_fill_row_spans_merges_unsorted_and_adjacent_spans() -> None:
+    buffer = torch.arange(1, 13, dtype=torch.int32)
+    _zero_fill_row_spans(buffer, [(9, 11), (2, 4), (4, 5), (7, 8)])
+    assert buffer.tolist() == [1, 2, 0, 0, 0, 6, 7, 0, 9, 0, 0, 12]
+
+
+def test_zero_fill_row_spans_without_spans_is_noop() -> None:
+    buffer = torch.arange(4, dtype=torch.int32)
+    _zero_fill_row_spans(buffer, [])
+    assert buffer.tolist() == [0, 1, 2, 3]
 
 
 def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
@@ -2198,6 +2210,48 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertFalse(
             inputs._can_use_steady_gen_fast_prepare(batch, new_tokens, None,
                                                     None, True))
+
+    def test_padding_request_input_id_rows_are_zeroed(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        generation = _create_request_with_tokens([50, 51, 52, 53, 54], 1)
+        generation.py_seq_slot = 0
+        generation.py_batch_idx = 0
+        padding = _create_request_with_tokens([60, 61, 62], 2)
+        padding.is_cuda_graph_dummy = True
+        padding.py_seq_slot = 1
+
+        graph_batch = ScheduledRequests()
+        graph_batch.generation_requests = [generation, padding]
+        new_tokens = torch.zeros((1, 4, 1), dtype=torch.int32, device="cuda")
+        new_tokens[0, 0, 0] = 777
+        overlap_state = SimpleNamespace(new_tokens=new_tokens)
+        inputs = model_engine._runner._inputs
+        inputs._can_use_steady_gen_fast_prepare = Mock(return_value=False)
+        # The padding row is written by neither input-id copy, so poison the
+        # buffer with an out-of-vocabulary id to catch a stale read.
+        model_engine._runner._buffers.input_ids_cuda.fill_(1 << 30)
+
+        prepared = inputs.prepare_inputs(
+            scheduled_requests=graph_batch,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            new_tensors_device=overlap_state,
+            resource_manager=resource_manager,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
+        )
+
+        self.assertEqual(prepared.kwargs["input_ids"][:2].cpu().tolist(),
+                         [777, 0])
+        kv_cache_manager.shutdown()
 
     def test_promoted_context_precedes_speculative_overlap_generation(
             self) -> None:
