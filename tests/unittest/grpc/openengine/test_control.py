@@ -19,6 +19,7 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     model_pb2,
     server_pb2,
 )
+from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
@@ -172,12 +173,14 @@ async def test_model_info_reports_the_context_window_and_capabilities():
 
 @pytest.mark.asyncio
 async def test_model_info_advertises_loaded_image_support(monkeypatch):
+    inference = _inference()
     monkeypatch.setattr(
-        "tensorrt_llm.grpc.openengine.control.supported_media_modalities",
-        lambda llm: frozenset({"image"}),
+        inference,
+        "_media_capabilities",
+        MediaCapabilities({"image": "<image_{}>"}),
     )
 
-    info = await _servicer().GetModelInfo(
+    info = await _servicer(inference=inference).GetModelInfo(
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
 

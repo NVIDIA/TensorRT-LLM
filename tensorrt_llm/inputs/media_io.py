@@ -45,6 +45,10 @@ from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
 
 
+class MediaFetchError(RuntimeError):
+    """A transient failure while fetching remote media."""
+
+
 def rgba_to_rgb(
     image: Image.Image, background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
 ) -> Image.Image:
@@ -161,7 +165,7 @@ def _validate_url(url: str) -> None:
     try:
         infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
-        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
+        raise MediaFetchError(f"Could not resolve hostname {hostname!r}") from exc
 
     allow_private = _allow_private_urls()
     for _family, _type, _proto, _canon, sockaddr in infos:
@@ -257,18 +261,29 @@ async def _safe_aiohttp_get(
     async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
         current_url = url
         for _ in range(_MAX_REDIRECTS + 1):
-            async with fetch_session.get(
-                current_url, timeout=timeout, allow_redirects=False
-            ) as response:
-                if response.status in _REDIRECT_STATUSES:
-                    redirect_url = response.headers.get("Location", "")
-                    current_url = urljoin(current_url, redirect_url)
-                    await asyncio.to_thread(_validate_url, current_url)
-                    continue
-                maybe_coro = response.raise_for_status()
-                if asyncio.iscoroutine(maybe_coro):
-                    await maybe_coro
-                return await _read_aiohttp_content(response)
+            try:
+                async with fetch_session.get(
+                    current_url, timeout=timeout, allow_redirects=False
+                ) as response:
+                    if response.status in _REDIRECT_STATUSES:
+                        redirect_url = response.headers.get("Location", "")
+                        current_url = urljoin(current_url, redirect_url)
+                        await asyncio.to_thread(_validate_url, current_url)
+                        continue
+                    maybe_coro = response.raise_for_status()
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+                    return await _read_aiohttp_content(response)
+            except MediaFetchError:
+                raise
+            except aiohttp.ClientResponseError as error:
+                if error.status in (408, 429) or error.status >= 500:
+                    raise MediaFetchError(
+                        f"remote media server returned HTTP {error.status}"
+                    ) from error
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                raise MediaFetchError(f"remote media fetch failed: {error}") from error
         raise RuntimeError("Too many redirects")
 
     if session is not None:

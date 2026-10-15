@@ -25,13 +25,14 @@ from .coordinator import (
     Reservation,
 )
 from .disagg import disaggregated_params_from_request
-from .errors import AbortFailedError, UnsupportedFeatureError
+from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
 from .request_mapping import (
     _input_from_request,
     _metadata_from_context,
     conversation_affinity_enabled,
     conversation_params_from_request,
+    media_capabilities_for_model,
     sampling_params_from_request,
 )
 from .streaming import (
@@ -62,8 +63,14 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         # context worker uses. The actual transfer is driven by opaque_state.
         self._kv_transfer_backend = kv_transfer_backend
         self._guided_backend = llm.args.guided_decoding_backend
+        self._media_capabilities = media_capabilities_for_model(llm)
         self.subagent_affinity_auth_key = subagent_affinity_auth_key
         self._active_requests: dict[str, Any] = {}
+
+    @property
+    def supported_media_modalities(self) -> frozenset[str]:
+        """Media capabilities cached from the loaded model and mapper."""
+        return self._media_capabilities.modalities
 
     def active_request_count(self) -> int:
         """Requests accepted and not yet completed."""
@@ -175,7 +182,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if request.kv.HasField("bypass_prefix_cache") and request.kv.bypass_prefix_cache:
                     raise UnsupportedFeatureError("prefix cache bypass is not supported")
 
-            inputs = await _input_from_request(request, self._llm)
+            inputs = await _input_from_request(request, self._llm, self._media_capabilities)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
@@ -229,6 +236,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             )
         except UnsupportedFeatureError as error:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(error))
+            return
+        except MediaUnavailableError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
             return
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))

@@ -35,7 +35,7 @@ from .bindings import (
     openengine_pb2_grpc,
     server_pb2,
 )
-from .capabilities import supported_guides, supported_media_modalities
+from .capabilities import supported_guides
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
@@ -284,7 +284,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ) -> model_pb2.ModelInfo:
         # Single-model server: like Generate, any non-empty name resolves to the
         # loaded model.
-        media_modalities = supported_media_modalities(self._llm)
+        media_modalities = self._inference.supported_media_modalities
         info = model_pb2.ModelInfo(
             model_id=self._model,
             served_model_name=self._model,
