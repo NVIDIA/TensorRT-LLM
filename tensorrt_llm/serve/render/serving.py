@@ -37,10 +37,16 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from .chat import arender_chat, tokenize_rendered
-from .prompt_types import RenderedRequest, UnsupportedRenderError
+from .prompt_types import (
+    PreparedContext,
+    ReasoningParserKwargs,
+    RenderedRequest,
+    UnsupportedRenderError,
+)
 from .resources import RenderResources
 
 # Top-level request fields that a Dynamo gateway adds for its own routing and
@@ -77,6 +83,28 @@ def _normalize_completion_prompts(prompt: Any) -> List[Any]:
     if isinstance(prompt, list):
         return list(prompt)
     raise RenderRequestError(400, "Unsupported prompt type.")
+
+
+def _request_fields(request: Any) -> Dict[str, Any]:
+    """The fields of a rendered request that are copied from the inference request."""
+    return dict(model=request.model, cache_salt=getattr(request, "cache_salt", None))
+
+
+def _reasoning_fields(
+    request: Any, resources: RenderResources, context: PreparedContext
+) -> Dict[str, Any]:
+    """``reasoning_ended`` and ``reasoning_parser_kwargs`` for the configured parser."""
+    parser = resources.reasoning_parser
+    if not parser:
+        return {}
+    thinking = context.resolved_thinking.get(parser)
+    return dict(
+        # The mode is "reasoning is open"; the field says "reasoning has ended".
+        reasoning_ended=None if thinking is None else not thinking,
+        reasoning_parser_kwargs=ReasoningParserKwargs(
+            chat_template_kwargs=dict(request.chat_template_kwargs or {})
+        ),
+    )
 
 
 class ServingRender:
@@ -125,12 +153,24 @@ class ServingRender:
             if not resources.use_harmony:
                 raise
             raise RenderRequestError(400, str(error)) from error
+        context = PreparedContext.model_validate(rendered.context)
+        tokens_trusted, untrusted_reason = rendered.tokens_trusted, rendered.untrusted_reason
+        if not context.is_trivial():
+            # Same rule as the router: a request that carries only ids cannot make the
+            # decisions the worker reads off the rendered text.
+            tokens_trusted = False
+            untrusted_reason = untrusted_reason or (
+                "serving decisions derived from the rendered prompt cannot be forwarded"
+            )
         return RenderedRequest(
             kind="chat",
+            request_id=f"chatcmpl-{uuid.uuid4().hex}",
             token_ids=rendered.token_ids,
-            tokens_trusted=rendered.tokens_trusted,
-            untrusted_reason=rendered.untrusted_reason,
+            tokens_trusted=tokens_trusted,
+            untrusted_reason=untrusted_reason,
             request=original,
+            **_request_fields(request),
+            **_reasoning_fields(request, resources, context),
         )
 
     async def render_completion(self, body: Dict[str, Any]) -> List[RenderedRequest]:
@@ -146,7 +186,8 @@ class ServingRender:
             raise RenderRequestError(400, str(error)) from error
         resources = self._resources_factory()
         results: List[RenderedRequest] = []
-        for prompt in _normalize_completion_prompts(request.prompt):
+        request_id = f"cmpl-{uuid.uuid4().hex}"
+        for index, prompt in enumerate(_normalize_completion_prompts(request.prompt)):
             if isinstance(prompt, str):
                 try:
                     token_ids = await asyncio.to_thread(
@@ -163,8 +204,10 @@ class ServingRender:
             results.append(
                 RenderedRequest(
                     kind="completion",
+                    request_id=f"{request_id}-{index}",
                     token_ids=token_ids,
                     request={**body, "prompt": token_ids},
+                    **_request_fields(request),
                 )
             )
         return results

@@ -203,6 +203,84 @@ class TestStandaloneApp:
         )
 
 
+class TestRenderedRequestFields:
+    """The request id, the copied request fields and the reasoning state of a rendered request."""
+
+    OPEN = "<think>"
+    CLOSED = "</think>"
+
+    @staticmethod
+    def _app(marker, **overrides):
+        template = (
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+            "{% if add_generation_prompt %}<assistant>" + marker + "{% endif %}"
+        )
+        return build_render_app(resources(make_tokenizer(chat_template=template), **overrides))
+
+    def test_chat_copies_the_model_and_the_cache_salt(self, client) -> None:
+        body = {**CHAT_BODY, "cache_salt": "salt"}
+
+        rendered = client.post("/v1/chat/completions/render", json=body).json()
+
+        assert rendered["request_id"].startswith("chatcmpl-")
+        assert rendered["model"] == "m"
+        assert rendered["cache_salt"] == "salt"
+        # Execution-only and context fields are not part of the response.
+        assert not {"stream", "stream_options", "priority", "render_context"} & set(rendered)
+
+    def test_without_a_reasoning_parser_there_is_no_reasoning_state(self, client) -> None:
+        rendered = client.post("/v1/chat/completions/render", json=CHAT_BODY).json()
+
+        assert rendered["reasoning_ended"] is None
+        assert rendered["reasoning_parser_kwargs"] is None
+        assert rendered["tokens_trusted"] is True
+
+    @pytest.mark.parametrize(
+        ("marker", "ended"), [(OPEN, False), (CLOSED, True)], ids=["open", "closed"]
+    )
+    def test_the_reasoning_mode_is_read_off_the_prompt(self, marker, ended) -> None:
+        app = self._app(marker, reasoning_parser="poolside_v1")
+        body = {**CHAT_BODY, "chat_template_kwargs": {"enable_thinking": False}}
+
+        rendered = TestClient(app).post("/v1/chat/completions/render", json=body).json()
+
+        # The parser reports "reasoning is open"; the field says "reasoning has ended".
+        assert rendered["reasoning_ended"] is ended
+        assert rendered["reasoning_parser_kwargs"] == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    def test_ids_that_carry_a_reasoning_decision_are_not_trusted(self) -> None:
+        # A request holding only these ids could not tell the worker the reasoning mode.
+        rendered = (
+            TestClient(self._app(self.OPEN))
+            .post("/v1/chat/completions/render", json=CHAT_BODY)
+            .json()
+        )
+
+        assert rendered["tokens_trusted"] is False
+        assert "cannot be forwarded" in rendered["untrusted_reason"]
+
+    def test_a_prompt_that_says_nothing_leaves_reasoning_ended_unset(self, tokenizer) -> None:
+        app = build_render_app(resources(tokenizer, reasoning_parser="poolside_v1"))
+
+        rendered = TestClient(app).post("/v1/chat/completions/render", json=CHAT_BODY).json()
+
+        assert rendered["reasoning_ended"] is None
+        assert rendered["reasoning_parser_kwargs"] == {"chat_template_kwargs": {}}
+        assert rendered["tokens_trusted"] is True
+
+    def test_each_completion_prompt_gets_its_own_request_id(self, client) -> None:
+        body = {"model": "m", "prompt": ["hello", "world"]}
+
+        rendered = client.post("/v1/completions/render", json=body).json()
+
+        ids = [item["request_id"] for item in rendered]
+        assert len(set(ids)) == 2
+        assert all(request_id.startswith("cmpl-") for request_id in ids)
+        assert all(item["model"] == "m" for item in rendered)
+
+
 class TestCompletionsRender:
     @pytest.fixture(scope="class")
     def tokenizer(self):
@@ -264,7 +342,8 @@ class TestEmbeddedMounting:
         )
 
         assert embedded.status_code == 200
-        assert embedded.json() == standalone.json()
+        # Each response is a new request, so the ids differ.
+        assert {**embedded.json(), "request_id": ""} == {**standalone.json(), "request_id": ""}
 
     def test_serving_workers_mount_them_only_when_enabled(self, monkeypatch) -> None:
         monkeypatch.delenv("TRTLLM_ENABLE_RENDER_ENDPOINTS", raising=False)
