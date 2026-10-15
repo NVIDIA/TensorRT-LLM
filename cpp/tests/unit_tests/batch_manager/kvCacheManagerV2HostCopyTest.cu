@@ -18,8 +18,9 @@
 // Round-trip tests for copyHostToDevice / copyDeviceToHost in kvCacheManagerV2Utils.cu.
 //
 // A call whose tasks are at least hostCopyDmaMinBytes() each takes the copy-engine path (one cuMemcpyBatchAsync, or
-// one cuMemcpy{HtoD,DtoH}Async per task on the legacy NULL stream, which the batched call does not accept); smaller
-// tasks take the batched copy kernel. The knob is read once per process, so instead of changing the environment
+// one cuMemcpy{HtoD,DtoH}Async per task on the legacy NULL stream, which the batched call does not accept), unless
+// HostMem::shouldUseChunkedRegistration() is true, where every call takes the kernel; smaller tasks take the batched
+// copy kernel. The knob is read once per process, so instead of changing the environment
 // variable mid-process the tests pick sizes on both sides of the default and ask the policy predicate which path a size
 // takes; the raw-value semantics of the knob are tested through hostCopyDmaMinBytesFor().
 
@@ -235,9 +236,8 @@ TEST_F(KvCacheManagerV2HostCopyTest, ThresholdFollowsEnvironment)
     }
 }
 
-// An empty call enqueues nothing whatever numBytes says: the dispatch guard in copyHostToDevice / copyDeviceToHost
-// (`!tasks.empty()`) keeps it on the kernel branch and launchBatchedCopy returns CUDA_SUCCESS at batchSize 0, so
-// cuMemcpyBatchAsync never sees count == 0, which its attrsIdxs/numAttrs constraints forbid.
+// An empty call enqueues nothing whatever numBytes says: copyHostToDevice / copyDeviceToHost return CUDA_SUCCESS before
+// choosing a path, so cuMemcpyBatchAsync never sees count == 0, which its attrsIdxs/numAttrs constraints forbid.
 TEST_F(KvCacheManagerV2HostCopyTest, EmptyTaskListIsANoOp)
 {
     std::vector<MMTask> const none;
@@ -336,10 +336,17 @@ TEST_F(KvCacheManagerV2HostCopyTest, StreamOrderingThroughEvents)
         ASSERT_NE(deviceCheck.get(), nullptr);
         auto* hostBytes = reinterpret_cast<unsigned char*>(host.address());
         std::memset(hostBytes, 0, numBytes);
+        std::vector<MMTask> deviceToHost{MMTask{host.address(), reinterpret_cast<MemAddress>(device.get())}};
+        std::vector<MMTask> hostToDevice{MMTask{reinterpret_cast<MemAddress>(deviceCheck.get()), host.address()}};
         // Known non-0xA5 contents before the gate: an out-of-order read must not find 0xA5 left behind by the previous
-        // iteration's allocation.
+        // iteration's allocation. Both copies also run once here, on zeros, so that a first launch of the copy kernel,
+        // which may load its module and synchronize the context, happens before the gate shuts mStream.
         ASSERT_EQ(cudaMemsetAsync(device.get(), 0x00, numBytes, mStream), cudaSuccess);
         ASSERT_EQ(cudaMemsetAsync(deviceCheck.get(), 0x00, numBytes, mStream), cudaSuccess);
+        ASSERT_EQ(copyDeviceToHost(deviceToHost, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(mStream)),
+            CUDA_SUCCESS);
+        ASSERT_EQ(copyHostToDevice(hostToDevice, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(mStream)),
+            CUDA_SUCCESS);
         ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
 
         // Created before the gate is shut (stream creation can wait for host callbacks) and owned, so an early return
@@ -359,14 +366,12 @@ TEST_F(KvCacheManagerV2HostCopyTest, StreamOrderingThroughEvents)
 
         // Producer on mStream: fill device, then device -> host, then record.
         ASSERT_EQ(cudaMemsetAsync(device.get(), 0xA5, numBytes, mStream), cudaSuccess);
-        std::vector<MMTask> deviceToHost{MMTask{host.address(), reinterpret_cast<MemAddress>(device.get())}};
         ASSERT_EQ(copyDeviceToHost(deviceToHost, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(mStream)),
             CUDA_SUCCESS);
         ASSERT_EQ(cudaEventRecord(ready.get(), mStream), cudaSuccess);
 
         // Consumer on a second stream: wait on the event, host -> deviceCheck, read back.
         ASSERT_EQ(cudaStreamWaitEvent(consumer.get(), ready.get(), 0), cudaSuccess);
-        std::vector<MMTask> hostToDevice{MMTask{reinterpret_cast<MemAddress>(deviceCheck.get()), host.address()}};
         ASSERT_EQ(
             copyHostToDevice(hostToDevice, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(consumer.get())),
             CUDA_SUCCESS);

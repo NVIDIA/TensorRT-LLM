@@ -336,14 +336,18 @@ bool useCopyEngineForHostCopy(size_t numBytes) noexcept
 namespace
 {
 
-// One dispatch for both directions: the copy engines when the policy selects them for a non-empty call, the batched
-// copy kernel otherwise. The kernel's launcher takes a 32-bit byte count and rounds it up to whole 2 KiB iterations in
-// 32-bit arithmetic, so it is limited to tasks below 4 GiB; the copy engines take a size_t.
+// One dispatch for both directions: nothing for an empty call, the copy engines when the policy selects them, the
+// batched copy kernel otherwise. The kernel's launcher takes a 32-bit byte count and rounds it up to whole 2 KiB
+// iterations in 32-bit arithmetic, so it is limited to tasks below 4 GiB; the copy engines take a size_t.
 template <bool HostToDevice>
 CUresult copyAcrossHostLink(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     TLLM_CHECK_WITH_INFO(numBytes >= 0, "numBytes = %zd must be non-negative", numBytes);
-    if (numBytes > 0 && !tasks.empty() && useCopyEngineForHostCopy(static_cast<size_t>(numBytes)))
+    if (tasks.empty())
+    {
+        return CUDA_SUCCESS;
+    }
+    if (numBytes > 0 && useCopyEngineForHostCopy(static_cast<size_t>(numBytes)))
     {
         return copyWithCopyEngine<HostToDevice>(tasks, static_cast<size_t>(numBytes), stream);
     }

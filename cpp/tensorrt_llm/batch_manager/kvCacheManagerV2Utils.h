@@ -104,10 +104,10 @@ CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize
 CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToHost(std::vector<Task<MemAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-//! copyHostToDevice / copyDeviceToHost use the hardware copy engines when numBytes > 0, tasks is non-empty and
-//! useCopyEngineForHostCopy() says so, and the batched copy kernel otherwise (an empty call or numBytes == 0 takes the
-//! kernel, which then enqueues nothing). The kernel moves 16 B grains: it throws when numBytes is not a multiple of 16
-//! and, unchecked, faults on a task address that is not 16 B aligned, and it takes less than 4 GiB per task (the
+//! copyHostToDevice / copyDeviceToHost return CUDA_SUCCESS without enqueuing anything for an empty call, use the
+//! hardware copy engines when numBytes > 0 and useCopyEngineForHostCopy() says so, and the batched copy kernel
+//! otherwise (numBytes == 0 takes the kernel). The kernel moves 16 B grains: it throws when numBytes is not a multiple
+//! of 16 and, unchecked, faults on a task address that is not 16 B aligned, and it takes less than 4 GiB per task (the
 //! launcher's byte count is a uint32_t); the copy engines accept any size and any alignment. Any stream is accepted;
 //! on the copy-engine path the legacy NULL stream, as 0 or as CU_STREAM_LEGACY, takes one cuMemcpy{HtoD,DtoH}Async per
 //! task. Both throw TllmException on a negative numBytes. On main, hot<->host migrations go through

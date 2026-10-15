@@ -119,16 +119,18 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyHostToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
-        "Copy data from host to device: the copy engines (one cuMemcpyBatchAsync) when "
-        "use_copy_engine_for_host_copy(num_bytes) is True, otherwise CUDA kernels");
+        "Copy data from host to device: the copy engines when use_copy_engine_for_host_copy(num_bytes) is True and "
+        "the call is non-empty (one cuMemcpyBatchAsync, or one memcpy per task on the legacy NULL stream), otherwise "
+        "the batched copy kernel");
 
     module.def(
         "copy_device_to_host",
         [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyDeviceToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
-        "Copy data from device to host: the copy engines (one cuMemcpyBatchAsync) when "
-        "use_copy_engine_for_host_copy(num_bytes) is True, otherwise CUDA kernels");
+        "Copy data from device to host: the copy engines when use_copy_engine_for_host_copy(num_bytes) is True and "
+        "the call is non-empty (one cuMemcpyBatchAsync, or one memcpy per task on the legacy NULL stream), otherwise "
+        "the batched copy kernel");
 
     module.def(
         "use_copy_engine_for_host_copy", [](size_t numBytes) -> bool { return useCopyEngineForHostCopy(numBytes); },
