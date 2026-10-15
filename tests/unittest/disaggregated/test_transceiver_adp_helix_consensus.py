@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gen-side completion consensus under attention-DP with helix CP / PP.
+"""Gen-side completion consensus under attention-DP with helix CP or PP.
 
-Under attention-DP the DP groups schedule independently, but the PP ranks
-and the helix CP ranks of one DP group share the same requests. The Python
-transceiver must therefore still reach completion consensus across the
-CP (x PP) group; otherwise one CP rank can start decoding a request whose
-KV its partner has not received yet and the helix all-to-all deadlocks.
+Under attention-DP the DP groups schedule independently, but the helix CP
+ranks (or the PP ranks) of one DP group share the same requests. The Python
+transceiver must therefore still reach completion consensus across that
+group; otherwise one CP rank can start decoding a request whose KV its
+partner has not received yet and the helix all-to-all deadlocks.
+Attention-DP with both helix CP and pp_size > 1 is rejected.
 """
 
 from __future__ import annotations
@@ -75,7 +76,7 @@ def test_adp_with_helix_cp_syncs_across_cp_group() -> None:
 
 
 def test_adp_with_cp_and_pp_is_rejected() -> None:
-    """The Python transceiver rejects attention-DP with both CP and PP.
+    """KvCacheTransceiverV2 rejects attention-DP with helix CP when pp_size > 1.
 
     Only the pp=1 executor loops align gen-init admission across the CP ranks.
     """
