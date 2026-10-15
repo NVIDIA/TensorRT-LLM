@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.7"
+EVENT_SCHEMA_VER = "0.8"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -95,6 +95,51 @@ class _LlmCounterSnapshot(BaseModel):
         le=_UINT32_MAX,
         alias="llmInitializationFailures",
         description="Number of LLM construction attempts that raised an exception.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class _VisualGenCounterSnapshot(BaseModel):
+    """Cumulative VisualGen lifecycle, workload, and performance summaries."""
+
+    visual_gen_metrics_json: str = Field(
+        default="{}", max_length=8192, alias="visualGenMetricsJson"
+    )
+    peak_num_queued_requests: int = Field(
+        default=0, ge=0, le=_UINT32_MAX, alias="peakNumQueuedRequests"
+    )
+    peak_num_active_requests: int = Field(
+        default=0, ge=0, le=_UINT32_MAX, alias="peakNumActiveRequests"
+    )
+    session_duration_sec: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="sessionDurationSec")
+    failed_component: Literal["none", "unclassified"] = Field(
+        default="none", alias="failedComponent"
+    )
+
+    visual_gen_initialization_attempts: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="visualGenInitializationAttempts",
+    )
+    visual_gen_instances_created: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="visualGenInstancesCreated",
+    )
+    active_visual_gen_instances: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="activeVisualGenInstances",
+    )
+    visual_gen_initialization_failures: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="visualGenInitializationFailures",
     )
 
     model_config = {"populate_by_name": True}
@@ -232,6 +277,116 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
     model_config = {"populate_by_name": True}
 
 
+VisualGenModality = Literal[
+    "image",
+    "video",
+    "video_audio",
+    "layered_image",
+    "mixed",
+    "unknown",
+]
+VisualGenLaunchMode = Literal["local_spawn", "torchrun", "slurm", "unknown"]
+
+
+class TrtllmVisualGenInitialReport(_VisualGenCounterSnapshot):
+    """VisualGen initial report emitted after the pipeline is ready."""
+
+    trtllm_version: str = Field(default="", max_length=_SHORT_STR, alias="trtllmVersion")
+    platform_info: str = Field(default="", max_length=_LONG_STR, alias="platform")
+    python_version: str = Field(default="", max_length=_SHORT_STR, alias="pythonVersion")
+    cpu_architecture: str = Field(default="", max_length=_SHORT_STR, alias="cpuArchitecture")
+    cpu_count: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="cpuCount")
+    gpu_count: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="gpuCount")
+    gpu_name: str = Field(default="", max_length=_LONG_STR, alias="gpuName")
+    gpu_memory_mb: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="gpuMemoryMB")
+    cuda_version: str = Field(default="", max_length=_SHORT_STR, alias="cudaVersion")
+
+    runtime_kind: Literal["visual_gen"] = Field(default="visual_gen", alias="runtimeKind")
+    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
+    model_id: str = Field(default="other", max_length=_LONG_STR, alias="modelId")
+    pipeline_class_name: str = Field(
+        default="other", max_length=_LONG_STR, alias="pipelineClassName"
+    )
+    resolved_pipeline_class: str = Field(
+        default="other", max_length=_LONG_STR, alias="resolvedPipelineClass"
+    )
+    modality: VisualGenModality = Field(default="unknown", alias="modality")
+    launch_mode: VisualGenLaunchMode = Field(default="unknown", alias="launchMode")
+    node_count: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="nodeCount")
+    n_workers: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="nWorkers")
+
+    quantization_algo: str = Field(default="", max_length=_SHORT_STR, alias="quantizationAlgo")
+    dynamic_weight_quant: bool = Field(default=False, alias="dynamicWeightQuant")
+    quantized_components_json: str = Field(default="[]", alias="quantizedComponentsJson")
+
+    cfg_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="cfgSize")
+    ulysses_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="ulyssesSize")
+    ring_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="ringSize")
+    attn2d_row_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="attn2dRowSize")
+    attn2d_col_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="attn2dColSize")
+    tensor_parallel_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="tensorParallelSize")
+    parallel_vae_size: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="parallelVaeSize")
+    parallel_vae_split_dim: Literal["width", "height"] = Field(
+        default="width", alias="parallelVaeSplitDim"
+    )
+
+    components_present_json: str = Field(
+        default="{}", max_length=1024, alias="componentsPresentJson"
+    )
+    transformer_count: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="transformerCount")
+    checkpoint_format: Literal["diffusers", "single_safetensors", "other"] = Field(
+        default="other", alias="checkpointFormat"
+    )
+    pipeline_load_duration_sec: float = Field(
+        default=0.0, ge=0, le=_UINT32_MAX, alias="pipelineLoadDurationSec"
+    )
+    warmup_duration_sec: float = Field(default=0.0, ge=0, le=_UINT32_MAX, alias="warmupDurationSec")
+    cache_backend: Literal["teacache", "cache_dit", "none", "other"] = Field(
+        default="none", alias="cacheBackend"
+    )
+    sparse_attention_algorithm: Literal["skip_softmax", "vsa", "none", "other"] = Field(
+        default="none", alias="sparseAttentionAlgorithm"
+    )
+    vsa_sparsity: Literal["le_0.25", "le_0.5", "le_0.75", "le_1.0", "gt_1.0", "unknown"] = Field(
+        default="unknown", alias="vsaSparsity"
+    )
+    target_sparsity: Literal["le_0.25", "le_0.5", "le_0.75", "le_1.0", "gt_1.0", "unknown"] = Field(
+        default="unknown", alias="targetSparsity"
+    )
+    quant_attention_enabled: bool = Field(default=False, alias="quantAttentionEnabled")
+    qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4", "none", "other"] = Field(
+        default="none", alias="qkDtype"
+    )
+    v_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4", "none", "other"] = Field(
+        default="none", alias="vDtype"
+    )
+    q_block_size: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="qBlockSize")
+    k_block_size: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="kBlockSize")
+    v_block_size: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="vBlockSize")
+    attention_backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL", "other"] = Field(
+        default="other", alias="attentionBackend"
+    )
+    cuda_graph_enable: bool = Field(default=False, alias="cudaGraphEnable")
+    torch_compile_enable: bool = Field(default=False, alias="torchCompileEnable")
+    enable_fullgraph: bool = Field(default=False, alias="enableFullgraph")
+    enable_autotune: bool = Field(default=False, alias="enableAutotune")
+    features_json: str = Field(default="{}", max_length=1024, alias="featuresJson")
+
+    model_config = {"populate_by_name": True}
+
+
+class TrtllmVisualGenHeartbeat(_VisualGenCounterSnapshot):
+    """Periodic VisualGen liveness and lifecycle-counter snapshot."""
+
+    seq: int = Field(..., ge=0, le=_UINT32_MAX)
+    runtime_kind: Literal["visual_gen"] = Field(default="visual_gen", alias="runtimeKind")
+    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
+    n_workers: int = Field(default=1, ge=0, le=_UINT32_MAX, alias="nWorkers")
+    gpu_count: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="gpuCount")
+
+    model_config = {"populate_by_name": True}
+
+
 TerminationKind = Literal[
     "clean",
     "exception",
@@ -249,6 +404,7 @@ LifecyclePhase = Literal[
 ]
 TerminationComponent = Literal[
     "llm",
+    "visual_gen",
     "server",
     "engine_worker",
     "disagg_worker",
@@ -257,7 +413,10 @@ TerminationComponent = Literal[
 ReportingSource = Literal["self", "supervisor", "executor_proxy"]
 
 
-class TrtllmExitReport(_LlmCounterSnapshot):
+RuntimeKind = Literal["llm", "visual_gen", "mixed", "unknown"]
+
+
+class TrtllmExitReport(_LlmCounterSnapshot, _VisualGenCounterSnapshot):
     """TRT-LLM terminal event parameters.
 
     Sent at most once for a telemetry session when TRT-LLM or a surviving
@@ -321,6 +480,11 @@ class TrtllmExitReport(_LlmCounterSnapshot):
         max_length=_SHORT_STR,
         alias="deploymentId",
         description="Identifier used to correlate a disaggregated deployment.",
+    )
+    runtime_kind: RuntimeKind = Field(
+        default="unknown",
+        alias="runtimeKind",
+        description="Runtime families observed in this process.",
     )
 
     model_config = {"populate_by_name": True}
@@ -427,7 +591,13 @@ def get_iso_timestamp(dt: Optional[datetime] = None) -> str:
 
 
 def build_gxt_payload(
-    event: Union[TrtllmInitialReport, TrtllmHeartbeat, TrtllmExitReport],
+    event: Union[
+        TrtllmInitialReport,
+        TrtllmHeartbeat,
+        TrtllmVisualGenInitialReport,
+        TrtllmVisualGenHeartbeat,
+        TrtllmExitReport,
+    ],
     *,
     session_id: str,
     trtllm_version: str,
@@ -448,6 +618,10 @@ def build_gxt_payload(
         event_name = "trtllm_initial_report"
     elif isinstance(event, TrtllmHeartbeat):
         event_name = "trtllm_heartbeat"
+    elif isinstance(event, TrtllmVisualGenInitialReport):
+        event_name = "trtllm_visual_gen_initial_report"
+    elif isinstance(event, TrtllmVisualGenHeartbeat):
+        event_name = "trtllm_visual_gen_heartbeat"
     elif isinstance(event, TrtllmExitReport):
         event_name = "trtllm_exit_report"
     else:

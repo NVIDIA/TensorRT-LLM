@@ -151,6 +151,27 @@ def _apply_effective_telemetry_config(llm_args: dict,
         )
 
 
+def _apply_visual_gen_telemetry_config(
+        visual_gen_args: "VisualGenArgs", *, telemetry: bool,
+        explicit_cli_telemetry: bool) -> "VisualGenArgs":
+    """Apply the authoritative CLI ingress and opt-out to VisualGen args."""
+    telemetry_config = visual_gen_args.telemetry_config
+    if explicit_cli_telemetry or not telemetry:
+        telemetry_config = telemetry_config.model_copy(
+            update={"disabled": not telemetry})
+    telemetry_config = telemetry_config.model_copy(
+        update={"usage_context": _telemetry_config.UsageContext.CLI_SERVE})
+    visual_gen_args = visual_gen_args.model_copy(
+        update={"telemetry_config": telemetry_config})
+    apply_usage_session_config(
+        telemetry_config,
+        default_usage_context=_telemetry_config.UsageContext.CLI_SERVE.value,
+        component="server",
+        lifecycle_phase="config_validation",
+    )
+    return visual_gen_args
+
+
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
@@ -1308,6 +1329,24 @@ def serve(
     """
     logger.set_level(log_level)
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config", "config_overrides"))
+    # Honor VisualGen YAML opt-out before validating other command options.
+    raw_visual_gen_args = {}
+    if visual_gen_args is not None:
+        with open(visual_gen_args, "r") as config_file:
+            raw_visual_gen_args = yaml.safe_load(config_file) or {}
+        if not isinstance(raw_visual_gen_args, dict):
+            raise ValueError(
+                "VisualGenArgs YAML must contain a mapping at the document root"
+            )
+        _command_telemetry.apply_raw_config_telemetry_opt_out(
+            raw_visual_gen_args,
+            usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+            component="server",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
 
@@ -1355,9 +1394,6 @@ def serve(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
-
-    explicit_cli_keys = collect_explicit_cli_keys(
-        exclude=("extra_llm_api_options", "config", "config_overrides"))
 
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
@@ -1583,8 +1619,12 @@ def serve(
     def _serve_visual_gen():
         from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-        parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
-                                  if visual_gen_args is not None else None)
+        parsed_visual_gen_args = VisualGenArgs(**raw_visual_gen_args)
+        parsed_visual_gen_args = _apply_visual_gen_telemetry_config(
+            parsed_visual_gen_args,
+            telemetry=telemetry,
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)

@@ -54,6 +54,22 @@ A field can still be absent from a specific payload when its parent config is
 unset or when the safety sanitizer rejects the runtime value.
 """
 
+_VISUAL_GEN_OVERVIEW = """\
+## VisualGen telemetry
+
+VisualGen uses the same process-scoped reporter and opt-outs as LLM telemetry.
+Its initial report contains explicitly allowlisted pipeline/model identity,
+deployment, parallelism, attention, cache, compilation, and component metadata.
+Heartbeats and the final exit snapshot carry cumulative endpoint/modality counts,
+bucketed request shapes, approximate latency percentiles, queue peaks, and
+reliability counters. No individual request record, prompt, media, output, private
+model path, arbitrary extra parameter, or exception message is sent.
+
+See the [VisualGen field inventory](source:tensorrt_llm/usage/schemas/README.md#visualgen-events)
+for wire fields, buckets, and collection limits. Use `TelemetryConfig(disabled=True)`
+with `VisualGenArgs`, or the existing environment/file and CLI opt-outs.
+"""
+
 
 def _escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
@@ -82,6 +98,7 @@ def _table(rows: list[dict]) -> str:
 
 
 def generate_telemetry_reference(repo_root: Path | str, output_path: Path | str) -> None:
+    """Render the LLM configuration reference and VisualGen telemetry overview."""
     repo_root = Path(repo_root)
     golden = json.loads((repo_root / _GOLDEN_REL).read_text())
     rows = golden.get("TorchLlmArgs", [])
@@ -93,6 +110,7 @@ def generate_telemetry_reference(repo_root: Path | str, output_path: Path | str)
         "",
         _table(rows),
         "",
+        _VISUAL_GEN_OVERVIEW,
     ]
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
