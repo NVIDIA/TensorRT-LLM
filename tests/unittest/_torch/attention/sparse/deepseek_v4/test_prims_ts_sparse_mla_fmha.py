@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the PrimTS native sparse MLA FMHA library (DeepSeek-V4, SM100/SM103)."""
+"""Tests for the PrimTS native sparse MLA FMHA library (DeepSeek-V4, SM100)."""
 
 import math
 from types import SimpleNamespace
@@ -33,6 +33,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def _skip_unless_toolchain() -> None:
+    """Skip the tests that need the library to actually serve a batch."""
+    if get_sm_version() != 100:
+        pytest.skip("PrimTS sparse MLA serves SM100 only (SM103 is not yet qualified)")
     reason = get_prims_ts_toolchain_unsupported_reason()
     if reason is not None:
         pytest.skip(reason)
@@ -41,7 +44,7 @@ def _skip_unless_toolchain() -> None:
 def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
     """The library ships enabled and ahead of the TRTLLM-Gen fallback.
 
-    Its ``is_available`` restricts it to DeepSeek-V4 on SM100/SM103, so being
+    Its ``is_available`` restricts it to DeepSeek-V4 on SM100, so being
     in the default set changes nothing for other models or architectures.
     """
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
@@ -53,6 +56,33 @@ def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
     assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes()
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")
     assert PrimsTSSparseMlaFmha not in registry.get_enabled_fmha_lib_classes()
+
+
+def test_sm103_stays_on_the_fallback_until_qualified(monkeypatch) -> None:
+    """B300/GB300 report an SM reason; SM100 proceeds to the shape and toolchain checks.
+
+    The vendored kernels admit SM103 through their architecture guard, but the
+    flashinfer signoff is SM100 only and L0 #64329 hit an illegal memory access
+    in the GB300 DeepSeek-V4-Pro warmup, so the adapter keeps SM103 on TRTLLM-Gen.
+    """
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
+
+    attn = SimpleNamespace(
+        use_fp8_ds_mla=False,
+        kv_cache_dtype="auto",
+        _uses_nvfp4_compress=False,
+        kv_lora_rank=448,
+        qk_rope_head_dim=64,
+        head_dim=512,
+        num_heads=16,
+    )
+    monkeypatch.setattr(mod, "get_sm_version", lambda: 103)
+    assert "SM103" in PrimsTSSparseMlaFmha._unavailable_reason(attn)
+    monkeypatch.setattr(mod, "get_sm_version", lambda: 90)
+    assert "requires SM100" in PrimsTSSparseMlaFmha._unavailable_reason(attn)
+    monkeypatch.setattr(mod, "get_sm_version", lambda: 100)
+    reason = PrimsTSSparseMlaFmha._unavailable_reason(attn)
+    assert reason is None or reason == get_prims_ts_toolchain_unsupported_reason()
 
 
 def test_softmax_scale_follows_qk_head_dim() -> None:
