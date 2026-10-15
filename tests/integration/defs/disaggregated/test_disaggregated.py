@@ -96,6 +96,38 @@ _FATAL_LOG_PATTERNS = (
 )
 
 
+def archive_process_logs(work_dir, log_output_dir):
+    """Copy the cluster's saved log files into log_output_dir for CI upload.
+
+    In CI, log_output_dir is pytest's --output-dir (the stage directory), which
+    is tarred and uploaded to Artifactory as results-<stage>.tar.gz, so logs
+    copied here survive the test and are downloadable from the CI job. Each
+    test gets its own subdirectory, named after PYTEST_CURRENT_TEST.
+
+    Returns the destination directory, or None if nothing was copied.
+    """
+    if not log_output_dir or not os.path.isdir(work_dir):
+        return None
+    test_name = os.environ.get("PYTEST_CURRENT_TEST", "disagg")
+    test_name = test_name.split("::")[-1].split(" ")[0]
+    test_name = re.sub(r"[^A-Za-z0-9._-]+", "_", test_name)[:200]
+    dest = os.path.join(log_output_dir, "disagg-logs", test_name)
+    os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for name in sorted(os.listdir(work_dir)):
+        if not name.endswith(".log"):
+            continue
+        try:
+            shutil.copy2(os.path.join(work_dir, name), dest)
+            copied += 1
+        except OSError as e:
+            print(f"Could not archive {name}: {e}")
+    if copied == 0:
+        return None
+    print(f"Archived {copied} disagg log file(s) to {dest}", flush=True)
+    return dest
+
+
 def scan_logs_for_fatal_errors(processes):
     """Scan saved process logs for fatal disagg/worker error patterns.
 
@@ -728,6 +760,7 @@ def setup_disagg_cluster(
     ctx_env: dict[str, str] | None = None,
     gen_env: dict[str, str] | None = None,
     share_gpu: bool = False,
+    log_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -741,6 +774,10 @@ def setup_disagg_cluster(
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
             for stress runs (cluster_uri/minimal_instances are still derived below)
+        save_log: Redirect each worker's and the server's output to a file in
+            work_dir instead of the inherited stdout
+        log_output_dir: With save_log, directory the logs are copied to if
+            startup fails (CI's --output-dir, so they get uploaded)
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -1005,7 +1042,9 @@ def setup_disagg_cluster(
             f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        if not save_log:
+        if save_log:
+            archive_process_logs(work_dir, log_output_dir)
+        else:
             shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
@@ -2480,7 +2519,8 @@ def run_disaggregated_aiperf(config_file,
                              cancellation_delay=None,
                              max_error_rate=0.05,
                              env=None,
-                             cwd=None):
+                             cwd=None,
+                             log_output_dir=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2501,6 +2541,8 @@ def run_disaggregated_aiperf(config_file,
             errors recorded by aiperf exceeds this (None disables the gate)
         env: Environment variables dict
         cwd: Working directory
+        log_output_dir: If set, the full worker/server logs are copied there
+            when the run fails (pass the output_dir fixture so CI uploads them)
     """
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
@@ -2510,6 +2552,7 @@ def run_disaggregated_aiperf(config_file,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
                              save_log=True,
+                             log_output_dir=log_output_dir,
                              disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
 
     server_host = config.get("hostname", "localhost")
@@ -2678,6 +2721,9 @@ def run_disaggregated_aiperf(config_file,
                             logger.error(line.rstrip())
             except OSError:
                 pass
+        # Keep the full logs for post-mortem: copy them into the CI output
+        # directory before the finally block removes work_dir.
+        archive_process_logs(work_dir, log_output_dir)
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -3013,7 +3059,7 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
 def test_disaggregated_stress_test(disaggregated_test_root,
                                    disaggregated_example_root, llm_venv,
                                    test_config, input_tokens, output_tokens,
-                                   concurrency):
+                                   concurrency, output_dir):
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
@@ -3070,7 +3116,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              cancellation_rate=test_config.cancellation_rate,
                              cancellation_delay=test_config.cancellation_delay,
                              env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+                             cwd=llm_venv.get_working_directory(),
+                             log_output_dir=output_dir)
 
 
 def run_cancel_stress_test(server_url: str,
