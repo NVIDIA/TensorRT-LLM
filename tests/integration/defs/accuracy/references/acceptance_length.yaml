@@ -122,3 +122,34 @@ ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3:
 TestGLM53FlashFP8::test_mtp:
   ref_al: 3.384
   min_al: 3.215
+# Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::
+# test_mtp1_gsm8k_and_acceptance. Keyed by target and variant for the same
+# reason as the ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3 entry above.
+#
+# max_draft_len is 1 on this checkpoint (`mtp_num_hidden_layers: 1`, one module
+# replayed once per step), so acceptance length lives in [1.0, 2.0]: 1.0 is a
+# draft path that is rejected every time -- the exact failure a miscomputed MTP
+# layer produces, with the text still correct and every accuracy gate green --
+# and 2.0 is every draft accepted.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
+  # Smoke-scale, and labelled as such: measured on GB300 over the boot prompt
+  # pair, STOCK 1.7403 against modeling_v2's 1.8063 on the same prompts. The
+  # number below is the STOCK reading, so the gate is not self-referential.
+  # There is no full-gsm8k reading yet: the accuracy runs were made without
+  # enable_iter_perf_stats, so they recorded no specDecodingStats.
+  ref_al: 1.7403
+  # Hand-set as a collapse tripwire, NOT the automatic 95% of ref_al -- 1.65
+  # would be a floor derived from a two-prompt smoke applied to a 1319-sample
+  # benchmark, which is a flaky test rather than a gate. 1.5 is the midpoint of
+  # the variant's whole range: a collapsed or miscomputed draft path scores 1.0,
+  # and anything at or above 1.5 is accepting at least half its drafts.
+  #
+  # This unit has a disclosed deviation the gate is deliberately sized around:
+  # the draft layer runs dense attention rather than QSA, because
+  # `QSAAttentionMetadata` has no `prepare_for_draft_forward`. That costs
+  # acceptance on long prompts and costs nothing on short ones, so a floor set
+  # tight against a short-prompt reading would fail on the benchmark for a
+  # reason already written down. Replace both numbers with a full-gsm8k STOCK
+  # reading (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg) when one is
+  # measured, and tighten min_al then.
+  min_al: 1.5
