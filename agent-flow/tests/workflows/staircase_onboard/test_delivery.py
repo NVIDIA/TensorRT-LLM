@@ -41,14 +41,14 @@ class SyntheticCore(DecoderModel):
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
-class PrefillTarget(Target):
+class PrefillTarget:
     def step_args(self, md):
         return dict(num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
 
     def forward(self, attn_metadata, *args, **kwargs): ...
 
 
-class DecodeTarget(Target):
+class DecodeTarget:
     def step_args(self, md):
         return dict(num_contexts=0, num_ctx_tokens=0)
 
@@ -59,7 +59,7 @@ _WEIGHTS = '''\
 """A synthetic weight table."""
 
 
-class SyntheticWeights(ModelWeights):
+class SyntheticWeights:
     WEIGHTS: tuple = ()
 
 
@@ -67,7 +67,7 @@ MODEL_WEIGHTS = SyntheticWeights()
 '''
 
 
-#: An entry in #19977's form: an OpWrapper whose class is its contract.
+#: An entry as modeling_v2 states it: an OpWrapper whose class is its contract.
 _ENTRY = """\
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
@@ -76,7 +76,7 @@ class Entry(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
     CELLS = (Cell(why="decode", spec=dict(rows=1)), Cell(why="prefill", spec=dict(rows=2048)))
 
-    def raw_call(self, x):
+    def __call__(self, x):
         return x
 
     def reference(self, x):
@@ -124,19 +124,14 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
         target / delivery.MODEL_OPS_DIRNAME / "moe" / "router.py",
         root / delivery.model_ops_tests_dir(TARGET_REL) / "moe" / "test_modeling_v2_router.py",
     )
-    (catalog / "index.yaml").write_text(
-        yaml.safe_dump(
-            {"entries": [{"path": f"{category}/{name}.py"} for category, name in _SHARED_ENTRIES]}
-        ),
-        encoding="utf-8",
-    )
-
     (root / delivery.CATALOG_TESTS_DIR / "test_modeling_v2_claims.py").write_text(
         "def test(): ...\n", encoding="utf-8"
     )
     routing = root / delivery.MODELING_V2_PACKAGE / "models" / "gpt_oss" / "routing.py"
     routing.write_text(
-        'TARGET_MODULES = {"X": "models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling"}\n',
+        "def route(*args):\n"
+        "    from .gpt_oss_120b__sm_103__tp1.modeling import ModelingV2GptOss120bSm103Tp1\n"
+        "    return ModelingV2GptOss120bSm103Tp1\n",
         encoding="utf-8",
     )
 
@@ -195,7 +190,7 @@ def _replace_modeling(root: Path, old: str, new: str) -> None:
 def test_a_core_without_its_decode_target_is_flagged(tmp_path):
     """The core dispatches every step to one of two targets; one alone is half a model."""
     root = _build_repo(tmp_path)
-    _replace_modeling(root, "class DecodeTarget(Target):", "class Decode(Target):")
+    _replace_modeling(root, "class DecodeTarget:", "class Decode:")
     failure = next(c for c in _verify(root).failures if c.name == "target:prefill-decode")
     assert "no DecodeTarget" in failure.detail
 
@@ -228,7 +223,16 @@ def test_a_weights_file_without_a_table_is_flagged(tmp_path):
     root = _build_repo(tmp_path)
     (root / TARGET_REL / "weights.py").write_text("MODEL_WEIGHTS = object()\n", encoding="utf-8")
     failure = next(c for c in _verify(root).failures if c.name == "target:weight-table")
-    assert "no ModelWeights subclass" in failure.detail
+    assert "no class with a WEIGHTS table" in failure.detail
+
+
+def test_a_table_the_loader_cannot_reach_is_flagged(tmp_path):
+    """The loader reaches the table through MODEL_WEIGHTS; a table without it loads nothing."""
+    root = _build_repo(tmp_path)
+    weights = root / TARGET_REL / "weights.py"
+    weights.write_text(_WEIGHTS.replace("MODEL_WEIGHTS = SyntheticWeights()", ""), encoding="utf-8")
+    failure = next(c for c in _verify(root).failures if c.name == "target:weight-table")
+    assert "MODEL_WEIGHTS" in failure.detail
 
 
 def test_a_hand_written_manifest_beside_the_table_is_flagged(tmp_path):
@@ -324,12 +328,13 @@ def test_another_targets_op_is_refused(tmp_path):
     assert "promote the entry" in failure.detail
 
 
-def test_an_unindexed_entry_fails(tmp_path):
+def test_the_catalog_needs_no_index(tmp_path):
+    """The catalog is its entries: there is no index file to be listed in."""
     root = _build_repo(tmp_path)
-    index = root / delivery.CATALOG_DIR / "index.yaml"
-    index.write_text(yaml.safe_dump({"entries": [{"path": "gemm/cublas_mm.py"}]}), encoding="utf-8")
+    assert not (root / delivery.CATALOG_DIR / "index.yaml").exists()
     report = _verify(root)
-    assert any("index.yaml" in c.detail for c in report.failures)
+    assert report.passed, report.render()
+    assert not any("index" in c.detail for c in report.checks)
 
 
 def test_an_unrouted_target_is_caught(tmp_path):

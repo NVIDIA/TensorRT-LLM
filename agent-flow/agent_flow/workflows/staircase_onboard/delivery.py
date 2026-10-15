@@ -166,7 +166,7 @@ def imported_model_ops(modeling_py: Path) -> list[tuple[str, str, str]]:
 class EntryContract:
     """What an entry's source states about itself, read without importing it.
 
-    An entry is an ``OpWrapper`` subclass: ``raw_call`` is the op call,
+    An entry is an ``OpWrapper`` subclass: ``__call__`` is the op call,
     ``reference`` what it should compute, ``CELLS`` the inputs it is certified
     over and ``ARCHS`` the architectures those cells were driven on. There is
     no separate contract file -- the class is the contract, and its test is
@@ -245,7 +245,7 @@ def entry_contract(path: Path) -> EntryContract:
         return EntryContract(
             problems=(
                 "no OpWrapper subclass: an entry is its executable contract "
-                "(raw_call, reference, CELLS, ARCHS), not a bare function",
+                "(__call__, reference, CELLS, ARCHS), not a bare function",
             )
         )
     problems: list[str] = []
@@ -253,7 +253,7 @@ def entry_contract(path: Path) -> EntryContract:
     cells = 0
     for cls in classes:
         methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
-        for required in ("raw_call", "reference"):
+        for required in ("__call__", "reference"):
             if required not in methods:
                 problems.append(f"{cls.name} defines no {required}")
         cls_cells = _cell_count(_class_assignment(cls, "CELLS"))
@@ -278,19 +278,6 @@ def _contract_detail(contract: EntryContract) -> str:
     return f"{'/'.join(contract.classes)}: {contract.cells} cell(s) on {', '.join(contract.archs)}"
 
 
-def catalog_index_paths(repo_root: Path) -> set[str]:
-    """Every entry path recorded in ``catalog/index.yaml``."""
-    index = repo_root / CATALOG_DIR / "index.yaml"
-    if not index.is_file():
-        return set()
-    data = yaml.safe_load(index.read_text(encoding="utf-8")) or {}
-    return {
-        str(entry.get("path", "")).strip()
-        for entry in (data.get("entries") or [])
-        if isinstance(entry, dict)
-    }
-
-
 def _entry_problems(wrapper: Path) -> tuple[list[str], EntryContract | None]:
     if not wrapper.is_file():
         return [f"entry missing: {wrapper}"], None
@@ -299,7 +286,7 @@ def _entry_problems(wrapper: Path) -> tuple[list[str], EntryContract | None]:
 
 
 def check_catalog_entries(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every imported shared entry exists, states a certified contract, and is indexed.
+    """Every imported shared entry exists and states a certified contract.
 
     Every entry is an ``OpWrapper``; there are no exempt categories. Native
     torch calls are not entries -- a target calls torch directly -- so an
@@ -307,18 +294,14 @@ def check_catalog_entries(repo_root: Path, entries: Iterable[tuple[str, str]]) -
     must carry its cells.
     """
     checks: list[Check] = []
-    indexed = catalog_index_paths(repo_root)
     for category, name in entries:
         rel = f"{category}/{name}.py"
         problems, contract = _entry_problems(repo_root / CATALOG_DIR / rel)
-        if rel not in indexed:
-            problems.append(f"not listed in catalog/index.yaml (looked for {rel!r})")
         checks.append(
             Check(
                 name=f"catalog:{rel}",
                 passed=not problems,
-                detail="; ".join(problems)
-                or f"{_contract_detail(contract)}; listed in catalog/index.yaml",
+                detail="; ".join(problems) or _contract_detail(contract),
             )
         )
     return checks
@@ -335,8 +318,7 @@ def check_model_ops(
 ) -> list[Check]:
     """Every ``ops/`` entry the target imports is its own, and states a certified contract.
 
-    Not indexed: ``catalog/index.yaml`` lists the shared vocabulary only. An
-    op another target needs is promoted to the shared catalog, with its test;
+    An op another target needs is promoted to the shared catalog, with its test;
     importing it out of a sibling's ``ops/`` couples two targets that are
     certified independently.
     """
@@ -462,8 +444,6 @@ def _check_phase_targets(tree: ast.AST) -> list[Check]:
         if node is None:
             problems.append(f"no {name}")
             continue
-        if "Target" not in _base_names(node):
-            problems.append(f"{name} does not derive from Target")
         methods = {
             item.name
             for item in node.body
@@ -477,7 +457,7 @@ def _check_phase_targets(tree: ast.AST) -> list[Check]:
             name="target:prefill-decode",
             passed=not problems,
             detail="; ".join(problems)
-            or "PrefillTarget and DecodeTarget derive from Target and define step_args and forward",
+            or "PrefillTarget and DecodeTarget define step_args and forward",
         )
     ]
     decode = classes.get("DecodeTarget")
@@ -506,18 +486,19 @@ def _check_phase_targets(tree: ast.AST) -> list[Check]:
 
 
 def _check_weight_table(weights_py: Path) -> Check:
-    """``weights.py`` states each weight once, as a ``ModelWeights`` table.
+    """``weights.py`` states each weight once, in a ``WEIGHTS`` table, exposed as ``MODEL_WEIGHTS``.
 
-    ``ModelWeights`` generates the manifest from ``WEIGHTS``, so a hand-written
-    manifest beside the table is a second copy of every checkpoint key -- the
-    drift the table exists to stop.
+    The table's class generates the manifest from ``WEIGHTS`` (``declare``,
+    ``manifest``, ``load`` are passes over it), so a hand-written manifest
+    beside the table is a second copy of every checkpoint key -- the drift the
+    table exists to stop. The loader reaches the table through the module-level
+    ``MODEL_WEIGHTS`` instance.
     """
     tree = ast.parse(weights_py.read_text(encoding="utf-8"))
     tables = [
         node
         for node in _class_nodes(tree).values()
-        if "ModelWeights" in _base_names(node)
-        and any(
+        if any(
             (isinstance(item, ast.Assign) and any(_is_name(t, "WEIGHTS") for t in item.targets))
             or (isinstance(item, ast.AnnAssign) and _is_name(item.target, "WEIGHTS"))
             for item in node.body
@@ -542,18 +523,28 @@ def _check_weight_table(weights_py: Path) -> Check:
             if isinstance(node, ast.FunctionDef) and node.name in HAND_MANIFEST_NAMES
         }
     )
+    exposed = any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            _is_name(t, "MODEL_WEIGHTS")
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+        for node in tree.body
+    )
     problems = []
     if not tables:
-        problems.append("no ModelWeights subclass with a WEIGHTS table")
+        problems.append("no class with a WEIGHTS table")
+    if not exposed:
+        problems.append("no module-level MODEL_WEIGHTS instance of the table")
     if hand_manifest:
         problems.append(
             f"hand-written {', '.join(hand_manifest)} beside the table; "
-            "ModelWeights.manifest() generates it from WEIGHTS"
+            "the table's manifest() generates it from WEIGHTS"
         )
     return Check(
         name="target:weight-table",
         passed=not problems,
-        detail="; ".join(problems) or f"{tables[0].name}(ModelWeights) declares WEIGHTS",
+        detail="; ".join(problems) or f"{tables[0].name} declares WEIGHTS; MODEL_WEIGHTS exposes it",
     )
 
 
@@ -602,10 +593,12 @@ def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
         return [Check(name="routing:module", passed=False, detail=f"missing: {routing}")]
 
     text = routing.read_text(encoding="utf-8")
-    # The dotted form routing uses, e.g.
-    # ``models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling``.
+    # Routing imports the target where it returns it, relative to the family
+    # package (``from .gpt_oss_120b__sm_103__tp1.modeling import ...``); an
+    # absolute ``models.<family>.<target>`` form names it too.
     dotted = target_rel.split(f"{MODELING_V2_PACKAGE}/", 1)[-1].replace("/", ".").rstrip(".")
-    referenced = dotted in text
+    relative = f"from .{Path(target_rel.rstrip('/')).name}."
+    referenced = dotted in text or relative in text
     claims_test = repo_root / CATALOG_TESTS_DIR / "test_modeling_v2_claims.py"
     return [
         Check(
@@ -902,7 +895,6 @@ __all__ = [
     "MODELING_V2_PACKAGE",
     "MODEL_OPS_DIRNAME",
     "TEST_DB_DIR",
-    "catalog_index_paths",
     "check_accuracy_reference",
     "check_catalog_entries",
     "check_catalog_tests",
