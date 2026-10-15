@@ -368,8 +368,6 @@ public:
 private:
     VirtMem mVirtMem;
     std::vector<SlotIdMap> const* mSlotMaps;
-    // Requested slots per domain; the mapped count can exceed it by the tail of a chunk.
-    std::vector<SlotCount> mRequestedNumSlots;
 };
 
 // ---------------------------------------------------------------------------
@@ -499,7 +497,7 @@ public:
 
     // Total bytes across all pools, rounding each pool's bytes up to granularity.
     // Mirrors Python total_quota: sum(round_up(p.num_bytes, granularity) for p in pg._pools).
-    size_t roundedNumBytes(size_t granularity) const noexcept
+    virtual size_t roundedNumBytes(size_t granularity) const noexcept
     {
         size_t total = 0;
         for (auto const& pool : mPools)
@@ -528,9 +526,14 @@ public:
     // numSlots: initial slot count per locality domain (size numLocalityDomains()).
     GpuPoolGroup(std::vector<SlotCount> const& numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
         PooledPhysMemAllocator& physMemAllocator);
+    // The allocators hold pointers into mSlotMaps, so release them before the maps go away.
+    ~GpuPoolGroup() override;
 
     void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt, int localityDomainId = 0) override;
     std::vector<std::pair<SlotCount, SlotCount>> slotRanges() const override;
+    // Each domain's backing is rounded up on its own, so the sum must be too or a quota
+    // round trip through totalQuota() loses slots.
+    size_t roundedNumBytes(size_t granularity) const noexcept override;
 
     [[nodiscard]] std::vector<std::pair<size_t, size_t>> mappedRanges(PoolIndex poolIdx) const
     {

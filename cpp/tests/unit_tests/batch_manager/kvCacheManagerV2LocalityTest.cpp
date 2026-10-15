@@ -33,6 +33,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace
@@ -391,6 +392,98 @@ TEST_F(KvCacheManagerV2MockLocalityTest, QuotaIsSharedPerDomainConsistentlyOnIni
             EXPECT_EQ(free[0], resizeGrains * kSlotsPerGrain);
         }
     }
+}
+
+TEST_F(KvCacheManagerV2MockLocalityTest, ManagerResizeDecidesPerDomain)
+{
+    constexpr size_t kFullQuota = 256ULL << 20;
+    constexpr size_t kMidQuota = 192ULL << 20;
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto& storage = manager->storage();
+    PoolGroupIndex const pg{0};
+    auto const ratio = storage.getRatioList(kHotLevel);
+    SlotCount const full = storage.numSlots(pg);
+    ASSERT_TRUE(manager->resize(kHotLevel, kMidQuota));
+    SlotCount const mid = storage.numSlots(pg);
+    ASSERT_LT(mid, full);
+    ASSERT_TRUE(manager->resize(kHotLevel, kFullQuota));
+    ASSERT_EQ(storage.numSlots(pg), full);
+
+    // Domain 0 above the target and domain 1 below it: one shrinks while the other grows.
+    storage.shrinkPoolGroup(kHotLevel, pg, mid / 2, {}, /*localityDomainId=*/1);
+    ASSERT_EQ(storage.getPerLocalityDomainFreeSlots()[1], mid / 2);
+    storage.adjustCacheLevel(kHotLevel, kMidQuota, ratio, nullptr);
+    EXPECT_EQ(storage.getPerLocalityDomainFreeSlots(), (std::vector<SlotCount>{mid, mid}));
+
+    // Domain 1 already at the target: only domain 0 moves.
+    storage.shrinkPoolGroup(kHotLevel, pg, mid / 2, {}, /*localityDomainId=*/0);
+    storage.adjustCacheLevel(kHotLevel, kMidQuota, ratio, nullptr);
+    EXPECT_EQ(storage.getPerLocalityDomainFreeSlots(), (std::vector<SlotCount>{mid, mid}));
+
+    EXPECT_THROW(storage.expandPoolGroup(kHotLevel, pg, mid, /*localityDomainId=*/0), std::exception);
+    EXPECT_THROW(storage.shrinkPoolGroup(kHotLevel, pg, mid, {}, /*localityDomainId=*/1), std::exception);
+    EXPECT_EQ(storage.getPerLocalityDomainFreeSlots(), (std::vector<SlotCount>{mid, mid}));
+}
+
+// A 3 MiB slot does not divide the 2 MiB grain, so each domain's backing rounds up on its own.
+// Re-applying the reported quota must not lose slots.
+TEST_F(KvCacheManagerV2MockLocalityTest, QuotaRoundTripKeepsCoarseSlots)
+{
+    constexpr size_t kMiB = 1ULL << 20;
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 32;
+    GpuCacheTierConfig gpu{32 * kMiB};
+    gpu.enableLocalityDomains = true;
+    config.cacheTiers.emplace_back(gpu);
+    AttentionLayerConfig layer;
+    layer.layerId = 0;
+    layer.buffers.push_back(BufferConfig{"key", 3 * kMiB, std::nullopt});
+    config.layers.emplace_back(std::move(layer));
+
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto& storage = manager->storage();
+    PoolGroupIndex const pg{0};
+    SlotCount const initial = storage.numSlots(pg);
+    ASSERT_GT(initial, 0);
+    size_t const perDomainBytes = (static_cast<size_t>(initial) * 3 * kMiB + 2 * kMiB - 1) / (2 * kMiB) * (2 * kMiB);
+    EXPECT_EQ(manager->getQuota(kHotLevel), 2 * perDomainBytes);
+    for (int i = 0; i < 2; ++i)
+    {
+        manager->adjust();
+        EXPECT_EQ(storage.numSlots(pg), initial);
+        EXPECT_EQ(storage.getPerLocalityDomainFreeSlots(), (std::vector<SlotCount>{initial, initial}));
+        EXPECT_EQ(manager->getQuota(kHotLevel), 2 * perDomainBytes);
+    }
+}
+
+TEST_F(KvCacheManagerV2MockLocalityTest, SecondaryGpuTierIsRejectedWhenLocalized)
+{
+    auto config = makeLocalizedConfig();
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{64ULL << 20});
+    try
+    {
+        KvCacheManager manager(config);
+        FAIL() << "a localized manager accepted a secondary GPU tier";
+    }
+    catch (std::invalid_argument const& e)
+    {
+        EXPECT_NE(std::string(e.what()).find("Locality domains"), std::string::npos) << e.what();
+    }
+}
+
+TEST_F(KvCacheManagerV2MockLocalityTest, UtilizationIsReportedPerDomain)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto& storage = manager->storage();
+    auto const capacity = storage.numSlots(PoolGroupIndex{0});
+    auto cache = manager->createKvCache(scopeFor(1));
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(mStream)));
+    ASSERT_TRUE(cache->resize(static_cast<int>(capacity) / 2 * 32));
+
+    EXPECT_FLOAT_EQ(storage.getUtilization(kHotLevel, 0).at(PoolGroupIndex{0}), 0.f);
+    EXPECT_GT(storage.getUtilization(kHotLevel, 1).at(PoolGroupIndex{0}), 0.4f);
+    EXPECT_LT(storage.getUtilization(kHotLevel).at(PoolGroupIndex{0}), 0.35f);
+    cache->close();
 }
 
 TEST_F(KvCacheManagerV2MockLocalityTest, NonLocalizedScopesHashAsBefore)

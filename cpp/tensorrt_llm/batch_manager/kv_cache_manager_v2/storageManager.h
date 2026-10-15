@@ -333,8 +333,11 @@ public:
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
-    StorageStatistics getStatistics(CacheLevel level = kHotLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0}) const;
-    TypedVec<PoolGroupIndex, float> getUtilization(CacheLevel level = kHotLevel) const;
+    // Summed over locality domains unless one is given.
+    StorageStatistics getStatistics(CacheLevel level = kHotLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0},
+        std::optional<int> localityDomainId = std::nullopt) const;
+    TypedVec<PoolGroupIndex, float> getUtilization(
+        CacheLevel level = kHotLevel, std::optional<int> localityDomainId = std::nullopt) const;
     float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).

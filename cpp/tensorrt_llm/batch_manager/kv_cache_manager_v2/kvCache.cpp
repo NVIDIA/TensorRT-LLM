@@ -534,8 +534,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         throw std::invalid_argument("OPTIONAL reuse selection is only valid before the first resume");
     }
 
-    // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
+    // Check utilization against threshold. Allocation is per domain, so the guard is too.
+    auto const utilizations = mManager->storage().getUtilization(kHotLevel, localityDomainId());
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {

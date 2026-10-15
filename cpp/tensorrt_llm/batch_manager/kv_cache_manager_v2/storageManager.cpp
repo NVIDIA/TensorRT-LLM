@@ -444,6 +444,15 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
+        // The shared allocator would place this tier per domain while allocation always targets
+        // domain 0 on non-hot levels, stranding the other domains' share.
+        if (gpuPhysMemAllocator != nullptr && mNumLocalityDomains > 1)
+        {
+            throw std::invalid_argument(
+                "Locality domains are supported only when the GPU tier is the hot tier; "
+                "cache tier "
+                + std::to_string(level.value()) + " is a GPU tier");
+        }
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
             gpuPhysMemAllocator);
     }
@@ -1716,28 +1725,34 @@ std::vector<SlotCount> StorageManager::getPerLocalityDomainFreeSlots() const
     return result;
 }
 
-StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex pgIdx) const
+StorageStatistics StorageManager::getStatistics(
+    CacheLevel level, PoolGroupIndex pgIdx, std::optional<int> localityDomainId) const
 {
     auto const& lvl = mLevels.at(level);
+    auto const domainFilter
+        = localityDomainId.has_value() ? localityDomainFilter(level, localityDomainId) : std::nullopt;
     SlotCount freeSlots = 0;
     SlotCount totalSlots = 0;
-    for (int localityDomainId = 0; localityDomainId < lvl.storage->numLocalityDomains(); ++localityDomainId)
+    for (int domain = 0; domain < lvl.storage->numLocalityDomains(); ++domain)
     {
-        freeSlots += lvl.storage->numFreeSlots(pgIdx, localityDomainId);
-        totalSlots += lvl.storage->numSlots(pgIdx, localityDomainId);
+        if (domainFilter.has_value() && domain != *domainFilter)
+            continue;
+        freeSlots += lvl.storage->numFreeSlots(pgIdx, domain);
+        totalSlots += lvl.storage->numSlots(pgIdx, domain);
     }
-    SlotCount evictable = lvl.controller.numEvictablePages(pgIdx);
+    SlotCount evictable = lvl.controller.numEvictablePages(pgIdx, domainFilter);
     auto sizes = lvl.storage->slotSize(pgIdx);
     return StorageStatistics{sizes, totalSlots, freeSlots, evictable};
 }
 
-TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level) const
+TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(
+    CacheLevel level, std::optional<int> localityDomainId) const
 {
     TypedVec<PoolGroupIndex, float> result;
     result.reserve(numPoolGroups(level));
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(level); ++pgIdx)
     {
-        auto const s = getStatistics(level, pgIdx);
+        auto const s = getStatistics(level, pgIdx, localityDomainId);
         TLLM_CHECK_WITH_INFO(s.total > 0, "getUtilization: pool group %d at level %d has zero capacity",
             static_cast<int>(pgIdx.value()), static_cast<int>(level.value()));
         result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
@@ -1769,7 +1784,9 @@ void StorageManager::expandPoolGroup(
     CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, int localityDomainId)
 {
     auto& pg = poolGroup(level, pgIdx);
-    TLLM_CHECK_DEBUG(newNumSlots > pg.numSlots(localityDomainId));
+    TLLM_CHECK_WITH_INFO(newNumSlots > pg.numSlots(localityDomainId),
+        "expandPoolGroup: target %d is not above the current %d slots of locality domain %d",
+        static_cast<int>(newNumSlots), static_cast<int>(pg.numSlots(localityDomainId)), localityDomainId);
     pg.resizePools(newNumSlots, localityDomainId);
     pg.slotAllocator(localityDomainId).expand(newNumSlots);
 }
@@ -1784,7 +1801,9 @@ void StorageManager::shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator(localityDomainId);
     auto& ctrl = mLevels.at(level).controller;
-    TLLM_CHECK_DEBUG(newNumSlots < pg.numSlots(localityDomainId));
+    TLLM_CHECK_WITH_INFO(newNumSlots < pg.numSlots(localityDomainId),
+        "shrinkPoolGroup: target %d is not below the current %d slots of locality domain %d",
+        static_cast<int>(newNumSlots), static_cast<int>(pg.numSlots(localityDomainId)), localityDomainId);
     // Only this domain's pages and local slot indices matter; slot ids are global and interleaved.
     std::optional<int> const domainFilter
         = pg.numLocalityDomains() == 1 ? std::nullopt : std::optional<int>{localityDomainId};
@@ -1908,7 +1927,6 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
 {
     auto& lvlStorage = *mLevels.at(level).storage;
-    auto oldNumSlots = lvlStorage.slotCountList();
     size_t const granularity = lvlStorage.poolSizeGranularity();
     int const numDomains = lvlStorage.numLocalityDomains();
     size_t quota;
@@ -1934,24 +1952,29 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
+    // Domains are resized one at a time and a failure leaves the already resized ones at the new
+    // capacity, so each (pool group, domain) pair is compared against its own current capacity:
+    // a retry then only touches the pairs that are still off target.
     // Shrink first.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        if (newNumSlots[pgIdx] >= oldNumSlots[pgIdx])
-            continue;
         std::vector<SharedPtr<Page>> pages;
         if (persistentPages)
             pages = (*persistentPages)[pgIdx];
         for (int localityDomainId = 0; localityDomainId < numDomains; ++localityDomainId)
-            shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], pages, localityDomainId);
+        {
+            if (newNumSlots[pgIdx] < lvlStorage.numSlots(pgIdx, localityDomainId))
+                shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], pages, localityDomainId);
+        }
     }
     // Then expand.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        if (newNumSlots[pgIdx] <= oldNumSlots[pgIdx])
-            continue;
         for (int localityDomainId = 0; localityDomainId < numDomains; ++localityDomainId)
-            expandPoolGroup(level, pgIdx, newNumSlots[pgIdx], localityDomainId);
+        {
+            if (newNumSlots[pgIdx] > lvlStorage.numSlots(pgIdx, localityDomainId))
+                expandPoolGroup(level, pgIdx, newNumSlots[pgIdx], localityDomainId);
+        }
     }
     if (lvlStorage.cacheTier() == CacheTier::GPU_MEM)
     {

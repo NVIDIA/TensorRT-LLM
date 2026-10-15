@@ -345,11 +345,11 @@ GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator&
     : SlotPoolBase(slotSize)
     , mVirtMem(vmSize, physMemAllocator)
     , mSlotMaps(slotMaps)
-    , mRequestedNumSlots(static_cast<size_t>(physMemAllocator.numLocalityDomains()), SlotCount{0})
 {
     TLLM_CHECK_DEBUG_WITH_INFO(
         vmSize % physMemAllocator.physMemSize() == 0, "vm_size must be aligned to phys_mem_size");
-    TLLM_CHECK_DEBUG(mSlotMaps == nullptr || mSlotMaps->size() == mRequestedNumSlots.size());
+    TLLM_CHECK_DEBUG(
+        mSlotMaps == nullptr || mSlotMaps->size() == static_cast<size_t>(physMemAllocator.numLocalityDomains()));
     if (numSlots != 0)
     {
         resize(numSlots);
@@ -437,7 +437,6 @@ void GpuSlotPool::resize(SlotCount newNumSlots, int localityDomainId)
             throw;
         }
     }
-    mRequestedNumSlots[localityDomainId] = newNumSlots;
 }
 
 SlotCount GpuSlotPool::extendByOnePhysMem()
@@ -449,7 +448,9 @@ SlotCount GpuSlotPool::extendByOnePhysMem()
 Address GpuSlotPool::slotAddress(SlotId slot) const
 {
     // Slot ids may lie beyond numSlots() when domains interleave, so bound by the reservation.
-    TLLM_CHECK_DEBUG_WITH_INFO(slot >= SlotId{0} && mSlotSize * (toSizeT(slot) + 1) <= mVirtMem.virtualBytes(),
+    TLLM_CHECK_DEBUG_WITH_INFO(mSlotMaps == nullptr
+            ? isValidSlotId(slot)
+            : slot >= SlotId{0} && mSlotSize * (toSizeT(slot) + 1) <= mVirtMem.virtualBytes(),
         "GpuSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mVirtMem.address() + mSlotSize * toSizeT(slot));
 }
@@ -742,6 +743,25 @@ GpuPoolGroup::GpuPoolGroup(std::vector<SlotCount> const& numSlots, TypedVec<Pool
             mSlotAllocators[localityDomainId]->expand(count);
         }
     }
+}
+
+GpuPoolGroup::~GpuPoolGroup()
+{
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+}
+
+size_t GpuPoolGroup::roundedNumBytes(size_t granularity) const noexcept
+{
+    size_t total = 0;
+    for (auto const& pool : mPools)
+    {
+        auto const& gpuPool = static_cast<GpuSlotPool const&>(*pool);
+        for (int localityDomainId = 0; localityDomainId < gpuPool.numLocalityDomains(); ++localityDomainId)
+        {
+            total += roundUp(gpuPool.slotSize() * slotCountToSizeT(gpuPool.numSlots(localityDomainId)), granularity);
+        }
+    }
+    return total;
 }
 
 SlotCount GpuPoolGroup::getNumSlotsFromPools(int localityDomainId) const noexcept

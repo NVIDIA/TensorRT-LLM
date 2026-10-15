@@ -28,7 +28,8 @@ enum class LocalizationMode
 };
 
 // TRT_LLM_MOCK_LOCALIZATION_SUPPORT: unset probes the device, "0" disables locality domains,
-// "1" reports the device's domain count while backing every domain with ordinary device memory.
+// "1" reports the fixed Rubin domain count on any device while backing every domain with
+// ordinary device memory.
 LocalizationMode localizationMode();
 
 // 1 when locality domains are disabled or the current device has none, otherwise the domain count.
