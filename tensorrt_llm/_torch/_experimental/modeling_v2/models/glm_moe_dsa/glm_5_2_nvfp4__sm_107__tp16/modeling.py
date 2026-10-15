@@ -20,9 +20,11 @@ import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM, DeepseekV3Model
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.speculative import SpecMetadata
 
 from . import weights as _weights
@@ -64,10 +66,38 @@ class DecodeTarget:
 
     Routed to only when the batch has no context rows, which the core decides
     per step; nothing in this class reads the phase back.
+
+    The step is written out layer by layer for this deployment's configuration,
+    which ``__init__`` checks once:
+
+    - Layers 0-2 (dense, unquantized): the attention all-reduces its own output,
+      the residual add and ``post_attention_layernorm`` follow, and the MLP's
+      all-reduce carries the residual add and the next layer's input norm.
+    - Layers 3-77 (MoE): both all-reduces carry the residual add and the
+      following norm; the experts finalize before theirs (16 ranks span nodes).
+    - The last all-reduce applies the model's final norm (``next_layer_layernorm``).
     """
 
     def __init__(self, core: "Glm52Nvfp4Sm107Tp16Core") -> None:
         self.core = core
+        for layer in core.layers[: core.num_hidden_layers]:
+            assert layer.allreduce is not None and layer.next_layer_layernorm is not None
+            assert layer.input_layernorm.nvfp4_scale is None, "kv_a_proj is not NVFP4"
+            if isinstance(layer.mlp, GatedMLP):
+                assert (
+                    layer.mlp_tp_size == _TP
+                    and not layer.disable_attn_allreduce
+                    and not layer.fusion_config.PRE_MLP_FUSION
+                    and layer.fusion_config.POST_MLP_FUSION
+                    and layer.post_attention_layernorm.nvfp4_scale is None
+                ), f"layer {layer.layer_idx}: unexpected dense-layer configuration"
+            else:
+                assert (
+                    layer.disable_attn_allreduce
+                    and layer.fusion_config.PRE_MOE_FUSION
+                    and layer.fusion_config.POST_MOE_FUSION
+                    and layer.mapping.is_multi_node()
+                ), f"layer {layer.layer_idx}: unexpected MoE-layer configuration"
 
     def forward(
         self,
@@ -78,14 +108,78 @@ class DecodeTarget:
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        return DeepseekV3Model.forward(
-            self.core,
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
+        core = self.core
+        if inputs_embeds is None:
+            inputs_embeds = core.embed_tokens(input_ids)
+        residual = inputs_embeds
+        hidden_states = core.layers[0].input_layernorm(inputs_embeds)
+        for layer in core.layers[: core.num_hidden_layers]:
+            if isinstance(layer.mlp, GatedMLP):
+                hidden_states, residual = self._dense_layer(
+                    layer, position_ids, hidden_states, residual, attn_metadata
+                )
+            else:
+                hidden_states, residual = self._moe_layer(
+                    layer, position_ids, hidden_states, residual, attn_metadata
+                )
+        return hidden_states
+
+    @staticmethod
+    def _dense_layer(layer, position_ids, hidden_states, residual, attn_metadata):
+        hidden_states = layer.self_attn(
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            spec_metadata=spec_metadata,
-            **kwargs,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(enable_allreduce=True),
+        )
+        hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+        hidden_states = layer.mlp(
+            hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+        )
+        return layer.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=layer.next_layer_layernorm.weight,
+                eps=layer.next_layer_layernorm.variance_epsilon,
+            ),
+        )
+
+    @staticmethod
+    def _moe_layer(layer, position_ids, hidden_states, residual, attn_metadata):
+        hidden_states = layer.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(enable_allreduce=False),
+        )
+        hidden_states, residual = layer.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=layer.post_attention_layernorm.weight,
+                eps=layer.post_attention_layernorm.variance_epsilon,
+                trigger_completion_at_end=False,
+            ),
+        )
+        hidden_states = layer.mlp(
+            hidden_states,
+            None,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(enable_allreduce=False),
+            do_finalize=True,
+        )
+        return layer.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=layer.next_layer_layernorm.weight,
+                eps=layer.next_layer_layernorm.variance_epsilon,
+                trigger_completion_at_end=False,
+            ),
         )
 
 
