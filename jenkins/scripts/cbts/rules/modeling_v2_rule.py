@@ -25,18 +25,21 @@ modeling_v2 iff one of its `tests:` entries matches a marker in
 `_MV2_ENTRY_PATTERNS`. Those markers are exact by construction rather
 than by luck: every unit test file in the subtree is named
 `test_modeling_v2_*` precisely so it cannot collide with the upstream
-test of the same op, and the accuracy files follow the same prefix. So
-there is no substring that could claim an unrelated entry, and no
-`mtp_nextn=0`-style carve-out is needed.
+test of the same op, and the accuracy gates live in their own
+`accuracy/modeling_v2/` directory. So there is no substring that could
+claim an unrelated entry, and no `mtp_nextn=0`-style carve-out is
+needed.
 
 Outward fallback: not needed, and that is a property of the design
-rather than an accident. Nothing imports this subtree unless
-`TRTLLM_MODELING_V2` is set: `AutoModelForCausalLM._resolve_class` calls
+rather than an accident. Nothing beyond the resolver module is imported
+unless `LLM(modeling_v2=...)` is on: the model loader calls
 `modeling_v2_resolve`, which returns immediately when the switch is off,
-and the routing modules are imported lazily behind it. The one caller
-outside the subtree is `tensorrt_llm/_torch/models/modeling_auto.py`,
-which this rule does not claim -- a PR touching it falls back to
-baseline, which is what a change to the shared resolver deserves.
+and the routing modules are imported lazily behind it. The callers
+outside the subtree are `tensorrt_llm/_torch/pyexecutor/model_loader.py`
+(decides) and `tensorrt_llm/_torch/models/modeling_auto.py` (reads the
+decision off `ModelConfig`), neither of which this rule claims -- a PR
+touching them falls back to baseline, which is what a change to the
+shared resolver deserves.
 
 `.md` exclusion matters more here than for most rules: the catalog
 carries a contract document per entry, so roughly a fifth of the files
@@ -69,14 +72,16 @@ from .docs_rule import is_docs_path
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
 _MV2_SRC_PREFIXES: tuple[str, ...] = ("tensorrt_llm/_torch/_experimental/modeling_v2/",)
 
-# Substrings that mark a test entry as modeling_v2. Both are unambiguous:
+# Substrings that mark a test entry as modeling_v2. All are unambiguous:
 #   - "unittest/_torch/modeling_v2/" → the op-level catalog matrix, taken
 #     as whole-directory entries (one on l0_gb300, one on
 #     l0_gb300_multi_gpus for the 4-rank collectives)
-#   - "test_modeling_v2_" → the accuracy gates, and any future unit file
-#     named by the subtree's own convention
+#   - "accuracy/modeling_v2/" → the per-model accuracy gates
+#   - "test_modeling_v2_" → any future unit file named by the subtree's
+#     own convention
 _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
     "unittest/_torch/modeling_v2/",
+    "accuracy/modeling_v2/",
     "test_modeling_v2_",
 )
 

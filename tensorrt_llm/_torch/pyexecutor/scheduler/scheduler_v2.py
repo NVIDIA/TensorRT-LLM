@@ -1166,7 +1166,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._free_kv_caches(req)
             return False
 
-        if draft_reuse != common_reuse:
+        # A served prefix is held in both pools even when their reuse policies
+        # commit different depths. Compare the effective prefixes before freeing it.
+        served_prefix = req.py_served_prefix_end
+        if max(draft_reuse, served_prefix) != max(common_reuse, served_prefix):
             # The shorter re-claim can itself fall short, so drop straight to
             # no reuse rather than iterate against an eviction we do not own.
             draft_manager.free_resources(req)

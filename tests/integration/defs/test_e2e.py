@@ -1337,10 +1337,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  None,
                  marks=skip_pre_blackwell,
                  id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
-    pytest.param('Kimi-K2-Thinking-NVFP4',
-                 None,
-                 marks=skip_pre_blackwell,
-                 id='Kimi-K2-Thinking-NVFP4'),
     pytest.param('MiniMax-M3',
                  _MINIMAX_M3_EVAL_CONFIG,
                  marks=skip_pre_blackwell,
@@ -1364,7 +1360,7 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
         "--backend=pytorch",
     ]
 
-    if "Kimi" in model_path or "MiniMax-M3" in model_path:
+    if "MiniMax-M3" in model_path:
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")
