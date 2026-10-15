@@ -949,6 +949,26 @@ def _register_fake():
         return draft_tokens.new_empty(
             (num_contexts + draft_tokens.shape[0], ))
 
+    @torch.library.register_fake("trtllm::glm_draft_sample_glue")
+    def _(logits, exchange_buffer, exchange_flags, group_size, draft_tokens,
+          draft_step, embed_table, hidden, enorm_weight, hnorm_weight, eps,
+          col_lo, col_hi, glue_out, positions_in, positions_out, gather_ids,
+          seq_lens, fill_seq_lens, kv_lens, kv_update, rewind_accepted,
+          draft_len, block_offsets, dsa_layout, req_idx_per_token,
+          slot_mapping_fp8, slot_mapping_scale, gen_kv_indptr,
+          gen_cached_token_indptr, accepted_tokens, batch_indices,
+          num_accepted, next_new_tokens):
+        return None
+
+    @torch.library.register_fake("trtllm::glm_draft_ehproj_table")
+    def _(logits, exchange_buffer, exchange_flags, group_size, draft_tokens,
+          draft_step, hidden_half, token_table, norm_weight, eps, normed_out,
+          residual_out, positions_in, positions_out, gather_ids, seq_lens,
+          fill_seq_lens, kv_lens, kv_update, rewind_accepted, draft_len,
+          block_offsets, dsa_layout, req_idx_per_token, slot_mapping_fp8,
+          slot_mapping_scale, gen_kv_indptr, gen_cached_token_indptr):
+        return None
+
     @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
     def _(
         logits: torch.Tensor,

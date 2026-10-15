@@ -145,7 +145,8 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  glmDraftSampleGlueOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
