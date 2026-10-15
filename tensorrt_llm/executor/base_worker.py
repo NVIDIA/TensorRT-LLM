@@ -1622,18 +1622,17 @@ def _get_logprobs(worker, response: LlmResponse) -> Optional[LogProbsResult]:
         return None
 
     logprob_params = getattr(generation_result, "_logprob_params", None)
+    logprobs_result = None
     if logprob_params:
-        if logprob_params.prompt_logprobs is None:
-            return None
-        logprobs_result = _compute_pytorch_prompt_logprobs(
-            generation_result, response)
-        if logprob_params.drop_context_logits:
-            response.clear_context_logits()
-        return logprobs_result
+        if logprob_params.prompt_logprobs is not None:
+            logprobs_result = _compute_pytorch_prompt_logprobs(
+                generation_result, response)
+            if logprob_params.drop_context_logits:
+                response.clear_context_logits()
 
-    if response.result.is_final:
+    if getattr(getattr(response, "result", None), "is_final", False):
         generation_result.clear_logprob_params()
-    return None
+    return logprobs_result
 
 
 def _send_rsp_to_postproc(
