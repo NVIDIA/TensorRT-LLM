@@ -20,11 +20,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
 
@@ -122,12 +125,85 @@ TEST(ZmqControlChannel, ManyMessagesPreserveOrderAndContent)
     }
 }
 
+TEST(ZmqControlChannel, ConcurrentSendersUseOneSocketOwner)
+{
+    b::ZmqControlChannel sender("multiSender");
+    b::ZmqControlChannel receiver("multiReceiver");
+    sender.addPeer("multiReceiver", receiver.localEndpoint());
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 250;
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < kThreads; ++thread)
+    {
+        threads.emplace_back(
+            [&, thread]
+            {
+                for (int i = 0; i < kPerThread; ++i)
+                {
+                    auto const rid = static_cast<std::uint64_t>(thread * kPerThread + i);
+                    sender.sendTo("multiReceiver", b::encodeAck(rid, static_cast<std::uint32_t>(i), rid));
+                }
+            });
+    }
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+
+    std::vector<bool> seen(kThreads * kPerThread, false);
+    for (int i = 0; i < kThreads * kPerThread; ++i)
+    {
+        std::string from, blob;
+        ASSERT_TRUE(recvRetry(receiver, from, blob, 4000)) << "missing msg " << i;
+        b::BounceMsgHeader h{};
+        ASSERT_TRUE(b::decodeHeader(blob, h));
+        ASSERT_LT(h.requestId, seen.size());
+        EXPECT_FALSE(seen[h.requestId]);
+        seen[h.requestId] = true;
+    }
+    EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) { return value; }));
+}
+
+TEST(ZmqControlChannel, RecvMayRunOutsideConstructionThread)
+{
+    b::ZmqControlChannel sender("crossThreadSender");
+    b::ZmqControlChannel receiver("crossThreadReceiver");
+    sender.addPeer("crossThreadReceiver", receiver.localEndpoint());
+
+    std::promise<std::pair<std::string, std::string>> received;
+    auto result = received.get_future();
+    std::thread reactor(
+        [&receiver, &received]
+        {
+            std::string peer;
+            std::string blob;
+            if (recvRetry(receiver, peer, blob, 4000))
+            {
+                received.set_value({std::move(peer), std::move(blob)});
+            }
+            else
+            {
+                received.set_exception(std::make_exception_ptr(std::runtime_error("message not received")));
+            }
+        });
+
+    sender.sendTo("crossThreadReceiver", b::encodeAck(/*rid=*/9, /*chunk=*/3, /*regionHandle=*/7));
+    auto const status = result.wait_for(std::chrono::seconds(5));
+    reactor.join();
+    ASSERT_EQ(status, std::future_status::ready);
+    auto const [peer, blob] = result.get();
+    EXPECT_EQ(peer, "crossThreadSender");
+    b::BounceMsgHeader header{};
+    ASSERT_TRUE(b::decodeHeader(blob, header));
+    EXPECT_EQ(header.requestId, 9U);
+}
+
 TEST(ZmqControlChannel, SendToDoesNotBlockWhenPeerQueueFull)
 {
-    // sendTo() runs on the reactor IO thread (and under the dealer mutex that also gates submit()),
-    // so it must NEVER block. Blast far more messages than any HWM/TCP buffer can hold to a peer that
-    // never reads: a blocking send would wedge the caller forever (the reactor stall the design
-    // forbids); the non-blocking send must drop and let the loop finish promptly.
+    // sendTo() can run on application, reactor, and scatter threads, so it must NEVER block. Blast far
+    // more messages than any application/DEALER HWM can hold to a peer that never reads: the bounded
+    // command queue and non-blocking DEALER owner must drop and let the caller finish promptly.
     auto a = std::make_shared<b::ZmqControlChannel>("floodA");
     b::ZmqControlChannel bch("floodB"); // bound ROUTER, but we deliberately never recv() on it
     a->addPeer("floodB", bch.localEndpoint());
