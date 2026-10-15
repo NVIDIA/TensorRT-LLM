@@ -34,6 +34,7 @@ subsequent dispatches call ``handle.update(topk_idx, ...)`` to rebind routing.
 CUDA-graph capture is supported once the handle exists.
 """
 
+from enum import Enum
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -42,10 +43,17 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantMode
 
 from .base import Communication
 
 _NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
+
+
+class _TransportMode(Enum):
+    BF16 = "bf16"
+    FP8 = "fp8"
+    NVFP4 = "nvfp4"
 
 
 class NcclEP(Communication):
@@ -74,26 +82,17 @@ class NcclEP(Communication):
         self.hidden_size = hidden_size
         self.num_local_experts = num_slots // self.ep_size
         self.max_top_k = top_k
-        self.quant_config = quant_config
         # DS-FP8 uses BF16 transport; the local backend quantizes it.
         self.uses_internal_fp8_dispatch = False
-        self.use_external_fp8 = self._has_fp8_qdq()
-        self.use_external_nvfp4 = self._has_nvfp4()
-        if self.uses_internal_fp8_dispatch or self.use_external_fp8 or self.use_external_nvfp4:
-            from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_supports_version
+        self._requested_low_precision_combine = use_low_precision_combine
+        # Singleton NCCL EP context: owns the EP group, RDMA buffers, and
+        # persistent OUTPUT Tensor descriptors. Allocate it lazily on first
+        # dispatch because full-model construction runs under MetaInitMode,
+        # which redirects torch.empty to the meta device even when a CUDA
+        # device is passed explicitly.
 
-            if not nccl_ep_supports_version("0.2"):
-                raise RuntimeError("NCCL-EP quantized dispatch requires libnccl_ep >= 0.2.")
-
-        if self.use_external_nvfp4 and hidden_size % 256 != 0:
-            raise RuntimeError(
-                "NCCL-EP NVFP4 dispatch requires hidden_size divisible by 256 "
-                "for 16-byte token and scale rows."
-            )
-
-        self.use_low_precision_combine = (
-            use_low_precision_combine and self.supports_low_precision_combine()
-        )
+        self._ctx = None
+        self.set_quant_config(quant_config)
 
         self.max_tokens_per_rank = (
             max_num_tokens
@@ -102,18 +101,56 @@ class NcclEP(Communication):
         )
         self.max_recv_tokens = self.ep_size * self.max_tokens_per_rank
 
-        # Singleton NCCL EP context: owns the EP group, RDMA buffers, and
-        # persistent OUTPUT Tensor descriptors. Allocate it lazily on first
-        # dispatch because full-model construction runs under MetaInitMode,
-        # which redirects torch.empty to the meta device even when a CUDA
-        # device is passed explicitly.
-        self._ctx = None
-
         # Persistent dispatch handle. Created on first dispatch via
         # group.create_handle; reused thereafter via handle.update so
         # subsequent dispatches are CUDA-graph-safe.
         self._handle = None  # nccl.ep.Handle | None
         self._dispatch_state: dict = {}
+
+    def set_quant_config(self, quant_config: Optional[QuantConfig]) -> None:
+        """Apply a layer's resolved format before allocating its communication context."""
+        # Resolve from authoritative fields: QuantConfig's cached properties
+        # may describe an earlier value after an in-place configuration edit.
+        quant_mode = QuantMode.from_quant_algo(
+            quant_config.quant_algo if quant_config is not None else None,
+            quant_config.kv_cache_quant_algo if quant_config is not None else None,
+        )
+        has_fp8 = quant_mode.has_fp8_qdq()
+        has_nvfp4 = quant_mode.has_nvfp4()
+        mode = (
+            _TransportMode.NVFP4
+            if has_nvfp4
+            else _TransportMode.FP8
+            if has_fp8
+            else _TransportMode.BF16
+        )
+        if self._ctx is not None and mode != self._transport_mode:
+            raise RuntimeError(
+                "Cannot change NCCL-EP transport format after context initialization."
+            )
+        if has_fp8 or has_nvfp4:
+            from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_supports_version
+
+            if not nccl_ep_supports_version("0.2"):
+                raise RuntimeError("NCCL-EP quantized dispatch requires libnccl_ep >= 0.2.")
+        if has_nvfp4 and self.hidden_size % 256 != 0:
+            raise RuntimeError(
+                "NCCL-EP NVFP4 dispatch requires hidden_size divisible by 256 "
+                "for 16-byte token and scale rows."
+            )
+        self._transport_mode = mode
+
+    @property
+    def use_external_fp8(self) -> bool:
+        return self._transport_mode is _TransportMode.FP8
+
+    @property
+    def use_external_nvfp4(self) -> bool:
+        return self._transport_mode is _TransportMode.NVFP4
+
+    @property
+    def use_low_precision_combine(self) -> bool:
+        return self._requested_low_precision_combine and self.supports_low_precision_combine()
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -137,12 +174,6 @@ class NcclEP(Communication):
     def supports_low_precision_combine(self) -> bool:
         """Return whether the experimental LL NVFP4 combine path is available."""
         return self.use_external_nvfp4 and self.hidden_size % 512 == 0
-
-    def _has_fp8_qdq(self) -> bool:
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq()
-
-    def _has_nvfp4(self) -> bool:
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4()
 
     def _get_context(self):
         if self._ctx is None:

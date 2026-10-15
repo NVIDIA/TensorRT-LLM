@@ -63,6 +63,7 @@ def _wrapper() -> ConfigurableMoE:
     wrapper.activation = DEFAULT_MOE_ACTIVATION
     wrapper.activation_type = ActivationType(DEFAULT_MOE_ACTIVATION.kind)
     wrapper.routing_method = Mock()
+    wrapper.comm = None
     wrapper._override_quant_config = None
     for attr in _BACKEND_SYNC_ATTRS:
         setattr(wrapper, attr, None)

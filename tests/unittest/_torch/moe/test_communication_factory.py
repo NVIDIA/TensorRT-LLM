@@ -453,7 +453,8 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     comm.max_tokens_per_rank = comm.max_recv_tokens = 1
     comm.hidden_size = 4
     comm.use_fp8 = comm.uses_internal_fp8_dispatch = False
-    comm.use_external_fp8 = comm.use_external_nvfp4 = False
+    comm._ctx = None
+    comm.set_quant_config(None)
     comm._dispatch_state = {}
     monkeypatch.setattr(comm, "_get_context", lambda: context)
     monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
@@ -704,3 +705,177 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+@pytest.mark.parametrize("layer_quant_algo", [None, QuantAlgo.NVFP4])
+def test_configurable_moe_comm_uses_backend_quantization(monkeypatch, layer_quant_algo):
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import MoESchedulerKind
+
+    model_config = _make_model_config()
+    global_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    model_config.quant_config = global_quant_config
+    layer_quant_config = QuantConfig(quant_algo=layer_quant_algo)
+    moe = SimpleNamespace(
+        model_config=model_config,
+        backend=SimpleNamespace(
+            scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+            quant_config=layer_quant_config,
+        ),
+        enable_dwdp=False,
+        num_experts=256,
+        num_slots=256,
+        routing_method=SimpleNamespace(experts_per_token=8),
+        expert_size_per_partition=16,
+        use_flashinfer=False,
+        hidden_size=7168,
+        communication_method=None,
+    )
+    factory = Mock()
+    monkeypatch.setattr(communication_factory.CommunicationFactory, "create_strategy", factory)
+
+    assert ConfigurableMoE._create_comm_strategy_auto(moe) is factory.return_value
+    effective_config = factory.call_args.kwargs["model_config"]
+    assert effective_config.quant_config is layer_quant_config
+    assert effective_config.mapping is model_config.mapping
+    assert model_config.quant_config is global_quant_config
+
+
+@pytest.mark.parametrize("initial_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+@pytest.mark.parametrize("final_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_nccl_ep_layer_quantization_finalization(monkeypatch, initial_algo, final_algo):
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+        quant_config=QuantConfig(quant_algo=initial_algo),
+        use_low_precision_combine=True,
+    )
+    final_config = QuantConfig(quant_algo=final_algo)
+    backend = SimpleNamespace(
+        quant_config=QuantConfig(quant_algo=initial_algo),
+        _weights_created=True,
+        create_weights=Mock(),
+    )
+    wrapper = SimpleNamespace(
+        backend=backend, comm=comm, _override_quant_config=None, quant_config=final_config
+    )
+    ConfigurableMoE.create_weights(wrapper)
+    assert comm.use_external_fp8 == (final_algo == QuantAlgo.FP8)
+    assert comm.use_external_nvfp4 == (final_algo == QuantAlgo.NVFP4)
+    assert comm.supports_post_quant_dispatch() == (final_algo is not None)
+    assert comm.use_low_precision_combine == (final_algo == QuantAlgo.NVFP4)
+    assert backend.quant_config is final_config
+    backend.create_weights.assert_called_once_with()
+    assert comm._ctx is None
+
+
+@pytest.mark.parametrize("final_algo", [QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_nccl_ep_rejects_format_change_after_context_initialization(monkeypatch, final_algo):
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+    )
+    context = comm._ctx = object()
+    comm.set_quant_config(QuantConfig())  # An unchanged transport remains valid.
+    with pytest.raises(RuntimeError, match="after context initialization"):
+        comm.set_quant_config(QuantConfig(quant_algo=final_algo))
+    assert comm._ctx is context
+    assert not comm.supports_post_quant_dispatch()
+
+
+def test_nccl_ep_validates_late_quantized_configuration(monkeypatch):
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: False)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=384,
+    )
+    with pytest.raises(RuntimeError, match="libnccl_ep >= 0.2"):
+        comm.set_quant_config(QuantConfig(quant_algo=QuantAlgo.NVFP4))
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    with pytest.raises(RuntimeError, match="hidden_size divisible by 256"):
+        comm.set_quant_config(QuantConfig(quant_algo=QuantAlgo.NVFP4))
+    assert not comm.supports_post_quant_dispatch()
+
+
+def test_nccl_ep_owns_resolved_quantization(monkeypatch):
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+        quant_config=config,
+    )
+    comm._ctx = object()
+    assert config.layer_quant_mode.has_nvfp4()
+    config.quant_algo = None
+    assert config.layer_quant_mode.has_nvfp4()  # Deliberately stale cache.
+    assert comm.use_external_nvfp4
+    with pytest.raises(RuntimeError, match="after context initialization"):
+        comm.set_quant_config(config)
+
+
+@pytest.mark.parametrize("final_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_nccl_ep_context_uses_resolved_mode_despite_stale_config(monkeypatch, final_algo):
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fake_ep = SimpleNamespace(Layout=SimpleNamespace(RANK_MAJOR=object()))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+    get_context = Mock(return_value=object())
+    monkeypatch.setattr(nccl_ep_utils, "get_nccl_ep_context", get_context)
+    config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    assert config.layer_quant_mode.has_nvfp4()
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+        quant_config=config,
+    )
+    config.quant_algo = final_algo
+    comm.set_quant_config(config)
+    # A stray assignment to the former public attribute cannot alter the mode.
+    comm.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    context = comm._get_context()
+    assert context is get_context.return_value
+    assert get_context.call_args.kwargs["external_fp8"] == (final_algo == QuantAlgo.FP8)
+    assert get_context.call_args.kwargs["external_nvfp4"] == (final_algo == QuantAlgo.NVFP4)
+    assert comm._get_context() is context
+    get_context.assert_called_once()
+
+
+def test_nccl_ep_rejected_finalization_preserves_backend(monkeypatch):
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+    )
+    context = comm._ctx = object()
+    original_config = QuantConfig()
+    backend = SimpleNamespace(quant_config=original_config, create_weights=Mock())
+    wrapper = SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        _override_quant_config=None,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+    )
+    with pytest.raises(RuntimeError, match="after context initialization"):
+        ConfigurableMoE.create_weights(wrapper)
+    assert backend.quant_config is original_config
+    backend.create_weights.assert_not_called()
+    assert comm._ctx is context
+    assert not comm.supports_post_quant_dispatch()

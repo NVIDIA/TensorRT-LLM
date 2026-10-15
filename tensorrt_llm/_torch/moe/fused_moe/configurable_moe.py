@@ -50,6 +50,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
+from .communication.nccl_ep import NcclEP
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -173,6 +174,7 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        self.comm = None
         self._override_quant_config = override_quant_config
         if override_quant_config is not None:
             self.quant_config = override_quant_config
@@ -605,8 +607,12 @@ class ConfigurableMoE(MoE):
             return None
         if self.enable_dwdp:
             return None
+        # Communication must use the same quantization contract as this layer's
+        # backend, including unquantized MTP overrides in quantized models.
+        comm_model_config = copy.copy(self.model_config)
+        comm_model_config.quant_config = self.backend.quant_config
         return CommunicationFactory.create_strategy(
-            model_config=self.model_config,
+            model_config=comm_model_config,
             num_experts=self.num_experts,
             num_slots=self.num_slots,
             top_k=self.routing_method.experts_per_token,
@@ -727,11 +733,14 @@ class ConfigurableMoE(MoE):
         # An explicit override is authoritative. Otherwise use the wrapper's
         # final value, after model __post_init__ has applied layerwise and
         # exclusion-based quantization settings.
-        self.backend.quant_config = (
+        quant_config = (
             self._override_quant_config
             if self._override_quant_config is not None
             else self.quant_config
         )
+        if isinstance(self.comm, NcclEP):
+            self.comm.set_quant_config(quant_config)
+        self.backend.quant_config = quant_config
         # The quant config just changed and a backend may resolve its activation
         # ABI from it: TRTLLMGenFusedMoE narrows the clamp to a uniform scalar on
         # the FP8 block-scale path, whose kernel takes one ``double`` by value.
