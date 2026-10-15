@@ -22,10 +22,15 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
     forward_generation_sparse_attn,
 )
+from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendForwardArgs
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM, DeepseekV3Model
@@ -42,12 +47,15 @@ from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import EventType
 
 from . import weights as _weights
+from .ops.attention.mla_kv_half_append import mla_kv_half_append
+from .ops.attention.sparse_mla_flash_decode import sparse_mla_flash_decode
 from .ops.embedding.fused_embedding import fused_embedding
 from .ops.gemm.dense_mlp_small_m import INTER_PER_RANK, dense_mlp_small_m
 from .ops.gemm.fused_a_gemm import MAX_TOKENS as FUSED_A_MAX_TOKENS
 from .ops.gemm.fused_a_gemm import OUT_FEATURES as FUSED_A_OUT_FEATURES
 from .ops.gemm.fused_a_gemm import fused_a_gemm
 from .ops.gemm.low_m_gemm import low_m_gemm
+from .ops.gemm.q_b_fp8_rope import q_b_fp8_rope
 from .ops.moe.routed_experts import (
     FUSED_ROUTER_MAX_TOKENS,
     make_fused_router_workspace,
@@ -102,10 +110,14 @@ class DecodeTarget:
       following norm; the experts finalize before theirs (16 ranks span nodes).
     - The last all-reduce applies the model's final norm (``next_layer_layernorm``).
 
-    Attention is MLA with the DSA indexer on the generation rows: q_a, the
-    compressed KV and its rope part come from one GEMM over the stored
-    kv_a_proj_with_mqa weight (up to 8 rows), and the built-in modules compute
-    the rest.
+    Attention is MLA with the DSA indexer on the generation rows. For up to 8
+    rows: q_a, the compressed KV and its rope part come from one GEMM over the
+    stored kv_a_proj_with_mqa weight; q_b with k_b absorbed and the q_a norm
+    folded writes the RoPE'd FP8 query in its epilogue, while on the aux stream
+    one kernel normalizes, ropes and appends the KV half to the FP8 cache; the
+    built-in indexer selects the 2048 rows; and the flash decode attends over
+    them at 4 heads with v_b folded in, ahead of o_proj. A larger batch takes the
+    built-in modules' path.
 
     The MoE block over up to 8 rows runs its shared expert as two split-K
     GEMMs around SwiGLU on the aux stream, and its routed experts in one
@@ -167,12 +179,41 @@ class DecodeTarget:
                     and not backend.bias
                     and backend.w3_w1_weight.shape[-1] * 2 == config.hidden_size
                 ), f"layer {layer.layer_idx}: routed experts are not unpadded TRTLLM-Gen NVFP4"
+        self.index_topk = config.index_topk
+        # q_b with k_b absorbed and the q_a norm weight folded, per layer: for head h, rows
+        # [h * 576, h * 576 + 512) are k_b_trans[h] @ W_q_b[h, :qk_nope] and the next 64 rows
+        # W_q_b[h, qk_nope:], every column times gamma_q_a; FP64, rounded to BF16 once.
+        self._q_b_absorbed = {}
+        for layer in core.layers[: core.num_hidden_layers]:
+            mla = layer.self_attn
+            assert (
+                getattr(mla.mqa, "has_fp8_kv_cache", False)
+                and mla.kv_cache_dtype != "fp8_ds_mla"
+                and mla.k_b_proj_trans.dtype == torch.bfloat16
+                and mla.v_b_proj.dtype == torch.bfloat16
+                and mla.v_b_proj.is_contiguous()
+                and mla.q_b_proj.weight.dtype == torch.bfloat16
+            ), f"layer {layer.layer_idx}: unexpected MLA weights or KV cache layout"
+            qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
+            w = mla.q_b_proj.weight.view(mla.num_heads_tp, qk_head_dim, mla.q_lora_rank).double()
+            nope = torch.bmm(mla.k_b_proj_trans.double(), w[:, : mla.qk_nope_head_dim])
+            absorbed = torch.cat([nope, w[:, mla.qk_nope_head_dim :]], 1)
+            absorbed = absorbed * mla.q_a_layernorm.weight.double()
+            self._q_b_absorbed[layer.layer_idx] = (
+                absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
+            )
+        device = core.embed_tokens.weight.device
+        # The attention scales the KV-half kernel writes and the flash decode reads.
+        self._bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+        self._bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        self._unit_scale = torch.ones(1, dtype=torch.float32, device=device)
+        self._kv_pool = None
+
         moe_layers = [
             layer
             for layer in core.layers[: core.num_hidden_layers]
             if not isinstance(layer.mlp, GatedMLP)
         ]
-        device = core.embed_tokens.weight.device
         # One exchange workspace per router call site: its launches must run in stream order.
         self._router_workspace = {
             layer.layer_idx: make_fused_router_workspace(device) for layer in moe_layers
@@ -290,15 +331,113 @@ class DecodeTarget:
         )
         return shared_output.add_(routed_output)
 
-    @staticmethod
-    def _attention(layer, position_ids, hidden_states, attn_metadata, all_reduce_params, fused_a):
+    def _attention(self, layer, position_ids, hidden_states, attn_metadata, all_reduce_params, fused):
         """MLA with the DSA indexer over generation rows, through o_proj."""
+        if not fused:
+            return self._attention_builtin(
+                layer, position_ids, hidden_states, attn_metadata, all_reduce_params
+            )
+        mla = layer.self_attn
+        mqa = mla.mqa
+        manager = attn_metadata.kv_cache_manager
+        num_tokens = attn_metadata.num_tokens
+        seq_len_q = num_tokens // attn_metadata.num_seqs
+        head_dim = mla.kv_lora_rank + mla.qk_rope_head_dim
+        mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
+        cos_sin = mqa.rotary_cos_sin
+        kv_lens = attn_metadata.kv_lens_cuda_runtime
+        if self._kv_pool is None:
+            self._kv_pool = manager.get_unique_primary_pool()
+
+        kv_a = fused_a_gemm(hidden_states, mla.kv_a_proj_with_mqa.weight, [])[:num_tokens]
+        q_a = kv_a[:, : mla.q_lora_rank]
+        quant_q = hidden_states.new_empty((num_tokens, mla.num_heads_tp * head_dim), dtype=torch.uint8)
+
+        def q_half():
+            q_b_fp8_rope(
+                q_a,
+                self._q_b_absorbed[layer.layer_idx],
+                quant_q,
+                kv_lens,
+                cos_sin.view(-1, mla.qk_rope_head_dim, 2),
+                self._unit_scale,
+                mla.q_a_layernorm.variance_epsilon,
+                head_dim,
+                mla.qk_rope_head_dim,
+                seq_len_q,
+                "regular",
+            )
+
+        def kv_half():
+            mla_kv_half_append(
+                kv_a[:, mla.q_lora_rank :],
+                mla.kv_a_layernorm.weight,
+                mla.kv_a_layernorm.variance_epsilon,
+                cos_sin,
+                kv_lens,
+                0,
+                seq_len_q,
+                attn_metadata.kv_cache_block_offsets,
+                manager.kv_cache_pool_pointers,
+                manager.kv_cache_pool_mapping,
+                mqa.get_local_layer_idx(attn_metadata),
+                manager.tokens_per_block,
+                attn_metadata.max_seq_len,
+                self._bmm1_scale,
+                self._bmm2_scale,
+                mla.softmax_scale,
+            )
+
+        maybe_execute_in_parallel(
+            q_half, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
+        )
+        indexer = mqa.indexer
+        indexer_intermediates = None
+        if indexer is not None:
+            qr = mla.q_a_layernorm(q_a)
+            indexer_intermediates = [
+                t[:num_tokens]
+                for t in indexer.pre_indexer_proj(
+                    qr, hidden_states[:num_tokens], position_ids[..., :num_tokens]
+                )
+            ]
+            indexer._update_k_cache(indexer_intermediates[1], indexer_intermediates[2], attn_metadata)
+        indices, _ = mqa.sparse_attn_predict(
+            hidden_states[:num_tokens],
+            None,
+            attn_metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.generation_only,
+                sparse_backend_args=DSABackendForwardArgs(
+                    indexer_intermediates=indexer_intermediates
+                ),
+            ),
+        )
+        output = hidden_states.new_empty(
+            (hidden_states.shape[0], mla.num_heads_tp * mla.v_head_dim)
+        )
+        sparse_mla_flash_decode(
+            quant_q.view(num_tokens, mla.num_heads_tp, head_dim),
+            self._kv_pool,
+            indices,
+            kv_lens,
+            self._bmm1_scale,
+            self._bmm2_scale,
+            mla.v_b_proj,
+            output,
+            seq_len_q,
+            self.index_topk,
+        )
+        if indexer is not None:
+            indexer.maybe_join_prev_topk_copy()
+        return mla.o_proj(output, all_reduce_params=all_reduce_params, layer_idx=mla.layer_idx)
+
+    @staticmethod
+    def _attention_builtin(layer, position_ids, hidden_states, attn_metadata, all_reduce_params):
+        """The built-in modules' MLA with the DSA indexer, for a batch the kernels do not serve."""
         mla = layer.self_attn
         num_tokens = attn_metadata.num_tokens
-        if fused_a:
-            kv_a = fused_a_gemm(hidden_states, mla.kv_a_proj_with_mqa.weight, [])
-        else:
-            kv_a = mla.kv_a_proj_with_mqa(hidden_states)
+        kv_a = mla.kv_a_proj_with_mqa(hidden_states)
         q, compressed_kv, k_pe = kv_a.split(
             [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], -1
         )
@@ -335,11 +474,10 @@ class DecodeTarget:
             indexer.maybe_join_prev_topk_copy()
         return mla.o_proj(output, all_reduce_params=all_reduce_params, layer_idx=mla.layer_idx)
 
-    @staticmethod
     def _dense_layer(
-        layer, position_ids, hidden_states, residual, attn_metadata, fused_a, small_m
+        self, layer, position_ids, hidden_states, residual, attn_metadata, fused_a, small_m
     ):
-        hidden_states = DecodeTarget._attention(
+        hidden_states = self._attention(
             layer,
             position_ids,
             hidden_states,
@@ -368,7 +506,7 @@ class DecodeTarget:
         )
 
     def _moe_layer(self, layer, position_ids, hidden_states, residual, attn_metadata, fused_a):
-        hidden_states = DecodeTarget._attention(
+        hidden_states = self._attention(
             layer,
             position_ids,
             hidden_states,
