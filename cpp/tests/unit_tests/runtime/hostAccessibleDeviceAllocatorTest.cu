@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -231,6 +232,61 @@ TEST_F(HostAccessibleDeviceAllocatorTest, GetHostPtrForUnallocated)
     // Use an arbitrary pointer value.
     void* devPtr = reinterpret_cast<void*>(0xDEADBEEF);
     EXPECT_EQ(allocator->getHostPtr(devPtr), nullptr);
+}
+
+// Without a NUMA node for GPU memory (e.g. CDMM mode) and without GDRCopy, host accessible memory falls back to
+// managed memory on hardware-coherent platforms (e.g. GB200/GB300), where the host can access device-resident managed
+// memory directly. The test only runs in that configuration, e.g. on a CDMM node where /dev/gdrdrv is absent.
+TEST_F(HostAccessibleDeviceAllocatorTest, ManagedMemoryFallbackWithoutGdrCopy)
+{
+    int deviceId = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
+    int directAccess = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&directAccess, cudaDevAttrDirectManagedMemAccessFromHost, deviceId));
+    if (directAccess == 0)
+    {
+        GTEST_SKIP() << "Host cannot directly access device-resident managed memory on this system.";
+    }
+    if (tensorrt_llm::common::getEnvEplbForceGdrcopy())
+    {
+        GTEST_SKIP() << "GDRCopy is forced by TRTLLM_EPLB_FORCE_GDRCOPY.";
+    }
+    if (TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0 || gdrcopy::initialize())
+    {
+        GTEST_SKIP() << "GPU memory is a NUMA node or GDRCopy is available, so the managed memory fallback is unused.";
+    }
+    ASSERT_TRUE(allocator->isSupported());
+
+    constexpr size_t numInts = 256;
+    constexpr size_t allocSize = numInts * sizeof(int);
+    void* devPtr = allocator->allocate(allocSize);
+    ASSERT_NE(devPtr, nullptr);
+    void* hostPtr = allocator->getHostPtr(devPtr);
+    ASSERT_NE(hostPtr, nullptr);
+
+    // 1. Copy from the host with memcpyToDevice, as the online EPLB weight updates do, then verify on the device.
+    std::vector<int> pattern(numInts);
+    std::iota(pattern.begin(), pattern.end(), 0);
+    allocator->memcpyToDevice(hostPtr, pattern.data(), allocSize);
+    bool deviceVerificationResult = false;
+    bool* dResult = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&dResult, sizeof(bool)));
+    verifyDataOnDevice<<<1, 1>>>(static_cast<int*>(devPtr), numInts, dResult);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    TLLM_CUDA_CHECK(cudaMemcpy(&deviceVerificationResult, dResult, sizeof(bool), cudaMemcpyDeviceToHost));
+    TLLM_CUDA_CHECK(cudaFree(dResult));
+    EXPECT_TRUE(deviceVerificationResult);
+
+    // 2. Write from the device, then read and verify from the host.
+    writeDataOnDevice<<<1, 1>>>(static_cast<int*>(devPtr), numInts);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    int const* hostIntPtr = static_cast<int const*>(hostPtr);
+    for (size_t i = 0; i < numInts; ++i)
+    {
+        EXPECT_EQ(hostIntPtr[i], static_cast<int>(numInts - i));
+    }
+
+    allocator->free(devPtr);
 }
 
 } // namespace tensorrt_llm::runtime::unit_tests

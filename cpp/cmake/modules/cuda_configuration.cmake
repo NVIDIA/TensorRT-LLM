@@ -85,6 +85,10 @@ Functions
   ``CMAKE_CUDA_ARCHITECTURES_FAMILIES``
     List of family architectures (e.g., ``100f``, ``120f``).
 
+  ``CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS``
+    Architectures TensorRT-LLM provides optimized kernels for, i.e. the values
+    ``CMAKE_CUDA_ARCHITECTURES`` may select from.
+
   ``CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES``
     Boolean indicating if family targets are supported.
 
@@ -299,6 +303,10 @@ function(setup_cuda_architectures)
     else()
       message(STATUS "Detecting native CUDA compute capability - done")
       set(CMAKE_CUDA_ARCHITECTURES_RAW "${CUDA_ARCH_OUTPUT}")
+      # SM 121 runs the kernels built for SM 120.
+      if(CMAKE_CUDA_ARCHITECTURES_RAW STREQUAL "121")
+        set(CMAKE_CUDA_ARCHITECTURES_RAW 120)
+      endif()
     endif()
   elseif(CMAKE_CUDA_ARCHITECTURES_RAW STREQUAL "all")
     unset(CMAKE_CUDA_ARCHITECTURES_RAW)
@@ -345,6 +353,26 @@ function(setup_cuda_architectures)
       list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 107)
     endif()
   endif()
+
+  # TensorRT-LLM only promises optimized kernels for these architectures.
+  set(ARCHITECTURES_WITH_KERNELS
+      80
+      86
+      89
+      90
+      100
+      103
+      107
+      120)
+  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES_RAW)
+    if(NOT CUDA_ARCH IN_LIST ARCHITECTURES_WITH_KERNELS)
+      list(JOIN ARCHITECTURES_WITH_KERNELS ";" SUPPORTED_ARCHITECTURES)
+      message(
+        FATAL_ERROR
+          "CUDA architecture ${CUDA_ARCH} is not supported by TensorRT-LLM. "
+          "Supported architectures: ${SUPPORTED_ARCHITECTURES}.")
+    endif()
+  endforeach()
 
   # CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
   # automatically added -real or -a suffix.
@@ -427,15 +455,6 @@ function(setup_cuda_architectures)
     endif()
   endforeach()
 
-  set(ARCHITECTURES_WITH_KERNELS
-      80
-      86
-      89
-      90
-      100
-      103
-      107
-      120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
@@ -482,6 +501,9 @@ function(setup_cuda_architectures)
       PARENT_SCOPE)
   set(CMAKE_CUDA_ARCHITECTURES_FAMILIES
       ${CMAKE_CUDA_ARCHITECTURES_FAMILIES}
+      PARENT_SCOPE)
+  set(CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS
+      ${ARCHITECTURES_WITH_KERNELS}
       PARENT_SCOPE)
 endfunction()
 

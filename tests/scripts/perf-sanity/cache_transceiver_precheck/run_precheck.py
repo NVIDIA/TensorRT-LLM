@@ -221,13 +221,10 @@ def load_internal_apis():
     The precheck bypasses the serving stack and drives internal APIs directly
     (_torch.pyexecutor.*, bindings.internal.*, private llm_utils resolvers),
     none of which carry a stability promise. Centralizing the imports means an
-    upstream rename breaks exactly here, and the contract test
-    (tests/unittest/others/test_cache_transceiver_precheck_run.py) fails in
-    the refactorer's pre-merge CI instead of aborting the SLURM disagg perf
-    pipeline at runtime.
+    upstream rename breaks exactly here.
 
-    Deliberately lazy (NOT at module import): --dry-run and the pure-logic
-    unit tests must work without torch / tensorrt_llm installed.
+    Deliberately lazy (NOT at module import): --dry-run must work without
+    torch / tensorrt_llm installed.
     """
     global _INTERNAL_APIS
     if _INTERNAL_APIS is not None:
