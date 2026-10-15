@@ -51,10 +51,10 @@ class Fp4Quantize(OpWrapper):
     # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
     # routed-expert path, at its hidden size and its intermediate. qwen3.8
     # (qwen4_exp) calls it only for its routed experts: linear scales at hidden
-    # 2560. A linear buffer has no row padding, so at a row count that is not a
-    # multiple of 128 it is shorter than the swizzled one; at a multiple of 128
-    # the two are the same length and only the cells' byte order tells them
-    # apart.
+    # 2560; glm-5.2 likewise, at hidden 6144. A linear buffer has no row
+    # padding, so at a row count that is not a multiple of 128 it is shorter
+    # than the swizzled one; at a multiple of 128 the two are the same length
+    # and only the cells' byte order tells them apart.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode, hidden 7168, swizzled scales -- the dense MLP's input",
@@ -87,6 +87,10 @@ class Fp4Quantize(OpWrapper):
         Cell(
             why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 verify step: 8 rows at hidden 6144, linear -- its routed-expert input",
+            spec=dict(shape=(8, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     )
 
