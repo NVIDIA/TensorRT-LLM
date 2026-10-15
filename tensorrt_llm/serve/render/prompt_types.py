@@ -51,10 +51,6 @@ class RenderedPrompt:
     token_ids: Optional[List[int]] = None
     # The forced named-tool prefix was appended to ``text``.
     prefix_applied: bool = False
-    # False when ``token_ids`` must not be forwarded as the executed prompt
-    # (see ``untrusted_reason``); a consumer then renders the prompt itself.
-    tokens_trusted: bool = True
-    untrusted_reason: Optional[str] = None
     # Decisions derived from the rendered prompt (see :class:`PreparedContext`); a caller
     # that would forward the ids checks them first.
     context: Dict[str, Any] = field(default_factory=dict)
@@ -107,8 +103,10 @@ class RenderedRequest(BaseModel):
     To have a worker execute the ids without rendering, use its existing token-in routes
     rather than a dedicated endpoint: ``POST /v1/completions`` with ``token_ids`` as the
     prompt, or ``POST /v1/chat/completions`` with the original body plus ``prompt_token_ids``
-    (the mechanism the router's write-back already uses). Only ids with ``tokens_trusted``
-    and a matching ``render_fingerprint`` should be executed that way.
+    (the mechanism the router's write-back already uses), and only for a worker whose
+    ``render_fingerprint`` matches. A request with a named ``tool_choice`` is the exception: the
+    worker appends a forced tool-call prefix to the prompt it renders and rejects it together
+    with ``prompt_token_ids``, so send ``request`` as it is and let the worker render it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -129,11 +127,5 @@ class RenderedRequest(BaseModel):
     reasoning_parser_kwargs: Optional[ReasoningParserKwargs] = None
     # Copied from the request: a salted prefix cache changes the block hashes a router computes.
     cache_salt: Optional[str] = None
-    # False when the ids must not be executed as is: a named tool_choice (the worker adds a
-    # forced tool-call prefix), or a prompt that carries decisions a request holding only ids
-    # would lose (reasoning mode, usage offset; see PreparedContext). The consumer lets the
-    # worker render.
-    tokens_trusted: bool = True
-    untrusted_reason: Optional[str] = None
     # The original request body.
     request: Dict[str, Any] = Field(default_factory=dict)

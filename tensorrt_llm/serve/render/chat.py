@@ -409,12 +409,6 @@ def render_chat(
         truncate_prompt_tokens=request.truncate_prompt_tokens,
         encode_rendered=encode_rendered,
     )
-    if getattr(request.tool_choice, "function", None) is not None:
-        # A named function forces the model into that call by appending the tool
-        # parser's begin string to the prompt; only a worker with a tool parser
-        # can do that, so ids rendered here are not the executed prompt.
-        result.tokens_trusted = False
-        result.untrusted_reason = "named_tool_choice"
     result.context = preparation_context(request, res, result)
     return result
 

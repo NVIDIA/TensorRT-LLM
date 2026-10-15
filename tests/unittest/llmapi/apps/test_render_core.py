@@ -85,7 +85,6 @@ class TestRenderChat:
 
         assert result.text == text
         assert result.token_ids == ids
-        assert result.tokens_trusted is True
         assert result.prefix_applied is False
 
     def test_tools_reach_the_template(self, tokenizer) -> None:
@@ -138,18 +137,6 @@ class TestRenderChat:
         request = chat_request(chat_template=REQUEST_TEMPLATE)
         with pytest.raises(ValueError, match="chat_template"):
             render_chat(request, resources(tokenizer))
-
-    def test_named_tool_choice_marks_the_ids_untrusted(self, tokenizer) -> None:
-        request = chat_request(
-            tools=[WEATHER_TOOL],
-            tool_choice={"type": "function", "function": {"name": "get_weather"}},
-        )
-
-        result = render_chat(request, resources(tokenizer))
-
-        assert result.tokens_trusted is False
-        assert result.untrusted_reason == "named_tool_choice"
-        assert result.token_ids  # still usable for routing
 
     def test_multimodal_input_is_rejected(self, tokenizer) -> None:
         request = chat_request(
@@ -746,7 +733,6 @@ class TestRenderedRequest:
 
         assert again == body
         assert again.schema_version == RENDERED_REQUEST_SCHEMA_VERSION
-        assert again.tokens_trusted is True
 
     def test_unknown_fields_are_rejected(self) -> None:
         with pytest.raises(ValidationError):
