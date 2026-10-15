@@ -105,6 +105,11 @@ AIPERF_EXTRA_DEPS = [
 # ("Feature type 'Json' not found"). 4.x+ is required.
 MIN_DATASETS_MAJOR = 4
 
+# The aiperf scenario that defines the AgentX workload. Only the agentx-harness
+# fork registers it, so its presence is also how the fork is told apart from the
+# upstream PyPI aiperf of the same import name.
+AGENTX_SCENARIO = "inferencex-agentx-mvp"
+
 # PyExecutor's HangDetector is hard-coded at 300 s with no env override, so a
 # multi-minute pip install with zero requests in flight idles the GEN worker
 # into MPI_Abort -- which then presents as a *client* connection failure. A
@@ -174,11 +179,17 @@ def _env_float(name: str, default: float) -> float:
 def aiperf_is_usable() -> bool:
     """Return whether the ambient interpreter already has a working agentx stack.
 
-    Checks importability *and* the datasets major version, since a container
-    with aiperf but datasets 3.x fails only later, when loading the corpus.
+    Checks importability, that the ``aiperf`` found is the agentx-harness fork
+    (it alone ships the ``inferencex-agentx-mvp`` scenario), *and* the datasets
+    major version, since a container with aiperf but datasets 3.x fails only
+    later, when loading the corpus. The fork check matters because
+    requirements-dev.txt pins the upstream PyPI ``aiperf``, which imports fine
+    but rejects ``--scenario`` at the start of the run.
     """
     probe = (
         "import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson; "
+        "from aiperf.common.scenario.registry import get_scenario; "
+        f"get_scenario({AGENTX_SCENARIO!r}); "
         f"import sys; sys.exit(0 if int(datasets.__version__.split('.')[0]) >= {MIN_DATASETS_MAJOR} else 1)"
     )
     return (
@@ -307,7 +318,7 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
         "aiperf",
         "profile",
         "--scenario",
-        "inferencex-agentx-mvp",
+        AGENTX_SCENARIO,
         "-m",
         args.model,
         "--tokenizer-trust-remote-code",

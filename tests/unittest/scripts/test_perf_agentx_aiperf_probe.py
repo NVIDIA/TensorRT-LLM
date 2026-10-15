@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the AgentX client's check that the installed aiperf is the agentx fork."""
+
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+AGENTX_CLIENT_PATH = REPO_ROOT / "tests" / "integration" / "defs" / "perf" / "agentx_client.py"
+
+# Every module aiperf_is_usable imports besides the fork-only scenario registry.
+_STUB_MODULES = ("cyclopts", "datasets", "transformers", "pydantic", "msgspec", "orjson")
+
+
+@pytest.fixture
+def client() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("perf_agentx_client", AGENTX_CLIENT_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_stub_site(root: Path, *, fork: bool, datasets_version: str = "4.7.0") -> None:
+    """Stand-in packages: an upstream-like aiperf, or the fork with its scenario."""
+    for name in _STUB_MODULES:
+        version = datasets_version if name == "datasets" else "1.0.0"
+        (root / name).mkdir()
+        (root / name / "__init__.py").write_text(f"__version__ = {version!r}\n")
+    (root / "aiperf").mkdir()
+    (root / "aiperf" / "__init__.py").write_text("")
+    if fork:
+        registry = root / "aiperf" / "common" / "scenario"
+        registry.mkdir(parents=True)
+        (root / "aiperf" / "common" / "__init__.py").write_text("")
+        (registry / "__init__.py").write_text("")
+        (registry / "registry.py").write_text(
+            "SCENARIOS = {'inferencex-agentx-mvp': object()}\n"
+            "def get_scenario(name):\n"
+            "    return SCENARIOS[name]\n"
+        )
+
+
+def _probe(client: ModuleType, monkeypatch, site: Path) -> bool:
+    """Run aiperf_is_usable with only the stub packages importable."""
+    real_call = subprocess.call
+
+    def call(argv, **kwargs):
+        # -I keeps the host interpreter's own site-packages out of the probe.
+        return real_call(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                f"import sys; sys.path.insert(0, {str(site)!r}); " + argv[-1],
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(client.subprocess, "call", call)
+    return client.aiperf_is_usable()
+
+
+def test_upstream_aiperf_is_not_usable(client: ModuleType, monkeypatch, tmp_path: Path):
+    # requirements-dev.txt installs the PyPI aiperf, which has no AgentX scenario
+    # and rejects --scenario; it must trigger the fork install, not skip it.
+    _write_stub_site(tmp_path, fork=False)
+    assert not _probe(client, monkeypatch, tmp_path)
+
+
+def test_agentx_fork_is_usable(client: ModuleType, monkeypatch, tmp_path: Path):
+    _write_stub_site(tmp_path, fork=True)
+    assert _probe(client, monkeypatch, tmp_path)
+
+
+def test_fork_with_old_datasets_is_not_usable(client: ModuleType, monkeypatch, tmp_path: Path):
+    _write_stub_site(tmp_path, fork=True, datasets_version="3.1.0")
+    assert not _probe(client, monkeypatch, tmp_path)
+
+
+def test_command_runs_the_scenario_the_probe_checks(client: ModuleType, monkeypatch):
+    monkeypatch.delenv("AGENTX_EXTRA_ARGS", raising=False)
+    args = client.parse_args(
+        ["--model", "/m", "--concurrency", "8", "--dataset", "d", "--host", "h", "--port", "1"]
+    )
+    cmd = client.build_aiperf_cmd(args, "http://h:1", "/tmp/a")
+    assert cmd[cmd.index("--scenario") + 1] == client.AGENTX_SCENARIO
