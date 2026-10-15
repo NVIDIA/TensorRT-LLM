@@ -18,6 +18,7 @@ from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import moe_comm_serving_timeouts
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -331,7 +332,11 @@ class DecoderCudaGraphs:
             finally:
                 self.cuda_graph_runner.is_warmup_only = False
             self.reset_padding_dummies()
-            self.run_cuda_graph_warmup(resource_manager)
+            # Captured graphs keep the MoE communication timeouts that were
+            # current at capture, and serving replays them, so capture with the
+            # serving timeouts. The warmup-only pass above keeps the warmup ones.
+            with moe_comm_serving_timeouts():
+                self.run_cuda_graph_warmup(resource_manager)
 
     def _prepare_capture_batch(
         self,

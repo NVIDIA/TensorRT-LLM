@@ -31,7 +31,6 @@ from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
-from ..common import moe_a2a_steady_state_budget_for_capture
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
@@ -447,12 +446,7 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Capture with the steady-state MoE all-to-all budget: the timeout is a
-        # launch argument and is baked into every later replay.
-        with (
-            self._warmup_timer.phase("cuda_graph_capture"),
-            moe_a2a_steady_state_budget_for_capture(),
-        ):
+        with self._warmup_timer.phase("cuda_graph_capture"):
             self._graphs.warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
@@ -645,7 +639,8 @@ class DecoderWarmup:
         completion-flag deadline. It is a partial mitigation only: other
         first-touch compiles remain inside collective-bearing forwards, and some
         sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
+        The warmup MoE communication timeout (see ``moe_comm_timeout_guard.py``)
+        covers the general case.
 
         Only the fallback tactics are compiled -- what an eager, cache-miss
         forward selects. The runner's kernel cache key excludes m/n/k, so one

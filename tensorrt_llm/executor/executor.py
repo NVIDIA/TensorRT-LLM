@@ -305,6 +305,12 @@ class GenerationExecutor(ABC):
                 self.shutdown()
             raise error
 
+        # Called once per streamed response: skip the get_nowait() raise/catch
+        # of Empty in the common no-error case. An error enqueued concurrently
+        # is picked up on the next call.
+        if self._error_queue.empty():
+            return
+
         # Drain the first error from the queue using get_nowait() to
         # avoid blocking if another thread consumed the item between
         # the empty() check and the get() call.  Per-request errors

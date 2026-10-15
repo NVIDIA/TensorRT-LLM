@@ -222,6 +222,7 @@ def test_decoder_runner_nested_bypass_restores_after_exception() -> None:
 @pytest.mark.parametrize("enabled", [False, True])
 def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabled: bool) -> None:
     """Exercise the relocated warmup orchestration with eager/compiled routing."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as graphs_module
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
     from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
@@ -275,9 +276,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     monkeypatch.setattr(warmup_module, "warmup_sampling_module", Mock())
     monkeypatch.setattr(warmup_module, "log_mem_snapshot", Mock())
     monkeypatch.setattr(warmup_module.AutoTuner, "get", Mock())
-    monkeypatch.setattr(
-        warmup_module, "moe_a2a_steady_state_budget_for_capture", contextlib.nullcontext
-    )
+    monkeypatch.setattr(graphs_module, "moe_comm_serving_timeouts", contextlib.nullcontext)
     monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
     monkeypatch.setattr(warmup_module, "gc", SimpleNamespace(collect=Mock()))
     with (
