@@ -7097,6 +7097,21 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"Speculation type {self.speculative_config.decoding_type} does not "
                     f"support backend {self.backend}")
 
+            if isinstance(self.speculative_config, NGramDecodingConfig):
+                logger.warning_once(
+                    "NGramDecodingConfig (decoding_type 'NGram') is deprecated "
+                    "and will be removed in January 2027. Use SADecodingConfig "
+                    "(decoding_type 'SA', suffix automaton speculative "
+                    "decoding) instead.",
+                    key="deprecated_ngram_decoding_config")
+            elif isinstance(self.speculative_config,
+                            UserProvidedDecodingConfig):
+                logger.warning_once(
+                    "UserProvidedDecodingConfig (decoding_type "
+                    "'User_Provided') is deprecated and will be removed in "
+                    "January 2027.",
+                    key="deprecated_user_provided_decoding_config")
+
             # If user passed decoding_type: Eagle on pytorch, convert to Eagle3 with warning
             if type(self.speculative_config) is EagleDecodingConfig:
                 logger.warning(
