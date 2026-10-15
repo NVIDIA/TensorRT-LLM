@@ -32,19 +32,19 @@ Keep `cache_transceiver_config` identical in the two files. For the remaining fi
 
 ## NIXL Backend Configuration
 
-NIXL supports multiple underlying communication backends for KV cache exchange. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+With `cache_transceiver_config.backend: NIXL`, the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable selects the underlying NIXL backend for KV cache exchange. The NIXL UCX backend is distinct from TRT-LLM's direct UCX backend, selected with `cache_transceiver_config.backend: UCX`.
 
 **Supported NIXL backends:**
 - **UCX** (default)
 - **LIBFABRIC** (available from v0.16.0)
 
-If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+If an unsupported NIXL backend is specified, TRT-LLM selects the NIXL UCX backend.
 
 ### LIBFABRIC Backend Setup
 
 **Note:** Containers built from NGC PyTorch base images with AWS EFA development files at `/opt/amazon/efa` build the NIXL-LIBFABRIC plugin against that installation by default (see `docker/common/install_nixl.sh`). Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select this backend. Other base images fall back to system libfabric detection and may not include the plugin. Use the installation options below if the plugin is missing or you need a custom libfabric installation.
 
-**KV cache V2 limitation:** A two-node B300 test using NGC PyTorch 26.09, NIXL 1.4.0 and AWS libfabric 2.4.0amzn5.0 failed on the LIBFABRIC/EFA path with CUDA VMM allocations. The failures involve [NIXL allocation-context handling](https://github.com/ai-dynamo/nixl/pull/2425) and [libfabric CUDA synchronization](https://github.com/ofiwg/libfabric/issues/12853). The container build does not patch either dependency; this path needs fixes delivered through NIXL and the official EFA Installer. Plugin availability alone does not establish V2 compatibility. KV cache V1 passed the Qwen3-0.6B TP1/PP1 control, which does not establish support for other configurations. UCX remains the default backend.
+**KV cache V2 limitation with the NIXL LIBFABRIC backend:** Two-node B300 testing with NGC PyTorch 26.09, NIXL 1.4.0 and AWS libfabric 2.4.0amzn5.0 exposed [NIXL allocation-context handling](https://github.com/ai-dynamo/nixl/pull/2425) and [libfabric CUDA VMM synchronization](https://github.com/ofiwg/libfabric/issues/12853) failures on the EFA RDM path. A diagnostic backport of the libfabric fixes alone still failed NIXL's context check. With that backport and unmodified NIXL, `NIXL_DISABLE_CUDA_ADDR_WA=1` allowed KV cache V2 inference to complete; this workaround does not fix the bundled libfabric. The container patches neither dependency and does not set this environment variable by default. Plugin availability does not establish KV cache V2 compatibility over EFA. KV cache V1 passed the Qwen3-0.6B TP1/PP1 control only. The NIXL UCX backend remains the default.
 
 #### Prerequisites
 
@@ -66,7 +66,7 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 **Network Hardware Requirements:**
 - AWS EFA (Elastic Fabric Adapter), with compatible KV cache settings and dependency versions as described above
 
-##### For UCX Backend
+##### For the NIXL UCX Backend
 
 UCX is typically pre-installed in NVIDIA GPU containers. No additional installation is usually required.
 
