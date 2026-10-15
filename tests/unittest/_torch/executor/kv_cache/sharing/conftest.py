@@ -21,10 +21,12 @@ from __future__ import annotations
 import ctypes
 import gc
 import hashlib
+import importlib.util
 import inspect
 import sys
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Dict, Generator, Iterator, List, Optional, Sequence, Tuple
 from unittest.mock import patch
@@ -926,6 +928,24 @@ _KIT = SimpleNamespace(
 def kit():
     """The helpers and oracles above, for test modules that cannot import this file by name."""
     return _KIT
+
+
+@pytest.fixture(scope="session")
+def blob_memory_store():
+    """The blob backend's in-memory store and driver (``MemoryStore``, ``MemoryDriver``). They are
+    test doubles of the store-driver boundary and live beside its tests, not in the package."""
+    blob_tests = Path(__file__).resolve().parents[3] / "disaggregation" / "blob"
+    if "object_trailer" not in sys.modules:  # memory_store imports its sibling by this name
+        _load_by_path("object_trailer", blob_tests / "object_trailer.py")
+    return _load_by_path("blob_memory_store", blob_tests / "memory_store.py")
+
+
+def _load_by_path(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # its dataclasses look their module up by name
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.hookimpl(wrapper=True)
