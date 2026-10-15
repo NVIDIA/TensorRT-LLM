@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
 import inspect
 import pickle
@@ -66,6 +67,11 @@ def _make_cubin_loader(get_artifact: Callable[..., bytes] | None) -> ModuleType:
     return cubin_loader
 
 
+def _fail_like_a_kernel() -> None:
+    """Raise what a FlashInfer kernel raises when an artifact it needs was not fetched."""
+    raise RuntimeError("Error occurred when running GEMM!")
+
+
 @pytest.fixture
 def fake_flashinfer(monkeypatch) -> _FakeFlashInfer:
     """Install the monitor on a fake FlashInfer package for the duration of a test."""
@@ -112,6 +118,7 @@ def test_empty_fetch_is_returned_unchanged_and_reported(fake_flashinfer):
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
             assert fake_flashinfer.fetch(_CUBIN) == b""
+            _fail_like_a_kernel()
 
     (failure,) = excinfo.value.failures
     assert failure.file_name == _CUBIN
@@ -127,10 +134,9 @@ def test_fetch_error_is_reraised_unchanged_and_reported(fake_flashinfer):
 
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
-            with pytest.raises(RuntimeError) as fetch_error:
-                fake_flashinfer.fetch(_HEADER)
-            assert fetch_error.value is error
+            fake_flashinfer.fetch(_HEADER)
 
+    assert excinfo.value.__cause__ is error
     assert excinfo.value.failures == (
         FlashInferArtifactFailure(
             file_name=_HEADER, reason=f"RuntimeError: Artifact not found locally: {_HEADER}"
@@ -212,6 +218,23 @@ def test_error_raised_after_a_failed_fetch_becomes_the_cause(fake_flashinfer):
 
 
 @cpu_only
+def test_failed_fetch_in_a_block_that_completes_is_only_logged(fake_flashinfer, logged):
+    def profile_tactic():
+        fake_flashinfer.fetch(_CUBIN)
+        _fail_like_a_kernel()
+
+    with raise_on_flashinfer_artifact_failure():
+        # An autotuner skips a tactic whose kernel cannot be loaded.
+        with contextlib.suppress(RuntimeError):
+            profile_tactic()
+        result = "output"
+
+    assert result == "output"
+    (message,) = logged["error"]
+    assert _CUBIN in message
+
+
+@cpu_only
 def test_fetch_that_failed_before_the_block_is_not_reported(fake_flashinfer):
     fake_flashinfer.fetch(_CUBIN)
     error = MemoryError("CUDA out of memory")
@@ -225,12 +248,15 @@ def test_fetch_that_failed_before_the_block_is_not_reported(fake_flashinfer):
 
 @cpu_only
 def test_nested_blocks_report_a_failed_fetch_once(fake_flashinfer):
+    gemm_error = RuntimeError("Error occurred when running GEMM!")
+
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
             with raise_on_flashinfer_artifact_failure():
                 fake_flashinfer.fetch(_CUBIN)
+                raise gemm_error
 
-    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__cause__ is gemm_error
     assert len(excinfo.value.failures) == 1
 
 
@@ -241,6 +267,7 @@ def test_repeated_failures_of_one_file_are_listed_once(fake_flashinfer):
             fake_flashinfer.fetch(_CUBIN)
             fake_flashinfer.fetch(_HEADER)
             fake_flashinfer.fetch(_CUBIN)
+            _fail_like_a_kernel()
 
     assert [failure.file_name for failure in excinfo.value.failures] == [_CUBIN, _HEADER]
 
@@ -261,6 +288,7 @@ def test_error_says_where_artifacts_come_from_and_how_to_provide_them(fake_flash
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
             fake_flashinfer.fetch(file_name)
+            _fail_like_a_kernel()
 
     message = str(excinfo.value)
     assert file_name in message
@@ -278,6 +306,7 @@ def test_error_survives_pickling(fake_flashinfer):
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
             fake_flashinfer.fetch(_CUBIN)
+            _fail_like_a_kernel()
 
     restored = pickle.loads(pickle.dumps(excinfo.value))
 

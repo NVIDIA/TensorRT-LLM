@@ -21,10 +21,12 @@ and somewhere else: as an assertion while FlashInfer generates a module, as
 "Failed to load cubin" from an attention kernel, as "Error occurred when running
 GEMM!" from a MoE kernel, or not at all. None of these names the file.
 
-``install_flashinfer_artifact_monitor`` records every fetch that fails and logs
-it with the file name, without changing what FlashInfer does.
-``raise_on_flashinfer_artifact_failure`` turns the fetches that failed inside a
-block into one ``FlashInferArtifactUnavailableError``.
+``install_flashinfer_artifact_monitor`` records the fetches that fail in
+FlashInfer's ``get_artifact`` and logs each with the file name, without changing
+what FlashInfer does.
+``raise_on_flashinfer_artifact_failure`` turns an error that a block raises after
+a fetch failed inside it into one ``FlashInferArtifactUnavailableError`` that
+names the files.
 """
 
 import collections
@@ -179,10 +181,12 @@ _monitor: _ArtifactFetchMonitor | None = None
 
 
 def install_flashinfer_artifact_monitor() -> None:
-    """Record every FlashInfer artifact fetch that fails, and log it with the file name.
+    """Record the FlashInfer artifact fetches that fail, and log each with the file name.
 
-    Every runtime download in FlashInfer goes through its ``get_artifact``, so this
-    wraps that one function for ``raise_on_flashinfer_artifact_failure``. Calling it
+    FlashInfer's runtime downloads go through its ``get_artifact``, so this wraps that
+    one function for ``raise_on_flashinfer_artifact_failure``. The exception in
+    FlashInfer 0.6.18 is the ``checksums.txt`` of its CuTe DSL FMHA kernels, which it
+    downloads directly, so a failure to fetch that file is not recorded. Calling this
     again does nothing. If this FlashInfer version has no ``get_artifact``, logs a
     warning and leaves FlashInfer as is.
     """
@@ -245,15 +249,19 @@ def _install_monitor(
 
 @contextlib.contextmanager
 def raise_on_flashinfer_artifact_failure() -> Iterator[None]:
-    """Raise if a FlashInfer artifact fetch fails while the block runs.
+    """Name the FlashInfer artifacts that could not be fetched when the block fails.
 
-    Only fetches that fail inside the block are reported, so a later unrelated
-    error is not blamed on an earlier failure. If the block raised, its error is
-    the cause of the raised one; if no fetch failed, the block's own error
-    propagates unchanged. Does nothing until the monitor is installed.
+    If the block raises after a fetch failed inside it, raises
+    ``FlashInferArtifactUnavailableError`` with the block's error as the cause;
+    otherwise the block's error propagates unchanged. Only fetches inside the
+    block count, so a later unrelated error is not blamed on an earlier failure.
+    A block that completes returns normally even if a fetch failed inside it: an
+    autotuner skips a tactic whose kernel cannot be loaded, and the monitor has
+    already logged the fetch. Does nothing until the monitor is installed.
 
     Raises:
-        FlashInferArtifactUnavailableError: A fetch failed inside the block.
+        FlashInferArtifactUnavailableError: The block raised after a fetch failed
+            inside it.
     """
     monitor = _monitor
     if monitor is None:
@@ -270,6 +278,3 @@ def raise_on_flashinfer_artifact_failure() -> Iterator[None]:
         if failures:
             raise FlashInferArtifactUnavailableError(failures, monitor.source) from error
         raise
-    failures = monitor.failures_since(mark)
-    if failures:
-        raise FlashInferArtifactUnavailableError(failures, monitor.source)
