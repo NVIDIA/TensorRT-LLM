@@ -835,7 +835,11 @@ def _mx_e2e_cases() -> dict[str, dict[str, object]]:
 
 
 def _l0_model_express_case_ids() -> dict[int, list[str]]:
-    """Map each `l0_model_express.yml` GPU count to its donor/receiver case IDs."""
+    """Map each `l0_model_express.yml` GPU count to its donor/receiver case IDs.
+
+    Blocks that share a GPU count, such as the pre-merge canary and the
+    post-merge TP=1 rows, are combined.
+    """
     test_db = yaml.safe_load(
         _repository_text("tests/integration/test_lists/test-db/l0_model_express.yml")
     )
@@ -844,12 +848,11 @@ def _l0_model_express_case_ids() -> dict[int, list[str]]:
     for block in test_db["l0_model_express"]:
         gpu_count = block["condition"]["ranges"]["system_gpu_count"]
         assert gpu_count["gte"] == gpu_count["lte"]
-        assert gpu_count["gte"] not in case_ids
-        case_ids[gpu_count["gte"]] = [
+        case_ids.setdefault(gpu_count["gte"], []).extend(
             test.removeprefix(prefix).removesuffix("]")
             for test in block["tests"]
             if test.startswith(prefix)
-        ]
+        )
     return case_ids
 
 
@@ -865,8 +868,8 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
 
     The `_MX_CASES` rows must follow the shared naming scheme, and
-    `l0_model_express.yml` must list each row in the block whose GPU count
-    matches the row's two TP groups.
+    `l0_model_express.yml` must list each row exactly once, in a block whose GPU
+    count matches the row's two TP groups.
     """
     cases = _mx_e2e_cases()
     ci_case_ids = _l0_model_express_case_ids()
