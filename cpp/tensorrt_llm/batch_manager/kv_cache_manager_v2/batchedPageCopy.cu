@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -763,8 +764,8 @@ void BatchedPageCopier::detect()
 
 void BatchedPageCopier::computeConfigs()
 {
-    // The kernel is used only on coherent (NVLink-C2C) links. On discrete PCIe it loses to the
-    // copy engine in both directions and on both architectures measured:
+    // The copy engine is the default on every link. On discrete PCIe the kernel loses to it in
+    // both directions and on both architectures measured:
     //
     //   H100 PCIe Gen4  offload 8.56 vs 17.45 GiB/s (0.49x)   onboard 23.89 vs 23.88 (1.00x)
     //   B200 PCIe Gen5  offload 25.13 vs 43.17 GiB/s (0.58x)  onboard 39.99 vs 42.58 (0.94x)
@@ -775,11 +776,25 @@ void BatchedPageCopier::computeConfigs()
     // ~13.5 GB/s per CTA (vs ~30 on C2C), so the grid sizing below under-provisions it. That is
     // fixable with a per-link-class kPerCtaGBs, but the ceiling is the copy engine either way, so
     // PCIe simply uses cuMemcpyBatchAsync -- which also costs zero SMs.
+    //
+    // On coherent (NVLink-C2C) links the kernel roughly matches the copy engine on an idle GPU, but
+    // it is opt-in (see detail::kCoherentCopyKernelEnv) for two reasons. Its CTAs compete with the
+    // inference kernels for SM slots, so a migration issued during a long prefill waits for
+    // resident blocks to retire, while the copy engine is unaffected by SM load. And on some
+    // coherent systems, once SM loads/stores have reached registered host memory, every later
+    // kernel boundary in the process -- including those inside CUDA graph replays -- stays slower,
+    // a persistent per-step cost on decode that dwarfs any copy-time gain.
+    //
     // Chunked host registration (a kernel-version workaround; see HostMem) breaks the copy-engine path,
     // whose descriptors may not cross a registered region. The kernel works on virtual addresses
     // and does not care, so chunking forces the kernel on regardless of link type -- accepting the
-    // PCIe slowdown above rather than reintroducing per-page splitting on the CPU.
-    bool const kernelViable = mTopology.coherentLink || HostMem::shouldUseChunkedRegistration();
+    // costs above rather than reintroducing per-page splitting on the CPU.
+    char const* const coherentKernelValue = std::getenv(detail::kCoherentCopyKernelEnv);
+    bool const kernelOnCoherentLink = coherentKernelValue != nullptr && std::string_view(coherentKernelValue) == "1";
+    bool const kernelViable = detail::selectCopyKernel(
+        mTopology.coherentLink, HostMem::shouldUseChunkedRegistration(), kernelOnCoherentLink);
+    TLLM_LOG_DEBUG("BatchedPageCopier: device %d, coherentLink=%d, path=%s", mTopology.device,
+        static_cast<int>(mTopology.coherentLink), kernelViable ? "copy kernel" : "copy engine");
 
     auto build = [&](int stages, double gridMult) -> KernelConfig
     {
@@ -886,7 +901,7 @@ void BatchedPageCopier::launchGenericKernel(PoolCopyArgs const& args, CopyDirect
 
 //! Copy-engine path: expand the index pairs into per-page descriptors and submit them as one
 //! batch. Descriptor construction is O(numPairs) on the CPU and on the critical path, which is
-//! why the kernel path exists at all -- but on PCIe the copy engine still wins overall.
+//! why the kernel path exists at all -- but the copy engine still wins overall; see computeConfigs().
 void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stream) const
 {
     // Descriptor scratch. Page identities change on every eviction so the contents cannot be
@@ -1004,6 +1019,12 @@ void BatchedPageCopier::launchKernel(PoolCopyArgs const& args, CopyDirection dir
 
 namespace detail
 {
+
+bool selectCopyKernel(bool coherentLink, bool chunkedRegistration, bool kernelOnCoherentLink) noexcept
+{
+    return chunkedRegistration || (coherentLink && kernelOnCoherentLink);
+}
+
 #if CUDA_VERSION < 12080
 namespace
 {

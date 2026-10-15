@@ -68,7 +68,10 @@ struct PoolCopyArgs
 //!     platform-independent: 32 KiB for offload, 64 KiB for onboard;
 //!   * CTA count scales with the CPU-GPU link bandwidth, sized via Little's Law;
 //!   * on H100-class PCIe parts the SM store path is far slower than the copy engine, so the
-//!     kernel is disabled and callers should keep using cuMemcpyBatchAsync.
+//!     kernel is disabled and callers should keep using cuMemcpyBatchAsync;
+//!   * on coherent NVLink-C2C links the copy engine is also the default, because the kernel
+//!     competes with inference kernels for SMs; set detail::kCoherentCopyKernelEnv to "1" to use
+//!     the kernel there.
 class BatchedPageCopier
 {
 public:
@@ -175,6 +178,16 @@ private:
 
 namespace detail
 {
+
+//! Environment variable that selects the copy kernel instead of the copy engine on coherent
+//! (NVLink-C2C) links when set to "1". Read when a BatchedPageCopier is constructed.
+inline constexpr char const* kCoherentCopyKernelEnv = "TLLM_KV_CACHE_MANAGER_V2_COHERENT_COPY_KERNEL";
+
+//! The copy-path decision of BatchedPageCopier, separated from platform detection so that it can
+//! be tested on any machine. Returns true when the copy kernel must be used, false for the copy
+//! engine. Chunked host registration always selects the kernel, because a copy-engine descriptor
+//! may not cross a registered region.
+[[nodiscard]] bool selectCopyKernel(bool coherentLink, bool chunkedRegistration, bool kernelOnCoherentLink) noexcept;
 
 //! Copies ephemeral host page indices into device memory while leaving the destination update
 //! asynchronous.
