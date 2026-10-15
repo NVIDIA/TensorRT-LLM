@@ -1260,6 +1260,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # The lender sharing.attach_lender installs, one per manager for its life; None without one.
     # On the class so it exists without running __init__.
     _sharing = None
+    # Layer-group id -> sliding window size, built on first use by
+    # _get_windowed_layer_group_sizes(). The window-crossing check reads it on every capacity
+    # growth, so it is declared on the class to exist without running __init__.
+    _windowed_layer_group_sizes: Optional[Dict[int, int]] = None
 
     def __init__(
         self,
