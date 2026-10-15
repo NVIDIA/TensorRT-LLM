@@ -1787,6 +1787,52 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             ({
                 "type": "boolean"
             }, "\ntrue\n", True),
+            # Spaces and HTML entities in a string are part of the value.
+            ({
+                "type": "string"
+            }, "  keep &amp;  ", "  keep &amp;  "),
+            # null is text unless the schema allows null.
+            ({
+                "type": "string"
+            }, "null", "null"),
+            ({
+                "type": "string"
+            }, "NULL", "NULL"),
+            (None, "null", "null"),
+            ({
+                "type": ["string", "null"]
+            }, "null", None),
+            # A boolean is read through surrounding spaces and accepts 1/0;
+            # other text is kept.
+            ({
+                "type": "boolean"
+            }, " true ", True),
+            ({
+                "type": "boolean"
+            }, "1", True),
+            ({
+                "type": "boolean"
+            }, "maybe", "maybe"),
+            # An integer that does not parse falls back to JSON, which reads a
+            # padded null as null.
+            ({
+                "type": "integer"
+            }, " null ", None),
+            # When string is allowed, digits stay text.
+            ({
+                "type": ["string", "null"]
+            }, "123", "123"),
+            ({
+                "anyOf": [{
+                    "type": "string"
+                }, {
+                    "type": "null"
+                }]
+            }, "123", "123"),
+            # An object is decoded as JSON only, not as a Python literal.
+            ({
+                "type": "object"
+            }, "{'x': 1}", "{'x': 1}"),
         ],
     )
     def test_raw_values_are_typed_as_written(self, parser, schema, raw,
