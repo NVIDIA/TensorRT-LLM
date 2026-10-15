@@ -6851,6 +6851,25 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             tiers.append(tier)
         return replace(config, layers=layers, cache_tiers=tiers)
 
+    def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
+        if layer_id in self.high_layers.values():
+            return (
+                Role.KEY_BLOCK_SCALE
+                if self.high_dtype == DataType.NVFP4 and role_a == Role.KEY
+                else None
+            )
+        return super()._get_block_scale_role(role_a, layer_id)
+
+    def get_layer_bytes_per_token(
+        self, local_layer_idx: int, data_role: Role, *, dtype: Optional[DataType] = None
+    ):
+        for original, high in self.high_layers.items():
+            if local_layer_idx == high:
+                return super().get_layer_bytes_per_token(
+                    original, data_role, dtype=self.high_dtype if dtype is None else dtype
+                )
+        return super().get_layer_bytes_per_token(local_layer_idx, data_role, dtype=dtype)
+
     def get_high_precision_window(
         self, layer_idx: int, request_ids: list[int], kv_layout: str
     ) -> tuple[torch.Tensor, list[list[int]]]:
