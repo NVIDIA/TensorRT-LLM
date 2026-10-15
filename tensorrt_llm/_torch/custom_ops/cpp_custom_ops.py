@@ -34,7 +34,7 @@ def _register_fake():
     @torch.library.register_fake("trtllm::causal_layout_")
     def causal_layout_(
         table: torch.Tensor,
-        regions: torch.Tensor,
+        private_pages: torch.Tensor,
         rows: torch.Tensor,
         block_offsets: torch.Tensor,
         seq_len_kv: torch.Tensor,

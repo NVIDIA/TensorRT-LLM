@@ -18,173 +18,237 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/causalLayout.h"
 
+#include <cub/warp/warp_reduce.cuh>
+#include <cub/warp/warp_scan.cuh>
+
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels
+namespace kernels::causalLayout
 {
 namespace
 {
 
+namespace constants
+{
 constexpr int kThreads = 256;
-constexpr int kMaxSpans = 2;              // the fixed region and the window
-constexpr int kMaxRanges = 3 * kMaxSpans; // three partial pages, each cut by at most two spans
+constexpr int kWarpSize = 32;
+constexpr int kMaxRanges = 2;                                // visible ranges: the fixed tokens and the window
+constexpr int kMaxBoundaryPages = 2 * kMaxRanges;            // each range's first and last page
+constexpr int kMaxSegments = kMaxBoundaryPages * kMaxRanges; // one per (boundary page, range), a lane each
+static_assert(kMaxSegments <= kWarpSize, "one warp plans a block");
+} // namespace constants
 
-// What one causal block sees before its own tokens: whole logical pages as runs, and the visible
-// positions of its partial pages as ascending ranges, each with the index of its first slot in the
-// block's private region.
+// What one causal block sees before its own tokens, in logical token positions.
+//
+// The block sees one or two visible ranges of positions: the fixed tokens [0, fixedEnd), then the
+// window [windowBegin, blockBegin); a single range [0, blockBegin) when the window reaches the
+// fixed tokens. A page that lies fully inside a range goes into the block's row as it is. A page a
+// range covers only partly cannot: a page table cannot start or stop a key sequence mid-page. Those
+// positions form segments (one per partial page and range), which are copied, in ascending position
+// order, into the block's private pages, slot by slot; the block's own tokens follow them there.
+//
+// Example, 32-token pages, 40 fixed tokens, a 100-token window, a block starting at 200: the ranges
+// are [0, 40) and [100, 200). Full pages: 0, then 4 and 5. Segments, in order: positions 32-39 on
+// page 1 (the fixed tail), 100-127 on page 3 (where the window starts) and 192-199 on page 6 (just
+// before the block). They fill private slots 0-7, 8-35 and 36-43, and the block's own tokens start
+// at private slot 44.
 struct BlockPlan
 {
-    int64_t runA[kMaxSpans];
-    int64_t runB[kMaxSpans];
-    int64_t rangeLo[kMaxRanges];
-    int64_t rangeHi[kMaxRanges];
-    int64_t rangeK[kMaxRanges];
-    int64_t whole;     // whole pages
-    int64_t partial;   // visible positions on partial pages
-    int64_t numStatic; // of those, the resident ones (position < past); they come first
-    int numRuns;
-    int numRanges;
+    // Logical pages [fullPageBegin[r], fullPageEnd[r]) lie fully inside visible range r; the row
+    // lists range 0's, then range 1's.
+    int64_t fullPageBegin[constants::kMaxRanges];
+    int64_t fullPageEnd[constants::kMaxRanges];
+    // Segment s holds positions [segmentBegin[s], segmentEnd[s]), ascending across segments, and
+    // starts at private slot segmentPrivateSlot[s].
+    int64_t segmentBegin[constants::kMaxSegments];
+    int64_t segmentEnd[constants::kMaxSegments];
+    int64_t segmentPrivateSlot[constants::kMaxSegments];
+    // Row entries before the private pages.
+    int64_t numFullPages;
+    // Private slots before the block's own tokens: the segments' total length.
+    int64_t numPartialSlots;
+    // Of those, the leading ones that hold committed tokens (position < past). They are copied
+    // into the private pages at commit; the rest hold earlier blocks' tokens of this forward, which
+    // every forward writes into the private pages.
+    int64_t numCommittedSlots;
+    int numRanges; // 0 for a block at position 0, else 1 or 2
+    int numSegments;
 };
 
-__device__ void planBlock(CausalLayoutParams const& p, int64_t i, BlockPlan& plan)
+__device__ int64_t pageOf(CausalLayoutParams const& p, int64_t pos)
 {
-    int64_t const tpb = p.tokensPerPage;
-    int64_t const start = p.past + i * p.blockSize;
-    int64_t const fixed = p.fixedTokens;
-    int64_t const winStart = max(fixed, start - p.windowTokens);
-    int64_t spanLo[kMaxSpans];
-    int64_t spanHi[kMaxSpans];
-    int numSpans = 0;
-    if (winStart <= fixed)
-    {
-        if (start > 0)
-        {
-            spanLo[numSpans] = 0;
-            spanHi[numSpans++] = start;
-        }
-    }
-    else
-    {
-        if (fixed > 0)
-        {
-            spanLo[numSpans] = 0;
-            spanHi[numSpans++] = fixed;
-        }
-        spanLo[numSpans] = winStart;
-        spanHi[numSpans++] = start;
-    }
+    return pos >> p.pageShift;
+}
 
-    plan.whole = 0;
-    plan.numRuns = numSpans;
-    for (int s = 0; s < numSpans; ++s)
-    {
-        int64_t const a = (spanLo[s] + tpb - 1) / tpb;
-        int64_t const b = max(a, spanHi[s] / tpb);
-        plan.runA[s] = a;
-        plan.runB[s] = b;
-        plan.whole += b - a;
-    }
+__device__ int64_t slotOf(CausalLayoutParams const& p, int64_t pos)
+{
+    return pos & (p.tokensPerPage - 1);
+}
 
-    // The spans' edge pages, sorted; those no run covers are the partial pages.
-    int64_t edges[2 * kMaxSpans];
-    int numEdges = 0;
-    for (int s = 0; s < numSpans; ++s)
+// Appends the visible range [begin, end) unless it is empty.
+__device__ void addRange(int64_t (&rangeBegin)[constants::kMaxRanges], int64_t (&rangeEnd)[constants::kMaxRanges],
+    int& numRanges, int64_t begin, int64_t end)
+{
+    if (end > begin)
     {
-        edges[numEdges++] = spanLo[s] / tpb;
-        edges[numEdges++] = (spanHi[s] - 1) / tpb;
-    }
-    for (int x = 1; x < numEdges; ++x)
-    {
-        int64_t const v = edges[x];
-        int y = x - 1;
-        for (; y >= 0 && edges[y] > v; --y)
-        {
-            edges[y + 1] = edges[y];
-        }
-        edges[y + 1] = v;
-    }
-    plan.numRanges = 0;
-    plan.partial = 0;
-    plan.numStatic = 0;
-    for (int x = 0; x < numEdges; ++x)
-    {
-        int64_t const page = edges[x];
-        if (x > 0 && edges[x - 1] == page)
-        {
-            continue;
-        }
-        bool covered = false;
-        for (int r = 0; r < plan.numRuns; ++r)
-        {
-            covered |= plan.runA[r] <= page && page < plan.runB[r];
-        }
-        if (covered)
-        {
-            continue;
-        }
-        for (int s = 0; s < numSpans; ++s)
-        {
-            int64_t const lo = max(spanLo[s], page * tpb);
-            int64_t const hi = min(spanHi[s], (page + 1) * tpb);
-            if (hi <= lo)
-            {
-                continue;
-            }
-            plan.rangeLo[plan.numRanges] = lo;
-            plan.rangeHi[plan.numRanges] = hi;
-            plan.rangeK[plan.numRanges] = plan.partial;
-            ++plan.numRanges;
-            plan.partial += hi - lo;
-            plan.numStatic += max(int64_t{0}, min(hi, p.past) - lo);
-        }
+        rangeBegin[numRanges] = begin;
+        rangeEnd[numRanges++] = end;
     }
 }
 
-// The logical position of the k-th visible slot on the block's partial pages.
-__device__ int64_t positionAt(BlockPlan const& plan, int64_t k)
+// Boundary page b: the first page of range b / 2 for even b, its last page for odd b. The ranges
+// are disjoint and ordered, so boundary pages ascend with b.
+__device__ int64_t boundaryPage(CausalLayoutParams const& p, int64_t const (&rangeBegin)[constants::kMaxRanges],
+    int64_t const (&rangeEnd)[constants::kMaxRanges], int b)
 {
-    int r = 0;
-    while (r + 1 < plan.numRanges && k >= plan.rangeK[r + 1])
+    return b % 2 == 0 ? pageOf(p, rangeBegin[b / 2]) : pageOf(p, rangeEnd[b / 2] - 1);
+}
+
+// Warp 0 plans block i. A partial page is a boundary page that is not a full page; each lane takes
+// one (boundary page, range) pair and measures that range's segment on that page. Lanes are in
+// position order, so an exclusive sum of the segment lengths gives each segment its private slot,
+// and an exclusive sum over the lanes that have a segment gives each segment its index.
+__device__ void planBlock(CausalLayoutParams const& p, int64_t i, BlockPlan& plan)
+{
+    __shared__ typename cub::WarpScan<int64_t>::TempStorage privateSlotScan;
+    __shared__ typename cub::WarpScan<int>::TempStorage segmentIndexScan;
+    __shared__ typename cub::WarpReduce<int64_t>::TempStorage committedSum;
+    int const lane = threadIdx.x % constants::kWarpSize;
+    int64_t const tpb = p.tokensPerPage;
+    int64_t const blockBegin = p.past + i * p.blockSize;
+    int64_t const fixedEnd = p.fixedTokens;
+    int64_t const windowBegin = max(fixedEnd, blockBegin - p.windowTokens);
+
+    // a contiguous range of token position [begin, end)
+    // holds tokens the block is allowed to attend to
+    int64_t rangeBegin[constants::kMaxRanges];
+    int64_t rangeEnd[constants::kMaxRanges];
+    int numRanges = 0;
+    if (windowBegin <= fixedEnd)
     {
-        ++r;
+        addRange(rangeBegin, rangeEnd, numRanges, 0, blockBegin);
     }
-    return plan.rangeLo[r] + (k - plan.rangeK[r]);
+    else // history exceeds the window
+    {
+        addRange(rangeBegin, rangeEnd, numRanges, 0, fixedEnd);
+        addRange(rangeBegin, rangeEnd, numRanges, windowBegin, blockBegin);
+    }
+
+    int64_t fullPageBegin[constants::kMaxRanges]; // first full page of the range
+    int64_t fullPageEnd[constants::kMaxRanges];   // one past the last full page
+    for (int r = 0; r < numRanges; ++r)
+    {
+        fullPageBegin[r] = pageOf(p, rangeBegin[r] + tpb - 1);
+        fullPageEnd[r] = max(fullPageBegin[r], pageOf(p, rangeEnd[r]));
+    }
+
+    // figure out attended ranges within non-full pages
+    int const boundary = lane / constants::kMaxRanges;
+    int const range = lane % constants::kMaxRanges;
+    int64_t segmentBegin = 0;
+    int64_t segmentLength = 0;
+    int64_t committedLength = 0;
+    if (boundary < 2 * numRanges && range < numRanges)
+    {
+        int64_t const page = boundaryPage(p, rangeBegin, rangeEnd, boundary);
+        bool const sameAsPrevious = boundary > 0 && boundaryPage(p, rangeBegin, rangeEnd, boundary - 1) == page;
+        bool isFullPage = false;
+        for (int r = 0; r < numRanges; ++r)
+        {
+            isFullPage |= fullPageBegin[r] <= page && page < fullPageEnd[r];
+        }
+        if (!sameAsPrevious && !isFullPage)
+        {
+            segmentBegin = max(rangeBegin[range], page * tpb);
+            int64_t const segmentEnd = min(rangeEnd[range], (page + 1) * tpb);
+            segmentLength = max(int64_t{0}, segmentEnd - segmentBegin);
+            committedLength = max(int64_t{0}, min(segmentEnd, p.past) - segmentBegin);
+        }
+    }
+
+    // where does the segment start in private pages (destination)
+    int64_t privateSlot = 0;
+    int64_t numPartialSlots = 0;
+    cub::WarpScan<int64_t>(privateSlotScan).ExclusiveSum(segmentLength, privateSlot, numPartialSlots);
+    // which entry of the plan's segment list the lane writes
+    int segmentIndex = 0;
+    int numSegments = 0;
+    cub::WarpScan<int>(segmentIndexScan).ExclusiveSum(segmentLength > 0 ? 1 : 0, segmentIndex, numSegments);
+
+    // publish result
+    int64_t const numCommittedSlots = cub::WarpReduce<int64_t>(committedSum).Sum(committedLength); // lane 0 only
+    if (segmentLength > 0)
+    {
+        plan.segmentBegin[segmentIndex] = segmentBegin;
+        plan.segmentEnd[segmentIndex] = segmentBegin + segmentLength;
+        plan.segmentPrivateSlot[segmentIndex] = privateSlot;
+    }
+    if (lane == 0)
+    {
+        plan.numRanges = numRanges;
+        plan.numFullPages = 0;
+        for (int r = 0; r < numRanges; ++r)
+        {
+            plan.fullPageBegin[r] = fullPageBegin[r];
+            plan.fullPageEnd[r] = fullPageEnd[r];
+            plan.numFullPages += fullPageEnd[r] - fullPageBegin[r];
+        }
+        plan.numSegments = numSegments;
+        plan.numPartialSlots = numPartialSlots;
+        plan.numCommittedSlots = numCommittedSlots;
+    }
+}
+
+// The logical position copied into private slot privateSlot (< numPartialSlots).
+__device__ int64_t positionAtPrivateSlot(BlockPlan const& plan, int64_t privateSlot)
+{
+    int s = 0;
+    while (s + 1 < plan.numSegments && privateSlot >= plan.segmentPrivateSlot[s + 1])
+    {
+        ++s;
+    }
+    return plan.segmentBegin[s] + (privateSlot - plan.segmentPrivateSlot[s]);
 }
 
 // The view page holding logical position pos. After a rotation the fixed tail on the page it
 // shares with the history is still read from that page's old view, now at the ring's tail.
 __device__ int32_t viewOf(CausalLayoutParams const& p, int64_t pos)
 {
-    int64_t const page = pos / p.tokensPerPage;
-    if (p.dropPages > 0 && pos < p.fixedTokens && page == p.fixedTokens / p.tokensPerPage)
+    int64_t const page = pageOf(p, pos);
+    if (p.dropPages > 0 && pos < p.fixedTokens && page == pageOf(p, p.fixedTokens))
     {
         return p.table[p.numPages - p.dropPages];
     }
     return p.table[page];
 }
 
-__device__ void sharedWork(CausalLayoutParams const& p)
+// The home slot id (view page * tokensPerPage + slot) of each token the next forward writes, at
+// positions past, past + 1, ...; the chunk write puts each token's K/V there.
+__device__ void writeStagedHomeSlots(CausalLayoutParams const& p)
 {
-    int64_t const tpb = p.tokensPerPage;
     for (int64_t t = threadIdx.x; t < p.numStaged; t += blockDim.x)
     {
         int64_t const pos = p.past + t;
-        p.stagedSlots[t] = static_cast<int64_t>(p.table[pos / tpb]) * tpb + pos % tpb;
+        p.stagedSlots[t] = static_cast<int64_t>(p.table[pageOf(p, pos)]) * p.tokensPerPage + slotOf(p, pos);
     }
-    if (p.refillSrc == nullptr)
+}
+
+// Copies (layer-0 pool rows) that move the fixed tokens' tail after a rotation. When the fixed
+// tokens end mid-page, their last page is shared with history; a rotation moves that page to the
+// ring's tail, so its fixed slots are copied to the page that now follows the full fixed pages.
+// Unused entries are -1: no rotation this commit, or the fixed tokens end on a page boundary.
+__device__ void writeFixedTailRefill(CausalLayoutParams const& p)
+{
+    int64_t const tailLength = p.dropPages > 0 ? slotOf(p, p.fixedTokens) : 0;
+    int64_t const tailPage = pageOf(p, p.fixedTokens);
+    for (int64_t slot = threadIdx.x; slot < p.tokensPerPage; slot += blockDim.x)
     {
-        return;
-    }
-    int64_t const tail = p.dropPages > 0 ? p.fixedTokens % tpb : 0;
-    int64_t const fixedPages = p.fixedTokens / tpb;
-    for (int64_t slot = threadIdx.x; slot < tpb; slot += blockDim.x)
-    {
-        if (slot < tail)
+        if (slot < tailLength)
         {
             p.refillSrc[slot] = static_cast<int64_t>(p.table[p.numPages - p.dropPages]) * p.rowsPerPage + slot;
-            p.refillDst[slot] = static_cast<int64_t>(p.table[fixedPages]) * p.rowsPerPage + slot;
+            p.refillDst[slot] = static_cast<int64_t>(p.table[tailPage]) * p.rowsPerPage + slot;
         }
         else
         {
@@ -200,33 +264,42 @@ __global__ void causalLayoutKernel(CausalLayoutParams p)
     int64_t const i = blockIdx.x;
     if (i >= p.numBlocks)
     {
-        sharedWork(p);
+        // The commit block: work done once per commit, not per causal block.
+        if (p.stagedSlots != nullptr)
+        {
+            writeStagedHomeSlots(p);
+        }
+        if (p.refillSrc != nullptr)
+        {
+            writeFixedTailRefill(p);
+        }
         return;
     }
-    if (threadIdx.x == 0)
+    if (threadIdx.x < constants::kWarpSize)
     {
         planBlock(p, i, plan);
     }
     __syncthreads();
 
     int64_t const tpb = p.tokensPerPage;
-    int32_t const* region = p.regions + i * p.regionPages;
+    int32_t const* privatePages = p.privatePages + i * p.numPrivatePages;
 
-    // The row: whole pages in logical order, then the private region, then zeros.
+    // The row: full pages in logical order, then the private pages, then zeros.
     int32_t* row = p.rows + i * p.rowLen;
     int32_t* offK = p.blockOffsets + i * 2 * p.rowLen;
     int32_t* offV = offK + p.rowLen;
-    int64_t const len0 = plan.numRuns > 0 ? plan.runB[0] - plan.runA[0] : 0;
+    int64_t const fullPagesOfRange0 = plan.numRanges > 0 ? plan.fullPageEnd[0] - plan.fullPageBegin[0] : 0;
     for (int64_t j = threadIdx.x; j < p.rowLen; j += blockDim.x)
     {
         int32_t view = 0;
-        if (j < plan.whole)
+        if (j < plan.numFullPages)
         {
-            view = p.table[j < len0 ? plan.runA[0] + j : plan.runA[1] + (j - len0)];
+            view = p.table[j < fullPagesOfRange0 ? plan.fullPageBegin[0] + j
+                                                 : plan.fullPageBegin[1] + (j - fullPagesOfRange0)];
         }
-        else if (j < plan.whole + p.regionPages)
+        else if (j < plan.numFullPages + p.numPrivatePages)
         {
-            view = region[j - plan.whole];
+            view = privatePages[j - plan.numFullPages];
         }
         row[j] = view;
         offK[j] = static_cast<int32_t>(view * p.kvFactor);
@@ -234,30 +307,30 @@ __global__ void causalLayoutKernel(CausalLayoutParams p)
     }
     if (threadIdx.x == 0)
     {
-        p.seqLenKv[i] = static_cast<int32_t>(plan.whole * tpb + plan.partial + p.blockSize);
+        p.seqLenKv[i] = static_cast<int32_t>(plan.numFullPages * tpb + plan.numPartialSlots + p.blockSize);
     }
 
-    // The block's own tokens follow the partial slots in its region.
+    // The block's own tokens follow the partial slots in its private pages.
     int64_t* own = p.ownSlots + i * p.blockSize;
     for (int64_t t = threadIdx.x; t < p.blockSize; t += blockDim.x)
     {
-        int64_t const k = plan.partial + t;
-        own[t] = static_cast<int64_t>(region[k / tpb]) * tpb + k % tpb;
+        int64_t const k = plan.numPartialSlots + t;
+        own[t] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * tpb + slotOf(p, k);
     }
 
-    // Partial slots: resident positions are copied now (pieces), staged ones are written by
-    // every forward (extras).
+    // Partial slots: committed tokens are copied in at commit (pieces); this forward's tokens of
+    // earlier blocks are written in by every forward (extras).
     int64_t const pieceCap = 3 * (tpb - 1);
     int64_t const extraCap = 2 * (tpb - 1);
     int64_t* pieceSrc = p.pieceSrc + i * pieceCap;
     int64_t* pieceDst = p.pieceDst + i * pieceCap;
     for (int64_t k = threadIdx.x; k < pieceCap; k += blockDim.x)
     {
-        if (k < plan.numStatic)
+        if (k < plan.numCommittedSlots)
         {
-            int64_t const pos = positionAt(plan, k);
-            pieceSrc[k] = static_cast<int64_t>(viewOf(p, pos)) * p.rowsPerPage + pos % tpb;
-            pieceDst[k] = static_cast<int64_t>(region[k / tpb]) * p.rowsPerPage + k % tpb;
+            int64_t const pos = positionAtPrivateSlot(plan, k);
+            pieceSrc[k] = static_cast<int64_t>(viewOf(p, pos)) * p.rowsPerPage + slotOf(p, pos);
+            pieceDst[k] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * p.rowsPerPage + slotOf(p, k);
         }
         else
         {
@@ -267,15 +340,16 @@ __global__ void causalLayoutKernel(CausalLayoutParams p)
     }
     int64_t* extraSrc = p.extraSrc + i * extraCap;
     int64_t* extraDst = p.extraDst + i * extraCap;
-    int64_t const ownFirst = static_cast<int64_t>(region[plan.partial / tpb]) * tpb + plan.partial % tpb;
+    int64_t const ownFirst
+        = static_cast<int64_t>(privatePages[pageOf(p, plan.numPartialSlots)]) * tpb + slotOf(p, plan.numPartialSlots);
     for (int64_t t = threadIdx.x; t < extraCap; t += blockDim.x)
     {
-        int64_t const k = plan.numStatic + t;
-        if (k < plan.partial)
+        int64_t const k = plan.numCommittedSlots + t;
+        if (k < plan.numPartialSlots)
         {
-            int64_t const pos = positionAt(plan, k);
+            int64_t const pos = positionAtPrivateSlot(plan, k);
             extraSrc[t] = pos - p.past;
-            extraDst[t] = static_cast<int64_t>(region[k / tpb]) * tpb + k % tpb;
+            extraDst[t] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * tpb + slotOf(p, k);
         }
         else
         {
@@ -344,7 +418,7 @@ void invokeCausalLayout(CausalLayoutParams const& params, cudaStream_t stream)
     {
         return;
     }
-    causalLayoutKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(params);
+    causalLayoutKernel<<<static_cast<unsigned>(blocks), constants::kThreads, 0, stream>>>(params);
     check_cuda_error(cudaGetLastError());
 }
 
@@ -365,6 +439,6 @@ void invokeCopyKvSlots(CopyKvSlotsParams const& params, int elemSize, cudaStream
     }
 }
 
-} // namespace kernels
+} // namespace kernels::causalLayout
 
 TRTLLM_NAMESPACE_END
