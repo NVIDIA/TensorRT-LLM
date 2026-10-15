@@ -134,6 +134,7 @@ add_th_common_family(
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
+  glmDsaHistTopKOp.cpp
   asyncUlyssesOp.cpp
   glmMnnvlAllgatherOp.cpp
   glmMnnvlHopOp.cpp
