@@ -31,7 +31,11 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    ModelingV2Mode,
+    modeling_v2_resolve,
+    resolved_mode,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
@@ -170,6 +174,14 @@ def test_r1_dep4_matches(mode):
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _R1_TARGET
 
 
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_the_target_reads_the_mode_it_was_resolved_under(mode):
+    """A target raises instead of falling back under require, so it has to know which mode built it."""
+    config = _model_config(_gpt_oss_config())
+    target = modeling_v2_resolve(config, _llm_args(mode))
+    assert resolved_mode(target) is ModelingV2Mode(mode)
+
+
 def test_resolve_class_reads_the_decision_off_the_config():
     """The loader decides and writes the class on the ModelConfig; the class
     lookup only has to honour it."""
@@ -278,6 +290,24 @@ def test_r1_dep4_with_vanilla_mtp_does_not_match():
         modeling_v2_resolve(config, _llm_args("require"))
     with pytest.raises(ValueError, match="MTP"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, parallel",
+    [
+        (dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1), "tp4"),
+        (dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1), "tp8"),
+        # experts split by expert rather than by tensor: another weight layout, no target
+        (dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8), None),
+        (dict(world_size=8, tp_size=8, moe_tp_size=8, enable_attention_dp=True), None),
+        (dict(world_size=2, tp_size=2, moe_tp_size=2), None),
+    ],
+)
+def test_minimax_m3_parallel_names_the_target_topology(mapping_kwargs, parallel):
+    """MiniMax-M3 has one target per tensor-parallel width: tp4 and tp8 load different per-rank shapes."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    assert routing._parallel(Mapping(**mapping_kwargs)) == parallel
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
