@@ -19,6 +19,40 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
+## Health checks
+
+OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as inference. `Check` returns the current status, and `Watch` immediately sends the current status and streams subsequent changes. Use the named services `inference` and `liveness`:
+
+| Service | Meaning | Kubernetes use |
+|---------|---------|----------------|
+| `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Startup and readiness probes |
+| `liveness` | The gRPC server has started and is not shutting down. | Liveness probe |
+
+The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. Both services report `NOT_SERVING` during graceful shutdown. A stopped or failed server cannot answer the probe.
+
+For a pod exposing port 50051, configure the probes with their service names:
+
+```yaml
+startupProbe:
+  grpc:
+    port: 50051
+    service: inference
+  periodSeconds: 10
+  failureThreshold: 60
+readinessProbe:
+  grpc:
+    port: 50051
+    service: inference
+livenessProbe:
+  grpc:
+    port: 50051
+    service: liveness
+```
+
+The example allows about ten minutes for model loading. Set `failureThreshold * periodSeconds` to cover the worst-case startup time for your model and deployment.
+
+Bind the listener to the pod IP or `0.0.0.0` so kubelet can reach it. OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
