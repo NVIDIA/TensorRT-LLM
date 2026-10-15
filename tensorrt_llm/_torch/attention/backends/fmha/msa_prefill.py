@@ -147,6 +147,13 @@ def _aligned_nvfp4_dequant_scales(
     if refresh or getattr(attn, "_msa_nvfp4_dequant_scale_source_ptr", None) != source_ptr:
         cache[:, 0].copy_(kv_scale_quant_orig[1:3])
         attn._msa_nvfp4_dequant_scale_source_ptr = source_ptr
+        # A weight reload also updates decode's derived BMM scales in place,
+        # preserving the addresses already held by captured CUDA graphs.
+        sparse_scale_source = getattr(attn, "_msa_trtllm_gen_sparse_scale_source", None)
+        if sparse_scale_source is not None:
+            from ..sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import _get_bmm_scales
+
+            _get_bmm_scales(attn, cache[0, :1], cache[1, :1], sparse_scale_source[2], refresh=True)
 
     k_global_scale = cache[0, :1]
     v_global_scale = cache[1, :1]
