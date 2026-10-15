@@ -10,10 +10,11 @@ and can hold a method on an event or make it raise. Every wait has an upper boun
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -267,13 +268,15 @@ class DriverSpy:
     ``hold(method)`` makes calls of ``method`` wait until the returned event is set;
     ``fail(method, error, times)`` makes the next ``times`` calls raise ``error`` instead;
     ``answer(method, value, times)`` makes them return ``value`` without reaching the driver.
-    ``ops`` lists every operation ``put``/``get`` returned, with its rows.
+    ``ops`` lists every operation ``put``/``get`` returned, with its rows; ``peak_in_flight`` is
+    the most ``put``/``get`` calls that were ever inside the driver at once.
     """
 
     def __init__(self, inner: StoreDriver) -> None:
         self.inner = inner
         self.calls: list[Call] = []
         self.ops: list[tuple[tuple[RowIO, ...], OpHandle]] = []
+        self.in_flight = self.peak_in_flight = 0
         self._changed = threading.Condition()
         self._holds: dict[str, threading.Event] = {}
         self._failures: dict[str, list] = {}
@@ -322,13 +325,14 @@ class DriverSpy:
 
     def put(self, rows: Sequence[RowIO]) -> OpHandle:
         self._enter("put", rows=rows)
-        return self._started(rows, self.inner.put(rows))
+        with self._counted():
+            return self._started(rows, self.inner.put(rows))
 
     def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
         self._enter("get", rows=rows)
-        return self._started(
-            rows, self.inner.get(rows) if hint is None else self.inner.get(rows, hint)
-        )
+        with self._counted():
+            op = self.inner.get(rows) if hint is None else self.inner.get(rows, hint)
+            return self._started(rows, op)
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
         self._enter("poll", op=op)
@@ -355,6 +359,17 @@ class DriverSpy:
     def close(self) -> None:
         self._enter("close")
         self.inner.close()
+
+    @contextlib.contextmanager
+    def _counted(self) -> Iterator[None]:
+        with self._changed:
+            self.in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            yield
+        finally:
+            with self._changed:
+                self.in_flight -= 1
 
     def _scripted_answer(self, method: str) -> list | None:
         with self._changed:
