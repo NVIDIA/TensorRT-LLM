@@ -71,10 +71,9 @@ class MultimodalEncoderItemMetadata(NamedTuple):
     example, its row range in ``pixel_values``), so an item can be sliced
     out for a single-item encoder call.
 
-    TODO(TRTLLM-14477): `MultimodalParams.mm_item_order` carries the same prompt-order
-    manifest for the mixed-modality full-request encode path. Single-source
-    the two representations at the input processor so one manifest serves
-    both the item-scheduling path and the full-request interleave.
+    Shared by item scheduling and full-request encoder output assembly.
+    `MultimodalParams.mm_item_order` remains a fallback for legacy processors
+    that do not emit this metadata.
     """
 
     encoder_token_lengths: List[int]
@@ -1562,6 +1561,13 @@ def create_input_processor_with_hash(
                 "MultimodalEncoderItemMetadata or None for raw multimodal "
                 f"payloads, got {type(item_metadata).__name__}")
         item_metadata.validate()
+
+        mm_item_order = inputs.get("mm_item_order")
+        if mm_item_order and item_metadata.item_refs != [
+            (entry["modality"], entry["index"]) for entry in mm_item_order
+        ]:
+            raise ValueError("Multimodal encoder item references do not match "
+                             "the prompt item order")
 
         multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
         existing_embedding_lengths = multimodal_data.get(

@@ -126,6 +126,17 @@ def test_mm_item_metadata_rejects_wrong_return_type():
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
+def test_mm_item_metadata_retains_three_field_tuple_contract() -> None:
+    metadata = MultimodalEncoderItemMetadata([("image", 0)], [4], [2])
+
+    item_refs, encoder_lengths, output_lengths = metadata
+
+    assert metadata._fields == ("item_refs", "encoder_token_lengths", "output_embedding_lengths")
+    assert item_refs == [("image", 0)]
+    assert encoder_lengths == [4]
+    assert output_lengths == [2]
+
+
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     """Producer writes a flat int64 cumsum tensor at py_multimodal_data[multimodal_embed_mask_cumsum]."""
 
@@ -308,6 +319,44 @@ _UUID_HASH_SNAPSHOT = {
         -1123551599,
     ],
 }
+
+
+@pytest.mark.parametrize("hashing_enabled", [False, True])
+def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool) -> None:
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = hashing_enabled
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            return [10, 101, 102, 20, 101, 102, 30], {
+                "multimodal_data": {
+                    "image": {},
+                    "video": {},
+                    "multimodal_embedding_lengths": [2, 2],
+                }
+            }
+
+        def get_num_tokens_per_video(self, *, video: list[np.ndarray], **kwargs: object) -> int:
+            return 2
+
+        def get_mm_encoder_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict
+        ) -> MultimodalEncoderItemMetadata:
+            return MultimodalEncoderItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+
+    processor = Processor()
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {
+            "image": [np.array([1], dtype=np.uint8)],
+            "video": [VideoData(frames=[np.full((2, 2, 3), 2, dtype=np.uint8)], metadata={})],
+        },
+        "mm_item_order": [{"modality": "image", "index": 0}, {"modality": "video", "index": 0}],
+    }
+
+    with pytest.raises(ValueError, match="item references do not match the prompt item order"):
+        create_input_processor_with_hash(processor)(inputs, None)
+
+    assert processor.multimodal_hashing_supported is hashing_enabled
 
 
 @pytest.mark.parametrize("hashing_enabled", [False, True], ids=["fallback", "hashing"])
