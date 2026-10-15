@@ -2,12 +2,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
 
+from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
@@ -17,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import (
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
 )
-from tensorrt_llm.inputs.multimodal_data import VideoData
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
     MultimodalEncoderItemMetadata,
     create_input_processor_with_hash,
@@ -25,6 +28,11 @@ from tensorrt_llm.inputs.registry import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_media_modalities_match_io_and_validation_contract() -> None:
+    assert MEDIA_MODALITIES == get_args(MediaModality) == ("image", "video", "audio")
+    assert set(MEDIA_MODALITIES) == set(MEDIA_IO_REGISTRY)
 
 
 class _ItemMetadataFakeProcessor:
@@ -145,6 +153,19 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     )
 
 
+@pytest.mark.parametrize("cached_cumsum", [None, torch.tensor([0, 1], dtype=torch.int64)])
+def test_existing_mm_cumsum_preserves_storage_and_backfills_block_alignment(
+    cached_cumsum: torch.Tensor | None,
+) -> None:
+    processor = SimpleNamespace(mm_bidirectional_blocks=True)
+    data = {"multimodal_embed_mask_cumsum": cached_cumsum}
+
+    maybe_compute_mm_embed_cumsum([10, 101], {"multimodal_data": data}, processor)
+
+    assert data["multimodal_embed_mask_cumsum"] is cached_cumsum
+    assert data["mm_bidirectional_blocks"] is True
+
+
 def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
     """Final expanded prompt layout wins over dummy-placeholder metadata."""
 
@@ -221,6 +242,229 @@ class _KwargsHashFakeProcessor:
 
     def get_mm_special_token_ids(self):
         return None
+
+
+_CONTENT_HASH_SNAPSHOT = {
+    "image": [
+        1704823964,
+        362764787,
+        1556099772,
+        -86050102,
+        551081767,
+        1806967272,
+        -1857978322,
+        -1074313326,
+    ],
+    "video": [
+        -839685430,
+        -760767140,
+        -2055508912,
+        -1577466732,
+        1582489614,
+        1138227298,
+        1889150221,
+        1556646618,
+    ],
+    "audio": [
+        -1693994058,
+        897664400,
+        754889986,
+        -1726904048,
+        -495512501,
+        952543145,
+        -87795905,
+        -419978698,
+    ],
+}
+_UUID_HASH_SNAPSHOT = {
+    "image": [
+        1777607066,
+        -1240710263,
+        -116192886,
+        1440160746,
+        120140059,
+        -2062281779,
+        960024653,
+        2041693752,
+    ],
+    "video": [
+        2070136680,
+        -523271134,
+        1570526135,
+        1209057230,
+        1458965967,
+        334689758,
+        1673654996,
+        -1634814920,
+    ],
+    "audio": [
+        -1172540155,
+        -1149723152,
+        1994549875,
+        -2028680509,
+        93572480,
+        1551260061,
+        -1949652498,
+        -1123551599,
+    ],
+}
+
+
+@pytest.mark.parametrize("hashing_enabled", [False, True], ids=["fallback", "hashing"])
+@pytest.mark.parametrize("use_uuids", [False, True], ids=["content", "uuid"])
+@pytest.mark.parametrize(
+    "modalities,token_ids,explicit_ids,special_ids,expected_cumsum,expected_runs",
+    [
+        pytest.param(
+            ["image"],
+            [10, 101, 102, 20],
+            None,
+            None,
+            [0, 1, 2, 2],
+            ([0, 1], [1], [2]),
+            id="out-of-vocab-image",
+        ),
+        pytest.param(
+            ["image"],
+            [10, 101, 102, 20],
+            [101, 102],
+            None,
+            [0, 1, 2, 2],
+            ([0, 1], [1], [2]),
+            id="explicit-image-tokens",
+        ),
+        pytest.param(
+            ["image"],
+            [10, 101, 200, 102, 20],
+            [101, 102],
+            [200],
+            [0, 1, 1, 2, 2],
+            ([0, 1], [1], [3]),
+            id="image-framing-token",
+        ),
+        pytest.param(
+            ["video"],
+            [10, 101, 20, 102, 30],
+            None,
+            None,
+            [0, 1, 1, 2, 2],
+            ([0, 2], [1, 3], [1, 1]),
+            id="video-interleaved-text",
+        ),
+        pytest.param(
+            ["audio"],
+            [10, 101, 102, 20],
+            [101, 102],
+            None,
+            [0, 1, 2, 2],
+            ([0, 1], [1], [2]),
+            id="audio",
+        ),
+        pytest.param(
+            ["video", "image", "audio"],
+            [10, 101, 102, 20, 101, 102, 30, 101, 102, 40],
+            [101, 102],
+            None,
+            [0, 1, 2, 2, 3, 4, 4, 5, 6, 6],
+            ([0, 1, 2, 3], [1, 4, 7], [2, 2, 2]),
+            id="mixed-prompt-order",
+        ),
+    ],
+)
+def test_multimodal_input_contract_snapshot(
+    modalities: list[str],
+    token_ids: list[int],
+    explicit_ids: list[int] | None,
+    special_ids: list[int] | None,
+    expected_cumsum: list[int],
+    expected_runs: tuple[list[int], list[int], list[int]],
+    hashing_enabled: bool,
+    use_uuids: bool,
+) -> None:
+    """Pin framework metadata independently of model-specific media encoding."""
+    item_refs = [(modality, 0) for modality in modalities]
+    num_items = len(item_refs)
+
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = hashing_enabled
+        mm_bidirectional_blocks = True
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            return list(token_ids), {
+                "multimodal_data": {
+                    **{modality: {} for modality in modalities},
+                    "multimodal_embedding_lengths": [2] * num_items,
+                }
+            }
+
+        def get_num_tokens_per_image(self, *, image: np.ndarray) -> int:
+            return 2 + len(special_ids or [])
+
+        def get_num_tokens_per_video(self, *, video: list[np.ndarray], **kwargs: object) -> int:
+            return 2
+
+        def get_num_tokens_per_audio(self, *, audio: AudioData) -> int:
+            return 2
+
+        def get_mm_token_ids(self) -> torch.Tensor | None:
+            return torch.tensor(explicit_ids) if explicit_ids is not None else None
+
+        def get_mm_special_token_ids(self) -> torch.Tensor | None:
+            return torch.tensor(special_ids) if special_ids is not None else None
+
+        def get_mm_encoder_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict
+        ) -> MultimodalEncoderItemMetadata:
+            return MultimodalEncoderItemMetadata(item_refs, [4] * num_items, [2] * num_items)
+
+    media = {
+        "image": [np.array([1], dtype=np.uint8)],
+        "video": [VideoData(frames=[np.full((2, 2, 3), 2, dtype=np.uint8)], metadata={})],
+        "audio": [AudioData(samples=np.array([0.25, -0.5], dtype=np.float32), sample_rate=16000)],
+    }
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {key: value for key, value in media.items() if key in modalities},
+        "mm_item_order": [
+            {"modality": modality, "index": 0, "placeholder": f"<{modality}>"}
+            for modality in modalities
+        ],
+    }
+    if use_uuids:
+        inputs["multi_modal_uuids"] = {modality: [f"{modality}-id"] for modality in modalities}
+
+    actual_token_ids, extra = create_input_processor_with_hash(Processor())(inputs, None)
+
+    assert actual_token_ids == token_ids
+    data = extra["multimodal_data"]
+    cumsum = data["multimodal_embed_mask_cumsum"]
+    assert cumsum.dtype == torch.int64
+    assert cumsum.device.type == "cpu"
+    assert cumsum.tolist() == expected_cumsum
+    assert data["mm_bidirectional_blocks"] is True
+    assert data["multimodal_embedding_lengths"] == [2] * num_items
+    assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalEncoderItemMetadata(
+        item_refs, [4] * num_items, [2] * num_items
+    )
+    if not hashing_enabled:
+        assert "multimodal_input" not in extra
+        return
+
+    mm_input = extra["multimodal_input"]
+    hashes = _UUID_HASH_SNAPSHOT if use_uuids else _CONTENT_HASH_SNAPSHOT
+    assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    assert mm_input.multimodal_uuids == (
+        [f"{modality}-id" for modality in modalities] if use_uuids else None
+    )
+    assert mm_input.multimodal_positions == [1 + 3 * index for index in range(num_items)]
+    assert mm_input.multimodal_lengths == [2 + len(special_ids or [])] * num_items
+    assert (
+        mm_input.multimodal_item_run_cu_offsets,
+        mm_input.multimodal_run_positions,
+        mm_input.multimodal_run_lengths,
+    ) == expected_runs
+    if special_ids:
+        assert data["special_token_offsets"] == [1]
 
 
 def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
