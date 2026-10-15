@@ -451,8 +451,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # Non-DP tp x cp gathers over the world behind the same predicate and
             # goes through the same step, which lines up its CP ranks but not its
             # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP. The PP loop is not covered: under attention DP with
-            # tp > 1 its first-stage ranks admit from their own schedule.
+            # can without CP. The PP loop does not align admission, so
+            # _check_compatible rejects attention DP with both CP and PP.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
@@ -1641,11 +1641,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._wait_reqs[rid]
 
     def _check_compatible(self):
-        if self._mapping.cp_size != 1 and not self._mapping.has_cp_helix():
+        m = self._mapping
+        if m.cp_size != 1 and not m.has_cp_helix():
             raise ValueError(
                 f"KvCacheTransceiverV2: _check_compatible: unsupported context parallelism "
-                f"(cp_size={self._mapping.cp_size}, cp_type={self._mapping.cp_config.get('cp_type')}); "
+                f"(cp_size={m.cp_size}, cp_type={m.cp_config.get('cp_type')}); "
                 f"only cp_size == 1 or helix CP is supported"
+            )
+        # Under attention DP the gen-side completion consensus spans the CP x PP
+        # ranks of a DP group, so they must admit the same gen-init requests in
+        # the same iteration. Only the pp=1 executor loops align that admission
+        # (DisaggTransferCoordinator.align_gen_admission_across_cp); in the PP
+        # loop a CP rank can admit a request its peers did not and enter the
+        # consensus collective alone.
+        if m.enable_attention_dp and m.cp_size > 1 and m.pp_size > 1:
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support attention DP with helix "
+                f"context parallelism when pp_size > 1 (got pp_size={m.pp_size}). "
+                "Set pipeline_parallel_size=1 or enable_attention_dp=False."
             )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:

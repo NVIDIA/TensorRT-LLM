@@ -74,23 +74,23 @@ def test_adp_with_helix_cp_syncs_across_cp_group() -> None:
     assert tc._gen_consensus([1, 2]) == [1]
 
 
-def test_adp_with_helix_cp_and_pp_syncs_across_both() -> None:
-    """Attention-DP + helix CP + PP gathers over CP first, then PP."""
-    # cp=2, pp=2: cp_allgather returns the two CP ranks of this PP stage,
-    # pp_allgather then stacks the other PP stage's CP pair on top.
-    dist = SimpleNamespace(
-        allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
-        cp_allgather=lambda payload: [payload, [1, 3]],
-        pp_allgather=lambda gathered: [gathered, [[1], [1, 2]]],
-    )
-    tc = _transceiver(
-        _mapping(tp_size=1, cp_size=2, pp_size=2, world_size=4, enable_attention_dp=True),
-        dist,
+def test_adp_with_cp_and_pp_is_rejected() -> None:
+    """The Python transceiver rejects attention-DP with both CP and PP.
+
+    Only the pp=1 executor loops align gen-init admission across the CP ranks.
+    """
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = _mapping(
+        tp_size=2,
+        cp_size=2,
+        pp_size=2,
+        world_size=8,
+        enable_attention_dp=True,
+        has_cp_helix=lambda: True,
     )
 
-    assert tc._gen_need_sync is True
-    # Consensus needs all pp_size * cp_size == 4 ranks to agree.
-    assert tc._gen_consensus([1, 2, 3]) == [1]
+    with pytest.raises(ValueError, match=r"pp_size > 1"):
+        tc._check_compatible()
 
 
 def test_adp_consensus_outcome_completes_only_when_every_cp_rank_completed() -> None:

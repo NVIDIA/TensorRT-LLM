@@ -141,6 +141,7 @@ l0_h100:
   # Helix CP
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_accepts_attention_dp_with_helix_cp
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_rejects_attention_dp_with_helix_cp_under_pp
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
