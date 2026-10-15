@@ -47,17 +47,22 @@ elsewhere):
   does not pass it to the dense attention backend.
 - Vision/text encoders (SigLip/Radio/CLIP/Parakeet, MiniMax-VL tower) collapse
   onto the bidirectional MHA tuples already listed (e.g. 16x64 / 12x64 full).
-- Sparse indexer kernels are covered in depth under ``sparse/``. This model
-  sweep runs the production indexer on every backend over shared weights, so it
-  validates selection and the selected-attention path against the Vanilla
-  golden together.
+- Sparse indexer kernels are covered in depth under ``sparse/``. For DSA this
+  model sweep runs the production indexer on every backend over shared weights,
+  so it validates selection and the selected-attention path against the Vanilla
+  golden together. DeepSeek-V4 cases inject one ratio-4 selection into every
+  backend; its indexer is covered under ``sparse/`` alone.
 - Multimodal cross variants (Llama4-vision, Gemma4-MM) reuse the cross tuples.
 """
 
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    SparseAttentionConfig,
+)
 
 AttentionPhase = Literal["ctx", "gen"]
 
@@ -537,6 +542,32 @@ _MLA = [
             index_n_heads=64,
             index_head_dim=128,
             index_topk=128,
+            skip_indexer_for_short_seqs=False,
+        ),
+    ),
+    # DeepSeek-V4 ratio-4 layers: a 128-token sliding window plus compressed
+    # entries the indexer selects. Values are the full 512-wide latent rows. The
+    # sweep uses a reduced top-k to keep the case small; the native DeepSeek-V4
+    # tests cover the production top-k and the ratio-1/128 layers.
+    ModelAttnConfig(
+        "deepseekv4_sparse_mla",
+        "DeepSeek-V4 ratio-4 layers",
+        num_heads=64,
+        num_kv_heads=1,
+        head_dim=512,
+        rope="gptj",
+        is_mla=True,
+        kv_lora_rank=448,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+        hidden_size=7168,
+        sparse_attention_config=DeepSeekV4SparseAttentionConfig(
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=8,
+            compress_ratios=[4],
             skip_indexer_for_short_seqs=False,
         ),
     ),

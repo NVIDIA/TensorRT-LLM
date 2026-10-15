@@ -23,6 +23,7 @@ from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionBackend,
     AttentionForwardArgs,
     AttentionInputType,
     PositionalEmbeddingParams,
@@ -30,7 +31,12 @@ from tensorrt_llm._torch.attention.backends.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4AttentionType
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSABackendForwardArgs
+from tensorrt_llm._torch.attention.backends.sparse.params import (
+    SparseBackendForwardArgs,
+    SparseParams,
+)
 from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -53,10 +59,17 @@ BF16_RTOL = 3e-3
 # differ from the fp16 golden by ~0.1-0.4. Matches test_attention_mla.py (fp8=4e-1).
 FP8_ATOL = 4e-1
 FP4_ATOL = 6e-1
-# Golden-vs-backend tolerance for selected sparse MLA (bf16 latent-gather
+# Golden-vs-backend tolerance for DSA selected sparse MLA (bf16 latent-gather
 # accumulation).
 SPARSE_ATOL = 1e-1
 SPARSE_RTOL = 1e-2
+# DeepSeek-V4 also attends the 512-wide latent values, RoPE slice included,
+# under a per-head sink; same bound as the TRTLLM-vs-reference checks in
+# sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py.
+DEEPSEEK_V4_SPARSE_ATOL = 2e-1
+DEEPSEEK_V4_SPARSE_RTOL = 2e-2
+# DeepSeek-V4 checkpoint vocabulary size, a required DeepseekV4CacheManager argument.
+DEEPSEEK_V4_VOCAB_SIZE = 129280
 
 # Backends compared against the VanillaAttention golden. FlashInfer is only
 # included when available, so callers can iterate this list unconditionally.
@@ -201,6 +214,11 @@ class BackendCase:
     @property
     def max_num_tokens(self) -> int:
         """Metadata token capacity needed by the largest packed tensor in the case."""
+        sparse_config = self.sparse_attention_config
+        if sparse_config is not None and sparse_config.algorithm == "deepseek_v4":
+            # DeepseekV4CacheManager splits its pool quota between context and
+            # generation tokens by max_num_tokens, so size it to this case.
+            return max(self.nnz_q, self.nnz_kv, *self.token_nums)
         return max(DEFAULT_MAX_NUM_TOKENS, self.nnz_q, self.nnz_kv, *self.token_nums)
 
     def to_dict(self) -> dict:
@@ -338,6 +356,15 @@ def _build_mla_kv_cache_manager(
     if sparse_config is not None:
         cls = get_sparse_attn_kv_cache_manager(sparse_config)
         kwargs.update(sparse_attention_config=sparse_config)
+        if sparse_config.algorithm == "deepseek_v4":
+            kwargs.update(
+                compressor_dtype=tensorrt_llm.bindings.DataType.FLOAT,
+                vocab_size=DEEPSEEK_V4_VOCAB_SIZE,
+                # add_dummy_requests prefills every request as a prompt of
+                # its full token count, cached prefix included.
+                max_input_len=max(case.token_nums),
+                max_num_tokens=case.max_num_tokens,
+            )
     else:
         cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
 
@@ -720,6 +747,49 @@ def _seed_indexer_k_cache(
     )
 
 
+def _sparse_phase_slices(case: BackendCase) -> List[tuple[AttentionInputType, slice]]:
+    """Return the (phase type, packed-token slice) pairs a sparse MLA module runs.
+
+    Sparse MLA modules call the backend once per phase, context first.
+    """
+    num_context_tokens = sum(case.seq_lens[: case.num_contexts])
+    phases = []
+    if case.num_contexts:
+        phases.append((AttentionInputType.context_only, slice(0, num_context_tokens)))
+    if case.num_contexts < case.num_seqs:
+        phases.append((AttentionInputType.generation_only, slice(num_context_tokens, case.nnz_q)))
+    return phases
+
+
+def _create_sparse_mla_attention(
+    case: BackendCase, backend: str, sparse_params: SparseParams, *, v_head_dim: int
+) -> AttentionBackend:
+    """Build an absorbed sparse MLA backend through the factory the MLA module uses.
+
+    Weights are skipped; callers create the ones their case needs.
+    """
+    return create_attention(
+        backend,
+        layer_idx=0,
+        num_heads=case.num_heads,
+        head_dim=case.kv_lora_rank + case.qk_rope_head_dim,
+        num_kv_heads=1,
+        q_scaling=case.q_scaling,
+        pos_embd_params=_mla_context_pos_embd_params(case),
+        is_mla_enable=True,
+        q_lora_rank=case.q_lora_rank,
+        kv_lora_rank=case.kv_lora_rank,
+        qk_nope_head_dim=case.qk_nope_head_dim,
+        qk_rope_head_dim=case.qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        hidden_size=case.hidden_size,
+        predicted_tokens_per_seq=1,
+        sparse_params=sparse_params,
+        dtype=case.compute_dtype,
+        skip_create_weights_in_init=True,
+    )
+
+
 def _run_sparse_mla_backend(
     case: BackendCase,
     backend: str,
@@ -747,31 +817,10 @@ def _run_sparse_mla_backend(
     sparse_metadata_params = sparse_config.to_sparse_metadata_params(pretrained_config=None)
     AttentionCls = get_attention_backend(backend, sparse_params=sparse_params)
     request_ids = list(range(case.num_seqs))
-    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
-    pos_embd_params = _mla_context_pos_embd_params(case)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    attn = create_attention(
-        backend,
-        layer_idx=0,
-        num_heads=case.num_heads,
-        head_dim=d_latent,
-        num_kv_heads=1,
-        q_scaling=case.q_scaling,
-        pos_embd_params=pos_embd_params,
-        is_mla_enable=True,
-        q_lora_rank=case.q_lora_rank,
-        kv_lora_rank=case.kv_lora_rank,
-        qk_nope_head_dim=case.qk_nope_head_dim,
-        qk_rope_head_dim=case.qk_rope_head_dim,
-        # Selected sparse MLA returns latent values; the model's V projection
-        # lives outside the standalone backend, so v_head_dim is the latent width.
-        v_head_dim=case.kv_lora_rank,
-        hidden_size=case.hidden_size,
-        predicted_tokens_per_seq=1,
-        sparse_params=sparse_params,
-        dtype=case.compute_dtype,
-        skip_create_weights_in_init=True,
-    )
+    # Selected sparse MLA returns latent values; the model's V projection lives
+    # outside the standalone backend, so v_head_dim is the latent width.
+    attn = _create_sparse_mla_attention(case, backend, sparse_params, v_head_dim=case.kv_lora_rank)
     # update_quant_config initializes the quant/FMHA state needed before forward;
     # _create_indexer then materializes the indexer weights it skipped.
     attn.update_quant_config(None)
@@ -821,18 +870,9 @@ def _run_sparse_mla_backend(
             make_position_ids(case.seq_lens, case.num_cached_tokens),
         )
 
-        num_context_tokens = sum(case.seq_lens[: case.num_contexts])
-        phases = []
-        if case.num_contexts:
-            phases.append((AttentionInputType.context_only, slice(0, num_context_tokens)))
-        if case.num_contexts < case.num_seqs:
-            phases.append(
-                (AttentionInputType.generation_only, slice(num_context_tokens, case.nnz_q))
-            )
-
         outputs = []
         native_phase_outputs = []
-        for attention_input_type, token_slice in phases:
+        for attention_input_type, token_slice in _sparse_phase_slices(case):
             # Both DSA backends own context RoPE, so context receives raw
             # inputs. The standalone generation harness does not invoke the
             # module's mla_rope_generation hook and therefore feeds generation
@@ -920,6 +960,261 @@ def _run_sparse_mla_backend(
                 : case.nnz_q
             ].contiguous()
         return output
+    finally:
+        mgr.shutdown()
+
+
+def _build_deepseek_v4_topk_indices(
+    case: BackendCase, generator: torch.Generator, compress_ratio: int
+) -> torch.Tensor:
+    """Return int32 [nnz_q, index_topk] ratio-4 selections in the indexer's contract.
+
+    Row t lists up to ``index_topk`` distinct compressed entries visible to its
+    token, ``e < (p + 1) // compress_ratio``, in ascending order, then -1.
+    """
+    topk = case.sparse_attention_config.index_topk
+    indices = torch.full((case.nnz_q, topk), -1, dtype=torch.int32, device="cuda")
+    row = 0
+    for cached_len, q_len in zip(case.num_cached_tokens, case.seq_lens, strict=True):
+        for position in range(cached_len, cached_len + q_len):
+            num_visible = (position + 1) // compress_ratio
+            count = min(topk, num_visible)
+            selected = torch.randperm(num_visible, generator=generator, device="cuda")[:count]
+            indices[row, :count] = torch.sort(selected).values.to(torch.int32)
+            row += 1
+    return indices
+
+
+def _generate_deepseek_v4_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
+    """Generate raw DeepSeek-V4 inputs shared by every backend, plus their cached state.
+
+    Every DeepSeek-V4 backend owns RoPE, so the new tokens' query and latent rows
+    are unrotated. ``cached_latent`` holds each request's prefix as the SWA pool
+    stores it (k_pe rotated at its position), ``compressed_latent`` the COMPRESS
+    rows of every entry visible after this step, and ``topk_indices`` the ratio-4
+    selection injected into every backend.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    cdt = case.compute_dtype
+    num_heads = case.num_heads
+    kv_lora_rank = case.kv_lora_rank
+    qk_rope_head_dim = case.qk_rope_head_dim
+    d_latent = kv_lora_rank + qk_rope_head_dim
+    pos_embd_params = _mla_context_pos_embd_params(case)
+
+    def rotate(k_pe: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return apply_rope(
+            k_pe, positions, pos_embd_params.rope, qk_rope_head_dim, is_neox=pos_embd_params.is_neox
+        )
+
+    q_pe = _randn(gen, cdt, case.nnz_q, num_heads, qk_rope_head_dim)
+    q_nope = _randn(gen, cdt, case.nnz_q, num_heads, kv_lora_rank)
+    compressed_kv = _randn(gen, cdt, case.nnz_q, kv_lora_rank)
+    k_pe = _randn(gen, cdt, case.nnz_q, qk_rope_head_dim)
+    new_positions = make_position_ids(case.seq_lens, case.num_cached_tokens)
+
+    cached_latent = []
+    for cached_len in case.num_cached_tokens:
+        cached_k_pe = _randn(gen, cdt, cached_len, qk_rope_head_dim)
+        if cached_len:
+            cached_positions = torch.arange(cached_len, dtype=torch.int32, device="cuda")
+            cached_k_pe = rotate(cached_k_pe, cached_positions)
+        cached_latent.append(
+            torch.cat((_randn(gen, cdt, cached_len, kv_lora_rank), cached_k_pe), dim=-1)
+        )
+
+    sparse_params = case.sparse_attention_config.to_sparse_params(
+        layer_idx=None, pretrained_config=None
+    )
+    compress_ratio = sparse_params.compress_ratios[0]
+    return dict(
+        fused_q=torch.cat((q_nope, q_pe), dim=-1).reshape(case.nnz_q, num_heads * d_latent),
+        q_pe=q_pe,
+        latent_cache=torch.cat((compressed_kv, k_pe), dim=-1),
+        expected_new_latent=torch.cat((compressed_kv, rotate(k_pe, new_positions)), dim=-1),
+        cached_latent=cached_latent,
+        compressed_latent=[
+            _randn(gen, cdt, token_count // compress_ratio, d_latent)
+            for token_count in case.token_nums
+        ],
+        topk_indices=_build_deepseek_v4_topk_indices(case, selection_gen, compress_ratio),
+        attention_sinks=torch.randn(num_heads, generator=gen, device="cuda") * 0.5,
+    )
+
+
+def _deepseek_v4_pool_rows(
+    mgr,
+    layer_idx: int,
+    request_id: int,
+    attention_type: DeepseekV4AttentionType,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return a DeepSeek-V4 pool [pages, tokens, dim] and the (page, row) of ``indices``.
+
+    ``indices`` are request-local positions (SWA) or entries (COMPRESS).
+    """
+    buffer = mgr.get_buffers(layer_idx, attention_type)
+    tokens_per_page = buffer.shape[1]
+    block_ids = torch.tensor(
+        mgr.get_cache_indices(request_id, layer_idx, attention_type),
+        dtype=torch.long,
+        device=buffer.device,
+    )
+    return buffer, block_ids[indices // tokens_per_page], indices % tokens_per_page
+
+
+def _fill_deepseek_v4_cache(
+    mgr,
+    layer_idx: int,
+    request_ids: List[int],
+    cached_latent: List[torch.Tensor],
+    compressed_latent: List[torch.Tensor],
+) -> None:
+    """Store each request's cached prefix in the SWA pool and its entries in COMPRESS."""
+    for attention_type, rows_per_request in (
+        (DeepseekV4AttentionType.SWA, cached_latent),
+        (DeepseekV4AttentionType.COMPRESS, compressed_latent),
+    ):
+        for request_id, rows in zip(request_ids, rows_per_request, strict=True):
+            indices = torch.arange(rows.shape[0], device=rows.device)
+            buffer, pages, offsets = _deepseek_v4_pool_rows(
+                mgr, layer_idx, request_id, attention_type, indices
+            )
+            buffer[pages, offsets, : rows.shape[-1]] = rows.to(buffer.dtype)
+
+
+def _assert_deepseek_v4_swa_contains_new_tokens(
+    mgr,
+    layer_idx: int,
+    request_ids: List[int],
+    case: BackendCase,
+    expected_new_latent: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Assert the backend stored every new token's rotated latent row in the SWA pool."""
+    for request_id, cached_len, expected in zip(
+        request_ids,
+        case.num_cached_tokens,
+        _split_packed_tokens(expected_new_latent, case.seq_lens),
+        strict=True,
+    ):
+        positions = torch.arange(cached_len, cached_len + expected.shape[0], device=expected.device)
+        buffer, pages, offsets = _deepseek_v4_pool_rows(
+            mgr, layer_idx, request_id, DeepseekV4AttentionType.SWA, positions
+        )
+        torch.testing.assert_close(
+            buffer[pages, offsets, : expected.shape[-1]].float(),
+            expected.to(buffer.dtype).float(),
+            atol=atol,
+            rtol=rtol,
+        )
+
+
+def _run_deepseek_v4_sparse_mla_backend(
+    case: BackendCase, backend: str, inputs: Dict, *, kv_layout: str
+) -> torch.Tensor:
+    """Run DeepSeek-V4 selected sparse MLA the way the DeepSeek-V4 module does.
+
+    Every backend receives the same raw inputs and owns RoPE: context rotates
+    inside ``forward``, while generation first calls ``mla_rope_generation``,
+    which rotates the query and appends the rotated latent. The SWA and COMPRESS
+    pools are prefilled and the ratio-4 selection is injected, so a case covers
+    the backend's own work: RoPE, the SWA append and dual-pool attention with a
+    sink. Each call builds its own cache manager.
+    """
+    sparse_config = case.sparse_attention_config
+    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(pretrained_config=None)
+    AttentionCls = get_attention_backend(backend, sparse_params=sparse_params)
+    request_ids = list(range(case.num_seqs))
+    # DeepSeek-V4 values are the full latent rows, RoPE slice included.
+    attn = _create_sparse_mla_attention(
+        case, backend, sparse_params, v_head_dim=case.kv_lora_rank + case.qk_rope_head_dim
+    )
+    # The indexer and compressor weights stay uncreated: selections are injected
+    # and the COMPRESS pool is prefilled. update_quant_config initializes the
+    # quant/FMHA state the forward needs.
+    attn.update_quant_config(None)
+    mgr = _build_mla_kv_cache_manager(case, backend, sparse_config)
+
+    try:
+        mgr.add_dummy_requests(request_ids, case.token_nums)
+        _fill_deepseek_v4_cache(
+            mgr, 0, request_ids, inputs["cached_latent"], inputs["compressed_latent"]
+        )
+        metadata = _make_sparse_metadata(
+            AttentionCls,
+            case,
+            mgr,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            case.num_contexts,
+            case.prompt_lens,
+            kv_layout=kv_layout,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            sparse_metadata_params=sparse_metadata_params,
+        )
+
+        outputs = []
+        for attention_input_type, token_slice in _sparse_phase_slices(case):
+            fused_q = inputs["fused_q"][token_slice].clone()
+            q_pe = inputs["q_pe"][token_slice].clone()
+            latent_cache = inputs["latent_cache"][token_slice].clone()
+            forward_args = AttentionForwardArgs(
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+                attention_sinks=inputs["attention_sinks"],
+                sparse_backend_args=SparseBackendForwardArgs(
+                    topk_indices=inputs["topk_indices"][token_slice]
+                ),
+                attention_input_type=attention_input_type,
+            )
+            if attention_input_type == AttentionInputType.generation_only:
+                forward_args.cu_q_seqlens = torch.empty(
+                    metadata.num_seqs + 1, dtype=torch.int32, device="cuda"
+                )
+                forward_args.cu_kv_seqlens = torch.empty_like(forward_args.cu_q_seqlens)
+                forward_args.fmha_scheduler_counter = torch.empty(
+                    1, dtype=torch.uint32, device="cuda"
+                )
+                attn.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    metadata,
+                    forward_args.cu_q_seqlens,
+                    forward_args.cu_kv_seqlens,
+                    forward_args.fmha_scheduler_counter,
+                    None,
+                    None,
+                    None,
+                )
+            out = attn.forward(fused_q, None, None, metadata, forward_args=forward_args)
+            if backend == "TRTLLM":
+                runtime_params = forward_args.sparse_runtime_params
+                assert runtime_params.sparse_attn_indices is not None
+                assert (
+                    runtime_params.sparse_attn_indices_block_size
+                    == sparse_params.indices_block_size
+                )
+            # Preserve each phase before the next phase can reuse its workspace.
+            outputs.append((out[0] if isinstance(out, tuple) else out).clone())
+
+        cache_atol, cache_rtol = _tolerances(case, case.compute_dtype)
+        _assert_deepseek_v4_swa_contains_new_tokens(
+            mgr,
+            0,
+            request_ids,
+            case,
+            inputs["expected_new_latent"],
+            atol=cache_atol,
+            rtol=cache_rtol,
+        )
+        return torch.cat(outputs, dim=0)[: case.nnz_q].contiguous()
     finally:
         mgr.shutdown()
 
@@ -1225,7 +1520,11 @@ def _tolerances(case: "BackendCase", kv_dtype) -> tuple:
     quantized atol gets extra headroom and the rtol relaxes to the bf16 rtol.
     """
     if case.is_sparse:
-        return SPARSE_ATOL, SPARSE_RTOL
+        algorithm = case.sparse_attention_config.algorithm
+        if algorithm == "dsa":
+            return SPARSE_ATOL, SPARSE_RTOL
+        if algorithm == "deepseek_v4":
+            return DEEPSEEK_V4_SPARSE_ATOL, DEEPSEEK_V4_SPARSE_RTOL
 
     bf16 = case.compute_dtype == torch.bfloat16
     if kv_dtype == torch.float8_e4m3fn:
@@ -1553,7 +1852,8 @@ def run_backend(
     matrix). MLA cases are dispatched to the absorbed-generation path.
     """
     if case.is_sparse:
-        if case.is_mla:
+        algorithm = case.sparse_attention_config.algorithm
+        if algorithm == "dsa":
             return _run_sparse_mla_backend(
                 case,
                 backend,
@@ -1563,7 +1863,9 @@ def run_backend(
                 indexer_topk_override=sparse_topk_override,
                 native_outputs=sparse_native_outputs,
             )
-        raise ValueError(f"Unsupported sparse contract: is_mla={case.is_mla}")
+        if algorithm == "deepseek_v4":
+            return _run_deepseek_v4_sparse_mla_backend(case, backend, inputs, kv_layout=kv_layout)
+        raise ValueError(f"Unsupported sparse algorithm: {algorithm}")
 
     if case.is_mla:
         if case.is_context_only:
@@ -1748,21 +2050,24 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     Handles both standard attention and absorbed-MLA generation (dispatched
     inside ``run_backend``). The Vanilla golden always runs in its native NHD
     layout; each backend under test runs in the case's requested layout (or HND).
-    Sparse cases compare each backend's Indexer selection against Vanilla by
+    DSA cases compare each backend's Indexer selection against Vanilla by
     set overlap, run attention with Vanilla's exact selection to isolate the
     attention implementation, and retain a bounded end-to-end check with the
-    backend's own selection.
+    backend's own selection. DeepSeek-V4 cases inject one selection into every
+    backend.
     A gen-only batch is additionally replayed through a captured CUDA graph.
 
     Returns the per-backend outputs (including ``"VANILLA"`` golden) for callers
     that want the raw tensors (e.g. the minimizer).
     """
     is_mla = case.is_mla
-    if case.is_sparse:
-        if case.is_mla:
-            inputs = generate_sparse_mla_inputs(case, seed)
-        else:
-            raise ValueError(f"Unsupported sparse contract: is_mla={case.is_mla}")
+    algorithm = case.sparse_attention_config.algorithm if case.is_sparse else None
+    if algorithm == "dsa":
+        inputs = generate_sparse_mla_inputs(case, seed)
+    elif algorithm == "deepseek_v4":
+        inputs = _generate_deepseek_v4_sparse_mla_inputs(case, seed)
+    elif case.is_sparse:
+        raise ValueError(f"Unsupported sparse algorithm: {algorithm}")
     elif is_mla:
         if case.is_context_only:
             inputs = generate_mla_context_inputs(case, seed)
@@ -1770,7 +2075,8 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
             inputs = generate_mla_gen_inputs(case, seed)
     else:
         inputs = generate_inputs(case, seed)
-    golden_indexer_outputs = {} if case.is_sparse else None
+    compare_indexers = algorithm == "dsa"
+    golden_indexer_outputs = {} if compare_indexers else None
     golden = run_backend(
         case,
         "VANILLA",
@@ -1791,8 +2097,8 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         # Fused RoPE only applies to TRTLLM (the sole support_fused_rope backend).
         fuse_rope = case.fused_rope and backend == "TRTLLM"
         layout = case.kv_layout or "HND"  # native for TRTLLM/FlashInfer
-        backend_indexer_outputs = {} if case.is_sparse else None
-        backend_native_outputs = {} if case.is_sparse else None
+        backend_indexer_outputs = {} if compare_indexers else None
+        backend_native_outputs = {} if compare_indexers else None
         out = run_backend(
             case,
             backend,
@@ -1807,7 +2113,7 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         results[backend] = out
 
         atol, rtol = _tolerances(case, kv_dtype)
-        if case.is_sparse:
+        if compare_indexers:
             try:
                 _assert_sparse_indexer_matches_golden(
                     backend_indexer_outputs,

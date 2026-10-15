@@ -28,6 +28,10 @@ from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+    DEEPSEEK_V4_SPARSE_RATIO,
+)
+
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
 _BF16 = ("bfloat16", None)
@@ -83,15 +87,31 @@ def _phases_from_window(window: int) -> dict:
 _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
-# Model-agnostic sparse sweep dimensions, shared by every sparse config.
+# Model-agnostic sparse sweep dimensions: bf16 compute, plus the KV layout,
+# page size and KV-cache manager V2 flag each algorithm's cache manager takes.
 _SPARSE_COMPUTE_DTYPE = "bfloat16"
-_SPARSE_KV_LAYOUT = "HND"
-_SPARSE_PAGE_SIZE = 64
-_SPARSE_USE_KVM_V2 = False
+# Every sparse algorithm in the sweep needs an entry in both tables below.
+_SPARSE_SWEEP_DIMS = {
+    "dsa": ("HND", 64, False),
+    # A DeepSeek-V4 page holds one full 128-token sliding window, and its cache
+    # manager is built on KV-cache manager V2.
+    "deepseek_v4": ("HND", 128, True),
+}
+# Lowest SM each sparse algorithm's sweep runs on. DSA's TRTLLM sparse FMHA is
+# Blackwell-only, although its Vanilla golden also serves the module's FlashMLA
+# path below SM100. DeepSeek-V4's cache manager and Vanilla golden need SM100.
+_SPARSE_MIN_SM_VERSION = {"dsa": 100, "deepseek_v4": 100}
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
-    if cfg.sparse_attention_config is not None:
+    sparse_config = cfg.sparse_attention_config
+    if sparse_config is not None and sparse_config.algorithm == "deepseek_v4":
+        # Two sliding windows plus the ratio-4 top-k span: long rows see a
+        # truncated window spread over several pages and more compressed
+        # entries than top-k keeps.
+        long_len = 2 * sparse_config.window_size + DEEPSEEK_V4_SPARSE_RATIO * cfg.sparse_topk
+        return _phases(long_len + 32, gen_len=1)
+    if sparse_config is not None:
         return _phases(cfg.sparse_topk + 32, gen_len=1)
     if cfg.mask != "sliding":
         return _PHASES
@@ -158,24 +178,23 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     common = _common(cfg)
     phases = _phases_for(cfg)
 
-    # Sparse cases use one model-agnostic sweep (bf16 latent cache, fixed layout/
-    # page/manager). Every backend runs its own indexer over shared weights, so
-    # a case covers selection and execution together; the phase lengths
-    # (top-k + 32) keep every long row genuinely sparse.
+    # Sparse cases use one model-agnostic sweep per algorithm (bf16 latent cache,
+    # the algorithm's layout/page/manager). DSA backends run their own indexers
+    # over shared weights, so a case covers selection and execution together;
+    # DeepSeek-V4 backends share one injected selection. The phase lengths keep
+    # every long row genuinely sparse.
     if cfg.sparse_attention_config is not None:
-        manager = "v2" if _SPARSE_USE_KVM_V2 else "v1"
-        tag = (
-            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
-            f"-p{_SPARSE_PAGE_SIZE}-{manager}"
-        )
+        kv_layout, page_size, use_v2 = _SPARSE_SWEEP_DIMS[cfg.sparse_attention_config.algorithm]
+        manager = "v2" if use_v2 else "v1"
+        tag = f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{kv_layout}-p{page_size}-{manager}"
         for phase_name in ("ctx", "gen", "mix"):
             yield (
                 f"{cfg.id}-{phase_name}-{tag}",
                 BackendCase(
-                    page_size=_SPARSE_PAGE_SIZE,
-                    kv_layout=_SPARSE_KV_LAYOUT,
+                    page_size=page_size,
+                    kv_layout=kv_layout,
                     dtype=_SPARSE_COMPUTE_DTYPE,
-                    use_kv_cache_manager_v2=_SPARSE_USE_KVM_V2,
+                    use_kv_cache_manager_v2=use_v2,
                     **phases[phase_name],
                     **common,
                 ),
@@ -271,11 +290,11 @@ MODEL_CASES = _model_cases()
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
     case = MODEL_CASES[name]
-    if case.is_sparse and getSMVersion() < 100:
-        # The backend matrix includes the TRTLLM trtllm-gen sparse FMHA, which
-        # is Blackwell-only. The Vanilla reference itself remains usable below
-        # SM100 through the module's FlashMLA dispatch.
-        pytest.skip(f"DSA requires sm>=100/Blackwell (have sm{getSMVersion()})")
+    if case.is_sparse:
+        algorithm = case.sparse_attention_config.algorithm
+        min_sm = _SPARSE_MIN_SM_VERSION[algorithm]
+        if getSMVersion() < min_sm:
+            pytest.skip(f"{algorithm} requires sm>={min_sm} (have sm{getSMVersion()})")
     run_case(case)
 
 
