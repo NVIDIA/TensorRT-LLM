@@ -47,6 +47,11 @@ add_gtest(kvCacheManagerV2ColdPageCopyTest
 target_include_directories(
   kvCacheManagerV2ColdPageCopyTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2BatchedPageCopierTest
+          "kvCacheManagerV2BatchedPageCopierTest.cu;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2BatchedPageCopierTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(coldPageCodecTest coldPageCodecTest.cpp)
 target_include_directories(
   coldPageCodecTest PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)

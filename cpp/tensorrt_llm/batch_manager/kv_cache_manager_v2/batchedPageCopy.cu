@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -77,6 +78,42 @@ constexpr double kOnboardGridMult = 1.45;
 //! Conservative link bandwidths used when NVML is unavailable.
 constexpr double kFallbackCoherentGBs = 223.6; //!< the narrower (2 GPUs per Grace) C2C config
 constexpr double kFallbackPcieGBs = 64.0;      //!< PCIe Gen5 x16, one direction
+
+//! Opt-in escape hatch: force the SM copy kernel path even when the copy engine would otherwise be
+//! selected. Set to "1" to enable. Useful for A/B perf comparisons and for older CUDA builds where
+//! cuMemcpyBatchAsync is not available.
+constexpr char const* kForceSMCopyEnv = "TRTLLM_KV_CACHE_FORCE_SM_COPY";
+
+//! Reads the force-SM-copy env var once (lazy static). Returns true iff the variable is set to "1".
+bool readForceSMCopyEnv()
+{
+    static bool const forced = tensorrt_llm::common::getBoolEnv(kForceSMCopyEnv);
+    return forced;
+}
+
+//! Selects whether the SM copy kernel is viable for this host-tier copy path.
+//!
+//! The decision tree is:
+//!   1. If the caller forced the SM kernel via TRTLLM_KV_CACHE_FORCE_SM_COPY → viable.
+//!   2. If HostMem uses chunked registration → viable (copy-engine descriptors cannot cross a
+//!      registration boundary; the kernel works on a contiguous virtual range and is indifferent).
+//!   3. Otherwise → NOT viable, the copy engine is always preferred.
+//!
+//! Historically the kernel was also selected on coherent NVLink-C2C links because it could match
+//! the raw bandwidth. That caused CUDA-graph replay idle gaps on SM107 (Grace), so coherent links
+//! now follow the same copy-engine default as PCIe.
+bool selectKernelViable(bool coherentLink [[maybe_unused]])
+{
+    if (readForceSMCopyEnv())
+    {
+        return true;
+    }
+    if (HostMem::shouldUseChunkedRegistration())
+    {
+        return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Kernel
@@ -763,23 +800,17 @@ void BatchedPageCopier::detect()
 
 void BatchedPageCopier::computeConfigs()
 {
-    // The kernel is used only on coherent (NVLink-C2C) links. On discrete PCIe it loses to the
-    // copy engine in both directions and on both architectures measured:
-    //
-    //   H100 PCIe Gen4  offload 8.56 vs 17.45 GiB/s (0.49x)   onboard 23.89 vs 23.88 (1.00x)
-    //   B200 PCIe Gen5  offload 25.13 vs 43.17 GiB/s (0.58x)  onboard 39.99 vs 42.58 (0.94x)
-    //
-    // The two have different causes. Hopper's SM->host store path is capped near 8.5 GiB/s in
-    // hardware, which no amount of pipelining or extra CTAs recovers. Blackwell has no such cap,
-    // but PCIe round-trip latency is high enough that a fixed 32 KiB in flight yields only
-    // ~13.5 GB/s per CTA (vs ~30 on C2C), so the grid sizing below under-provisions it. That is
-    // fixable with a per-link-class kPerCtaGBs, but the ceiling is the copy engine either way, so
-    // PCIe simply uses cuMemcpyBatchAsync -- which also costs zero SMs.
-    // Chunked host registration (a kernel-version workaround; see HostMem) breaks the copy-engine path,
-    // whose descriptors may not cross a registered region. The kernel works on virtual addresses
-    // and does not care, so chunking forces the kernel on regardless of link type -- accepting the
-    // PCIe slowdown above rather than reintroducing per-page splitting on the CPU.
-    bool const kernelViable = mTopology.coherentLink || HostMem::shouldUseChunkedRegistration();
+    // Path selection is delegated to selectKernelViable() above; see its doc comment for the full
+    // decision tree. The short version: the copy engine is the default for every host-tier copy
+    // path because it costs zero SMs and does not suffer the CUDA-graph replay idle-gap regression
+    // that the SM kernel exhibits on coherent NVLink-C2C links. The SM kernel remains viable only
+    // when forced by env or when chunked host registration forbids the copy-engine path.
+    bool const kernelViable = selectKernelViable(mTopology.coherentLink);
+
+    TLLM_LOG_INFO("BatchedPageCopier: device {} coherent={} chunkedHostReg={} forceSMEnv={} -> "
+                  "using {}",
+        mTopology.device, mTopology.coherentLink, HostMem::shouldUseChunkedRegistration(),
+        readForceSMCopyEnv(), kernelViable ? "SM kernel" : "copy engine");
 
     auto build = [&](int stages, double gridMult) -> KernelConfig
     {
