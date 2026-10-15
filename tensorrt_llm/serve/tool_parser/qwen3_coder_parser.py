@@ -1,10 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://raw.githubusercontent.com/sgl-project/sglang/d8fcbaa38da95201914a1277971044ee66837b26/python/sglang/srt/function_call/qwen3_coder_detector.py
 
 import ast
 import html
 import json
+import math
 import re
 from typing import Any, Dict, List, Tuple
+
+from jsonschema import exceptions, protocols, validators
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -14,6 +19,91 @@ from tensorrt_llm.serve.tool_parser.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+
+
+def _normalize_schema_type(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    value = value.strip().lower()
+    if value in ("str", "text", "varchar", "char", "enum"):
+        return "string"
+    if value.startswith(("int", "uint", "long", "short", "unsigned")):
+        return "integer"
+    if value.startswith(("num", "float")):
+        return "number"
+    if value in ("bool", "binary"):
+        return "boolean"
+    if value.startswith("dict"):
+        return "object"
+    if value == "arr" or value.startswith("list"):
+        return "array"
+    return value
+
+
+def _normalize_parameter_schema(schema: Any) -> Any:
+    """Normalize legacy type names only within schema nodes."""
+    if not isinstance(schema, dict):
+        return schema
+    if any(key in schema for key in ("$ref", "$dynamicRef", "$recursiveRef")):
+        raise ValueError("Parameter references require the enclosing tool schema.")
+    normalized = dict(schema)
+    if "type" in schema:
+        value = schema["type"]
+        normalized["type"] = (
+            [_normalize_schema_type(item) for item in value]
+            if isinstance(value, list)
+            else _normalize_schema_type(value)
+        )
+    for key in (
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    ):
+        if isinstance(schema.get(key), dict):
+            normalized[key] = {
+                name: _normalize_parameter_schema(child) for name, child in schema[key].items()
+            }
+    for key in (
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "prefixItems",
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ):
+        if key in schema:
+            value = schema[key]
+            normalized[key] = (
+                [_normalize_parameter_schema(child) for child in value]
+                if isinstance(value, list)
+                else _normalize_parameter_schema(value)
+            )
+    return normalized
+
+
+def _is_json_value(value: Any) -> bool:
+    """Reject Python literals whose JSON serialization would change their types."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
 
 
 class Qwen3CoderToolParser(BaseToolParser):
@@ -44,6 +134,7 @@ class Qwen3CoderToolParser(BaseToolParser):
             r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL
         )
         self._buf: str = ""
+        self._parameter_validators: dict[tuple[str, str], protocols.Validator | None] = {}
 
         # Streaming state variables
         self._current_function_name: str = ""
@@ -358,12 +449,12 @@ class Qwen3CoderToolParser(BaseToolParser):
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
-        """Convert parameter value based on its type in the schema."""
-        # Copy and modify from `vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py`.
-        param_value = html.unescape(param_value.strip())
-        if param_value.lower() == "null":
-            return None
+        """Preserve valid strings and accept only schema-valid conversions.
 
+        The exact token ``null`` denotes null when allowed by the schema.
+        ``None`` denotes null only when the schema rejects it as a string.
+        """
+        param_value = html.unescape(param_value.strip())
         if param_name not in param_config:
             if param_config != {}:
                 logger.warning(
@@ -372,72 +463,58 @@ class Qwen3CoderToolParser(BaseToolParser):
                 )
             return param_value
 
-        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
-            param_type = str(param_config[param_name]["type"]).strip().lower()
-        elif isinstance(param_config[param_name], dict) and "anyOf" in param_config[param_name]:
-            # anyOf has no top-level "type"; treat as object to trigger json.loads.
-            param_type = "object"
-        else:
-            param_type = "string"
+        schema = param_config[param_name]
+        if schema == {} or schema is True:
+            return param_value
+        key = (func_name, param_name)
+        if key not in self._parameter_validators:
+            try:
+                normalized = _normalize_parameter_schema(schema)
+                validator_type = validators.validator_for(normalized)
+                validator_type.check_schema(normalized)
+                self._parameter_validators[key] = validator_type(normalized)
+            except (exceptions.SchemaError, TypeError, ValueError):
+                self._parameter_validators[key] = None
+                logger.warning(
+                    f"Unsupported schema for parameter '{param_name}' in tool '{func_name}'; "
+                    "preserving its text."
+                )
+        validator = self._parameter_validators[key]
+        if validator is None:
+            return param_value
 
-        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+        if param_value == "null" and validator.is_valid(None):
+            return None
+        if validator.is_valid(param_value):
             return param_value
-        elif (
-            param_type.startswith("int")
-            or param_type.startswith("uint")
-            or param_type.startswith("long")
-            or param_type.startswith("short")
-            or param_type.startswith("unsigned")
-        ):
+        if param_value == "None" and validator.is_valid(None):
+            return None
+
+        for decode in (json.loads, int, float):
             try:
-                return int(param_value)
-            except (ValueError, TypeError):
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an "
-                    f"integer in tool '{func_name}', degenerating to string."
-                )
-                return param_value
-        elif param_type.startswith("num") or param_type.startswith("float"):
+                candidate = decode(param_value)
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if _is_json_value(candidate) and validator.is_valid(candidate):
+                return candidate
+        if param_value.lower() in ("true", "false"):
+            candidate = param_value.lower() == "true"
+            if validator.is_valid(candidate):
+                return candidate
+        if param_value.startswith(("{", "[")):
             try:
-                float_param_value = float(param_value)
-                return (
-                    float_param_value
-                    if float_param_value - int(float_param_value) != 0
-                    else int(float_param_value)
-                )
-            except (ValueError, TypeError):
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float "
-                    f"in tool '{func_name}', degenerating to string."
-                )
-                return param_value
-        elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean "
-                    f"(`true` or `false`) in tool '{func_name}', degenerating to false."
-                )
-            return param_value == "true"
-        else:
-            if (
-                param_type in ["object", "array", "arr"]
-                or param_type.startswith("dict")
-                or param_type.startswith("list")
-            ):
-                try:
-                    param_value = json.loads(param_value)
-                    return param_value
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    logger.warning(
-                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
-                        f"parsed with json.loads in tool '{func_name}', will try other methods to parse it."
-                    )
-            try:
-                param_value = ast.literal_eval(param_value)  # safer
+                candidate = ast.literal_eval(param_value)
             except (ValueError, SyntaxError, TypeError):
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
-                    f"converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
-                )
-            return param_value
+                pass
+            else:
+                if (
+                    isinstance(candidate, (dict, list))
+                    and _is_json_value(candidate)
+                    and validator.is_valid(candidate)
+                ):
+                    return candidate
+        logger.warning(
+            f"Cannot convert parameter '{param_name}' in tool '{func_name}' to its schema; "
+            "preserving its text."
+        )
+        return param_value
