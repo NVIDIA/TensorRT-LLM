@@ -44,10 +44,18 @@ The server is ready when the log shows `Application startup complete`. Then:
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
     "model": "/path/to/musespark-open-checkpoint",
     "messages": [{"role": "user", "content": "Where is New York?"}],
-    "max_tokens": 64,
-    "temperature": 0
+    "max_tokens": 1024,
+    "temperature": 0,
+    "reasoning_effort": "low"
 }' -w "\n"
 ```
+
+The checkpoint's chat template defaults to the highest reasoning effort
+(`xhigh`), and reasoning tokens count toward `max_tokens`, so a small budget can
+be spent entirely on reasoning and leave `content` empty. The request above sets
+`reasoning_effort` to `low`; raise the effort (`medium`, `high`, `xhigh`) and
+`max_tokens` together for harder prompts. With `--reasoning_parser musespark`,
+the reasoning is returned separately in `reasoning_content`.
 
 Guided decoding (JSON mode / JSON schema via the `xgrammar` backend) is
 enabled by `guided_decoding_backend: xgrammar` in `serve_config.yaml` and used

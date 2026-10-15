@@ -170,7 +170,9 @@ When the `Status: 200` code is returned, the server is ready for queries. Note t
 
 ### Basic Test
 
-After the TensorRT LLM server shows `Application startup complete`, you can send requests to the server:
+After the TensorRT LLM server shows `Application startup complete`, you can send requests to the server.
+
+The checkpoint's chat template defaults to the highest reasoning effort (`xhigh`), and reasoning tokens count toward `max_tokens`: at the default effort, a small `max_tokens` can be spent entirely on reasoning and leave `content` empty. The examples below set `"reasoning_effort": "low"`; raise the effort (`medium`, `high`, `xhigh`) and `max_tokens` together for harder prompts.
 
 ```shell
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -181,12 +183,13 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
             "content": "Where is New York?"
         }
     ],
-    "max_tokens": 64,
-    "temperature": 0
+    "max_tokens": 1024,
+    "temperature": 0,
+    "reasoning_effort": "low"
 }' -w "\n"
 ```
 
-The response should contain a `choices[0].message.content` field completing the request, plus a `usage` section with the token counts.
+The response should contain a `choices[0].message.content` field completing the request, plus a `usage` section with the token counts. With `--reasoning_parser musespark`, the model's reasoning is returned separately in `choices[0].message.reasoning_content`.
 
 ### Guided Decoding Test
 
@@ -196,10 +199,13 @@ With `guided_decoding_backend: xgrammar` in the configuration, constrained JSON 
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
     "model": "/path/to/musespark-open-checkpoint",
     "messages": [{"role": "user", "content": "Give me a city and its country as JSON."}],
-    "max_tokens": 128,
+    "max_tokens": 1024,
+    "reasoning_effort": "low",
     "response_format": {"type": "json_object"}
 }' -w "\n"
 ```
+
+With `--reasoning_parser musespark`, the model writes its reasoning before the constrained answer, so the reasoning tokens count toward `max_tokens` here as well; the JSON object is returned in `choices[0].message.content`.
 
 ## Benchmarking Performance
 
