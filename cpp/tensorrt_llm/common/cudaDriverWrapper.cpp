@@ -35,6 +35,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include <cuda.h>
 
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 
@@ -46,10 +47,10 @@ namespace common
 namespace
 {
 
-//! The wrapper shared by getInstance() and getInstanceIfLoaded(); it expires when the last user releases it.
-std::weak_ptr<CUDADriverWrapper>& loadedInstance()
+//! The wrapper published by getInstance() for getInstanceIfLoaded().
+std::atomic<std::weak_ptr<CUDADriverWrapper>>& loadedInstance()
 {
-    static std::weak_ptr<CUDADriverWrapper> instance;
+    static std::atomic<std::weak_ptr<CUDADriverWrapper>> instance;
     return instance;
 }
 
@@ -57,26 +58,21 @@ std::weak_ptr<CUDADriverWrapper>& loadedInstance()
 
 std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
 {
-    static std::mutex mutex;
-    std::shared_ptr<CUDADriverWrapper> result = loadedInstance().lock();
-    if (result)
-    {
-        return result;
-    }
-
-    std::lock_guard<std::mutex> const lock(mutex);
-    result = loadedInstance().lock();
-    if (!result)
-    {
-        result = std::shared_ptr<CUDADriverWrapper>(new CUDADriverWrapper());
-        loadedInstance() = result;
-    }
-    return result;
+    auto& loaded = loadedInstance();
+    static std::shared_ptr<CUDADriverWrapper> instance;
+    static std::once_flag flag;
+    std::call_once(flag,
+        [&loaded]
+        {
+            instance = std::shared_ptr<CUDADriverWrapper>(new CUDADriverWrapper());
+            loaded.store(instance);
+        });
+    return instance;
 }
 
 std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstanceIfLoaded()
 {
-    return loadedInstance().lock();
+    return loadedInstance().load().lock();
 }
 
 CUDADriverWrapper::CUDADriverWrapper()
