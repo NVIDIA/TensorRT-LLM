@@ -21,6 +21,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     modeling as M,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 Shell = M.ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
 
 MERGE = 2
