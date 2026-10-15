@@ -110,7 +110,7 @@ def test_only_replacing_multimodal_content_exempts_prompt_ids(multimodal_params,
     assert _multimodal_params_replace_prompt_ids(multimodal_params) is expected
 
 
-def _fake_llm(monkeypatch, *, encoder_decoder=False):
+def _fake_llm(monkeypatch, *, encoder_decoder=False, preprocess=None):
     """Just enough of a BaseLLM to drive generate_async up to the executor."""
     executor = MagicMock()
     executor.is_shutdown.return_value = False
@@ -126,6 +126,7 @@ def _fake_llm(monkeypatch, *, encoder_decoder=False):
         _is_encoder_decoder_model=lambda: encoder_decoder,
         _get_decoder_prompt_token_ids=lambda sampling_params: [0],
         _normalize_token_ids=lambda token_ids, name: list(token_ids),
+        _preprocess=preprocess,
     )
     llm._prompt_vocab_size = MethodType(BaseLLM._prompt_vocab_size, llm)
     llm._check_prompt_token_ids = MethodType(BaseLLM._check_prompt_token_ids, llm)
@@ -162,6 +163,16 @@ def test_generate_async_rejects_before_submission(monkeypatch, inputs, kwargs, e
     llm, executor = _fake_llm(monkeypatch, encoder_decoder=encoder_decoder)
     with pytest.raises(RequestError):
         BaseLLM.generate_async(llm, inputs, **kwargs)
+    executor.generate_async.assert_not_called()
+
+
+@pytest.mark.parametrize("inputs", ["a text prompt", [1, _VOCAB]], ids=["text", "token_ids"])
+def test_generate_async_rejects_raw_prompts_before_submission(monkeypatch, inputs):
+    preprocess = MagicMock(return_value=([1, _VOCAB], None, None, None))
+    llm, executor = _fake_llm(monkeypatch, preprocess=preprocess)
+    with pytest.raises(RequestError, match=f"Prompt token id {_VOCAB} is out of range"):
+        BaseLLM.generate_async(llm, inputs)
+    preprocess.assert_called_once()
     executor.generate_async.assert_not_called()
 
 
