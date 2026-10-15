@@ -9,7 +9,7 @@ import gc
 import inspect
 import math
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -27,6 +27,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import moe_comm_serving_timeouts
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -108,7 +109,6 @@ from ..common import (
     get_position_id_offset,
     get_top_level_model,
     make_scheduled_inputs,
-    moe_a2a_steady_state_budget_for_capture,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
     ship_multimodal_indices,
@@ -238,6 +238,61 @@ class ExtraInputsCollector:
 _NO_EXTRA_INPUTS = ExtraInputsCollector()
 
 
+class PrefillCompiledModel(torch.nn.Module):
+    """Share weights between eligible prefill/mixed and original eager paths.
+
+    The prefill flag includes the all-rank attention-DP decision and capture
+    ceiling. A decode-only rank must still compile when another rank prefills.
+    """
+
+    def __init__(self, eager_model: torch.nn.Module, compiled_model: torch.nn.Module) -> None:
+        """Keep eager and compiled entry points sharing the same model weights."""
+        super().__init__()
+        self.eager_model = eager_model
+        self._bypass_active = False
+        # The compiled callable references the same weights. Register only the
+        # eager tree so state_dict(), children() and _apply() visit it once.
+        object.__setattr__(self, "compiled_model", compiled_model)
+
+    def named_modules(
+        self,
+        memo: set[torch.nn.Module] | None = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, torch.nn.Module]]:
+        """Expose checkpoint-compatible module names for partial weight reloads."""
+        # Weight reloads match checkpoint prefixes against this traversal.
+        # Hide the eager_model prefix even with remove_duplicate=False.
+        yield from self.eager_model.named_modules(memo, prefix, remove_duplicate)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Use the compiled path only for globally eligible prefill batches."""
+        model = self.compiled_model if self.use_compiled_forward() else self.eager_model
+        return model(*args, **kwargs)
+
+    def use_compiled_forward(self) -> bool:
+        """Return whether the current forward should use torch.compile."""
+        return not self._bypass_active and get_per_request_prefill_cuda_graph_flag()
+
+    @contextmanager
+    def bypass(self) -> Iterator[None]:
+        """Temporarily force eager execution regardless of graph eligibility."""
+        previous = self._bypass_active
+        self._bypass_active = True
+        try:
+            yield
+        finally:
+            self._bypass_active = previous
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate model-specific attributes to the original eager model."""
+        # Epilogues can access transformer attributes after forward returns.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("eager_model"), name)
+
+
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
@@ -270,6 +325,13 @@ class DecoderRunner(ScheduledModelRunner):
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self.model = model
+        if config.compile_only_piecewise_graphs:
+            assert isinstance(model, DecoderModelForCausalLM), (
+                "compile_only_piecewise_graphs requires DecoderModelForCausalLM"
+            )
+            assert isinstance(model.model, PrefillCompiledModel), (
+                "compile_only_piecewise_graphs requires a PrefillCompiledModel decoder body"
+            )
         self.input_processor = input_processor
         self._model_caller = model_caller
         self.mapping = mapping
@@ -723,8 +785,11 @@ class DecoderRunner(ScheduledModelRunner):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if self._context_warmups_supported:
-            with self._warmup_timer.phase(
-                "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
@@ -752,8 +817,11 @@ class DecoderRunner(ScheduledModelRunner):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if self._context_warmups_supported and not self.mapping.has_cp_helix():
-            with self._warmup_timer.phase(
-                "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
@@ -762,8 +830,11 @@ class DecoderRunner(ScheduledModelRunner):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_timer.phase(
-                "mamba_hybrid", metrics=self._metrics, metric_name="mamba_hybrid_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "mamba_hybrid", metrics=self._metrics, metric_name="mamba_hybrid_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
@@ -773,25 +844,8 @@ class DecoderRunner(ScheduledModelRunner):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Warm up every graph shape before capturing any graph. Attention
-        # kernels can switch implementations at smaller batch sizes and require
-        # a larger workspace, so the first pass grows the workspace to its
-        # maximum size. The second pass runs the final per-shape warmup and
-        # captures without resizing the workspace.
-        # Capture with the steady-state MoE all-to-all budget: the timeout is a
-        # launch argument and is baked into every later replay.
-        with (
-            self._warmup_timer.phase("cuda_graph_capture"),
-            moe_a2a_steady_state_budget_for_capture(),
-        ):
-            with self.cuda_graph_runner.allow_capture():
-                self.cuda_graph_runner.is_warmup_only = True
-                try:
-                    self._run_cuda_graph_warmup(resource_manager)
-                finally:
-                    self.cuda_graph_runner.is_warmup_only = False
-                self.cuda_graph_runner.padding_dummy_requests = {}
-                self._run_cuda_graph_warmup(resource_manager)
+        with self._warmup_timer.phase("cuda_graph_capture"):
+            self._warmup_and_capture_cuda_graphs(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -815,10 +869,13 @@ class DecoderRunner(ScheduledModelRunner):
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
-            with self._warmup_timer.phase(
-                "memory_pool_prepop",
-                metrics=self._metrics,
-                metric_name="memory_pool_prepopulation_seconds",
+            with (
+                self._warmup_timer.phase(
+                    "memory_pool_prepop",
+                    metrics=self._metrics,
+                    metric_name="memory_pool_prepopulation_seconds",
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(resource_manager)
                 self._general_warmup(resource_manager, warmup_requests_configs)
@@ -979,7 +1036,8 @@ class DecoderRunner(ScheduledModelRunner):
         completion-flag deadline. It is a partial mitigation only: other
         first-touch compiles remain inside collective-bearing forwards, and some
         sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
+        The warmup MoE communication timeout (see ``moe_comm_timeout_guard.py``)
+        covers the general case.
 
         Only the fallback tactics are compiled -- what an eager, cache-miss
         forward selects. The runner's kernel cache key excludes m/n/k, so one
@@ -1907,6 +1965,27 @@ class DecoderRunner(ScheduledModelRunner):
         if should_capture_no_spec:
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes for draft_len in draft_lengths]
+
+    def _warmup_and_capture_cuda_graphs(self, resource_manager: ResourceManager) -> None:
+        """Warm up every CUDA-graph shape, then capture the graphs.
+
+        Attention kernels can switch implementations at smaller batch sizes and
+        require a larger workspace, so the first pass grows the workspace to its
+        maximum size without capturing. The second pass runs the final
+        per-shape warmup and captures without resizing the workspace.
+        """
+        with self.cuda_graph_runner.allow_capture():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
+                self._run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
+            self.cuda_graph_runner.padding_dummy_requests = {}
+            # Captured graphs keep the MoE communication timeouts that were
+            # current at capture, and serving replays them, so capture with the
+            # serving timeouts. The warmup-only pass above keeps the warmup ones.
+            with moe_comm_serving_timeouts():
+                self._run_cuda_graph_warmup(resource_manager)
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
@@ -4788,7 +4867,10 @@ class DecoderRunner(ScheduledModelRunner):
                     if needs_capture:
 
                         def capture_forward_fn(inputs: dict[str, Any]):
-                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                            with (
+                                self._maybe_bypass_torch_compile(bypass=True),
+                                MoeLoadBalancerIterContext(moe_load_balancer),
+                            ):
                                 return self._forward_step(
                                     inputs,
                                     enable_spec_decode=enable_spec_decode,
@@ -4848,6 +4930,15 @@ class DecoderRunner(ScheduledModelRunner):
                 return outputs
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
             return {**outputs, "runtime_draft_len": runtime_draft_len}
+
+    @contextmanager
+    def _maybe_bypass_torch_compile(self, bypass: bool = False) -> Iterator[None]:
+        """Force eager execution for auxiliary work and ordinary CUDA graphs."""
+        if not self._config.compile_only_piecewise_graphs or not bypass:
+            yield
+            return
+        with self.model.model.bypass():
+            yield
 
     def model_forward(self, *, is_dummy: bool, **kwargs):
         assert self._model_caller is not None

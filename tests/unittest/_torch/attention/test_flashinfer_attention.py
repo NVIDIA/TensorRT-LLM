@@ -22,10 +22,11 @@ from tensorrt_llm._torch.attention.backends.flashinfer import (
 from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -332,7 +333,7 @@ class TestFlashInferAttention(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=256),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -391,7 +392,7 @@ class TestFlashInferAttention(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=256),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -485,7 +486,7 @@ class TestFlashInferAttention(unittest.TestCase):
             self.skipTest("FlashInfer trtllm-gen requires SM100 or SM103")
 
         def create_manager():
-            return KVCacheManager(
+            return KVCacheManagerV2(
                 KvCacheConfig(max_tokens=256),
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=1,
@@ -660,7 +661,7 @@ class TestFlashInferAttention(unittest.TestCase):
 
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
@@ -674,7 +675,7 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-        for i in range(kv_cache_manager.num_layers):
+        for i in kv_cache_manager.layer_offsets:
             buf = kv_cache_manager.get_buffers(i)
             if buf is not None:
                 torch.nn.init.normal_(buf)
@@ -1006,7 +1007,7 @@ class TestFlashInferAttention(unittest.TestCase):
         else:
             raise ValueError("Invalid dtype for unit test")
 
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,

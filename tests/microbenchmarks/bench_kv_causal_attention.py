@@ -48,8 +48,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 # The fp32 reference shared with the unit tests lives in the unittest tree.

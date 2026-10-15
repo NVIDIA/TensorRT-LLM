@@ -5,7 +5,7 @@
 The binding is stateless on the Python side: every piece of state it reads
 is an explicit argument. The test builds that state for real — a caller-
 owned paged KV pool, pool pointer/mapping tensors, block-offset tables
-(hand-filled for single-layer pools, produced by a real KVCacheManager for
+(hand-filled for single-layer pools, produced by a real KVCacheManagerV2 for
 the multi-layer case), and the int32 host/device length tensors — and
 compares against fp32 torch references. The certified configurations
 exercised:
@@ -109,7 +109,7 @@ exercised:
       new-token pass, folded together by the downstream trtllm merge op and
       checked against a single-pass full-range fp32 reference.
 4. Standard GQA over one paged pool shared by 4 layers: pool, layer->pool
-   mapping, and block offsets produced by a real multi-layer KVCacheManager
+   mapping, and block offsets produced by a real multi-layer KVCacheManagerV2
    and consumed by the op as-is, with local_layer_idx 0-3 selecting mapping
    rows. Per-layer outputs, bit-exact per-layer appends, sibling-layer
    isolation, and a doctored-mapping call pinning the pool-base shift to
@@ -157,7 +157,7 @@ exercised:
    mask). Covered on the three shipped bf16 geometries: bitwise equivalence
    with the packed path when nothing is cached; cached prefixes across the
    page grid, chunked prefill loops, and mixed cached/fresh/generation
-   batches; the same over a real 4-layer KVCacheManager pool, where the read
+   batches; the same over a real 4-layer KVCacheManagerV2 pool, where the read
    now also goes through the layer base shift; and the gpt-oss cell — sinks
    plus a 128-token window over a cached prefix past the window, with the
    attended key set read out one-hot and the read page set measured page by
@@ -167,19 +167,33 @@ exercised:
 """
 
 import math
+import zlib
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
+    MLA_CONTEXT,
+    STANDARD,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention as op,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _validating import (  # noqa: E402 — needs the path declared above
+    ULP,
+    assert_within_ulp,
+    validating,
+)
 
 assert torch.cuda.is_available(), "thop_attention requires a CUDA device"
 
@@ -248,6 +262,22 @@ FP8_DECODE_RTOL = 2**-4
 # so no claim here rests on it.
 FP8_MLA_ATOL = 2**-3
 FP8_MLA_RTOL = 2**-4
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """A softmax chain, so the band is the longest in this catalog.
+
+    Attention accumulates twice -- once over the KV range inside the
+    softmax, once over the same range in the value product -- and the
+    kernel splits both differently from a single fp32 pass. 8 ulp
+    element-wise against the row scale and 4 of relative RMS, the same band
+    a two-GEMM MoE chain gets, and for the same reason.
+
+    Scored in bf16 ulp whatever the output dtype: on the fp8 paths the
+    operands are e4m3 and the accumulation is bf16-limited, so fp32's ulp
+    would measure the container.
+    """
+    assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
 
 class _PagedAttnEnv:
@@ -408,93 +438,94 @@ class _PagedAttnEnv:
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        thop_attention(
-            q=qkv,
-            k=None,  # packed QKV rides inside q
-            v=None,
-            output=output,
-            output_sf=None,
-            workspace_=self.workspace,
-            sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
-            host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
-            host_total_kv_lens=torch.tensor([total_ctx_kv, total_gen_kv], dtype=torch.int32),
-            context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
-            host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
-            host_request_types=torch.tensor(req_types, dtype=torch.int32),
-            max_context_q_len_override=None,
-            kv_cache_block_offsets=self.block_offsets,
-            host_kv_cache_pool_pointers=self.pool_pointers,
-            host_kv_cache_pool_mapping=self.pool_mapping,
-            cache_indirection=None,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
-            out_scale=None,
-            rotary_inv_freq=None,
-            rotary_cos_sin=None,
-            latent_cache=None,
-            q_pe=None,
-            block_ids_per_seq=None,
-            attention_sinks=attention_sinks,
-            is_fused_qkv=True,
-            update_kv_cache=True,
-            predicted_tokens_per_seq=1,
-            local_layer_idx=0,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
-            tokens_per_block=self.tokens_per_block,
-            max_num_requests=self.max_batch,
-            max_context_length=self.max_seq_len,
-            max_seq_len=(
-                self.max_seq_len if max_seq_len_override is None else max_seq_len_override
-            ),
-            attention_window_size=self.attention_window_size,
-            beam_width=1,
-            mask_type=mask_type,
-            quant_mode=self.quant_mode,
-            q_scaling=1.0,
-            position_embedding_type=0,  # no in-kernel RoPE
-            rope_dim=0,
-            rope_base=10000.0,
-            rope_scale_type=0,
-            rope_scale=1.0,
-            rope_short_m_scale=1.0,
-            rope_long_m_scale=1.0,
-            rope_max_positions=1024,
-            rope_original_max_positions=1024,
-            use_paged_context_fmha=use_paged_context_fmha,
-            attention_input_type=0,  # mixed
-            is_mla_enable=False,
-            chunked_prefill_buffer_batch_size=1,
-            q_lora_rank=None,
-            kv_lora_rank=None,
-            qk_nope_head_dim=None,
-            qk_rope_head_dim=None,
-            v_head_dim=None,
-            rope_append=None,
-            mrope_rotary_cos_sin=None,
-            mrope_position_deltas=None,
-            helix_position_offsets=None,
-            helix_is_inactive_rank=None,
-            attention_chunk_size=None,
-            softmax_stats_tensor=None,
-            is_spec_decoding_enabled=False,
-            use_spec_decoding=False,
-            is_spec_dec_tree=False,
-            spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
-            spec_decoding_packed_mask=None,
-            spec_decoding_bl_tree_mask_offset=None,
-            spec_decoding_bl_tree_mask=None,
-            spec_bl_tree_first_sparse_mask_offset_kv=None,
-            sparse_kv_indices=None,
-            sparse_kv_offsets=None,
-            sparse_attn_indices=None,
-            sparse_attn_offsets=None,
-            sparse_attn_indices_block_size=0,
-            num_contexts=num_contexts,
-            num_ctx_tokens=num_ctx_tokens,
-        )
+        with validating(op):
+            op(
+                q=qkv,
+                k=None,  # packed QKV rides inside q
+                v=None,
+                output=output,
+                output_sf=None,
+                workspace_=self.workspace,
+                sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+                host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
+                host_total_kv_lens=torch.tensor([total_ctx_kv, total_gen_kv], dtype=torch.int32),
+                context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
+                host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
+                host_request_types=torch.tensor(req_types, dtype=torch.int32),
+                max_context_q_len_override=None,
+                kv_cache_block_offsets=self.block_offsets,
+                host_kv_cache_pool_pointers=self.pool_pointers,
+                host_kv_cache_pool_mapping=self.pool_mapping,
+                cache_indirection=None,
+                kv_scale_orig_quant=self.kv_scale_orig_quant,
+                kv_scale_quant_orig=self.kv_scale_quant_orig,
+                out_scale=None,
+                rotary_inv_freq=None,
+                rotary_cos_sin=None,
+                latent_cache=None,
+                q_pe=None,
+                block_ids_per_seq=None,
+                attention_sinks=attention_sinks,
+                is_fused_qkv=True,
+                update_kv_cache=True,
+                predicted_tokens_per_seq=1,
+                local_layer_idx=0,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                tokens_per_block=self.tokens_per_block,
+                max_num_requests=self.max_batch,
+                max_context_length=self.max_seq_len,
+                max_seq_len=(
+                    self.max_seq_len if max_seq_len_override is None else max_seq_len_override
+                ),
+                attention_window_size=self.attention_window_size,
+                beam_width=1,
+                mask_type=mask_type,
+                quant_mode=self.quant_mode,
+                q_scaling=1.0,
+                position_embedding_type=0,  # no in-kernel RoPE
+                rope_dim=0,
+                rope_base=10000.0,
+                rope_scale_type=0,
+                rope_scale=1.0,
+                rope_short_m_scale=1.0,
+                rope_long_m_scale=1.0,
+                rope_max_positions=1024,
+                rope_original_max_positions=1024,
+                use_paged_context_fmha=use_paged_context_fmha,
+                attention_input_type=0,  # mixed
+                is_mla_enable=False,
+                chunked_prefill_buffer_batch_size=1,
+                q_lora_rank=None,
+                kv_lora_rank=None,
+                qk_nope_head_dim=None,
+                qk_rope_head_dim=None,
+                v_head_dim=None,
+                rope_append=None,
+                mrope_rotary_cos_sin=None,
+                mrope_position_deltas=None,
+                helix_position_offsets=None,
+                helix_is_inactive_rank=None,
+                attention_chunk_size=None,
+                softmax_stats_tensor=None,
+                is_spec_decoding_enabled=False,
+                use_spec_decoding=False,
+                is_spec_dec_tree=False,
+                spec_decoding_generation_lengths=None,
+                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_packed_mask=None,
+                spec_decoding_bl_tree_mask_offset=None,
+                spec_decoding_bl_tree_mask=None,
+                spec_bl_tree_first_sparse_mask_offset_kv=None,
+                sparse_kv_indices=None,
+                sparse_kv_offsets=None,
+                sparse_attn_indices=None,
+                sparse_attn_offsets=None,
+                sparse_attn_indices_block_size=0,
+                num_contexts=num_contexts,
+                num_ctx_tokens=num_ctx_tokens,
+            )
         torch.cuda.synchronize()
 
         # Record the K/V slices just appended to the cache, per request.
@@ -688,14 +719,8 @@ def test_rejects_non_divisible_head_counts() -> None:
     raising, having computed only the first (6 // 4) * 4 = 4 head columns
     and left the other two all-zero (the decode path does raise, from
     xqaDispatcher: 'numQHeads should be multiple of numKVHeads')."""
-    torch.manual_seed(50)
-    env = _PagedAttnEnv(num_heads=6, num_kv_heads=4, head_dim=128)
-    env.add_request(0, 16)
-    try:
-        env.call_op(env.random_qkv(16), [16], 1, [0], MASK_CAUSAL)
-    except AssertionError:
-        return
-    raise AssertionError("6q/4kv geometry was not rejected by the wrapper")
+    with pytest.raises(AssertionError, match="must be a multiple of"):
+        op.is_valid(num_heads=6, num_kv_heads=4)
 
 
 # ─── Standard configuration, multi-layer shared pool ───────────────────
@@ -708,7 +733,7 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 class _MultiLayerPagedAttnEnv:
-    """Real multi-layer op state: a trtllm KVCacheManager hosting one paged
+    """Real multi-layer op state: a trtllm KVCacheManagerV2 hosting one paged
     pool shared by several layers, whose pool pointers, layer->pool mapping,
     and block offsets the op consumes exactly as produced. The pool element
     type follows the manager dtype (bf16, or fp8-e4m3 with the same quant
@@ -744,7 +769,7 @@ class _MultiLayerPagedAttnEnv:
         self.max_seq_len = max_seq_len
         self.quant_mode = quant_mode
 
-        self.mgr = KVCacheManager(
+        self.mgr = KVCacheManagerV2(
             KvCacheConfig(
                 max_tokens=num_blocks * tokens_per_block,
                 enable_block_reuse=False,
@@ -787,6 +812,9 @@ class _MultiLayerPagedAttnEnv:
         for idx in range(num_layers):
             view = self.mgr.get_buffers(idx, kv_layout="HND")
             assert view is not None
+            page_scale = self.mgr.get_layer_page_index_scale(idx)
+            assert page_scale == num_layers * 2
+            view = view[:: page_scale // 2]
             view.zero_()
             self.layer_views.append(view)
         # Auto-resized in place by the op on first call.
@@ -807,7 +835,8 @@ class _MultiLayerPagedAttnEnv:
 
     def add_decode_token(self, request_id: int) -> None:
         """Extend the manager's allocation by one generated token."""
-        self.mgr.impl.add_token(request_id)
+        cache = self.mgr.kv_cache_map[request_id]
+        assert cache.resize(cache.capacity + 1)
 
     def refresh_offsets(self, request_ids: List[int], num_contexts: int) -> None:
         """Copy the manager-produced block offsets for this batch to device."""
@@ -879,96 +908,97 @@ class _MultiLayerPagedAttnEnv:
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        thop_attention(
-            q=qkv,
-            k=None,  # packed QKV rides inside q
-            v=None,
-            output=output,
-            output_sf=None,
-            workspace_=self.workspace,
-            sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
-            host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
-            host_total_kv_lens=torch.tensor(
-                [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
-                dtype=torch.int32,
-            ),
-            context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
-            host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
-            host_request_types=torch.tensor(req_types, dtype=torch.int32),
-            max_context_q_len_override=None,
-            kv_cache_block_offsets=block_offsets,
-            host_kv_cache_pool_pointers=pool_pointers,
-            host_kv_cache_pool_mapping=pool_mapping,
-            cache_indirection=None,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
-            out_scale=None,
-            rotary_inv_freq=None,
-            rotary_cos_sin=None,
-            latent_cache=None,
-            q_pe=None,
-            block_ids_per_seq=None,
-            attention_sinks=None,
-            is_fused_qkv=True,
-            update_kv_cache=True,
-            predicted_tokens_per_seq=1,
-            local_layer_idx=local_layer_idx,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
-            tokens_per_block=self.tokens_per_block,
-            max_num_requests=self.max_batch,
-            max_context_length=self.max_seq_len,
-            max_seq_len=self.max_seq_len,
-            attention_window_size=(
-                self.max_seq_len if attention_window_size is None else attention_window_size
-            ),
-            beam_width=1,
-            mask_type=MASK_CAUSAL,
-            quant_mode=self.quant_mode,
-            q_scaling=1.0,
-            position_embedding_type=0,  # no in-kernel RoPE
-            rope_dim=0,
-            rope_base=10000.0,
-            rope_scale_type=0,
-            rope_scale=1.0,
-            rope_short_m_scale=1.0,
-            rope_long_m_scale=1.0,
-            rope_max_positions=1024,
-            rope_original_max_positions=1024,
-            use_paged_context_fmha=use_paged_context_fmha,
-            attention_input_type=0,  # mixed
-            is_mla_enable=False,
-            chunked_prefill_buffer_batch_size=1,
-            q_lora_rank=None,
-            kv_lora_rank=None,
-            qk_nope_head_dim=None,
-            qk_rope_head_dim=None,
-            v_head_dim=None,
-            rope_append=None,
-            mrope_rotary_cos_sin=None,
-            mrope_position_deltas=None,
-            helix_position_offsets=None,
-            helix_is_inactive_rank=None,
-            attention_chunk_size=None,
-            softmax_stats_tensor=None,
-            is_spec_decoding_enabled=False,
-            use_spec_decoding=False,
-            is_spec_dec_tree=False,
-            spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
-            spec_decoding_packed_mask=None,
-            spec_decoding_bl_tree_mask_offset=None,
-            spec_decoding_bl_tree_mask=None,
-            spec_bl_tree_first_sparse_mask_offset_kv=None,
-            sparse_kv_indices=None,
-            sparse_kv_offsets=None,
-            sparse_attn_indices=None,
-            sparse_attn_offsets=None,
-            sparse_attn_indices_block_size=0,
-            num_contexts=num_contexts,
-            num_ctx_tokens=num_ctx_tokens,
-        )
+        with validating(op):
+            op(
+                q=qkv,
+                k=None,  # packed QKV rides inside q
+                v=None,
+                output=output,
+                output_sf=None,
+                workspace_=self.workspace,
+                sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+                host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
+                host_total_kv_lens=torch.tensor(
+                    [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
+                    dtype=torch.int32,
+                ),
+                context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
+                host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
+                host_request_types=torch.tensor(req_types, dtype=torch.int32),
+                max_context_q_len_override=None,
+                kv_cache_block_offsets=block_offsets,
+                host_kv_cache_pool_pointers=pool_pointers,
+                host_kv_cache_pool_mapping=pool_mapping,
+                cache_indirection=None,
+                kv_scale_orig_quant=self.kv_scale_orig_quant,
+                kv_scale_quant_orig=self.kv_scale_quant_orig,
+                out_scale=None,
+                rotary_inv_freq=None,
+                rotary_cos_sin=None,
+                latent_cache=None,
+                q_pe=None,
+                block_ids_per_seq=None,
+                attention_sinks=None,
+                is_fused_qkv=True,
+                update_kv_cache=True,
+                predicted_tokens_per_seq=1,
+                local_layer_idx=local_layer_idx,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                tokens_per_block=self.tokens_per_block,
+                max_num_requests=self.max_batch,
+                max_context_length=self.max_seq_len,
+                max_seq_len=self.max_seq_len,
+                attention_window_size=(
+                    self.max_seq_len if attention_window_size is None else attention_window_size
+                ),
+                beam_width=1,
+                mask_type=MASK_CAUSAL,
+                quant_mode=self.quant_mode,
+                q_scaling=1.0,
+                position_embedding_type=0,  # no in-kernel RoPE
+                rope_dim=0,
+                rope_base=10000.0,
+                rope_scale_type=0,
+                rope_scale=1.0,
+                rope_short_m_scale=1.0,
+                rope_long_m_scale=1.0,
+                rope_max_positions=1024,
+                rope_original_max_positions=1024,
+                use_paged_context_fmha=use_paged_context_fmha,
+                attention_input_type=0,  # mixed
+                is_mla_enable=False,
+                chunked_prefill_buffer_batch_size=1,
+                q_lora_rank=None,
+                kv_lora_rank=None,
+                qk_nope_head_dim=None,
+                qk_rope_head_dim=None,
+                v_head_dim=None,
+                rope_append=None,
+                mrope_rotary_cos_sin=None,
+                mrope_position_deltas=None,
+                helix_position_offsets=None,
+                helix_is_inactive_rank=None,
+                attention_chunk_size=None,
+                softmax_stats_tensor=None,
+                is_spec_decoding_enabled=False,
+                use_spec_decoding=False,
+                is_spec_dec_tree=False,
+                spec_decoding_generation_lengths=None,
+                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_packed_mask=None,
+                spec_decoding_bl_tree_mask_offset=None,
+                spec_decoding_bl_tree_mask=None,
+                spec_bl_tree_first_sparse_mask_offset_kv=None,
+                sparse_kv_indices=None,
+                sparse_kv_offsets=None,
+                sparse_attn_indices=None,
+                sparse_attn_offsets=None,
+                sparse_attn_indices_block_size=0,
+                num_contexts=num_contexts,
+                num_ctx_tokens=num_ctx_tokens,
+            )
         torch.cuda.synchronize()
 
         if record:
@@ -1565,12 +1595,25 @@ def test_sinks_reject_bad_dtype_and_layout() -> None:
         "too many elements": torch.cat([good, other]),
         "empty": torch.empty(0, dtype=torch.float32, device="cuda"),
     }
+    # One good call before the guard assertions. Not decoration: this file has a
+    # pre-existing order dependence inside the sinks group. Removing *any* of
+    # its members makes test_bf16_paged_context_gpt_oss_sinks_and_window die
+    # with an illegal instruction and take twenty later tests down as setup
+    # errors. Measured on the unmodified file: dropping two sinks tests gives 20
+    # errors, dropping two tests from outside the group gives none. Asserting
+    # the guard directly, as below, would otherwise remove this test's only op
+    # call and trip it.
+    env.call_op(qkv, [16], 1, [0], MASK_CAUSAL, attention_sinks=good, record=False)
+
+    # The guard is asserted against `is_valid` rather than by driving a whole
+    # paged call and expecting it to abort partway. A guard is a claim about
+    # arguments; firing it from inside `call_op` leaves the environment
+    # half-advanced -- output allocated, cache bookkeeping moved on, no op call
+    # behind either.
     for label, sinks in bad_layouts.items():
-        try:
-            env.call_op(qkv, [16], 1, [0], MASK_CAUSAL, attention_sinks=sinks, record=False)
-        except AssertionError:
-            continue
-        raise AssertionError(f"{label} attention_sinks was not rejected by the wrapper")
+        with pytest.raises(AssertionError, match="attention_sinks must be contiguous"):
+            op.is_valid(num_heads=SINK_HQ, num_kv_heads=SINK_HKV, attention_sinks=sinks)
+        del label
 
 
 # ─── Cyclic sliding window (attention_window_size < max_seq_len) + sinks ─
@@ -2300,8 +2343,11 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        point and is read straight back from there).
     3. use_paged_context_fmha=False on a context call with a cached prefix is
        silently wrong — no exception, an answer far off the reference.
-    4. context_lengths on a context row must be this call's new-token count.
-       The sequence's full KV length and 0 are both far off.
+    4. context_lengths on a context row must be this call's new-token count;
+       0 is far off. A larger value is not probed: the context FMHA then
+       writes past the output buffer, which holds this call's new tokens
+       only (compute-sanitizer memcheck: invalid global writes), and corrupts
+       whatever lies beyond it.
 
     The wrong batch states of (3) and (4) also corrupt the pool, so every
     rival runs against its own freshly prepared copy of one fixed state:
@@ -2387,22 +2433,21 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
         base,
         "cached-prefix context at use_paged_context_fmha=False",
     )
-    for ctx_len in (cached + new, 0):
-        cenv, cq = prepared()
-        _assert_far_outside(
-            cenv.call_op(
-                cq,
-                [new],
-                1,
-                [0],
-                MASK_CAUSAL,
-                record=False,
-                ctx_lens_override=[ctx_len],
-                use_paged_context_fmha=True,
-            ),
-            base,
-            f"context_lengths={ctx_len}",
-        )
+    cenv, cq = prepared()
+    _assert_far_outside(
+        cenv.call_op(
+            cq,
+            [new],
+            1,
+            [0],
+            MASK_CAUSAL,
+            record=False,
+            ctx_lens_override=[0],
+            use_paged_context_fmha=True,
+        ),
+        base,
+        "context_lengths=0",
+    )
 
     # (2) page by page. Pages 0-1 hold the cached prefix and must be read;
     # page 2 holds only tokens 64..83, which this call appends itself.
@@ -2427,7 +2472,7 @@ def test_bf16_paged_context_multilayer_shared_pool() -> None:
     """The paged-context read goes through the same layer base shift the
     append does.
 
-    One pool shared by 4 layers — real KVCacheManager state, GQA 32q/8kv d128
+    One pool shared by 4 layers — real KVCacheManagerV2 state, GQA 32q/8kv d128
     — with every layer served a fresh context chunk, then a context chunk over
     its own cached prefix, then a decode step. Each layer's output is gated
     against that layer's own history, so a read landing in a sibling's slabs
@@ -2987,103 +3032,104 @@ class _MlaPagedEnv:
     ) -> None:
         ns = len(kv_lens)
         req_types = [0 if i < num_contexts else 1 for i in range(ns)]
-        thop_attention(
-            q=q,
-            k=k,
-            v=v,
-            output=output,
-            output_sf=None,
-            workspace_=self.workspace,
-            sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
-            host_past_key_value_lengths=torch.tensor(
-                kv_lens if host_past_lens is None else host_past_lens,
-                dtype=torch.int32,
-            ),
-            host_total_kv_lens=torch.tensor(
-                [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
-                dtype=torch.int32,
-            ),
-            context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
-            host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
-            host_request_types=torch.tensor(req_types, dtype=torch.int32),
-            max_context_q_len_override=None,
-            kv_cache_block_offsets=self.block_offsets,
-            host_kv_cache_pool_pointers=self.pool_pointers,
-            host_kv_cache_pool_mapping=self.pool_mapping,
-            cache_indirection=None,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
-            out_scale=None,
-            rotary_inv_freq=self.rotary_inv_freq,
-            rotary_cos_sin=self.rotary_cos_sin,
-            latent_cache=latent_cache,
-            q_pe=q_pe,
-            block_ids_per_seq=None,
-            attention_sinks=None,
-            is_fused_qkv=k is None,
-            update_kv_cache=True,
-            predicted_tokens_per_seq=predicted_tokens_per_seq,
-            local_layer_idx=0,
-            num_heads=self.num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            tokens_per_block=self.tokens_per_block,
-            max_num_requests=self.max_batch,
-            max_context_length=self.max_seq_len,
-            max_seq_len=self.max_seq_len,
-            attention_window_size=self.max_seq_len,
-            beam_width=1,
-            mask_type=mask_type,
-            quant_mode=self.quant_mode,
-            q_scaling=self.q_scaling,
-            position_embedding_type=POSITION_EMBEDDING_TYPE_YARN,
-            rope_dim=QK_ROPE_HEAD_DIM,
-            rope_base=self.rope_scalars.rope_base,
-            rope_scale_type=self.rope_scalars.rope_scale_type,
-            rope_scale=self.rope_scalars.rope_scale,
-            rope_short_m_scale=self.rope_scalars.rope_short_m_scale,
-            rope_long_m_scale=self.rope_scalars.rope_long_m_scale,
-            rope_max_positions=self.rope_scalars.rope_max_positions,
-            rope_original_max_positions=self.rope_scalars.rope_original_max_positions,
-            use_paged_context_fmha=False,
-            attention_input_type=attention_input_type,
-            is_mla_enable=True,
-            chunked_prefill_buffer_batch_size=1,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
-            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-            v_head_dim=v_head_dim,
-            rope_append=True,
-            mrope_rotary_cos_sin=None,
-            mrope_position_deltas=None,
-            helix_position_offsets=None,
-            helix_is_inactive_rank=None,
-            attention_chunk_size=None,
-            softmax_stats_tensor=softmax_stats_tensor,
-            is_spec_decoding_enabled=False,
-            use_spec_decoding=False,
-            is_spec_dec_tree=False,
-            spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
-            spec_decoding_packed_mask=None,
-            spec_decoding_bl_tree_mask_offset=None,
-            spec_decoding_bl_tree_mask=None,
-            spec_bl_tree_first_sparse_mask_offset_kv=None,
-            sparse_kv_indices=None,
-            sparse_kv_offsets=None,
-            sparse_attn_indices=None,
-            sparse_attn_offsets=None,
-            sparse_attn_indices_block_size=0,
-            cu_q_seqlens=cu_q_seqlens,
-            cu_kv_seqlens=cu_kv_seqlens,
-            fmha_scheduler_counter=fmha_scheduler_counter,
-            mla_bmm1_scale=mla_bmm1_scale,
-            mla_bmm2_scale=mla_bmm2_scale,
-            quant_q_buffer=quant_q_buffer,
-            num_contexts=num_contexts,
-            num_ctx_tokens=num_ctx_tokens,
-        )
+        with validating(op):
+            op(
+                q=q,
+                k=k,
+                v=v,
+                output=output,
+                output_sf=None,
+                workspace_=self.workspace,
+                sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+                host_past_key_value_lengths=torch.tensor(
+                    kv_lens if host_past_lens is None else host_past_lens,
+                    dtype=torch.int32,
+                ),
+                host_total_kv_lens=torch.tensor(
+                    [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
+                    dtype=torch.int32,
+                ),
+                context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
+                host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
+                host_request_types=torch.tensor(req_types, dtype=torch.int32),
+                max_context_q_len_override=None,
+                kv_cache_block_offsets=self.block_offsets,
+                host_kv_cache_pool_pointers=self.pool_pointers,
+                host_kv_cache_pool_mapping=self.pool_mapping,
+                cache_indirection=None,
+                kv_scale_orig_quant=self.kv_scale_orig_quant,
+                kv_scale_quant_orig=self.kv_scale_quant_orig,
+                out_scale=None,
+                rotary_inv_freq=self.rotary_inv_freq,
+                rotary_cos_sin=self.rotary_cos_sin,
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+                block_ids_per_seq=None,
+                attention_sinks=None,
+                is_fused_qkv=k is None,
+                update_kv_cache=True,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
+                local_layer_idx=0,
+                num_heads=self.num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                tokens_per_block=self.tokens_per_block,
+                max_num_requests=self.max_batch,
+                max_context_length=self.max_seq_len,
+                max_seq_len=self.max_seq_len,
+                attention_window_size=self.max_seq_len,
+                beam_width=1,
+                mask_type=mask_type,
+                quant_mode=self.quant_mode,
+                q_scaling=self.q_scaling,
+                position_embedding_type=POSITION_EMBEDDING_TYPE_YARN,
+                rope_dim=QK_ROPE_HEAD_DIM,
+                rope_base=self.rope_scalars.rope_base,
+                rope_scale_type=self.rope_scalars.rope_scale_type,
+                rope_scale=self.rope_scalars.rope_scale,
+                rope_short_m_scale=self.rope_scalars.rope_short_m_scale,
+                rope_long_m_scale=self.rope_scalars.rope_long_m_scale,
+                rope_max_positions=self.rope_scalars.rope_max_positions,
+                rope_original_max_positions=self.rope_scalars.rope_original_max_positions,
+                use_paged_context_fmha=False,
+                attention_input_type=attention_input_type,
+                is_mla_enable=True,
+                chunked_prefill_buffer_batch_size=1,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                v_head_dim=v_head_dim,
+                rope_append=True,
+                mrope_rotary_cos_sin=None,
+                mrope_position_deltas=None,
+                helix_position_offsets=None,
+                helix_is_inactive_rank=None,
+                attention_chunk_size=None,
+                softmax_stats_tensor=softmax_stats_tensor,
+                is_spec_decoding_enabled=False,
+                use_spec_decoding=False,
+                is_spec_dec_tree=False,
+                spec_decoding_generation_lengths=None,
+                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_packed_mask=None,
+                spec_decoding_bl_tree_mask_offset=None,
+                spec_decoding_bl_tree_mask=None,
+                spec_bl_tree_first_sparse_mask_offset_kv=None,
+                sparse_kv_indices=None,
+                sparse_kv_offsets=None,
+                sparse_attn_indices=None,
+                sparse_attn_offsets=None,
+                sparse_attn_indices_block_size=0,
+                cu_q_seqlens=cu_q_seqlens,
+                cu_kv_seqlens=cu_kv_seqlens,
+                fmha_scheduler_counter=fmha_scheduler_counter,
+                mla_bmm1_scale=mla_bmm1_scale,
+                mla_bmm2_scale=mla_bmm2_scale,
+                quant_q_buffer=quant_q_buffer,
+                num_contexts=num_contexts,
+                num_ctx_tokens=num_ctx_tokens,
+            )
         torch.cuda.synchronize()
 
     def call_context(
@@ -5265,3 +5311,130 @@ def test_mla_rejects_null_q_lora_rank() -> None:
         assert "bad optional access" in str(exc), f"unexpected message: {exc}"
     else:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
+
+
+# ─── The entry's own cell list ──────────────────────────────────────────
+
+
+def _cell_standard(cell) -> None:
+    """A gpt-oss cell: GQA with sinks, with or without a sliding window.
+
+    Driven against `op.reference` rather than this file's `_sink_reference`,
+    which is the point of the cell list: the entry states what the op computes
+    and CI drives that statement. The two are cross-checked against each other
+    first, because a reference that disagrees with a reference is a different
+    failure from a kernel that moved.
+    """
+    spec = cell.spec
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    window = spec["window"]
+    env = (
+        _sink_env(attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
+        if window
+        else _sink_env()
+    )
+    n_tokens = 200 if window else 48
+    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000)
+    env.add_request(0, n_tokens)
+    qkv = env.random_qkv(n_tokens)
+    out = _paged_ctx_call(env, qkv, [n_tokens], 1, [0], attention_sinks=sink)
+
+    hq, hkv, dim = env.num_heads, env.num_kv_heads, env.head_dim
+    q = qkv[:, : hq * dim]
+    k = torch.cat(env.k_history[0]).reshape(-1, hkv * dim)
+    v = torch.cat(env.v_history[0]).reshape(-1, hkv * dim)
+    ref = op.reference(
+        q,
+        k,
+        v,
+        [n_tokens],
+        [k.shape[0]],
+        num_heads=hq,
+        num_kv_heads=hkv,
+        qk_head_dim=dim,
+        v_head_dim=dim,
+        softmax_scale=1.0 / math.sqrt(dim),
+        causal=True,
+        attention_sinks=sink,
+        window=window,
+    )
+    local = _sink_reference(env, qkv, [n_tokens], [0], [0], sink, window=window)
+    torch.testing.assert_close(
+        ref.float(),
+        local.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=lambda m: f"op.reference disagrees with _sink_reference\n{m}",
+    )
+    _compare(out, ref)
+
+
+def _cell_mla_context(cell) -> None:
+    """The deepseek MLA context cell, on the no-append flavour.
+
+    The appending flavour ropes q and k inside the call, and `reference` does
+    not model rope -- it is masked softmax attention over explicit K/V, and the
+    rope belongs to the entries beside this one. The no-append flavour takes
+    q/k already roped by the caller, which is the form the reference states, so
+    that is the one a cell can gate.
+
+    The two scale factors under quant_mode 128 -- `s**2` inside the softmax
+    scale and `s` on the output -- default to 1.0 on this flavour, which is why
+    only `e4m3_inputs` is set here.
+    """
+    env = _fp8_r1_env()
+    cached_lens, new_lens = [96, 31, 0], [32, 9, 25]
+    kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    for rid, total in enumerate(kv_lens):
+        env.add_request(rid, new_lens[rid])
+        env.reserve_cache_pages(rid, total)
+    k, v = _fp8_pool_backed_kv(env, cached_lens, new_lens)
+    q = torch.randn(sum(new_lens), env.num_heads * QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    out = env.call_context_no_append([0, 1, 2], new_lens, kv_lens, q, k, v)
+
+    ref = op.reference(
+        q,
+        k,
+        v,
+        new_lens,
+        kv_lens,
+        num_heads=cell.spec["num_heads"],
+        num_kv_heads=cell.spec["num_kv_heads"],
+        qk_head_dim=QK_HEAD_DIM,
+        v_head_dim=V_HEAD_DIM,
+        softmax_scale=env.softmax_scale,
+        causal=True,
+        e4m3_inputs=True,
+    )
+    local = _fp8_no_append_reference(env, q, k, v, new_lens, kv_lens)
+    torch.testing.assert_close(
+        ref.float(),
+        local.float(),
+        rtol=FP8_MLA_RTOL,
+        atol=FP8_MLA_ATOL,
+        msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
+    )
+    _compare(out, ref)
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_certified_cells(cell) -> None:
+    """Drive every configuration the entry claims.
+
+    The MLA generation cell is driven by the tests above rather than here: its
+    output lives in latent space, reconstructed from the paged cache, and the
+    entry's `reference` takes explicit K/V. The cell stays in the list because
+    it is a configuration a shipped target runs and `is_valid` is checked
+    against it; what this file does not do is compare it to `reference`, and
+    saying so is better than a cell that quietly proves less than its siblings.
+    """
+    kind = cell.spec["input_type"]
+    if kind == STANDARD:
+        _cell_standard(cell)
+    elif kind == MLA_CONTEXT:
+        _cell_mla_context(cell)
+    else:
+        with validating(op):
+            op.is_valid(num_heads=cell.spec["num_heads"], num_kv_heads=cell.spec["num_kv_heads"])
+        pytest.skip("MLA generation is covered by test_fp8_mla_r1_cell_generation_decode_h128")

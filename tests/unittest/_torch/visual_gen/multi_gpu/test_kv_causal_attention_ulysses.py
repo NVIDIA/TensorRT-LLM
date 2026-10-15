@@ -35,16 +35,16 @@ import torch.multiprocessing as mp
 from utils.kv_causal_reference import exact_reference
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
-from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention
+from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 WORLD = 2

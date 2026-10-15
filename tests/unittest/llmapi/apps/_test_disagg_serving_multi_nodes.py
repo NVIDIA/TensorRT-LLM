@@ -5,6 +5,7 @@ import time
 
 import openai
 import pytest
+from test_common import cluster_env
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
 
@@ -77,8 +78,11 @@ def env():
     # auto-selection, so UCX_TLS must be set explicitly there. Identify GB300 via
     # sm_103 (Blackwell Ultra) + aarch64 (Grace) -- this excludes HGX B300
     # (also sm_103 but x86_64) and avoids depending on the GPU device name string.
+    # A cluster rule, if one matches, overrides this.
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
+    cluster_env.apply_ucx_env(e,
+                              cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
     return e
 
 

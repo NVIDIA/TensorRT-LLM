@@ -30,12 +30,12 @@ from utils.kv_causal_reference import exact_reference as _exact_reference
 from utils.kv_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

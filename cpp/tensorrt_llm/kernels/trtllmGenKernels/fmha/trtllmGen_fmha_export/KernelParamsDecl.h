@@ -120,11 +120,21 @@ struct KernelParams {
   //  where each tokenQ has a corresponding topK length.
   int32_t const* ptrSparseMlaTopKLens;
 
-  // The attention window size for sliding window attention.
-  int32_t mAttentionWindowSize;
+  // Sliding-window bounds: query q attends to inclusive K range
+  // [q - leftSlidingWindow, q + rightSlidingWindow], clamped to the sequence. Runtime values; the
+  // cubin cache key does not record exact left/right sliding-window values.
+  int32_t mLeftSlidingWindow{-1};
+  // rightSlidingWindow == 0 is causal; SlidingOrChunkedCausal requires a finite
+  // rightSlidingWindow, so -1 is invalid.
+  int32_t mRightSlidingWindow{-1};
+  // VariableWindow bounds, shape [sumSeqLensQ]. Index with cumSeqLensQ[b] + local q.
+  // Values are inclusive K positions local to batch b:
+  // 0 <= start <= qPosK <= end < seqLenKv[b], where qPosK = seqLenKv[b] - seqLenQ[b] + local q.
+  int32_t const* ptrVariableWindowTokenStarts{nullptr};
+  int32_t const* ptrVariableWindowTokenEnds{nullptr};
   // The batch size
   int32_t mBatchSize;
-  // The chunked attention size in log2.
+  // The chunked attention size in log2. A value > 0 selects chunked attention semantics.
   int32_t mChunkedAttentionSizeLog2;
   // Padded token dimension for the DSv4 fused FP32 or packed UE8M0 scale layout.
   int64_t mDsv4ScaleBufM;
