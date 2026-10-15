@@ -55,7 +55,6 @@ from . import envelope as envelope_mod
 from . import gate_cli, launch_gate, remediation, step_check
 from . import gates as gates_mod
 from . import overlap as overlap_mod
-from .catalog_index import CatalogIndexHook
 from .committer import CommitPolicy, install_committer
 from .delivery import DeliveryReport, summarize_for_auditor, verify_delivery, write_premerge_pack
 from .embargo import display_entries, merge_hook_maps, source_embargo_enforcement
@@ -438,8 +437,6 @@ class StaircaseOnboardWorkflow:
         #: The evidence ledger: every gate result enters it through the log's sink.
         self.evidence = RunEvidence(self, clean=clean)
         self.gate_log = gates_mod.GateLog(sink=self.evidence.record)
-        #: catalog/index.yaml, regenerated from the per-entry fragments in HEAD.
-        self._catalog_index = CatalogIndexHook(self)
         self._progress_ctx = ProgressContext(path=self.progress_path)
         self._tools = build_progress_tools(self._progress_ctx)
 
@@ -2266,10 +2263,7 @@ class StaircaseOnboardWorkflow:
             self._close_run(state, log, verdict="delivery-failed:findings")
             return False
 
-        self._catalog_index.sync(log)
-        report = self.evidence.record_delivery_checks(
-            self._catalog_index.extend(self._delivery_report(state))
-        )
+        report = self.evidence.record_delivery_checks(self._delivery_report(state))
         self.journal.section("delivery checks", f"```\n{report.render()}\n```")
         print_message(report.render(), log)
         if not report.passed:
@@ -3085,8 +3079,6 @@ class StaircaseOnboardWorkflow:
         """Run one agent turn, recording the prompt **before** it is sent."""
         iteration = self._progress_ctx.current_iteration
         unit = self._progress_ctx.current_unit
-        # Every role that reads the catalog index reads it current.
-        self._catalog_index.sync()
         # Every role, one place. The smith path does not come through here --
         # it owns its own layer per dispatch -- so `_smith_prompt` carries
         # the same block explicitly.

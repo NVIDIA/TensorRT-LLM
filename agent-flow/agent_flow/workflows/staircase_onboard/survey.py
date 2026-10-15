@@ -965,7 +965,7 @@ def entry_certification(py_path):
         ):
             continue
         for stmt in node.body:
-            if isinstance(stmt, ast.FunctionDef) and stmt.name == "raw_call":
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == "__call__":
                 call = ast.get_source_segment(text, stmt) or ""
                 continue
             if isinstance(stmt, ast.Assign):
@@ -988,7 +988,7 @@ def entry_certification(py_path):
                         isinstance(func, ast.Attribute) and func.attr == "Cell"
                     ):
                         cells += 1
-    # The op `raw_call` makes, not the first op the file mentions: an entry's
+    # The op `__call__` makes, not the first op the file mentions: an entry's
     # docstring and reference routinely name its neighbours. A tier-3 entry
     # calls a FlashInfer callable instead of a trtllm op.
     match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", call)
@@ -1001,25 +1001,23 @@ def entry_certification(py_path):
     return sorted(archs), cells, ("torch.ops.trtllm." + match.group(1)) if match else ""
 
 catalog = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
-index = catalog / "index.yaml"
-if index.is_file():
-    # Same reason as above: a five-field list read without a YAML parser.
-    entry = None
-    # The list may sit at column 0 or be indented under `entries:` -- the
-    # in-tree index indents it, and a column-0 match read that index as EMPTY,
-    # so a dry run printed `0/0 entries certified` over 19 certified entries.
-    for raw in index.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line.startswith("- path:"):
-            if entry:
-                out["catalog"].append(entry)
-            entry = {"path": line.split(":", 1)[1].strip(), "impl": "", "summary": ""}
-        elif entry is not None and line.startswith("impl:"):
-            entry["impl"] = line.split(":", 1)[1].strip()
-        elif entry is not None and line.startswith("summary:"):
-            entry["summary"] = line.split(":", 1)[1].strip().strip("'\"")[:160]
-    if entry:
-        out["catalog"].append(entry)
+# The shared vocabulary is the entry files themselves -- there is no index: one
+# OpWrapper per file under catalog/<category>/; underscore modules (_op.py) are
+# the catalog's own infrastructure.
+for py in sorted(catalog.glob("*/*.py")) if catalog.is_dir() else ():
+    if py.name.startswith("_"):
+        continue
+    summary = ""
+    try:
+        doc = (ast.get_docstring(ast.parse(py.read_text(encoding="utf-8"))) or "").strip()
+        summary = doc.splitlines()[0][:160] if doc else ""
+    except (OSError, SyntaxError):
+        pass
+    out["catalog"].append({
+        "path": "%s/%s" % (py.parent.name, py.name),
+        "impl": entry_certification(py)[2],
+        "summary": summary,
+    })
 # A target's own ops: certified for that target, promotable for another.
 models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
 for py in sorted(models.glob("*/*/ops/*/*.py")) if models.is_dir() else ():
@@ -1490,7 +1488,7 @@ def _flashinfer_lines(inventory: Inventory, limit: int) -> list[str]:
         f"**FlashInfer {version}: {len(inventory.flashinfer_api)} public callables, "
         f"{len(unreferenced)} referenced nowhere in the engine.** The op inventory cannot "
         f"see these: no trtllm op wraps them. A demand one of them answers is tier 3 — an "
-        f"entry whose `raw_call` calls `flashinfer.<module>.<name>` directly, which costs a "
+        f"entry whose `__call__` calls `flashinfer.<module>.<name>` directly, which costs a "
         f"wrapper and its cells, not an implementation. Search them before you claim tier "
         f"4 or 5, and before any ceiling:",
         "",

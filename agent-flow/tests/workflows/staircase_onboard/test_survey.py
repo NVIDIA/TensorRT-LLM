@@ -424,7 +424,7 @@ def test_receipt_absent_is_the_default_not_a_pass():
 
 
 def _entry_source(impl, archs, cells=2):
-    """An entry in #19977's form: the OpWrapper class is the contract."""
+    """An entry as modeling_v2 states it: the OpWrapper class is the contract."""
     arch_set = ", ".join(f"Arch.{a}" for a in archs)
     cell_list = "".join(f"Cell(why='c{i}', spec={{}}), " for i in range(cells))
     return (
@@ -433,29 +433,29 @@ def _entry_source(impl, archs, cells=2):
         '    """Mentions torch.ops.trtllm.neighbour in prose, which is not the op."""\n\n'
         f"    ARCHS = frozenset({{{arch_set}}})\n"
         f"    CELLS = ({cell_list})\n\n"
-        "    def raw_call(self, x):\n"
+        "    def __call__(self, x):\n"
         f"        return {impl}(x)\n\n"
         "    def reference(self, x):\n"
         "        return x\n"
     )
 
 
-def _fake_repo(tmp_path, entries, indent="", model_ops=()):
-    """A repo tree with a catalog index and its entries, and nothing else.
+def _fake_repo(tmp_path, entries, model_ops=()):
+    """A repo tree with catalog entries, and nothing else.
 
-    ``indent`` nests the list under ``entries:`` the way the in-tree index
-    does; the default keeps it at column 0. ``model_ops`` are
-    ``(family/target, category/name.py, impl, archs)`` kept in a target's ``ops/``.
+    The catalog is its entry files: ``entries`` are ``(category/name.py, impl,
+    archs)`` written under ``catalog/``, beside the catalog's own ``_op.py``.
+    ``model_ops`` are ``(family/target, category/name.py, impl, archs)`` kept in
+    a target's ``ops/``.
     """
     catalog = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
     catalog.mkdir(parents=True)
-    lines = ["entries:"]
+    (catalog / "_op.py").write_text("class OpWrapper:\n    pass\n", encoding="utf-8")
     for path, impl, archs in entries:
-        lines += [f"{indent}- path: {path}", f"{indent}  impl: {impl}", f"{indent}  summary: s"]
         py = catalog / path
         py.parent.mkdir(parents=True, exist_ok=True)
+        (py.parent / "__init__.py").write_text("", encoding="utf-8")
         py.write_text(_entry_source(impl, archs), encoding="utf-8")
-    (catalog / "index.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
     models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
     for scope, path, impl, archs in model_ops:
         py = models / scope / "ops" / path
@@ -551,14 +551,11 @@ def test_another_targets_ops_are_promotable_not_spendable(tmp_path):
     assert "`fam/ckpt__sm_103__tp1/ops/moe/router`" in block
 
 
-@pytest.mark.parametrize("indent", ["", "  "], ids=["column0", "indented"])
-def test_the_probe_reads_an_index_nested_under_entries(tmp_path, indent):
-    """The in-tree index indents its list under `entries:`.
+def test_the_probe_reads_the_entries_from_the_catalog_files(tmp_path):
+    """There is no index: every `catalog/<category>/<name>.py` is an entry.
 
-    Measured on the DeepSeek-V4.1 dry run: the column-0 match read the real
-    index as empty, and the survey reported `0/0 entries certified` over 19
-    entries that all carry sm_103 receipts -- the exact reading this survey
-    exists to prevent.
+    The catalog's own modules (`_op.py`, a category's `__init__.py`) are not
+    entries, and an entry's summary is its module docstring's first line.
     """
     repo = _fake_repo(
         tmp_path,
@@ -566,11 +563,14 @@ def test_the_probe_reads_an_index_nested_under_entries(tmp_path, indent):
             ("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS),
             ("gemm/y.py", "torch.ops.trtllm.y", _INLINE_PASS),
         ],
-        indent=indent,
+    )
+    (repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog/gemm/y.py").write_text(
+        '"""A y GEMM."""\n' + _entry_source("torch.ops.trtllm.y", _INLINE_PASS), encoding="utf-8"
     )
     inventory = _run_probe(repo)
-    assert [e.path for e in inventory.catalog] == ["norm/x.py", "gemm/y.py"]
-    assert [e.impl for e in inventory.catalog] == ["torch.ops.trtllm.x", "torch.ops.trtllm.y"]
+    assert [e.path for e in inventory.catalog] == ["gemm/y.py", "norm/x.py"]
+    assert [e.impl for e in inventory.catalog] == ["torch.ops.trtllm.y", "torch.ops.trtllm.x"]
+    assert inventory.catalog[0].summary == "A y GEMM."
     assert all(e.receipt == RECEIPT_PASSED for e in inventory.catalog)
 
 
