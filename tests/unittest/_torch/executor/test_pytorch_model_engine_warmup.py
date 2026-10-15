@@ -831,27 +831,30 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
 
 
 class _Tracker:
-    """Records method-call order via mock side_effects."""
+    """Records method-call order (and each call's arguments) via mock side_effects."""
 
     def __init__(self):
         self.calls = []
+        self.call_args = {}
 
     def __call__(self, name):
         def _wrapped(*args, **kwargs):
             self.calls.append(name)
+            self.call_args.setdefault(name, []).append((args, kwargs))
 
         return _wrapped
 
 
 def _run_warmup_tracked(
-    model_engine, resource_manager, *, force_helix_cp=False, capture_logs=False
+    model_engine, resource_manager, *, force_helix_cp=False, capture_logs=False, tracker=None
 ):
     """Patch warmup stages and cleanup operations, then run warmup.
 
-    Optionally force helix CP and capture logs. Returns
-    (call_order_list, log_records_or_None).
+    Optionally force helix CP and capture logs. Pass ``tracker`` to inspect the
+    recorded call arguments. Returns (call_order_list, log_records_or_None).
     """
-    tracker = _Tracker()
+    if tracker is None:
+        tracker = _Tracker()
     # Engines left by earlier tests are cyclic; finalize them before tracking.
     gc.collect()
     # Observe this module's explicit cleanup without counting unrelated
@@ -1240,7 +1243,15 @@ class TestWarmupCleanup(unittest.TestCase):
         warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
         runs, on generation requests, followed by one empty_cache."""
         model_engine, resource_manager = _build_engine_and_resource_manager()
-        calls, _ = _run_warmup_tracked(model_engine, resource_manager, force_helix_cp=True)
+        tracker = _Tracker()
+        calls, _ = _run_warmup_tracked(
+            model_engine, resource_manager, force_helix_cp=True, tracker=tracker
+        )
+        self.assertEqual(
+            tracker.call_args["autotuner"],
+            [((resource_manager,), {"generation_only": True})],
+            "Helix CP must tune on generation requests only",
+        )
         self.assertNotIn("general_warmup", calls, f"Helix CP should skip general; got {calls}")
         self.assertIn("autotuner", calls, f"Helix CP should run the autotuner; got {calls}")
         self.assertEqual(
