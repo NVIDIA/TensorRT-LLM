@@ -61,9 +61,12 @@ _INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 # chunk gathers the KV of every request in it and scores every query against
 # all of it, so its logits grow with the product of the packed totals while
 # each query row only needs its own request's window. Prefix-reuse hits make
-# this explode: each brings few new tokens but its whole cached context. A
-# request whose own logits exceed the cap still gets a chunk to itself, where
-# _INDEXER_MQA_LOGITS_ELEM_BUDGET tiles it. Override via env if needed.
+# this explode: each brings few new tokens but its whole cached context. The
+# cap only decides which requests share a chunk. The memory of each logits call
+# is bounded separately by the query tiling under
+# _INDEXER_MQA_LOGITS_ELEM_BUDGET, which also accounts for the per-head dot
+# products of the decoded FP4 path and tiles a request whose own logits exceed
+# this cap in a chunk of its own. Override via env if needed.
 _INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
     os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 26)
 )
@@ -427,6 +430,75 @@ def group_prefill_requests_by_logits_budget(
     return groups
 
 
+def plan_mla_chunked_prefill_chunks(
+    q_lens: Sequence[int],
+    kv_lens: Sequence[int],
+    elem_budget: int,
+    q_begin: int = 0,
+    q_end: Optional[int] = None,
+) -> List[List[Tuple[int, int, int, int]]]:
+    """Plan the indexer prefill chunks covering context query tokens ``[q_begin, q_end)``.
+
+    Requests that lie fully inside the range are grouped with
+    ``group_prefill_requests_by_logits_budget``. A request cut by the range
+    boundary contributes only its covered query tokens, as a chunk of its own.
+
+    Args:
+        q_lens: New (query) tokens per request.
+        kv_lens: Compressed KV tokens per request, cached plus new.
+        elem_budget: Maximum packed logits elements for a multi-request group.
+        q_begin: First context query token to cover.
+        q_end: End of the covered context query tokens; defaults to all of them.
+
+    Returns:
+        Chunk specs for ``Indexer.prepare_one_prefill_chunk``, in token order:
+        ``(req_idx, token_start_in_req, token_end_in_req, req_cum_start)``.
+    """
+    assert len(q_lens) == len(kv_lens)
+    if q_end is None:
+        q_end = sum(q_lens)
+    q_starts = []
+    q_start = 0
+    for q_len in q_lens:
+        q_starts.append(q_start)
+        q_start += q_len
+
+    chunks: List[List[Tuple[int, int, int, int]]] = []
+    full_run: List[int] = []
+
+    def flush_full_run() -> None:
+        groups = group_prefill_requests_by_logits_budget(
+            [q_lens[i] for i in full_run], [kv_lens[i] for i in full_run], elem_budget
+        )
+        for group in groups:
+            chunks.append(
+                [(full_run[g], 0, q_lens[full_run[g]], q_starts[full_run[g]]) for g in group]
+            )
+        full_run.clear()
+
+    for req_idx, q_len in enumerate(q_lens):
+        begin = max(q_begin, q_starts[req_idx])
+        end = min(q_end, q_starts[req_idx] + q_len)
+        if begin >= end:
+            continue
+        if end - begin == q_len:
+            full_run.append(req_idx)
+        else:
+            flush_full_run()
+            chunks.append(
+                [
+                    (
+                        req_idx,
+                        begin - q_starts[req_idx],
+                        end - q_starts[req_idx],
+                        q_starts[req_idx],
+                    )
+                ]
+            )
+    flush_full_run()
+    return chunks
+
+
 # Shrink the indexer prefill chunk size for very long requests to bound the
 # fp8(_fp4)_mqa_logits activation memory (~ chunk_size * K_compressed), keyed on
 # the largest compressed KV length in the batch. Entries are
@@ -560,6 +632,12 @@ def _split_prefill_queries(
     size, rank = mapping.tp_size, mapping.tp_rank
     sizes = [(r + 1) * count // size - r * count // size for r in range(size)]
     return count * rank // size, count * (rank + 1) // size, sizes
+
+
+def _prefill_q_split_threshold(metadata: DSAtrtllmAttentionMetadata) -> int:
+    """Query-token count from which prefill indexer queries are split across TP ranks."""
+    sparse_metadata_params = metadata.sparse_metadata_params
+    return sparse_metadata_params.q_split_threshold if sparse_metadata_params is not None else 8192
 
 
 @maybe_compile(dynamic=True)
@@ -1203,11 +1281,15 @@ class Indexer(nn.Module):
         """
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
+        metadata.indexer_prefill_q_split = None
 
         # When MLA chunked prefill is active, it already bounds the new tokens per
-        # request, so requests are never split here. They are only grouped so that
-        # a chunk's packed logits stay bounded: with cached KV, a request's KV can
-        # be far longer than its new tokens.
+        # request, so requests are not split by length here. From
+        # q_split_threshold context query tokens on, the batch's queries are
+        # split evenly across TP ranks and each rank plans chunks for its share
+        # only. Within that share, requests are grouped so that a chunk's packed
+        # logits stay bounded: with cached KV, a request's KV can be far longer
+        # than its new tokens.
         has_mla_chunked_prefill = (
             metadata.enable_context_mla_with_cached_kv and metadata.runtime_features.chunked_prefill
         )
@@ -1221,16 +1303,15 @@ class Indexer(nn.Module):
                 (cached_indptr[i + 1] - cached_indptr[i] + q_lens[i]) // compress_ratio
                 for i in range(num_contexts)
             ]
-            q_starts = [0]
-            for q_len in q_lens[:-1]:
-                q_starts.append(q_starts[-1] + q_len)
+            q_begin, q_end, q_sizes = _split_prefill_queries(
+                sum(q_lens), metadata.mapping, _prefill_q_split_threshold(metadata)
+            )
+            if q_sizes is not None:
+                metadata.indexer_prefill_q_split = (q_begin, q_end, q_sizes)
             metadata.indexer_prefill_chunks = [
-                Indexer.prepare_one_prefill_chunk(
-                    metadata,
-                    [(i, 0, q_lens[i], q_starts[i]) for i in group],
-                )
-                for group in group_prefill_requests_by_logits_budget(
-                    q_lens, kv_lens, _INDEXER_PACKED_LOGITS_ELEM_BUDGET
+                Indexer.prepare_one_prefill_chunk(metadata, chunk_specs)
+                for chunk_specs in plan_mla_chunked_prefill_chunks(
+                    q_lens, kv_lens, _INDEXER_PACKED_LOGITS_ELEM_BUDGET, q_begin, q_end
                 )
             ]
         else:
@@ -1698,12 +1779,10 @@ class Indexer(nn.Module):
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
-                sparse_metadata_params = metadata.sparse_metadata_params
-                q_split_threshold = (
-                    sparse_metadata_params.q_split_threshold
-                    if sparse_metadata_params is not None
-                    else 8192
-                )
+                q_split_threshold = _prefill_q_split_threshold(metadata)
+                # Chunks planned for this rank's share of the queries only are
+                # never split again; their top-k rows are gathered after the loop.
+                batch_q_split = metadata.indexer_prefill_q_split
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
                 # FP4 packs two codes per byte so the gathered row holds half
                 # as many bytes as in the FP8 path. The scale (4 bytes) is the
@@ -1728,9 +1807,12 @@ class Indexer(nn.Module):
                     )
 
                     chunk_num_token = chunk.token_end - chunk.token_start
-                    chunk_q_start, chunk_q_end, q_sizes = _split_prefill_queries(
-                        chunk_num_token, metadata.mapping, q_split_threshold
-                    )
+                    if batch_q_split is None:
+                        chunk_q_start, chunk_q_end, q_sizes = _split_prefill_queries(
+                            chunk_num_token, metadata.mapping, q_split_threshold
+                        )
+                    else:
+                        chunk_q_start, chunk_q_end, q_sizes = 0, chunk_num_token, None
 
                     global_q_start = chunk.token_start + chunk_q_start
                     global_q_end = chunk.token_start + chunk_q_end
@@ -1777,6 +1859,15 @@ class Indexer(nn.Module):
                             dim=0,
                             sizes=q_sizes,
                         )
+
+                if batch_q_split is not None:
+                    local_q_begin, local_q_end, q_sizes = batch_q_split
+                    topk_indices_buffer[: sum(q_sizes), :] = allgather(
+                        topk_indices_buffer[local_q_begin:local_q_end, :],
+                        metadata.mapping,
+                        dim=0,
+                        sizes=q_sizes,
+                    )
             elif metadata.num_ctx_kv_tokens == 0:
                 # No compressed KV tokens — fill with -1 (no valid indices)
                 topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)

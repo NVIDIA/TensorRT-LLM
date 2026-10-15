@@ -49,6 +49,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
     group_prefill_requests_by_logits_budget,
+    plan_mla_chunked_prefill_chunks,
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
@@ -3488,6 +3489,71 @@ def test_group_prefill_requests_by_logits_budget(q_lens, kv_lens, elem_budget, e
             assert packed <= elem_budget
 
 
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,elem_budget,q_range,expected_chunks",
+    [
+        # Without a range, whole requests are grouped by the budget.
+        (
+            [500, 500, 500, 500],
+            [16000] * 4,
+            1 << 26,
+            (0, None),
+            [[(0, 0, 500, 0), (1, 0, 500, 500)], [(2, 0, 500, 1000), (3, 0, 500, 1500)]],
+        ),
+        # Requests cut by the range keep only their covered tokens, alone.
+        (
+            [100, 300, 100],
+            [10, 10, 10],
+            1 << 26,
+            (50, 450),
+            [[(0, 50, 100, 0)], [(1, 0, 300, 100)], [(2, 0, 50, 400)]],
+        ),
+        # Whole requests between two cut ones are still grouped together.
+        (
+            [100, 20, 30, 100],
+            [10, 10, 10, 10],
+            1 << 26,
+            (50, 200),
+            [[(0, 50, 100, 0)], [(1, 0, 20, 100), (2, 0, 30, 120)], [(3, 0, 50, 150)]],
+        ),
+        # A range inside one request covers a middle piece of it.
+        ([1000], [1000], 1 << 26, (250, 500), [[(0, 250, 500, 0)]]),
+        ([100], [100], 1 << 26, (100, 100), []),
+    ],
+    ids=["full_range", "cut_edges", "group_between_cuts", "middle_piece", "empty_range"],
+)
+@pytest.mark.cpu_only
+def test_plan_mla_chunked_prefill_chunks(q_lens, kv_lens, elem_budget, q_range, expected_chunks):
+    q_begin, q_end = q_range
+    chunks = plan_mla_chunked_prefill_chunks(q_lens, kv_lens, elem_budget, q_begin, q_end)
+    assert chunks == expected_chunks
+
+
+@pytest.mark.parametrize("tp_size", [2, 3, 4, 8])
+@pytest.mark.cpu_only
+def test_plan_mla_chunked_prefill_chunks_covers_tp_shares(tp_size):
+    rng = random.Random(tp_size)
+    q_lens = [rng.randint(1, 3000) for _ in range(23)]
+    kv_lens = [q + rng.randint(0, 40000) for q in q_lens]
+    elem_budget = 1 << 26
+    total = sum(q_lens)
+    q_starts = [sum(q_lens[:i]) for i in range(len(q_lens))]
+    covered = []
+    for rank in range(tp_size):
+        q_begin, q_end = total * rank // tp_size, total * (rank + 1) // tp_size
+        for chunk in plan_mla_chunked_prefill_chunks(q_lens, kv_lens, elem_budget, q_begin, q_end):
+            if len(chunk) > 1:
+                assert all(start == 0 and end == q_lens[i] for i, start, end, _ in chunk)
+                packed = sum(q_lens[i] for i, *_ in chunk) * sum(kv_lens[i] for i, *_ in chunk)
+                assert packed <= elem_budget
+            for req_idx, start, end, req_start in chunk:
+                assert req_start == q_starts[req_idx]
+                covered.append((req_start + start, req_start + end))
+    # Every context query token is covered exactly once, in order.
+    assert covered[0][0] == 0 and covered[-1][1] == total
+    assert all(prev[1] == cur[0] for prev, cur in zip(covered, covered[1:]))
+
+
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("compress_ratio", [1, 4])
@@ -4622,16 +4688,12 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
 
 
-@skip_pre_hopper
-def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
-    """Grouping reuse-hit requests into separate chunks must not change top-k.
+def _mla_prefill_reuse_case(monkeypatch):
+    """Build a reuse-hit MLA chunked-prefill batch; return a runner over it.
 
-    Under MLA chunked prefill every context request used to be packed into one
-    indexer chunk whose logits are [sum(new tokens) x sum(cached + new KV)].
-    With prefix reuse each request brings few new tokens but a long cached
-    context, so that product grows with the square of the request count. The
-    budget splits such batches; each query row still scores only its own
-    request's window, so the selected indices must match the packed run.
+    Four context requests bring few new tokens each on top of long cached
+    prefixes. The runner prepares the batch with a given packed-logits budget
+    (and optionally a TP mapping) and returns the planned chunks and top-k.
     """
     torch.manual_seed(0)
     heads, head_dim = 64, 128
@@ -4695,7 +4757,7 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
     q_fp8 = q.to(torch.float8_e4m3fn)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
-    def run(elem_budget):
+    def run(elem_budget, mapping=None):
         monkeypatch.setattr(dsa_indexer, "_INDEXER_PACKED_LOGITS_ELEM_BUDGET", elem_budget)
         metadata = _create_mock_metadata(
             request_ids,
@@ -4712,18 +4774,36 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
             enable_context_mla_with_cached_kv=True,
             indexer_head_dim=head_dim,
         )
+        metadata.mapping = mapping
         Indexer.prepare(metadata)
         indexer._update_k_cache(k_fp8, k_scale, metadata)
         topk = indexer.sparse_attn_indexer(
             metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
         ).clone()
-        return metadata.indexer_prefill_chunks, topk
+        return metadata, topk
 
-    packed_chunks, topk_packed = run(1 << 62)
-    split_chunks, topk_split = run(0)
+    return run, seq_lens, total_kv_lens, total_tokens
+
+
+@skip_pre_hopper
+def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
+    """Grouping reuse-hit requests into separate chunks must not change top-k.
+
+    Under MLA chunked prefill, packing every context request into one indexer
+    chunk makes its logits [sum(new tokens) x sum(cached + new KV)]. With
+    prefix reuse each request brings few new tokens but a long cached context,
+    so that product grows with the square of the request count. The budget
+    splits such batches; each query row still scores only its own request's
+    window, so the selected indices must match the packed run.
+    """
+    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(monkeypatch)
+    packed_metadata, topk_packed = run(1 << 62)
+    split_metadata, topk_split = run(0)
+    packed_chunks = packed_metadata.indexer_prefill_chunks
+    split_chunks = split_metadata.indexer_prefill_chunks
 
     assert len(packed_chunks) == 1
-    assert len(split_chunks) == batch_size
+    assert len(split_chunks) == len(seq_lens)
     q_start = kv_start = 0
     for chunk, q_len, kv_len in zip(split_chunks, seq_lens, total_kv_lens):
         assert (chunk.token_start, chunk.token_end) == (q_start, q_start + q_len)
@@ -4734,6 +4814,60 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
     # Top-k order within a row is unspecified; the selected sets must be equal.
     _, _, min_similarity = validate_topk_indices(topk_split, topk_packed, total_tokens)
     assert min_similarity == 1.0, f"split vs packed select different indices: {min_similarity}"
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
+    """Splitting a grouped MLA prefill batch across TP ranks must not change top-k.
+
+    Each emulated rank plans chunks for its share of the context queries only,
+    including requests cut at the share boundaries, and all-gathers its top-k
+    rows once. Concatenating the gathered shares must reproduce the top-k of
+    the unsplit run.
+    """
+    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(monkeypatch)
+    # Pairs of requests fit the budget. With TP2 the second rank's share holds
+    # a cut request followed by two whole ones grouped into one chunk; with TP4
+    # every share is too short to hold two whole requests.
+    elem_budget = 600 * 8000
+    request_bounds = [sum(seq_lens[:i]) for i in range(1, len(seq_lens))]
+    _, topk_unsplit = run(elem_budget)
+
+    monkeypatch.setattr(dsa_indexer, "_prefill_q_split_threshold", lambda metadata: 1)
+    gathered = []
+
+    def fake_allgather(tensor, mapping, dim=-1, sizes=None):
+        gathered.append((mapping.tp_rank, tensor.clone(), list(sizes)))
+        return torch.full(
+            (sum(sizes), *tensor.shape[1:]), -2, dtype=tensor.dtype, device=tensor.device
+        )
+
+    monkeypatch.setattr(dsa_indexer, "allgather", fake_allgather)
+    expected_sizes = [
+        (r + 1) * total_tokens // tp_size - r * total_tokens // tp_size for r in range(tp_size)
+    ]
+    has_grouped_chunk = False
+    for rank in range(tp_size):
+        mapping = Mapping(world_size=tp_size, rank=rank, tp_size=tp_size, pp_size=1)
+        metadata, _ = run(elem_budget, mapping)
+        q_begin, q_end, q_sizes = metadata.indexer_prefill_q_split
+        assert q_sizes == expected_sizes
+        assert (q_begin, q_end) == (sum(expected_sizes[:rank]), sum(expected_sizes[: rank + 1]))
+        chunks = metadata.indexer_prefill_chunks
+        assert [(c.token_start, c.token_end) for c in chunks] == list(
+            zip([q_begin] + [c.token_end for c in chunks[:-1]], [c.token_end for c in chunks])
+        )
+        assert chunks[0].token_start == q_begin and chunks[-1].token_end == q_end
+        has_grouped_chunk |= any(
+            c.token_start < bound < c.token_end for c in chunks for bound in request_bounds
+        )
+
+    assert has_grouped_chunk == (tp_size == 2)
+    assert [rank for rank, _, _ in gathered] == list(range(tp_size)), "one allgather per rank"
+    topk_split = torch.cat([rows for _, rows, _ in gathered])
+    _, _, min_similarity = validate_topk_indices(topk_split, topk_unsplit, total_tokens)
+    assert min_similarity == 1.0, f"TP split vs unsplit select different indices: {min_similarity}"
 
 
 @pytest.mark.cpu_only
