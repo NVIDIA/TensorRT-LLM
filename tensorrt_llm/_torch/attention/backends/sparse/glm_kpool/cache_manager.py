@@ -133,15 +133,46 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def suspend_request(self, request) -> None:
-        if self._kda_replay is not None:
-            self._kda_replay.prepare_suspend(self, request)
+        replay = self._kda_replay
+        request_id = request.py_request_id
+        cache = self.kv_cache_map.get(request_id)
+        slot = self._request_id_to_state_index.get(request_id, -1)
+        if replay is not None and slot >= 0 and cache is not None and cache.is_active:
+            if request_id in replay.acceptance_pending:
+                raise RuntimeError(
+                    f"Request {request_id} is being suspended before update_resources "
+                    "recorded the acceptance of its last verify, so its pending KDA drafts are unknown"
+                )
+            if request_id in replay.unseeded_requests:
+                replay.unseeded_requests.remove(request_id)
+            else:
+                with replay.on_cache_stream(self._stream):
+                    replay.commit_pending_drafts(slot)
+            del self._request_id_to_state_index[request_id]
+            replay.suspended_requests.add(request_id)
         super().suspend_request(request)
 
     @override
     def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
         super()._setup_state_indices(requests, num_contexts)
-        if self._kda_replay is not None and self.local_num_mamba_layers > 0:
-            self._kda_replay.seed_resumed_requests(self, requests, num_contexts)
+        replay = self._kda_replay
+        if replay is None or self.local_num_mamba_layers == 0:
+            return
+        replay.suspended_requests.difference_update(
+            request.py_request_id for request in requests[:num_contexts]
+        )
+        slots = []
+        for request in requests[num_contexts:]:
+            if request.py_request_id in replay.suspended_requests:
+                replay.suspended_requests.remove(request.py_request_id)
+                slots.append(self._request_id_to_state_index[request.py_request_id])
+        if slots:
+            with replay.on_cache_stream(self._stream):
+                replay.seed_transferred_slots(
+                    torch.tensor(
+                        slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device
+                    )
+                )
 
     @override
     def prepare_resources(self, scheduled_batch) -> None:

@@ -3,7 +3,6 @@
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
 import contextlib
-import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -11,6 +10,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+    Glm5NextCacheManager,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
@@ -2422,6 +2424,8 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
     enable_kv_pool_rebalance=False,
+    max_tokens=512,
+    max_gpu_total_bytes=0,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2435,7 +2439,8 @@ def _build_v2_hybrid_with_mamba_layer(
             enable_attention_dp=enable_attention_dp,
         )
     kv_cache_config = KvCacheConfig(
-        max_tokens=512,
+        max_tokens=max_tokens,
+        max_gpu_total_bytes=max_gpu_total_bytes,
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=enable_partial_reuse,
         block_reuse_config=BlockReuseConfig(
@@ -3678,7 +3683,8 @@ def test_v2_hybrid_intermediate_states_size_by_tokens_per_gen_step():
 
 
 @skip_no_cuda
-def test_v2_kda_replay_policy_allocates_logical_slot_caches():
+@pytest.mark.parametrize("max_tokens,byte_limit", [(512, 0), (None, 16 << 20), (512, 16 << 20)])
+def test_v2_kda_replay_policy_allocates_logical_slot_caches(max_tokens, byte_limit):
     spec_config = MTPDecodingConfig(max_draft_len=2)
     policy = KDAReplayState(
         num_speculative_tokens=2,
@@ -3693,22 +3699,22 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
         mamba_n_groups=6,
         mamba_ssm_cache_dtype=torch.float32,
         speculative_state=policy,
+        max_tokens=max_tokens,
+        max_gpu_total_bytes=byte_limit,
     )
     try:
         assert mgr._kda_replay is policy
         assert policy.intermediate_indices.shape == (4,)
         assert not hasattr(mgr, "get_replay_state_update_metadata")
 
-        total_quota = math.ceil(
-            mgr._get_quota_from_max_tokens(mgr.kv_cache_config.max_tokens)
-            / mgr.kv_cache_config.max_util_for_resume
-        )
         replay_bytes = sum(
             buffer.untyped_storage().nbytes()
             for buffer in (*policy._layer_replay_buffers(), policy.prev_num_accepted_tokens)
         )
         native_bytes = mgr.impl.get_quota(GPU_LEVEL)
-        assert native_bytes + replay_bytes <= total_quota
+        assert mgr._get_external_cache_bytes(mgr.impl) == replay_bytes
+        if byte_limit:
+            assert native_bytes + replay_bytes <= byte_limit
         assert mgr.kv_cache_manager_py_config.cache_tiers[0].quota == native_bytes
 
         layer_cache = mgr.mamba_layer_cache(0)
@@ -3946,11 +3952,11 @@ class _SlotCache:
         self.is_active = False
 
 
-def _v2_kda_replay_stub(num_slots=4):
+def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager):
     """A V2 hybrid manager stub with CPU KDA replay buffers and one layer's V2 conv states ([Q | K | V] sections of 2
     channels, a committed window of 3), for the state-index setup that prepare_resources runs. Committing pending drafts
     is recorded instead of run (it needs the GPU kernels)."""
-    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr = object.__new__(manager_cls)
     mgr.local_num_mamba_layers = 1
     mgr._kda_replay = KDAReplayState(2)
     mgr._speculative_state = mgr._kda_replay
@@ -3996,12 +4002,13 @@ def _kda_replay_slot(mgr, slot):
 
 
 @pytest.mark.parametrize("resume_slot", [1, 0], ids=["new_slot", "old_slot"])
-def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(resume_slot):
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(resume_slot, manager_cls):
     """A suspend commits the request's pending drafts and conv window into its slot's V2 states and forgets the slot,
     which can then go to another request. The request resumes in a new slot, or in its old one after that request has
     finished. Either way its replay caches are seeded from the V2 conv state it resumes with, nothing is pending, and
     the other request's replay state is left alone."""
-    mgr = _v2_kda_replay_stub()
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
     first = SimpleNamespace(py_request_id=1, is_dummy=False)
     second = SimpleNamespace(py_request_id=2, is_dummy=False)
     mgr.kv_cache_map[1] = _SlotCache(0)
@@ -4043,14 +4050,15 @@ def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(resume_slot)
 
 
 @pytest.mark.parametrize("recorded_by", ["update_resources", "revert_allocate_generation"])
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
-    monkeypatch, recorded_by
+    monkeypatch, recorded_by, manager_cls
 ):
     """With a host drafter, update_resources records the acceptance of a batch's verify, and a suspend needs it to
     commit the request's pending drafts. A suspend between the batch's prepare_resources and its update_resources
     raises instead of committing a stale count. Once update_resources has recorded it, or the batch is reverted without
     running, the suspend commits."""
-    mgr = _v2_kda_replay_stub()
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     for method in ("prepare_resources", "update_resources", "revert_allocate_generation"):
         monkeypatch.setattr(KVCacheManagerV2, method, MagicMock())
@@ -4077,10 +4085,11 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
 
 
 @pytest.mark.parametrize("seeded", [False, True], ids=["before_seeding", "after_seeding"])
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
-    monkeypatch, seeded
+    monkeypatch, seeded, manager_cls
 ):
-    mgr = _v2_kda_replay_stub()
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
     monkeypatch.setattr(KVCacheManagerV2, "prepare_resources", MagicMock())
     request = SimpleNamespace(py_request_id=1, is_dummy=False, is_disagg_generation_init_state=True)
     mgr.kv_cache_map[1] = _SlotCache(0)

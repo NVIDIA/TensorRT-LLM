@@ -46,7 +46,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -724,9 +724,10 @@ def test_kda_scratch_cost_matches_allocated_slot_buffers():
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 @pytest.mark.parametrize("replay", [False, True])
 @pytest.mark.parametrize("pool_share", [0.25, 0.75])
-@pytest.mark.parametrize("quota_source", ["max_tokens", "max_gpu_total_bytes"])
+@pytest.mark.parametrize("quota_source", ["max_tokens", "max_gpu_total_bytes", "both"])
+@pytest.mark.parametrize("granularity", [1, 4096])
 def test_kda_pool_allocation_reserves_actual_replay_capacity(
-    monkeypatch, manager_cls, replay, pool_share, quota_source
+    monkeypatch, manager_cls, replay, pool_share, quota_source, granularity
 ):
     from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as module
 
@@ -743,15 +744,18 @@ def test_kda_pool_allocation_reserves_actual_replay_capacity(
     manager.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     persistent_bytes_per_slot = 2 * (128 + 288)
     total_quota = 1 << 20
-    if quota_source == "max_tokens":
+    if quota_source in ("max_tokens", "both"):
         monkeypatch.setattr(
             KVCacheManagerV2, "_get_quota_from_max_tokens", lambda self, tokens: tokens * 64
         )
         total_quota = manager._get_quota_from_max_tokens(16384)
+        assert total_quota == 16384 * 64 + 4 * persistent_bytes_per_slot
 
     class Pool:
         def __init__(self, config, **kwargs):
-            self.quota = config.cache_tiers[0].quota
+            self.quota = (
+                (config.cache_tiers[0].quota + granularity - 1) // granularity * granularity
+            )
             self.resize_calls = 0
 
         @property
@@ -769,7 +773,7 @@ def test_kda_pool_allocation_reserves_actual_replay_capacity(
 
         def resize(self, level, quota):
             self.resize_calls += 1
-            self.quota = quota
+            self.quota = (quota + granularity - 1) // granularity * granularity
             return True
 
     monkeypatch.setattr(module, "KVCacheManagerPy", Pool)
@@ -778,7 +782,10 @@ def test_kda_pool_allocation_reserves_actual_replay_capacity(
         layers=[],
         cache_tiers=[GpuCacheTierConfig(quota=total_quota), HostCacheTierConfig(quota=12345)],
     )
-    pool = manager._allocate_cache_pools(config, event_manager=None, cold_page_codec=None)
+    byte_limit = total_quota if quota_source != "max_tokens" else None
+    pool = manager._allocate_cache_pools(
+        config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=byte_limit
+    )
     # The native pool can have many more slots than the live batch needs.
     assert pool.slots > layout.max_batch_size
     if replay:
@@ -791,12 +798,15 @@ def test_kda_pool_allocation_reserves_actual_replay_capacity(
             buffer.untyped_storage().nbytes()
             for buffer in (*state._layer_replay_buffers(), state.prev_num_accepted_tokens)
         )
-        assert pool.resize_calls > 0
-        assert pool.quota + scratch_bytes <= total_quota
+        if byte_limit:
+            assert pool.resize_calls > 0
+            assert pool.quota + scratch_bytes <= byte_limit
+        else:
+            assert pool.resize_calls == 0
         assert manager._get_external_cache_bytes(pool) == scratch_bytes
     else:
         assert pool.resize_calls == 0
-        assert pool.quota == total_quota
+        assert pool.quota == (total_quota + granularity - 1) // granularity * granularity
     # Host fallback retries must retain the original total GPU budget.
     assert config.cache_tiers[0].quota == total_quota
     assert config.cache_tiers[1].quota == 12345
@@ -817,16 +827,62 @@ def test_external_cache_reservation_rejects_unusable_quota(monkeypatch, resize_s
     )
     # A backend that reports success without releasing memory must fail too.
     with pytest.raises(ValueError, match="external cache storage"):
-        manager._allocate_cache_pools(config, event_manager=None, cold_page_codec=None)
+        manager._allocate_cache_pools(
+            config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=1024
+        )
     cache.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize("byte_limit", [1500, 1800])
+def test_external_cache_reservation_handles_native_minimum_and_rounding(monkeypatch, byte_limit):
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as module
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._get_external_cache_bytes = lambda cache: cache.quota
+
+    class Pool:
+        quota = 1024
+        shutdown_called = False
+
+        def get_quota(self, level):
+            return self.quota
+
+        def resize(self, level, quota):
+            rounded = (quota + 255) // 256 * 256
+            if rounded < 768:
+                return False
+            self.quota = rounded
+            return True
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    pool = Pool()
+    monkeypatch.setattr(module, "KVCacheManagerPy", lambda *args, **kwargs: pool)
+    config = KVCacheManagerConfig(
+        tokens_per_block=32, layers=[], cache_tiers=[GpuCacheTierConfig(quota=1024)]
+    )
+    if byte_limit < 2 * 768:
+        with pytest.raises(ValueError, match="external cache storage"):
+            manager._allocate_cache_pools(
+                config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=byte_limit
+            )
+        assert pool.shutdown_called
+    else:
+        manager._allocate_cache_pools(
+            config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=byte_limit
+        )
+        assert pool.quota == 768
+        assert not pool.shutdown_called
 
 
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 @pytest.mark.parametrize("stochastic_rounding", [False, True])
 @pytest.mark.parametrize("replay", [False, True])
 @pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("interval", [0, 32])
 def test_kda_affine_estimator_includes_replay_scratch(
-    monkeypatch, manager_cls, stochastic_rounding, replay, reuse
+    monkeypatch, manager_cls, stochastic_rounding, replay, reuse, interval
 ):
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import cache_manager as glm_module
     from tensorrt_llm._torch.modules.kimi_kda import cache_manager as kda_module
@@ -858,7 +914,10 @@ def test_kda_affine_estimator_includes_replay_scratch(
         quant_config=SimpleNamespace(mamba_ssm_stochastic_rounding=stochastic_rounding),
     )
     monkeypatch.setattr(glm_module, "unwrap_glm5_next_text_config", lambda config: config)
-    kv_config = KvCacheConfig(enable_block_reuse=reuse)
+    kv_config = KvCacheConfig(
+        enable_block_reuse=reuse,
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+    )
     cost = manager_cls.get_cache_size_per_token(
         config,
         layout.mapping,
@@ -881,7 +940,7 @@ def test_kda_affine_estimator_includes_replay_scratch(
     )
     state_bytes = 2 * 416 + scratch_per_slot
     interval = kv_config.mamba_state_config.periodic_snapshot_interval
-    slope = (state_bytes + interval - 1) // interval if reuse else 0
+    slope = (state_bytes + interval - 1) // interval if reuse and interval > 0 else 0
     assert cost == (slope, (layout.max_batch_size + dummy_slots) * state_bytes)
 
 

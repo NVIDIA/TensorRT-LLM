@@ -1728,6 +1728,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 config,
                 event_manager=event_sink,
                 cold_page_codec=create_cold_page_codec(config),
+                max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
             )
         else:
             init_error: Optional[Exception] = None
@@ -1737,6 +1738,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     config,
                     event_manager=event_sink,
                     cold_page_codec=create_cold_page_codec(config),
+                    max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
                 )
             except Exception as error:
                 if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
@@ -1777,6 +1779,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         config,
                         event_manager=event_sink,
                         cold_page_codec=create_cold_page_codec(config),
+                        max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
                     )
                 except Exception as error:
                     fallback_error = error.with_traceback(None)
@@ -1803,7 +1806,7 @@ class KVCacheManagerV2(BaseResourceManager):
             config = replace(
                 config,
                 cache_tiers=[
-                    replace(config.cache_tiers[0], quota=candidate.get_quota(GPU_LEVEL)),
+                    GpuCacheTierConfig(quota=candidate.get_quota(GPU_LEVEL)),
                     *config.cache_tiers[1:],
                 ],
             )
@@ -3080,33 +3083,49 @@ class KVCacheManagerV2(BaseResourceManager):
         return 0
 
     def _allocate_cache_pools(
-        self, config: KVCacheManagerConfigPy, *, event_manager, cold_page_codec
+        self,
+        config: KVCacheManagerConfigPy,
+        *,
+        event_manager,
+        cold_page_codec,
+        max_gpu_total_bytes: int | None = None,
     ) -> KVCacheManagerPy:
-        """Reserve external storage before publishing pool addresses and capacities."""
+        """Fit native pools and external storage within the physical GPU budget."""
         cache = KVCacheManagerPy(
             config, event_manager=event_manager, cold_page_codec=cold_page_codec
         )
-        total_quota = config.cache_tiers[0].quota
-        previous_pool_quota = total_quota
         external_bytes = self._get_external_cache_bytes(cache)
-        while external_bytes and cache.get_quota(GPU_LEVEL) + external_bytes > total_quota:
-            # Scale the combined footprint, then recheck the actual capacity:
-            # native allocation granularity and minimum slots affect rounding.
-            native_bytes = cache.get_quota(GPU_LEVEL)
-            pool_quota = native_bytes * total_quota // (native_bytes + external_bytes)
-            if (
-                pool_quota <= 0
-                or pool_quota >= previous_pool_quota
-                or not cache.resize(GPU_LEVEL, pool_quota)
-            ):
-                cache.shutdown()
-                raise ValueError(
-                    "The GPU cache quota cannot accommodate native pools and "
-                    f"external cache storage ({external_bytes} bytes)."
-                )
-            previous_pool_quota = pool_quota
-            external_bytes = self._get_external_cache_bytes(cache)
-        return cache
+        # A token limit sizes the native pools; their minimum slots and allocation
+        # granularity can exceed that logical size. Only a byte limit caps the
+        # combined physical allocation, including model-owned scratch.
+        if not external_bytes or not max_gpu_total_bytes:
+            return cache
+        native_bytes = cache.get_quota(GPU_LEVEL)
+        if native_bytes + external_bytes <= max_gpu_total_bytes:
+            return cache
+
+        lower_quota = 0
+        upper_quota = config.cache_tiers[0].quota
+        pool_quota = min(
+            upper_quota - 1,
+            native_bytes * max_gpu_total_bytes // (native_bytes + external_bytes),
+        )
+        while lower_quota < pool_quota < upper_quota:
+            if not cache.resize(GPU_LEVEL, pool_quota):
+                # A quota below the native minimum cannot be resized. Search
+                # above it before concluding that the combined budget cannot fit.
+                lower_quota = pool_quota
+            else:
+                external_bytes = self._get_external_cache_bytes(cache)
+                if cache.get_quota(GPU_LEVEL) + external_bytes <= max_gpu_total_bytes:
+                    return cache
+                upper_quota = pool_quota
+            pool_quota = (lower_quota + upper_quota) // 2
+        cache.shutdown()
+        raise ValueError(
+            "The GPU cache quota cannot accommodate native pools and "
+            f"external cache storage ({external_bytes} bytes)."
+        )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""

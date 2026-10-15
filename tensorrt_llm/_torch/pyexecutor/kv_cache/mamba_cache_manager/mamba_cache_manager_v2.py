@@ -432,13 +432,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return self.max_batch_size * self.mapping.pp_size
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        return (
-            sum(
-                buffer.size
-                for layer_id in self.mamba_pp_layers
-                for buffer in self._get_recurrent_buffer_configs(layer_id)
-            )
-            + self._extra_scratch_bytes_per_slot()
+        """Return persistent bytes per slot allocated by the native pools."""
+        return sum(
+            buffer.size
+            for layer_id in self.mamba_pp_layers
+            for buffer in self._get_recurrent_buffer_configs(layer_id)
         )
 
     def _num_ssm_snapshots_for_capacity(
