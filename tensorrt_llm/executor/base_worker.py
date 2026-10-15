@@ -1325,8 +1325,8 @@ class AwaitResponseHelper:
 
     def process_responses(
             self, responses: List[tllm.Response]) -> List[tllm.Response]:
-        """Append deferred submission errors to the engine responses."""
-        responses = list(responses)
+        """Filter empty engine responses, then append deferred submission errors."""
+        responses = [response for response in responses if response is not None]
 
         # Drain with get_nowait(): this may run concurrently from the
         # ManagedThread and RPC fetch_responses(), and empty()+get() can
