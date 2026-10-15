@@ -32,29 +32,29 @@ OpenEngine serves the standard `grpc.health.v1.Health` service on its gRPC port.
 
 The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. Both services report `NOT_SERVING` during graceful shutdown. Each `Watch` ends after this final status. A stopped or failed server cannot answer the probe.
 
-For a Pod with a loopback inference port at 50051, start the health-only listener on port 50052:
+For a Pod with a loopback inference port at 30001, start the health-only listener on port 30002:
 
 ```bash
 trtllm-serve <model> --grpc --grpc-protocol openengine \
-  --host 127.0.0.1 --port 50051 --openengine-health-port 50052
+  --host 127.0.0.1 --port 30001 --openengine-health-port 30002
 ```
 
-Configure Kubernetes to probe port 50052:
+Configure Kubernetes to probe port 30002:
 
 ```yaml
 startupProbe:
   grpc:
-    port: 50052
+    port: 30002
     service: inference
   periodSeconds: 10
   failureThreshold: 60
 readinessProbe:
   grpc:
-    port: 50052
+    port: 30002
     service: inference
 livenessProbe:
   grpc:
-    port: 50052
+    port: 30002
     service: liveness
 ```
 

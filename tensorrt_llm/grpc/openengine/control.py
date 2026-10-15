@@ -416,7 +416,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         if self._frontend is not None:
             try:
                 status = await self._frontend.request("status")
-                model_ready = model_ready and status["ready"]
+                model_ready = model_ready and status["ready"] and not status["stopping"]
             except CoordinationError:
                 model_ready = False
         checks.append(

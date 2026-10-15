@@ -168,7 +168,7 @@ class OpenEngineServer:
             self._health_server = grpc.aio.server(options=[("grpc.so_reuseport", 0)])
             health_pb2_grpc.add_HealthServicer_to_server(self._health, self._health_server)
             self.health_port = self._health_server.add_insecure_port(
-                _format_bind_address("0.0.0.0", health_port)
+                _format_bind_address("0.0.0.0", health_port)  # nosec B104: Pod-IP health probes
             )
 
     async def start(self) -> None:
