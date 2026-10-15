@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
                     cast)
 
+import numpy as np
 import torch
 import transformers
 from tqdm import tqdm
@@ -330,6 +331,37 @@ def _multimodal_params_have_encoder_features(
     audio_data = multimodal_params.multimodal_data.get("audio")
     return isinstance(audio_data,
                       dict) and "encoder_input_features" in audio_data
+
+
+def _check_prompt_token_id_range(prompt_token_ids: Union[Sequence[int],
+                                                         torch.Tensor,
+                                                         np.ndarray],
+                                 vocab_size: Optional[int],
+                                 allow_out_of_vocab: bool) -> None:
+    """Reject prompt token ids that would index outside the embedding table.
+
+    An out-of-range id reaches the embedding lookup, where an unmasked gather
+    triggers a device-side assert that leaves the CUDA context unusable, so a
+    single request can take down the whole server. Negative ids are always
+    rejected. Ids at or above ``vocab_size`` are accepted only when
+    ``allow_out_of_vocab`` is set: multimodal requests and prompt adapters use
+    them as placeholders that are replaced before the embedding lookup, and a
+    generation-only request carries the context worker's expanded prompt.
+    """
+    if len(prompt_token_ids) == 0:
+        return
+    if isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
+        low = int(prompt_token_ids.min())
+        high = int(prompt_token_ids.max())
+    else:
+        low = min(prompt_token_ids)
+        high = max(prompt_token_ids)
+    if low < 0:
+        raise RequestError(f"Prompt token ids must be non-negative, got {low}.")
+    if vocab_size is not None and high >= vocab_size and not allow_out_of_vocab:
+        raise RequestError(
+            f"Prompt token id {high} is out of range for a vocabulary of "
+            f"{vocab_size} tokens.")
 
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -671,6 +703,16 @@ class BaseLLM:
                 return normalized
         raise TypeError(f"{name} must be a list of token ids.")
 
+    def _prompt_vocab_size(self) -> Optional[int]:
+        """Vocabulary size of the text embedding, or None when unknown."""
+        hf_model_config = getattr(self, "_hf_model_config", None)
+        for config in (getattr(hf_model_config, "text_config",
+                               None), hf_model_config):
+            vocab_size = getattr(config, "vocab_size", None)
+            if isinstance(vocab_size, int) and vocab_size > 0:
+                return vocab_size
+        return None
+
     def _is_encoder_decoder_model(self) -> bool:
         return bool(getattr(self._hf_model_config, "is_encoder_decoder", False))
 
@@ -878,6 +920,11 @@ class BaseLLM:
         self._check_arguments(len(prompt_token_ids),
                               sampling_params,
                               is_gen_only=is_gen_only)
+        _check_prompt_token_id_range(
+            prompt_token_ids,
+            self._prompt_vocab_size(),
+            allow_out_of_vocab=multimodal_params is not None
+            or prompt_adapter_request is not None or is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
