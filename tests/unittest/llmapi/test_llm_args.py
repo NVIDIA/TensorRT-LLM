@@ -1347,8 +1347,9 @@ def test_branch_snapshot_auto_manager_selection(preference: str | None) -> None:
 
     args = TorchLlmArgs(
         model="dummy",
-        kv_cache_config=KvCacheConfig(block_reuse_config=BlockReuseConfig(
-            enable_branch_snapshot=True)))
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2="auto",
+            block_reuse_config=BlockReuseConfig(enable_branch_snapshot=True)))
     if preference == "V2":
         assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
     else:
