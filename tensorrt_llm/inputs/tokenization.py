@@ -76,8 +76,13 @@ def _truncating_copy(tokenizer: Any) -> Optional[Tuple[Any, threading.Lock]]:
 def _encode(tokenizer: Any, prompt: str, add_special_tokens: bool, kwargs: dict) -> List[int]:
     try:
         return tokenizer.encode(prompt, add_special_tokens=add_special_tokens, **kwargs)
-    except TypeError:
-        # Tiktoken path
+    except TypeError as error:
+        # A tiktoken ``Encoding`` rejects ``add_special_tokens``; it neither adds special tokens
+        # nor truncates, and only needs the special tokens the prompt contains to be allowed.
+        # Any other ``TypeError`` is an error inside an ordinary tokenizer's encode (a bad
+        # option, say) and is reported as it is, not retried with the options dropped.
+        if "add_special_tokens" not in str(error):
+            raise
         return tokenizer.encode(prompt, allowed_special=TIKTOKEN_ALLOWED_SPECIAL_TOKENS)
 
 
