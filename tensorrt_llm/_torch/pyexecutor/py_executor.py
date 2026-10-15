@@ -565,16 +565,6 @@ class PyExecutor:
 
         self.peft_cache_config = peft_cache_config
 
-        self.iter_counter = 0
-        # profile config
-        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
-            PROFILE_START_STOP_ENV_VAR_NAME)
-        # Convert to mutable sets so start_profile()/stop_profile() can
-        # .add() runtime-configured iteration indices.
-        # _load_iteration_indexes returns frozensets.
-        self.profile_start_iters = set(_env_start_iters)
-        self.profile_stop_iters = set(_env_stop_iters)
-
         # Runtime-configurable profiling state. Populated by start_profile()
         # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
         # or API calls. When these are None/False the _profiler() context
@@ -686,6 +676,15 @@ class PyExecutor:
         enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
+        # profile config
+        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
+            PROFILE_START_STOP_ENV_VAR_NAME)
+        # Convert to mutable sets so start_profile()/stop_profile() can
+        # .add() runtime-configured iteration indices.
+        # _load_iteration_indexes returns frozensets.
+        self.profile_start_iters = set(_env_start_iters)
+        self.profile_stop_iters = set(_env_stop_iters)
+
         self._metrics = {}
         self._disagg_coordinator = None
         self._ctx_mla_kv_len_cap = "unset"

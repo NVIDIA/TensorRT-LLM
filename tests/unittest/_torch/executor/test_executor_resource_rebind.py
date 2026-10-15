@@ -3,13 +3,19 @@
 """Contracts for switching a stopped executor from profiling to serving resources."""
 
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, PyExecutorResources
+from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    PyExecutor,
+    PyExecutorResources,
+    _ExecutorExecutionConfig,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 
@@ -154,18 +160,115 @@ def test_failed_executor_cannot_resume_with_new_resources(executor, error_field)
     ex._initialize_execution.assert_not_called()
 
 
-def test_rebind_uses_same_executor_and_does_not_start_worker(executor):
+def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     ex, _ = executor
+    monkeypatch.setenv("TLLM_PROFILE_START_STOP", "2-4")
+    executor_module._load_iteration_indexes.cache_clear()
+    monkeypatch.setattr(torch.cuda, "Stream", Mock())
+    monkeypatch.setattr(torch.cuda, "Event", Mock())
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(executor_module, "_distributed_warmup_guard", lambda *args: nullcontext())
+    monkeypatch.setattr(executor_module.ADPRouter, "create", Mock())
+    monkeypatch.setattr(executor_module, "HangDetector", Mock())
+    monkeypatch.setattr(executor_module, "ExecutorRequestQueue", Mock())
+    monkeypatch.setattr(executor_module, "RequestBroadcaster", Mock())
+    monkeypatch.setattr(executor_module, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(executor_module.GpuKeepalive, "create_from_env", Mock(return_value=None))
+    monkeypatch.setattr(
+        executor_module, "create_executor_hang_diagnostics", Mock(return_value=(None, None))
+    )
+    for name in (
+        "_emit_initial_stats",
+        "_set_global_steady_clock_offset",
+        "_initialize_remote_tail_adp",
+        "_maybe_init_kv_connector_manager",
+        "_validate_moe_a2a_checkpoint_support",
+        "_warn_if_kv_block_budget_unchecked",
+    ):
+        monkeypatch.setattr(ex, name, Mock())
+    ex.device_id = 0
+    ex.global_rank = 0
+    ex.dist = SimpleNamespace(pp_size=1, rank=0, mapping=Mock(), barrier=Mock())
+    ex.execution_stream = Mock()
+    ex.drafter = None
+    ex.guided_decoder = None
+    ex._execution_config = _ExecutorExecutionConfig(
+        disable_overlap_scheduler=True,
+        enable_early_first_token_response=False,
+        max_input_len=128,
+        max_batch_size=2,
+        max_beam_width=1,
+        max_draft_len=0,
+        max_total_draft_tokens=0,
+        garbage_collection_gen0_threshold=None,
+        resource_governor_queue=None,
+        hang_detection_timeout=None,
+        enable_kv_pool_rebalance=False,
+    )
+    ex.model_engine.enable_attention_dp = False
+    ex.model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
+    ex.model_engine.get_max_num_sequences = Mock(return_value=2)
+    ex.model_engine.warmup = Mock()
+    ex.model_engine.llm_args = SimpleNamespace(
+        max_stats_len=0,
+        max_num_tokens=128,
+        print_iter_log=False,
+        enable_iter_perf_stats=False,
+        enable_iter_req_stats=False,
+        iter_perf_stats_interval=1,
+        stream_interval=1,
+        attention_dp_config=None,
+        batch_wait_timeout_ms=0,
+        batch_wait_timeout_iters=0,
+        batch_wait_max_tokens_ratio=0,
+    )
+    cache = Mock(
+        event_buffer_max_size=0,
+        streaming_kv_events_enabled=False,
+        enable_block_reuse=False,
+        tokens_per_block=16,
+    )
+    cache.get_kv_cache_stats.return_value = SimpleNamespace(max_num_blocks=8, tokens_per_block=16)
+    resources = PyExecutorResources(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: cache}),
+        scheduler=Mock(),
+        kv_cache_transceiver=None,
+        peft_cache_config=None,
+        virtual_memory_pools=None,
+        kv_connector_manager=None,
+        dwdp_manager=None,
+        max_seq_len=128,
+        max_num_sequences=2,
+        waiting_queue_policy=executor_module.WaitingQueuePolicy.FCFS,
+    )
+    ex.iter_counter = 42
+    ex._ctx_mla_kv_len_cap = None
+    ex.profile_start_iters = {99}
+    ex.profile_stop_iters = set()
+    old_shutdown_event = ex.shutdown_event
     engine, stream = ex.model_engine, ex.execution_stream
     ex.release_resources()
-    resources = Mock(spec=PyExecutorResources)
-    ex._initialize_execution = Mock()
+    ex._disagg_coordinator = object()
     ex.start_worker = Mock()
-    assert ex.rebind_resources(resources) is None
-    ex._initialize_execution.assert_called_once_with(resources)
-    ex.start_worker.assert_not_called()
-    assert ex.model_engine is engine and ex.execution_stream is stream
-    assert not ex._resources_released
+    try:
+        ex.rebind_resources(resources)
+        assert ex.iter_counter == 0
+        assert ex.profile_start_iters == {2}
+        assert ex.profile_stop_iters == {4}
+        assert ex._ctx_mla_kv_len_cap == "unset"
+        assert ex._disagg_coordinator is None
+        assert not ex.worker_started
+        assert ex.shutdown_event is not old_shutdown_event
+        assert not ex.shutdown_event.is_set()
+        assert ex.resource_manager is resources.resource_manager
+        assert ex.kv_cache_manager is cache
+        assert ex.model_engine is engine and ex.execution_stream is stream
+        assert not ex._resources_released
+        engine.warmup.assert_called_once_with(resources.resource_manager)
+        ex.start_worker.assert_not_called()
+    finally:
+        executor_module._load_iteration_indexes.cache_clear()
 
 
 def test_failed_rebind_cannot_be_retried_over_partial_resources(executor):
