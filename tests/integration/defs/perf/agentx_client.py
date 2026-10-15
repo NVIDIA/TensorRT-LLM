@@ -371,6 +371,15 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     if warmup > 0:
         cmd += ["--warmup-requests-per-lane", str(warmup)]
 
+    # The scenario forces ignore_eos, so the model can emit its end-of-sequence
+    # token as an ordinary output token. With the server's default
+    # skip_special_tokens it decodes to no text, and a one-token response
+    # (every warmup request, and every ctx_only request) then carries no
+    # content, which aiperf rejects as InvalidInferenceResultError. Keeping
+    # special tokens in the text makes every generated token visible; it does
+    # not change the token counts the metrics are built from.
+    cmd += ["--extra-inputs", "skip_special_tokens:false"]
+
     # Plain os.environ.get with a default, mirroring the reference script's
     # `${VAR-default}`: an explicitly empty value must disable the flag, which
     # is how a production (>=900 s) run drops --unsafe-override.

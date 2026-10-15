@@ -95,10 +95,22 @@ def test_fork_with_old_datasets_is_not_usable(client: ModuleType, monkeypatch, t
     assert not _probe(client, monkeypatch, tmp_path)
 
 
-def test_command_runs_the_scenario_the_probe_checks(client: ModuleType, monkeypatch):
+def _default_cmd(client: ModuleType, monkeypatch) -> list[str]:
     monkeypatch.delenv("AGENTX_EXTRA_ARGS", raising=False)
     args = client.parse_args(
         ["--model", "/m", "--concurrency", "8", "--dataset", "d", "--host", "h", "--port", "1"]
     )
-    cmd = client.build_aiperf_cmd(args, "http://h:1", "/tmp/a")
+    return client.build_aiperf_cmd(args, "http://h:1", "/tmp/a")
+
+
+def test_command_runs_the_scenario_the_probe_checks(client: ModuleType, monkeypatch):
+    cmd = _default_cmd(client, monkeypatch)
     assert cmd[cmd.index("--scenario") + 1] == client.AGENTX_SCENARIO
+
+
+def test_command_keeps_special_tokens_in_the_text(client: ModuleType, monkeypatch):
+    # Under the scenario's forced ignore_eos, a one-token response can be the
+    # end-of-sequence token; without this it decodes to no text at all.
+    cmd = _default_cmd(client, monkeypatch)
+    extra_inputs = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--extra-inputs"]
+    assert "skip_special_tokens:false" in extra_inputs
