@@ -125,6 +125,9 @@ SLURM_CORES_REQUEST = "1"
 SLURM_CORES_LIMIT = "1"
 SLURM_MEMORY_REQUEST = "8Gi"
 SLURM_MEMORY_LIMIT = "12Gi"
+// SLURM job workspaces and output logs are kept on the cluster for debugging
+// and pruned once nothing in them has changed for this many days.
+SLURM_OUTPUT_RETENTION_DAYS = 10
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
@@ -777,6 +780,19 @@ def isValidSlurmJobId(def slurmJobID) {
     return slurmJobID && slurmJobID.toString() ==~ /\d+/
 }
 
+// Remote commands that prune SLURM job output not modified within
+// SLURM_OUTPUT_RETENTION_DAYS: sbatch job workspaces
+// (bloom/scripts/<host>-multi_node_test-*) in which no file has changed, and
+// agent job logs (slurm-logs/slurm-<jobid>-<host>-test-*.out). Avoids `$`,
+// which the local shell building the ssh command would expand.
+def staleSlurmOutputCleanupCommands() {
+    def days = SLURM_OUTPUT_RETENTION_DAYS
+    return [
+        "find /home/svc_tensorrt/bloom/scripts -mindepth 1 -maxdepth 1 -type d -name '*-multi_node_test-*' -exec bash -c 'find {} -mtime -${days} -print -quit | grep -q . || rm -rf {}' \\; 2>/dev/null || true",
+        "find /home/svc_tensorrt/slurm-logs -maxdepth 1 -type f -name 'slurm-*-test-*.out' ! -mtime -${days} -delete 2>/dev/null || true",
+    ]
+}
+
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
@@ -816,8 +832,11 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
-        ].join(" ; ")
+            // Keep the job workspace (job-output.log etc.) for debugging, but drop
+            // the S3 spool and credentials right away.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config || true",
+        ] + staleSlurmOutputCleanupCommands()
+        cleanupCommands = cleanupCommands.join(" ; ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
@@ -867,7 +886,8 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-        ].join(" ; ")
+        ] + staleSlurmOutputCleanupCommands()
+        cleanupCommands = cleanupCommands.join(" ; ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
