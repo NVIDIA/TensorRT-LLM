@@ -661,6 +661,167 @@ def test_beta_cache_sibling_layer_after_aligned_warmup(
         )
 
 
+def _dim_contiguous_clone(cache):
+    clone = torch.empty(
+        cache.shape[0], cache.shape[2], cache.shape[1], dtype=cache.dtype, device=cache.device
+    ).transpose(1, 2)
+    clone.copy_(cache)
+    return clone
+
+
+def _verify_after_round_one(B, H, num_spec, seed):
+    """Inputs of a verify that follows a first verify run by the kernel, with
+    a different number of the first round's drafts accepted per request.
+
+    The conv windows start at bf16 values, as they do when the cache manager
+    seeds them from its bf16 conv pool."""
+    data = make_conv_data(B, H, M=num_spec, seed=seed)
+    for name in ("cs_q", "cs_k", "cs_v"):
+        data[name].copy_(data[name].bfloat16().float())
+    first = cute_run(data)
+    data = make_conv_data(B, H, M=num_spec, seed=seed + 1)
+    for name in ("qkg_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
+        data[name] = first[name]
+    data["initial_state_cute"] = first["state_v_first"]
+    data["num_accepted_tokens"] = torch.arange(B, dtype=torch.int32, device="cuda") % (num_spec + 1)
+    return data
+
+
+@pytest.mark.parametrize("B,H,num_spec", [(32, 12, 2), (32, 6, 2), (4, 6, 7)], ids=lambda v: str(v))
+def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
+    """Committing the pending drafts first leaves the next verify's results
+    unchanged, bit for bit.
+
+    This is what the cache manager does across a suspend.
+    ``kda_mtp_commit_pending_drafts`` folds the accepted drafts into the
+    state, ``store_kda_replay_conv_window`` puts the conv window after them in
+    the bf16 conv pool, and the resume seeds the replay caches from that pool
+    with nothing pending. The verify that follows must give exactly the
+    outputs, state, caches and windows of the verify that replays the drafts
+    itself."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        kda_mtp_commit_pending_drafts,
+    )
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
+        copy_kda_replay_conv_window,
+        store_kda_replay_conv_window,
+    )
+
+    data = _verify_after_round_one(B, H, num_spec, seed=41)
+    accepted = data["num_accepted_tokens"]
+    slots = data["ssm_state_indices"]
+    replayed = cute_run(data)
+
+    state = data["initial_state_cute"].clone()
+    cs = [_dim_contiguous_clone(data[name]) for name in ("cs_q", "cs_k", "cs_v")]
+    kda_mtp_commit_pending_drafts(
+        state,
+        *cs,
+        data["qkg_cache"].clone(),
+        data["v_cache"].clone(),
+        data["beta_cache"].clone(),
+        slots,
+        accepted,
+        num_spec,
+        conv_width=data["W"],
+    )
+    for n in range(B):
+        unchanged = torch.equal(state[n], data["initial_state_cute"][n])
+        assert unchanged == (int(accepted[n]) == 0), n
+    conv_pool = torch.zeros(
+        B, 3 * H * data["K"], data["W"] - 1, dtype=torch.bfloat16, device="cuda"
+    )
+    store_kda_replay_conv_window(conv_pool, *cs, slots, accepted)
+    for cache in cs:
+        cache.zero_()
+    copy_kda_replay_conv_window(conv_pool, *cs, slots)
+
+    resumed = dict(data)
+    resumed.update(
+        initial_state_cute=state,
+        cs_q=cs[0],
+        cs_k=cs[1],
+        cs_v=cs[2],
+        qkg_cache=torch.zeros_like(data["qkg_cache"]),
+        v_cache=torch.zeros_like(data["v_cache"]),
+        beta_cache=torch.zeros_like(data["beta_cache"]),
+        num_accepted_tokens=torch.zeros_like(accepted),
+        # The same token rows: the verify reads request n's new tokens from
+        # cu_seqlens[n] + num_accepted_tokens[n].
+        cu_seqlens=data["cu_seqlens"] + torch.cat([accepted, accepted.new_zeros(1)]),
+    )
+    resumed = cute_run(resumed)
+
+    for name in (
+        "out",
+        "state_v_first",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        assert torch.equal(resumed[name], replayed[name]), name
+
+
+def test_commit_pending_drafts_replays_the_per_token_records():
+    """With per-token verify states, a slot's accepted drafts are replayed onto
+    its pool state, in order, from the per-draft records the Kimi K3 verify
+    kernels keep in its region (vn, beta * k, decay), and the conv window after
+    them is stored; other slots are left alone."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import commit_kda_pending_drafts
+
+    torch.manual_seed(5)
+    num_slots, H, K, W, num_spec = 9, 6, 128, 4, 7
+
+    def small(*shape, scale):
+        # Few significant bits: every product and sum below is exact in fp32,
+        # so the reference does not depend on fused or separate rounding.
+        return torch.randint(-4, 5, shape, device="cuda").float() * scale
+
+    state = small(num_slots, H, K, K, scale=2.0**-4)
+    vn = small(num_slots, num_spec, H, K, scale=2.0**-2)
+    beta_k = small(num_slots, num_spec, H, K, scale=2.0**-3)
+    decay = torch.randint(1, 3, (num_slots, num_spec, H, K), device="cuda").float() * 0.5
+    state_tok = torch.zeros(num_slots, num_spec, H, K, K, device="cuda")
+    records = state_tok.view(num_slots, -1)
+    size = num_spec * H * K
+    for i, part in enumerate((vn, beta_k, decay)):
+        records[:, i * size : (i + 1) * size] = part.reshape(num_slots, -1)
+    cs = [
+        torch.randn(num_slots, W - 1 + num_spec, H * K, device="cuda")
+        .bfloat16()
+        .float()
+        .transpose(1, 2)
+        for _ in range(3)
+    ]
+    conv_pool = torch.zeros(num_slots, 3 * H * K, W - 1, dtype=torch.bfloat16, device="cuda")
+    slots = torch.tensor([7, 0, 3, 5, 1, 8], dtype=torch.int32, device="cuda")
+    accepted = torch.tensor([0, 1, 3, 7, 2, 5], dtype=torch.int32, device="cuda")
+    before = state.clone()
+    unread = torch.empty(0, device="cuda")
+
+    commit_kda_pending_drafts(
+        state, conv_pool, *cs, unread, unread, unread, slots, accepted, state_tok=state_tok
+    )
+
+    for slot, count in zip(slots.tolist(), accepted.tolist()):
+        expected = before[slot].clone()
+        for t in range(count):
+            expected = (
+                decay[slot, t][:, None, :] * expected
+                + vn[slot, t][:, :, None] * beta_k[slot, t][:, None, :]
+            )
+        assert torch.equal(state[slot], expected), slot
+        for section, cache in enumerate(cs):
+            window = conv_pool[slot, section * H * K : (section + 1) * H * K].float()
+            assert torch.equal(window, cache[slot, :, count : count + W - 1]), (slot, section)
+    others = [slot for slot in range(num_slots) if slot not in slots.tolist()]
+    assert torch.equal(state[others], before[others])
+    assert not conv_pool[others].any()
+
+
 if __name__ == "__main__":
     import sys
 

@@ -4197,7 +4197,6 @@ def _load_p4_n256_score_half_from_tmem(
     _publish_p4_n256_atomic_rowmax(
         sAtomicRunningRowMax, tile_row_max, warp_idx, tidx, producer_warp_base
     )
-    cute.nvgpu.cfence()
     return (
         ctm.Vector.from_elements(tuple(score_values), dtype=ctm.Float32),
         ctm.Vector.from_elements(tuple(group_max_values), dtype=ctm.Float32),
@@ -4437,7 +4436,6 @@ def _prepack_p4_n256_score_half_before_rowmax(
         )
         group_valid = group_valid_values[local_group_idx]
         group_max = group_max_values[local_group_idx]
-        cute.nvgpu.warp_switch()
         if cutlass.const_expr(use_mixed_imlp):
             p_bias = ctm.Float32(LOG2_6) - group_max * softmax_scale_log2
             word0, word1, p_sum = _pack_p4_16_scores_from_group_packed_f16x2(
@@ -4617,9 +4615,7 @@ def _finalize_p4_n256_score_half_psf_source(
         bank_idx, score_half_idx, local_warp_idx, lane_idx
     )
     sPSF[psf_source_word_offset] = pv_sf_word
-    cute.nvgpu.cfence()
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    cute.nvgpu.cfence()
     return (denominator_sf_word, prequant_row_sum)
 
 
@@ -4729,9 +4725,7 @@ def _runtime_finalize_final_p4_n256_score_half_psf_source(
         bank_idx, score_half_idx, local_warp_idx, lane_idx
     )
     sPSF[psf_source_word_offset] = pv_sf_word
-    cute.nvgpu.cfence()
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    cute.nvgpu.cfence()
     return (denominator_sf_word, prequant_row_sum)
 
 
@@ -5189,7 +5183,6 @@ def _runtime_issue_pv_tile_slot(
                 a_collector_op=a_collector_op,
             )
     if stream_li_idx > ctm.Int32(0) and stream_li_idx + ctm.Int32(1) == stream_li_total:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             _cross_arrive_smem_p4_cta2_mbar(
                 pair_overlap_sync_mbars.subview(
@@ -5567,7 +5560,6 @@ def _runtime_t336_prepare_p_source(
             )
         )
     if is_compute_warp:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     _store_prepacked_p4_n256_score_half_to_direct_a(
@@ -5581,8 +5573,6 @@ def _runtime_t336_prepare_p_source(
     )
     if prims.elect_sync():
         prims.mbarrier_arrive(direct_p_ready_mbar)
-    if is_compute_warp:
-        cute.nvgpu.cfence()
     owned_psf_word, prequant_row_sum = _finalize_p4_n256_score_half_psf_source(
         sPSF,
         group_max_values,
@@ -5798,7 +5788,6 @@ def _runtime_t336_producer_tile(
             sAtomicRunningRowMax, warp_idx, tidx, producer_warp_base=producer_warp_base
         )
     if is_compute_warp:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     lane_rebase = ctm.Boolean(False)
@@ -5833,8 +5822,6 @@ def _runtime_t336_producer_tile(
     )
     if prims.elect_sync():
         prims.mbarrier_arrive(direct_p_ready_mbar)
-    if is_compute_warp:
-        cute.nvgpu.cfence()
     if cutlass.const_expr(not is_final_tile):
         next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
             _select_smem_p4_lazy_anchor_runtime(
@@ -7030,7 +7017,6 @@ def _run_mla_decode_body(
                 ):
                     pass
                 stream_li_total = kv_tiles
-                cute.nvgpu.cfence()
                 qk0_handle = qk_smem_consumer.wait()
                 qk_smem_consumer.advance()
                 qk0_score_handle = tmem_score_slot0_producer.acquire_and_advance()
@@ -7306,7 +7292,6 @@ def _run_mla_decode_body(
                 final_direct_p_ready_mbar, final_direct_p_phase, time_limit=10000000
             ):
                 pass
-            cute.nvgpu.cfence()
             cute.arch.mbarrier_arrive(
                 p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
                 cutlass.Int32(0),

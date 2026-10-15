@@ -209,6 +209,7 @@ def _kpool_score_kernel(
     ROWS: tl.constexpr,
     PRECISION: tl.constexpr,
     HAS_REQ: tl.constexpr,
+    DOT_DTYPE: tl.constexpr = tl.float32,
 ):
     """Score ``BP`` pools for ``ROWS`` consecutive rows: ``sum_h w[h] * relu(q_h . key_j * s)``.
 
@@ -257,7 +258,7 @@ def _kpool_score_kernel(
             slot = tl.load(BT + t0 * bt_stride + page, mask=valid_any, other=0).to(tl.int64)
             kptr = POOL + slot * slot_stride + off * row_stride + 2 * HD
             keys = tl.load(kptr[:, None] + d[None, :], mask=valid_any[:, None], other=0.0).to(
-                tl.float32
+                DOT_DTYPE
             )
             for i in tl.static_range(ROWS):
                 r = r0 + i
@@ -268,7 +269,7 @@ def _kpool_score_kernel(
                     Q + r * H * HD + h[:, None] * HD + d[None, :],
                     mask=hmask[:, None] & in_range,
                     other=0.0,
-                ).to(tl.float32)
+                ).to(DOT_DTYPE)
                 scores = tl.dot(q, tl.trans(keys), input_precision=PRECISION)  # [HP, BP]
                 scores = tl.maximum(scores * q_scale, 0.0)
                 w = tl.load(
@@ -286,14 +287,12 @@ def _kpool_score_kernel(
             valid = j < kv_len // KPOOL
             slot = tl.load(BT + tbl * bt_stride + page, mask=valid, other=0).to(tl.int64)
             kptr = POOL + slot * slot_stride + off * row_stride + 2 * HD
-            keys = tl.load(kptr[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(
-                tl.float32
-            )
+            keys = tl.load(kptr[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(DOT_DTYPE)
             q = tl.load(
                 Q + r * H * HD + h[:, None] * HD + d[None, :],
                 mask=hmask[:, None] & in_range,
                 other=0.0,
-            ).to(tl.float32)
+            ).to(DOT_DTYPE)
             scores = tl.dot(q, tl.trans(keys), input_precision=PRECISION)  # [HP, BP]
             scores = tl.maximum(scores * q_scale, 0.0)
             w = tl.load(
@@ -320,6 +319,7 @@ def kpool_score(
     precision: str = "ieee",
     rows_per_program: int = 1,
     request_ids: torch.Tensor | None = None,
+    max_kv_len: int | None = None,
 ) -> torch.Tensor:
     """Pool scores ``[N, num_pools_max]`` fp32.
 
@@ -331,7 +331,9 @@ def kpool_score(
     rows (``block_tables`` broadcast with stride 0, one context request) or,
     with ``request_ids`` (``[N]`` int32, row -> block-table row), the packed
     query tokens of several context requests in position order. Fixed shapes,
-    no host sync.
+    no host sync. ``max_kv_len``, a host bound on every row's ``kv_lens``,
+    restricts the launch to pools some row can see; columns past that bound are
+    left unwritten, so readers must stop at each row's ``kv_len // kpool``.
     """
     n, num_heads, hd = q.shape
     if hd != head_dim:
@@ -344,8 +346,18 @@ def kpool_score(
         raise ValueError(
             "kpool_score: rows_per_program > 1 needs a broadcast block table or request_ids"
         )
+    # bf16 operands are only exact for bf16 inputs; wider queries or keys keep
+    # the fp32 (tf32) dot.
+    bf16_dot = precision == "bf16" and q.dtype == index_pool.dtype == torch.bfloat16
+    if precision == "bf16" and not bf16_dot:
+        precision = "tf32"
     bp = 64
-    grid = (triton.cdiv(n, rows), triton.cdiv(num_pools_max, bp))
+    score_blocks = triton.cdiv(num_pools_max, bp)
+    if max_kv_len is not None:
+        score_blocks = min(score_blocks, triton.cdiv(max(0, int(max_kv_len)) // kpool, bp))
+        if score_blocks == 0:
+            return out
+    grid = (triton.cdiv(n, rows), score_blocks)
     _kpool_score_kernel[grid](
         q,
         weights,
@@ -371,9 +383,14 @@ def kpool_score(
         HP=max(16, triton.next_power_of_2(num_heads)),
         BP=bp,
         ROWS=rows,
-        PRECISION=precision,
+        # "bf16" keeps bf16 operands for the tensor-core dot (fp32 accumulate);
+        # "tf32"/"ieee" widen them to fp32 first.
+        PRECISION="ieee" if bf16_dot else precision,
+        DOT_DTYPE=tl.bfloat16 if bf16_dot else tl.float32,
         HAS_REQ=request_ids is not None,
-        num_warps=4,
+        # Row groups are register-heavy; two warps per program keep more
+        # programs resident, which hides the gathered key loads.
+        num_warps=2 if rows > 1 else 4,
     )
     return out
 

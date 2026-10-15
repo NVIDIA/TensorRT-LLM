@@ -31,15 +31,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import predictor as sol_predictor
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import predictor as sol_predictor
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.backend import (
     SOLCuTeDSLAttention,
     SOLTrtllmAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
     SolPredictorOutputs,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import sol_attn_backend
