@@ -49,6 +49,22 @@ from tensorrt_llm.visual_gen.args import (
 # =============================================================================
 
 
+def is_flux3_checkpoint(checkpoint_path: Path) -> bool:
+    """Return whether root config.json identifies a FLUX.3 Klein package.
+
+    Missing, malformed, or non-matching configs return False. Flux3Checkpoint
+    separately validates format version 1 and the required package contents.
+    """
+    config_path = checkpoint_path / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        config = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(config, dict) and config.get("model") == "flux-3-image-klein"
+
+
 def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     """
     Discover components from a Diffusers pipeline manifest.
@@ -563,7 +579,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 args=args,
             )
 
-        Supports two checkpoint formats:
+        Supports three checkpoint formats:
+        * **FLUX.3 image package** -- root ``config.json`` identifies
+          ``flux-3-image-klein`` with ``format_version=1``; weights live in
+          ``model.safetensors``. Select
+          packaged quantized weights with ``pipeline_config.variant``;
+          text encoder, tokenizer, and VAE assets remain under the root.
         * **Diffusers directory layout** -- ``model_index.json`` or
           ``modular_model_index.json`` with component sub-directories each
           containing ``config.json``.
@@ -621,7 +642,25 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             components[PipelineComponent.TRANSFORMER] = components.pop("transformer_ref")
         component_config_dicts: Dict[str, Dict[str, Any]] = {}
 
-        if components:
+        if is_flux3_checkpoint(checkpoint_path):
+            from .models.flux3.checkpoint import Flux3Checkpoint
+
+            package = Flux3Checkpoint(checkpoint_path, resolved_pipeline_config.get("variant"))
+            config_dict = package.transformer_config()
+            pretrained_config = SimpleNamespace(**config_dict)
+            component_config_dicts["transformer"] = config_dict
+            extra_attrs["flux3_checkpoint"] = package
+            user_quant = args.quant_config if args else None
+            explicit_algo = (
+                user_quant.get("quant_algo")
+                if isinstance(user_quant, dict)
+                else getattr(user_quant, "quant_algo", None)
+            )
+            if explicit_algo is not None:
+                raise ValueError(
+                    "FLUX.3 precision is selected by pipeline_config.variant; remove quant_config.quant_algo"
+                )
+        elif components:
             # ---------- Diffusers directory layout ----------
             if component not in components:
                 raise ValueError(

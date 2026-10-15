@@ -3434,10 +3434,11 @@ class Fp8PerTokenQuantTactic(enum.IntEnum):
 
     TRTLLM = -1
     VECTORIZED = 1
+    WARP_PDL = 2
 
 
 class Fp8PerTokenQuantRunner(TunableRunner):
-    """Profiles TRT-LLM vs vectorized FP8 per-token activation quantization kernels."""
+    """Profiles native, vectorized, and warp-based FP8 quantization kernels."""
 
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(0, 0, ()), ),
@@ -3445,7 +3446,7 @@ class Fp8PerTokenQuantRunner(TunableRunner):
     )
 
     def unique_id(self):
-        return ()
+        return (1, )
 
     def get_valid_tactics(
         self,
@@ -3454,7 +3455,8 @@ class Fp8PerTokenQuantRunner(TunableRunner):
         **kwargs,
     ) -> List[int]:
         return [
-            Fp8PerTokenQuantTactic.TRTLLM, Fp8PerTokenQuantTactic.VECTORIZED
+            Fp8PerTokenQuantTactic.TRTLLM, Fp8PerTokenQuantTactic.VECTORIZED,
+            Fp8PerTokenQuantTactic.WARP_PDL
         ]
 
     def forward(
@@ -3463,31 +3465,56 @@ class Fp8PerTokenQuantRunner(TunableRunner):
         tactic: int = Fp8PerTokenQuantTactic.TRTLLM,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = inputs[0]
-        if tactic == Fp8PerTokenQuantTactic.VECTORIZED:
+        if tactic == Fp8PerTokenQuantTactic.WARP_PDL:
+            qx, scale = torch.ops.tensorrt_llm.warp_per_token_fp8_quant(x)
+        elif tactic == Fp8PerTokenQuantTactic.VECTORIZED:
             qx, scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)
         else:
             qx, scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
         return qx, scale.float()
 
 
+@fast_custom_op("trtllm::warp_fp8_per_token_quant", mutates_args=())
+def warp_fp8_per_token_quant(
+    x: torch.Tensor, min_scale: float = 1.0 / (448.0 * 512.0)
+) -> List[torch.Tensor]:
+    """Warp FP8 quantization with FP32 scales; use min_scale=1e-12 for BFL FP8R."""
+    qx, scale = torch.ops.tensorrt_llm.warp_per_token_fp8_quant(
+        x, True, min_scale)
+    return [qx, scale]
+
+
+@warp_fp8_per_token_quant.register_fake
+def _(
+    x: torch.Tensor, min_scale: float = 1.0 / (448.0 * 512.0)
+) -> List[torch.Tensor]:
+    return [
+        x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+        x.new_empty((*x.shape[:-1], 1), dtype=torch.float32),
+    ]
+
+
 @fast_custom_op("trtllm::tunable_fp8_per_token_quant", mutates_args=())
 def tunable_fp8_per_token_quant(x: torch.Tensor) -> List[torch.Tensor]:
-    """FP8 per-token quantization with autotuning between TRT-LLM and vectorized kernels.
+    """FP8 per-token quantization with autotuning across three native tactics.
 
-    During warmup, the AutoTuner profiles both backends and caches the fastest
-    one per input shape. Subsequent calls use the cached selection.
+    During tuning, profile the original, vectorized, and warp operators.
+    Inference uses the cached selection, or the original operator on a cache
+    miss. TRTLLM_FP8_QUANT_TACTIC can force a tactic; TRTLLM_ENABLE_PDL=0
+    disables PDL for the warp operator.
 
     Returns:
         [qx, scale] — fp8_e4m3fn tensor + float32 per-token scales [..., 1]
     """
     runner = Fp8PerTokenQuantRunner()
 
-    # TRTLLM_FP8_QUANT_TACTIC=trtllm|vectorized forces a specific kernel.
     forced = os.environ.get("TRTLLM_FP8_QUANT_TACTIC", "").lower()
     if forced == "trtllm":
         best_tactic = Fp8PerTokenQuantTactic.TRTLLM
     elif forced == "vectorized":
         best_tactic = Fp8PerTokenQuantTactic.VECTORIZED
+    elif forced == "warp_pdl":
+        best_tactic = Fp8PerTokenQuantTactic.WARP_PDL
     else:
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(

@@ -1112,6 +1112,19 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
         return F.linear(input, weight, bias)
 
 
+@dataclass
+class Fp8RowwiseQuantizedTensor:
+    """Per-token E4M3 activation reusable by projections of the same input.
+
+    Keep the original activation for shape, output dtype and LoRA consumers.
+    Quantized data is flattened to [tokens, channels], with one scale per token.
+    """
+
+    original: torch.Tensor
+    quantized: torch.Tensor
+    scales: torch.Tensor
+
+
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
@@ -1143,16 +1156,23 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
+    def apply(self, module: Linear,
+              input: torch.Tensor | Fp8RowwiseQuantizedTensor,
               bias: Optional[torch.Tensor]):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # fp8_rowwise_gemm requires a 2D mat1; flatten here and unflatten the output below.
+        prequantized = input if isinstance(input,
+                                           Fp8RowwiseQuantizedTensor) else None
+        if prequantized is not None:
+            input = prequantized.original
         orig_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
         # FP8 tensor inputs are from attention. Directly use ones as scale.
-        if input.dtype == torch.float8_e4m3fn:
+        if prequantized is not None:
+            qinput, cur_input_scale = prequantized.quantized, prequantized.scales
+        elif input.dtype == torch.float8_e4m3fn:
             qinput = input
             cur_input_scale = torch.ones(input.shape[0],
                                          device=input.device,
@@ -4252,7 +4272,8 @@ class Linear(nn.Module):
             output = LoraLayer.forward_with_base(
                 lambda: self.quant_method.apply(self, input, bias),
                 (self.lora, ),
-                input,
+                input.original
+                if isinstance(input, Fp8RowwiseQuantizedTensor) else input,
                 lora_params,
                 layer_idx,
             )
@@ -4287,7 +4308,8 @@ class Linear(nn.Module):
 
     def forward(
         self,
-        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        input: Union[torch.Tensor, Fp4QuantizedTensor,
+                     Fp8RowwiseQuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,

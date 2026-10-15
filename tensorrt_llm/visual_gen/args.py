@@ -636,6 +636,14 @@ class CompilationConfig(StrictBaseModel):
             "For image models, use [1]."
         ),
     )
+    modes: Optional[List[str]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "List of generation modes to warmup at startup (e.g. ['t2i', 'i2i']). "
+            "If None, uses model-specific defaults."
+        ),
+    )
     skip_warmup: bool = Field(
         False,
         status="prototype",

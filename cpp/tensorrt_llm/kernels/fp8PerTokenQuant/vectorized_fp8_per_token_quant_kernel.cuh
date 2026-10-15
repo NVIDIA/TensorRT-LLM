@@ -17,6 +17,7 @@
 // Adapted from vLLM (Apache-2.0):
 // https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
 // Extracted: dynamic_per_token_scaled_fp8_quant_kernel_strided only.
+// NVIDIA modification: optional scale floor for model-specific FP8 recipes.
 
 #pragma once
 
@@ -32,7 +33,7 @@ inline constexpr int kPerTokenQuantBlockSize = 256;
 template <typename scalar_t, typename fp8_type>
 __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type* __restrict__ out, float* __restrict__ scale,
     scalar_t const* __restrict__ input, float const* __restrict__ scale_ub, int hidden_size, int64_t in_row_stride,
-    int64_t out_row_stride)
+    int64_t out_row_stride, float min_scale = 0.0f)
 {
     static_assert(kPerTokenQuantBlockSize > 0, "block size must be positive");
     assert(blockDim.x == kPerTokenQuantBlockSize);
@@ -59,7 +60,9 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type* __re
     if (tid == 0)
     {
         token_scale = scale_ub ? fminf(block_max, *scale_ub) : block_max;
-        token_scale = fmaxf(token_scale / quant_type_max_v<fp8_type>, min_scaling_factor<fp8_type>::val());
+        token_scale = min_scale > 0.0f
+            ? fmaxf(__fdiv_rn(token_scale, static_cast<float>(quant_type_max_v<fp8_type>)), min_scale)
+            : fmaxf(token_scale / quant_type_max_v<fp8_type>, min_scaling_factor<fp8_type>::val());
         scale[token_idx] = token_scale;
     }
     __syncthreads();
@@ -67,7 +70,18 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type* __re
     // 2) quantize
     vectorize_with_alignment<16>(token_in, token_out, hidden_size, tid, blockDim.x,
         [=] __device__(fp8_type & dst, scalar_t const& src)
-        { dst = scaled_fp8_conversion<false, fp8_type>(static_cast<float>(src), token_scale); });
+        {
+            if (min_scale > 0.0f)
+            {
+                float const limit = static_cast<float>(quant_type_max_v<fp8_type>);
+                float const value = fmaxf(-limit, fminf(__fdiv_rn(static_cast<float>(src), token_scale), limit));
+                dst = fp8::vec_conversion<fp8_type, float>(value);
+            }
+            else
+            {
+                dst = scaled_fp8_conversion<false, fp8_type>(static_cast<float>(src), token_scale);
+            }
+        });
 }
 
 } // namespace vllm

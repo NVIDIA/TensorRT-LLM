@@ -29,6 +29,10 @@ template <typename T_IN>
 void invokeVectorizedPerTokenFP8Quant(
     void* output, float* scales, T_IN const* input, int hidden_size, int64_t num_tokens, cudaStream_t stream);
 
+template <typename T_IN>
+void invokeWarpPerTokenFP8Quant(void* output, float* scales, T_IN const* input, int hiddenSize, int64_t numTokens,
+    int smCount, bool enablePdl, float minScale, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

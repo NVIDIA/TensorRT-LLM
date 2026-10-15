@@ -430,12 +430,59 @@ def enable_cache_dit_for_qwen_image(
     )
 
 
+def enable_cache_dit_for_flux3(
+    pipeline: Any, cache_dit_cfg: CacheDiTConfig
+) -> CacheDiTEnableResult:
+    """Cache-DiT BlockAdapter for FLUX.3's combined-token single_blocks (Pattern_3)."""
+    calibrator = _maybe_calibrator(cache_dit_cfg)
+    if cache_dit_cfg.enable_separate_cfg:
+        raise ValueError("Packed FLUX.3 uses one CFG call per step; disable enable_separate_cfg")
+    db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=False)
+
+    if calibrator is not None:
+        logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
+        modifier = ParamsModifier(cache_config=db_cfg, calibrator_config=calibrator)
+    else:
+        modifier = ParamsModifier(cache_config=db_cfg)
+
+    transformer = pipeline.transformer
+    adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.single_blocks],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        params_modifiers=[modifier],
+        check_forward_pattern=False,
+        check_num_outputs=False,
+    )
+
+    logger.info(
+        f"Cache-DiT: FLUX.3 — Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
+        f"W={db_cfg.max_warmup_steps}, R={cache_dit_cfg.residual_diff_threshold:.3f}",
+    )
+
+    disable_target = cache_dit.enable_cache(
+        adapter,
+        cache_config=db_cfg,
+        calibrator_config=calibrator,
+    )
+
+    def refresh_flux3(num_inference_steps: int, **_kwargs) -> None:
+        _refresh_ctx(transformer, cache_dit_cfg, num_inference_steps, False)
+
+    return CacheDiTEnableResult(
+        refresh=refresh_flux3,
+        disable=lambda: cache_dit.disable_cache(disable_target),
+        summary_modules=[transformer],
+    )
+
+
 CUSTOM_CACHE_DIT_ENABLERS = {
     "WanPipeline": enable_cache_dit_for_wan,
     "WanImageToVideoPipeline": enable_cache_dit_for_wan,
     "FluxPipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=False),
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
+    "Flux3Pipeline": enable_cache_dit_for_flux3,
     "QwenImagePipeline": enable_cache_dit_for_qwen_image,
     "QwenImageLayeredPipeline": enable_cache_dit_for_qwen_image,
 }

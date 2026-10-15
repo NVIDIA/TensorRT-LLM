@@ -27,6 +27,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 |---|---|
 | `black-forest-labs/FLUX.1-dev` | Text-to-Image |
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
+| `black-forest-labs/flux-3-image-klein-base` | Text-to-Image, Image-to-Image |
+| `black-forest-labs/flux-3-image-klein` | Text-to-Image, Image-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
 | `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
@@ -52,7 +54,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `zai-org/GLM-Image` | Text-to-Image |
 
 
-Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json` (or `modular_model_index.json` for modular pipelines); LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
+Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json` (or `modular_model_index.json` for modular pipelines); LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. FLUX.3 Klein checkpoints are detected via `model: "flux-3-image-klein"` in the root `config.json`. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
 ### Feature Matrix
 
@@ -60,6 +62,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.3 Klein Base** | No | Yes | No | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
+| **FLUX.3 Klein (SD)** | No | Yes | No | Yes | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
@@ -88,6 +92,8 @@ To learn more about VisualGen, see [`examples/visual_gen/`](https://github.com/N
 ### Usage with `trtllm-serve`
 
 The `trtllm-serve` command automatically detects diffusion models (by the presence of `model_index.json`) and launches an OpenAI-compatible visual generation server with image and video generation endpoints.
+
+> **Note:** Native FLUX.3 checkpoints require `--visual_gen_args <YAML path>` or `--enable_visual_gen` to select VisualGen.
 
 See [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for server launch instructions, example configurations, and API usage.
 
@@ -198,6 +204,8 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+FLUX.3 loads packaged FP8 rowwise or NVFP4 weights through `pipeline_config.variant`; see the [FLUX.3 example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/models/flux3.py).
 
 #### Wan VAE NVFP4
 
@@ -387,7 +395,7 @@ CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components betw
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
-- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
+- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX.1 and FLUX.2 use embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to these models or the distilled FastWan 2.2 model.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.
 - **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2 and MiniMax-H3 distribute independent tiles.
