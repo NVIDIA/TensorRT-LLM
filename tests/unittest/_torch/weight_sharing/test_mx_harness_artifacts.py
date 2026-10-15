@@ -39,12 +39,15 @@ from tensorrt_llm._torch.weight_sharing import (
 
 __extra_import_path__ = ["~/tests/integration"]
 from defs.model_express.mx_harness import (  # noqa: E402
+    MX_ROLES,
     ROLES,
     MxE2ECase,
     MxRunLayout,
     archive_run_artifacts,
+    assert_weight_manifests,
     collect_available_manifests,
     collect_available_payloads,
+    collect_weight_manifests,
     report_timings,
 )
 
@@ -158,3 +161,62 @@ def test_archive_is_skipped_without_an_output_dir(tmp_path: Path) -> None:
     assert archive_run_artifacts(None, "llama-bf16-tp1", layout) is None
     assert archive_run_artifacts("", "llama-bf16-tp1", layout) is None
     assert not (tmp_path / "model_express").exists()
+
+
+def _write_mx_manifests(manifest_dir: Path, *, donor_preloaded: bool = False) -> None:
+    """Write the final and transfer manifests of a TP=1 MX donor/receiver run without a baseline."""
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    module = _TwoTensorModule()
+    contexts = {
+        ("final", "donor"): {
+            "checkpoint_format": "MX",
+            "weights_preloaded": donor_preloaded,
+            "world_size": 1,
+        },
+        ("final", "receiver"): {
+            "checkpoint_format": "MX",
+            "weights_preloaded": True,
+            "world_size": 1,
+        },
+        ("transfer", "donor"): {"boundary": "donor_publish"},
+        ("transfer", "receiver"): {"boundary": "receiver_p2p_success"},
+    }
+    for (family, role), extra in contexts.items():
+        context = {"family": family, "role": role, "rank": 0, **extra}
+        write_weight_manifest(
+            build_weight_manifest(module, context=context),
+            manifest_dir / manifest_file_name(family, role, 0),
+        )
+
+
+def test_mx_role_manifests_pass_without_a_baseline(tmp_path: Path) -> None:
+    _write_mx_manifests(tmp_path)
+
+    manifests = collect_weight_manifests(tmp_path, _case(), roles=MX_ROLES)
+    assert sorted(manifests) == [
+        ("final", "donor", 0),
+        ("final", "receiver", 0),
+        ("transfer", "donor", 0),
+        ("transfer", "receiver", 0),
+    ]
+    assert_weight_manifests(_case(), manifests, roles=MX_ROLES)
+
+    # The default roles still require the HF baseline's final manifest.
+    with pytest.raises(pytest.fail.Exception, match=r"absent=\[\('final', 'baseline', 0\)\]"):
+        collect_weight_manifests(tmp_path, _case())
+
+
+def test_mx_role_manifests_still_reject_a_preloaded_donor(tmp_path: Path) -> None:
+    # A donor that itself received weights from another live MX source.
+    _write_mx_manifests(tmp_path, donor_preloaded=True)
+    manifests = collect_weight_manifests(tmp_path, _case(), roles=MX_ROLES)
+
+    with pytest.raises(AssertionError, match="donor must load from disk"):
+        assert_weight_manifests(_case(), manifests, roles=MX_ROLES)
+
+
+def test_manifest_roles_must_include_both_mx_roles(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="include"):
+        collect_weight_manifests(tmp_path, _case(), roles=("baseline", "donor"))
+    with pytest.raises(ValueError, match="include"):
+        assert_weight_manifests(_case(), {}, roles=("donor", "donor", "receiver"))

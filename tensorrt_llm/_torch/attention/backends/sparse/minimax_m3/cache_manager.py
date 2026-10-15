@@ -326,6 +326,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
                 f"{self.indexer_kv_dtype!r}."
             )
+        # Filled at the end of __init__; the base __init__ may already call get_buffers.
+        self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         super().__init__(*args, **kwargs)
 
         if self.dtype == DataType.NVFP4:
@@ -378,6 +381,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     (num_total_slots, 1, self.sparse_index_dim),
                     dtype=torch_dtype,
                     device=device,
+                )
+        # Resolve the K/V and NVFP4 scale views once too: the forward fetches them every step.
+        for layer_idx in self.layer_offsets:
+            self._kv_buffers[layer_idx, kv_layout] = self.get_buffers(layer_idx, kv_layout)
+            if self.is_nvfp4_layer(layer_idx):
+                self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
+                    layer_idx, kv_layout
                 )
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
@@ -510,6 +520,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool's slot ids; :meth:`copy_batch_block_offsets` scales them.
         """
         super()._prepare_page_table_tensor(index_mapper_capacity)
+        if self.dtype == DataType.NVFP4:
+            # Nothing reads a hybrid cache's own block offsets: MSA layers address pages
+            # by slot id and the shared draft layer reads MiniMaxM3DraftKVCacheView's
+            # table. Without pools, a new reader fails instead of reading unfilled offsets.
+            self.num_attention_op_pools = 0
         draft_layers = [
             layer_idx
             for layer_idx in self._shared_draft_layer_ids
@@ -555,6 +570,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             f"attention-op pools {[pool for pool, _ in op_pools]} address their pages."
         )
 
+    def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
+        # Staging for the per-layer block-offset copy, which a hybrid NVFP4 cache never runs.
+        if self.dtype != DataType.NVFP4:
+            super()._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,
@@ -564,6 +584,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
+        if self.num_attention_op_pools == 0:
+            return
         super().copy_batch_block_offsets(
             dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
         )
@@ -741,6 +763,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
         """
+        view = self._kv_buffers.get((layer_idx, kv_layout or self._main_kv_layout_name()))
+        if view is not None:
+            return view
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
         )
@@ -811,6 +836,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self, layer_idx: int, kv_layout: Optional[str] = None
     ) -> torch.Tensor:
         """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``."""
+        view = self._block_scale_buffers.get((layer_idx, kv_layout or self._main_kv_layout_name()))
+        if view is not None:
+            return view
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
             layer_idx, kv_layout
         )
