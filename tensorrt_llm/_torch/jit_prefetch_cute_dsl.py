@@ -777,9 +777,9 @@ class TopKProvider:
             body = prefill if phase == "prefill" else decode
             if body is None:
                 continue
+            # Scores narrower than top_k (short prefixes; CSA2 also selects
+            # over compressed rows) still run the kernel, keyed on their width.
             for cols in self._widths():
-                if cols < top_k:
-                    continue
                 if phase == "prefill":
                     batches = [(1, 1)]
                 else:
