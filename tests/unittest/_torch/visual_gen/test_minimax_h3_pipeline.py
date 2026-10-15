@@ -431,7 +431,9 @@ def _req(prepared_inputs: dict, num_frames: int = 124) -> SimpleNamespace:
 def test_fl2va_warmup_key_tracks_keyframe_count() -> None:
     pipeline = _make_warmup_key_pipeline("fl2va")
 
-    assert pipeline.request_warmup_cache_key(_req({})) == (768, 1344, 124, 0)
+    # A keyframe-free request matches the plain warmup pass, so it keeps the
+    # base key: warmup records the plain pass as (h, w, f), not (h, w, f, 0).
+    assert pipeline.request_warmup_cache_key(_req({})) == (768, 1344, 124)
     assert pipeline.request_warmup_cache_key(
         _req({"keyframes": [Image.new("RGB", (1344, 768))]})
     ) == (768, 1344, 124, 1)
@@ -445,11 +447,16 @@ def test_fl2va_default_variants_cover_both_keyframe_counts() -> None:
 
     variants = pipeline.resolve_warmup_reference_variants(768, 1344, 124)
     assert [len(v.images) for v in variants] == [1, 2]
-    assert pipeline.warmup_cache_keys([(768, 1344, 124)]) == {
+    keys = pipeline.warmup_cache_keys([(768, 1344, 124)])
+    assert keys == {
         (768, 1344, 124),
         (768, 1344, 124, 1),
         (768, 1344, 124, 2),
     }
+    # Every reachable keyframe count maps to a recorded key, including zero.
+    for count in (0, 1, 2):
+        req = _req({"keyframes": [Image.new("RGB", (1344, 768))] * count})
+        assert pipeline.request_warmup_cache_key(req) in keys
 
 
 def test_ref2va_warmup_key_carries_reference_composition() -> None:

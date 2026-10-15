@@ -237,7 +237,7 @@ class Flux2Pipeline(BasePipeline):
         """Warm one reference image at the output shape by default.
 
         FLUX.2 accepts an unbounded number of reference images, so coverage of
-        multi-reference edits must come from ``compilation.reference_variants``.
+        multi-reference edits must come from ``compilation.reference_variants_for_warmup``.
         """
         return [ReferenceWarmupVariant(images=[(height, width)])]
 

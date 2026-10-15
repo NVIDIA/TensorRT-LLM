@@ -338,6 +338,9 @@ class MiniMaxH3Pipeline(BasePipeline):
                 ),
             )
         keyframes = req.prepared_inputs.get("keyframes") or []
+        if not keyframes:
+            # A keyframe-free request matches the plain warmup pass.
+            return base_key
         return (*base_key, len(keyframes))
 
     def default_warmup_reference_variants(
@@ -346,7 +349,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         if self.workflow == "ref2va":
             # Canonical case: one image reference at the output canvas. Video,
             # audio and multi-reference mixes come from
-            # ``compilation.reference_variants``.
+            # ``compilation.reference_variants_for_warmup``.
             return [ReferenceWarmupVariant(images=[(height, width)])]
         # FL2VA accepts a first- and a last-frame keyframe; warm both counts.
         return [

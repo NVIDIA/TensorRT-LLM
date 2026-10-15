@@ -71,6 +71,8 @@ _LAZY_ATTRS = {
     "CacheConfig": "tensorrt_llm.visual_gen.args",
     "CacheDiTConfig": "tensorrt_llm.visual_gen.args",
     "CompilationConfig": "tensorrt_llm.visual_gen.args",
+    "ReferenceVideoSpec": "tensorrt_llm.visual_gen.args",
+    "ReferenceWarmupVariant": "tensorrt_llm.visual_gen.args",
     "CpuOffloadConfig": "tensorrt_llm.visual_gen.args",
     "CudaGraphConfig": "tensorrt_llm.visual_gen.args",
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
@@ -126,6 +128,8 @@ __all__ = [
     "ExtraParamSchema",
     # Cross-cutting sub-configs
     "CompilationConfig",
+    "ReferenceVideoSpec",
+    "ReferenceWarmupVariant",
     "CudaGraphConfig",
     "CpuOffloadConfig",
     "TorchCompileConfig",

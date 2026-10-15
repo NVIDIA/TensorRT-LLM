@@ -283,7 +283,7 @@ class BasePipeline(nn.Module):
         """Model-specific default reference warmup variants for one planned shape.
 
         Subclasses whose references change the compiled shape override. Used
-        only when ``compilation.reference_variants`` is not set.
+        only when ``compilation.reference_variants_for_warmup`` is not set.
         """
         return []
 
@@ -292,11 +292,11 @@ class BasePipeline(nn.Module):
     ) -> List[ReferenceWarmupVariant]:
         """Resolve reference warmup variants for one planned shape.
 
-        Priority: user-specified ``compilation.reference_variants`` (``[]``
+        Priority: user-specified ``compilation.reference_variants_for_warmup`` (``[]``
         disables reference warmup), then model defaults. Variants exceeding the
         pipeline's accepted reference slots are skipped with a warning.
         """
-        configured = self.pipeline_config.compilation.reference_variants
+        configured = self.pipeline_config.compilation.reference_variants_for_warmup
         variants = (
             list(configured)
             if configured is not None

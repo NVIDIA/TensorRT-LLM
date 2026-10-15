@@ -17,14 +17,14 @@ from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipel
 from tensorrt_llm.visual_gen.args import CompilationConfig, ReferenceWarmupVariant
 
 
-def _make_warmup_stub(reference_variants=None) -> Flux2Pipeline:
+def _make_warmup_stub(reference_variants_for_warmup=None) -> Flux2Pipeline:
     """Weightless Flux2Pipeline shell for warmup-key tests (CPU, no GPU)."""
     pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
     pipeline.vae_scale_factor = 8
     pipeline.image_processor = Flux2ImageProcessor(vae_scale_factor=16)
     pipeline.pipeline_config = SimpleNamespace(
         torch_dtype=torch.float32,
-        compilation=CompilationConfig(reference_variants=reference_variants),
+        compilation=CompilationConfig(reference_variants_for_warmup=reference_variants_for_warmup),
     )
     pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.empty(0)]))
     pipeline._device = torch.device("cpu")
@@ -198,7 +198,7 @@ def test_multi_reference_variant_warms_and_records_each_reference_shape() -> Non
     """A configured two-reference variant warms one pass carrying both
     references and records the key a matching two-reference request produces."""
     pipeline = _make_warmup_stub(
-        reference_variants=[ReferenceWarmupVariant(images=[(70, 100), (480, 832)])]
+        reference_variants_for_warmup=[ReferenceWarmupVariant(images=[(70, 100), (480, 832)])]
     )
 
     pipeline._run_warmup(1024, 1024, num_frames=1, steps=2)
@@ -226,7 +226,7 @@ def test_multi_reference_variant_warms_and_records_each_reference_shape() -> Non
 
 
 def test_empty_reference_variants_disables_reference_warmup() -> None:
-    pipeline = _make_warmup_stub(reference_variants=[])
+    pipeline = _make_warmup_stub(reference_variants_for_warmup=[])
 
     assert pipeline.resolve_warmup_reference_variants(1024, 1024, 1) == []
     assert pipeline.warmup_cache_keys([(1024, 1024, 1)]) == {(1024, 1024)}

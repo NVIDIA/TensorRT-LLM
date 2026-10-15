@@ -53,6 +53,27 @@ class TestCompilationConfig:
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             CompilationConfig(resolutions=[(480, 832)], bad_field=True)
 
+    def test_reference_variant_bounds(self):
+        """Non-positive or absurd reference sizes are rejected at config time."""
+        with pytest.raises(ValidationError):
+            ReferenceVideoSpec(size=(0, 64), num_frames=8)
+        with pytest.raises(ValidationError):
+            ReferenceVideoSpec(size=(64, 64), num_frames=8, fps=0)
+        with pytest.raises(ValidationError):
+            ReferenceVideoSpec(size=(64, 64), num_frames=10**9)
+        with pytest.raises(ValidationError):
+            ReferenceVideoSpec(size=(64, 64), num_frames=8, audio_seconds=-1.0)
+        with pytest.raises(ValidationError):
+            ReferenceWarmupVariant(images=[(20000, 64)])
+        with pytest.raises(ValidationError):
+            ReferenceWarmupVariant(audio=[0.0])
+        ok = ReferenceWarmupVariant(
+            images=[(1024, 1024)],
+            videos=[ReferenceVideoSpec(size=(480, 832), num_frames=49, fps=30.0)],
+            audio=[5.0],
+        )
+        assert ok.videos[0].fps == 30.0
+
 
 class TestVisualGenArgsWarmup:
     """CompilationConfig integration with VisualGenArgs."""
@@ -319,7 +340,7 @@ class TestWarmupExecution:
 
         variant = ReferenceWarmupVariant(images=[(480, 832), (720, 1280)])
         cfg = CompilationConfig(
-            resolutions=[(480, 832)], num_frames=[33], reference_variants=[variant]
+            resolutions=[(480, 832)], num_frames=[33], reference_variants_for_warmup=[variant]
         )
         pipe = RefStub(cfg)
         warmed_refs = []
