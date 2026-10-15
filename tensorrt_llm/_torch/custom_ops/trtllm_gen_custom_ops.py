@@ -499,6 +499,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
         output: Optional[torch.Tensor] = None,
+        hidden_states_ready_event: Optional[int] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -516,7 +517,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
+            hidden_states_ready_event)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -679,7 +681,12 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                topk_ids: Optional[torch.Tensor] = None,
                                output: Optional[torch.Tensor] = None,
                                tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False) -> List[torch.Tensor]:
+                               use_dp: bool = False,
+                               hidden_states_ready_event: Optional[int] = None
+                               ) -> List[torch.Tensor]:
+    """hidden_states_ready_event: raw cudaEvent_t (torch.cuda.Event.cuda_event)
+    recorded on another stream once hidden_states and hidden_states_scale are
+    written; the op waits on it right before FC1, after launching routing."""
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -755,7 +762,8 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     result = kernel_runner(
         input_tensors,
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-        output=output)
+        output=output,
+        hidden_states_ready_event=hidden_states_ready_event)
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -823,7 +831,8 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False,
+      hidden_states_ready_event: Optional[int] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

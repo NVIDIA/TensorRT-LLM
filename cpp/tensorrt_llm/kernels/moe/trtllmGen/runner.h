@@ -288,6 +288,9 @@ struct MoERunnerArgs
     // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
     // and [num_tokens, hidden_size/16] in float for e2m1
     void* hidden_states_scale = nullptr;
+    // Optional: recorded on another stream once hidden_states and hidden_states_scale are written. The runner waits
+    // on it right before gemm1, their first reader, so the routing launched before gemm1 does not wait for them.
+    cudaEvent_t hidden_states_ready = nullptr;
 
     // Optional inputs:
     void* topk_weights = nullptr; // [num_tokens, top_k]  with quantized weights

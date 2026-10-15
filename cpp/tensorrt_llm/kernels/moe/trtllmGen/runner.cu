@@ -840,6 +840,11 @@ void Runner::run(
 
     auto const& config = mPassingConfigs[configIndex];
 
+    if (args.hidden_states_ready != nullptr)
+    {
+        // gemm1 is the first kernel that reads hidden_states; routing, launched before this point, does not wait.
+        TLLM_CUDA_CHECK(cudaStreamWaitEvent(stream, args.hidden_states_ready, 0));
+    }
     mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
         workspace.expert_weights, args.output1_scales_scalar, args.output1_scales_gate_scalar, args.gemm1_bias,
         args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output, workspace.gemm1_output_scale,
