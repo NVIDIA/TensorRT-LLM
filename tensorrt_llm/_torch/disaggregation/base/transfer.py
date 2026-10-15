@@ -17,12 +17,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
-from .backend import Chunk
+if TYPE_CHECKING:
+    from ..native.extent import Chunk
 
 
 class SessionStatus(Enum):

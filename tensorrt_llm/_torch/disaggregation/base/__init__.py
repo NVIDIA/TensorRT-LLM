@@ -12,36 +12,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The cache-transfer contract.
+"""The KV cache transfer backend contract.
 
-What this package exports is the contract; what it does not is backend-internal and has to be
-imported by file path.
+The package exports the contract, plus ``TokenRange`` and ``CacheKind``, which belong to native and
+the page table. Its other modules are not part of the contract and are imported by file path.
 """
 
 from .backend import (
     Attempt,
-    CacheExtent,
+    Backend,
     CacheKind,
-    Cancelled,
-    Chunk,
-    Delivered,
-    Failed,
-    Fetches,
+    Capabilities,
+    Hint,
+    InvalidSubmission,
+    LayerGroupRows,
     Outcome,
-    Publishes,
+    SlotRegion,
+    SubmissionRejected,
     TokenRange,
+    View,
+    WakeFn,
 )
 
 __all__ = [
     "Attempt",
-    "CacheExtent",
+    "Backend",
     "CacheKind",
-    "Cancelled",
-    "Chunk",
-    "Delivered",
-    "Failed",
-    "Fetches",
+    "Capabilities",
+    "Hint",
+    "InvalidSubmission",
+    "LayerGroupRows",
     "Outcome",
-    "Publishes",
+    "SlotRegion",
+    "SubmissionRejected",
     "TokenRange",
+    "View",
+    "WakeFn",
 ]
