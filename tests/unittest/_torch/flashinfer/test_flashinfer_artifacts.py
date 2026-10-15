@@ -15,6 +15,7 @@
 
 import importlib
 import inspect
+import pickle
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -269,6 +270,21 @@ def test_error_says_where_artifacts_come_from_and_how_to_provide_them(fake_flash
     assert "FLASHINFER_CUBIN_DIR" in message
     assert "FLASHINFER_NO_DOWNLOAD=1" in message
     assert ("until the process restarts" in message) == (file_name == _CUBIN)
+
+
+@cpu_only
+def test_error_survives_pickling(fake_flashinfer):
+    # An executor worker pickles its startup error to report it to the proxy process.
+    with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
+        with raise_on_flashinfer_artifact_failure():
+            fake_flashinfer.fetch(_CUBIN)
+
+    restored = pickle.loads(pickle.dumps(excinfo.value))
+
+    assert type(restored) is FlashInferArtifactUnavailableError
+    assert str(restored) == str(excinfo.value)
+    assert restored.failures == excinfo.value.failures
+    assert restored.source == excinfo.value.source
 
 
 @cpu_only

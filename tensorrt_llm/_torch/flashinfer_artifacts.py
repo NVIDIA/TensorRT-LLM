@@ -87,6 +87,16 @@ class FlashInferArtifactUnavailableError(RuntimeError):
         self.source = source
         super().__init__(_describe_failures(failures, source))
 
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type["FlashInferArtifactUnavailableError"],
+        tuple[tuple[FlashInferArtifactFailure, ...], FlashInferArtifactSource],
+    ]:
+        # An executor worker pickles its startup error to send it to the proxy
+        # process, and the default reduction would call __init__ with the message.
+        return type(self), (self.failures, self.source)
+
 
 def _describe_source(source: FlashInferArtifactSource) -> str:
     return (
@@ -160,7 +170,8 @@ class _ArtifactFetchMonitor:
             self._failure_count += 1
             self._recent_failures.append((self._failure_count, failure))
         logger.error(
-            f"FlashInfer could not fetch {file_name}: {reason}. {_describe_source(self.source)}"
+            f"FlashInfer could not fetch {file_name}: {reason.rstrip('.')}. "
+            f"{_describe_source(self.source)}"
         )
 
 
