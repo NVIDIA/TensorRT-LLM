@@ -228,7 +228,7 @@ class MambaDecodeProvider:
         "tensorrt_llm._torch.modules.mamba.selective_state_update",
         "tensorrt_llm._torch.modules.mamba.replay_selective_state_update",
         "tensorrt_llm._torch.modules.mamba.causal_conv1d_triton",
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_state_kernels",
     )
 
     # Enumerated again after every warmup (JitPrefetcher.start_background):
