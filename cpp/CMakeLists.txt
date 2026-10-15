@@ -174,14 +174,14 @@ if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
   include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
 endif()
 
-# Generated FMHA sources (see contextFusedMultiHeadAttention/CMakeLists.txt for
-# the full definition and default). fmha_cubin.h is included transitively by
-# headers used across several targets, so when generation is redirected out of
-# the source tree the directory must be on every target's include path, not just
-# the FMHA target's.
-if(DEFINED TRTLLM_FMHA_GEN_DIR AND NOT "${TRTLLM_FMHA_GEN_DIR}" STREQUAL "")
-  include_directories("${TRTLLM_FMHA_GEN_DIR}")
-endif()
+# Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
+# cubin/fmha_cubin.{h,cpp}). fmha_cubin.h is included transitively by headers
+# used across several targets, so the directory must be on every target's
+# include path, not just the FMHA target's.
+set(TRTLLM_FMHA_GEN_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+    CACHE PATH "Directory containing generated FMHA sources")
+include_directories("${TRTLLM_FMHA_GEN_DIR}")
 
 setup_cuda_compiler()
 
@@ -443,6 +443,18 @@ if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
+  # Ubuntu's aarch64 GCC turns on -mfix-cortex-a53-843419 by default, which
+  # makes the linker rewrite some loads as a branch to a veneer that performs
+  # the load and jumps back. BOLT reads that branch as a tail call, so when it
+  # relocates the function it patches the veneer's return site with an x16
+  # trampoline and destroys a live x16. Grace is not a Cortex-A53, so the
+  # workaround only costs us correctness here. Note there is no
+  # -Wl,--no-fix-cortex-a53-843419: GNU ld rejects it, the driver flag is the
+  # only way to stop the option being passed.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
+                                                        STREQUAL "GNU")
+    add_link_options(-mno-fix-cortex-a53-843419)
+  endif()
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
   set(CMAKE_STRIP
       ""

@@ -128,6 +128,7 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -155,6 +156,7 @@ l0_b200:
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
+  - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
@@ -184,8 +186,10 @@ l0_b200:
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
+  - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/test_moe_comm_timeout_guard.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
@@ -202,6 +206,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
+  - unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
@@ -246,6 +251,7 @@ l0_b200:
   # function's leaves on Blackwell, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   # On-device suffix-automaton spec-dec kernel tests (CUDA graph capture;
@@ -340,6 +346,9 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
+  - unittest/_torch/visual_gen/test_qwen_image_registry.py
+  - unittest/_torch/visual_gen/test_qwen_image_parity.py
+  - unittest/_torch/visual_gen/test_qwen_image_layered_parity.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
   - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_fp4_conv_autotuner.py
@@ -398,6 +407,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/test_minimax_h3_fused_adaln.py
+  - unittest/_torch/visual_gen/test_minimax_h3_vae_decode.py
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)

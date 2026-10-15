@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the optimized Kimi K3 KDA prefill op."""
 
+import importlib.util
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -166,22 +169,26 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert relative_l2 < 3e-2
 
 
+@pytest.mark.parametrize("token_major", [False, True], ids=["channel_major", "token_major"])
 @pytest.mark.parametrize("sequence_length", [1, 127, 256])
 @torch.no_grad()
-def test_fused_kda_post_conv_matches_reference(sequence_length: int) -> None:
-    """Packed convolution output is normalized and transposed correctly."""
+def test_fused_kda_post_conv_matches_reference(sequence_length: int, token_major: bool) -> None:
+    """Packed convolution output is normalized and transposed correctly.
+
+    Token-major input is the transposed view of ``[T, 3P]`` rows.
+    """
     torch.manual_seed(1)
     num_heads, head_dim = 8, 128
     projection_size = num_heads * head_dim
-    packed = torch.randn(
-        3 * projection_size,
-        sequence_length,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    shape = (3 * projection_size, sequence_length)
+    if token_major:
+        shape = shape[::-1]
+    packed = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    if token_major:
+        packed = packed.t()
 
     actual_q, actual_k, actual_v = fused_kda_post_conv(packed, num_heads, head_dim)
-    unpacked = packed.view(3, projection_size, sequence_length)
+    unpacked = packed.reshape(3, projection_size, sequence_length)
     expected_q = unpacked[0].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
     expected_k = unpacked[1].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
     expected_v = unpacked[2].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
@@ -196,6 +203,68 @@ def test_fused_kda_post_conv_matches_reference(sequence_length: int) -> None:
     torch.testing.assert_close(actual_q, expected_q.to(packed.dtype), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(actual_k, expected_k.to(packed.dtype), rtol=1e-2, atol=1e-2)
     assert torch.equal(actual_v, expected_v)
+
+
+@torch.no_grad()
+def test_fused_kda_post_conv_rejects_layout_without_unit_stride() -> None:
+    """Input with no unit stride along tokens or features is rejected."""
+    projection_size = 2 * 128
+    packed = torch.randn(3 * projection_size, 8, 2, dtype=torch.bfloat16, device="cuda")[..., 0]
+    with pytest.raises(ValueError, match="unit stride"):
+        fused_kda_post_conv(packed, 2, 128)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    ("num_tokens", "dtype", "channel_major"),
+    [
+        (256, torch.bfloat16, True),
+        (301, torch.bfloat16, False),
+        (300, torch.bfloat16, False),
+        (300, torch.float32, True),
+    ],
+    ids=["bf16-aligned", "bf16-odd", "bf16-even-unaligned", "fp32-aligned"],
+)
+def test_project_packed_conv_input_layout(
+    num_tokens: int, dtype: torch.dtype, channel_major: bool
+) -> None:
+    """The transposed GEMM is used only when its output rows are 16-byte aligned.
+
+    Other token counts keep the token-major GEMM and return its transposed view,
+    so the alignment rule follows the element size rather than a token count.
+    """
+    torch.manual_seed(3)
+    # Only the projection layout is checked, so two heads keep the weights small.
+    kda = _make_kda(num_heads=2).to(dtype)
+    kda.finalize_decode_weights()
+    assert kda._qkvg_proj_weight is not None
+    x2d = torch.randn(num_tokens, HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.05
+
+    packed_conv, _ = kda._project_packed_conv_input(x2d.unsqueeze(0), x2d)
+
+    assert packed_conv.shape == (3 * kda.proj_size, num_tokens)
+    assert packed_conv.stride(1 if channel_major else 0) == 1
+    expected = torch.nn.functional.linear(
+        x2d.float(), kda._qkvg_proj_weight[: 3 * kda.proj_size].float()
+    ).t()
+    torch.testing.assert_close(packed_conv.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.no_grad()
+def test_prefill_output_matches_across_projection_layouts() -> None:
+    """Aligned and unaligned token counts produce the same prefill output.
+
+    The odd-length request is the aligned one plus one trailing token, so its
+    shared prefix must match the aligned request token for token.
+    """
+    torch.manual_seed(4)
+    kda = _make_kda()
+    hidden_states = torch.randn(1, 257, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
+
+    aligned = _run_production_prefill(kda, hidden_states[:, :256].contiguous())
+    unaligned = _run_production_prefill(kda, hidden_states)
+
+    torch.testing.assert_close(unaligned[:, :256], aligned, rtol=2e-2, atol=2e-2)
 
 
 @torch.no_grad()
@@ -490,6 +559,128 @@ def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
         _assert_close(state_fused, state_unfused)
 
 
+# fused_k123's K1 warps meet at this barrier after the cross-warp scan, then
+# read the scanned prefix rows and the chunk total from sPartialLast.
+_K1_SCAN_BARRIER = "                k1_internal_barrier()\n"
+_K1_SCAN_READS = (
+    _K1_SCAN_BARRIER
+    + "\n"
+    + "                for vi in cutlass.range_constexpr(VEC):\n"
+    + "                    rGkLast[vi] = sPartialLast[K1_ROW_GROUPS - 1, col_base + vi]\n"
+)
+# K1 warp 1 reads the prefix row 0 and the chunk total.
+_LATE_K1_WARP = (
+    "                if k1_warp == 1:\n"
+    "                    late_t = _test_globaltimer()\n"
+    "                    late_end = late_t + cutlass.Int64(20000)\n"
+    "                    while late_t < late_end:\n"
+    "                        late_t = _test_globaltimer()\n"
+)
+_GLOBALTIMER = """
+
+@dsl_user_op
+def _test_globaltimer(*, loc=None, ip=None):
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+"""
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [None, [100, 257, 63]],
+    ids=["padded_eqlen", "varlen"],
+)
+def test_fused_prefill_does_not_depend_on_k1_warp_timing(
+    sequence_lengths: list[int] | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A K1 warp that reads the scanned partial sums late gets the same bits.
+
+    A copy of fused_k123 stalls K1 warp 1 for 20 us right after the scan
+    barrier, so the other K1 warps run ahead into the next chunk before it
+    reads sPartialLast. Outputs and states must equal the unpatched kernel's.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops as kimi_k3_ops
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda import fused_k123
+
+    source = Path(fused_k123.__file__).read_text()
+    assert source.count(_K1_SCAN_READS) == 1, "fused_k123's K1 scan reads moved"
+    late_source = source.replace(
+        _K1_SCAN_READS, _K1_SCAN_BARRIER + _LATE_K1_WARP + _K1_SCAN_READS[len(_K1_SCAN_BARRIER) :]
+    )
+    late_path = tmp_path / "fused_k123_late_k1_warp.py"
+    late_path.write_text(late_source + _GLOBALTIMER)
+    spec = importlib.util.spec_from_file_location(late_path.stem, late_path)
+    late_module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, late_path.stem, late_module)
+    spec.loader.exec_module(late_module)
+
+    torch.manual_seed(10)
+    if sequence_lengths is None:
+        sequence_length = 300
+        num_sequences = 1
+        cu_seqlens = None
+    else:
+        sequence_length = sum(sequence_lengths)
+        num_sequences = len(sequence_lengths)
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+            dtype=torch.long,
+            device="cuda",
+        )
+
+    def randn(*shape: int, dtype: torch.dtype = torch.bfloat16, scale: float = 0.05):
+        return (torch.randn(*shape, dtype=torch.float32, device="cuda") * scale).to(dtype)
+
+    def l2norm(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(x.float(), dim=-1).to(torch.bfloat16)
+
+    shape = (1, sequence_length, NUM_HEADS, HEAD_DIM)
+    inputs = dict(
+        q=l2norm(randn(*shape)),
+        k=l2norm(randn(*shape)),
+        v=randn(*shape),
+        g=randn(*shape),
+        beta=randn(1, sequence_length, NUM_HEADS, dtype=torch.float32),
+        scale=HEAD_DIM**-0.5,
+        state_indices=torch.arange(num_sequences, dtype=torch.int32, device="cuda"),
+        safe_gate=True,
+        lower_bound=-5.0,
+        use_gate_in_kernel=True,
+        A_log=torch.randn(NUM_HEADS, dtype=torch.float32, device="cuda") * 0.1,
+        dt_bias=torch.randn(NUM_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda") * 0.1,
+        cu_seqlens=cu_seqlens,
+        use_beta_sigmoid_in_kernel=True,
+    )
+    initial_state = randn(
+        num_sequences, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, scale=0.01
+    )
+
+    def run() -> tuple[torch.Tensor, torch.Tensor]:
+        state = initial_state.clone()
+        output = torch.ops.trtllm.kda_prefill(state_pool=state, **inputs).clone()
+        return output, state
+
+    expected_output, expected_state = run()
+    monkeypatch.setattr(kimi_k3_ops, "_fused_make_host", late_module.make_host_function)
+    monkeypatch.setattr(kimi_k3_ops, "_fused_k123_cache", {})
+    output, state = run()
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
 @torch.no_grad()
 def test_kda_mixer_empty_prefill():
     """An empty token payload still publishes the conv state for its slot."""
@@ -598,6 +789,74 @@ def test_kda_prefill_op_rejects_misaligned_state_indices() -> None:
             state_indices=state_indices,
             scale=HEAD_DIM**-0.5,
         )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [[100, 200], None],
+    ids=["varlen", "equal-length-padded"],
+)
+def test_kda_prefill_op_output_survives_the_next_call(sequence_lengths) -> None:
+    """The op's output belongs to the caller, as its fake (a new tensor) declares.
+
+    A second call with the same shapes and other inputs must leave the first
+    call's output as it was. ``None`` runs one 300-token row without
+    cu_seqlens, which the op pads to a chunk multiple and slices back.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
+    from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
+
+    heads = 2
+    tokens = sum(sequence_lengths) if sequence_lengths else 300
+    rows = len(sequence_lengths) if sequence_lengths else 1
+    state_pool = torch.zeros(rows, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda")
+    state_indices = torch.arange(rows, dtype=torch.int32, device="cuda")
+    cu_seqlens = None
+    chunk_indices = None
+    if sequence_lengths:
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+            dtype=torch.long,
+            device="cuda",
+        )
+        chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
+
+    def call(seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        shape = (1, tokens, heads, HEAD_DIM)
+
+        def unit() -> torch.Tensor:
+            t = torch.randn(*shape, generator=gen, device="cuda")
+            return (t / t.norm(dim=-1, keepdim=True)).to(torch.bfloat16)
+
+        state_pool.zero_()
+        return torch.ops.trtllm.kda_prefill(
+            q=unit(),
+            k=unit(),
+            v=(torch.randn(*shape, generator=gen, device="cuda") * 0.5).to(torch.bfloat16),
+            g=torch.randn(*shape, generator=gen, device="cuda").to(torch.bfloat16),
+            beta=torch.randn(1, tokens, heads, generator=gen, device="cuda"),
+            state_pool=state_pool,
+            state_indices=state_indices,
+            scale=HEAD_DIM**-0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            safe_gate=True,
+            lower_bound=-5.0,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            A_log=torch.zeros(heads, device="cuda"),
+            dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
+        )
+
+    first = call(seed=0)
+    kept = first.clone()
+    second = call(seed=1)
+    torch.cuda.synchronize()
+    assert first.shape == second.shape == (1, tokens, heads, HEAD_DIM)
+    assert not torch.equal(second, kept), "the two calls must compute different outputs"
+    assert torch.equal(first, kept), "a later call wrote an earlier call's output"
 
 
 @torch.no_grad()
@@ -787,6 +1046,94 @@ def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(
         fallback_state.index_select(0, slot_indices),
         optimized_state.index_select(0, slot_indices),
     )
+
+
+@torch.no_grad()
+def test_token_major_prefill_matches_channel_major_with_initial_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token-major projection layout carries continuation state like channel-major.
+
+    An unaligned token count takes the token-major projection and the
+    channel-last convolution. Forcing the same projection channel-major must
+    give the same outputs and pool updates for mixed initial states,
+    permuted slots and an unused slot.
+    """
+    torch.manual_seed(5)
+    kda = _make_kda()
+    sequence_lengths = [64, 64, 64, 63]
+    assert sum(sequence_lengths) * torch.bfloat16.itemsize % 16 != 0
+    cumulative_lengths = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.long,
+        device="cuda",
+    )
+    hidden_states = (
+        torch.randn(1, sum(sequence_lengths), HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        * 0.05
+    )
+    slots = 5
+    slot_indices = torch.tensor([3, 0, 4, 1], dtype=torch.int32, device="cuda")
+    has_initial_states = torch.tensor([True, False, True, False], device="cuda")
+    conv_seed = (
+        torch.randn(
+            slots,
+            3 * kda.proj_size,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    state_seed = (
+        torch.randn(slots, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda") * 0.05
+    )
+
+    def run():
+        """Prefill from fresh copies of the seeded pools; return output and pools."""
+        conv_pool, state_pool = conv_seed.clone(), state_seed.clone()
+        output = _run_production_prefill(
+            kda,
+            hidden_states,
+            cumulative_lengths,
+            conv_pool=conv_pool,
+            state_pool=state_pool,
+            slot_indices=slot_indices,
+            has_initial_states=has_initial_states,
+        )
+        return output, conv_pool, state_pool
+
+    project = KimiKDALinearAttention._project_packed_conv_input
+    layouts = []
+
+    def recording_project(self, x, x2d):
+        """Record whether the projection came back token-major."""
+        packed_conv, onorm_g = project(self, x, x2d)
+        layouts.append(packed_conv.stride(0) == 1)
+        return packed_conv, onorm_g
+
+    monkeypatch.setattr(KimiKDALinearAttention, "_project_packed_conv_input", recording_project)
+    token_major = run()
+    assert layouts == [True]
+
+    def channel_major_project(self, x, x2d):
+        """Force the channel-major layout regardless of alignment."""
+        packed_conv, onorm_g = project(self, x, x2d)
+        return packed_conv.contiguous(), onorm_g
+
+    monkeypatch.setattr(KimiKDALinearAttention, "_project_packed_conv_input", channel_major_project)
+    channel_major = run()
+
+    _assert_close(token_major[0], channel_major[0])
+    # Convolution states are copied verbatim out of the projection.
+    torch.testing.assert_close(token_major[1], channel_major[1], rtol=0, atol=0)
+    _assert_close(
+        token_major[2].index_select(0, slot_indices),
+        channel_major[2].index_select(0, slot_indices),
+    )
+    unused_slot = 2
+    assert torch.equal(token_major[1][unused_slot], conv_seed[unused_slot])
+    assert torch.equal(token_major[2][unused_slot], state_seed[unused_slot])
 
 
 @torch.no_grad()
