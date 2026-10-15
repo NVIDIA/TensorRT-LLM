@@ -1,0 +1,503 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""What any ``StoreDriver`` owes the backend, checked through the protocol alone.
+
+A driver's test module subclasses :class:`DriverConformance` as ``Test...`` and provides
+``make_driver``. Every check observes consequences the backend could observe: bytes in registered
+memory, row results, access end, rejections without effect. Nothing here uses a driver's own
+controls, so the same checks run against the in-memory driver, a real store's driver, and the
+deliberately broken drivers that prove each check bites.
+
+Each check runs inside a :class:`Harness` that keeps every endpoint and operation it created and,
+when the check is over, waits for access to end, unregisters the regions, drains and closes the
+driver. Memory whose access never provably ended is kept alive instead of being freed.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import threading
+import time
+from collections.abc import Callable, Generator, Sequence
+
+import pytest
+from host_memory import HostBuffer
+
+from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
+from tensorrt_llm._torch.disaggregation.blob.store import (
+    DriverRejected,
+    OpHandle,
+    ProbeStatus,
+    RegionHandle,
+    RegionLayout,
+    RegistrationError,
+    RowIO,
+    RowResult,
+    RowStatus,
+    Span,
+    StoreDriver,
+    concluded,
+)
+
+SLOT = 8
+PREFIX = "t"
+
+# Lender names are 54 bytes and start with a 16-byte scope digest shared by every name of a
+# deployment. A key built from a truncated name collides across these.
+SCOPE = b"scope" + bytes(11)
+NAME_BYTES = 54
+
+
+def name_of(label: str) -> bytes:
+    return SCOPE + hashlib.blake2b(label.encode(), digest_size=NAME_BYTES - len(SCOPE)).digest()
+
+
+NAMES = {label: name_of(label) for label in "ABC"}
+
+
+def key_of(label: str) -> str:
+    return encode_key(PREFIX, NAMES[label])
+
+
+def wait_until(predicate: Callable[[], bool], what: str, timeout: float) -> None:
+    """Polls ``predicate`` until true; fails after ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.001)
+
+
+def statuses(driver: StoreDriver, op: OpHandle) -> list[RowStatus]:
+    return [result.status for result in driver.poll(op)]
+
+
+class Endpoint:
+    """One side of a transfer: one registered region with a slot per label."""
+
+    def __init__(
+        self,
+        driver: StoreDriver,
+        labels: Sequence[str],
+        *,
+        fill: int = 0,
+        slot: int = SLOT,
+        register: bool = True,
+    ) -> None:
+        self.driver = driver
+        self.labels = list(labels)
+        self.slot = slot
+        self.payload = HostBuffer(slot * len(labels), fill)
+        self.handle: RegionHandle | None = None
+        if register:
+            self.register()
+
+    def register(self) -> None:
+        """Registers the region. When the store may have kept it despite an error, the handle
+        is recorded all the same, so the region can still be unregistered later."""
+        layout = RegionLayout(self.slot, len(self.labels), "kv")
+        try:
+            self.handle = self.driver.register(self.payload.address, self.payload.nbytes, layout)
+        except RegistrationError as error:
+            self.handle = error.handle
+            raise
+
+    def rows(self) -> list[RowIO]:
+        return [
+            RowIO(key_of(label), self.span(i), position=(0, i))
+            for i, label in enumerate(self.labels)
+        ]
+
+    def span(self, index: int) -> Span:
+        return self.payload.span(index * self.slot, self.slot)
+
+    def fill_row(self, index: int, data: bytes) -> None:
+        self.payload.write(data, index * self.slot)
+
+    def read_row(self, index: int) -> bytes:
+        return self.payload.read(index * self.slot, self.slot)
+
+    def intact(self) -> bool:
+        return self.payload.canaries_intact()
+
+    def unregister(self) -> None:
+        if self.handle is not None:
+            self.driver.unregister(self.handle)
+
+
+# Endpoints whose memory a driver may still touch or still holds registered when a check ends.
+# Never freed.
+UNRELEASED_ENDPOINTS: list[Endpoint] = []
+
+
+class Harness:
+    """One driver under test plus everything a check created with it."""
+
+    def __init__(self, driver: StoreDriver, timeout: float) -> None:
+        self.driver = driver
+        self.timeout = timeout
+        self.endpoints: list[Endpoint] = []
+        self.ops: list[OpHandle] = []
+        self.done = False
+
+    # Creating things the harness will clean up.
+
+    def endpoint(self, labels: Sequence[str], *, fill: int = 0, slot: int = SLOT) -> Endpoint:
+        endpoint = Endpoint(self.driver, labels, fill=fill, slot=slot, register=False)
+        self.endpoints.append(endpoint)  # kept before the store is asked, whatever register does
+        endpoint.register()
+        return endpoint
+
+    def put(self, rows: Sequence[RowIO]) -> OpHandle:
+        op = self.driver.put(rows)
+        self.ops.append(op)
+        return op
+
+    def get(self, rows: Sequence[RowIO]) -> OpHandle:
+        op = self.driver.get(rows)
+        self.ops.append(op)
+        return op
+
+    def publish(self, rows: dict[str, bytes], slot: int = SLOT) -> Endpoint:
+        """Puts ``rows`` (label to payload) and returns the writer endpoint."""
+        writer = self.endpoint(list(rows), slot=slot)
+        for i, data in enumerate(rows.values()):
+            writer.fill_row(i, data)
+        op = self.put(writer.rows())
+        assert [r.status for r in self.settle(op)] == [RowStatus.READY] * len(rows)
+        self.settle_access(op)
+        return writer
+
+    # Waiting.
+
+    def settle(self, op: OpHandle) -> tuple[RowResult, ...]:
+        """Waits for every row's result, not for access end."""
+        wait_until(
+            lambda: concluded(self.driver.poll(op)), "the operation to conclude", self.timeout
+        )
+        return self.driver.poll(op)
+
+    def settle_access(self, op: OpHandle) -> None:
+        wait_until(lambda: self.driver.access_ended(op), "access to end", self.timeout)
+
+    def needs(self, *, put: bool = False, get: bool = False, rows: int = 1) -> None:
+        """Skips the check when the driver does not declare what it needs."""
+        caps = self.driver.capabilities
+        if put and not caps.put:
+            pytest.skip("this driver declares no put")
+        if get and not caps.get:
+            pytest.skip("this driver declares no get")
+        if caps.max_rows_per_op is not None and rows > caps.max_rows_per_op:
+            pytest.skip(f"this driver takes at most {caps.max_rows_per_op} rows per operation")
+
+    # Cleanup.
+
+    def cleanup(self) -> list[str]:
+        """Ends everything the check created, in order; returns what did not go to plan.
+
+        Memory a driver may still touch, or still holds registered, is retained for good. A
+        cleanup that did not finish may be called again.
+        """
+        if self.done:
+            return []
+        problems: list[str] = []
+        for op in self.ops:
+            try:
+                self.settle_access(op)
+            except Exception as error:  # noqa: BLE001 - every cleanup step is reported
+                problems.append(f"access end: {error!r}")
+        if problems:
+            UNRELEASED_ENDPOINTS.extend(self.endpoints)
+            return problems
+        for endpoint in self.endpoints:
+            try:
+                endpoint.unregister()
+            except Exception as error:  # noqa: BLE001 - every cleanup step is reported
+                problems.append(f"unregister: {error!r}")
+                UNRELEASED_ENDPOINTS.append(endpoint)
+        if problems:
+            return problems
+        try:
+            if self.driver.drain(self.timeout):
+                self.driver.close()
+            else:
+                problems.append("drain did not return True")
+        except Exception as error:  # noqa: BLE001 - every cleanup step is reported
+            problems.append(f"drain/close: {error!r}")
+        self.done = not problems
+        return problems
+
+
+class DriverConformance:
+    """Contract checks for one driver. Subclass as ``Test...`` and implement ``make_driver``."""
+
+    timeout = 5.0
+
+    def make_driver(self) -> StoreDriver:
+        raise NotImplementedError
+
+    def make_blocked_probe(self) -> tuple[StoreDriver, str, Callable[[], None]] | None:
+        """A driver whose store stalls every query of the returned key until the returned
+        callable runs; ``None`` when this driver cannot stage that, which skips the check."""
+        return None
+
+    @contextlib.contextmanager
+    def harness(self, driver: StoreDriver | None = None) -> Generator[Harness, None, None]:
+        """A fresh driver (or ``driver``) with cleanup afterwards. A failing check keeps its own
+        error; cleanup trouble fails only a check that passed."""
+        h = Harness(driver if driver is not None else self.make_driver(), self.timeout)
+        try:
+            yield h
+        except BaseException:
+            h.cleanup()
+            raise
+        problems = h.cleanup()
+        assert not problems, "cleanup after the check: " + "; ".join(problems)
+
+    # Bytes and results.
+
+    def test_put_then_get_moves_whole_rows_and_never_aliases_the_source(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True, rows=2)
+            writer = h.publish({"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+            writer.fill_row(0, b"xxxxxxxx")  # the source changes after the put concluded
+
+            reader = h.endpoint(["A", "B"], fill=0x2D)
+            results = h.settle(h.get(reader.rows()))
+            assert [r.status for r in results] == [RowStatus.READY, RowStatus.READY]
+            assert reader.read_row(0) == b"aaaaaaaa"
+            assert reader.read_row(1) == b"bbbbbbbb"
+            assert reader.intact() and writer.intact()
+
+    def test_get_reports_hit_hit_miss_and_leaves_the_miss_untouched(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True, rows=3)
+            h.publish({"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+            reader = h.endpoint(["A", "B", "C"], fill=0x2D)
+            results = h.settle(h.get(reader.rows()))
+            assert [r.status for r in results] == [
+                RowStatus.READY,
+                RowStatus.READY,
+                RowStatus.MISS,
+            ]
+            assert reader.read_row(2) == b"-" * SLOT
+            assert reader.intact()
+
+    def test_an_object_of_the_wrong_size_is_a_fault_not_a_miss(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            h.publish({"A": b"aaaa"}, slot=4)
+            reader = h.endpoint(["A"], fill=0x2D)
+            (result,) = h.settle(h.get(reader.rows()))
+            assert result.status is RowStatus.FAULT
+            assert reader.read_row(0) == b"-" * SLOT
+            assert reader.intact()
+
+    def test_a_duplicate_put_of_a_committed_object_is_ready(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            h.publish({"A": b"aaaaaaaa"})
+            h.publish({"A": b"aaaaaaaa"})  # a second writer, same content
+            reader = h.endpoint(["A"])
+            (result,) = h.settle(h.get(reader.rows()))
+            assert result.status is RowStatus.READY
+            assert reader.read_row(0) == b"aaaaaaaa"
+
+    def test_a_put_under_an_existing_key_leaves_the_object_whole(self) -> None:
+        """Whatever a driver answers a writer bringing other bytes, the object readers get is
+        the one that was committed."""
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            h.publish({"A": b"aaaaaaaa"})
+            other = h.endpoint(["A"])
+            other.fill_row(0, b"zzzzzzzz")
+            (result,) = h.settle(h.put(other.rows()))
+            assert result.status in (RowStatus.READY, RowStatus.FAULT)
+            reader = h.endpoint(["A"], fill=0x2D)
+            (got,) = h.settle(h.get(reader.rows()))
+            assert got.status is RowStatus.READY
+            assert reader.read_row(0) == b"aaaaaaaa"
+
+    # Rejections leave no trace.
+
+    def test_rows_outside_a_live_registration_are_rejected_before_any_effect(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            inside = h.endpoint(["A"])
+            stray = HostBuffer(SLOT, fill=0x2D)
+            h.publish({"A": b"aaaaaaaa"})
+
+            with pytest.raises(DriverRejected):
+                h.get([RowIO(key_of("A"), stray.span())])
+            assert stray.read() == b"-" * SLOT and stray.canaries_intact()
+
+            inside.fill_row(0, b"bbbbbbbb")
+            inside.unregister()
+            with pytest.raises(DriverRejected):
+                h.put([RowIO(key_of("B"), inside.span(0))])
+            reader = h.endpoint(["B"])
+            assert [r.status for r in h.settle(h.get(reader.rows()))] == [RowStatus.MISS]
+
+    def test_a_key_appears_at_most_once_per_operation(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True, rows=2)
+            writer = h.endpoint(["A", "A"])
+            writer.fill_row(0, b"aaaaaaaa")
+            writer.fill_row(1, b"bbbbbbbb")
+            with pytest.raises(DriverRejected):
+                h.put(writer.rows())
+            reader = h.endpoint(["A", "A"], fill=0x2D)
+            with pytest.raises(DriverRejected):
+                h.get(reader.rows())
+            single = h.endpoint(["A"])
+            assert [r.status for r in h.settle(h.get(single.rows()))] == [RowStatus.MISS]
+            assert reader.read_row(0) == reader.read_row(1) == b"-" * SLOT
+
+    def test_rows_beyond_the_declared_limit_are_rejected(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            limit = h.driver.capabilities.max_rows_per_op
+            if limit is None or limit >= 3:
+                pytest.skip("this driver declares no row limit this check can exceed")
+            writer = h.endpoint(["A", "B", "C"][: limit + 1])
+            with pytest.raises(DriverRejected):
+                h.put(writer.rows())
+            reader = h.endpoint(["A"])
+            assert [r.status for r in h.settle(h.get(reader.rows()))] == [RowStatus.MISS]
+
+    def test_an_undeclared_direction_is_rejected(self) -> None:
+        with self.harness() as h:
+            caps = h.driver.capabilities
+            if caps.get and caps.put:
+                pytest.skip("this driver declares both directions")
+            endpoint = h.endpoint(["A"])
+            endpoint.fill_row(0, b"aaaaaaaa")
+            with pytest.raises(DriverRejected):
+                if caps.put:
+                    h.get(endpoint.rows())
+                else:
+                    h.put(endpoint.rows())
+            assert endpoint.read_row(0) == b"aaaaaaaa"
+
+    # Results, access and capabilities over time.
+
+    def test_results_are_stable_and_access_ends_with_evidence(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True, rows=2)
+            h.publish({"A": b"aaaaaaaa"})
+            reader = h.endpoint(["A", "C"])
+            op = h.get(reader.rows())
+            results = h.settle(op)
+            assert h.driver.poll(op) == results
+            h.settle_access(op)
+            assert h.driver.access_ended(op)
+            assert not h.driver.access_unprovable(op)
+            assert h.driver.poll(op) == results
+
+    def test_cancel_after_conclusion_changes_nothing(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            if not h.driver.capabilities.cancel:
+                pytest.skip("this driver declares no cancel")
+            h.publish({"A": b"aaaaaaaa"})
+            reader = h.endpoint(["A"], fill=0x2D)
+            op = h.get(reader.rows())
+            results = h.settle(op)
+            h.driver.cancel(op)
+            assert h.driver.poll(op) == results
+            assert reader.read_row(0) == b"aaaaaaaa"
+
+    def test_capabilities_do_not_change(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True)
+            before = h.driver.capabilities
+            h.publish({"A": b"aaaaaaaa"})
+            assert h.driver.capabilities == before
+            assert h.driver.capabilities == before
+
+    def test_probe_reports_hit_and_miss(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True)
+            if not h.driver.capabilities.probe:
+                pytest.skip("this driver declares no probe")
+            h.publish({"A": b"aaaaaaaa"})
+            assert h.driver.probe([key_of("A"), key_of("C")], self.timeout) == (
+                ProbeStatus.HIT,
+                ProbeStatus.MISS,
+            )
+
+    def test_probe_returns_within_its_budget(self) -> None:
+        with self.harness() as h:
+            if not h.driver.capabilities.probe:
+                pytest.skip("this driver declares no probe")
+            keys = [key_of(label) for label in "ABC"]
+            started = time.monotonic()
+            answer = h.driver.probe(keys, 0.05)
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.05 + 0.5, f"probe took {elapsed:.2f}s on a 0.05s budget"
+            assert len(answer) == 3 and set(answer) <= set(ProbeStatus)
+
+    def test_probe_answers_unknown_for_a_key_the_store_does_not_answer_in_time(self) -> None:
+        staged = self.make_blocked_probe()
+        if staged is None:
+            pytest.skip("this driver cannot stage a blocked query")
+        driver, blocked_key, unblock = staged
+        with self.harness(driver) as h:
+            if not driver.capabilities.probe:
+                pytest.skip("this driver declares no probe")
+            answer: list[tuple[ProbeStatus, ...]] = []
+            # Off this thread, so a probe that waits for the store fails instead of hanging.
+            prober = threading.Thread(
+                target=lambda: answer.append(driver.probe([blocked_key], 0.05)), daemon=True
+            )
+            prober.start()
+            prober.join(0.05 + 0.5)
+            try:
+                assert not prober.is_alive(), "probe waited for the store past its budget"
+                assert answer == [(ProbeStatus.UNKNOWN,)]
+            finally:
+                unblock()
+                prober.join(h.timeout)
+
+    # Registration, drain and close.
+
+    def test_unregister_is_idempotent_and_frees_the_range(self) -> None:
+        with self.harness() as h:
+            endpoint = h.endpoint(["A"])
+            with pytest.raises(DriverRejected):
+                h.driver.register(endpoint.payload.address, SLOT, RegionLayout(SLOT, 1))
+            endpoint.unregister()
+            endpoint.unregister()
+            try:
+                handle = h.driver.register(endpoint.payload.address, SLOT, RegionLayout(SLOT, 1))
+            except DriverRejected as error:
+                pytest.fail(f"the range stayed registered: {error}")
+            h.driver.unregister(handle)
+
+    def test_drain_is_one_way(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True)
+            writer = h.publish({"A": b"aaaaaaaa"})
+            assert h.driver.drain(self.timeout) is True
+            with pytest.raises(DriverRejected):
+                h.put(writer.rows())
+            with pytest.raises(DriverRejected):
+                h.get(writer.rows())
+            assert h.driver.drain(self.timeout) is True
+            assert writer.read_row(0) == b"aaaaaaaa"
+
+    def test_close_needs_a_true_drain_and_no_live_registrations(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True)
+            writer = h.publish({"A": b"aaaaaaaa"})
+            with pytest.raises(DriverRejected):
+                h.driver.close()
+            assert h.driver.drain(self.timeout) is True
+            with pytest.raises(DriverRejected):
+                h.driver.close()
+            writer.unregister()
+            h.driver.close()
+            h.driver.close()
+            h.done = True  # closed by the check itself
+            with pytest.raises(DriverRejected):
+                h.put(writer.rows())
