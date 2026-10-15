@@ -60,7 +60,7 @@ def _cleanup_mpi_env():
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
     """Initialize distributed environment for a worker process."""
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -529,8 +529,8 @@ def test_wan_vsa_gates_follow_ulysses_aligned_tp_q_shard(
     monkeypatch: pytest.MonkeyPatch, tp_rank: int, expected_head_range: tuple[int, int]
 ) -> None:
     """VSA gates must select the same TP-local heads as the Q projection."""
+    from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
-    from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.visual_gen.args import VideoSparseAttentionConfig
 

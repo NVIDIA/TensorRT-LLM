@@ -21,9 +21,10 @@ class PPCommTag(IntEnum):
     SCHEDULE_RESULT = 20001
     EXECUTED_BATCH_NUM = 20002
     SAMPLE_STATE = 20003
-    # Reserved and never sent, so the MPI progress pump's MPI_Iprobe always
-    # misses. Kept well apart from the tags above, which share its
-    # communicator.
+    # Reserved and never sent, so the MPI_Iprobe of the relay thread's MPI
+    # progress pump and of PyExecutor's native MPI progress thread always
+    # misses. Kept well apart from the tags above, which share their
+    # communicators.
     MPI_PROGRESS_PROBE = 20100
 
 
@@ -35,7 +36,9 @@ class PPCommTag(IntEnum):
 # complete, which can deadlock the PP ring when pp_size >= 3. The sample-state
 # relay thread therefore polls its queue with a timeout and issues a
 # non-matching MPI_Iprobe between polls. A native call that holds the GIL
-# across a whole CUDA synchronization can still starve it.
+# across a whole CUDA synchronization can still starve it; PyExecutor's
+# native MPI progress thread (TLLM_PP_MPI_PROGRESS_INTERVAL_US) covers that
+# case.
 MPI_PROGRESS_POLL_MS_ENV_VAR_NAME = "TLLM_PP_MPI_PROGRESS_POLL_MS"
 # CPython's default thread switch interval.
 DEFAULT_MPI_PROGRESS_POLL_MS = 5.0

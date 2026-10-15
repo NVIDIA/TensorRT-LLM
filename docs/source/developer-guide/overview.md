@@ -186,6 +186,15 @@ The value is baked into the kernels at JIT compile time and participates in the
 JIT cache key, so changing it recompiles the affected kernels rather than
 silently reusing a cached binary.
 
+TensorRT-LLM overrides this default at runtime, without recompiling. While the
+engine warms up, the barriers use `TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC` (default
+1800 seconds), because one-time per-rank work such as kernel JIT compilation can
+delay a healthy rank by minutes. While serving, they use
+`TRTLLM_MOE_COMM_TIMEOUT_SEC` when it is set, so `DG_JIT_BARRIER_TIMEOUT_SECONDS`
+only sets the serving budget when `TRTLLM_MOE_COMM_TIMEOUT_SEC` is unset. Both
+variables apply to every MoE communication kernel; see "Communication timeouts"
+in `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md`.
+
 This is primarily a diagnostic knob: raising it distinguishes a slow-but-healthy
 rendezvous (all ranks eventually arrive and the run proceeds) from a genuine
 hang or a rank-count mismatch (the same `signal`/`target` split reappears at the

@@ -63,7 +63,7 @@ See `rules/README.md` for per-rule logic.
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
 | `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`; excl. docs; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files under `tensorrt_llm/visual_gen/**` and `tensorrt_llm/media/**` (eagerly imported by `trtllm-serve`) force `null` fallback. |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
-| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches the modeling_v2 subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`; excl. docs, which are a fifth of the subtree — every catalog entry carries a contract document). Narrows to blocks containing modeling_v2 test entries (`unittest/_torch/modeling_v2/`, `test_modeling_v2_*`). No outward-facing fallback is needed: nothing imports the subtree unless `TRTLLM_MODELING_V2` is set, and its one caller outside the subtree (`_torch/models/modeling_auto.py`) is left unclaimed, so touching the shared resolver falls back to baseline. |
+| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches the modeling_v2 subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`; excl. docs, which are a fifth of the subtree — every catalog entry carries a contract document). Narrows to blocks containing modeling_v2 test entries (`unittest/_torch/modeling_v2/`, `test_modeling_v2_*`). No outward-facing fallback is needed: nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)` is on, and its callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching the shared resolver falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
 | `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run the complete `l0_cpu` suite on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
@@ -338,9 +338,12 @@ CBTS defers to the existing filter chain when:
   YAML edit)
 - Combined scope is `None` (incompatible mix)
 - Tier 2 declines: a residual file is not core Python, is absent from the
-  touch DB, has an import-executed change (module / class body, signature or
-  decorator line), has no usable patch, has unparsable source, or has a closure
-  change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
+  touch DB, has an unbounded import-executed change (class body, signature,
+  decorator, or unsupported module statement), has no usable patch, has
+  unparsable source, or has a closure change with no wider row set. A small AST
+  allowlist maps literal bindings, newly added builtin imports, and plain
+  declarations to consumers/callers after a repository reference check (see
+  `coverage_selection/SELECTION.md` §3-4).
 - No touch DB artifact could be resolved — Tier 2 never runs
 - The Tier-2 residual cannot be applied without conflicts to the selected coverage DB (the
   freshest complete build on a PR head's first run, then pinned for that head)
