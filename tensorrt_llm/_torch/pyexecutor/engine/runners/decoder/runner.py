@@ -3664,6 +3664,12 @@ class DecoderRunner(ScheduledModelRunner):
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
+        if _use_mrope and first_draft_requests:
+            raise NotImplementedError(
+                "First-draft requests on an mRoPE model are not supported: they add no "
+                "mRoPE delta read slot, so every later generation request would read "
+                "another request's delta."
+            )
 
         # Helix bookkeeping is needed by BOTH the extend (speculative verify
         # group) and the plain generation packing loops below, so initialize
