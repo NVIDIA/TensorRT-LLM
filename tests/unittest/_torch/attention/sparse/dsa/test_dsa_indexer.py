@@ -1760,6 +1760,7 @@ def _create_mock_metadata(
     use_cute_dsl_paged_mqa_logits=False,
     compress_ratio=1,
     indexer_head_dim=128,
+    max_num_tokens=8192,
 ):
     """Helper to create mock metadata for testing."""
 
@@ -1776,6 +1777,7 @@ def _create_mock_metadata(
         def __init__(self):
             """Initialize mock metadata with buffers, block tables, and indexer state."""
             self.num_sms = deep_gemm.get_num_sms()
+            self.max_num_tokens = max_num_tokens
             self.request_ids = request_ids
             self.num_contexts = num_contexts
             self.num_generations = num_generations
@@ -3527,6 +3529,31 @@ def test_plan_mla_chunked_prefill_chunks(q_lens, kv_lens, elem_budget, q_range, 
     q_begin, q_end = q_range
     chunks = plan_mla_chunked_prefill_chunks(q_lens, kv_lens, elem_budget, q_begin, q_end)
     assert chunks == expected_chunks
+
+
+@pytest.mark.parametrize(
+    "packed_budget,mqa_budget,max_num_tokens,max_seq_len,expected",
+    [
+        # Long-context configs keep the packed cap.
+        (1 << 28, 1 << 31, 8192, 1 << 20, 1 << 28),
+        # A short max_seq_len bounds every single-request tile below the cap.
+        (1 << 28, 1 << 31, 8192, 4096, 8192 * 4096),
+        # So does a lowered per-call logits budget.
+        (1 << 28, 1 << 24, 8192, 1 << 20, 1 << 24),
+    ],
+    ids=["packed_cap", "max_seq_len_clamp", "mqa_budget_clamp"],
+)
+@pytest.mark.cpu_only
+def test_packed_logits_elem_budget_clamp(
+    monkeypatch, packed_budget, mqa_budget, max_num_tokens, max_seq_len, expected
+):
+    monkeypatch.setattr(dsa_indexer, "_INDEXER_PACKED_LOGITS_ELEM_BUDGET", packed_budget)
+    monkeypatch.setattr(dsa_indexer, "_INDEXER_MQA_LOGITS_ELEM_BUDGET", mqa_budget)
+    metadata = SimpleNamespace(
+        max_num_tokens=max_num_tokens,
+        kv_cache_manager=SimpleNamespace(max_seq_len=max_seq_len),
+    )
+    assert dsa_indexer._packed_logits_elem_budget(metadata) == expected
 
 
 @pytest.mark.parametrize("tp_size", [2, 3, 4, 8])

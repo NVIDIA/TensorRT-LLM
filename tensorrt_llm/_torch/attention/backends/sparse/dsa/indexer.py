@@ -57,18 +57,19 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 _INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 
 # Cap on the [sum(q) x sum(kv)] logits of context requests packed into one
-# indexer prefill chunk (in elements; 1 << 26 is 256 MiB of fp32). A packed
+# indexer prefill chunk (in elements; 1 << 28 is 1 GiB of fp32). A packed
 # chunk gathers the KV of every request in it and scores every query against
 # all of it, so its logits grow with the product of the packed totals while
 # each query row only needs its own request's window. Prefix-reuse hits make
 # this explode: each brings few new tokens but its whole cached context. The
-# cap only decides which requests share a chunk. The memory of each logits call
-# is bounded separately by the query tiling under
-# _INDEXER_MQA_LOGITS_ELEM_BUDGET, which also accounts for the per-head dot
-# products of the decoded FP4 path and tiles a request whose own logits exceed
-# this cap in a chunk of its own. Override via env if needed.
+# cap only decides which requests share a chunk; _packed_logits_elem_budget
+# also clamps it to the largest single-request logits tile the configuration
+# can reach. The memory of each logits call is bounded separately by the query
+# tiling under _INDEXER_MQA_LOGITS_ELEM_BUDGET, which also accounts for the
+# per-head dot products of the decoded FP4 path and tiles a request whose own
+# logits exceed this cap in a chunk of its own. Override via env if needed.
 _INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
-    os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 26)
+    os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 28)
 )
 
 if TYPE_CHECKING:
@@ -638,6 +639,21 @@ def _prefill_q_split_threshold(metadata: DSAtrtllmAttentionMetadata) -> int:
     """Query-token count from which prefill indexer queries are split across TP ranks."""
     sparse_metadata_params = metadata.sparse_metadata_params
     return sparse_metadata_params.q_split_threshold if sparse_metadata_params is not None else 8192
+
+
+def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
+    """Packed-logits cap for grouping context requests into one prefill chunk.
+
+    A single request's logits tile is at most ``min(_INDEXER_MQA_LOGITS_ELEM_BUDGET,
+    max_num_tokens * max_seq_len)`` elements, the size the KV cache estimate
+    reserves for the indexer logits workspace where it reserves one. Clamping
+    the packed cap to it keeps a packed chunk within that reserve.
+    """
+    single_request_tile = min(
+        _INDEXER_MQA_LOGITS_ELEM_BUDGET,
+        metadata.max_num_tokens * metadata.kv_cache_manager.max_seq_len,
+    )
+    return min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
 
 
 @maybe_compile(dynamic=True)
@@ -1311,7 +1327,7 @@ class Indexer(nn.Module):
             metadata.indexer_prefill_chunks = [
                 Indexer.prepare_one_prefill_chunk(metadata, chunk_specs)
                 for chunk_specs in plan_mla_chunked_prefill_chunks(
-                    q_lens, kv_lens, _INDEXER_PACKED_LOGITS_ELEM_BUDGET, q_begin, q_end
+                    q_lens, kv_lens, _packed_logits_elem_budget(metadata), q_begin, q_end
                 )
             ]
         else:
