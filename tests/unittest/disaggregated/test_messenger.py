@@ -173,5 +173,18 @@ def test_zmq_messenger_send_timeout(dynamic_endpoint):
         blocking.stop()
 
 
+def test_zmq_messenger_send_times_out_when_peer_never_drains(dynamic_endpoint):
+    """A bounded send raises zmq.Again once the queue to an undrained peer is full."""
+    # Nothing listens on dynamic_endpoint, so queued messages are never drained and
+    # the DEALER's outgoing queue fills at the default SNDHWM (1000 messages).
+    messenger = ZMQMessenger("DEALER", endpoint=dynamic_endpoint, send_timeout_ms=50)
+    try:
+        with pytest.raises(zmq.Again):
+            for _ in range(10 * messenger._socket.getsockopt(zmq.SNDHWM)):
+                messenger.send([b"payload"])
+    finally:
+        messenger.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
