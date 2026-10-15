@@ -1684,16 +1684,20 @@ _DRAFT_LAYOUT = dict(sparse_layer_ids=[48], pool_id=0, scale=4, num_pools=1, max
 
 
 def _qsa_metadata_with_draft(
-    monkeypatch, *, mtp_index_share: bool = False, draft_layout: dict | None = _DRAFT_LAYOUT
+    monkeypatch,
+    *,
+    mtp_index_share: bool = False,
+    draft_layout: dict | None = _DRAFT_LAYOUT,
+    draft_manager=None,
 ):
     """QSA metadata over a target manager and, unless `draft_layout` is None, a separate
-    draft manager."""
+    draft manager (`draft_manager` replaces the one `draft_layout` describes)."""
     monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
     metadata = object.__new__(QSAAttentionMetadata)
     metadata.kv_cache_manager = _qsa_layout_manager(**_TARGET_LAYOUT)
-    metadata.draft_kv_cache_manager = (
-        None if draft_layout is None else _qsa_layout_manager(**draft_layout)
-    )
+    if draft_manager is None and draft_layout is not None:
+        draft_manager = _qsa_layout_manager(**draft_layout)
+    metadata.draft_kv_cache_manager = draft_manager
     metadata.sparse_metadata_params = QSASparseMetadataParams(
         token_topk=8, compress_ratio=4, mtp_index_share=mtp_index_share
     )
@@ -1744,13 +1748,43 @@ def test_qsa_draft_block_table_exists_only_for_a_separate_draft_manager(monkeypa
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_shared_topk_slots_cover_the_draft_manager(monkeypatch) -> None:
-    """The shared selection buffers are addressed by whichever manager is bound."""
-    wide_draft = dict(_DRAFT_LAYOUT, sparse_layer_ids=[48, 49, 50])
-    metadata = _qsa_metadata_with_draft(monkeypatch, mtp_index_share=True, draft_layout=wide_draft)
+@pytest.mark.parametrize("kind", ("not_qsa", "no_local_layer"))
+def test_qsa_draft_table_needs_a_qsa_draft_manager_with_local_layers(monkeypatch, kind) -> None:
+    if kind == "not_qsa":
+        draft_manager = SimpleNamespace(qsa_position_layer_id=0)
+    else:
+        draft_manager = _qsa_layout_manager(**_DRAFT_LAYOUT)
+        draft_manager.qsa_position_layer_id = None
+    metadata = _qsa_metadata_with_draft(monkeypatch, draft_manager=draft_manager)
+    metadata._seq_lens = torch.ones(2, dtype=torch.int32)
 
-    assert metadata.qsa_shared_topk_indices.shape[0] == 3
-    assert metadata.qsa_shared_topk_visible_blocks.shape[0] == 3
+    assert metadata.qsa_draft_block_table is None
+    # The target's own manager is bound, as outside a draft loop, and the hook and the
+    # refresh both leave the target bindings alone.
+    metadata.prepare_for_draft_forward()
+    metadata._refresh_qsa_draft_block_table()
+    assert metadata.draft_replay_swapped_attrs == {}
+    assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "draft_layout, slots",
+    (
+        (dict(_DRAFT_LAYOUT, sparse_layer_ids=[48, 49, 50]), 3),  # draft wider than target
+        (_DRAFT_LAYOUT, 2),  # target wider than draft
+        (None, 2),  # no separate draft manager
+    ),
+    ids=("draft_wider", "target_wider", "no_draft"),
+)
+def test_qsa_shared_topk_slots_cover_the_wider_manager(monkeypatch, draft_layout, slots) -> None:
+    """The shared selection buffers are addressed by whichever manager is bound."""
+    metadata = _qsa_metadata_with_draft(
+        monkeypatch, mtp_index_share=True, draft_layout=draft_layout
+    )
+
+    assert metadata.qsa_shared_topk_indices.shape[0] == slots
+    assert metadata.qsa_shared_topk_visible_blocks.shape[0] == slots
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1770,7 +1804,7 @@ def test_qsa_draft_forward_addresses_the_draft_manager_pages(monkeypatch) -> Non
 
     draft_manager = metadata.draft_kv_cache_manager
     saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
-    assert saved is not None and saved.get("saved_backend_state") is not None
+    assert saved is not None
     assert metadata.kv_cache_manager is draft_manager
     assert metadata.qsa_block_table is metadata.qsa_draft_block_table
     # Every operand of the table refresh is the draft manager's while swapped, so a
@@ -1783,6 +1817,26 @@ def test_qsa_draft_forward_addresses_the_draft_manager_pages(monkeypatch) -> Non
     assert metadata.kv_cache_manager is not draft_manager
     assert metadata.qsa_block_table is target_table
     assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_prepare_decodes_the_target_and_the_draft_table(monkeypatch) -> None:
+    """`prepare()` is what refreshes both tables before every step and replay: a second
+    generation of offsets reaches the target table and the draft table through it."""
+    num_seqs = 3
+    metadata = _qsa_metadata_with_draft(monkeypatch)
+    metadata._seq_lens = torch.ones(num_seqs, dtype=torch.int32)
+    # The parent's prepare and the row mapping are not under test here.
+    monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", lambda self: None)
+    monkeypatch.setattr(QSAAttentionMetadata, "_refresh_qsa_token_mapping", lambda self: None)
+    monkeypatch.setattr(
+        QSAAttentionMetadata, "_refresh_qsa_speculative_snapshot_state", lambda self: None
+    )
+    for generation in (0, 1):
+        target_slots, draft_slots = _set_qsa_offsets(metadata, num_seqs, generation)
+        metadata.prepare()
+        torch.testing.assert_close(metadata.qsa_block_table[:num_seqs], target_slots)
+        torch.testing.assert_close(metadata.qsa_draft_block_table[:num_seqs], draft_slots)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

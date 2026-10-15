@@ -335,13 +335,7 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         self._refresh_qsa_draft_block_table()
         self._refresh_qsa_token_mapping()
 
-    _QSA_DRAFT_SWAP_FIELDS = (
-        "qsa_block_table",
-        "_qsa_attention_pool_id",
-        "_qsa_page_index_scale",
-    )
-
-    def prepare_for_draft_forward(self) -> dict | None:
+    def prepare_for_draft_forward(self) -> None:
         """Point the QSA page table at the separate draft manager's pages.
 
         The caller has already swapped ``kv_cache_manager`` and
@@ -351,17 +345,15 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         row mapping is manager-independent and stays as it is.
         """
         if self.qsa_draft_block_table is None:
-            return None
+            return
         if self.kv_cache_manager is not self.draft_kv_cache_manager:
             raise RuntimeError(
                 "QSA draft forward expects the metadata's draft KV cache manager "
                 f"to be bound; got {type(self.kv_cache_manager).__name__}"
             )
-        saved_state = {name: getattr(self, name) for name in self._QSA_DRAFT_SWAP_FIELDS}
         self.swap_for_draft("qsa_block_table", self.qsa_draft_block_table)
         self.swap_for_draft("_qsa_attention_pool_id", self._qsa_draft_attention_pool_id)
         self.swap_for_draft("_qsa_page_index_scale", self._qsa_draft_page_index_scale)
-        return saved_state
 
     def prepare(self) -> None:
         """Refresh host decisions, then rebuild graph-stable device mappings."""
