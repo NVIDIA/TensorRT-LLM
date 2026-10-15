@@ -1193,12 +1193,12 @@ def _launch(key: tuple, factory, *args) -> None:
     key = (key, signature)
     compiled = _COMPILED.get(key)
     if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm up CSA2 CuTe kernels before CUDA Graph capture")
         loader = csa2_loader
         if loader is not None:
             compiled = loader(key)
         if compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Warm up CSA2 CuTe kernels before CUDA Graph capture")
             compiled = ns.cute.compile(factory(), *args)
         _COMPILED[key] = compiled
     compiled(*args)

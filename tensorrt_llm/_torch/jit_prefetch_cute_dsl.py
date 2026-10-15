@@ -48,7 +48,6 @@ executor's device and answered by a shim (``device_props`` /
 # string annotations against module globals, where ``cutlass`` is not bound.
 import hashlib
 import inspect
-import itertools
 import json
 import os
 import types
@@ -351,6 +350,21 @@ def csa2_publish_spec(block_size: int, padded: int, sparse_block: int, ptrs) -> 
     )
 
 
+# Element types a CSA2 glue-kernel pointer can have (csa2.kernel._cute_dtype).
+_CSA2_ELEMENTS = ("Float32", "Int64", "Int32", "Uint32", "Uint8", "BFloat16", "Float8E4M3FN")
+
+
+def _cutlass_element_name(text: str) -> str:
+    """The ``cutlass`` attribute name of an element type given as
+    ``str(type)`` (what ``csa2.kernel._ptr`` records in a launch key)."""
+    import cutlass
+
+    for name in _CSA2_ELEMENTS:
+        if text == name or text == str(getattr(cutlass, name)):
+            return name
+    raise ValueError(f"unknown CSA2 pointer element type {text!r}")
+
+
 def csa2_spec_from_launch_key(key: tuple) -> Optional[str]:
     """Spec for a ``csa2.kernel._launch`` key, or None if it is not a
     candidate publication (the only CSA2 glue kernel prefetched)."""
@@ -358,7 +372,7 @@ def csa2_spec_from_launch_key(key: tuple) -> Optional[str]:
     if name != "candidate_publish":
         return None
     block_size, padded, sparse_block = fields[:3]
-    ptrs = [s for s in signature if s is not None]
+    ptrs = [(_cutlass_element_name(e), a) for e, a in (s for s in signature if s is not None)]
     return csa2_publish_spec(block_size, padded, sparse_block, ptrs)
 
 
@@ -868,12 +882,13 @@ class Csa2PublishProvider:
     layer whose ``candidate_source`` is itself) for every scores chunk. Its
     compile key is the layer's candidate block size and sparse block, the
     power-of-two block capacity ``padded`` (``next_pow2(ceil(width /
-    block_size))`` for the chunk's score width), and each pointer's element
-    type and the alignment ``_ptr`` gives it: up to 4 bytes for the fp32
-    scores and int32 outputs, 8 for the int64 visible lengths, lowered when
-    the row a chunk starts at is not that aligned. Every capacity up to the
-    kernel's 4096 blocks, the widest a sequence of ``max_seq_len`` positions
-    reaches, times every alignment, is enumerated up front.
+    block_size))`` for the chunk's score width, any width from 1 in eager
+    prefill), and each pointer's element type and the alignment ``_ptr``
+    gives it, which is fixed: 4 bytes for the fp32 scores and the int32
+    outputs (their element size), 8 for the int64 visible lengths (whose
+    rows start at a multiple of 8 bytes). Every capacity up to the kernel's
+    limit of 4096 blocks, or the widest ``max_seq_len`` positions reach, is
+    enumerated up front.
     """
 
     def __init__(self, model, max_seq_len: int):
@@ -882,7 +897,8 @@ class Csa2PublishProvider:
             layout = getattr(mod, "layout", None)
             layer_of = getattr(layout, "layer", None)
             idx = getattr(mod, "layer_idx", None)
-            if layer_of is None or idx is None or not hasattr(mod, "sparse_block"):
+            block_size = getattr(layout, "candidate_block_size", None)
+            if layer_of is None or idx is None or block_size is None:
                 continue
             try:
                 layer = layer_of(idx)
@@ -890,31 +906,28 @@ class Csa2PublishProvider:
                 continue
             if getattr(layer, "candidate_source", None) != idx:
                 continue
-            self.geometries.add((int(layout.candidate_block_size), int(mod.sparse_block)))
+            # The indexer (built in the first forward) holds sparse_block;
+            # it follows from the block size the same way.
+            sparse_block = getattr(mod, "sparse_block", None)
+            if sparse_block is None:
+                sparse_block = next((b for b in (16, 8) if block_size % b == 0), 0)
+            self.geometries.add((int(block_size), int(sparse_block)))
         self.max_seq_len = max(1, int(max_seq_len))
 
     def __bool__(self):
         return bool(self.geometries)
 
     def enumerate_specs(self) -> List[str]:
+        # (scores, visible, output, sparse ids, sparse counts); without a
+        # sparse block the last two are placeholders: the output again.
+        ptrs = [("Float32", 4), ("Int64", 8), ("Int32", 4), ("Int32", 4), ("Int32", 4)]
         specs = []
         for block_size, sparse_block in sorted(self.geometries):
             blocks = min(4096, -(-self.max_seq_len // block_size))
-            padded, capacities = 1, []
+            padded = 1
             while padded < 2 * blocks and padded <= 4096:
-                capacities.append(padded)
+                specs.append(csa2_publish_spec(block_size, padded, sparse_block, ptrs))
                 padded *= 2
-            # (scores, visible, output, sparse ids, sparse counts); without a
-            # sparse block the last two are the output again.
-            score_aligns = (4,)  # fp32 rows of an fp32 tensor
-            visible_aligns = (8,)  # int64 visible lengths
-            out_aligns = (4,)  # int32 rows
-            for padded in capacities:
-                for s_a, v_a, o_a in itertools.product(score_aligns, visible_aligns, out_aligns):
-                    ids_a = o_a if not sparse_block else 4
-                    ptrs = [("Float32", s_a), ("Int64", v_a), ("Int32", o_a),
-                            ("Int32", ids_a), ("Int32", ids_a)]  # fmt: skip
-                    specs.append(csa2_publish_spec(block_size, padded, sparse_block, ptrs))
         return specs
 
 
