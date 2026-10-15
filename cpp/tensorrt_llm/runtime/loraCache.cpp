@@ -191,12 +191,12 @@ void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr source
     {
         pageIds = claimPagesWithEvict(neededPages);
     }
-    catch (std::runtime_error& e)
+    catch (std::runtime_error const&)
     {
         std::lock_guard<std::mutex> lk(mCacheMutex);
         mInProgressTasks.erase(taskValue->it);
         mCacheMap.erase(taskId);
-        throw e;
+        throw;
     }
 
     taskValue->pageIds = std::move(pageIds);
@@ -314,7 +314,6 @@ std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
     std::vector<size_t> pageIdsToEvict;
     std::vector<uint64_t> taskIdsToEvict;
     auto neededPages = numPages - availablePages;
-    auto it = mDoneTasks.rbegin();
     for (auto it = mDoneTasks.rbegin(); it != mDoneTasks.rend() && neededPages > 0; it = std::next(it))
     {
         auto const taskId = *it;
@@ -323,9 +322,9 @@ std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
         pageIdsToEvict.insert(pageIdsToEvict.end(), taskValue.pageIds.begin(), taskValue.pageIds.end());
         neededPages -= taskValue.pageIds.size();
     }
-    if (it == mDoneTasks.rend())
+    if (neededPages > 0)
     {
-        throw LoraCacheFullException("Cache is full. There are no done tasks to evict");
+        throw LoraCacheFullException("Cache is full. There are not enough pages in done tasks to evict");
     }
 
     TLLM_LOG_DEBUG("evicting " + std::to_string(taskIdsToEvict.size()));
@@ -560,8 +559,8 @@ void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, Si
     auto const hiddenSize = input.getShape().d[1];
     auto const splitHiddenSize = static_cast<SizeType32>(hiddenSize / tpSize);
 
-    auto outputPtr = bufferCast<T>(output);
-    auto const inputPtr = bufferCast<T>(input);
+    auto outputPtr = output.getBufferPtr<T>();
+    auto const inputPtr = input.getBufferPtr<T>();
 
     for (SizeType32 adapterIdx = 0; adapterIdx < adapterSize; ++adapterIdx)
     {

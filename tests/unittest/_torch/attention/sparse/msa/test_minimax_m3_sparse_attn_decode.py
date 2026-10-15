@@ -10,6 +10,9 @@ The PyTorch oracle follows the vLLM reference linked in the file header
 truncated at the query token's own causal extent.
 """
 
+import logging
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +22,6 @@ from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
-    msa_package_available,
     require_msa_module,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
@@ -530,7 +532,260 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs(num_topk_chunks):
 
 
 @skip_not_sm100
-@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+def test_msa_prefill_head_major_selector_cuda_graph(dtype: torch.dtype) -> None:
+    """A short context must not read a generation token's selector backing."""
+    msa = require_msa_module()
+    num_queries, num_heads, num_kv_heads, topk = 6, 32, 2, MSA_REQUIRED_TOPK
+    q = torch.zeros((num_queries, num_heads, HEAD_DIM), device="cuda", dtype=dtype)
+    k = torch.zeros((2 * topk, num_kv_heads, PAGE_SIZE, HEAD_DIM), device="cuda", dtype=dtype)
+    v = torch.ones_like(k)
+    page_ids = torch.arange(2 * topk, device="cuda", dtype=torch.int32)
+
+    # Six context tokens followed by eight generation tokens, in the indexer's
+    # head-major backing. The context slice retains the full batch's head stride.
+    selected = torch.empty((num_kv_heads, 14, topk), device="cuda", dtype=torch.int32)
+    selected = selected.transpose(0, 1)
+    selected[:] = torch.arange(topk, device="cuda", dtype=torch.int32)
+    # Contiguous-pointer addressing misreads this generation row as context
+    # query 4/head 0. Its pages are allocated but beyond the context's causal
+    # extent, so the unfixed kernel produces NaNs from entirely finite inputs.
+    selected[8, 0] = torch.arange(topk, 2 * topk, device="cuda", dtype=torch.int32)
+    context_selected = selected[:num_queries]
+    assert not context_selected.is_contiguous()
+
+    kv_len = topk * PAGE_SIZE
+    plan = msa.fmha_sm100_plan(
+        torch.tensor([num_queries], dtype=torch.int32),
+        torch.tensor([kv_len], dtype=torch.int32),
+        num_heads,
+        num_kv_heads=num_kv_heads,
+        qo_offset=torch.tensor([kv_len - num_queries], dtype=torch.int32),
+        page_size=PAGE_SIZE,
+        kv_block_num=topk,
+        causal=True,
+        num_kv_splits=1,
+        use_fp8_kvcache=dtype == torch.float8_e4m3fn,
+    )
+    assert not plan[3]["MM-SA-Nv"], "Regression must exercise the CUTLASS short-query path"
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    kwargs = dict(
+        kv_indices=page_ids,
+        kv_block_indexes=context_selected,
+        out=out,
+        sm_scale=HEAD_DIM**-0.5,
+        output_maxscore=False,
+    )
+    msa.fmha_sm100(q, k, v, plan, **kwargs)
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        msa.fmha_sm100(q, k, v, plan, **kwargs)
+    for value in (1.0, 2.0):
+        v.fill_(value)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, value), rtol=0, atol=0)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize(
+    ("layout", "num_kv_splits", "group"),
+    [
+        ("contiguous", 1, 16),
+        ("head-slice", 1, 16),
+        ("column-slice", 2, 16),
+        ("broadcast", 2, 1),
+        ("column-broadcast", 2, 16),
+    ],
+)
+def test_msa_prefill_selector_strides_cuda_graph(
+    dtype: torch.dtype, layout: str, num_kv_splits: int, group: int
+) -> None:
+    """Loader, padding scan and mask must read the same live selector view."""
+    msa = require_msa_module()
+    num_queries, num_kv_heads, topk = 6, 2, MSA_REQUIRED_TOPK
+    num_heads = num_kv_heads * group
+    num_pages = 2 * topk
+    q = torch.zeros((num_queries, num_heads, HEAD_DIM), device="cuda", dtype=dtype)
+    k = torch.zeros((num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM), device="cuda", dtype=dtype)
+    # Page- and head-dependent values make wrong selector rows observable. With
+    # Q=K=0 the output is
+    # the mean over selected pages, which exposes finite-but-wrong row reads.
+    page_values = torch.arange(num_pages, device="cuda")[:, None] // 4
+    page_values = page_values + 8 * torch.arange(num_kv_heads, device="cuda")[None, :]
+    v = page_values[:, :, None, None].expand_as(k).to(dtype).contiguous()
+    page_ids = torch.arange(num_pages, device="cuda", dtype=torch.int32)
+    if layout == "contiguous":
+        selected = torch.empty((num_queries, num_kv_heads, topk), device="cuda", dtype=torch.int32)
+    elif layout == "head-slice":
+        backing = torch.full((num_kv_heads, 14, topk), -1, device="cuda", dtype=torch.int32)
+        selected = backing.transpose(0, 1)[3 : 3 + num_queries]
+    elif layout == "column-slice":
+        backing = torch.full((num_kv_heads, 14, 2 * topk + 1), -1, device="cuda", dtype=torch.int32)
+        selected = backing.transpose(0, 1)[3 : 3 + num_queries, :, 1::2]
+    elif layout == "column-broadcast":
+        backing = torch.empty((num_queries, num_kv_heads, 1), device="cuda", dtype=torch.int32)
+        selected = backing.expand(num_queries, num_kv_heads, topk)
+        assert selected.stride(2) == 0
+    elif layout == "large-head-gap":
+        head_stride = 2**31
+        numel = head_stride + num_queries * topk
+        required_bytes = numel * 4
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        print(
+            f"Large-offset preflight: required={required_bytes}, free={free_bytes}, total={total_bytes}"
+        )
+        if free_bytes < required_bytes + 4 * 2**30:
+            pytest.skip("Large-offset validation needs 8 GiB backing plus 4 GiB headroom")
+        # Allocate but never initialize the gap. Only the 192 logical elements
+        # are written and consumed; head 1 uses an actual offset above INT32_MAX.
+        backing = torch.empty((numel,), device="cuda", dtype=torch.int32)
+        selected = backing.as_strided((num_queries, num_kv_heads, topk), (topk, head_stride, 1))
+        assert selected.stride(1) == 2**31
+    else:
+        backing = torch.empty((1, 1, topk), device="cuda", dtype=torch.int32)
+        selected = backing.expand(num_queries, num_kv_heads, topk)
+
+    rows = torch.arange(num_queries, device="cuda")[:, None, None]
+    heads = torch.arange(num_kv_heads, device="cuda")[None, :, None]
+    columns = torch.arange(topk, device="cuda")[None, None, :]
+    valid_count = torch.where((rows + heads) % 2 == 0, 4, 8)
+    logical = torch.where(columns < valid_count, (rows + heads) % 4 + columns, -1).to(torch.int32)
+    if layout == "broadcast":
+        logical = logical[:1, :1].expand(num_queries, num_kv_heads, topk)
+        backing.copy_(logical[:1, :1])
+    elif layout == "column-broadcast":
+        logical = (4 * ((rows + heads) % 4)).expand(num_queries, num_kv_heads, topk).to(torch.int32)
+        backing.copy_(logical[:, :, :1])
+    else:
+        selected.copy_(logical)
+
+    kv_len = num_pages * PAGE_SIZE
+    plan = msa.fmha_sm100_plan(
+        torch.tensor([num_queries], dtype=torch.int32),
+        torch.tensor([kv_len], dtype=torch.int32),
+        num_heads,
+        num_kv_heads=num_kv_heads,
+        qo_offset=torch.tensor([kv_len - num_queries], dtype=torch.int32),
+        page_size=PAGE_SIZE,
+        kv_block_num=topk,
+        causal=True,
+        num_kv_splits=num_kv_splits,
+        use_fp8_kvcache=dtype == torch.float8_e4m3fn,
+    )
+    assert not plan[3]["MM-SA-Nv"]
+    assert plan[3]["num_kv_splits"] == num_kv_splits
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    kwargs = dict(kv_indices=page_ids, kv_block_indexes=selected, out=out, output_maxscore=False)
+    msa.fmha_sm100(q, k, v, plan, **kwargs)
+    eager = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        msa.fmha_sm100(q, k, v, plan, **kwargs)
+
+    for shift in (0, 4):
+        current = torch.where(logical >= 0, logical + shift, -1)
+        if layout == "broadcast":
+            backing.copy_(current[:1, :1])
+        elif layout == "column-broadcast":
+            backing.copy_(current[:, :, :1])
+        else:
+            selected.copy_(current)
+        # Gather the known page values directly, independently of MSA's
+        # implementation. All selected pages are fully inside the causal range.
+        values = page_values[current.clamp_min(0).long(), heads]
+        valid = current >= 0
+        expected = (values * valid).sum(-1).float() / valid.sum(-1)
+        expected = (
+            expected.repeat_interleave(group, dim=1).unsqueeze(-1).expand_as(out).to(out.dtype)
+        )
+        if shift == 0:
+            torch.testing.assert_close(eager, expected, rtol=0, atol=0)
+        graph.replay()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@skip_not_sm100
+@pytest.mark.skipif(
+    os.environ.get("MSA_VALIDATE_LARGE_OFFSET") != "1", reason="8 GiB boundary validation is opt-in"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+def test_msa_prefill_selector_large_offset_cuda_graph(dtype: torch.dtype) -> None:
+    test_msa_prefill_selector_strides_cuda_graph(dtype, "large-head-gap", 2, 16)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("group", [1, 16])
+@pytest.mark.parametrize("num_kv_splits", [1, 2])
+def test_msa_nonpaged_original_q_metadata(
+    dtype: torch.dtype, group: int, num_kv_splits: int
+) -> None:
+    """Nonpaged load arguments must retain the original packed-Q layout."""
+    msa = require_msa_module()
+    torch.manual_seed(20260929)
+    num_queries, kv_len, num_kv_heads = 6, 2048, 2
+    num_heads = num_kv_heads * group
+    # Vary every Q row/head/channel: uniform Q would hide lost layout metadata.
+    q = torch.randn((num_queries, num_heads, HEAD_DIM), device="cuda", dtype=torch.bfloat16).to(
+        dtype
+    )
+    k = torch.randn((kv_len, num_kv_heads, HEAD_DIM), device="cuda", dtype=torch.bfloat16).to(dtype)
+    v = torch.randn((kv_len, num_kv_heads, HEAD_DIM), device="cuda", dtype=torch.bfloat16).to(dtype)
+    plan = msa.fmha_sm100_plan(
+        torch.tensor([num_queries], dtype=torch.int32),
+        torch.tensor([kv_len], dtype=torch.int32),
+        num_heads,
+        num_kv_heads=num_kv_heads,
+        causal=True,
+        qo_offset=torch.tensor([kv_len - num_queries], dtype=torch.int32),
+        page_size=-1,
+        num_kv_splits=num_kv_splits,
+        output_maxscore=False,
+    )
+    assert not plan[3]["MM-SA-Nv"]
+    assert plan[3]["pack_factor"] == group
+    assert plan[3]["num_kv_splits"] == num_kv_splits
+    assert q.stride() == (num_heads * HEAD_DIM, HEAD_DIM, 1)
+    out, _ = msa.fmha_sm100(q, k, v, plan, output_maxscore=False)
+
+    # Selecting every identity-mapped page gives dense attention. The existing
+    # oracle's decode extent kv_len - num_queries + token + 1 matches qo_offset.
+    num_pages = kv_len // PAGE_SIZE
+    k_pages = k.reshape(num_pages, PAGE_SIZE, num_kv_heads, HEAD_DIM).transpose(1, 2)
+    v_pages = v.reshape(num_pages, PAGE_SIZE, num_kv_heads, HEAD_DIM).transpose(1, 2)
+    all_pages = torch.arange(num_pages, device="cuda", dtype=torch.int32)
+    selected = all_pages.view(1, 1, num_pages).expand(num_kv_heads, num_queries, num_pages)
+    expected = _reference_sparse_decode(
+        q,
+        k_pages,
+        v_pages,
+        selected,
+        all_pages.view(1, num_pages),
+        torch.tensor([kv_len], device="cuda", dtype=torch.int32),
+        HEAD_DIM**-0.5,
+        num_queries,
+    )
+    cosine = torch.nn.functional.cosine_similarity(out.float().flatten(), expected.flatten(), dim=0)
+    threshold = 0.99999 if dtype == torch.bfloat16 else 0.9995
+    reference_norm = torch.linalg.vector_norm(expected)
+    relative_l2 = torch.linalg.vector_norm(out.float() - expected) / reference_norm
+    norm_ratio = torch.linalg.vector_norm(out.float()) / reference_norm
+    print(
+        f"nonpaged oracle: dtype={dtype}, group={group}, splits={num_kv_splits}, "
+        f"cosine={cosine.item():.9g}, relative_l2={relative_l2.item():.9g}, norm_ratio={norm_ratio.item():.9g}"
+    )
+
+    assert torch.isfinite(out).all()
+    assert cosine > threshold
+    # Cosine alone accepts uniformly rescaled output. Final reference checks
+    # observed a maximum norm deviation below 0.07% across both dtypes.
+    torch.testing.assert_close(norm_ratio, torch.ones_like(norm_ratio), rtol=0, atol=1e-2)
+
+
+@skip_not_sm100
 def test_sparse_decode_matches_msa_kernel():
     """A/B against the fmha_sm100 sparse GQA path this kernel replaces."""
     from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_sparse_gqa
@@ -696,7 +951,6 @@ def test_nvfp4_sparse_decode_split_k_invariant(num_topk_chunks):
 
 @pytest.mark.parametrize(("num_kv_heads", "group"), [(1, 8), (2, 16)], ids=["h1-g8", "h2-g16"])
 @skip_not_sm100
-@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
 def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
     """A/B against MSA's NVFP4 CSR kernel over the same cache bytes.
 
@@ -791,7 +1045,6 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
 @pytest.mark.parametrize("pair_dequant", [False, True], ids=["scalar", "pair"])
 @pytest.mark.parametrize("kv_len", [1, 2], ids=["one-token", "k-sensitive"])
 @skip_not_sm100
-@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
 def test_msa_nvfp4_calibrated_staging_and_scale_replay(
     q_dtype: torch.dtype, pair_dequant: bool, kv_len: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1055,3 +1308,64 @@ def test_sm100f_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expec
         _sm100f_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(12, 0))
         == {}
     )
+
+
+@skip_not_sm100
+def test_msa_jit_cache_tracks_sources_and_build_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    require_msa_module()
+    # MSA is optional outside supported GPU test environments; import after its
+    # required-package check rather than during collection on other platforms.
+    from fmha_sm100 import jit
+
+    package = tmp_path / "package"
+    csrc = package / "csrc"
+    csrc.mkdir(parents=True)
+    header = csrc / "params.h"
+    header.write_text("int field;\n")
+    template = csrc / "inst.jinja"
+    template.write_text("{{ dtype }}\n")
+    build_script = package / "jit.py"
+    build_script.write_text("compiler_flags = '-std=c++20'\n")
+    monkeypatch.setattr(jit, "_PACKAGE_DIR", package)
+    monkeypatch.setattr(jit, "_FMHA_VARLEN_DIR", csrc)
+    for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
+        monkeypatch.delenv(name, raising=False)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache_root))
+    with caplog.at_level(logging.INFO, logger=jit.__name__):
+        original = jit._compute_cache_base()
+    assert original.parent == cache_root
+    assert original == jit._compute_cache_base()
+    assert str(original) in caplog.text
+    assert "require recompilation" in caplog.text
+
+    for source in (header, template, build_script):
+        content = source.read_bytes()
+        source.write_bytes(content + b"// changed\n")
+        assert jit._compute_cache_base() != original
+        source.write_bytes(content)
+        assert jit._compute_cache_base() == original
+    renamed = header.with_name("renamed.h")
+    header.rename(renamed)
+    assert jit._compute_cache_base() != original
+    renamed.rename(header)
+
+    # Presence enables these flags even when the environment value is empty.
+    for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
+        monkeypatch.setenv(name, "")
+        assert jit._compute_cache_base() != original
+        monkeypatch.delenv(name)
+    assert jit._compute_cache_base() == original
+    monkeypatch.delenv("MINFER_FMHA_CACHE_DIR")
+    monkeypatch.setattr(
+        jit.os.path, "expanduser", lambda _: str(tmp_path / ".cache/minfer/fmha_sm100")
+    )
+    default = jit._compute_cache_base()
+    assert default.parent == tmp_path / ".cache/minfer/fmha_sm100"
+    assert default.name == original.name
+    monkeypatch.setenv("FMHA_GMEM_CHECK", "1")
+    checked = jit._compute_cache_base()
+    assert checked.parent == tmp_path / ".cache/minfer/fmha_sm100_gmem_check"
+    assert checked.name != default.name

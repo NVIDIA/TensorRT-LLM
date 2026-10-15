@@ -521,8 +521,10 @@ def test_sleep_loading_selects_loader_device_and_restores_previous_device(
 @pytest.mark.parametrize(
     "feature, message",
     [
-        ("multi_gpu", "requires a single GPU"),
-        ("parallel_config", "requires a single GPU"),
+        ("multi_gpu", "requires world_size=1"),
+        ("parallel_config", "requires world_size=1"),
+        ("visual_mapping", "requires world_size=1"),
+        ("ulysses_config", "requires world_size=1"),
         ("cpu_offload", "cannot be combined with CPU offloading or CUDA graphs"),
         ("cuda_graph", "cannot be combined with CPU offloading or CUDA graphs"),
         ("cache", "does not yet support cache acceleration or runtime LoRA"),
@@ -538,6 +540,10 @@ def test_h3_rejects_unsupported_combinations_before_capture(
         pipeline.mapping = SimpleNamespace(world_size=2)
     elif feature == "parallel_config":
         config.parallel.tp_size = 2
+    elif feature == "visual_mapping":
+        config.visual_gen_mapping = SimpleNamespace(world_size=2)
+    elif feature == "ulysses_config":
+        config.parallel.ulysses_size = 2
     elif feature == "cpu_offload":
         config.cpu_offload_config.enable = True
     elif feature == "cuda_graph":
@@ -682,8 +688,9 @@ def test_sleeping_h3_rejects_forward_before_cuda_work() -> None:
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("references", [None, [object()]])
 def test_h3_forward_holds_generation_scope(
-    allocation_backend: SimpleNamespace, enabled: bool, raises: bool
+    allocation_backend: SimpleNamespace, enabled: bool, raises: bool, references: list | None
 ) -> None:
     from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
         MiniMaxH3Pipeline,
@@ -709,7 +716,8 @@ def test_h3_forward_holds_generation_scope(
     def forward(**kwargs) -> object:
         assert torch.is_inference_mode_enabled()
         assert (manager._generation_thread is not None) == enabled
-        assert kwargs == dict(request, keyframes=None, keyframe_anchors=None)
+        assert kwargs == dict(request, keyframes=None, keyframe_anchors=None, references=references)
+        assert kwargs["references"] is references
         if raises:
             raise ValueError("generation failed")
         return output
@@ -717,9 +725,9 @@ def test_h3_forward_holds_generation_scope(
     pipeline._forward = forward
     if raises:
         with pytest.raises(ValueError, match="generation failed"):
-            pipeline.forward(**request)
+            pipeline.forward(**request, references=references)
     else:
-        assert pipeline.forward(**request) is output
+        assert pipeline.forward(**request, references=references) is output
     assert manager._generation_thread is None
     manager.sleep()
 
@@ -741,14 +749,23 @@ def test_sleep_api_belongs_only_to_h3() -> None:
 
 @pytest.mark.parametrize("operation", ["sleep", "wake_up"])
 @pytest.mark.parametrize("world_size", [1, 2])
-def test_h3_sleep_controls_require_single_rank(operation: str, world_size: int) -> None:
+@pytest.mark.parametrize("mapping_kind", ["llm", "visual_gen", "parallel"])
+def test_h3_sleep_controls_require_single_rank(
+    operation: str, world_size: int, mapping_kind: str
+) -> None:
     from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
         MiniMaxH3Pipeline,
     )
 
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.mapping = SimpleNamespace(world_size=world_size)
+    pipeline.mapping = SimpleNamespace(world_size=world_size if mapping_kind == "llm" else 1)
+    pipeline.pipeline_config = SimpleNamespace(
+        visual_gen_mapping=SimpleNamespace(
+            world_size=world_size if mapping_kind == "visual_gen" else 1
+        ),
+        parallel=SimpleNamespace(n_workers=world_size if mapping_kind == "parallel" else 1),
+    )
     pipeline._sleep_manager = MagicMock()
     if world_size == 1:
         getattr(pipeline, operation)()

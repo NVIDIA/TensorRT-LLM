@@ -24,6 +24,11 @@ add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
 add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
 add_gtest(kvCacheManagerTest kvCacheManagerTest.cpp)
 add_gtest(kvCacheManagerFabricMemoryTest kvCacheManagerFabricMemoryTest.cpp)
+add_gtest(kvCacheManagerV2ConfigTest
+          "kvCacheManagerV2ConfigTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2ConfigTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(
   kvCacheManagerV2DefaultColdPageCodecTest
   "kvCacheManagerV2DefaultColdPageCodecTest.cpp;kvCacheManagerV2PoisonCheck.cpp"

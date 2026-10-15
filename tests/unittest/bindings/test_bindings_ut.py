@@ -222,9 +222,7 @@ def test_llm_request():
         "max_new_tokens": 5,
         "sampling_config": sampling_config,
         "input_tokens": [0, 1, 2],
-        "position_ids": [0, 1, 2],
         "is_streaming": True,
-        "end_id": 100,
         "prompt_embedding_table": torch.tensor((10, 10)),
         "prompt_vocab_size": 2,
         "return_log_probs": True,
@@ -237,7 +235,6 @@ def test_llm_request():
     assert llm_request.prompt_len == 3
     assert llm_request.sampling_config.beam_width == sampling_config.beam_width
     assert llm_request.streaming
-    assert llm_request.end_id == 100
     assert llm_request.seq_slot is None
     assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
@@ -248,7 +245,6 @@ def test_llm_request():
     assert llm_request.get_token(1, 2) == 2
     assert llm_request.get_tokens(1) == [0, 1, 2]
     assert llm_request.max_num_generated_tokens == 0
-    assert llm_request.position_ids == [0, 1, 2]
 
     llm_request.add_new_token(42, 0)
     assert llm_request.get_token(0, 3) == 42

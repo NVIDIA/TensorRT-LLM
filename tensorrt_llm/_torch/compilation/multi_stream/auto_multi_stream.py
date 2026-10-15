@@ -100,6 +100,35 @@ def estimate_time(node: Node) -> int:
     return DEFAULT_OP_COST
 
 
+def _returns_view(node: Node) -> bool:
+    """Whether ``node`` returns a view of its first argument."""
+    if node.op != "call_function":
+        return False
+    if node.target is getitem:
+        source = node.args[0]
+        return isinstance(source, Node) and _returns_view(source)
+    if node.target is torch.ops.aten._unsafe_view.default:
+        return True
+    schema = getattr(node.target, "_schema", None)
+    return schema is not None and any(
+        ret.alias_info is not None and not ret.alias_info.is_write
+        for ret in schema.returns)
+
+
+def _storage_root(node: Node) -> Node:
+    """Follow view ops back to the node that owns the aliased storage."""
+    while (_returns_view(node) and node.args
+           and isinstance(node.args[0], Node)):
+        node = node.args[0]
+    return node
+
+
+@dataclass(frozen=True)
+class _ReadBeforeWrite:
+    """Used to order an in-place op after a reader."""
+    reader: Node
+
+
 @dataclass
 class Stream:
     # Stream id
@@ -174,6 +203,8 @@ class MultiStreamDAG:
         self.entry_node = MultiStreamNode(None, dict())
 
         latest_inplace_stat = {}
+        # Nodes that accessed each storage root since its last in-place write.
+        accesses_since_write: Dict[Node, List[MultiStreamNode]] = {}
         inplace_map = inplace_info()
 
         def flatten_args(args):
@@ -200,6 +231,18 @@ class MultiStreamDAG:
 
             args = flatten_args([a for a in node.args] +
                                 [a for a in node.kwargs.values()])
+            accessed_roots = dict.fromkeys(
+                _storage_root(arg) for arg in args if isinstance(arg, Node))
+
+            mutated_args = []
+            if node.op == "call_function" and node.target in inplace_map:
+                for inplace_arg in inplace_map[node.target].values():
+                    # At this stage, all inplace op must be using kwargs for all params
+                    assert inplace_arg in node.kwargs
+                    mutated_args += flatten_args([node.kwargs[inplace_arg]])
+            mutated_roots = dict.fromkeys(
+                _storage_root(arg) for arg in mutated_args
+                if isinstance(arg, Node))
 
             in_edges = dict()
             for arg in args:
@@ -222,6 +265,11 @@ class MultiStreamDAG:
                     if isinstance(mutated_arg, torch.fx.Node):
                         in_edges[mutated_arg] = mutator
 
+            for root in mutated_roots:
+                for accessor in accesses_since_write.get(root, ()):
+                    if accessor not in in_edges.values():
+                        in_edges[_ReadBeforeWrite(accessor.node)] = accessor
+
             # For node without in edge, connect it to the entry
             if len(in_edges) == 0:
                 in_edges[None] = self.entry_node
@@ -232,15 +280,14 @@ class MultiStreamDAG:
                 vertex.distance = 0
             self.nodes[node] = vertex
             self.in_degrees[vertex] = len(in_edges)
-            if node.op == "call_function":
-                func = node.target
-                if func in inplace_map:
-                    for inplace_arg in inplace_map[func].values():
-                        # At this stage, all inplace op must be using kwargs for all params
-                        assert inplace_arg in node.kwargs
-                        args = flatten_args([node.kwargs[inplace_arg]])
-                        for arg in args:
-                            latest_inplace_stat[arg] = vertex
+            for arg in mutated_args:
+                latest_inplace_stat[arg] = vertex
+
+            for root in accessed_roots:
+                if root not in mutated_roots:
+                    accesses_since_write.setdefault(root, []).append(vertex)
+            for root in mutated_roots:
+                accesses_since_write[root] = [vertex]
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)
@@ -418,7 +465,7 @@ class MultiStreamDAG:
                         for wait in node.wait_on:
                             # wait[1] is the actual tensor that the op is waiting on.
                             # Need to record stream for that tensor.
-                            if wait[1] is None:
+                            if not isinstance(wait[1], Node):
                                 continue
                             new_graph.create_node(
                                 "call_function",

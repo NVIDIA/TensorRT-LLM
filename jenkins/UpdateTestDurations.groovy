@@ -17,7 +17,7 @@
 
 LLM_ROOT = "llm"
 
-UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
+UBUNTU_24_04_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
 DURATION_FILE_PATH = "tests/integration/defs/.test_durations"
 // Target repository the updated duration file is committed straight back into.
 TARGET_REPO = "NVIDIA/TensorRT-LLM"
