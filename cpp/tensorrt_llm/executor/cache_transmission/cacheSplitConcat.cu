@@ -318,7 +318,7 @@ TargetRanksInfo targetIRanksForIndexerKCache(
     }
     TLLM_CHECK_WITH_INFO(peerLayerNumSum == selfIndexerPerPP[selfPPRank],
         "Indexer K cache layer counts are inconsistent between the two sides: the attention-domain peers cover "
-        "%ld indexer layers but this rank owns %d. Both sides must derive the same per-layer indexer schedule.",
+        "{} indexer layers but this rank owns {}. Both sides must derive the same per-layer indexer schedule.",
         static_cast<long>(peerLayerNumSum), selfIndexerPerPP[selfPPRank]);
     return targetInfo;
 }
@@ -1206,7 +1206,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     for (auto&& outputSplitBlock : outputSplitBlocks)
     {
         TLLM_CHECK_WITH_INFO(outputSplitBlock->getDataType() == cacheDataType,
-            "outputSplitBlock data type mismatch expected: %d, actual: %d", static_cast<int>(cacheDataType),
+            "outputSplitBlock data type mismatch expected: {}, actual: {}", static_cast<int>(cacheDataType),
             static_cast<int>(outputSplitBlock->getDataType()));
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputSplitBlock->data()));
     }

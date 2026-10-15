@@ -74,7 +74,7 @@ void AgentTreeNode::insertRequest(LlmRequestPtr const& request)
             TLLM_LOG_WARNING("Node type {} not found in children at level {} — routing to Chatbot",
                 static_cast<SizeType32>(nodeType), nextLevel);
             it = mTypeToChild.find(NodeType::kCHATBOT);
-            TLLM_CHECK_WITH_INFO(it != mTypeToChild.end(), "Chatbot fallback node not found at level %d", nextLevel);
+            TLLM_CHECK_WITH_INFO(it != mTypeToChild.end(), "Chatbot fallback node not found at level {}", nextLevel);
         }
 
         it->second->insertRequest(request);

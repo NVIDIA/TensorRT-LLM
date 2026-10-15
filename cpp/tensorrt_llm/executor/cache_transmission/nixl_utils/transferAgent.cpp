@@ -633,10 +633,10 @@ void NixlHelper::posixGpuToFileFallback(MemoryDescs const& memoryDescs, FileDesc
 
         cudaError_t cpyErr = cudaMemcpy(
             hostBuffer.data(), reinterpret_cast<void*>(memDesc.getAddr()), numBytes, cudaMemcpyDeviceToHost);
-        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error={}", cpyErr);
 
         ssize_t written = ::write(fileDesc.getFd(), hostBuffer.data(), numBytes);
-        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error={}", written);
     }
 }
 
@@ -655,11 +655,11 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
         std::vector<uint8_t> hostBuffer(numBytes);
 
         ssize_t bytesRead = ::read(fileDesc.getFd(), hostBuffer.data(), numBytes);
-        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error=%zd", bytesRead);
+        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error={}", bytesRead);
 
         cudaError_t cpyErr = cudaMemcpy(
             reinterpret_cast<void*>(memDesc.getAddr()), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
-        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error={}", cpyErr);
     }
 }
 
@@ -811,9 +811,9 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     {
         mRank = config.rank.value();
         mWorldSize = config.worldSize.value();
-        TLLM_CHECK_WITH_INFO(mWorldSize > 0, "NIXL world size must be positive, got %d", mWorldSize);
+        TLLM_CHECK_WITH_INFO(mWorldSize > 0, "NIXL world size must be positive, got {}", mWorldSize);
         TLLM_CHECK_WITH_INFO(
-            mRank >= 0 && mRank < mWorldSize, "NIXL rank must be in [0, %d), got %d", mWorldSize, mRank);
+            mRank >= 0 && mRank < mWorldSize, "NIXL rank must be in [0, {}), got {}", mWorldSize, mRank);
     }
     else if (config.useListenThread && mpiEnabled)
     {
@@ -889,7 +889,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)
     {
-        TLLM_THROW("Failed to create NIXL backend: %s", nixlBackend.c_str());
+        TLLM_THROW("Failed to create NIXL backend: {}", nixlBackend.c_str());
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: {}", mAddress.c_str());
@@ -951,7 +951,7 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
-        name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+        name == remoteName, "loadRemoteAgent gets error agent name: {} != {}", name.c_str(), remoteName.c_str());
 #ifdef TLLM_BOUNCE_V2
     // Validate the peer's bounce capability handshake from AgentDesc and register its control
     // channel. Only peers with the same wire version, control kind, effective maxChunkSizeBytes and
@@ -1070,7 +1070,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
     auto status = postXferRequest(request.getOp(), xferSrc, xferDst, request.getRemoteName(), request.getSyncMessage());
     TLLM_CHECK_WITH_INFO(status != nullptr,
-        " rank: %d createXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
+        " rank: {} createXferReq failed (see warning above) selfname: {} remoteAgent name: {}", mRank, mName.c_str(),
         request.getRemoteName().c_str());
     return status;
 }
@@ -1163,7 +1163,7 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::notifySyncMessage called after shutdown");
     auto status = mRawAgent->genNotif(name, syncMessage);
     TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        status == NIXL_SUCCESS, "genNotif failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()
@@ -1173,7 +1173,7 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     nixl_notifs_t notifs;
     auto status = mRawAgent->getNotifs(notifs);
     TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "getNotifs failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        status == NIXL_SUCCESS, "getNotifs failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
 
     return notifs;
 }
@@ -1192,7 +1192,7 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
     // Bounce bootstrap is handled on the AgentDesc overload, which is the production path.
     auto const separator = connectionInfo.rfind(':');
     TLLM_CHECK_WITH_INFO(separator != std::string::npos,
-        "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': %s", connectionInfo.c_str());
+        "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': {}", connectionInfo.c_str());
     std::string ip = connectionInfo.substr(0, separator);
     std::string port = connectionInfo.substr(separator + 1);
     if (ip.size() >= 2 && ip.front() == '[' && ip.back() == ']')
@@ -1201,14 +1201,14 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
     }
     TLLM_LOG_DEBUG(mRank, "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to {} remoteagent name: {}",
         connectionInfo.c_str(), name.c_str());
-    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
+    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: {}",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
     md_extra_params.ipAddr = ip;
     md_extra_params.port = std::stoi(port);
     auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
     TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
     // status = mRawAgent->sendLocalMD(&md_extra_params);
     // TLLM_CHECK_WITH_INFO(
     //     status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
@@ -1219,7 +1219,7 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
     {
         status = mRawAgent->checkRemoteMD(name, descs);
         TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND,
-            "checkRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+            "checkRemoteMD failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
         if (status == NIXL_ERR_NOT_FOUND)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1235,7 +1235,7 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::checkRemoteDescs called after shutdown");
     auto status = mRawAgent->checkRemoteMD(name, NixlHelper::convertXferDist(memoryDescs));
-    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: %s",
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: {}",
         nixlEnumStrings::statusStr(status).c_str());
     return status == NIXL_SUCCESS;
 }
@@ -1323,13 +1323,13 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
     {
         status = mRawAgent->createBackend("GDS_MT", init, backend);
         if (status != NIXL_SUCCESS || !backend)
-            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = %d", status);
+            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = {}", status);
     }
     else
     {
         status = mRawAgent->createBackend("GDS", init, backend);
         if (status != NIXL_SUCCESS || !backend)
-            TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
+            TLLM_THROW("Failed to create NIXL GDS backend, status = {}", status);
     }
 }
 

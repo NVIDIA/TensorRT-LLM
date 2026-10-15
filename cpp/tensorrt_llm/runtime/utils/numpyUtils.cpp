@@ -250,7 +250,7 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
     auto const header_len = static_cast<uint16_t>(header.size());
 
     FILE* f_ptr = fopen(filename.c_str(), "wb");
-    TLLM_CHECK_WITH_INFO(f_ptr != nullptr, tc::fmtstr("Unable to open %s for writing.\n", filename.c_str()));
+    TLLM_CHECK_WITH_INFO(f_ptr != nullptr, "Unable to open {} for writing.\n", filename.c_str());
 
     fwrite(magic, sizeof(char), sizeof(magic) - 1, f_ptr);
     fwrite(&npy_major, sizeof(uint8_t), 1, f_ptr);

@@ -175,10 +175,10 @@ void BufferManager::copy(IBuffer const& src, void* dst, MemoryType dstType) cons
 
 void BufferManager::copy(IBuffer const& src, IBuffer& dst) const
 {
-    TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(),
-        tc::fmtstr("Incompatible data types: %s != %s", src.getDataTypeName(), dst.getDataTypeName()));
-    TLLM_CHECK_WITH_INFO(src.getSizeInBytes() == dst.getSizeInBytes(),
-        tc::fmtstr("Incompatible buffer sizes: %lu != %lu", src.getSizeInBytes(), dst.getSizeInBytes()));
+    TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(), "Incompatible data types: {} != {}",
+        src.getDataTypeName(), dst.getDataTypeName());
+    TLLM_CHECK_WITH_INFO(src.getSizeInBytes() == dst.getSizeInBytes(), "Incompatible buffer sizes: {} != {}",
+        src.getSizeInBytes(), dst.getSizeInBytes());
     copy(src, dst.data(), dst.getMemoryType());
 }
 

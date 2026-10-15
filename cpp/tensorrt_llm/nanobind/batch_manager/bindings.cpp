@@ -481,9 +481,9 @@ void initBindings(nb::module_& m)
         {
             auto checkIntBuffer = [](at::Tensor const& tensor, char const* name)
             {
-                TLLM_CHECK_WITH_INFO(tensor.device().is_cpu(), "%s must be a CPU tensor", name);
-                TLLM_CHECK_WITH_INFO(tensor.scalar_type() == at::kInt, "%s must have torch.int32 dtype", name);
-                TLLM_CHECK_WITH_INFO(tensor.is_contiguous(), "%s must be contiguous", name);
+                TLLM_CHECK_WITH_INFO(tensor.device().is_cpu(), "{} must be a CPU tensor", name);
+                TLLM_CHECK_WITH_INFO(tensor.scalar_type() == at::kInt, "{} must have torch.int32 dtype", name);
+                TLLM_CHECK_WITH_INFO(tensor.is_contiguous(), "{} must be contiguous", name);
             };
             checkIntBuffer(inputIds, "input_ids");
             checkIntBuffer(positionIds, "position_ids");

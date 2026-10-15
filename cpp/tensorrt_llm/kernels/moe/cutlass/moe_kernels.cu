@@ -1904,7 +1904,7 @@ void expandInputRowsFp8BlockScaleKernelLauncher(InputActivationsType const* unpe
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const hidden_size, int const k,
     int const num_experts_per_node, int64_t* expert_first_token_offset, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(hidden_size % 128 == 0, "Fused FC1 activation quant requires hidden_size %% 128 == 0.");
+    TLLM_CHECK_WITH_INFO(hidden_size % 128 == 0, "Fused FC1 activation quant requires hidden_size % 128 == 0.");
     auto* func = &expandInputRowsFp8BlockScaleKernel<InputActivationsType>;
     static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
     int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, EXPAND_THREADS_PER_BLOCK, 0);
@@ -4101,9 +4101,9 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         {
             TLLM_CHECK_WITH_INFO(mod.ranks_src_dev != nullptr && mod.ptrs_src_dev != nullptr
                     && mod.permuted_ranks_dev != nullptr && mod.permuted_ptrs_dev != nullptr,
-                "Grouped-GEMM LoRA %s module is missing pointer-expand buffers.", name);
+                "Grouped-GEMM LoRA {} module is missing pointer-expand buffers.", name);
             TLLM_CHECK_WITH_INFO(mod.dim_a == expectedDimA && mod.dim_b == expectedDimB,
-                "Grouped-GEMM LoRA %s module dimensions do not match the MoE runner dimensions.", name);
+                "Grouped-GEMM LoRA {} module dimensions do not match the MoE runner dimensions.", name);
         };
         validateLoraModule(grouped_gemm.fc1, "fc1", hidden_size, inter_size);
         validateLoraModule(grouped_gemm.fc2, "fc2", inter_size, hidden_size);
@@ -4446,10 +4446,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         // 64 for fp8 B (MXFP8). The `64 * 8 / sizeof_bits<WeightType>::value`
         // expression adjusts automatically via the template parameter.
         TLLM_CHECK_WITH_INFO(hidden_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-            "Hidden size %d does not meet minimum alignment requirements for MXFPX MOE GEMM %d", (int) hidden_size,
+            "Hidden size {} does not meet minimum alignment requirements for MXFPX MOE GEMM {}", (int) hidden_size,
             (int) (64 * 8 / sizeof_bits<WeightType>::value));
         TLLM_CHECK_WITH_INFO(inter_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-            "Inter size %d does not meet minimum alignment requirements for MXFPX MOE GEMM %d", (int) inter_size,
+            "Inter size {} does not meet minimum alignment requirements for MXFPX MOE GEMM {}", (int) inter_size,
             (int) (64 * 8 / sizeof_bits<WeightType>::value));
     }
     else
@@ -4460,7 +4460,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             && !isGatedActivation(fc1_activation_type))
         {
             TLLM_CHECK_WITH_INFO(inter_size % (256 / sizeof_bits<WeightType>::value) == 0,
-                "Inter size %d does not meet minimum alignment requirements for MOE GEMM %d", (int) inter_size,
+                "Inter size {} does not meet minimum alignment requirements for MOE GEMM {}", (int) inter_size,
                 (int) (256 / sizeof_bits<WeightType>::value));
         }
 
@@ -4470,16 +4470,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                     != cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE,
                 "Got NoSmem epilogue schedule, which is not supported for finalize fusion");
             TLLM_CHECK_WITH_INFO(hidden_size % (256 / sizeof_bits<WeightType>::value) == 0,
-                "Hidden size %d does not meet minimum alignment requirements for MOE GEMM %d", (int) hidden_size,
+                "Hidden size {} does not meet minimum alignment requirements for MOE GEMM {}", (int) hidden_size,
                 (int) (256 / sizeof_bits<WeightType>::value));
         }
 
         // Require at least 128 bits of alignment for MOE GEMM
         TLLM_CHECK_WITH_INFO(hidden_size % (128 / sizeof_bits<WeightType>::value) == 0,
-            "Hidden size %d does not meet minimum alignment requirements for MOE GEMM %d", (int) hidden_size,
+            "Hidden size {} does not meet minimum alignment requirements for MOE GEMM {}", (int) hidden_size,
             (int) (128 / sizeof_bits<WeightType>::value));
         TLLM_CHECK_WITH_INFO(inter_size % (128 / sizeof_bits<WeightType>::value) == 0,
-            "Inter size %d does not meet minimum alignment requirements for MOE GEMM %d", (int) inter_size,
+            "Inter size {} does not meet minimum alignment requirements for MOE GEMM {}", (int) inter_size,
             (int) (128 / sizeof_bits<WeightType>::value));
     }
 

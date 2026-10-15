@@ -134,7 +134,7 @@ std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32
     if (handle->abortFlag)
     {
         int flags = fcntl(fd, F_GETFL);
-        TLLM_CHECK_WITH_INFO(flags != -1, "fcntl failed with error: %s", strerror(errno));
+        TLLM_CHECK_WITH_INFO(flags != -1, "fcntl failed with error: {}", strerror(errno));
         SYSCHECK(fcntl(fd, F_SETFL, flags | O_NONBLOCK), "fcntl");
     }
 

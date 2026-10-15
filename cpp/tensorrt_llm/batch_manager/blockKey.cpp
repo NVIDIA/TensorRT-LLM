@@ -63,7 +63,7 @@ inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
 std::array<uint8_t, 32> makeHashArray(std::vector<SizeType32> const& mmHashVector)
 {
     TLLM_CHECK_WITH_INFO(
-        mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)", mmHashVector.size());
+        mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: {} (expected 8)", mmHashVector.size());
 
     std::array<uint8_t, 32> mmHashArray;
     // Python int(hex_chunk, 16) stores the first hash byte in the most significant byte.

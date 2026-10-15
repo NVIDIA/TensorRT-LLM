@@ -62,7 +62,7 @@ CapturedKernelLaunch captureFinalizeNode(moe::dev::finalize::Data const& data, c
 
     std::size_t numNodes = 0;
     TLLM_CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &numNodes));
-    TLLM_CHECK_WITH_INFO(numNodes == 1, "Expected one finalize kernel node, got %zu", numNodes);
+    TLLM_CHECK_WITH_INFO(numNodes == 1, "Expected one finalize kernel node, got {}", numNodes);
     cudaGraphNode_t node{};
     TLLM_CUDA_CHECK(cudaGraphGetNodes(graph, &node, &numNodes));
     cudaGraphNodeType nodeType{};
@@ -73,7 +73,7 @@ CapturedKernelLaunch captureFinalizeNode(moe::dev::finalize::Data const& data, c
     // runtime parameter structure cannot represent.
     CUDA_KERNEL_NODE_PARAMS params{};
     CUresult const result = cuGraphKernelNodeGetParams(node, &params);
-    TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Could not read finalize kernel node parameters: %d", result);
+    TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Could not read finalize kernel node parameters: {}", result);
     TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
     return {
         {params.gridDimX, params.gridDimY, params.gridDimZ}, {params.blockDimX, params.blockDimY, params.blockDimZ}};

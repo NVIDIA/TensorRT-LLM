@@ -90,8 +90,8 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
     }
 
     TLLM_CHECK_WITH_INFO(mPassingConfigIndices.size() != 0,
-        "No kernel found for the given options: eltTypeA: %s, eltTypeB: %s, outputType: %s, deepSeekFp8: %d, "
-        "transposeMmaOutput: %d, gpuSM: %d",
+        "No kernel found for the given options: eltTypeA: {}, eltTypeB: {}, outputType: {}, deepSeekFp8: {}, "
+        "transposeMmaOutput: {}, gpuSM: {}",
         tg::dtypeToString(mOptions.eltTypeA).c_str(), tg::dtypeToString(mOptions.eltTypeB).c_str(),
         tg::dtypeToString(mOptions.outputType).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
         gpuNativeSmVersion);

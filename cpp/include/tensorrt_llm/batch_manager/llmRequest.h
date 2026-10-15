@@ -717,9 +717,9 @@ public:
     {
         TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot change numReturnSequences.");
         TLLM_CHECK_WITH_INFO(
-            numReturnSequences > 0, "numReturnSequences should be a positive integer, got %d.", numReturnSequences);
+            numReturnSequences > 0, "numReturnSequences should be a positive integer, got {}.", numReturnSequences);
         TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
-            "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
+            "Cannot set numReturnSequences {} smaller than the number {} of child requests that have already created.",
             numReturnSequences, mChildRequests.size());
         mSamplingConfig.setNumReturnSequences(numReturnSequences);
         mSequenceFinalVec->resize(numReturnSequences);
@@ -998,7 +998,7 @@ public:
         // This check is make sure prepopulated prompt length (tokens already cached in KV cache) is less than prompt
         // length (total tokens in the prompt)
         TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
-            "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
+            "Invalid state: prepopulatedPromptLen ({}) >= promptLen ({}) for request {}", prepopulatedPromptLen,
             promptLen, mRequestId);
 
         auto& prePromptLen = mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
@@ -1072,9 +1072,9 @@ public:
     void discardDraftTokens(SizeType32 numTokensToDiscard)
     {
         TLLM_CHECK_WITH_INFO(
-            numTokensToDiscard > 0, "Can only discard a positive amount of draft tokens, got %d", numTokensToDiscard);
+            numTokensToDiscard > 0, "Can only discard a positive amount of draft tokens, got {}", numTokensToDiscard);
         TLLM_CHECK_WITH_INFO(numTokensToDiscard <= getNumDraftTokens(),
-            "Can't discard more draft tokens (%d) than exists (%d).", numTokensToDiscard, getNumDraftTokens());
+            "Can't discard more draft tokens ({}) than exists ({}).", numTokensToDiscard, getNumDraftTokens());
         mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
     }
 
@@ -1259,7 +1259,7 @@ public:
             auto const& outputTensorName = outputTensor.first;
             auto const dataType = getTensorDataType(outputTensorName);
             auto shape = getTensorShape(outputTensorName);
-            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
+            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '{}' must be dynamic",
                 outputTensorName.c_str());
             shape.d[0] = mPromptLen;
             auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
@@ -1270,7 +1270,7 @@ public:
             auto const& outputTensorName = outputTensor.first;
             auto const dataType = getTensorDataType(outputTensorName);
             auto shape = getTensorShape(outputTensorName);
-            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
+            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '{}' must be dynamic",
                 outputTensorName.c_str());
             shape.d[0] = mMaxNewTokens;
             shape = runtime::ITensor::unsqueeze(shape, 0);
@@ -1424,7 +1424,7 @@ public:
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");
-        TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
+        TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context ({}) can't be negative.", size);
         auto& contextChunkSize = mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
         contextChunkSize = std::min(size, getContextRemainingLength());
     }
@@ -1917,7 +1917,7 @@ private:
         {
             if (mInputTokenExtraIds.value()->size() != inputTokens.size())
             {
-                TLLM_THROW("inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
+                TLLM_THROW("inputTokenExtraIds vector size ({}) must be the same as input token vector size ({}).",
                     mInputTokenExtraIds.value()->size(), inputTokens.size());
             }
             std::transform(inputTokens.cbegin(), inputTokens.cend(), mInputTokenExtraIds.value()->cbegin(),
@@ -1956,7 +1956,7 @@ private:
                 = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with "
                   "prompt "
                   "tuning enabled.";
-            TLLM_THROW(errStr);
+            TLLM_THROW("{}", errStr);
         }
 
         setReturnLogProbs(outputLogProbs);

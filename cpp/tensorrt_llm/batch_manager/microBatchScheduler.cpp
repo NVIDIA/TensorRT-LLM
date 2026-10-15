@@ -278,7 +278,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     if (maxContextLength && maxContextLength.value() < chunkUnitSize)
     {
         TLLM_THROW(
-            "The forced chunk size (%d) exceeds the max context length (%d)", chunkUnitSize, maxContextLength.value());
+            "The forced chunk size ({}) exceeds the max context length ({})", chunkUnitSize, maxContextLength.value());
     }
     SizeType32 totalTokens{0};
     for (auto& llmReq : contextsToBeChunked)
@@ -397,7 +397,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         {
             reqNumTokens = llmReq->getEncoderOutputLen();
             TLLM_CHECK_WITH_INFO(!mMaxContextLength || reqNumTokens <= mMaxContextLength.value(),
-                "The number of encoder tokens (%d) exceeds the limit value (%d)", reqNumTokens,
+                "The number of encoder tokens ({}) exceeds the limit value ({})", reqNumTokens,
                 mMaxContextLength.value());
             if (maxNumTokensRuntime && batchNumTokens + reqNumTokens > maxNumTokensRuntime.value())
             {
@@ -423,7 +423,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                     = reuse_adjusted_compute(contextTokens, reusable, llmReq->getContextRemainingLength());
                 SizeType32 const computeTokens = std::max(1, contextCompute + draftTokens);
                 TLLM_CHECK_WITH_INFO(!mMaxContextLength || computeTokens <= mMaxContextLength.value(),
-                    "Context compute tokens (%d) exceeds the limit value (%d)", computeTokens,
+                    "Context compute tokens ({}) exceeds the limit value ({})", computeTokens,
                     mMaxContextLength.value());
                 if (maxNumTokensRuntime && batchNumTokens + computeTokens > maxNumTokensRuntime.value())
                 {

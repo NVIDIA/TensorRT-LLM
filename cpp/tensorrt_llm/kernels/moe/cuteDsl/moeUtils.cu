@@ -126,7 +126,7 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kSFVecSize = 16;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by {}.", kElemPerCopy);
 
 #ifdef ENABLE_FP4
     if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
@@ -136,8 +136,8 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
         int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
         static_assert(kSFElemPerCopy == kSFKAlignment);
         TLLM_CHECK_WITH_INFO(max_num_permuted_tokens % kSFMAlignment == 0,
-            "max_num_permuted_tokens must be divisible by %d.", kSFMAlignment);
-        TLLM_CHECK_WITH_INFO(hidden_size % (kSFVecSize * kSFKAlignment) == 0, "hidden_size must be divisible by %d.",
+            "max_num_permuted_tokens must be divisible by {}.", kSFMAlignment);
+        TLLM_CHECK_WITH_INFO(hidden_size % (kSFVecSize * kSFKAlignment) == 0, "hidden_size must be divisible by {}.",
             kSFVecSize * kSFKAlignment);
         TLLM_CHECK_WITH_INFO(input_sf != nullptr, "input_sf is required for NVFP4.");
         TLLM_CHECK_WITH_INFO(permuted_sf != nullptr, "permuted_sf is required for NVFP4.");
@@ -246,7 +246,7 @@ void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t co
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by {}.", kElemPerCopy);
 
     int32_t const blocks = num_tokens;
     int32_t const threads = kThreadsPerBlock;
@@ -345,7 +345,7 @@ void moeOutputMemset(InputType* input, int32_t const* tile_idx_to_mn_limit, int3
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by {}.", kElemPerCopy);
 
     auto kernel = &moeOutputMemsetKernel<InputType, kThreadsPerBlock>;
     static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -420,7 +420,7 @@ void moeOutputMemsetFromExpertCounts(InputType* input, int32_t const* expertCoun
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-    TLLM_CHECK_WITH_INFO(hiddenSize % kElemPerCopy == 0, "hiddenSize must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(hiddenSize % kElemPerCopy == 0, "hiddenSize must be divisible by {}.", kElemPerCopy);
     TLLM_CHECK_WITH_INFO(numLocalExperts > 0, "numLocalExperts must be positive.");
     TLLM_CHECK_WITH_INFO(expertCapacity > 0, "expertCapacity must be positive.");
 
@@ -541,7 +541,7 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kSFVecSize = 16;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-    TLLM_CHECK_WITH_INFO(interm_size % kElemPerCopy == 0, "interm_size must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(interm_size % kElemPerCopy == 0, "interm_size must be divisible by {}.", kElemPerCopy);
 
 #ifdef ENABLE_FP4
     if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
@@ -549,8 +549,8 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
         int32_t constexpr kSFMAlignment = 128;
         int32_t constexpr kSFKAlignment = 4;
         TLLM_CHECK_WITH_INFO(max_num_permuted_tokens % kSFMAlignment == 0,
-            "max_num_permuted_tokens must be divisible by %d.", kSFMAlignment);
-        TLLM_CHECK_WITH_INFO(interm_size % (kSFVecSize * kSFKAlignment) == 0, "interm_size must be divisible by %d.",
+            "max_num_permuted_tokens must be divisible by {}.", kSFMAlignment);
+        TLLM_CHECK_WITH_INFO(interm_size % (kSFVecSize * kSFKAlignment) == 0, "interm_size must be divisible by {}.",
             kSFVecSize * kSFKAlignment);
         TLLM_CHECK_WITH_INFO(global_sf != nullptr, "global_sf is required for NVFP4.");
         TLLM_CHECK_WITH_INFO(output_sf != nullptr, "output_sf is required for NVFP4.");
@@ -590,7 +590,7 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
             // Unsupported activation type
             break;
         }
-        TLLM_CHECK_WITH_INFO(false, "Unsupported activation type: %d", int(activation_type));
+        TLLM_CHECK_WITH_INFO(false, "Unsupported activation type: {}", int(activation_type));
         return nullptr;
     };
     auto kernel = get_act_kernel(activation_params.activation_type);

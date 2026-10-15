@@ -1339,7 +1339,7 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     else
     {
         TLLM_CHECK_WITH_INFO(
-            false, "applyBiasRopeUpdateKVCache kernel doesn't support head size = %d", params.size_per_head);
+            false, "applyBiasRopeUpdateKVCache kernel doesn't support head size = {}", params.size_per_head);
     }
 }
 
@@ -2152,7 +2152,7 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
     case 256: kernelSparseDispatchHeadSize<256, T, TCache, KVCacheBuffer>(params, stream); break;
     default:
         TLLM_CHECK_WITH_INFO(
-            false, "updateSparseKvCacheAfterFmha kernel doesn't support head size = %d", params.size_per_head);
+            false, "updateSparseKvCacheAfterFmha kernel doesn't support head size = {}", params.size_per_head);
         break;
     }
 }
@@ -2207,7 +2207,7 @@ void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const
 
     TLLM_CHECK_WITH_INFO(false,
         "Sparse KV compaction ships only the pipelined bf16 kernels (head size 64/128, page size 32/128 "
-        "tokens); got element size %zu, head size %d, %d tokens per page",
+        "tokens); got element size {}, head size {}, {} tokens per page",
         sizeof(T), headDim, tokensPerBlock);
 }
 

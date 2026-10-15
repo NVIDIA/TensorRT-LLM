@@ -37,6 +37,7 @@
 #include <iomanip>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -128,28 +129,27 @@ static char const* _cudaGetErrorEnum(cublasStatus_t error)
 }
 
 template <typename T>
-void check(T ptr, char const* const func, char const* const file, int const line)
+void check(T ptr, char const* const func, std::source_location const& location)
 {
     if (ptr)
     {
-        throw TllmException(file, line,
-            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
+        throw TllmException(
+            location, std::format("[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr)));
     }
 }
 
 template <typename T>
 void checkEx(
-    T ptr, std::initializer_list<T> const& validReturns, char const* const func, char const* const file, int const line)
+    T ptr, std::initializer_list<T> const& validReturns, char const* const func, std::source_location const& location)
 {
     if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
-        throw TllmException(file, line,
-            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
+        throw TllmException(
+            location, std::format("[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr)));
     }
 }
 
-#define check_cuda_error(val) check((val), #val, __FILE__, __LINE__)
-#define check_cuda_error_2(val, file, line) check((val), #val, file, line)
+#define check_cuda_error(val) check((val), #val, std::source_location::current())
 
 inline bool isCapturing(cudaStream_t stream)
 {
@@ -179,16 +179,16 @@ inline bool doCheckError(cudaStream_t stream)
     return doCheckIfNotCapturing && !isCapturing(stream);
 }
 
-inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
+inline void syncAndCheck(cudaStream_t stream, std::source_location const& location)
 {
     if (doCheckError(stream))
     {
         cudaStreamSynchronize(stream);
-        check(cudaGetLastError(), "cudaGetLastError", file, line);
+        check(cudaGetLastError(), "cudaGetLastError", location);
     }
 }
 
-#define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, __FILE__, __LINE__)
+#define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, std::source_location::current())
 
 #define PRINT_FUNC_NAME_()                                                                                             \
     do                                                                                                                 \
@@ -1417,7 +1417,7 @@ TRTLLM_NAMESPACE_END
 #define TLLM_CUDA_CHECK(stat)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                                \
+        tensorrt_llm::common::check((stat), #stat, std::source_location::current());                                   \
     } while (0)
 
 // We use singleton memory pool and the order of destructors depends on the compiler implementation. We find that the
@@ -1427,7 +1427,8 @@ TRTLLM_NAMESPACE_END
 #define TLLM_CUDA_CHECK_FREE_RESOURCE(stat)                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
+        tensorrt_llm::common::checkEx(                                                                                 \
+            (stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, std::source_location::current());                  \
     } while (0)
 
 // Warn-only variant: log a warning on failure but do not throw or abort.

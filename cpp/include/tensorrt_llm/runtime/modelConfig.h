@@ -145,7 +145,7 @@ public:
         , mNumLanguages(0)
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
-            "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
+            "Number of layers ({}) expected to be >= number of attention ({}) + number of rnn layers ({})", mNbLayers,
             mNbAttentionLayers, mNbRnnLayers);
         setNbKvHeads(mNbHeads);
     }
@@ -168,7 +168,7 @@ public:
     [[nodiscard]] SizeType32 countLocalLayers(
         LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: {}", pipelineParallelism);
         auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
         auto const numLocalLayers = getNbLayers(pipelineParallelism, pipelineParallelismRank);
         auto const firstLocalLayerIt = mLayerTypes.cbegin() + firstLocalLayer;
@@ -234,7 +234,7 @@ public:
     [[nodiscard]] SizeType32 getFirstLoraLayer(
         SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: {}", pipelineParallelism);
         if (mNbLoraLayers > 0)
         {
             auto const numBaseLayers = mNbLoraLayers / pipelineParallelism;
@@ -260,7 +260,7 @@ public:
     [[nodiscard]] SizeType32 getNbLoraLayers(
         SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: {}", pipelineParallelism);
         // If mNbLoraLayers is set (non-zero), use it with proper PP distribution
         if (mNbLoraLayers > 0)
         {
@@ -291,7 +291,7 @@ public:
 
     [[nodiscard]] SizeType32 getNbKvHeads(SizeType32 layerIdx) const
     {
-        TLLM_CHECK_WITH_INFO(layerIdx < mNbAttentionLayers, "Layer index %d is out of bounds", layerIdx);
+        TLLM_CHECK_WITH_INFO(layerIdx < mNbAttentionLayers, "Layer index {} is out of bounds", layerIdx);
         return mNumKvHeadsPerAttentionLayer[layerIdx];
     }
 
@@ -846,7 +846,7 @@ public:
         SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
     {
         TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
-        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: {}", pipelineParallelism);
 
         // count number of previous non-local attention layers
         auto const numPrevAttnLayers
@@ -864,7 +864,7 @@ public:
     {
         auto const numElems = static_cast<SizeType32>(headsPerLayer.size());
         TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
-            "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
+            "Length of head_per_layer ({}) must match number of attention layers ({})", numElems, mNbAttentionLayers);
         mNumKvHeadsPerAttentionLayer = headsPerLayer;
     }
 
@@ -872,7 +872,7 @@ public:
     {
         auto const numElems = static_cast<SizeType32>(headsPerLayer.size());
         TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
-            "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
+            "Length of head_per_layer ({}) must match number of attention layers ({})", numElems, mNbAttentionLayers);
         mNumKvHeadsPerCrossAttentionLayer = headsPerLayer;
     }
 

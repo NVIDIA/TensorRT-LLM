@@ -173,10 +173,10 @@ PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, run
         = getMaxNumSlots(config, dataType, pageWidth, max1dModSize, deviceCacheByteBudget);
 
     TLLM_CHECK_WITH_INFO(totalHostSlots >= minTotalSlots,
-        "Not enough space allocated to host LoRA cache to hold 1 max sized LoRA %lu < %lu", totalHostSlots,
+        "Not enough space allocated to host LoRA cache to hold 1 max sized LoRA {} < {}", totalHostSlots,
         minTotalSlots);
     TLLM_CHECK_WITH_INFO(totalDeviceSlots >= minTotalSlots,
-        "Not enough space allocated to device LoRA cache to hold 1 max sized LoRA %lu < %lu", totalDeviceSlots,
+        "Not enough space allocated to device LoRA cache to hold 1 max sized LoRA {} < {}", totalDeviceSlots,
         minTotalSlots);
 
     uint64_t const totalHostPages = common::ceilDiv(totalHostSlots, numSlotsPerPage);
@@ -379,7 +379,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     catch (std::runtime_error const& e)
     {
         updateTaskState(taskId, reqId, true, false);
-        TLLM_THROW("Error storing task=%lu in PEFT cache -- %s", taskId, e.what());
+        TLLM_THROW("Error storing task={} in PEFT cache -- {}", taskId, e.what());
     }
 
     auto fn = [taskId, req = llmRequest, loadNeeded, this]()
@@ -433,11 +433,11 @@ void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
     auto const modelDataType = mModelConfig.getDataType();
 #ifdef ENABLE_FP8
     TLLM_CHECK_WITH_INFO(dataType == modelDataType || dataType == tensorrt_llm::DataType::kFP8,
-        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s or FP8",
+        "Unsupported LoRA weights dtype {} for PEFT cache; expected model dtype {} or FP8",
         runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
 #else
     TLLM_CHECK_WITH_INFO(dataType == modelDataType,
-        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s",
+        "Unsupported LoRA weights dtype {} for PEFT cache; expected model dtype {}",
         runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
 #endif
 
@@ -445,7 +445,7 @@ void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
     if (mDataType)
     {
         TLLM_CHECK_WITH_INFO(mDataType.value() == dataType,
-            "PEFT cache supports one homogeneous LoRA dtype; cache is %s but received %s",
+            "PEFT cache supports one homogeneous LoRA dtype; cache is {} but received {}",
             runtime::IBuffer::getDataTypeName(mDataType.value()), runtime::IBuffer::getDataTypeName(dataType));
         return;
     }

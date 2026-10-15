@@ -362,7 +362,7 @@ void MooncakeTransferAgent::registerMemory(RegisterDescs const& descs)
 
         int err = registerLocalMemory(mEngine, reinterpret_cast<void*>(desc.getAddr()), desc.getLen(), "*", 1);
 
-        TLLM_CHECK_WITH_INFO(err == 0, "registerLocalMemory failed, addr: %p, len: %lu",
+        TLLM_CHECK_WITH_INFO(err == 0, "registerLocalMemory failed, addr: {:p}, len: {}",
             reinterpret_cast<void*>(desc.getAddr()), desc.getLen());
 
         auto mooncakeDesc = std::make_shared<MooncakeMemoryDesc>(desc);
@@ -388,7 +388,7 @@ void MooncakeTransferAgent::deregisterMemory(RegisterDescs const& descs)
             int err = unregisterLocalMemory(mEngine, reinterpret_cast<void*>(desc.getAddr()));
 
             TLLM_CHECK_WITH_INFO(
-                err == 0, "unregisterLocalMemory failed, addr: %p", reinterpret_cast<void*>(desc.getAddr()));
+                err == 0, "unregisterLocalMemory failed, addr: {:p}", reinterpret_cast<void*>(desc.getAddr()));
 
             mMemRegInfo.erase(desc.getAddr());
         }
@@ -413,7 +413,7 @@ void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, ConnectionI
     auto segmentId = openSegment(mEngine, connectionInfo.c_str());
 
     TLLM_CHECK_WITH_INFO(
-        segmentId >= 0, "loadRemoteAgent openSegment failed, connectionInfo: %s", connectionInfo.c_str());
+        segmentId >= 0, "loadRemoteAgent openSegment failed, connectionInfo: {}", connectionInfo.c_str());
 
     mConnectedAgents[name].segmentId = segmentId;
 }
@@ -480,7 +480,7 @@ ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
         if (it == mConnectedAgents.end())
         {
             std::string error = "Remote agent " + remoteName + "not found";
-            TLLM_THROW(error);
+            TLLM_THROW("{}", error);
         }
 
         auto const& agentInfo = it->second;
@@ -520,7 +520,7 @@ ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
         rc = submitTransfer(mEngine, batchId, transferRequests.data(), requestCount);
     }
 
-    TLLM_CHECK_WITH_INFO(rc == 0, "submitTransfer failed with status: %d", rc);
+    TLLM_CHECK_WITH_INFO(rc == 0, "submitTransfer failed with status: {}", rc);
 
     return std::make_unique<MooncakeTransferStatus>(mEngine, batchId, requestCount);
 }
@@ -553,7 +553,7 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
 
     int ret = genNotifyInEngine(mEngine, segmentId, notifyMsg);
 
-    TLLM_CHECK_WITH_INFO(ret == 0, "genNotifyInEngine failed with status: %d", ret);
+    TLLM_CHECK_WITH_INFO(ret == 0, "genNotifyInEngine failed with status: {}", ret);
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> MooncakeTransferAgent::getNotifiedSyncMessages()
@@ -563,7 +563,7 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
 
     notify_msg_t* notifyMsgs = getNotifsFromEngine(mEngine, &size);
 
-    TLLM_CHECK_WITH_INFO(size >= 0, "getNotifsFromEngine returned negative size: %d", size);
+    TLLM_CHECK_WITH_INFO(size >= 0, "getNotifsFromEngine returned negative size: {}", size);
 
     for (int i = 0; i < size; i++)
     {

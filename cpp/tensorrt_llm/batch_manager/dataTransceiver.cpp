@@ -35,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <stdexcept>
 #include <unordered_map>
 #include <variant>
@@ -85,10 +86,10 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
         // Request-free (llmRequest-agnostic) transfer: there is no valid ID to attach.
         if (mRequest == nullptr)
         {
-            TLLM_THROW("%s", e.what());
+            TLLM_THROW("{}", e.what());
         }
         throw common::RequestSpecificException(
-            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
+            std::source_location::current(), e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
@@ -103,10 +104,10 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
         // Request-free (llmRequest-agnostic) transfer: there is no valid ID to attach.
         if (mRequest == nullptr)
         {
-            TLLM_THROW("%s", e.what());
+            TLLM_THROW("{}", e.what());
         }
         throw common::RequestSpecificException(
-            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
+            std::source_location::current(), e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
@@ -378,11 +379,11 @@ public:
         {
             std::scoped_lock lock(mSenderMutex);
             TLLM_CHECK_WITH_INFO(
-                !mTerminate, "Cannot enqueue request %zu after CacheSender termination", llmRequest->mRequestId);
+                !mTerminate, "Cannot enqueue request {} after CacheSender termination", llmRequest->mRequestId);
             auto const result
                 = mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
             TLLM_CHECK_WITH_INFO(
-                result.second, "Request %zu is already queued for KV cache transfer", llmRequest->mRequestId);
+                result.second, "Request {} is already queued for KV cache transfer", llmRequest->mRequestId);
         }
         mSenderCv.notify_all();
         return future;
@@ -431,7 +432,7 @@ public:
                 {
                     auto outputPath = getTransferOutputPath("send", mInstanceId);
                     mMeasuresFile.open(outputPath);
-                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
+                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: {}",
                         outputPath.string().c_str());
                 }
                 it->second.exportMeasure(mMeasuresFile, true);
@@ -517,7 +518,7 @@ public:
             allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
 
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
-            "Peer rank %d not found in expected counterparts", peerSelfIdx);
+            "Peer rank {} not found in expected counterparts", peerSelfIdx);
         std::shared_ptr<std::atomic<bool>> cancelFlag;
         if (common::getEnvDisaggEnableInflightCancel())
         {
@@ -585,7 +586,7 @@ public:
                         failResponse(it->second,
                             std::make_exception_ptr(
                                 TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
-                                    "Context KV cache request cancelled before a peer was ready for request %zu",
+                                    "Context KV cache request cancelled before a peer was ready for request {}",
                                     llmRequest.mRequestId)));
                         mReadyResponses.erase(it);
                     }
@@ -742,7 +743,7 @@ private:
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: {} ", e.what());
             discardTransferState(id);
-            auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
+            auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "{}", e.what());
             failResponse(resp, std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
@@ -820,7 +821,7 @@ private:
         {
             failResponse(*cancelledResponse,
                 std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId, common::RequestErrorCode::kNETWORK_ERROR,
-                    "KV cache transfer for request %zu was cancelled", reqId)));
+                    "KV cache transfer for request {} was cancelled", reqId)));
         }
         if (!allCounterpartsReady)
         {
@@ -1182,7 +1183,7 @@ public:
         }
         catch (std::exception const& e)
         {
-            TLLM_THROW("%s", e.what());
+            TLLM_THROW("{}", e.what());
         }
     }
 
@@ -1198,7 +1199,7 @@ public:
                 {
                     auto outputPath = getTransferOutputPath("recv", mInstanceId);
                     mMeasuresFile.open(outputPath);
-                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
+                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: {}",
                         outputPath.string().c_str());
                 }
                 session.exportMeasure(mMeasuresFile, false);
@@ -1479,7 +1480,7 @@ public:
                     {
                         it->mPromise->set_exception(std::make_exception_ptr(
                             TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
-                                "Generation KV cache request cancelled before send for request %zu",
+                                "Generation KV cache request cancelled before send for request {}",
                                 llmRequest.mRequestId)));
                     }
                     catch (std::future_error const&)
@@ -1627,7 +1628,7 @@ private:
         {
             if (perRequestCancel.load(std::memory_order_relaxed) || mTerminate.load(std::memory_order_relaxed))
             {
-                TLLM_THROW("KV cache receive request %zu cancelled before request-info", requestId);
+                TLLM_THROW("KV cache receive request {} cancelled before request-info", requestId);
             }
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             TLLM_LOG_DEBUG(
@@ -1650,12 +1651,12 @@ private:
                 {
                     session->poisonReservedRecvBuffers();
                 }
-                TLLM_THROW("KV cache receive request %zu cancelled while waiting for the ready signal", requestId);
+                TLLM_THROW("KV cache receive request {} cancelled while waiting for the ready signal", requestId);
             }
             if (readyResult == ReadySignalResult::kNotReady)
             {
                 session->releaseReservedRecvBuffers();
-                TLLM_THROW("KV cache receive request %zu was rejected by the context peer", requestId);
+                TLLM_THROW("KV cache receive request {} was rejected by the context peer", requestId);
             }
             if (readyResult == ReadySignalResult::kMixed)
             {
@@ -1667,7 +1668,7 @@ private:
                 {
                     session->releaseReservedRecvBuffers();
                 }
-                TLLM_THROW("KV cache receive request %zu received inconsistent ready signals from its context peers",
+                TLLM_THROW("KV cache receive request {} received inconsistent ready signals from its context peers",
                     requestId);
             }
 
@@ -1811,7 +1812,7 @@ private:
                         requestAndPromise.mRequest->mRequestId,
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     auto new_exception = TLLM_REQUEST_EXCEPTION(
-                        requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "%s", err.what());
+                        requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "{}", err.what());
                     requestAndPromise.mPromise->set_exception(std::make_exception_ptr(new_exception));
                 }
                 catch (std::exception const& err)

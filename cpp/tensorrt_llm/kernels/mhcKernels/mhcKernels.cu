@@ -922,7 +922,7 @@ void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 cons
         return;
 
     TLLM_CHECK_WITH_INFO(num_splits == 1 || num_splits == 2 || num_splits == 4 || num_splits == 8 || num_splits == 16,
-        "mhcBigFuseLaunch: only num_splits ∈ {1,2,4,8,16} supported, got %d", num_splits);
+        "mhcBigFuseLaunch: only num_splits ∈ {{1,2,4,8,16}} supported, got {}", num_splits);
 
     int const bs = (block_size > 0) ? block_size : selectBigFuseBlockSize(M);
     bool const fuse_norm = (norm_weight != nullptr);
@@ -961,7 +961,7 @@ void mhcGemmSqrsumFmaLaunch(__nv_bfloat16 const* x, float const* w_t, float* y, 
 
     int const tileN = (tile_n > 0) ? tile_n : selectFmaTileN(M, N);
 
-    TLLM_CHECK_WITH_INFO(N % tileN == 0, "mhcGemmSqrsumFmaLaunch: N=%d not divisible by tile_n=%d", N, tileN);
+    TLLM_CHECK_WITH_INFO(N % tileN == 0, "mhcGemmSqrsumFmaLaunch: N={} not divisible by tile_n={}", N, tileN);
 
 #define LAUNCH_FMA(TN) mhcGemmSqrsumFmaKernel<TN><<<dim3(M, (N + TN - 1) / TN), 256, 0, stream>>>(x, w_t, y, r, M, N, K)
 

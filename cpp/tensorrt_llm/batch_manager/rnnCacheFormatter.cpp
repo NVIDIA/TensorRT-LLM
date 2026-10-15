@@ -408,7 +408,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
             for (size_t t = 0; t < sourceNum; ++t)
             {
                 TLLM_CHECK_WITH_INFO(t < rnnRecvConns.size(),
-                    "unformatUnifiedPool: source index %zu >= rnnRecvConns size %zu", t, rnnRecvConns.size());
+                    "unformatUnifiedPool: source index {} >= rnnRecvConns size {}", t, rnnRecvConns.size());
                 size_t connIdx = rnnRecvConns[t];
                 // recvBuffers are from pre-allocated pool (cudaMalloc, NIXL-registered).
                 totalBytesRecv += recvBuffers[t]->getSizeInBytes();

@@ -57,11 +57,11 @@ void checkFp8CudaGraphAlignment(
     static int const smVersion = tensorrt_llm::common::getSMVersion();
     // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
     TLLM_CHECK_WITH_INFO(smVersion == fp8GroupedGemmConfig::kSm90 || smVersion == fp8GroupedGemmConfig::kSm100,
-        "%s requires Hopper (SM90) or B200 (SM100), but the current device is SM%d", kernelName, smVersion);
+        "{} requires Hopper (SM90) or B200 (SM100), but the current device is SM{}", kernelName, smVersion);
 
     TLLM_CHECK_WITH_INFO(minKN >= kFp8TmaAlignment && minKN % kFp8TmaAlignment == 0,
-        "%s requires active LoRA ranks to be multiples of %d elements for 128-bit TMA alignment. "
-        "The minimum K/N dimension is %d.",
+        "{} requires active LoRA ranks to be multiples of {} elements for 128-bit TMA alignment. "
+        "The minimum K/N dimension is {}.",
         kernelName, kFp8TmaAlignment, minKN);
 
     for (int problemIdx = 0; problemIdx < problemCount; ++problemIdx)
@@ -73,8 +73,8 @@ void checkFp8CudaGraphAlignment(
         }
 
         TLLM_CHECK_WITH_INFO(problem.n() % kFp8TmaAlignment == 0 && problem.k() % kFp8TmaAlignment == 0,
-            "%s requires GEMM N and K dimensions to be multiples of %d elements for 128-bit TMA alignment. "
-            "Max problem %d has M=%d, N=%d, K=%d.",
+            "{} requires GEMM N and K dimensions to be multiples of {} elements for 128-bit TMA alignment. "
+            "Max problem {} has M={}, N={}, K={}.",
             kernelName, kFp8TmaAlignment, problemIdx, problem.m(), problem.n(), problem.k());
     }
 }
@@ -144,7 +144,7 @@ void cudaGraphGroupedGemmTemplate(cutlass::gemm::GemmCoord* problemSizesPtr, int
     {
         cutlass::Status status = gemmOp.can_implement(args);
         TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-            "Grouped GEMM cannot be implemented with the given arguments, Error: %s",
+            "Grouped GEMM cannot be implemented with the given arguments, Error: {}",
             cutlass::cutlassGetStatusString(status));
     }
 
@@ -312,16 +312,16 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
     }
 
     cutlass::Status status = gemm.can_implement(arguments);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM can_implement failed: %s",
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM can_implement failed: {}",
         cutlass::cutlassGetStatusString(status));
 
     status = gemm.initialize(arguments, gemmWorkspace, stream);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM initialize failed: %s",
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM initialize failed: {}",
         cutlass::cutlassGetStatusString(status));
 
     status = gemm.run(stream);
     sync_check_cuda_error(stream);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM run failed: %s",
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM run failed: {}",
         cutlass::cutlassGetStatusString(status));
 
     TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
@@ -348,7 +348,7 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
         return;
 #endif
     }
-    TLLM_CHECK_WITH_INFO(false, "FP8 CUDA graph grouped GEMM was not compiled for SM%d", smVersion);
+    TLLM_CHECK_WITH_INFO(false, "FP8 CUDA graph grouped GEMM was not compiled for SM{}", smVersion);
 }
 
 #endif // CUTLASS architecture support
@@ -487,8 +487,8 @@ void cudaGraphSplitKGroupedGemmTemplate(cutlass::gemm::GemmCoord* problemSizesPt
     {
         cutlass::Status status = gemmOp.can_implement(args);
         TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-            "Split-K grouped GEMM cannot be implemented with the given arguments. Problem count: %d, Split-K slices: "
-            "%d, Error: %s",
+            "Split-K grouped GEMM cannot be implemented with the given arguments. Problem count: {}, Split-K slices: "
+            "{}, Error: {}",
             problemCount, splitKSlices, cutlass::cutlassGetStatusString(status));
     }
 
@@ -504,13 +504,13 @@ void cudaGraphSplitKGroupedGemmTemplate(cutlass::gemm::GemmCoord* problemSizesPt
 
     cutlass::Status status = gemmOp.initialize(args, gemmWorkspace);
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-        "Failed to initialize split-K grouped GEMM. Problem count: %d, Split-K slices: %d, Error: %s", problemCount,
+        "Failed to initialize split-K grouped GEMM. Problem count: {}, Split-K slices: {}, Error: {}", problemCount,
         splitKSlices, cutlass::cutlassGetStatusString(status));
 
     status = gemmOp.run(stream);
     sync_check_cuda_error(stream);
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-        "Failed to execute split-K grouped GEMM. Problem count: %d, Split-K slices: %d, Error: %s", problemCount,
+        "Failed to execute split-K grouped GEMM. Problem count: {}, Split-K slices: {}, Error: {}", problemCount,
         splitKSlices, cutlass::cutlassGetStatusString(status));
 }
 

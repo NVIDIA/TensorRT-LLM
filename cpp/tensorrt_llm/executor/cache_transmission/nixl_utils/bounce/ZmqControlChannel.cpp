@@ -85,7 +85,7 @@ bool ZmqControlChannel::addPeer(std::string const& peer, std::string const& endp
     }
     if (endpoint.empty())
     {
-        TLLM_THROW("ZmqControlChannel(%s): peer %s requires a non-empty endpoint", mSelfName.c_str(), peer.c_str());
+        TLLM_THROW("ZmqControlChannel({}): peer {} requires a non-empty endpoint", mSelfName.c_str(), peer.c_str());
     }
     try
     {
@@ -103,7 +103,7 @@ bool ZmqControlChannel::addPeer(std::string const& peer, std::string const& endp
     catch (zmq::error_t const& e)
     {
         TLLM_THROW(
-            "ZmqControlChannel(%s): peer %s has an invalid endpoint: %s", mSelfName.c_str(), peer.c_str(), e.what());
+            "ZmqControlChannel({}): peer {} has an invalid endpoint: {}", mSelfName.c_str(), peer.c_str(), e.what());
     }
 }
 

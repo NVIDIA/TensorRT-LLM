@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ using ::testing::HasSubstr;
 TEST(TllmException, StackTrace)
 {
     // clang-format off
-    auto ex = NEW_TLLM_EXCEPTION("TestException %d", 1);
+    auto ex = NEW_TLLM_EXCEPTION("TestException {}", 1);
     std::string const what{ex.what()};
     EXPECT_THAT(what, HasSubstr(std::to_string(__LINE__ - 2)));
     // clang-format on
@@ -46,13 +46,13 @@ TEST(TllmException, Logger)
     try
     {
         // clang-format off
-        TLLM_THROW("TestException %d", 1);
+        TLLM_THROW("TestException {}", 1);
     }
     catch (const std::exception& e)
     {
-        testing::internal::CaptureStdout();
+        testing::internal::CaptureStderr();
         TLLM_LOG_EXCEPTION(e);
-        auto const out = testing::internal::GetCapturedStdout();
+        auto const out = testing::internal::GetCapturedStderr();
         EXPECT_THAT(out, HasSubstr(std::to_string(__LINE__ - 7)));
         // clang-format on
         EXPECT_THAT(out, HasSubstr("TestException 1"));

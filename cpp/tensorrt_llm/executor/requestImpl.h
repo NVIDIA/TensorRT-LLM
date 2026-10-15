@@ -41,7 +41,7 @@ public:
     {
         if (cacheSalt.has_value() && cacheSalt->size() > kMaxCacheSaltLength)
         {
-            TLLM_THROW("cacheSalt length (%zu) exceeds the maximum supported length (%zu).", cacheSalt->size(),
+            TLLM_THROW("cacheSalt length ({}) exceeds the maximum supported length ({}).", cacheSalt->size(),
                 kMaxCacheSaltLength);
         }
         return cacheSalt;

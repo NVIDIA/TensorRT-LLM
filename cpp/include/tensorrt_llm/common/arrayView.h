@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ public:
     [[nodiscard]] reference operator[](size_type index)
     {
 #ifdef INDEX_RANGE_CHECK
-        TLLM_CHECK_WITH_INFO(index < mSize, "Index %lu is out of bounds [0, %lu)", index, mSize);
+        TLLM_CHECK_WITH_INFO(index < mSize, "Index {} is out of bounds [0, {})", index, mSize);
 #endif
         return mData[index];
     }
@@ -94,7 +94,7 @@ public:
     [[nodiscard]] const_reference operator[](size_type index) const
     {
 #ifdef INDEX_RANGE_CHECK
-        TLLM_CHECK_WITH_INFO(index < mSize, "Index %lu is out of bounds [0, %lu)", index, mSize);
+        TLLM_CHECK_WITH_INFO(index < mSize, "Index {} is out of bounds [0, {})", index, mSize);
 #endif
         return mData[index];
     }

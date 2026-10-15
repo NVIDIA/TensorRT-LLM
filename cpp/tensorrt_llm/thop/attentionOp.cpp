@@ -998,7 +998,7 @@ public:
             int32_t const num_requests = batch_beam / beam_width;
 
             TLLM_CHECK_WITH_INFO(num_tokens % num_seqs == 0,
-                "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens, num_seqs);
+                "seq_len should be same for all generation requests, num_tokens={}, num_seqs={}", num_tokens, num_seqs);
             int32_t const input_seq_length = num_tokens / num_seqs;
 
             common_enqueue_params.input_seq_length = input_seq_length;
@@ -1161,14 +1161,14 @@ static std::shared_ptr<AttentionOp> get_attention_op(
         "Paged-context attention (chunked prefill, KV cache reuse or speculative draft tokens) is not supported with "
         "relative position embedding: that attention always runs unfused, and the unfused path cannot attend to "
         "cached KV. Disable chunked prefill, KV cache reuse and speculative decoding for this model. "
-        "Attention configuration: %s",
+        "Attention configuration: {}",
         to_string(cache_key).c_str());
     TLLM_CHECK_WITH_INFO(!needs_fused_paged_context || op->mEnableContextFMHA,
         "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
         "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
         "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
         "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding. "
-        "Attention configuration: %s",
+        "Attention configuration: {}",
         to_string(cache_key).c_str());
     runner->prepare(*op);
     auto [iter, _] = op_cache.try_emplace(cache_key, op);

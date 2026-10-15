@@ -529,10 +529,10 @@ struct RoutingKernelTestParam
 
     std::string toString() const
     {
-        return tensorrt_llm::common::fmtstr(
-            "RoutingKernelTestParam[num_tokens=%d, num_experts=%d, topK=%u, doSoftmaxBeforeTopK=%d, normTopkProb=%d, "
-            "localExpertsStartIdx=%d, localExpertsStrideLog2=%d, numLocalExperts=%d, usePdl=%d, useTopKAsInput=%d, "
-            "useTopKPackedAsInput=%d, hasInvalidTopKInput=%d]",
+        return std::format(
+            "RoutingKernelTestParam[num_tokens={}, num_experts={}, topK={}, doSoftmaxBeforeTopK={}, normTopkProb={}, "
+            "localExpertsStartIdx={}, localExpertsStrideLog2={}, numLocalExperts={}, usePdl={}, useTopKAsInput={}, "
+            "useTopKPackedAsInput={}, hasInvalidTopKInput={}]",
             numTokens, numExperts, topK, doSoftmaxBeforeTopK, normTopkProb, localExpertsStartIdx,
             localExpertsStrideLog2, numLocalExperts, usePdl, useTopKAsInput, useTopKPackedAsInput, hasInvalidTopKInput);
     }

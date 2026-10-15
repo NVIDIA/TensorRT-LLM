@@ -228,7 +228,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             if (N > 0)
             {
                 TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
-                    "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank);
+                    "Invalid low_rank ({}). low_rank must be smaller than mMaxLowRank ({})", N, mMaxLowRank);
                 // size
                 auto const K = mInHiddenSize;
                 auto const N2 = mOutHiddenSizes[loraModuleIdx];
@@ -302,7 +302,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                 {
                     TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
 
-                        "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank);
+                        "Invalid low_rank ({}). low_rank must be smaller than mMaxLowRank ({})", N, mMaxLowRank);
 
                     auto const K = mInHiddenSize;
                     minKN = std::min(minKN, N);
@@ -340,7 +340,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
         if (problem_sizes.size() > 0)
         {
             TLLM_CHECK_WITH_INFO(mTransA == false && mTransB == true,
-                "Invalid transA (%d) transB (%d). transA must be false, transB must be true", int(mTransA),
+                "Invalid transA ({}) transB ({}). transA must be false, transB must be true", int(mTransA),
                 int(mTransB));
             // For the first GEMM, K is the "hidden size" and N is the "lora rank". So, K is often much larger than N.
             // To improve the GPU utilization, we use splitK to handle the K dimension in multiple blocks in parallel.

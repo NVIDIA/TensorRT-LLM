@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <iostream>
@@ -25,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include "tensorrt_llm/common/assert.h"
@@ -263,7 +266,7 @@ private:
         case ERROR: return "E";
         }
 
-        TLLM_THROW("Unknown log level: %d", level);
+        TLLM_THROW("Unknown log level: {}", static_cast<int>(level));
     }
 
     template <typename... Args>
@@ -280,8 +283,29 @@ private:
             rank = rank_;
         }
 
+        // FIXME: Remove printf compatibility once concurrent PRs have migrated to C++20 format strings.
+        // std::format places arguments only through braces, so a format with arguments and no braces is printf-style.
+        if constexpr (sizeof...(Args) > 0 && (kIsPrintfArg<Args> && ...))
+        {
+            // Format strings are string literals, so text is null-terminated.
+            auto const text = format.get();
+            if (text.find_first_of("{}") == std::string_view::npos)
+            {
+                auto const size = std::snprintf(nullptr, 0, text.data(), args...);
+                std::string message(std::max(size, 0), '\0');
+                std::snprintf(message.data(), message.size() + 1, text.data(), args...);
+                write(level, module.name, rank, message);
+                return;
+            }
+        }
+
         write(level, module.name, rank, std::format(format, std::forward<Args>(args)...));
     }
+
+    //! Whether C varargs pass T to snprintf the way printf conversions expect.
+    template <typename T>
+    static constexpr bool kIsPrintfArg = std::is_arithmetic_v<std::decay_t<T>> || std::is_pointer_v<std::decay_t<T>>
+        || std::is_null_pointer_v<std::decay_t<T>>;
 
     static std::string getPrefix(Level const level, std::string_view module, std::optional<int> rank)
     {

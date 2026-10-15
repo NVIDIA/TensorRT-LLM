@@ -277,7 +277,7 @@ void invokeMoeAlignBlockSize(void const* topk_ids, int32_t topk_ids_dtype_size, 
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Unsupported topk_ids dtype size: %d", topk_ids_dtype_size);
+        TLLM_CHECK_WITH_INFO(false, "Unsupported topk_ids dtype size: {}", topk_ids_dtype_size);
     }
 }
 

@@ -604,7 +604,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
 
     TLLM_CHECK_WITH_INFO(!pages.empty(), "empty pages");
     TLLM_CHECK_WITH_INFO(sourceWeights->getDataType() == pages.front()->getDataType(),
-        "Expected LoRA weights dtype %s to match cache dtype %s", sourceWeights->getDataTypeName(),
+        "Expected LoRA weights dtype {} to match cache dtype {}", sourceWeights->getDataTypeName(),
         pages.front()->getDataTypeName());
 
     TensorPtr weights = sourceWeights->getShape().nbDims == 2

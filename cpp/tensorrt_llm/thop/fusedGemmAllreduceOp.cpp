@@ -161,7 +161,7 @@ public:
         {
             std::stringstream ss;
             ss << "Please set TRTLLM_GEMM_ALLREDUCE_WORKSPACE_SIZE to at least " << requiredSize << " bytes";
-            TLLM_THROW("%s", ss.str().c_str());
+            TLLM_THROW("{}", ss.str().c_str());
         }
 
         auto handle = mHandles[key];
@@ -243,7 +243,7 @@ public:
         }
         else
         {
-            TLLM_THROW("Unsupported output dtype: %s", torch::toString(outputDtype));
+            TLLM_THROW("Unsupported output dtype: {}", torch::toString(outputDtype));
         }
 
         mConfigs = mRunner->getSupportedLaunchConfigs();

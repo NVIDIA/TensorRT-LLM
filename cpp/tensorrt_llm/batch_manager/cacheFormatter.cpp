@@ -871,9 +871,9 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 // buffer for it.
                 size_t validTpSize = pickUpConnections.size() / targetInfo.mDomainPPSize;
                 TLLM_CHECK_WITH_INFO(cacheBlockSizeSum % validTpSize == 0,
-                    "cacheBlockSizeSum must be divisible by validTpSize %ld", validTpSize);
+                    "cacheBlockSizeSum must be divisible by validTpSize {}", validTpSize);
                 TLLM_CHECK_WITH_INFO((cacheBlockSizeSum % (selfAttentionLayerNum * validTpSize)) == 0,
-                    "cacheBlockSizeSum must be divisible by validTpSize %ld * selfAttentionLayerNum %d", validTpSize,
+                    "cacheBlockSizeSum must be divisible by validTpSize {} * selfAttentionLayerNum {}", validTpSize,
                     selfAttentionLayerNum);
                 TLLM_CHECK(targetNum == pickUpConnections.size());
                 // the sum of buffer size is cacheBlockSizeSum.

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,7 +71,7 @@ public:
         }
 
         TLLM_THROW(
-            "Cannot get the result for a response with an error: %s", std::get<std::string>(mErrOrResult).c_str());
+            "Cannot get the result for a response with an error: {}", std::get<std::string>(mErrOrResult).c_str());
     }
 
     [[nodiscard]] std::string const& getErrorMsg() const

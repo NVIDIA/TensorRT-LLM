@@ -28,7 +28,6 @@
 
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
-using tensorrt_llm::common::fmtstr;
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
@@ -138,7 +137,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
         if (numTokens > 0)
         {
             TLLM_CHECK_WITH_INFO(idx == numTokens,
-                fmtstr("LoraParams and input dims don't match, lora tokens %d input tokens %ld", idx, numTokens));
+                "LoraParams and input dims don't match, lora tokens {} input tokens {}", idx, numTokens);
         }
     }
 

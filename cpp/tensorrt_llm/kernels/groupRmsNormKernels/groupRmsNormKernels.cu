@@ -585,7 +585,7 @@ void GroupRMSNormBaseKernel(GroupRMSParams<n>& params)
         TLLM_CHECK_WITH_INFO(
             params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
         TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
-            "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
+            "Input[{}] dimension {} is not divisible by {} (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
             i, params.input_last_dims[i], kPackedSize);
         // Make rounded_input_dims[i] a multiple of 32 * kPackedSize
@@ -682,7 +682,7 @@ void GroupRMSNormKernelLargeBatch(GroupRMSParams<n>& params)
         TLLM_CHECK_WITH_INFO(
             params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
         TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
-            "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
+            "Input[{}] dimension {} is not divisible by {} (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
             i, params.input_last_dims[i], kPackedSize);
     }

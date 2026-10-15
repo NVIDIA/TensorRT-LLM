@@ -428,7 +428,7 @@ void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, std::size_t n)
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
         [&tag](MemorySegment const& segment) { return segment.tag == tag; });
 
-    TLLM_CHECK_WITH_INFO(it != mMemorySegments.end(), "MemoryPool free: Requested tag %p could not be found", tag);
+    TLLM_CHECK_WITH_INFO(it != mMemorySegments.end(), "MemoryPool free: Requested tag {:p} could not be found", tag);
 
     // Free found tag
     it->tag = nullptr;

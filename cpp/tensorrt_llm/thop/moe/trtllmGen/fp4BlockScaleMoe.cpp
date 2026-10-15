@@ -549,7 +549,7 @@ public:
     RunnerType& getRunner(int32_t tileN, bool useFineGrained)
     {
         auto* runner = getRunnerOrNull(tileN, useFineGrained);
-        TLLM_CHECK_WITH_INFO(runner != nullptr, "No %s FP4BlockScaleMoe runner available for tileN=%d",
+        TLLM_CHECK_WITH_INFO(runner != nullptr, "No {} FP4BlockScaleMoe runner available for tileN={}",
             useFineGrained ? "FineGrained" : "non-FineGrained", tileN);
         return *runner;
     }

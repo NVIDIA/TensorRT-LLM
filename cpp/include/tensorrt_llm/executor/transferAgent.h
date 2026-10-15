@@ -123,7 +123,7 @@ public:
         : mLen{len}
     {
         int fd = ::open(filename.c_str(), flags, mode);
-        TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' (GDS)", filename.c_str());
+        TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '{}' (GDS)", filename.c_str());
         this->fd = fd;
     }
 

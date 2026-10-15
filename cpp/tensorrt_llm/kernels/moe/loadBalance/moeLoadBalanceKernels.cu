@@ -258,7 +258,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
         void* args[]
             = {&metaInfo, static_cast<void*>(const_cast<int**>(&enabled)), static_cast<void*>(&expertTokenCount)};
         TLLM_CHECK_WITH_INFO(
-            threadCount <= 1024, "expertCount=%d is too large and not supported now.", metaInfo.expertCount);
+            threadCount <= 1024, "expertCount={} is too large and not supported now.", metaInfo.expertCount);
         // TODO: add PDL support with cooperative launch
         TLLM_CUDA_CHECK(cudaLaunchCooperativeKernel(kernelFunc, gridDim, blockDim, &args[0], 0, stream));
     }
@@ -311,7 +311,7 @@ void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int nu
         dim3 gridDim(1);
         dim3 blockDim(threadCount);
         TLLM_CHECK_WITH_INFO(
-            threadCount <= 1024, "expertCount=%d is too large and not supported now.", metaInfo.expertCount);
+            threadCount <= 1024, "expertCount={} is too large and not supported now.", metaInfo.expertCount);
         launchWithPdlWhenEnabled(
             "zeroExpertTokenCount", kernelFunc, gridDim, blockDim, 0, stream, metaInfo, enabled, localExpertTokenCount);
     }

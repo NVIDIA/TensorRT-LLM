@@ -74,7 +74,7 @@ void promoteHostLibraryToGlobalScope()
     }
     TLLM_LOG_INFO("{}", "dlopen: " + name);
     void* handler = dlopen(name.c_str(), RTLD_LAZY);
-    TLLM_CHECK_WITH_INFO(handler, "%s can not be loaded correctly: %s", name.c_str(), dlerror());
+    TLLM_CHECK_WITH_INFO(handler, "{} can not be loaded correctly: {}", name.c_str(), dlerror());
     mHandlers[name] = handler;
     return handler;
 }
@@ -133,7 +133,7 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
         bounceHandshake = su::deserialize<std::string>(is);
     }
     TLLM_CHECK_WITH_INFO(!is.fail(),
-        "AgentDesc::deserialize failed: stream error after reading %zu/%zu regions (data size=%zu)", regions.size(),
+        "AgentDesc::deserialize failed: stream error after reading {}/{} regions (data size={})", regions.size(),
         numRegions, data.size());
     return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
 }
@@ -380,19 +380,19 @@ MemoryDescs VmmDescSplitter::splitVmmDescs(MemoryDescs const& descs, size_t& det
         size_t chunkSize = startSize;
 
         TLLM_CHECK_WITH_INFO(endSize == chunkSize,
-            "VMM chunk size mismatch: first chunk %zu bytes, last chunk %zu bytes. "
+            "VMM chunk size mismatch: first chunk {} bytes, last chunk {} bytes. "
             "All VMM chunks must be the same size.",
             chunkSize, endSize);
 
         TLLM_CHECK_WITH_INFO(addr == static_cast<uintptr_t>(startBase),
-            "VMM descriptor start address 0x%lx does not match chunk base 0x%lx. "
+            "VMM descriptor start address 0x{:x} does not match chunk base 0x{:x}. "
             "Descriptor must start at a chunk boundary.",
             static_cast<unsigned long>(addr), static_cast<unsigned long>(startBase));
 
         if (detectedChunkSize > 0)
         {
             TLLM_CHECK_WITH_INFO(chunkSize == detectedChunkSize,
-                "Inconsistent VMM chunk sizes across descriptors: %zu vs %zu. "
+                "Inconsistent VMM chunk sizes across descriptors: {} vs {}. "
                 "All VMM pools must use the same chunk size.",
                 chunkSize, detectedChunkSize);
         }

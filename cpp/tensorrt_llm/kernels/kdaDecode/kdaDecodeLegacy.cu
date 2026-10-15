@@ -1569,11 +1569,11 @@ void dispatch_kda_decode_heads(KdaDecodeLaunchParams const& p)
     default:
         if constexpr (kCompact)
         {
-            TLLM_CHECK_WITH_INFO(false, "KDA compact-heads decode does not support numHeads=%d", p.H);
+            TLLM_CHECK_WITH_INFO(false, "KDA compact-heads decode does not support numHeads={}", p.H);
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(false, "KDA decode does not support numHeads=%d", p.H);
+            TLLM_CHECK_WITH_INFO(false, "KDA decode does not support numHeads={}", p.H);
         }
     }
 }

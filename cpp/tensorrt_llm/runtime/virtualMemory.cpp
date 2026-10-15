@@ -50,7 +50,8 @@ ScopeGuard(bool const&, T) -> ScopeGuard<T>;
 
 void CUDAVirtualMemoryChunk::materialize()
 {
-    TLLM_CHECK_WITH_INFO(status() == RELEASED, "virtual memory not in RELEASED status, is: %d", status());
+    TLLM_CHECK_WITH_INFO(
+        status() == RELEASED, "virtual memory not in RELEASED status, is: {}", static_cast<int>(status()));
     mHandle = mCreator->create();
 
     // Track the number of configurators ran, so release can correctly teardown.
@@ -91,7 +92,7 @@ static bool safe_invoke_helper(
 void CUDAVirtualMemoryChunk::_release(bool destructing)
 {
     TLLM_CHECK_WITH_INFO(status() == MATERIALIZED || (status() == ERRORED && mState != INVALID_STATE),
-        "virtual memory is in status %d which cannot be released", status());
+        "virtual memory is in status {} which cannot be released", static_cast<int>(status()));
     size_t const count = mConfigurators.size();
     size_t const start = count - mState;
 
@@ -146,7 +147,7 @@ void OffloadConfigurator::teardown(CUmemGenericAllocationHandle, bool destructin
         {
         case MemoryType::kCPU: mBackedStorage = BufferManager::cpu(mSize, tensorrt_llm::DataType::kINT8); break;
         case MemoryType::kPINNED: mBackedStorage = BufferManager::pinned(mSize, tensorrt_llm::DataType::kINT8); break;
-        default: TLLM_THROW("Unknown memory type: %d", static_cast<int32_t>(mBackType));
+        default: TLLM_THROW("Unknown memory type: {}", static_cast<int32_t>(mBackType));
         }
     }
     // We have to synchronize here, or the memory may be unmapped before the copy operation.
@@ -164,7 +165,7 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string tag, CUDAVirtua
     std::unique_lock lock(mMutex);
     auto [memIt, created] = mMemories.try_emplace(handle, Entry{});
     TLLM_CHECK_WITH_INFO(
-        created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+        created, "CudaVirtualMemoryManager: handle 0x{:016x} already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
     auto const entryIt = mEntries.emplace(std::move(tag), memIt);
@@ -185,7 +186,7 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string tag, CUDAVirtua
             {std::move(creator), std::move(configurators)},
         });
     TLLM_CHECK_WITH_INFO(
-        created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+        created, "CudaVirtualMemoryManager: handle 0x{:016x} already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
     auto const entryIt = mEntries.emplace(std::move(tag), memIt);

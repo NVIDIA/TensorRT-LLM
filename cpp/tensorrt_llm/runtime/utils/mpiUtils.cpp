@@ -704,12 +704,12 @@ MpiProgressThread::MpiProgressThread(MPI_Comm comm, std::chrono::microseconds in
     , mProbeTag{probeTag}
 {
 #if ENABLE_MULTI_DEVICE
-    TLLM_CHECK_WITH_INFO(interval.count() > 0, "MPI progress thread interval must be positive, got %lld us",
+    TLLM_CHECK_WITH_INFO(interval.count() > 0, "MPI progress thread interval must be positive, got {} us",
         static_cast<long long>(interval.count()));
     int provided = MPI_THREAD_SINGLE;
     TLLM_MPI_CHECK(MPI_Query_thread(&provided));
     TLLM_CHECK_WITH_INFO(provided == MPI_THREAD_MULTIPLE,
-        "MPI progress thread needs MPI_THREAD_MULTIPLE, but MPI provides thread level %d", provided);
+        "MPI progress thread needs MPI_THREAD_MULTIPLE, but MPI provides thread level {}", provided);
     mRunning.store(true);
     mThread = std::thread(&MpiProgressThread::run, this);
 #else
@@ -772,7 +772,7 @@ void MpiProgressThread::run()
         lock.lock();
         if (rc != MPI_SUCCESS)
         {
-            TLLM_LOG_ERROR("MPI progress thread: MPI_Iprobe failed with error code %d; the thread stops.", rc);
+            TLLM_LOG_ERROR("MPI progress thread: MPI_Iprobe failed with error code {}; the thread stops.", rc);
             break;
         }
     }

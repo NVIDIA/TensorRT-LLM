@@ -183,7 +183,7 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std:
 
     size_t workSpaceSize = gemm.get_workspace_size(args);
     TLLM_CHECK_WITH_INFO(workSpaceSize <= gemmWorkSpaceSize,
-        "workSpaceSize (%lu) is smaller than required gemmWorkSpaceSize (%lu).", workSpaceSize,
+        "workSpaceSize ({}) is smaller than required gemmWorkSpaceSize ({}).", workSpaceSize,
         (size_t) gemmWorkSpaceSize);
 
     cutlass::Status status = gemm.initialize(args, gemmWorkSpace);

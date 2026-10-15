@@ -37,6 +37,7 @@
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/CudaArchDecl.h"
 #include "trtllm/gen/DtypeDecl.h"
+#include <source_location>
 #include <nlohmann/json.hpp>
 #include <cassert>
 #include <sstream>
@@ -85,7 +86,7 @@ inline std::string checkErrorStr(Args const&... args) {
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
       tensorrt_llm::common::throwRuntimeError(                                                     \
-          __FILE__, __LINE__, ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());                  \
+          std::source_location::current(), ::fmha::detail::checkErrorStr(__VA_ARGS__));             \
     }                                                                                              \
   } while (0)
 #endif
@@ -94,7 +95,7 @@ inline std::string checkErrorStr(Args const&... args) {
 #define TLLM_CHECK_INFO(cond, ...)                                                                 \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
-      TLLM_LOG_INFO("[FMHA] {}", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());              \
+      TLLM_LOG_INFO("[FMHA] {}", ::fmha::detail::checkErrorStr(__VA_ARGS__));                      \
     }                                                                                              \
   } while (0)
 #endif
@@ -104,9 +105,7 @@ inline std::string checkErrorStr(Args const&... args) {
 #define TLLM_CHECK_ERROR_FMT(cond, fmt, ...)                                                       \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
-      tensorrt_llm::common::throwRuntimeError(                                                     \
-          __FILE__, __LINE__,                                                                      \
-          tensorrt_llm::common::fmtstr(fmt, __VA_ARGS__).c_str());                                 \
+      tensorrt_llm::common::throwRuntimeError(std::source_location::current(), fmt, __VA_ARGS__);  \
     }                                                                                              \
   } while (0)
 #endif

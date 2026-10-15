@@ -979,7 +979,7 @@ protected:
                 std::lock_guard<std::mutex> lock(mDllMutex);
                 void* WrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
                 TLLM_CHECK_WITH_INFO(
-                    WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. dlerror: %s", dlerror());
+                    WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. dlerror: {}", dlerror());
                 auto load_sym = [](void* handle, char const* name)
                 {
                     void* ret = dllGetSym(handle, name);

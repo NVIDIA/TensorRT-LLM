@@ -96,7 +96,7 @@ std::shared_ptr<ncclComm_t> createSplitComm(ncclComm_t parentComm, int color, in
     ncclResult_t result = ncclCommSplit(parentComm, color, key, &newComm, nullptr);
     if (result != ncclSuccess)
     {
-        TLLM_THROW("ncclCommSplit failed with error: %d", result);
+        TLLM_THROW("ncclCommSplit failed with error: {}", static_cast<int>(result));
     }
 
     // Create a shared_ptr with custom deleter that cleans up resources first

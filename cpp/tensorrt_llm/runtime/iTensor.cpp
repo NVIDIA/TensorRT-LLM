@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -146,8 +146,7 @@ ITensor::UniquePtr ITensor::wrap(
 ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(0 < shape.nbDims, "Cannot squeeze 1-dimensional tensor");
-    TLLM_CHECK_WITH_INFO(
-        dim < shape.nbDims, tc::fmtstr("Invalid index %d, tensor has %d dimensions", dim, shape.nbDims));
+    TLLM_CHECK_WITH_INFO(dim < shape.nbDims, "Invalid index {}, tensor has {} dimensions", dim, shape.nbDims);
     TLLM_CHECK_WITH_INFO(shape.d[dim] == 1, "Can only squeeze dimension of size 1");
 
     Shape newDims{shape.nbDims - 1, {}};
@@ -160,7 +159,7 @@ ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(shape.nbDims < Shape::MAX_DIMS, "Too many dimensions to unsqueeze");
     TLLM_CHECK_WITH_INFO(
-        0 <= dim && dim <= shape.nbDims, common::fmtstr("Invalid dim %d, tensor has %d dimensions", dim, shape.nbDims));
+        0 <= dim && dim <= shape.nbDims, "Invalid dim {}, tensor has {} dimensions", dim, shape.nbDims);
 
     Shape newDims{shape.nbDims + 1, {}};
     std::copy(shape.d, shape.d + dim, newDims.d);
@@ -175,8 +174,8 @@ template <typename T, typename TOutput = T>
 void printTensor(ITensor const& tensor, std::ostream& out)
 {
     TLLM_CHECK_WITH_INFO(tensor.getDataType() == TRTDataType<typename std::remove_cv<T>::type>::value,
-        tc::fmtstr("Data type mismatch: %d vs %d", static_cast<std::int32_t>(tensor.getDataType()),
-            static_cast<std::int32_t>(TRTDataType<typename std::remove_cv<T>::type>::value)));
+        "Data type mismatch: {} vs {}", static_cast<std::int32_t>(tensor.getDataType()),
+        static_cast<std::int32_t>(TRTDataType<typename std::remove_cv<T>::type>::value));
     auto const& shape = tensor.getShape();
     out << "shape: " << shape << std::endl;
     out << "vals: " << std::endl;

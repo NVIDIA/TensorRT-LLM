@@ -283,7 +283,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
         tensorrt_llm::common::check_cuda_error(
             cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
         TLLM_CHECK_WITH_INFO(smem_size <= maxSmem,
-            "Mixed dtype WS grouped GEMM requires %d bytes shared memory but device supports %d", smem_size, maxSmem);
+            "Mixed dtype WS grouped GEMM requires {} bytes shared memory but device supports {}", smem_size, maxSmem);
     }
 
     auto can_implement = gemm.can_implement(arguments);

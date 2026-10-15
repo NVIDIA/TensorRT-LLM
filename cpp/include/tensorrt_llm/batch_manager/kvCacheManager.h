@@ -111,7 +111,7 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
         return {};
     }
     TLLM_CHECK_WITH_INFO(
-        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
+        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize={} > {}=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;
     auto const vecEnd = vec.begin() + usableSize;
     for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
@@ -290,10 +290,10 @@ struct WindowSizeMetadata
 
     std::string toString()
     {
-        return tensorrt_llm::common::fmtstr(
-            "WindowSizeMetadata{ .allottedPrimaryBlocks=%d, .allottedSecondaryBlocks=%d, .absolutePoolsOffset=%d, "
-            ".numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, .maxNumBlocks=%d, "
-            ".windowSize=%d, .isSWA=%d }",
+        return std::format(
+            "WindowSizeMetadata{{ .allottedPrimaryBlocks={}, .allottedSecondaryBlocks={}, .absolutePoolsOffset={}, "
+            ".numPools={}, .maxTokenNum={}, .maxBlocksPerSeq={}, .maxNumBlocks={}, "
+            ".windowSize={}, .isSWA={} }}",
             allottedPrimaryBlocks, allottedSecondaryBlocks, absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq,
             maxNumBlocks, windowSize, isSWA);
     }
@@ -654,7 +654,7 @@ public:
     {
         auto it = mNumFrontBlocksRemovedPerWindow.find(windowSize);
         TLLM_CHECK_WITH_INFO(it != mNumFrontBlocksRemovedPerWindow.end(),
-            "GenerationRequest::getNumFrontBlocksRemoved: windowSize=%d not registered for request %lu", windowSize,
+            "GenerationRequest::getNumFrontBlocksRemoved: windowSize={} not registered for request {}", windowSize,
             static_cast<unsigned long>(mRequestId));
         return it->second;
     }

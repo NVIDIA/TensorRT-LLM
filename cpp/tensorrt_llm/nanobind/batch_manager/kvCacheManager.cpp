@@ -556,7 +556,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 // identity for a single-pool manager (dense, legacy layout).
                 auto const row = self.getBlockManager().getIndexerKCachePoolLayerIdx(layer_idx);
                 TLLM_CHECK_WITH_INFO(row >= 0,
-                    "Layer %d owns no indexer K cache (masked out by the per-layer indexer mask).", layer_idx);
+                    "Layer {} owns no indexer K cache (masked out by the per-layer indexer mask).", layer_idx);
                 auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
                 return pool.index({torch::indexing::Slice(), row});
             },

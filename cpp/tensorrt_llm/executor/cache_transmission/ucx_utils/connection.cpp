@@ -83,7 +83,7 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
     {
         std::string error = std::string("Error in UcxConnection constructor for rank ")
             + std::to_string(mManager->getRank()) + ": " + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 
     mSendTagPrefix = mConnectionIdInPeer;

@@ -1912,7 +1912,7 @@ std::string BounceTransport::localHandshakeBlob() const
     auto endpoint = mCtx.channel->localEndpoint();
     if (endpoint.empty())
     {
-        TLLM_THROW("BounceTransport(%s): ZMQ control requires a non-empty local endpoint", mCtx.selfName.c_str());
+        TLLM_THROW("BounceTransport({}): ZMQ control requires a non-empty local endpoint", mCtx.selfName.c_str());
     }
     BounceHandshake handshake;
     handshake.wireVersion = kBounceVersion;

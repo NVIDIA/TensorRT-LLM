@@ -293,7 +293,7 @@ public:
         int blockCountPerChannel = (epSize + MAX_GROUP_COUNT_PER_BLOCK - 1) / MAX_GROUP_COUNT_PER_BLOCK;
         blockCountPerChannel *= 2; // for send and recv
         TLLM_CHECK_WITH_INFO(
-            blockCountPerChannel <= smCount, "GPU should support at lease one channel, usableSmCount=%d", smCount);
+            blockCountPerChannel <= smCount, "GPU should support at lease one channel, usableSmCount={}", smCount);
         int perferredChannel = smCount / 2 / blockCountPerChannel; // use half SMs for communication
         int channelCount = std::max(perferredChannel, 1);          // at lease one channel
         return channelCount;

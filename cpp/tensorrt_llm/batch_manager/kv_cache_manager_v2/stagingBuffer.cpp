@@ -322,8 +322,8 @@ StagingBufferRange* StagingBufferManager::reserve(
     }
 
     TLLM_CHECK_WITH_INFO(false,
-        "StagingBufferManager has no contiguous retired range satisfying the request: minSize=%zu, maxSize=%zu, "
-        "totalSize=%zu",
+        "StagingBufferManager has no contiguous retired range satisfying the request: minSize={}, maxSize={}, "
+        "totalSize={}",
         minSize, maxSize, mSize);
     return nullptr;
 }

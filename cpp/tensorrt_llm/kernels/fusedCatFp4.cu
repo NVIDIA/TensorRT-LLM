@@ -185,20 +185,20 @@ void invokeFusedCatFp4(int8_t* packed_out, int32_t* scale_out, __nv_bfloat16 con
         return;
     }
 
-    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatFp4: head_dim must be 128, got %d", head_dim);
-    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim, "fusedCatFp4: pe_dim (%d) + nope_dim (%d) != head_dim (%d)",
+    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatFp4: head_dim must be 128, got {}", head_dim);
+    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim, "fusedCatFp4: pe_dim ({}) + nope_dim ({}) != head_dim ({})",
         pe_dim, nope_dim, head_dim);
     TLLM_CHECK_WITH_INFO(pe_dim % ELEMS_PER_THREAD == 0,
-        "fusedCatFp4: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
+        "fusedCatFp4: pe_dim ({}) must be a multiple of {} for vectorized access", pe_dim, ELEMS_PER_THREAD);
     TLLM_CHECK_WITH_INFO(
-        pe_row_stride >= pe_dim, "fusedCatFp4: pe_row_stride (%d) must be >= pe_dim (%d)", pe_row_stride, pe_dim);
-    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp4: nope_row_stride (%d) must be >= nope_dim (%d)",
+        pe_row_stride >= pe_dim, "fusedCatFp4: pe_row_stride ({}) must be >= pe_dim ({})", pe_row_stride, pe_dim);
+    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp4: nope_row_stride ({}) must be >= nope_dim ({})",
         nope_row_stride, nope_dim);
     TLLM_CHECK_WITH_INFO(pe_row_stride % ELEMS_PER_THREAD == 0,
-        "fusedCatFp4: pe_row_stride (%d) must be a multiple of %d for aligned vectorized access", pe_row_stride,
+        "fusedCatFp4: pe_row_stride ({}) must be a multiple of {} for aligned vectorized access", pe_row_stride,
         ELEMS_PER_THREAD);
     TLLM_CHECK_WITH_INFO(nope_row_stride % ELEMS_PER_THREAD == 0,
-        "fusedCatFp4: nope_row_stride (%d) must be a multiple of %d for aligned vectorized access", nope_row_stride,
+        "fusedCatFp4: nope_row_stride ({}) must be a multiple of {} for aligned vectorized access", nope_row_stride,
         ELEMS_PER_THREAD);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;

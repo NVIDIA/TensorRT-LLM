@@ -341,7 +341,7 @@ public:
         }
 
         TLLM_CHECK_WITH_INFO(group_comm->getSize() == ranks.size(),
-            "[ipcNvlsAllocate] group communicator size (%u) does not match the number of ranks (%zu).",
+            "[ipcNvlsAllocate] group communicator size ({}) does not match the number of ranks ({}).",
             group_comm->getSize(), ranks.size());
 
         // Globally unique process ids, used only to name the per-process IPC sockets.

@@ -324,7 +324,7 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
     if (onlyUseDynamicBuffer)
     {
         TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
-            "Cannot assign dynamic cache transfer buffer kind=%s because the transfer buffer pool is poisoned",
+            "Cannot assign dynamic cache transfer buffer kind={} because the transfer buffer pool is poisoned",
             bufferKindName(getBufferKind()));
         return std::nullopt;
     }
@@ -355,7 +355,7 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
         TLLM_THROW("Cache transfer buffer acquisition cancelled");
     }
     TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
-        "Cannot assign cache transfer buffer kind=%s because the transfer buffer pool is poisoned",
+        "Cannot assign cache transfer buffer kind={} because the transfer buffer pool is poisoned",
         bufferKindName(getBufferKind()));
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)

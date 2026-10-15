@@ -329,7 +329,7 @@ public:
         {
             TLLM_THROW(
                 "DeepGEMM only supports Hopper (SM90) architectures, but current device compute "
-                "capability is %d.",
+                "capability is {}.",
                 sm_version);
         }
 

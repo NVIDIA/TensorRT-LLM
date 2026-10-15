@@ -39,16 +39,16 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string const& filename)
 {
     int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0664);
-    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for writing (POSIX fallback)", filename.c_str());
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '{}' for writing (POSIX fallback)", filename.c_str());
 
     ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
     std::vector<uint8_t> hostBuffer(numBytes);
 
     cudaError_t cpyErr = cudaMemcpy(hostBuffer.data(), srcPtr->data(), numBytes, cudaMemcpyDeviceToHost);
-    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
+    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error={}", static_cast<int>(cpyErr));
 
     ssize_t written = ::write(fd, hostBuffer.data(), numBytes);
-    TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+    TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error={}", written);
 
     TLLM_LOG_DEBUG("Wrote {} bytes to {} (POSIX fallback)", written, filename.c_str());
 
@@ -59,18 +59,18 @@ static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string con
 static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string const& filename)
 {
     int fd = ::open(filename.c_str(), O_RDONLY);
-    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for reading (POSIX fallback)", filename.c_str());
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '{}' for reading (POSIX fallback)", filename.c_str());
 
     ssize_t numBytes = static_cast<ssize_t>(dstPtr->getSizeInBytes());
     std::vector<uint8_t> hostBuffer(numBytes);
 
     ssize_t bytesRead = ::read(fd, hostBuffer.data(), numBytes);
-    TLLM_CHECK_WITH_INFO(bytesRead >= 0, "POSIX read error=%zd", bytesRead);
+    TLLM_CHECK_WITH_INFO(bytesRead >= 0, "POSIX read error={}", bytesRead);
 
     TLLM_LOG_DEBUG("Read {} bytes from {} (POSIX fallback)", bytesRead, filename.c_str());
 
     cudaError_t cpyErr = cudaMemcpy(dstPtr->data(), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
-    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error={}", static_cast<int>(cpyErr));
 
     ::close(fd);
     return true;
@@ -90,7 +90,7 @@ KVCacheTransferManager::KVCacheTransferManager(
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx)
 {
-    TLLM_CHECK_WITH_INFO(!pools.empty(), "Pool index %lu is out of bounds", poolIdx);
+    TLLM_CHECK_WITH_INFO(!pools.empty(), "Pool index {} is out of bounds", poolIdx);
     auto const& pool = pools.at(poolIdx);
     auto ptr = block->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
     auto const blockOffset = block->getMemoryPoolBlockIndex();
@@ -139,9 +139,9 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 auto const& srcShape = srcPool->getShape();
                 auto const& dstShape = dstPool->getShape();
                 TLLM_CHECK_WITH_INFO(srcShape.nbDims >= 2,
-                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", srcShape.nbDims);
+                    "Expected layer-first KVCache pool to have at least 2 dims, got {}", srcShape.nbDims);
                 TLLM_CHECK_WITH_INFO(dstShape.nbDims >= 2,
-                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", dstShape.nbDims);
+                    "Expected layer-first KVCache pool to have at least 2 dims, got {}", dstShape.nbDims);
                 auto const srcLayerStrideBytes = srcPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
                 auto const dstLayerStrideBytes = dstPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
                 // rowBytes is the per-block per-layer payload — identical for primary and secondary.
@@ -189,7 +189,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                     auto shape = srcPtr->getShape();
 
                     TLLM_CHECK_WITH_INFO(
-                        shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
+                        shape.nbDims == 4, "Expected KVCache block to have 4 dims, got {}", shape.nbDims);
 
                     tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
                         numTokensToCopy, kvFactor, stream);

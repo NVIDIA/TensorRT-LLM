@@ -60,7 +60,7 @@ std::pair<std::vector<size_t>, std::vector<size_t>> MLACacheFormatter::pickRecvC
         size_t rankIdx = i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize;
         auto rank = targetInfo.mIRanks.at(rankIdx);
         auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
-        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank {} not found in counterPartRanks", rank);
         pickUpConnections.push_back(std::distance(counterPartRanks.begin(), it));
         localRankIndices.push_back(rankIdx);
     }
@@ -78,7 +78,7 @@ std::vector<size_t> MLACacheFormatter::pickSendConnections(size_t numConnections
     for (auto rank : targetInfo.mIRanks)
     {
         auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
-        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank {} not found in counterPartRanks", rank);
         indices.push_back(std::distance(counterPartRanks.begin(), it));
     }
     return indices;

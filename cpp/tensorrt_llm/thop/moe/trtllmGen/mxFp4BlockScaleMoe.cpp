@@ -541,7 +541,7 @@ public:
     RunnerType& getRunner(int32_t tileN, bool useFineGrained)
     {
         auto* runner = getRunnerOrNull(tileN, useFineGrained);
-        TLLM_CHECK_WITH_INFO(runner != nullptr, "No %s Bf16MxE2m1 runner available for tileN=%d",
+        TLLM_CHECK_WITH_INFO(runner != nullptr, "No {} Bf16MxE2m1 runner available for tileN={}",
             useFineGrained ? "FineGrained" : "non-FineGrained", tileN);
         return *runner;
     }
@@ -688,7 +688,7 @@ public:
     RunnerType& getRunner(int32_t tileN, bool useFineGrained)
     {
         auto* runner = getRunnerOrNull(tileN, useFineGrained);
-        TLLM_CHECK_WITH_INFO(runner != nullptr, "No %s MxE4m3MxE2m1 runner available for tileN=%d",
+        TLLM_CHECK_WITH_INFO(runner != nullptr, "No {} MxE4m3MxE2m1 runner available for tileN={}",
             useFineGrained ? "FineGrained" : "non-FineGrained", tileN);
         return *runner;
     }

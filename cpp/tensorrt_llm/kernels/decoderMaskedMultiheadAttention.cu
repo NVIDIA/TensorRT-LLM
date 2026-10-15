@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -101,17 +101,17 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     bool const enable_attn_logit_softcapping = params.attn_logit_softcapping_scale > 0.f;
     int const head_size = params.hidden_size_per_head;
     TLLM_CHECK_WITH_INFO(!has_implicit_rel_attn_bias || head_size == 32 || head_size == 64 || head_size == 128,
-        "MMHA kernels haven't instantiate implicit_relative_attention_bias paths for head size %d.", head_size);
+        "MMHA kernels haven't instantiate implicit_relative_attention_bias paths for head size {}.", head_size);
     TLLM_CHECK_WITH_INFO(!enable_attn_logit_softcapping || head_size == 128 || head_size == 256,
-        "MMHA kernels haven't instantiate attn_logit_softcapping_scale paths for head size %d.", head_size);
+        "MMHA kernels haven't instantiate attn_logit_softcapping_scale paths for head size {}.", head_size);
     TLLM_CHECK_WITH_INFO(!(enable_attn_logit_softcapping && has_implicit_rel_attn_bias),
         "MMHA kernels haven't instantiate implicit_relative_attention_bias + attn_logit_softcapping_scale paths for "
-        "head size %d.",
+        "head size {}.",
         head_size);
 
     bool const has_block_sparse_attn = params.block_sparse_attention;
     TLLM_CHECK_WITH_INFO(!has_block_sparse_attn || head_size == 128,
-        "MMHA kernels were not instantiated for block_sparse_attention for head size %d.", head_size);
+        "MMHA kernels were not instantiated for block_sparse_attention for head size {}.", head_size);
     TLLM_CHECK_WITH_INFO(!(has_implicit_rel_attn_bias && has_block_sparse_attn),
         "MMHA kernels do not support combining implicit_relative_attention_bias and block_sparse_attention");
 
@@ -132,7 +132,7 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     case 192: MMHA_LAUNCH_KERNEL(192);
     case 224: MMHA_LAUNCH_KERNEL(224);
 #endif // FAST_BUILD
-    default: TLLM_CHECK_WITH_INFO(false, "unsupported head_size %d", params.hidden_size_per_head);
+    default: TLLM_CHECK_WITH_INFO(false, "unsupported head_size {}", params.hidden_size_per_head);
     }
 }
 

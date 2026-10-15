@@ -101,12 +101,12 @@ void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* 
     void* v_out, int P, int B, int D, int Sp_q, int H_q, int Sp_k, int H_k, int Sp_v, int H_v, cudaStream_t stream)
 {
     constexpr int VEC = 8;
-    TLLM_CHECK_WITH_INFO(D % VEC == 0, "ulyssesPostUnscatter: D must be a multiple of 8 (uint4 vec), got %d", D);
+    TLLM_CHECK_WITH_INFO(D % VEC == 0, "ulyssesPostUnscatter: D must be a multiple of 8 (uint4 vec), got {}", D);
     int const vec_per_row = D / VEC;
     int const H_max = std::max(H_q, std::max(H_k, H_v));
     int const threads = H_max * vec_per_row;
     TLLM_CHECK_WITH_INFO(threads <= 1024,
-        "ulyssesPostUnscatter: threads/block (maxH*D/8) must be <= 1024, got maxH=%d D=%d -> %d", H_max, D, threads);
+        "ulyssesPostUnscatter: threads/block (maxH*D/8) must be <= 1024, got maxH={} D={} -> {}", H_max, D, threads);
 
     int const total_tiles = P * (Sp_q + Sp_k + Sp_v); // packed over Q/K/V, no idle blocks
     dim3 const grid(total_tiles, B, 1);

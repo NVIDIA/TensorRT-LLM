@@ -133,12 +133,12 @@ void runCollectivePhase(McastGroupComm& comm, char const* phase, Action action, 
     if (failureIsTerminal)
     {
         TLLM_THROW(
-            "[McastDeviceMemory] %s failed on one or more ranks; the object is unusable and the process must be "
+            "[McastDeviceMemory] {} failed on one or more ranks; the object is unusable and the process must be "
             "torn down.",
             phase);
     }
     TLLM_THROW(
-        "[McastDeviceMemory] %s failed on one or more ranks before restore mutation; the object remains "
+        "[McastDeviceMemory] {} failed on one or more ranks before restore mutation; the object remains "
         "unmapped and the caller may retry with a valid communicator.",
         phase);
 }
@@ -175,11 +175,11 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
     // allocate for a different number of peers) and would deadlock the collectives below.
     TLLM_CHECK_WITH_INFO(mGroupComm != nullptr, "[McastDeviceMemory] group communicator must not be null.");
     TLLM_CHECK_WITH_INFO(mGroupComm->getSize() == mGroupSize,
-        "[McastDeviceMemory] group communicator size (%u) does not match the requested group size (%u). Under a "
+        "[McastDeviceMemory] group communicator size ({}) does not match the requested group size ({}). Under a "
         "non-MPI orchestrator this usually means the process group passed in does not cover the TP group.",
         mGroupComm->getSize(), mGroupSize);
     TLLM_CHECK_WITH_INFO(mGroupComm->getRank() == mGroupRank,
-        "[McastDeviceMemory] group communicator rank (%u) does not match the requested group rank (%u).",
+        "[McastDeviceMemory] group communicator rank ({}) does not match the requested group rank ({}).",
         mGroupComm->getRank(), mGroupRank);
 
     // Retained so checkpointRestore() can confirm a replacement backend covers the same processes.

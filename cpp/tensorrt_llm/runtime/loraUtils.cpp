@@ -88,7 +88,7 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
         SizeType32 nbModelLayers = modelConfig.getNbLoraLayers();
         auto const expectedDataType = loraDataType.value_or(modelConfig.getDataType());
         TLLM_CHECK_WITH_INFO(weights->getDataType() == expectedDataType,
-            "Expected LoRA weights dtype %s to match homogeneous cache dtype %s", weights->getDataTypeName(),
+            "Expected LoRA weights dtype {} to match homogeneous cache dtype {}", weights->getDataTypeName(),
             IBuffer::getDataTypeName(expectedDataType));
 
         auto loraModules = modelConfig.getLoraModules();

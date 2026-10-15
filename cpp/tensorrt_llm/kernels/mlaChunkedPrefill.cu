@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -309,7 +309,7 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T c
     cudaStream_t stream)
 {
     using KT = MergeSoftmaxTraits<T>;
-    TLLM_CHECK_WITH_INFO(head_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(head_size == KT::kHeadSize, "head dim should be equal to {}", KT::kHeadSize);
 
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_q_seq_len, KT::kTokenPerBlock)), batch_size, num_heads);
     dim3 block(KT::kNumThreads);
@@ -326,9 +326,9 @@ void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray c
     int max_seq_len, float const* kv_scale_quant_orig_ptr, cudaStream_t stream)
 {
     using KT = loadChunkedKVKernelTraits<TCache>;
-    TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
-    TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora dim should be equal to %d", KT::kLoraSize);
-    TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope dim should be equal to %d", KT::kRopeSize);
+    TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to {}", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora dim should be equal to {}", KT::kLoraSize);
+    TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope dim should be equal to {}", KT::kRopeSize);
     // {chunked_unit_size / token_per_block, batch_size, head_num}
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_seq_len, KT::kTokenPerBlock)), num_contexts, 1);
     loadChunkedKVCacheForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(output_kv_ptr, output_k_pe_ptr,

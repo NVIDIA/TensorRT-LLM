@@ -215,7 +215,7 @@ public:
     void insertBlocks(PrefixKey const& prefix, int windowSize, std::vector<BlockPtr> const& blocks)
     {
         TLLM_CHECK_WITH_INFO(blocks.size() == prefix.size(),
-            "insertBlocks: blocks.size()=%zu must equal prefix.size()=%zu", blocks.size(), prefix.size());
+            "insertBlocks: blocks.size()={} must equal prefix.size()={}", blocks.size(), prefix.size());
         auto nodeMatches = insertNodes(prefix);
         for (size_t i = 0; i < nodeMatches.exactMatches.size(); ++i)
         {

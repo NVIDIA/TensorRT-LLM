@@ -73,7 +73,7 @@ void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& p
     int const smVersion = tensorrt_llm::common::getSMVersion();
     // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
     TLLM_CHECK_WITH_INFO(smVersion == fp8GroupedGemmConfig::kSm90 || smVersion == fp8GroupedGemmConfig::kSm100,
-        "%s requires Hopper (SM90) or B200 (SM100), but the current device is SM%d", kernelName, smVersion);
+        "{} requires Hopper (SM90) or B200 (SM100), but the current device is SM{}", kernelName, smVersion);
 
     for (size_t problemIdx = 0; problemIdx < problemSizes.size(); ++problemIdx)
     {
@@ -84,8 +84,8 @@ void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& p
         }
 
         TLLM_CHECK_WITH_INFO(problem.n() % kFp8TmaAlignment == 0 && problem.k() % kFp8TmaAlignment == 0,
-            "%s requires GEMM N and K dimensions to be multiples of %d elements for 128-bit TMA alignment. "
-            "Problem %zu has M=%d, N=%d, K=%d.",
+            "{} requires GEMM N and K dimensions to be multiples of {} elements for 128-bit TMA alignment. "
+            "Problem {} has M={}, N={}, K={}.",
             kernelName, kFp8TmaAlignment, problemIdx, problem.m(), problem.n(), problem.k());
     }
 }
@@ -402,7 +402,7 @@ void fp8GroupedGemmImpl(std::vector<cutlass::gemm::GemmCoord> const& problemSize
     int64_t const totalParamsBytes
         = szProblemShapes + szPtrA + szPtrB + szPtrC + szPtrD + szStrideA + szStrideB + szStrideC + szStrideD;
     TLLM_CHECK_WITH_INFO(totalParamsBytes <= gemmParamsWorkSpaceSize,
-        "FP8 grouped GEMM params workspace too small: need %ld, have %ld", totalParamsBytes, gemmParamsWorkSpaceSize);
+        "FP8 grouped GEMM params workspace too small: need {}, have {}", totalParamsBytes, gemmParamsWorkSpaceSize);
 
     // Stage everything into a single host buffer, then memcpy to device.
     std::vector<char> hostBuf(totalParamsBytes);
@@ -476,18 +476,18 @@ void fp8GroupedGemmImpl(std::vector<cutlass::gemm::GemmCoord> const& problemSize
 
     size_t const workspaceSize = Gemm::get_workspace_size(arguments);
     TLLM_CHECK_WITH_INFO(static_cast<int64_t>(workspaceSize) <= gemmWorkspaceSize,
-        "FP8 grouped GEMM workspace too small: need %lu, have %ld", workspaceSize, gemmWorkspaceSize);
+        "FP8 grouped GEMM workspace too small: need {}, have {}", workspaceSize, gemmWorkspaceSize);
 
     cutlass::Status status = gemm.can_implement(arguments);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 grouped GEMM can_implement failed: %s",
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 grouped GEMM can_implement failed: {}",
         cutlass::cutlassGetStatusString(status));
 
     status = gemm.initialize(arguments, gemmWorkSpace, stream);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 grouped GEMM initialize failed: %s",
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 grouped GEMM initialize failed: {}",
         cutlass::cutlassGetStatusString(status));
 
     status = gemm.run(stream);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 grouped GEMM run failed: %s",
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 grouped GEMM run failed: {}",
         cutlass::cutlassGetStatusString(status));
 
     sync_check_cuda_error(stream);
@@ -517,7 +517,7 @@ void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, s
         return;
 #endif
     }
-    TLLM_CHECK_WITH_INFO(false, "FP8 grouped GEMM was not compiled for SM%d", smVersion);
+    TLLM_CHECK_WITH_INFO(false, "FP8 grouped GEMM was not compiled for SM{}", smVersion);
 }
 
 #endif // CUTLASS architecture support

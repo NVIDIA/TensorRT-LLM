@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ static void allocateAlignedHugePage(void* hintAddr, size_t sizeBytes, int numaNo
         TLLM_THROW("mmap aligned failed.");
         return;
     }
-    TLLM_CHECK_WITH_INFO(alignedAddr == hintAddr, "alignedAddr=%p, but hintAddr=%p", alignedAddr, hintAddr);
+    TLLM_CHECK_WITH_INFO(alignedAddr == hintAddr, "alignedAddr={:p}, but hintAddr={:p}", alignedAddr, hintAddr);
 
     void* addr = alignedAddr;
 
@@ -354,7 +354,7 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
     int currentDevId = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&currentDevId));
     TLLM_CHECK_WITH_INFO(currentDevId == mDevId,
-        "HostAccessibleDeviceAllocator is not initialized for the current device, currentDevId=%d, mDevId=%d",
+        "HostAccessibleDeviceAllocator is not initialized for the current device, currentDevId={}, mDevId={}",
         currentDevId, mDevId);
     TLLM_CHECK_WITH_INFO(isSupported(), "HostAccessibleDeviceAllocator is not supported on the current system.");
     void* devPtr = nullptr;

@@ -1309,7 +1309,7 @@ void lowPrecisionAllReduceDispatchType(kernels::LowPrecisionAllReduceParams& par
     case 2: lowPrecisionAllReduceDispatchRanksPerNode<T, __nv_fp8_e4m3, 2>(param, stream); break;
     case 4: lowPrecisionAllReduceDispatchRanksPerNode<T, __nv_fp8_e4m3, 4>(param, stream); break;
     case 8: lowPrecisionAllReduceDispatchRanksPerNode<T, __nv_fp8_e4m3, 8>(param, stream); break;
-    default: TLLM_THROW("Custom LowPrecision all reduce only supported on {2, 4, 8} GPUs per node.");
+    default: TLLM_THROW("Custom LowPrecision all reduce only supported on {{2, 4, 8}} GPUs per node.");
     }
 #else
     TLLM_THROW("Can't Use Low Precision Allreduce When Compile Without ENABLE_FP8");
@@ -1367,7 +1367,7 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize(
     // Check initialization
     if (!static_buffers->initialized || static_buffers->tpSize != tpSize)
     {
-        TLLM_THROW("Static buffers for TP size %zu not initialized", tpSize);
+        TLLM_THROW("Static buffers for TP size {} not initialized", tpSize);
     }
 
     // Use the stored flag pointer
@@ -1411,7 +1411,7 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize_hier(
     // Check initialization
     if (!static_buffers->initialized || static_buffers->tpSize != tpSize)
     {
-        TLLM_THROW("Static buffers for TP size %zu not initialized", tpSize);
+        TLLM_THROW("Static buffers for TP size {} not initialized", tpSize);
     }
 
     // Use the stored flag pointer

@@ -293,8 +293,8 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_he
 {
     // num_heads cap is SMEM/register driven (MAX_N = 64 * HEAD_DIM in the kernel template),
     // NOT block_size — the launcher uses a fixed blockDim=256 with 2 rows/CTA.
-    TLLM_CHECK_WITH_INFO(num_heads <= 64, "fusedDiTSplitNormFullDimRope: num_heads (%d) must be <= 64", num_heads);
-    TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDimRope: num_heads must be >= 1, got %d", num_heads);
+    TLLM_CHECK_WITH_INFO(num_heads <= 64, "fusedDiTSplitNormFullDimRope: num_heads ({}) must be <= 64", num_heads);
+    TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDimRope: num_heads must be >= 1, got {}", num_heads);
 
     int const N = num_heads * head_dim;
     constexpr int ROWS_PER_BLOCK = 2;
@@ -331,7 +331,7 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_he
         {                                                                                                              \
         case 64: LAUNCH(64, INTERLEAVE, PER_HEAD, COS_T); break;                                                       \
         case 128: LAUNCH(128, INTERLEAVE, PER_HEAD, COS_T); break;                                                     \
-        default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormFullDimRope: %d (only 64, 128)", head_dim);     \
+        default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormFullDimRope: {} (only 64, 128)", head_dim);     \
         }                                                                                                              \
     } while (0)
 #define DISPATCH_DTYPE(INTERLEAVE, PER_HEAD)                                                                           \

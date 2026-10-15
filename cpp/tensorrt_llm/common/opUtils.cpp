@@ -341,10 +341,11 @@ void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasSta
 {
     auto const mem = getMemoryInfo();
     TLLM_THROW(
-        "Failed to create %s. "
-        "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+        "Failed to create {}. "
+        "Status: {}, Context: {:p}, Free Memory: {} MB ({:.1f}%), Total: {} MB. "
         "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
-        operation, status, ctx, mem.free_mb, mem.free_percent, mem.total_mb);
+        operation, static_cast<int>(status), static_cast<void const*>(ctx), mem.free_mb, mem.free_percent,
+        mem.total_mb);
 }
 
 } // namespace

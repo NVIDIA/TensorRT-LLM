@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ tensorrt_llm::runtime::ITensor::Shape convert_shape(torch::Tensor tensor)
     constexpr auto trtMaxDims = tensorrt_llm::Dims::MAX_DIMS;
     auto const torchTensorNumDims = tensor.dim();
     TLLM_CHECK_WITH_INFO(torchTensorNumDims <= trtMaxDims,
-        "TensorRT supports at most %i tensor dimensions. Found a Torch tensor with %li dimensions.", trtMaxDims,
+        "TensorRT supports at most {} tensor dimensions. Found a Torch tensor with {} dimensions.", trtMaxDims,
         torchTensorNumDims);
     auto result = tensorrt_llm::Dims{};
     result.nbDims = static_cast<int32_t>(torchTensorNumDims);
@@ -108,7 +108,7 @@ cudaDataType_t convert_torch_dtype(torch::ScalarType dtype)
     case torch::kByte: return CUDA_R_8U;
     case torch::kChar: return CUDA_R_8I;
     case torch::kBool: return CUDA_R_8U;
-    default: TLLM_THROW("Unsupported torch dtype %s to convert", c10::toString(dtype));
+    default: TLLM_THROW("Unsupported torch dtype {} to convert", c10::toString(dtype));
     }
 }
 

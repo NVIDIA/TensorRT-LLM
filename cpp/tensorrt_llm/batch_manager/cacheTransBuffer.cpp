@@ -83,7 +83,7 @@ tensorrt_llm::DataType getTransferDataType(KVCacheManager::BaseKVCacheManager* c
 
         TLLM_CHECK_WITH_INFO(poolDataType == attentionDataType.value(),
             "Disaggregated KV cache transfer does not yet support attention pools with differing dtypes "
-            "(pool %d dtype=%d, pool %d dtype=%d). TODO(disagg-multi-dtype): per-pool dtype dispatch in formatter.",
+            "(pool {} dtype={}, pool {} dtype={}). TODO(disagg-multi-dtype): per-pool dtype dispatch in formatter.",
             firstPoolIdx, static_cast<int>(attentionDataType.value()), poolIdx, static_cast<int>(poolDataType));
     }
 

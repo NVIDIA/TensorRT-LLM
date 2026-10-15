@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
     do                                                                                                                 \
     {                                                                                                                  \
         auto e = cmd;                                                                                                  \
-        TLLM_CHECK_WITH_INFO(e == MPI_SUCCESS, "Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e);                 \
+        TLLM_CHECK_WITH_INFO(e == MPI_SUCCESS, "Failed: MPI error {}:{} '{}'", __FILE__, __LINE__, e);                 \
     } while (0)
 
 #define TLLM_NCCL_CHECK(cmd)                                                                                           \
@@ -35,6 +35,6 @@
     {                                                                                                                  \
         ncclResult_t r = cmd;                                                                                          \
         TLLM_CHECK_WITH_INFO(                                                                                          \
-            r == ncclSuccess, "Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r));           \
+            r == ncclSuccess, "Failed, NCCL error {}:{} '{}'\n", __FILE__, __LINE__, ncclGetErrorString(r));           \
     } while (0)
 #endif // ENABLE_MULTI_DEVICE

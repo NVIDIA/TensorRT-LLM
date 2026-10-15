@@ -407,7 +407,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method %s of enum %d",
+        TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method {} of enum {}",
             serializeMoeRoutingMethodType(routingMethodType).c_str(), (int) routingMethodType);
     }
 }

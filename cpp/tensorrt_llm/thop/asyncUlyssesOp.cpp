@@ -337,7 +337,7 @@ private:
 
         auto ptrs = newHandle->get_buffer_ptrs();
         TLLM_CHECK_WITH_INFO(
-            static_cast<int>(ptrs.size()) == pSize, "get_buffer_ptrs size %zu != world_size %d", ptrs.size(), pSize);
+            static_cast<int>(ptrs.size()) == pSize, "get_buffer_ptrs size {} != world_size {}", ptrs.size(), pSize);
         std::vector<void*> newPeerPtrs(ptrs.begin(), ptrs.end());
 
         // cudaMalloc last so any throw above is cleaned up by newSymmTensor /

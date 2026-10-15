@@ -53,7 +53,7 @@ WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParall
     {
         // total number is at most mGpusPerNode
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(numDevices) <= mGpusPerNode,
-            "Number of device IDs %zu is greater than GPUs per node %d", numDevices, mGpusPerNode);
+            "Number of device IDs {} is greater than GPUs per node {}", numDevices, mGpusPerNode);
 
         // all deviceIds is within the range
         TLLM_CHECK(*std::max_element(mDeviceIds.begin(), mDeviceIds.end()) < mGpusPerNode);
@@ -62,7 +62,7 @@ WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParall
         // all ids are unique
         std::set<SizeType32> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
         TLLM_CHECK_WITH_INFO(
-            deviceIdSet.size() == numDevices, "Device IDs are not unique %zu != %zu", deviceIdSet.size(), numDevices);
+            deviceIdSet.size() == numDevices, "Device IDs are not unique {} != {}", deviceIdSet.size(), numDevices);
 
         // log a warning if device ids are not contiguous
         if (std::adjacent_find(deviceIdSet.begin(), deviceIdSet.end(), [](auto x, auto y) { return y - x != 1; })
@@ -104,7 +104,7 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
     auto const tp = tensorParallelism.value_or(mpiSize / pp / cp);
     TLLM_LOG_DEBUG("TP: {}, PP: {}, CP: {}, gpusPerNode: {}", tp, pp, cp, gpusPerNode);
     TLLM_CHECK_WITH_INFO(
-        mpiSize == tp * pp * cp, "MPI size %d != TP size %d * PP size %d * CP Size %d", mpiSize, tp, pp, cp);
+        mpiSize == tp * pp * cp, "MPI size {} != TP size {} * PP size {} * CP Size {}", mpiSize, tp, pp, cp);
     SizeType32 deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     if (deviceCount < std::min(mpiSize, gpusPerNode))

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -105,7 +105,7 @@ inline std::vector<size_t> pickSendConnections(size_t numConnections, CacheState
     for (auto rank : targetInfo.mIRanks)
     {
         auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
-        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank {} not found in counterPartRanks", rank);
         indices.push_back(std::distance(counterPartRanks.begin(), it));
     }
     return indices;

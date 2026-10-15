@@ -216,11 +216,11 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t con
     int const num_vec_cols = num_cols / elts_in_int32;
 
     TLLM_CHECK_WITH_INFO(num_rows % B_ROWS_PER_MMA == 0,
-        fmtstr("Invalid shape for quantized tensor. Number of rows of quantized matrix must be a multiple of %d",
-            B_ROWS_PER_MMA));
+        "Invalid shape for quantized tensor. Number of rows of quantized matrix must be a multiple of {}",
+        B_ROWS_PER_MMA);
     TLLM_CHECK_WITH_INFO(num_cols % MMA_SHAPE_N == 0,
-        fmtstr("Invalid shape for quantized tensor. On turing/Ampere, the number of cols must be a multiple of %d.",
-            MMA_SHAPE_N));
+        "Invalid shape for quantized tensor. On turing/Ampere, the number of cols must be a multiple of {}.",
+        MMA_SHAPE_N);
 
     TLLM_CHECK_WITH_INFO(size_t(B_ROWS_PER_MMA) == row_permutation.size(), "Unexpected number of LDSM rows permuted.");
 
@@ -284,9 +284,9 @@ void subbyte_transpose_impl(
     // of 64 for weight-only quantization. As a result, this seemed like a reasonable tradeoff because it
     // allows GCC to emit vector instructions.
     TLLM_CHECK_WITH_INFO(!(col_bytes_trans % VECTOR_WIDTH) && !(col_bytes % VECTOR_WIDTH),
-        fmtstr("Number of bytes for rows and cols must be a multiple of %d. However, num_rows_bytes = %ld and "
-               "num_col_bytes = %ld.",
-            VECTOR_WIDTH, col_bytes_trans, col_bytes));
+        "Number of bytes for rows and cols must be a multiple of {}. However, num_rows_bytes = {} and "
+        "num_col_bytes = {}.",
+        VECTOR_WIDTH, col_bytes_trans, col_bytes);
 
     int const num_m_tiles = (num_rows + M_TILE_L1 - 1) / M_TILE_L1;
     int const num_n_tiles = (col_bytes + N_TILE_L1 - 1) / N_TILE_L1;
@@ -531,13 +531,13 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, int8_t
     int const rows_per_tile = details.rows_per_column_tile;
 
     TLLM_CHECK_WITH_INFO(!(num_rows % elts_in_int32),
-        fmtstr("The number of rows must be a multiple of %d but the number of rows is %ld.", elts_in_int32, num_rows));
+        "The number of rows must be a multiple of {} but the number of rows is {}.", elts_in_int32, num_rows);
 
     uint32_t const* input_byte_ptr = reinterpret_cast<uint32_t const*>(quantized_tensor);
     uint32_t* output_byte_ptr = reinterpret_cast<uint32_t*>(interleaved_quantized_tensor);
 
     TLLM_CHECK_WITH_INFO(!(num_rows % rows_per_tile),
-        fmtstr("The number of rows must be a multiple of %d but the number of rows is %ld.", rows_per_tile, num_rows));
+        "The number of rows must be a multiple of {} but the number of rows is {}.", rows_per_tile, num_rows);
 
     int const num_vec_rows = num_rows / elts_in_int32;
     int const vec_rows_per_tile = rows_per_tile / elts_in_int32;

@@ -66,7 +66,7 @@ int getActiveSlotCount(
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<uint8_t> const* deadRankMask)
 {
     TLLM_CHECK_WITH_INFO(deadRankMask == nullptr || static_cast<int>(deadRankMask->size()) == metaInfo.epSize,
-        "deadRankMask size (%ld) must match epSize (%d)",
+        "deadRankMask size ({}) must match epSize ({})",
         deadRankMask == nullptr ? 0L : static_cast<long>(deadRankMask->size()), metaInfo.epSize);
 
     int activeRankCount = 0;
@@ -88,7 +88,7 @@ void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float
     cpuPlacement->expertReplicaCount.resize(metaInfo.expertCount);
     int totalSlotCount = getActiveSlotCount(metaInfo, deadRankMask);
     TLLM_CHECK_WITH_INFO(totalSlotCount >= metaInfo.expertCount,
-        "Mask-only EPLB reconfigure would leave fewer active slots (%d) than experts (%d)", totalSlotCount,
+        "Mask-only EPLB reconfigure would leave fewer active slots ({}) than experts ({})", totalSlotCount,
         metaInfo.expertCount);
     // --- Edge Case 1: No replication needed ---
     if (totalSlotCount == metaInfo.expertCount)
@@ -166,7 +166,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
 
     for (int expertId = 0; expertId < metaInfo.expertCount; ++expertId)
     {
-        TLLM_CHECK_WITH_INFO(replicaCount[expertId] > 0, "Replica count (%d) for expert %d must be positive",
+        TLLM_CHECK_WITH_INFO(replicaCount[expertId] > 0, "Replica count ({}) for expert {} must be positive",
             replicaCount[expertId], expertId);
         double slotSize = expertLoadFactor[expertId] / static_cast<double>(replicaCount[expertId]);
         for (int replicaId = 0; replicaId < replicaCount[expertId]; ++replicaId)
@@ -177,7 +177,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     }
 
     TLLM_CHECK_WITH_INFO(static_cast<int>(allReplicas.size()) == totalSlotCount,
-        "Replica count sum (%ld) must match active slot count (%d)", static_cast<long>(allReplicas.size()),
+        "Replica count sum ({}) must match active slot count ({})", static_cast<long>(allReplicas.size()),
         totalSlotCount);
 
     // 2. Sort replicas by slotSize descending
@@ -217,7 +217,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
 
         int localSlotId = currentRankSlots[bestRank];
         TLLM_CHECK_WITH_INFO(localSlotId < metaInfo.slotCountPerRank,
-            "localSlotId=%d should be less than metaInfo.slotCountPerRank=%d", localSlotId, metaInfo.slotCountPerRank);
+            "localSlotId={} should be less than metaInfo.slotCountPerRank={}", localSlotId, metaInfo.slotCountPerRank);
         rankExpertIds[bestRank][localSlotId] = replica.expertId;
 
         // Update rank state
@@ -309,11 +309,11 @@ void prepareGpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaI
             {
                 continue;
             }
-            TLLM_CHECK_WITH_INFO(expertId < metaInfo.expertCount, "expertId=%d should be in range [0, %d)", expertId,
+            TLLM_CHECK_WITH_INFO(expertId < metaInfo.expertCount, "expertId={} should be in range [0, {})", expertId,
                 metaInfo.expertCount);
             int replicaId = globalSlotIds[expertId].size();
             TLLM_CHECK_WITH_INFO(replicaId < cpuPlacement->placementInfoForGPU.expertReplicaCount[expertId],
-                "Expert %d has more placed replicas than its replica count (%d)", expertId,
+                "Expert {} has more placed replicas than its replica count ({})", expertId,
                 cpuPlacement->placementInfoForGPU.expertReplicaCount[expertId]);
             int globalSlotId = rank * metaInfo.slotCountPerRank + slotId;
             globalSlotIds[expertId].push_back(globalSlotId);
@@ -323,7 +323,7 @@ void prepareGpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaI
         }
     }
     TLLM_CHECK_WITH_INFO(assignedSlotCount == startOffset,
-        "Placed slot count (%d) must match active replica count (%d)", assignedSlotCount, startOffset);
+        "Placed slot count ({}) must match active replica count ({})", assignedSlotCount, startOffset);
     // printCpuPlacementInfo(metaInfo, cpuPlacement);
 }
 
@@ -475,7 +475,7 @@ void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> co
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
             int expertId = initialWeightAssignments[rank * mMetaInfo.slotCountPerRank + localSlotId];
-            TLLM_CHECK_WITH_INFO(expertId >= 0 && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
+            TLLM_CHECK_WITH_INFO(expertId >= 0 && expertId < mMetaInfo.expertCount, "expertId={}", expertId);
             mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = expertId;
             mCpuPlacementInfo.expertReplicaCount[expertId]++;
         }
@@ -527,7 +527,7 @@ void SingleLayerMoeLoadBalancer::finalizeModel()
 
 void SingleLayerMoeLoadBalancer::startCpuNewIter(int64_t iterId, bool enableStatistic, bool enableUpdateWeights)
 {
-    TLLM_CHECK_WITH_INFO(mIterId + 1 == iterId, "Expected iterId=%ld, but got %ld", mIterId + 1, iterId);
+    TLLM_CHECK_WITH_INFO(mIterId + 1 == iterId, "Expected iterId={}, but got {}", mIterId + 1, iterId);
     mIterId = iterId;
     mStatisticEnabled = enableStatistic;
     mUpdateWeightsEnabled = enableUpdateWeights;
@@ -578,7 +578,7 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeMaskOnlyReplicaCounts(
     std::vector<uint8_t> const& deadRankMask) const
 {
     TLLM_CHECK_WITH_INFO(static_cast<int>(deadRankMask.size()) == mMetaInfo.epSize,
-        "deadRankMask size (%ld) must match epSize (%d)", static_cast<long>(deadRankMask.size()), mMetaInfo.epSize);
+        "deadRankMask size ({}) must match epSize ({})", static_cast<long>(deadRankMask.size()), mMetaInfo.epSize);
 
     std::vector<int> expertReplicaCount(mMetaInfo.expertCount, 0);
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
@@ -588,7 +588,7 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeMaskOnlyReplicaCounts(
         {
             int expertId = mCpuPlacementInfo.oldRankExpertIds[rank][localSlotId];
             TLLM_CHECK_WITH_INFO(expertId == -1 || (expertId >= 0 && expertId < mMetaInfo.expertCount),
-                "expertId=%d should be -1 or in range [0, %d)", expertId, mMetaInfo.expertCount);
+                "expertId={} should be -1 or in range [0, {})", expertId, mMetaInfo.expertCount);
             if (!rankDead && expertId >= 0)
             {
                 ++expertReplicaCount[expertId];
@@ -599,7 +599,7 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeMaskOnlyReplicaCounts(
     for (int expertId = 0; expertId < mMetaInfo.expertCount; ++expertId)
     {
         TLLM_CHECK_WITH_INFO(expertReplicaCount[expertId] > 0,
-            "Mask-only EPLB reconfigure would leave expert %d with no surviving replica", expertId);
+            "Mask-only EPLB reconfigure would leave expert {} with no surviving replica", expertId);
     }
     return expertReplicaCount;
 }
@@ -720,17 +720,17 @@ void MoeWeightUpdaterBase::addSingleWeightSlot(
 {
     TLLM_CHECK_WITH_INFO(mWeightSlotsFinalized == false, "Cannot add slots after finalize");
     TLLM_CHECK_WITH_INFO(localSlotId >= 0 && localSlotId < mMetaInfo.slotCountPerRank,
-        "localSlotId (%d) should be in range[0, %d)", localSlotId, mMetaInfo.slotCountPerRank);
+        "localSlotId ({}) should be in range[0, {})", localSlotId, mMetaInfo.slotCountPerRank);
     TLLM_CHECK_WITH_INFO(weightSlot.mWeightPtr != nullptr && weightSlot.mHeight > 0 && weightSlot.mWidth > 0
             && weightSlot.mPitch >= weightSlot.mWidth,
-        "Invalid weightSlot ptr=%p, Height=%ld, Width=%ld, with Pitch=%ld", weightSlot.mWeightPtr, weightSlot.mHeight,
+        "Invalid weightSlot ptr={:p}, Height={}, Width={}, with Pitch={}", weightSlot.mWeightPtr, weightSlot.mHeight,
         weightSlot.mWidth, weightSlot.mPitch);
     if (mWeightSlots.find(name) == mWeightSlots.end())
     {
         mWeightSlots.emplace(name, std::vector<MoeWeight>(mMetaInfo.slotCountPerRank));
     }
     TLLM_CHECK_WITH_INFO(mWeightSlots[name][localSlotId].mWeightPtr == nullptr,
-        "localSlotId=%d, name=%s already added.", localSlotId, name.c_str());
+        "localSlotId={}, name={} already added.", localSlotId, name.c_str());
     if (!gpuAccess)
     {
         // if using cpu copy, change to host accessible pointer.
@@ -748,15 +748,15 @@ void MoeWeightUpdaterBase::finalizeWeightSlot()
         auto name = it->first;
         auto& vecWeights = it->second;
         TLLM_CHECK_WITH_INFO(vecWeights.size() == static_cast<size_t>(mMetaInfo.slotCountPerRank),
-            "slot count not match for %s", name.c_str());
+            "slot count not match for {}", name.c_str());
         for (int i = 0; i < mMetaInfo.slotCountPerRank; ++i)
         {
-            TLLM_CHECK_WITH_INFO(vecWeights[i].mWeightPtr != nullptr, "slotId=%d, name=%s not added.", i, name.c_str());
+            TLLM_CHECK_WITH_INFO(vecWeights[i].mWeightPtr != nullptr, "slotId={}, name={} not added.", i, name.c_str());
             if (i > 0)
             {
                 TLLM_CHECK_WITH_INFO(
                     vecWeights[i].mHeight == vecWeights[0].mHeight && vecWeights[i].mWidth == vecWeights[0].mWidth,
-                    "finalizeWeightSlot slot shape not same for slot %d and 0, (%ld, %ld) v.s. (%ld, %ld)", i,
+                    "finalizeWeightSlot slot shape not same for slot {} and 0, ({}, {}) v.s. ({}, {})", i,
                     vecWeights[i].mHeight, vecWeights[i].mWidth, vecWeights[0].mHeight, vecWeights[0].mWidth);
             }
         }
@@ -778,18 +778,18 @@ HostMemoryMoeWeightUpdater::HostMemoryMoeWeightUpdater(
 void HostMemoryMoeWeightUpdater::addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight)
 {
     TLLM_CHECK_WITH_INFO(mHostWeightsFinalized == false, "Cannot add host weight after finalize");
-    TLLM_CHECK_WITH_INFO(expertId >= 0 && expertId < mMetaInfo.expertCount, "expertId (%d) should be in range[0, %d)",
+    TLLM_CHECK_WITH_INFO(expertId >= 0 && expertId < mMetaInfo.expertCount, "expertId ({}) should be in range[0, {})",
         expertId, mMetaInfo.expertCount);
     TLLM_CHECK_WITH_INFO(hostWeight.mWeightPtr != nullptr && hostWeight.mHeight > 0 && hostWeight.mWidth > 0
             && hostWeight.mPitch >= hostWeight.mWidth,
-        "Invalid hostWeight ptr=%p, Height=%ld, Width=%ld, with Pitch=%ld", hostWeight.mWeightPtr, hostWeight.mHeight,
+        "Invalid hostWeight ptr={:p}, Height={}, Width={}, with Pitch={}", hostWeight.mWeightPtr, hostWeight.mHeight,
         hostWeight.mWidth, hostWeight.mPitch);
     if (mHostWeights.find(name) == mHostWeights.end())
     {
         mHostWeights.emplace(name, std::vector<MoeWeight>(mMetaInfo.expertCount));
     }
     TLLM_CHECK_WITH_INFO(mHostWeights[name][expertId].mWeightPtr == nullptr,
-        "expertId=%d, name=%s already added to host weight.", expertId, name.c_str());
+        "expertId={}, name={} already added to host weight.", expertId, name.c_str());
     mHostWeights[name][expertId] = hostWeight;
 }
 
@@ -797,26 +797,26 @@ void HostMemoryMoeWeightUpdater::finalizeHostWeight()
 {
     TLLM_CHECK_WITH_INFO(mHostWeightsFinalized == false, "already finalized");
     TLLM_CHECK_WITH_INFO(mHostWeights.size() == mWeightSlots.size(),
-        "mHostWeights and mWeightSlots doesn't have same count of weights, %ld v.s. %ld.", mHostWeights.size(),
+        "mHostWeights and mWeightSlots doesn't have same count of weights, {} v.s. {}.", mHostWeights.size(),
         mWeightSlots.size());
     for (auto it = mHostWeights.cbegin(); it != mHostWeights.cend(); ++it)
     {
         auto name = it->first;
         auto& vecWeights = it->second;
         TLLM_CHECK_WITH_INFO(
-            mWeightSlots.find(name) != mWeightSlots.end(), "name %s not found in mWeightSlots.", name.c_str());
+            mWeightSlots.find(name) != mWeightSlots.end(), "name {} not found in mWeightSlots.", name.c_str());
         auto slotIt = mWeightSlots.find(name);
         TLLM_CHECK_WITH_INFO(vecWeights.size() == static_cast<size_t>(mMetaInfo.expertCount),
-            "expert count not match for %s", name.c_str());
+            "expert count not match for {}", name.c_str());
         for (int i = 0; i < mMetaInfo.expertCount; ++i)
         {
             TLLM_CHECK_WITH_INFO(
-                vecWeights[i].mWeightPtr != nullptr, "expertId=%d, name=%s not added.", i, name.c_str());
+                vecWeights[i].mWeightPtr != nullptr, "expertId={}, name={} not added.", i, name.c_str());
             if (i > 0)
             {
                 TLLM_CHECK_WITH_INFO(
                     vecWeights[i].mHeight == vecWeights[0].mHeight && vecWeights[i].mWidth == vecWeights[0].mWidth,
-                    "finalizeHostWeight host weights shape not same for expert %d and 0, (%ld, %ld) v.s. (%ld, %ld)", i,
+                    "finalizeHostWeight host weights shape not same for expert {} and 0, ({}, {}) v.s. ({}, {})", i,
                     vecWeights[i].mHeight, vecWeights[i].mWidth, vecWeights[0].mHeight, vecWeights[0].mWidth);
             }
             else
@@ -824,8 +824,8 @@ void HostMemoryMoeWeightUpdater::finalizeHostWeight()
                 auto& slotWeight = slotIt->second[0];
                 TLLM_CHECK_WITH_INFO(
                     vecWeights[i].mHeight == slotWeight.mHeight && vecWeights[i].mWidth == slotWeight.mWidth,
-                    "finalizeHostWeight host weights shape not same for expert 0 and slot 0, (%ld, %ld) v.s. (%ld, "
-                    "%ld)",
+                    "finalizeHostWeight host weights shape not same for expert 0 and slot 0, ({}, {}) v.s. ({}, "
+                    "{})",
                     vecWeights[i].mHeight, vecWeights[i].mWidth, slotWeight.mHeight, slotWeight.mWidth);
             }
         }
@@ -917,9 +917,9 @@ void HostMemoryMoeWeightUpdater::updateWeights(
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
         int newExpertId = placementCpuInfo->rankExpertIds[mMetaInfo.epRank][slotId];
         TLLM_CHECK_WITH_INFO(oldExpertId >= 0 && oldExpertId < mMetaInfo.expertCount,
-            "oldExpertId=%d, should in range [0, %d)", oldExpertId, mMetaInfo.expertCount);
+            "oldExpertId={}, should in range [0, {})", oldExpertId, mMetaInfo.expertCount);
         TLLM_CHECK_WITH_INFO(newExpertId >= 0 && newExpertId < mMetaInfo.expertCount,
-            "newExpertId=%d, should in range [0, %d)", newExpertId, mMetaInfo.expertCount);
+            "newExpertId={}, should in range [0, {})", newExpertId, mMetaInfo.expertCount);
         if (oldExpertId == newExpertId)
         {
             continue;
@@ -963,7 +963,7 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
     TLLM_CHECK_WITH_INFO(layerUpdatesPerIter == 0 || HostAccessibleDeviceAllocator::getInstance().isSupported(),
         "HostAccessibleDeviceAllocator is not supported on current platform, please install gdrcopy(gdrdrv).");
     TLLM_CHECK_WITH_INFO(
-        numaCpuCount > 0 && numaGpuCount > 0, "numaCpuCount=%d, numaGpuCount=%d", numaCpuCount, numaGpuCount);
+        numaCpuCount > 0 && numaGpuCount > 0, "numaCpuCount={}, numaGpuCount={}", numaCpuCount, numaGpuCount);
     int cpuCountPerGpu = std::max(1, numaCpuCount / numaGpuCount);
     std::string cpuArch = topologyDetector.getCpuArchitecture();
 
@@ -1065,7 +1065,7 @@ void MoeLoadBalancer::startIter(int64_t iterId, bool enableStatistic, bool enabl
     std::unique_lock<std::mutex> lock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot start iteration.");
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot start iteration while another iteration is active.");
-    TLLM_CHECK_WITH_INFO(mIterId + 1 == iterId, "Expected iterId=%ld, but got %ld", mIterId + 1, iterId);
+    TLLM_CHECK_WITH_INFO(mIterId + 1 == iterId, "Expected iterId={}, but got {}", mIterId + 1, iterId);
 
     mIterId = iterId;
     mIterActive = true;
@@ -1082,7 +1082,7 @@ void MoeLoadBalancer::endIter(int64_t iterId)
 {
     std::unique_lock<std::mutex> lock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mIterActive, "No active iteration to end.");
-    TLLM_CHECK_WITH_INFO(mIterId == iterId, "endIter expected iterId=%ld, but got %ld", mIterId, iterId);
+    TLLM_CHECK_WITH_INFO(mIterId == iterId, "endIter expected iterId={}, but got {}", mIterId, iterId);
     mIterActive = false;
 }
 
@@ -1115,11 +1115,11 @@ void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
         for (int deadRank : deadRanks)
         {
             TLLM_CHECK_WITH_INFO(
-                deadRank >= 0 && deadRank < mEpSize, "deadRank=%d should be in range [0, %d)", deadRank, mEpSize);
+                deadRank >= 0 && deadRank < mEpSize, "deadRank={} should be in range [0, {})", deadRank, mEpSize);
             candidateDeadRankMask[deadRank] = 1;
         }
         TLLM_CHECK_WITH_INFO(
-            candidateDeadRankMask[mEpRank] == 0, "Local epRank (%d) cannot be masked by a survivor", mEpRank);
+            candidateDeadRankMask[mEpRank] == 0, "Local epRank ({}) cannot be masked by a survivor", mEpRank);
     }
 
     for (auto& layer : mLayers)
@@ -1156,7 +1156,7 @@ void MoeLoadBalancer::workerThread()
             }
             auto iterInfo = mIterInfoQueue.front();
             mIterInfoQueue.pop();
-            TLLM_CHECK_WITH_INFO(iterInfo.iterId == iterId + 1, "Jump detected, iterId=%ld, but got next iterId=%ld",
+            TLLM_CHECK_WITH_INFO(iterInfo.iterId == iterId + 1, "Jump detected, iterId={}, but got next iterId={}",
                 iterId, iterInfo.iterId);
             iterId = iterInfo.iterId;
             iterUpdateWeightsEnabled = iterInfo.updateWeightsEnabled;
@@ -1278,13 +1278,13 @@ void MultiThreadWorker::waitTaskDone(int64_t taskId)
     auto it = mTaskMap.find(taskId);
     if (it == mTaskMap.end())
     {
-        TLLM_CHECK_WITH_INFO(mDoneTaskMap.count(taskId) > 0, "Task %ld not found", taskId);
+        TLLM_CHECK_WITH_INFO(mDoneTaskMap.count(taskId) > 0, "Task {} not found", taskId);
         mDoneTaskMap.erase(taskId);
         return;
     }
     auto task = it->second;
     task->cv.wait(lk, [task] { return task->remaining == 0; });
-    TLLM_CHECK_WITH_INFO(mDoneTaskMap.count(taskId) > 0, "Task %ld not found", taskId);
+    TLLM_CHECK_WITH_INFO(mDoneTaskMap.count(taskId) > 0, "Task {} not found", taskId);
     mDoneTaskMap.erase(taskId);
 }
 

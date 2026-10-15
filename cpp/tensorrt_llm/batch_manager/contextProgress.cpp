@@ -35,8 +35,8 @@ ContextProgress::ContextProgress(int numLayers)
 void ContextProgress::recordEvent(int layerIdx, cudaStream_t stream)
 {
     TLLM_CHECK(layerIdx < getNumLayers());
-    TLLM_CHECK_WITH_INFO(layerIdx == 0 || mCudaEventsRecorded[layerIdx - 1], "Layer %d is skipped", layerIdx - 1);
-    TLLM_CHECK_WITH_INFO(!mCudaEventsRecorded[layerIdx], "Layer %d is recorded twice", layerIdx);
+    TLLM_CHECK_WITH_INFO(layerIdx == 0 || mCudaEventsRecorded[layerIdx - 1], "Layer {} is skipped", layerIdx - 1);
+    TLLM_CHECK_WITH_INFO(!mCudaEventsRecorded[layerIdx], "Layer {} is recorded twice", layerIdx);
     TLLM_CUDA_CHECK(cudaEventRecord(mCudaEvents[layerIdx].get(), stream));
     mCudaEventsRecorded[layerIdx] = true;
     mConditionVariable.notify_all();

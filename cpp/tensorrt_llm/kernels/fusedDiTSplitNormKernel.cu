@@ -179,8 +179,8 @@ void launchFusedDiTSplitNormFullDim(
 {
     // num_heads cap is SMEM/register driven (MAX_N = 64 * HEAD_DIM in the kernel template),
     // NOT block_size — the launcher uses a fixed blockDim=256 with 2 rows/CTA.
-    TLLM_CHECK_WITH_INFO(num_heads <= 64, "fusedDiTSplitNormFullDim: num_heads (%d) must be <= 64", num_heads);
-    TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDim: num_heads must be >= 1, got %d", num_heads);
+    TLLM_CHECK_WITH_INFO(num_heads <= 64, "fusedDiTSplitNormFullDim: num_heads ({}) must be <= 64", num_heads);
+    TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDim: num_heads must be >= 1, got {}", num_heads);
 
     int const N = num_heads * head_dim;
     constexpr int ROWS_PER_BLOCK = 2;
@@ -204,7 +204,7 @@ void launchFusedDiTSplitNormFullDim(
     {
     case 64: LAUNCH(64); break;
     case 128: LAUNCH(128); break;
-    default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormFullDim: %d (only 64, 128)", head_dim);
+    default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormFullDim: {} (only 64, 128)", head_dim);
     }
 #undef LAUNCH
 }

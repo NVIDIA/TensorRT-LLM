@@ -162,7 +162,7 @@ Logger::Logger()
         Level level{};
         if (!parseLevelName(levelName, level))
         {
-            TLLM_THROW("Invalid log level: %s", levelName);
+            TLLM_THROW("Invalid log level: {}", levelName);
         }
         // If TLLM_LOG_FIRST_RANK_ONLY=ON, set LOG LEVEL of other device to ERROR
         if (isFirstRankOnly)

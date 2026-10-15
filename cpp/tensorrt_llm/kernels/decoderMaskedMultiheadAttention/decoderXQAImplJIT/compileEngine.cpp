@@ -23,25 +23,25 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include <source_location>
 #include <string>
 #include <vector>
 
 namespace
 {
 
-void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, char const* const file, int const line)
+void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, std::source_location const& location)
 {
     if (result != TLLM_XQA_JIT_SUCCESS)
     {
         std::vector<char> log(tllmXqaJitGetLastErrorStringSize());
         tllmXqaJitGetLastErrorString(log.data());
-        throw tensorrt_llm::common::TllmException(file, line,
-            tensorrt_llm::common::fmtstr("[TensorRT-LLM][ERROR] TllmXqaJit runtime error in %s: %s", func, log.data())
-                .c_str());
+        throw tensorrt_llm::common::TllmException(
+            location, std::format("[TensorRT-LLM][ERROR] TllmXqaJit runtime error in {}: {}", func, log.data()));
     }
 }
 
-#define CHECK_TLLM_XQA_JIT_ERROR(val) CHECK_TLLM_XQA_JIT_ERROR_((val), #val, __FILE__, __LINE__)
+#define CHECK_TLLM_XQA_JIT_ERROR(val) CHECK_TLLM_XQA_JIT_ERROR_((val), #val, std::source_location::current())
 
 } // anonymous namespace
 

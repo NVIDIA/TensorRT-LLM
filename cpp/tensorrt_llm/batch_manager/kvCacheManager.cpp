@@ -161,13 +161,13 @@ void KVCacheBlock::attachToLookupNode(radix_block_tree::LookupNodePtr node, int 
     {
         auto const wasCleared = mLookupNode->clearValue(mWindowSize);
         TLLM_CHECK_WITH_INFO(wasCleared,
-            "attachToLookupNode: block %d expected prior lookup slot to be occupied (clearValue returned false)",
+            "attachToLookupNode: block {} expected prior lookup slot to be occupied (clearValue returned false)",
             static_cast<int>(mBlockId));
     }
     // Assign fields AFTER trySetValue so local state is only updated on success.
     auto const wasInserted = node->trySetValue(windowSize, shared_from_this(), /*overwrite=*/false);
     TLLM_CHECK_WITH_INFO(wasInserted,
-        "attachToLookupNode: block %d found lookup slot already occupied by another block", static_cast<int>(mBlockId));
+        "attachToLookupNode: block {} found lookup slot already occupied by another block", static_cast<int>(mBlockId));
     mLookupNode = std::move(node);
     mWindowSize = windowSize;
 }
@@ -181,7 +181,7 @@ void KVCacheBlock::detachFromLookupNode()
     // clearValue triggers the cascade-prune up through empty ancestor nodes automatically.
     auto const wasCleared = mLookupNode->clearValue(mWindowSize);
     TLLM_CHECK_WITH_INFO(wasCleared,
-        "detachFromLookupNode: block %d expected lookup slot to be occupied (clearValue returned false)",
+        "detachFromLookupNode: block {} expected lookup slot to be occupied (clearValue returned false)",
         static_cast<int>(mBlockId));
     mLookupNode = nullptr;
     mWindowSize = std::numeric_limits<int>::max();
@@ -230,7 +230,7 @@ void KVCacheBlock::incRefCount()
 void KVCacheBlock::decRefCount()
 {
     TLLM_CHECK_WITH_INFO(
-        hasRefs(), "Can't remove link from block (id=%d) that is not allocated", static_cast<int>(mBlockId));
+        hasRefs(), "Can't remove link from block (id={}) that is not allocated", static_cast<int>(mBlockId));
     mRefCount--;
 }
 
@@ -530,7 +530,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             // Enforce that a full-attention window (windowSize == maxSequenceLength) must be present
             // alongside kRecurrentStates.
             TLLM_CHECK_WITH_INFO(blocksPerWindow.count(maxSequenceLength) > 0,
-                "kRecurrentStates window size requires a full-attention window size (== maxSequenceLength=%d) "
+                "kRecurrentStates window size requires a full-attention window size (== maxSequenceLength={}) "
                 "to be present alongside it.",
                 maxSequenceLength);
         }
@@ -542,7 +542,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
 
     TLLM_CHECK_WITH_INFO(
         !indexerKCacheLayerMask.has_value() || static_cast<SizeType32>(indexerKCacheLayerMask->size()) == mNumLayers,
-        "indexerKCacheLayerMask must have one entry per layer (expected %d, got %zu)", mNumLayers,
+        "indexerKCacheLayerMask must have one entry per layer (expected {}, got {})", mNumLayers,
         indexerKCacheLayerMask.has_value() ? indexerKCacheLayerMask->size() : 0);
 
     auto const uniqueWindowSizeToLayers
@@ -563,7 +563,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     for (auto const& pc : poolConfigurations)
     {
         TLLM_CHECK_WITH_INFO(poolByWindow.emplace(pc.windowSize, &pc).second,
-            "Multiple PoolConfigurations share windowSize=%d. Multi-pool-per-window requires an "
+            "Multiple PoolConfigurations share windowSize={}. Multi-pool-per-window requires an "
             "explicit layer->pool mapping, which is not yet wired through BlockManager.",
             pc.windowSize);
     }
@@ -592,7 +592,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             {
                 numPlaceholderBlocks = *linearAttentionMetadata->numPlaceholderBlocks;
                 TLLM_CHECK_WITH_INFO(numPlaceholderBlocks >= 0,
-                    "LinearAttentionMetadata::numPlaceholderBlocks must be >= 0, got %d", numPlaceholderBlocks);
+                    "LinearAttentionMetadata::numPlaceholderBlocks must be >= 0, got {}", numPlaceholderBlocks);
             }
             else
             {
@@ -702,7 +702,7 @@ WindowBlockManager::WindowBlockManager(tensorrt_llm::DataType dtype, SizeType32 
                     || (linearAttentionMetadata.has_value() && linearAttentionMetadata->hasRecurrentStatesCache()))
               ? 1
               : 2}
-    , mLogPrefix{tensorrt_llm::common::fmtstr("BlockManager[windowSize=%d]", mWindowSize)}
+    , mLogPrefix{std::format("BlockManager[windowSize={}]", mWindowSize)}
     , mReusedTokens{0.0}
     , mTotalInputTokens{0.0}
     , mEnablePartialReuse{enablePartialReuse}
@@ -799,7 +799,7 @@ WindowBlockManager::WindowBlockManager(tensorrt_llm::DataType dtype, SizeType32 
             KVCacheBlock::kCachedBlocksRootId - 2);
         TLLM_CHECK_WITH_INFO(isRecurrentState(),
             "numPlaceholderBlocks > 0 is only supported for recurrent-state (kRecurrentStates) managers, but this "
-            "manager has windowSize=%d and isSWA=%d",
+            "manager has windowSize={} and isSWA={}",
             windowSize, isSWA);
         mAllPlaceholderBlocksById.resize(numPlaceholderBlocks + 2, nullptr);
         for (SizeType32 i = 0; i < numPlaceholderBlocks; ++i)
@@ -1311,7 +1311,7 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, tensorrt_llm::
 
     auto const& block = getBlockById(blockId);
     bool const isSwaPlaceholder = blockId == KVCacheBlock::kPlaceholderBlockId;
-    TLLM_CHECK_WITH_INFO(block != nullptr || isSwaPlaceholder, "Unknown KV cache block id %d", blockId);
+    TLLM_CHECK_WITH_INFO(block != nullptr || isSwaPlaceholder, "Unknown KV cache block id {}", blockId);
     for (SizeType32 poolIdx = 0; poolIdx < static_cast<SizeType32>(mPools.size()); poolIdx++)
     {
         auto const& pool = mPools.at(poolIdx);
@@ -2442,7 +2442,7 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
     }
 
     TLLM_CHECK_WITH_INFO(hasFreeBlocks(requiredBlocks),
-        "Can't allocate new blocks for window size %d. No free blocks left.", mWindowSize);
+        "Can't allocate new blocks for window size {}. No free blocks left.", mWindowSize);
 
     if (shareAmongBeams)
     {
@@ -2792,9 +2792,9 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const numFree = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
     TLLM_CHECK_WITH_INFO(numFree <= getMaxNumBlocks(),
-        "%s::getNumFreeBlocks - primary free block count (%d) exceeds total block count (%d). "
+        "{}::getNumFreeBlocks - primary free block count ({}) exceeds total block count ({}). "
         "This indicates a block accounting inconsistency, likely caused by block pool swaps "
-        "during offload/onboard operations. numPrimaryBlocks=%d, numSecondaryBlocks=%d",
+        "during offload/onboard operations. numPrimaryBlocks={}, numSecondaryBlocks={}",
         mLogPrefix.c_str(), numFree, getMaxNumBlocks(), mNumPrimaryBlocks, mNumSecondaryBlocks);
     return numFree;
 }
@@ -2975,7 +2975,7 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
     for (auto const& blockId : blockIds)
     {
         TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
-            "Block id %d is out of range", blockId);
+            "Block id {} is out of range", blockId);
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
@@ -3967,13 +3967,13 @@ std::vector<kernels::KVCacheIndex::UnderlyingType> KVCacheManager::getMemoryPool
     for (auto const blockId : blockIds)
     {
         BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
-        TLLM_CHECK_WITH_INFO(block != nullptr, "Block not found (blockId=%d, windowSize=%d)", blockId, windowSize);
+        TLLM_CHECK_WITH_INFO(block != nullptr, "Block not found (blockId={}, windowSize={})", blockId, windowSize);
         // Invariant, not a recoverable condition: blocks referenced here are held by a live
         // request, allocation onboards offloaded blocks, and offload only selects free blocks.
         // A secondary block therefore indicates a block-lifetime bug, and the returned index
         // (pool flag stripped) would silently alias a primary slot.
         TLLM_CHECK_WITH_INFO(block->isPrimary(),
-            "Block is not in the primary pool (blockId=%d, windowSize=%d); the returned index is only "
+            "Block is not in the primary pool (blockId={}, windowSize={}); the returned index is only "
             "valid for primary-pool blocks",
             blockId, windowSize);
         indices.push_back(block->getMemoryPoolBlockIndex());
@@ -4099,9 +4099,9 @@ void synchronizeBlockCountsAcrossRanks(WorldConfig const& worldConfig, std::vect
     auto const rank = worldConfig.getRank();
     using tensorrt_llm::common::vec2str;
     TLLM_CHECK_WITH_INFO(isSortedVectorIdenticalAcrossAllRanks(worldConfig, windowSizes),
-        "[RANK %d] Asymmetrical pipeline parallelism detected: Ranks either have a different number of window "
+        "[RANK {}] Asymmetrical pipeline parallelism detected: Ranks either have a different number of window "
         "sizes, or differing values. This is not supported with Variable Sliding Window Attention. Local window "
-        "sizes for reference: %s",
+        "sizes for reference: {}",
         rank, vec2str(windowSizes).c_str());
     TLLM_LOG_DEBUG(
         "[RANK {}] Before mpi::MpiOp::MIN reduction: window sizes {} / primary blocks {} / secondary blocks {}", rank,
@@ -4137,8 +4137,8 @@ void reserveStaticHybridLinearStates(LinearAttentionMetadata const& linearAttent
     auto const staticMemoryBytes = static_cast<uint64_t>(maxBatchSize) * numLinearLayers
         * static_cast<uint64_t>(linearAttentionMetadata.allRecurrentStatesBytes);
     TLLM_CHECK_WITH_INFO(allottedPrimaryMemBytes > staticMemoryBytes,
-        "Not enough memory to allocate static cache for linear attention states. Required: %0.2f GiB, "
-        "Allotted: %0.2f GiB",
+        "Not enough memory to allocate static cache for linear attention states. Required: {:.2f} GiB, "
+        "Allotted: {:.2f} GiB",
         staticMemoryBytes / static_cast<double>(1 << 30), allottedPrimaryMemBytes / static_cast<double>(1 << 30));
     allottedPrimaryMemBytes -= staticMemoryBytes;
     TLLM_LOG_INFO(
@@ -4179,12 +4179,12 @@ std::map<SizeType32, float> computeWindowSizeShares(
         }
 
         TLLM_CHECK_WITH_INFO(shares.size() == windowSizeToLayers.size(),
-            "Number of shares in TRTLLM_WINDOW_SIZE_SHARES (%ld) must match number of window sizes (%ld)",
-            shares.size(), windowSizeToLayers.size());
+            "Number of shares in TRTLLM_WINDOW_SIZE_SHARES ({}) must match number of window sizes ({})", shares.size(),
+            windowSizeToLayers.size());
         float sumShares = 0.0f;
         for (auto s : shares)
         {
-            TLLM_CHECK_WITH_INFO(0.0f <= s && s <= 1.0f, "Shares must be in value range [0,1], got %f", s);
+            TLLM_CHECK_WITH_INFO(0.0f <= s && s <= 1.0f, "Shares must be in value range [0,1], got {:f}", s);
             sumShares += s;
         }
         TLLM_CHECK_WITH_INFO(sumShares > 0.0f, "Sum of shares must be > 0.");
@@ -4240,7 +4240,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     for (auto const& pc : poolConfigurations)
     {
         TLLM_CHECK_WITH_INFO(poolByWindow.emplace(pc.windowSize, &pc).second,
-            "Multiple PoolConfigurations share windowSize=%d. Multi-pool-per-window requires an "
+            "Multiple PoolConfigurations share windowSize={}. Multi-pool-per-window requires an "
             "explicit layer->pool mapping, which is not yet wired through calculateMaxNumBlocks.",
             pc.windowSize);
     }
@@ -4455,7 +4455,7 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     // the index<->token alignment this method relies on, so fail fast until SWA is supported.
     TLLM_CHECK_WITH_INFO(sequence.getNumFrontBlocksRemoved(windowSize) == 0,
         "commitAndGetBlockHashesForRequest does not support sliding-window attention with detached front blocks "
-        "(windowSize=%d, request %lu).",
+        "(windowSize={}, request {}).",
         windowSize, static_cast<unsigned long>(llmRequest.mRequestId));
 
     auto const& perBeamBlockIds = sequence.getCacheBlockIds(windowSize);
@@ -4493,7 +4493,7 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     {
         auto block = mBlockManager.getBlockById(blockIds[b], windowSize);
         TLLM_CHECK_WITH_INFO(block != nullptr,
-            "commitAndGetBlockHashesForRequest: null block at index %d (blockId=%d, request %lu).", b, blockIds[b],
+            "commitAndGetBlockHashesForRequest: null block at index {} (blockId={}, request {}).", b, blockIds[b],
             static_cast<unsigned long>(llmRequest.mRequestId));
         if (!block->isFull())
         {

@@ -333,7 +333,7 @@ UcxConnectionManager::UcxConnectionManager()
         catch (std::exception const& e)
         {
             std::string error = "Error creating worker and starting progress thread for rank " + std::string(e.what());
-            TLLM_THROW(error);
+            TLLM_THROW("{}", error);
         }
         auto workerAddressPtr = mWorkersPool.front()->getAddress();
         mWorkerAddress = workerAddressPtr->getString();
@@ -464,7 +464,7 @@ UcxConnectionManager::UcxConnectionManager()
                     }
                     else
                     {
-                        TLLM_THROW("Zmq recv unknown message: %s", recvMessage.c_str());
+                        TLLM_THROW("Zmq recv unknown message: {}", recvMessage.c_str());
                     }
                 }
             });
@@ -472,7 +472,7 @@ UcxConnectionManager::UcxConnectionManager()
     catch (std::exception const& e)
     {
         std::string error = std::string("Error in UcxConnectionManager initialization for rank ") + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 
@@ -534,7 +534,7 @@ void UcxConnectionManager::addConnection(std::string const& workerAddress)
     catch (std::exception const& e)
     {
         std::string error = "Error in addConnection(connRequest) for rank " + std::to_string(mRank) + ": " + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 
@@ -600,7 +600,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     {
         std::string error = "Error in addConnection(ip) for rank " + std::to_string(mRank) + " ip: " + ip
             + " port: " + std::to_string(port) + ": " + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 
@@ -648,14 +648,14 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         = *reinterpret_cast<UcxConnection::ConnectionIdType*>(state->mBuffer.data() + size);
     std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
     TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
-        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
+        "connectionFuture not found In recvConnect connectionId : {} , worldRank: {}", connectionId, mRank);
     if (mConnectionFutures.at(connectionId).valid())
     {
         // wait for the connection to be created
         mConnectionFutures.at(connectionId).get();
     }
     TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
-        "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId, mRank);
+        "Connection not found In recvConnect connectionId: {} , worldRank: {}", connectionId, mRank);
 
     TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
 
@@ -714,7 +714,7 @@ std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> makeUcxConn
     catch (std::exception const& e)
     {
         std::string error = "Error in makeUcxConnectionManager: " + std::string(e.what());
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 

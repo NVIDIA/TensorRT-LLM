@@ -105,7 +105,7 @@ CUresult launchBatchedCopyImpl(
 {
     TLLM_CHECK(nbTasks <= N);
     TLLM_CHECK_WITH_INFO(
-        nbBytes % sizeof(Grain) == 0, "Not implemented case: nbBytes = %d must be a multiple of 16.", nbBytes);
+        nbBytes % sizeof(Grain) == 0, "Not implemented case: nbBytes = {} must be a multiple of 16.", nbBytes);
     std::array<MMTask, N> const* pTasks;
     std::array<MMTask, N> tmp;
     if (nbTasks < N)
@@ -279,7 +279,7 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
     }
 
     TLLM_CHECK_WITH_INFO((numBlocksPerSeq * sizeof(SizeType32)) % sizeof(PackedInt) == 0,
-        "Not implemented case: numBlocksPerSeq * sizeof(SizeType32) = %zu must be a multiple of %zu.",
+        "Not implemented case: numBlocksPerSeq * sizeof(SizeType32) = {} must be a multiple of {}.",
         static_cast<size_t>(numBlocksPerSeq * sizeof(SizeType32)), static_cast<size_t>(sizeof(PackedInt)));
 
     dim3 gridDim(numPools, numSeqs, 1);

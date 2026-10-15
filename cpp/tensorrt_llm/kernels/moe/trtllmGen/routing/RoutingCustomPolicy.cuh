@@ -837,7 +837,7 @@ inline void dispatchRoutingPolicy(Data const& data, Fn&& fn)
         && data.mPostprocessType == RoutingPostprocessType::None)
         fn(NoOpPreprocess{}, NoOpPostprocess{});
     else
-        TLLM_CHECK_WITH_INFO(false, "Unsupported routing policy combination: preprocess=%d, postprocess=%d",
+        TLLM_CHECK_WITH_INFO(false, "Unsupported routing policy combination: preprocess={}, postprocess={}",
             static_cast<int>(data.mPreprocessType), static_cast<int>(data.mPostprocessType));
 }
 

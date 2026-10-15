@@ -571,8 +571,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
                                                                             : indexerLayerNumPerPP.at(selfPPRank);
         auto const numIndexerLayers = indexerPool->getShape().d[1];
         TLLM_CHECK_WITH_INFO(numIndexerLayers == static_cast<int64_t>(advertisedIndexerLayerNum),
-            "The indexer K cache pool holds %ld layer rows but indexerLayerNumPerPP advertises %d for PP rank "
-            "%d. Pass the per-PP indexer layer counts matching the (masked) indexer pool layout.",
+            "The indexer K cache pool holds {} layer rows but indexerLayerNumPerPP advertises {} for PP rank "
+            "{}. Pass the per-PP indexer layer counts matching the (masked) indexer pool layout.",
             static_cast<long>(numIndexerLayers), advertisedIndexerLayerNum, selfPPRank);
         mCacheTransBufferManagers.push_back(
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
@@ -607,7 +607,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             case 4: return tensorrt_llm::DataType::kFLOAT;
             case 2: return tensorrt_llm::DataType::kBF16;
             case 1: return tensorrt_llm::DataType::kFP8;
-            default: TLLM_THROW("Unsupported RNN state dtype size: %d", size);
+            default: TLLM_THROW("Unsupported RNN state dtype size: {}", size);
             }
         };
         TLLM_CHECK_WITH_INFO(linearMeta->rnnSsmDtypeSize > 0, "rnnSsmDtypeSize not set in LinearAttentionMetadata");
@@ -644,7 +644,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         executor::kv_cache::promoteHostLibraryToGlobalScope();
         mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
         TLLM_CHECK_WITH_INFO(
-            mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. error : %s", dlerror());
+            mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. error : {}", dlerror());
         auto load_sym = [](void* handle, char const* name)
         {
             void* ret = dllGetSym(handle, name);
@@ -1653,7 +1653,7 @@ void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& c
         int rank = useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
         auto filePath = outputPath / (mInstanceId + "_" + std::to_string(rank) + "_gen_transfer_summary.csv");
         mGenTransferSummaryFile.open(filePath);
-        TLLM_CHECK_WITH_INFO(mGenTransferSummaryFile.is_open(), "Failed to open gen transfer summary file: %s",
+        TLLM_CHECK_WITH_INFO(mGenTransferSummaryFile.is_open(), "Failed to open gen transfer summary file: {}",
             filePath.string().c_str());
         mGenTransferSummaryFile << "RequestID,gen_side_transfer_time(ms),kv_cache_size" << '\n';
     }

@@ -249,14 +249,14 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         && getEncoderInputFeatures()->getShape().nbDims < 4) // skip encoder shape validation for image inputs
     {
         TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
-            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
+            "Encoder length ({}) exceeds maximum encoder input length ({}).", getEncoderInputLen(),
             maxEncoderInputLen.value());
     }
 
     if (mPromptLen > maxInputLen)
     {
         TLLM_THROW(
-            "Prompt length (%d) exceeds maximum input length (%d). Set log level to info and check "
+            "Prompt length ({}) exceeds maximum input length ({}). Set log level to info and check "
             "TRTGptModel logs for how maximum input length is set",
             mPromptLen, maxInputLen);
     }
@@ -271,7 +271,7 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         if (inputDraftTokensLen > maxDraftLen)
         {
             TLLM_THROW(
-                "Draft tokens length (%d) exceeds maximum draft tokens length (%d).", inputDraftTokensLen, maxDraftLen);
+                "Draft tokens length ({}) exceeds maximum draft tokens length ({}).", inputDraftTokensLen, maxDraftLen);
         }
         draftLenPerEngineStep = inputDraftTokensLen;
 
@@ -304,7 +304,7 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
             "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
         TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-            "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
+            "inputTokenExtraIds vector size ({}) must be the same as input token vector size ({}).",
             mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
     }
 }
@@ -313,7 +313,7 @@ std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType request
 {
     TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
     TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumSubRequests()),
-        "Cannot create child requests more than the number of return sequences (%d)", getNumSubRequests());
+        "Cannot create child requests more than the number of return sequences ({})", getNumSubRequests());
     auto childReq = std::make_shared<LlmRequest>(*this);
     childReq->mRequestId = requestId;
     childReq->mSequenceIndex = mChildRequests.size() + 1;

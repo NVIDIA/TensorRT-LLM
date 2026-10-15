@@ -169,7 +169,7 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
                 break;
             }
         }
-        TLLM_CHECK_WITH_INFO(!result[lcId].empty(), "Lifecycle %d has no SlotDescVariant", lcId.value());
+        TLLM_CHECK_WITH_INFO(!result[lcId].empty(), "Lifecycle {} has no SlotDescVariant", lcId.value());
     }
     return result;
 }
@@ -1671,7 +1671,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level)
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(level); ++pgIdx)
     {
         auto const s = getStatistics(level, pgIdx);
-        TLLM_CHECK_WITH_INFO(s.total > 0, "getUtilization: pool group %d at level %d has zero capacity",
+        TLLM_CHECK_WITH_INFO(s.total > 0, "getUtilization: pool group {} at level {} has zero capacity",
             static_cast<int>(pgIdx.value()), static_cast<int>(level.value()));
         result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
     }

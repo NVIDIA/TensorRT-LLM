@@ -255,7 +255,7 @@ void marlinNvfp4MoeGemmDispatcher(void const* A, void const* B, void* C, void* C
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(isMarlinNvfp4SmSupported(sm),
-        "Marlin NVFP4 MoE GEMM is only supported on Ada (SM89) and Hopper (SM90-99); current SM = %d", sm);
+        "Marlin NVFP4 MoE GEMM is only supported on Ada (SM89) and Hopper (SM90-99); current SM = {}", sm);
 
     int dev;
     cudaGetDevice(&dev);

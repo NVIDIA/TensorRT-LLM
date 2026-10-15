@@ -761,7 +761,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         numTokens, clusterSize, blockSize, clusterSize, loadsPerThread, divUp(tokenDim, eltsPerThread));
 
     TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
-        "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim, 1024 * 8 * eltsPerThread);
+        "Hidden Dimension {} exceeds the maximum supported hidden dimension ({})", tokenDim, 1024 * 8 * eltsPerThread);
 
     cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1200,7 +1200,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const numEltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
-    TLLM_CHECK_WITH_INFO(tokenDim % numEltsPerThread == 0, "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d",
+    TLLM_CHECK_WITH_INFO(tokenDim % numEltsPerThread == 0, "[MNNVL AllReduceTwoShot] token_dim must be divisible by {}",
         numEltsPerThread);
 
     int const arNumThreads = divUp(tokenDim, numEltsPerThread);

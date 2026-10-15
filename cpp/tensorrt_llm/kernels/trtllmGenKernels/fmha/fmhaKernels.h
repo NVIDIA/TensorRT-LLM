@@ -240,7 +240,7 @@ public:
                 {
                     auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
                     TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
-                        "The kernel's hashId conflicts with another kernel in the same variant: existing=%s, new=%s.",
+                        "The kernel's hashId conflicts with another kernel in the same variant: existing={}, new={}.",
                         existingKernelMeta.mFuncName, kernelMeta.mFuncName);
                     // Prefer specific SM version over family version
                     if (existingKernelMeta.mSM == kSM_100f)
@@ -722,12 +722,12 @@ private:
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
-            "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
-            "headDimV=%d",
+            "Expect (32 <= headDim <= 1024), got headDimPerCtaV={}, headDimQk={}, "
+            "headDimV={}",
             headDimPerCtaV, headDimQk, headDimV);
         // The numTokensPerPage must be 0 (non-paged layouts) or a power of 2 (paged layouts).
         TLLM_CHECK_WITH_INFO(numTokensPerPage == 0 || (numTokensPerPage & (numTokensPerPage - 1)) == 0,
-            "The numTokensPerPage must be 0 or power of 2, got %d.", numTokensPerPage);
+            "The numTokensPerPage must be 0 or power of 2, got {}.", numTokensPerPage);
         TLLM_CHECK_WITH_INFO(tileSizeQ <= 128 && tileSizeKv <= 128, "The tileSizeQ and tileSizeKv must be <= 128.");
         TLLM_CHECK_WITH_INFO((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
             "The tileSizeQ and tileSizeKv must be power of 2.");
@@ -735,7 +735,7 @@ private:
         // Only (1,1), (2,1), and (1,2) are supported by FmhaOptions.
         TLLM_CHECK_WITH_INFO(
             (numInstsQ == 1 || numInstsQ == 2) && (numInstsKv == 1 || numInstsKv == 2) && (numInstsQ * numInstsKv <= 2),
-            "Expect numInstsQ/Kv in {(1,1),(2,1),(1,2)}, got numInstsQ=%d, numInstsKv=%d", numInstsQ, numInstsKv);
+            "Expect numInstsQ/Kv in {{(1,1),(2,1),(1,2)}}, got numInstsQ={}, numInstsKv={}", numInstsQ, numInstsKv);
         // Format of the hash key:
         // Bit 0  - 3 : qkvLayout.
         // Bit 4  - 7 : maskType.
@@ -776,7 +776,7 @@ private:
     {
         TLLM_CHECK_WITH_INFO(kernelMeta.mTileSizeQ > 0 && kernelMeta.mTileSizeKv > 0
                 && kernelMeta.mStepQ % kernelMeta.mTileSizeQ == 0 && kernelMeta.mStepKv % kernelMeta.mTileSizeKv == 0,
-            "Invalid step/tile sizes in FMHA kernel meta: stepQ=%d tileSizeQ=%d stepKv=%d tileSizeKv=%d",
+            "Invalid step/tile sizes in FMHA kernel meta: stepQ={} tileSizeQ={} stepKv={} tileSizeKv={}",
             kernelMeta.mStepQ, kernelMeta.mTileSizeQ, kernelMeta.mStepKv, kernelMeta.mTileSizeKv);
         int const numInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
         int const numInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
@@ -1538,7 +1538,7 @@ public:
     {
         static std::unique_ptr<TllmFmhaKernelFactory> sFactory[32] = {nullptr};
         int const deviceId = tensorrt_llm::common::getDevice();
-        TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId %d (must be < 32)", deviceId);
+        TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId {} (must be < 32)", deviceId);
         if (sFactory[deviceId] == nullptr)
         {
             sFactory[deviceId] = std::make_unique<TllmFmhaKernelFactory>(TllmFmhaKernelFactory());
