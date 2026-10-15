@@ -615,16 +615,29 @@ def processScanResults(ref) {
                             [title: 'CVE',             key: 'cve'],
                             [title: 'FIX VERSION',     key: 'fix_version'],
                         ]
-                        def vulnWidths = vulnCols.collect { col ->
-                            Math.max(col.title.length(),
-                                     (result.detected_vulnerabilities.collect { it[col.key].toString().length() }.max() ?: 0))
+                        // Plain index loops: Collection.max() is blocked by the script sandbox, and the
+                        // implicit `it` of `indices.collect {}` is null under the CPS transform.
+                        def vulnWidths = []
+                        for (int c = 0; c < vulnCols.size(); c++) {
+                            int width = vulnCols[c].title.length()
+                            for (def entry : result.detected_vulnerabilities) {
+                                width = Math.max(width, entry[vulnCols[c].key].toString().length())
+                            }
+                            vulnWidths << width
                         }
-                        def vulnSep = "+" + vulnWidths.collect { '-' * (it + 2) }.join('+') + "+"
-                        def vulnRows = [vulnSep,
-                                        "| " + vulnCols.indices.collect { vulnCols[it].title.padRight(vulnWidths[it]) }.join(' | ') + " |",
-                                        vulnSep]
-                        result.detected_vulnerabilities.each { entry ->
-                            vulnRows << "| " + vulnCols.indices.collect { entry[vulnCols[it].key].toString().padRight(vulnWidths[it]) }.join(' | ') + " |"
+                        def vulnSep = "+"
+                        def vulnHeader = "|"
+                        for (int c = 0; c < vulnCols.size(); c++) {
+                            vulnSep += '-' * (vulnWidths[c] + 2) + "+"
+                            vulnHeader += " " + vulnCols[c].title.padRight(vulnWidths[c]) + " |"
+                        }
+                        def vulnRows = [vulnSep, vulnHeader, vulnSep]
+                        for (def entry : result.detected_vulnerabilities) {
+                            def row = "|"
+                            for (int c = 0; c < vulnCols.size(); c++) {
+                                row += " " + entry[vulnCols[c].key].toString().padRight(vulnWidths[c]) + " |"
+                            }
+                            vulnRows << row
                         }
                         vulnRows << vulnSep
                         echo "New vulnerabilities detected:\n${vulnRows.join('\n')}"
