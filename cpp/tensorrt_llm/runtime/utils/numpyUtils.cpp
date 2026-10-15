@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ std::string getNumpyTypeDesc(tensorrt_llm::DataType type)
 
 tensorrt_llm::DataType typeFromNumpyDesc(std::string const& type)
 {
-    TLLM_LOG_DEBUG("numpy type: %s", type.c_str());
+    TLLM_LOG_DEBUG("numpy type: {}", type.c_str());
 
     using dt = tensorrt_llm::DataType;
     static std::unordered_map<std::string, dt> const type_map{{"?", dt::kBOOL}, {"u1", dt::kUINT8}, {"i1", dt::kINT8},
@@ -80,7 +80,7 @@ void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
     n_elems = fread((void*) &npy_major, sizeof(uint8_t), 1, f_ptr);
     n_elems += fread((void*) &npy_minor, sizeof(uint8_t), 1, f_ptr);
 
-    TLLM_LOG_DEBUG("npy format version: %d.%d", npy_major, npy_minor);
+    TLLM_LOG_DEBUG("npy format version: {}.{}", npy_major, npy_minor);
 
     if (npy_major == 1)
     {
@@ -115,7 +115,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, tensorrt_llm::DataType& ty
     std::string header(header_c, header_len);
     free(header_c);
 
-    TLLM_LOG_DEBUG("npy header: %s", header.c_str());
+    TLLM_LOG_DEBUG("npy header: {}", header.c_str());
 
     size_t start, end;
     start = header.find("'descr'") + 7;

@@ -201,7 +201,7 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
     TLLM_MPI_CHECK(MPI_Initialized(&initialized));
     if (!initialized)
     {
-        TLLM_LOG_INFO("Initializing MPI with thread mode %d", threadMode);
+        TLLM_LOG_INFO("Initializing MPI with thread mode {}", static_cast<int>(threadMode));
         int providedMode = 0;
         auto requiredMode = static_cast<int>(threadMode);
         MPICHECK(MPI_Init_thread(nullptr, nullptr, requiredMode, &providedMode));
@@ -341,14 +341,14 @@ std::unique_ptr<MpiRequest> MpiComm::sendAsync(
     void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
     couldUseMPI();
-    TLLM_LOG_DEBUG("start MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
+    TLLM_LOG_DEBUG("start MPI_Isend with dest {}, tag {}, size {}", dest, static_cast<int>(tag), size);
     std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Isend, buffer, size, getMpiDtype(dtype), dest, static_cast<int>(tag), mComm, &r->mRequest);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif
-    TLLM_LOG_DEBUG("end MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
+    TLLM_LOG_DEBUG("end MPI_Isend with dest {}, tag {}, size {}", dest, static_cast<int>(tag), size);
     return r;
 }
 
@@ -361,13 +361,13 @@ std::unique_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int 
 void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
     couldUseMPI();
-    TLLM_LOG_DEBUG("start MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
+    TLLM_LOG_DEBUG("start MPI_Send with dest {}, tag {}, size {}", dest, tag, size);
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Send, buffer, size, getMpiDtype(dtype), dest, tag, mComm);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
-    TLLM_LOG_DEBUG("end MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
+    TLLM_LOG_DEBUG("end MPI_Send with dest {}, tag {}, size {}", dest, tag, size);
 }
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
@@ -385,14 +385,14 @@ void MpiComm::send(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 MPI_Status MpiComm::recvRawTag(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
     couldUseMPI();
-    TLLM_LOG_DEBUG("start MPI_Recv with source %d, tag %d, size %d", source, tag, size);
+    TLLM_LOG_DEBUG("start MPI_Recv with source {}, tag {}, size {}", source, tag, size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Recv, buffer, size, getMpiDtype(dtype), source, tag, mComm, &status);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
-    TLLM_LOG_DEBUG("end MPI_Recv with source %d, tag %d, size %d", source, tag, size);
+    TLLM_LOG_DEBUG("end MPI_Recv with source {}, tag {}, size {}", source, tag, size);
     return status;
 }
 
@@ -531,27 +531,27 @@ int MpiComm::getSize() const
 
 MpiComm const& MpiComm::world()
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     static MpiComm commWorld{MPI_COMM_WORLD, false};
     initialize();
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return commWorld;
 }
 
 MpiComm& MpiComm::mutableSession()
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     static MpiComm commSession{MPI_COMM_WORLD, false};
     initialize();
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return commSession;
 }
 
 MpiComm& MpiComm::mutableLocalSession()
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     static MpiComm localSession = initLocalSession();
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return localSession;
 }
 
@@ -634,20 +634,20 @@ MpiWaitThread::MpiWaitThread(std::string name, std::function<void()> funcWait, s
     , mFuncWait{funcWait}
     , mFuncSetup{funcSetup}
 {
-    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} start", mName.c_str(), __PRETTY_FUNCTION__);
     mThread = std::make_unique<std::thread>(&MpiWaitThread::sideThread, this);
-    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 MpiWaitThread::~MpiWaitThread()
 {
-    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} start", mName.c_str(), __PRETTY_FUNCTION__);
     waitStop();
     mShouldExit.store(true);
     notifyStart();
     mThread->join();
     mThread.reset(nullptr);
-    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 void MpiWaitThread::sideThread()
@@ -666,36 +666,36 @@ void MpiWaitThread::sideThread()
 
 void MpiWaitThread::waitStart()
 {
-    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} start", mName.c_str(), __PRETTY_FUNCTION__);
     std::unique_lock<std::mutex> lock(mMutex);
     mCondVar.wait(lock, [this] { return mRunning; });
-    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 void MpiWaitThread::waitStop()
 {
-    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} start", mName.c_str(), __PRETTY_FUNCTION__);
     std::unique_lock<std::mutex> lock(mMutex);
     mCondVar.wait(lock, [this] { return !mRunning; });
-    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 void MpiWaitThread::notifyStart()
 {
-    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} start", mName.c_str(), __PRETTY_FUNCTION__);
     std::lock_guard<std::mutex> lock(mMutex);
     mRunning = true;
     mCondVar.notify_one();
-    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 void MpiWaitThread::notifyStop()
 {
-    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} start", mName.c_str(), __PRETTY_FUNCTION__);
     std::lock_guard<std::mutex> lock(mMutex);
     mRunning = false;
     mCondVar.notify_one();
-    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{}: {} stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 MpiProgressThread::MpiProgressThread(MPI_Comm comm, std::chrono::microseconds interval, int probeTag)

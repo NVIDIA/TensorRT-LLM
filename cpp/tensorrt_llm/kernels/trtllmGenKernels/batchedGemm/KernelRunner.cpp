@@ -458,7 +458,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
         if (printedBmmNames.find(msg) == printedBmmNames.end())
         {
             printedBmmNames.insert(msg);
-            TLLM_LOG_INFO(msg);
+            TLLM_LOG_INFO("{}", msg);
         }
     }
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere

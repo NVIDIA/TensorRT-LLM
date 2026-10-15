@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1373,7 +1373,7 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize(
     // Use the stored flag pointer
     *(static_buffers->flag_ptr) += 1;
 
-    TLLM_LOG_TRACE("AllReduceParams's flag value is %d", *(static_buffers->flag_ptr));
+    TLLM_LOG_TRACE("AllReduceParams's flag value is {}", *(static_buffers->flag_ptr));
     uint64_t flag_value = *(static_buffers->flag_ptr);
     LowPrecisionAllReduceParams params;
     // Even plugins use ping buffers, odd plugins use pong.
@@ -1417,7 +1417,7 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize_hier(
     // Use the stored flag pointer
     *(static_buffers->flag_ptr) += 1;
 
-    TLLM_LOG_TRACE("AllReduceParams's flag value is %d", *(static_buffers->flag_ptr));
+    TLLM_LOG_TRACE("AllReduceParams's flag value is {}", *(static_buffers->flag_ptr));
     uint64_t flag_value = *(static_buffers->flag_ptr);
     LowPrecisionAllReduceParams params;
     // Even plugins use ping buffers, odd plugins use pong.

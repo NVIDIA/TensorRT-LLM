@@ -136,7 +136,7 @@
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",                                 \
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput={}, dtypeInput={}",                                 \
             static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));                                  \
     }
 
@@ -164,7 +164,7 @@
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",                                 \
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput={}, dtypeInput={}",                                 \
             static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));                                  \
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ void sm100_dispatch_epilogue_schedules(ActivationType const* A, WeightType const
     int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemm_config.epilogue_schedule)
     {
     case tkc::EpilogueScheduleType::AUTO:
@@ -71,7 +71,7 @@ void sm100_dispatch_mainloop_schedules(ActivationType const* A, WeightType const
     int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     switch (gemm_config.mainloop_schedule)
     {
@@ -97,7 +97,7 @@ void sm100_dispatch_gemm_config(ActivationType const* A, WeightType const* B, Sc
     int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemm_config.cluster_shape)
     {
     // TODO: add support for other cluster shapes
@@ -121,7 +121,7 @@ void sm100_dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B
     int k, int const group_size, char* workspace, size_t workspace_bytes, tkc::CutlassGemmConfig gemm_config,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     // Note that SIMT configs are omitted here since they are not supported for fpA_intB.
     // We also only instantiate configs here where threadblockShapeM == warpShapeM since those usually perform the best
     // for mixed type gemms.

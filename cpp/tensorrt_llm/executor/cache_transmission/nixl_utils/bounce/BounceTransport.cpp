@@ -290,7 +290,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         // exception to escape the thread (registerPeerHandshake applies the same posture for the
         // out-of-band endpoint: catch, warn, fall back to NIXL).
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): rejected WANT from peer %s: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
+            "BounceTransport({}): rejected WANT from peer {}: {}", mCtx.selfName.c_str(), peer.c_str(), e.what());
     }
     auto const key = makeKey(peer, h.requestId);
     if (isCancelWant(chunkBytes))
@@ -321,7 +321,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     // a live request can never be NACKed.
     if (mCtx.scheduler.knowsFlow(key))
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropped duplicate WANT from peer %s rid=%llu", mCtx.selfName.c_str(),
+        TLLM_LOG_WARNING("BounceTransport({}): dropped duplicate WANT from peer {} rid={}", mCtx.selfName.c_str(),
             peer.c_str(), static_cast<unsigned long long>(h.requestId));
         return;
     }
@@ -337,7 +337,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     {
         if (bytes == 0 || bytes > mCtx.cfg.maxChunkSizeBytes)
         {
-            TLLM_LOG_WARNING("BounceTransport(%s): rejected WANT from peer %s rid=%llu: chunk size %u outside (0, %zu]",
+            TLLM_LOG_WARNING("BounceTransport({}): rejected WANT from peer {} rid={}: chunk size {} outside (0, {}]",
                 mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), bytes,
                 static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
             // Request-level NACK: the sender fails now instead of waiting out requestTimeoutMs.
@@ -383,7 +383,7 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     // malformed input; drop it instead of adding replay state or risking two readers of one grant.
     if (!mScattering.emplace(job.offset, false).second)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping duplicate DATA peer=%s rid=%llu chunk=%u region=%llu",
+        TLLM_LOG_WARNING("BounceTransport({}): dropping duplicate DATA peer={} rid={} chunk={} region={}",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
             static_cast<unsigned long long>(h.regionHandle));
         bounceRangeEnd(job.nvtxQueue);
@@ -560,8 +560,8 @@ void BounceReceiver::checkTimeouts()
         // all others quarantine (the silent peer's NIC may still be writing them).
         auto const [peer, rid] = splitKey(flow);
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): flow lease expired (no progress within %d ms) peer=%s rid=%llu -> reclaiming "
-            "(regions quarantined for %d ms before reuse)",
+            "BounceTransport({}): flow lease expired (no progress within {} ms) peer={} rid={} -> reclaiming "
+            "(regions quarantined for {} ms before reuse)",
             mCtx.selfName.c_str(), mCtx.cfg.receiverFlowTimeoutMs, peer.c_str(), static_cast<unsigned long long>(rid),
             mCtx.cfg.quarantineMs);
         reclaimAndFlagDeferred(
@@ -577,8 +577,8 @@ void BounceReceiver::recoverScatterJob(
     ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed, char const* what)
 {
     TLLM_LOG_WARNING(
-        "BounceTransport(%s): scatter worker exception rid=%llu chunk=%u: %s (acked=%d nackSent=%d "
-        "donePushed=%d)",
+        "BounceTransport({}): scatter worker exception rid={} chunk={}: {} (acked={} nackSent={} "
+        "donePushed={})",
         mCtx.selfName.c_str(), static_cast<unsigned long long>(job.rid), job.chunkIdx, what, static_cast<int>(acked),
         static_cast<int>(nackSent), static_cast<int>(donePushed));
     if (ctx != nullptr)
@@ -600,7 +600,7 @@ void BounceReceiver::recoverScatterJob(
         }
         catch (std::exception const& sendErr)
         {
-            TLLM_LOG_WARNING("BounceTransport(%s): NACK send failed rid=%llu chunk=%u: %s", mCtx.selfName.c_str(),
+            TLLM_LOG_WARNING("BounceTransport({}): NACK send failed rid={} chunk={}: {}", mCtx.selfName.c_str(),
                 static_cast<unsigned long long>(job.rid), job.chunkIdx, sendErr.what());
         }
     }
@@ -718,8 +718,7 @@ void BounceReceiver::scatterWorkerLoop()
                 // implies the nTotal <= maxEntries check would reject the job anyway.
                 if (srcInBounds && rawPieces > maxEntries)
                 {
-                    TLLM_LOG_WARNING(
-                        "BounceTransport(%s): rejected scatter with %llu pieces (max %zu) rid=%llu chunk=%u",
+                    TLLM_LOG_WARNING("BounceTransport({}): rejected scatter with {} pieces (max {}) rid={} chunk={}",
                         mCtx.selfName.c_str(), static_cast<unsigned long long>(rawPieces), maxEntries,
                         static_cast<unsigned long long>(job.rid), job.chunkIdx);
                     srcInBounds = false;
@@ -777,7 +776,7 @@ void BounceReceiver::scatterWorkerLoop()
                 // srcInBounds=0 covers both a run outside the granted region and a plan overflow (both
                 // warned above with detail).
                 TLLM_LOG_WARNING(
-                    "BounceTransport(%s): scatter failed (srcInBounds=%d launch=%d sync=%d) rid=%llu chunk=%u "
+                    "BounceTransport({}): scatter failed (srcInBounds={} launch={} sync={}) rid={} chunk={} "
                     "-> NACK, no ACK",
                     mCtx.selfName.c_str(), static_cast<int>(srcInBounds), static_cast<int>(launchErr),
                     static_cast<int>(syncErr), static_cast<unsigned long long>(job.rid), job.chunkIdx);
@@ -850,7 +849,7 @@ std::shared_future<BounceResult> BounceSender::submit(
         // standard NIXL path, so a bounce-layer fault surfaces to the caller instead of being
         // silently absorbed as a slow success. Whether to retry is the caller's decision.
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
+            "BounceTransport({}): plan build for peer {} rejected: {}", mCtx.selfName.c_str(), peer.c_str(), e.what());
         promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected});
         return fut;
     }
@@ -927,7 +926,7 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
     // RDMA write, even if it guesses the request id.
     if (peer != req.peer)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer GRANT peer=%s expected=%s rid=%llu",
+        TLLM_LOG_WARNING("BounceTransport({}): dropping wrong-peer GRANT peer={} expected={} rid={}",
             mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId));
         return;
     }
@@ -955,7 +954,7 @@ bool BounceSender::abandonOnCreditMispair(
         return false;
     }
     TLLM_LOG_WARNING(
-        "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
+        "BounceTransport({}): rid={} chunk={} packedBytes={} > granted region len={} (GRANT "
         "mispair/reorder); abandoning flow",
         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, static_cast<std::size_t>(packedBytes),
         static_cast<unsigned int>(creditLen));
@@ -987,7 +986,7 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
             // A posted chunk is only erased on ACK, and it can only be ACKed after consuming its
             // credit (nextCredit already passed it) — so a missing or already-credited target is a
             // protocol anomaly (dup GRANT after reconnect). Drop the credit, never mispair it.
-            TLLM_LOG_WARNING("BounceTransport(%s): rid=%llu chunk=%u unexpected credit (dup GRANT?); dropping",
+            TLLM_LOG_WARNING("BounceTransport({}): rid={} chunk={} unexpected credit (dup GRANT?); dropping",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.nextCredit);
             req.pendingCredits.pop_front();
             req.nextCredit += 1;
@@ -1013,8 +1012,8 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
         // Over-grant: receiver handed more credits than we have chunks. Shouldn't happen under
         // the protocol (receiver grants at most numChunks). Log it — silently dropping would
         // mask an upstream bug and leak the receiver-side regions backing these credits.
-        TLLM_LOG_WARNING("BounceTransport(%s): rid=%llu over-grant, dropping %zu extra credit(s)",
-            mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.pendingCredits.size());
+        TLLM_LOG_WARNING("BounceTransport({}): rid={} over-grant, dropping {} extra credit(s)", mCtx.selfName.c_str(),
+            static_cast<unsigned long long>(rid), req.pendingCredits.size());
         req.pendingCredits.clear();
     }
 }
@@ -1106,8 +1105,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // same expression), but a divergence must fail the flow, not corrupt the heap.
         if (nTotal > maxEntries)
         {
-            TLLM_LOG_WARNING(
-                "BounceTransport(%s): rid=%llu chunk=%u plan entries %zu > exec capacity %zu; abandoning flow",
+            TLLM_LOG_WARNING("BounceTransport({}): rid={} chunk={} plan entries {} > exec capacity {}; abandoning flow",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, nTotal, maxEntries);
             mCtx.exec->release(ctx);
             mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
@@ -1144,7 +1142,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             // the next CUDA call) and flag the Posted so drainGatherReady fails the request
             // deterministically (parked by failRequest, recycled by drainOrphanGather).
             (void) cudaGetLastError();
-            TLLM_LOG_WARNING("BounceTransport(%s): gather launch/record failed (launch=%d record=%d) rid=%llu chunk=%u",
+            TLLM_LOG_WARNING("BounceTransport({}): gather launch/record failed (launch={} record={}) rid={} chunk={}",
                 mCtx.selfName.c_str(), static_cast<int>(gatherErr), static_cast<int>(recordErr),
                 static_cast<unsigned long long>(rid), chunkIdx);
         }
@@ -1327,7 +1325,7 @@ bool BounceSender::pollSenderHandles()
                 {
                     // The write is terminal, so progress is safe; the status object keeps the
                     // handle and its destructor retries the backend release.
-                    TLLM_LOG_WARNING("BounceTransport(%s): terminal write handle release deferred rid=%llu chunk=%u",
+                    TLLM_LOG_WARNING("BounceTransport({}): terminal write handle release deferred rid={} chunk={}",
                         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx);
                 }
                 p.xfer.reset();
@@ -1363,14 +1361,14 @@ void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h)
     {
         // Expected late arrival: the request already failed / was cancelled (e.g. a scatter NACK
         // racing the timeout or a second chunk's NACK after the first one failed it).
-        TLLM_LOG_DEBUG("BounceTransport(%s): dropping NACK for unknown rid=%llu peer=%s chunk=%u",
-            mCtx.selfName.c_str(), static_cast<unsigned long long>(h.requestId), peer.c_str(), h.chunkIdx);
+        TLLM_LOG_DEBUG("BounceTransport({}): dropping NACK for unknown rid={} peer={} chunk={}", mCtx.selfName.c_str(),
+            static_cast<unsigned long long>(h.requestId), peer.c_str(), h.chunkIdx);
         return;
     }
     Request& req = it->second;
     if (peer != req.peer)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer NACK peer=%s expected=%s rid=%llu chunk=%u",
+        TLLM_LOG_WARNING("BounceTransport({}): dropping wrong-peer NACK peer={} expected={} rid={} chunk={}",
             mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId),
             h.chunkIdx);
         return;
@@ -1396,7 +1394,7 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     Request& req = it->second;
     if (peer != req.peer)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer ACK peer=%s expected=%s rid=%llu chunk=%u",
+        TLLM_LOG_WARNING("BounceTransport({}): dropping wrong-peer ACK peer={} expected={} rid={} chunk={}",
             mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId),
             h.chunkIdx);
         return;
@@ -1418,7 +1416,7 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     }
     if (!found)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping stale/invalid ACK peer=%s rid=%llu chunk=%u region=%llu",
+        TLLM_LOG_WARNING("BounceTransport({}): dropping stale/invalid ACK peer={} rid={} chunk={} region={}",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
             static_cast<unsigned long long>(h.regionHandle));
         // Duplicate / unknown ACK (zmq reconnect, retransmit). Do NOT count it — an over-count
@@ -1502,8 +1500,8 @@ bool BounceSender::drainOrphanLocal()
             {
                 o.warned = true;
                 TLLM_LOG_WARNING(
-                    "BounceTransport(%s): orphaned RDMA write rid=%llu region offset=%llu has not reached "
-                    "a terminal state after %lld ms; staging region held until it does",
+                    "BounceTransport({}): orphaned RDMA write rid={} region offset={} has not reached "
+                    "a terminal state after {} ms; staging region held until it does",
                     mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid),
                     static_cast<unsigned long long>(o.offset), static_cast<long long>(ageMs));
             }
@@ -1516,7 +1514,7 @@ bool BounceSender::drainOrphanLocal()
         {
             // The write is terminal, so recycling is safe; only the backend handle remains retained
             // (the status object's destructor retries the release).
-            TLLM_LOG_WARNING("BounceTransport(%s): terminal orphan handle release deferred rid=%llu",
+            TLLM_LOG_WARNING("BounceTransport({}): terminal orphan handle release deferred rid={}",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid));
         }
         mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.offset));
@@ -1570,8 +1568,8 @@ bool BounceSender::drainOrphanGather()
             {
                 o.warned = true;
                 TLLM_LOG_WARNING(
-                    "BounceTransport(%s): orphaned gather rid=%llu region offset=%llu has not completed after "
-                    "%lld ms; staging region held until it does",
+                    "BounceTransport({}): orphaned gather rid={} region offset={} has not completed after "
+                    "{} ms; staging region held until it does",
                     mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid),
                     static_cast<unsigned long long>(o.localOffset), static_cast<long long>(ageMs));
             }
@@ -1586,7 +1584,7 @@ bool BounceSender::drainOrphanGather()
             // consumes its content. For a sticky launch failure this WARNING duplicates the one
             // pumpRequest already emitted (acceptable: this second one names the region).
             (void) cudaGetLastError();
-            TLLM_LOG_WARNING("BounceTransport(%s): orphaned gather rid=%llu ended with CUDA error %s",
+            TLLM_LOG_WARNING("BounceTransport({}): orphaned gather rid={} ended with CUDA error {}",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid), cudaGetErrorString(st));
         }
         mCtx.exec->release(o.ctx);
@@ -1607,7 +1605,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     }
     // The one log line every sender-side failure passes through (timeout, peer drop, write/gather
     // failure) — keep it WARNING and keep the progress context.
-    TLLM_LOG_WARNING("BounceTransport(%s): request FAILED rid=%llu peer=%s reason=\"%s\" chunks acked=%u posted=%u/%u",
+    TLLM_LOG_WARNING("BounceTransport({}): request FAILED rid={} peer={} reason=\"{}\" chunks acked={} posted={}/{}",
         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.peer.c_str(), toString(reason), req.acked,
         req.nextPost, req.numChunks);
     // Release in-flight transfer handles and return each gather-staging region to the shared arena —
@@ -1751,7 +1749,7 @@ void BounceSender::failAll()
         if (!inFlight.empty())
         {
             TLLM_LOG_WARNING(
-                "BounceTransport(%s): %zu outbound writes still in flight at shutdown; arena teardown may race the NIC",
+                "BounceTransport({}): {} outbound writes still in flight at shutdown; arena teardown may race the NIC",
                 mCtx.selfName.c_str(), inFlight.size());
         }
     }
@@ -1817,7 +1815,7 @@ void BounceSender::failAll()
         if (!status->release())
         {
             TLLM_LOG_WARNING(
-                "BounceTransport(%s): NIXL handle still retained after shutdown retry", mCtx.selfName.c_str());
+                "BounceTransport({}): NIXL handle still retained after shutdown retry", mCtx.selfName.c_str());
         }
     }
     // Deferred cancels aren't sent at shutdown: in-flight RDMA writes aren't drained by the device
@@ -1848,14 +1846,13 @@ BounceTransport::BounceTransport(std::string selfName, BounceConfig cfg, int dev
         // ever handed out (e.g. 384 MiB -> 256 MiB usable).
         // KiB so sub-MiB (test) arenas do not read as "0 MiB".
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): bounce arena of %zu KiB has only %zu KiB usable (%zu KiB stranded); the buddy "
+            "BounceTransport({}): bounce arena of {} KiB has only {} KiB usable ({} KiB stranded); the buddy "
             "allocator rounds capacity down to a power of two -> set kv_cache_bounce_size_mb to a power of two",
             mCtx.selfName.c_str(), mCtx.cfg.arenaSizeBytes >> 10, cap >> 10, (mCtx.cfg.arenaSizeBytes - cap) >> 10);
     }
     if (mCtx.cfg.maxChunkSizeBytes > cap)
     {
-        TLLM_LOG_WARNING(
-            "BounceTransport(%s): maxChunkSizeBytes=%zu exceeds usable arena capacity=%zu; clamping to %zu",
+        TLLM_LOG_WARNING("BounceTransport({}): maxChunkSizeBytes={} exceeds usable arena capacity={}; clamping to {}",
             mCtx.selfName.c_str(), static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), cap, cap);
         mCtx.cfg.maxChunkSizeBytes = cap;
     }
@@ -1940,7 +1937,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     if (blob.empty())
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s does not advertise bounce (agent_bounce_buffer_enable off, bounce not "
+            "BounceTransport({}): peer {} does not advertise bounce (agent_bounce_buffer_enable off, bounce not "
             "built, or bounce init failed on that side) -> standard NIXL for this peer; this agent's bounce arena "
             "stays idle for it",
             mCtx.selfName.c_str(), peer.c_str());
@@ -1951,7 +1948,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     if (!decodeHandshake(blob, handshake))
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s advertised an unparsable bounce handshake -> bounce disabled for "
+            "BounceTransport({}): peer {} advertised an unparsable bounce handshake -> bounce disabled for "
             "this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str());
         return false;
@@ -1973,9 +1970,9 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
         // The chunk cap is clamped to each side's usable arena capacity; both capacities are printed so
         // an arena-induced mismatch is visible without a separate hint.
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s bounce handshake incompatible (wireVersion %u vs %u, controlKind "
-            "%u vs %u, maxChunkSizeBytes %llu vs %zu, requestTimeoutMs %d vs %d, peer arenaUsableCapacityBytes "
-            "%llu vs %zu) -> bounce disabled for this peer (NIXL fallback)",
+            "BounceTransport({}): peer {} bounce handshake incompatible (wireVersion {} vs {}, controlKind "
+            "{} vs {}, maxChunkSizeBytes {} vs {}, requestTimeoutMs {} vs {}, peer arenaUsableCapacityBytes "
+            "{} vs {}) -> bounce disabled for this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned>(handshake.wireVersion),
             static_cast<unsigned>(kBounceVersion), static_cast<unsigned>(handshake.controlKind),
             static_cast<unsigned>(localControlKind), static_cast<unsigned long long>(handshake.maxChunkSizeBytes),
@@ -1988,7 +1985,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     if (handshake.endpoint.empty())
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s advertised an empty bounce endpoint -> bounce disabled for this "
+            "BounceTransport({}): peer {} advertised an empty bounce endpoint -> bounce disabled for this "
             "peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str());
         return false;
@@ -2001,7 +1998,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     catch (std::exception const& e)
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s bounce endpoint '%s' rejected: %s -> bounce disabled for "
+            "BounceTransport({}): peer {} bounce endpoint '{}' rejected: {} -> bounce disabled for "
             "this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str(), handshake.endpoint.c_str(), e.what());
         return false;
@@ -2009,7 +2006,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     if (!peerAdded)
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s bounce endpoint could not be registered -> bounce disabled for "
+            "BounceTransport({}): peer {} bounce endpoint could not be registered -> bounce disabled for "
             "this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str());
         return false;
@@ -2088,7 +2085,7 @@ void BounceTransport::ioLoop()
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_WARNING("BounceTransport(%s): IO tick failed: %s", mCtx.selfName.c_str(), e.what());
+            TLLM_LOG_WARNING("BounceTransport({}): IO tick failed: {}", mCtx.selfName.c_str(), e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }

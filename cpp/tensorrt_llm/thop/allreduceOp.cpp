@@ -289,14 +289,14 @@ public:
         size_t seq_len = input.size(0);
         size_t hidden_size = input.size(-1);
         size_t bytes_per_element = input.element_size();
-        TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
+        TLLM_LOG_DEBUG("All reduce message size is {}", size * bytes_per_element);
 
         AllReduceStrategyType runtime_strategy = selectImplementation(seq_len, hidden_size);
 
         // Log runtime strategy
         auto const rank = getRank();
         TLLM_LOG_DEBUG(
-            "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
+            "AllReduceOp runtime strategy for rank {}: {}", rank, tensorrt_llm::kernels::toString(runtime_strategy));
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
         {
@@ -317,7 +317,7 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, getRank());
+        TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, getRank());
         if (mNcclComm.index() == 0)
         {
             mNcclComm = getComm(mGroup);
@@ -328,7 +328,7 @@ public:
             initGroupTopology();
         }
 
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, getRank());
+        TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, getRank());
         return 0;
     }
 
@@ -430,7 +430,7 @@ private:
                        [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
                        {
                            reduce_output = input.clone();
-                           // TLLM_LOG_INFO("AllReduce Rank: %d, tensor numel: %d", torchPg->getRank(),
+                           // TLLM_LOG_INFO("AllReduce Rank: {}, tensor numel: {}", torchPg->getRank(),
                            // reduce_output.numel());
                            std::vector tensors{reduce_output};
                            PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
@@ -524,7 +524,7 @@ private:
             {
                 // Small buffer: use input directly without window registration
                 TLLM_LOG_DEBUG(
-                    "[runNCCLAllReduceSymmetric] Buffer size %zu bytes < threshold %zu bytes, "
+                    "[runNCCLAllReduceSymmetric] Buffer size {} bytes < threshold {} bytes, "
                     "skipping window registration",
                     bufferSizeBytes, minRegistrationThreshold);
                 // inputTensor and inputPtr remain pointing to original input
@@ -544,8 +544,8 @@ private:
                 else
                 {
                     TLLM_LOG_DEBUG(
-                        "[runNCCLAllReduceSymmetric] Copying input into symmetric buffer %p (size=%zu bytes)",
-                        symmetricBuffer0.ptr, bufferSizeBytes);
+                        "[runNCCLAllReduceSymmetric] Copying input into symmetric buffer {:p} (size={} bytes)",
+                        static_cast<void const*>(symmetricBuffer0.ptr), bufferSizeBytes);
                     TLLM_CUDA_CHECK(cudaMemcpyAsync(
                         symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
 
@@ -558,8 +558,8 @@ private:
         else
         {
             // Buffer already registered - use it directly
-            TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using registered input buffer for %p (size=%zu bytes)",
-                input.data_ptr(), bufferSizeBytes);
+            TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using registered input buffer for {:p} (size={} bytes)",
+                static_cast<void const*>(input.data_ptr()), bufferSizeBytes);
             inputPtr = windowBuffer0.ptr;
         }
 
@@ -997,7 +997,7 @@ private:
         TLLM_CUDA_CHECK(cudaDriverGetVersion(&cudaDriverVersion));
         if (cudaDriverVersion < 12010)
         {
-            TLLM_LOG_DEBUG("MNNVL check: CUDA Driver version %d < 12010", cudaDriverVersion);
+            TLLM_LOG_DEBUG("MNNVL check: CUDA Driver version {} < 12010", cudaDriverVersion);
             return info;
         }
 
@@ -1011,7 +1011,7 @@ private:
             cudaDriver->cuDeviceGetAttribute(&multicastSupported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
         if (!multicastSupported)
         {
-            TLLM_LOG_DEBUG("MNNVL check: Device %d does not support multicast", deviceId);
+            TLLM_LOG_DEBUG("MNNVL check: Device {} does not support multicast", deviceId);
             return info;
         }
 
@@ -1021,7 +1021,7 @@ private:
             &fabricHandleSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice));
         if (!fabricHandleSupported)
         {
-            TLLM_LOG_DEBUG("MNNVL check: Device %d does not support fabric handles", deviceId);
+            TLLM_LOG_DEBUG("MNNVL check: Device {} does not support fabric handles", deviceId);
             return info;
         }
 
@@ -1031,7 +1031,7 @@ private:
         nvmlReturn_t nvmlResult = nvml->nvmlDeviceGetHandleByIndex(deviceId, &nvmlDevice);
         if (nvmlResult != NVML_SUCCESS)
         {
-            TLLM_LOG_DEBUG("MNNVL check: Failed to get NVML device handle for device %d - error=%d", deviceId,
+            TLLM_LOG_DEBUG("MNNVL check: Failed to get NVML device handle for device {} - error={}", deviceId,
                 static_cast<int>(nvmlResult));
             return info;
         }
@@ -1068,7 +1068,7 @@ private:
         if (nvmlResult != NVML_SUCCESS)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: nvmlDeviceGetGpuFabricInfo failed for device %d - error=%d (not supported or "
+                "MNNVL check: nvmlDeviceGetGpuFabricInfo failed for device {} - error={} (not supported or "
                 "no fabric manager)",
                 deviceId, static_cast<int>(nvmlResult));
             return info;
@@ -1077,7 +1077,8 @@ private:
         // Check if fabric is fully initialized
         if (fabricState != NVML_GPU_FABRIC_STATE_COMPLETED || fabricStatus != NVML_SUCCESS)
         {
-            TLLM_LOG_DEBUG("MNNVL check: Fabric state not complete - state=%u status=%u", fabricState, fabricStatus);
+            TLLM_LOG_DEBUG("MNNVL check: Fabric state not complete - state={} status={}",
+                static_cast<unsigned int>(fabricState), static_cast<unsigned int>(fabricStatus));
             return info;
         }
 
@@ -1095,7 +1096,7 @@ private:
         if (!clusterUuidValid)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: Device %d has invalid (all-zero) clusterUuid - not part of NVLink fabric", deviceId);
+                "MNNVL check: Device {} has invalid (all-zero) clusterUuid - not part of NVLink fabric", deviceId);
             return info;
         }
 
@@ -1124,7 +1125,7 @@ private:
         if (!allLinksUp)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: Not all NVLink links active - active=%u available=%u", activeLinks, availableLinks);
+                "MNNVL check: Not all NVLink links active - active={} available={}", activeLinks, availableLinks);
             return info;
         }
 
@@ -1133,7 +1134,7 @@ private:
         info.cliqueId = fabricCliqueId;
         info.isValid = true;
 
-        TLLM_LOG_INFO("MNNVL check: Device %d supports MNNVL (clusterUuid=%s, cliqueId=%u)", deviceId,
+        TLLM_LOG_INFO("MNNVL check: Device {} supports MNNVL (clusterUuid={}, cliqueId={})", deviceId,
             info.getClusterUuidString().c_str(), fabricCliqueId);
 #endif
         return info;
@@ -1147,7 +1148,7 @@ private:
     void setGroupTopology()
     {
         auto const rank = getRank();
-        TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
+        TLLM_LOG_INFO("Detecting local TP group for rank {}", rank);
         std::set<int> local_group = std::visit(
             overloaded{[&](std::shared_ptr<ncclComm_t>&) { return getLocalGroup(mGroup); },
                 [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg) { return getLocalGroupTorch(mGroup); }},
@@ -1181,7 +1182,7 @@ private:
                         mIsP2PSupported = false;
                         mIsNVLINKSupported = false;
                         TLLM_LOG_INFO(
-                            "P2P not supported between local devices %d and %d", first_device_id, second_device_id);
+                            "P2P not supported between local devices {} and {}", first_device_id, second_device_id);
                         // Continue checking other pairs, but mark as not supported
                         continue;
                     }
@@ -1261,7 +1262,7 @@ private:
         // See: http://docs.nvidia.com/deploy/nvml-api/index.html#structnvmlGpuFabricInfo__v2__t
         if (is_inter_node)
         {
-            TLLM_LOG_INFO("Found inter-node TP group for rank %d, checking MNNVL support via fabric info", rank);
+            TLLM_LOG_INFO("Found inter-node TP group for rank {}, checking MNNVL support via fabric info", rank);
 
             // Get MNNVL fabric info on local device
             MNNVLFabricInfo localFabricInfo;
@@ -1347,7 +1348,7 @@ private:
 
                 if (!rankFabricInfo.isValid)
                 {
-                    TLLM_LOG_DEBUG("MNNVL check: Rank %zu does not have valid fabric info", i);
+                    TLLM_LOG_DEBUG("MNNVL check: Rank {} does not have valid fabric info", i);
                     allRanksMnnvlConnected = false;
                     break;
                 }
@@ -1360,7 +1361,7 @@ private:
                 else if (rankFabricInfo != referenceFabricInfo)
                 {
                     // Fabric info mismatch - ranks are not in the same NVLink fabric
-                    TLLM_LOG_DEBUG("MNNVL check: Rank %zu has different fabric info (clique=%u vs reference clique=%u)",
+                    TLLM_LOG_DEBUG("MNNVL check: Rank {} has different fabric info (clique={} vs reference clique={})",
                         i, rankFabricInfo.cliqueId, referenceFabricInfo.cliqueId);
                     allRanksMnnvlConnected = false;
                     break;
@@ -1373,18 +1374,18 @@ private:
             mIsP2PSupported = false; // P2P doesn't work across nodes
 
             TLLM_LOG_INFO(
-                "Inter-node topology: localNVLink=%d, localFabricValid=%d, allRanksSameFabric=%d, finalMNNVL=%d",
+                "Inter-node topology: localNVLink={}, localFabricValid={}, allRanksSameFabric={}, finalMNNVL={}",
                 mIsNVLINKSupported ? 1 : 0, localFabricInfo.isValid ? 1 : 0, allRanksMnnvlConnected ? 1 : 0,
                 mIsMNNVLSupported ? 1 : 0);
             if (mIsMNNVLSupported && haveReference)
             {
-                TLLM_LOG_INFO("MNNVL enabled: All ranks share fabric (clusterUuid=%s, cliqueId=%u)",
+                TLLM_LOG_INFO("MNNVL enabled: All ranks share fabric (clusterUuid={}, cliqueId={})",
                     referenceFabricInfo.getClusterUuidString().c_str(), referenceFabricInfo.cliqueId);
             }
         }
         else
         {
-            TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
+            TLLM_LOG_INFO("TP group is intra-node for rank {}", rank);
         }
     }
 
@@ -1426,7 +1427,7 @@ private:
             // Check TWOSHOT constraint: seq_len >= tp_size
             if (mStrategy == AllReduceStrategyType::TWOSHOT && seq_len < mGroup.size())
             {
-                TLLM_LOG_WARNING("TWOSHOT strategy requires seq_len >= tp_size (%zu < %zu), falling back to ONESHOT",
+                TLLM_LOG_WARNING("TWOSHOT strategy requires seq_len >= tp_size ({} < {}), falling back to ONESHOT",
                     seq_len, mGroup.size());
                 return AllReduceStrategyType::ONESHOT;
             }
@@ -1519,7 +1520,7 @@ void preallocateNCCLWindowBuffer(
     {
         return;
     }
-    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
+    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating {} buffer(s) for tokens={} ({} bytes) comm {:p}",
         buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
     std::vector<void*> allocatedPtrs;
     allocatedPtrs.reserve(buffersPerSize);
@@ -1537,7 +1538,7 @@ void preallocateNCCLWindowBuffer(
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
+        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for {} bytes: {}", bufferSize, e.what());
     }
 
     for (auto ptr : allocatedPtrs)
@@ -1571,7 +1572,7 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_DEBUG("[isNCCLWindowBuffer] getComm threw (MPI disabled?): %s", e.what());
+        TLLM_LOG_DEBUG("[isNCCLWindowBuffer] getComm threw (MPI disabled?): {}", e.what());
         return false;
     }
 

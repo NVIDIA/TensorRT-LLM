@@ -219,7 +219,7 @@ struct BounceConfig
     {
         auto warnBad = [&]
         {
-            TLLM_LOG_WARNING("BounceConfig: invalid value '%s' for '%s' (from %s) -> keeping the current value",
+            TLLM_LOG_WARNING("BounceConfig: invalid value '{}' for '{}' (from {}) -> keeping the current value",
                 value.c_str(), key.c_str(), origin);
         };
         auto setBool = [&](bool& field)
@@ -384,7 +384,7 @@ struct BounceConfig
         {
             if (!applyParam(base, key, value, "agent_bounce_params"))
             {
-                TLLM_LOG_WARNING("BounceConfig: unknown agent_bounce_params key '%s' -> ignored", key.c_str());
+                TLLM_LOG_WARNING("BounceConfig: unknown agent_bounce_params key '{}' -> ignored", key.c_str());
             }
         }
         // Same validity check as applyParam's request_timeout_ms setter: only a value that was

@@ -167,7 +167,7 @@ public:
         auto handle = mHandles[key];
         if (handle == nullptr)
         {
-            TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
+            TLLM_LOG_DEBUG("Creating allreduce workspace for {}", key.toString().c_str());
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -156,7 +156,7 @@ void printLogitsKeyInfo(ITensor const& tensor, std::string const& infoStr)
 
     ss << " avg: " << mAvg << ", min: " << mMin << ", max: " << mMax << std::endl;
 
-    TLLM_LOG_TRACE(ss.str());
+    TLLM_LOG_TRACE("{}", ss.str());
 }
 
 template void printLogitsKeyInfo<float>(ITensor const& tensor, std::string const& infoStr);

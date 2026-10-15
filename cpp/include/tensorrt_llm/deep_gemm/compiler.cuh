@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -348,7 +348,7 @@ public:
         {
             if (kJitDebugging)
             {
-                TLLM_LOG_INFO("Using cached JIT runtime %s during build", name.c_str());
+                TLLM_LOG_INFO("Using cached JIT runtime {} during build", name.c_str());
             }
             return cachedRuntime;
         }
@@ -402,10 +402,10 @@ public:
         // Print options if debug enabled
         if (kJitDebugging)
         {
-            TLLM_LOG_INFO("Compiling JIT runtime %s with options: ", name.c_str());
+            TLLM_LOG_INFO("Compiling JIT runtime {} with options: ", name.c_str());
             for (auto const& flag : flags)
             {
-                TLLM_LOG_INFO("%s ", flag.c_str());
+                TLLM_LOG_INFO("{} ", flag.c_str());
             }
             TLLM_LOG_INFO("\n");
         }
@@ -415,7 +415,7 @@ public:
 
         if (kJitDebugging)
         {
-            TLLM_LOG_INFO("Generated kernel code:\n%s", code.c_str());
+            TLLM_LOG_INFO("Generated kernel code:\n{}", code.c_str());
         }
 
         if (kJitUseNvcc)
@@ -472,8 +472,8 @@ public:
                 {
                     auto end = std::chrono::high_resolution_clock::now();
                     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-                    TLLM_LOG_INFO("NVCC compilation took %d ms", duration.count());
-                    TLLM_LOG_INFO("Compilation log:\n%s", result.c_str());
+                    TLLM_LOG_INFO("NVCC compilation took {} ms", duration.count());
+                    TLLM_LOG_INFO("Compilation log:\n{}", result.c_str());
                 }
             }
         }
@@ -496,13 +496,13 @@ public:
             {
                 auto end = std::chrono::high_resolution_clock::now();
                 auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-                TLLM_LOG_INFO("NVRTC compilation took %d ms", duration.count());
+                TLLM_LOG_INFO("NVRTC compilation took {} ms", duration.count());
 
                 size_t logSize;
                 CHECK_NVRTC(nvrtcGetProgramLogSize(prog, &logSize));
                 std::vector<char> log(logSize);
                 CHECK_NVRTC(nvrtcGetProgramLog(prog, log.data()));
-                TLLM_LOG_INFO("Compilation log:\n%s", log.data());
+                TLLM_LOG_INFO("Compilation log:\n{}", log.data());
             }
 
             // Check if compilation succeeded
@@ -527,7 +527,7 @@ public:
                 runtimeCache.set(path.string(), std::move(runtime));
                 if (kJitDebugging)
                 {
-                    TLLM_LOG_INFO("Successfully cached JIT runtime %s in memory", name.c_str());
+                    TLLM_LOG_INFO("Successfully cached JIT runtime {} in memory", name.c_str());
                 }
                 return result;
             }
@@ -545,12 +545,12 @@ public:
             std::filesystem::rename(tmpCubinPath, cubinPath);
             if (kJitDebugging)
             {
-                TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s", path.string().c_str());
+                TLLM_LOG_INFO("Successfully copied kernel files to cache directory: {}", path.string().c_str());
             }
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: %s", e.what());
+            TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: {}", e.what());
         }
 
         // Clean up temporary directory after successful compilation
@@ -560,7 +560,7 @@ public:
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Warning: Failed to clean up temporary directory: %s", e.what());
+            TLLM_LOG_ERROR("Warning: Failed to clean up temporary directory: {}", e.what());
         }
 
         // Create runtime and cache it

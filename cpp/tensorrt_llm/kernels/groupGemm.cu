@@ -141,7 +141,7 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
     tensorrt_llm::DataType dataType, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     using ElementA = cutlassType;
     using ElementB = cutlassType;
     using ElementOutput = cutlassType;
@@ -247,7 +247,7 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     sync_check_cuda_error(stream);
 
     std::free(host_workspace);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
@@ -304,7 +304,7 @@ void fp8GroupedGemmImpl(std::vector<cutlass::gemm::GemmCoord> const& problemSize
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
     cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     using namespace cute;
 
@@ -492,7 +492,7 @@ void fp8GroupedGemmImpl(std::vector<cutlass::gemm::GemmCoord> const& problemSize
 
     sync_check_cuda_error(stream);
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
@@ -529,7 +529,7 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
     bool isLoraIn, tensorrt_llm::DataType dataType, int minKN, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
+    TLLM_LOG_TRACE("{} start, isLoraIn: {}, minKN = {}", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
 
 #ifdef ENABLE_FP8
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)

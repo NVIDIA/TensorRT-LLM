@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -155,7 +155,7 @@ TargetRanksInfo TargetRanksInfoForDPImpl(kv_cache::CacheState const& peerCacheSt
     TLLM_CHECK(targetPeerPpLayerNumSum == selfNumLayerPerPP[selfPPRank]);
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "selfPPRank:%d,selfPPNum:%d,peerPPNum:%d,selfTPNum:%d,peerTPNum:%d,peerPPRankStart:%d,peerPPRankEnd:%d",
+        "selfPPRank:{},selfPPNum:{},peerPPNum:{},selfTPNum:{},peerTPNum:{},peerPPRankStart:{},peerPPRankEnd:{}",
         selfPPRank, selfPPNum, peerPPNum, selfTPNum, peerTPNum, peerPPRankStart, peerPPRankEnd);
     int peerTPRankStart = 0;
     int mDomainTPSize = 1;
@@ -230,9 +230,9 @@ TargetRanksInfo TargetRanksInfoForDPImpl(kv_cache::CacheState const& peerCacheSt
     }
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "mDomainPPSize:%d, mDomainTPSize:%d, mDupHeadFactor:%d, mPeerDupHeadFactor:%d, selfPPRank:%d, selfPPNum:%d, "
-        "peerPPNum:%d, selfTPNum:%d, peerTPNum:%d, selfTPSizePerDPGroup:%d, peerTPSizePerDPGroup:%d, "
-        "selfNbHeadsPerLayer:%d, peerNbHeadsPerLayer:%d, selfTPrankInDPGroup:%d, peerDpRank:%d, selfRank:%d",
+        "mDomainPPSize:{}, mDomainTPSize:{}, mDupHeadFactor:{}, mPeerDupHeadFactor:{}, selfPPRank:{}, selfPPNum:{}, "
+        "peerPPNum:{}, selfTPNum:{}, peerTPNum:{}, selfTPSizePerDPGroup:{}, peerTPSizePerDPGroup:{}, "
+        "selfNbHeadsPerLayer:{}, peerNbHeadsPerLayer:{}, selfTPrankInDPGroup:{}, peerDpRank:{}, selfRank:{}",
         mDomainPPSize, mDomainTPSize, mDupHeadFactor, mPeerDupHeadFactor, selfPPRank, selfPPNum, peerPPNum, selfTPNum,
         peerTPNum, selfTPSizePerDPGroup, peerTPSizePerDPGroup, selfNbHeadsPerLayer, peerNbHeadsPerLayer,
         selfTPrankInDPGroup, peerDpRank, selfRank);
@@ -246,7 +246,7 @@ TargetRanksInfo TargetRanksInfoForDPImpl(kv_cache::CacheState const& peerCacheSt
         }
         return ss.str();
     };
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "retRanks:%s , targetPeerPPLayerNum:%s",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "retRanks:{} , targetPeerPPLayerNum:{}",
         vector_to_string(retRanks).c_str(), vector_to_string(targetPeerPPLayerNum).c_str());
     return {mDomainPPSize, mDomainTPSize, mDomainCPSize, std::move(retRanks), mDupHeadFactor, mPeerDupHeadFactor,
         std::move(targetPeerPPLayerNum)};
@@ -1189,7 +1189,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         auto cacheDataType = blocks.front()->getDataType();
         windowSizes.push_back(window);
         blockNumInwindow.push_back(blocks.size());
-        TLLM_LOG_DEBUG("window: %d, blockNum: %d  blockshape:[%d,%d]", window, blocks.size(),
+        TLLM_LOG_DEBUG("window: {}, blockNum: {}  blockshape:[{},{}]", window, blocks.size(),
             blocks.front()->getShape().d[0], blocks.front()->getShape().d[1]);
         auto layersNum = blocks.front()->getDimension<1>();
         layersInWindow.push_back(layersNum);
@@ -1269,7 +1269,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         blockNumPerWindowDevPtr = static_cast<int const*>(windowInfoDeviceBuffer->data());
         layersPerWindowDevPtr = static_cast<int const*>(windowInfoDeviceBuffer->data()) + windowSizes.size();
 
-        TLLM_LOG_DEBUG("windowNum:%d, inputBlockLayerNumSum:%d, ", windowNum, inputBlockLayerNumSum);
+        TLLM_LOG_DEBUG("windowNum:{}, inputBlockLayerNumSum:{}, ", windowNum, inputBlockLayerNumSum);
     }
 
     dim3 gridDim{gridDimx, gridDimy};
@@ -1297,8 +1297,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     constexpr int mlaSubWarpSize = 16;
 
     TLLM_LOG_DEBUG(
-        "splitKVCache - numLayers: %d, headNum: %d, domainPPSize: %d, domainTPSize: %d, "
-        "headsPerDomainTP: %d",
+        "splitKVCache - numLayers: {}, headNum: {}, domainPPSize: {}, domainTPSize: {}, "
+        "headsPerDomainTP: {}",
         numLayers, headNum, domainPPSize, domainTPSize, headNumDomainTP);
 
     int const remainder = dimsPerHead * sizeof(T) % 16;
@@ -1618,7 +1618,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     // so the per-rank layer count comes from the indexer layer counts.
     int const numLayers = isIndexerKCache ? selfCacheState.getIndexerLayerNumPerPP().at(selfPPRank)
                                           : selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:%d", numLayers);
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:{}", numLayers);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
     int const dimsPerHead = computeDimsPerHead(selfCacheState, isIndexerKCache);
 
@@ -1631,8 +1631,8 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
 
     bool isMLA = selfAttentionConfig.mAttentionType == CacheState::AttentionType::kMLA;
     TLLM_LOG_DEBUG(
-        "concatKVCache - numLayers: %d, headNum: %d, domainPPSize: %d, domainTPSize: %d, "
-        "headsPerDomainTP: %d",
+        "concatKVCache - numLayers: {}, headNum: {}, domainPPSize: {}, domainTPSize: {}, "
+        "headsPerDomainTP: {}",
         numLayers, headNum, domainPPSize, domainTPSize, headNumDomainTP);
 
     int const remainder = dimsPerHead * sizeof(T) % 16;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
     float const alpha, OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;

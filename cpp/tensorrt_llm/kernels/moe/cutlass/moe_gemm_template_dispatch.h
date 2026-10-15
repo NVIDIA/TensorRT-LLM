@@ -916,7 +916,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceS
     if (num_experts != num_experts_ || use_mxfp8_weight_scaling != use_mxfp8_weight_scaling_)
     {
         TLLM_LOG_TRACE(
-            "Calling getMaxWorkspaceSize() with a new (expert count, use_mxfp8_weight_scaling) (%d, %d) vs (%d, %d)",
+            "Calling getMaxWorkspaceSize() with a new (expert count, use_mxfp8_weight_scaling) ({}, {}) vs ({}, {})",
             num_experts, (int) use_mxfp8_weight_scaling, num_experts_, (int) use_mxfp8_weight_scaling_);
         num_experts_ = num_experts;
         use_mxfp8_weight_scaling_ = use_mxfp8_weight_scaling;
@@ -983,7 +983,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         }                                                                                                              \
         catch (tensorrt_llm::common::TllmException const& e)                                                           \
         {                                                                                                              \
-            TLLM_LOG_TRACE("Unsupported config skipped when calculating MOE workspace size %s", e.what());             \
+            TLLM_LOG_TRACE("Unsupported config skipped when calculating MOE workspace size {}", e.what());             \
         }                                                                                                              \
     } while (0)
 

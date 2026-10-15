@@ -46,7 +46,7 @@ bool loopedReadWrite(Func&& func, ssize_t size) noexcept
             {
                 continue; // Retry on interrupt
             }
-            TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(errno));
+            TLLM_LOG_ERROR("Disk read/write failed: {}\n", strerror(errno));
             return false;
         }
         count += bytes;

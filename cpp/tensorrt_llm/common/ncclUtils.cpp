@@ -117,7 +117,7 @@ bool queryNcclWindowSupported()
     if (version < kNcclWindowMinRuntimeVersion)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] NCCL runtime version %d.%d.%d does not support window buffers; falling back to regular "
+            "[NCCLUtil] NCCL runtime version {}.{}.{} does not support window buffers; falling back to regular "
             "tensors.",
             version / 10000, (version % 10000) / 100, version % 100);
         return false;
@@ -133,7 +133,7 @@ bool queryNcclWindowSupported()
     if (deviceErr != cudaSuccess)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Failed to query the current CUDA device while checking NCCL window support: %s; "
+            "[NCCLUtil] Failed to query the current CUDA device while checking NCCL window support: {}; "
             "falling back to regular tensors.",
             cudaGetErrorString(deviceErr));
         return false;
@@ -144,8 +144,8 @@ bool queryNcclWindowSupported()
     if (integratedErr != cudaSuccess)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Failed to query CUDA integrated-device attribute for device %d while checking NCCL window "
-            "support: %s; falling back to regular tensors.",
+            "[NCCLUtil] Failed to query CUDA integrated-device attribute for device {} while checking NCCL window "
+            "support: {}; falling back to regular tensors.",
             device, cudaGetErrorString(integratedErr));
         return false;
     }
@@ -158,7 +158,7 @@ bool queryNcclWindowSupported()
     catch (std::exception const& e)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Failed to query real CUDA SM version while checking NCCL window support: %s; falling back "
+            "[NCCLUtil] Failed to query real CUDA SM version while checking NCCL window support: {}; falling back "
             "to regular tensors.",
             e.what());
         return false;
@@ -168,7 +168,7 @@ bool queryNcclWindowSupported()
     if (!supported)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Disabling NCCL window buffers on integrated SM %d with NCCL runtime version %d.%d.%d; "
+            "[NCCLUtil] Disabling NCCL window buffers on integrated SM {} with NCCL runtime version {}.{}.{}; "
             "GB10 requires NCCL 2.30.4 or newer for symmetric window registration.",
             realSmVersion, version / 10000, (version % 10000) / 100, version % 100);
     }
@@ -267,7 +267,7 @@ void NcclCommResourceManager::registerResource(ncclComm_t comm, ResourceCleanupF
     auto& resources = mCommResources[comm];
     resources.emplace_back(std::move(cleanup), debugName ? debugName : "unnamed");
 
-    TLLM_LOG_TRACE("[NCCLUtil] Registered resource '%s' for NCCL comm %p (total: %zu)",
+    TLLM_LOG_TRACE("[NCCLUtil] Registered resource '{}' for NCCL comm {:p} (total: {})",
         debugName ? debugName : "unnamed", static_cast<void*>(comm), resources.size());
 }
 
@@ -314,7 +314,7 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
             // Logging may fail during static destruction, so wrap in try-catch
             try
             {
-                TLLM_LOG_TRACE("[NCCLUtil] Cleaning up %zu resources for NCCL comm %p", resourcesToClean.size(),
+                TLLM_LOG_TRACE("[NCCLUtil] Cleaning up {} resources for NCCL comm {:p}", resourcesToClean.size(),
                     static_cast<void*>(comm));
             }
             catch (...)
@@ -340,7 +340,7 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
             try
             {
                 TLLM_LOG_TRACE(
-                    "[NCCLUtil] Cleaning up resource '%s' for NCCL comm %p", name.c_str(), static_cast<void*>(comm));
+                    "[NCCLUtil] Cleaning up resource '{}' for NCCL comm {:p}", name.c_str(), static_cast<void*>(comm));
             }
             catch (...)
             {
@@ -352,7 +352,7 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
         {
             try
             {
-                TLLM_LOG_ERROR("[NCCLUtil] Exception during cleanup of resource '%s' for NCCL comm %p: %s",
+                TLLM_LOG_ERROR("[NCCLUtil] Exception during cleanup of resource '{}' for NCCL comm {:p}: {}",
                     name.c_str(), static_cast<void*>(comm), e.what());
             }
             catch (...)
@@ -364,7 +364,7 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
         {
             try
             {
-                TLLM_LOG_ERROR("[NCCLUtil] Unknown exception during cleanup of resource '%s' for NCCL comm %p",
+                TLLM_LOG_ERROR("[NCCLUtil] Unknown exception during cleanup of resource '{}' for NCCL comm {:p}",
                     name.c_str(), static_cast<void*>(comm));
             }
             catch (...)
@@ -435,8 +435,9 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     {
         bestFit->inUse = true;
         TLLM_LOG_TRACE(
-            "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
-            static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
+            "[NCCLUtil] Reusing NCCL window buffer for comm {:p}: handle={}, ptr={:p}, size={} (requested: {})",
+            static_cast<void*>(comm), bestFit->buffer.handle, static_cast<void const*>(bestFit->buffer.ptr),
+            bestFit->buffer.size, size);
         return bestFit->buffer;
     }
 
@@ -446,7 +447,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     auto const failureIt = mMinSymmetricFailureSize.find(comm);
     if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
     {
-        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm %p, size=%zu; known failure threshold=%zu",
+        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm {:p}, size={}; known failure threshold={}",
             static_cast<void*>(comm), size, failureIt->second);
         return NCCLWindowBuffer();
     }
@@ -456,18 +457,18 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
     if (capture_err != cudaSuccess)
     {
-        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
+        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: {}", cudaGetErrorString(capture_err));
     }
     if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
     {
-        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
+        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation during capture for comm {:p} (requested: {})",
             static_cast<void*>(comm), size);
         return NCCLWindowBuffer();
     }
 
     // No available buffer found, allocate a new one
     TLLM_LOG_TRACE(
-        "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
+        "[NCCLUtil] Allocating new NCCL window buffer for comm {:p}, size={}", static_cast<void*>(comm), size);
     int handle = static_cast<int>(commBuffers.size());
     NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle, stream);
     // Only cache valid buffers. allocateAndRegisterBuffer returns an empty buffer when any rank
@@ -533,8 +534,8 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] Attempted to release buffer %p for unknown comm %p", ptr, static_cast<void*>(comm));
+        TLLM_LOG_WARNING("[NCCLUtil] Attempted to release buffer {:p} for unknown comm {:p}",
+            static_cast<void const*>(ptr), static_cast<void*>(comm));
         return;
     }
 
@@ -543,12 +544,14 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
         if (entry.buffer.ptr == ptr)
         {
             entry.inUse = false;
-            TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p: ptr=%p", static_cast<void*>(comm), ptr);
+            TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm {:p}: ptr={:p}", static_cast<void*>(comm),
+                static_cast<void const*>(ptr));
             return;
         }
     }
 
-    TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer %p for comm %p", ptr, static_cast<void*>(comm));
+    TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer {:p} for comm {:p}", static_cast<void const*>(ptr),
+        static_cast<void*>(comm));
 }
 
 ncclWindow_t NCCLWindowAllocator::getWindow(ncclComm_t comm, void* ptr) const
@@ -652,7 +655,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
         {
             TLLM_LOG_WARNING(
                 "[NCCLUtil] ncclMemAlloc failed on at least one other rank; "
-                "freeing local allocation (size=%zu) and aborting window registration on all ranks.",
+                "freeing local allocation (size={}) and aborting window registration on all ranks.",
                 size);
         }
         return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
@@ -672,8 +675,8 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
     // Step 5: Success. Transfer ownership to the returned buffer.
     ncclGuard.release();
     NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
-    TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
-        handle, buffer.ptr, buffer.size, static_cast<void*>(buffer.window));
+    TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle={}, ptr={:p}, size={}, window={:p}",
+        handle, static_cast<void const*>(buffer.ptr), buffer.size, static_cast<void*>(buffer.window));
     return buffer;
 }
 
@@ -723,8 +726,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     cudaError_t cudaErr = cudaDeviceSynchronize();
     if (cudaErr != cudaSuccess)
     {
-        TLLM_LOG_WARNING("[NCCLUtil] cudaDeviceSynchronize failed with error: %d before cleanup for comm %p", cudaErr,
-            static_cast<void*>(comm));
+        TLLM_LOG_WARNING("[NCCLUtil] cudaDeviceSynchronize failed with error: {} before cleanup for comm {:p}",
+            static_cast<int>(cudaErr), static_cast<void*>(comm));
         // Continue anyway - the sync failure might be from a previous error
     }
 
@@ -747,7 +750,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     }
 
     TLLM_LOG_TRACE(
-        "[NCCLUtil] Cleaning up %zu NCCL window buffers for comm %p", commIt->second.size(), static_cast<void*>(comm));
+        "[NCCLUtil] Cleaning up {} NCCL window buffers for comm {:p}", commIt->second.size(), static_cast<void*>(comm));
 
     // Check for buffers still in use - this shouldn't happen if cleanup is called properly,
     // but we log a warning if it does
@@ -764,11 +767,11 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     if (inUseCount > 0)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Cleaning up %zu buffers still marked as in-use for comm %p. "
+            "[NCCLUtil] Cleaning up {} buffers still marked as in-use for comm {:p}. "
             "This may indicate buffers weren't properly released before cleanup.",
             inUseCount, static_cast<void*>(comm));
     }
-    TLLM_LOG_DEBUG("[NCCLUtil] NCCL window allocator teardown for comm %p: %zu buffers, %zu bytes total",
+    TLLM_LOG_DEBUG("[NCCLUtil] NCCL window allocator teardown for comm {:p}: {} buffers, {} bytes total",
         static_cast<void*>(comm), commIt->second.size(), totalBytes);
 
     for (auto& entry : commIt->second)
@@ -787,9 +790,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
                 if (result != ncclSuccess)
                 {
                     TLLM_LOG_WARNING(
-                        "[NCCLUtil] ncclCommWindowDeregister failed with error: %d for comm %p, "
-                        "window %p (buffer inUse: %d)",
-                        result, static_cast<void*>(comm), static_cast<void*>(entry.buffer.window), entry.inUse);
+                        "[NCCLUtil] ncclCommWindowDeregister failed with error: {} for comm {:p}, "
+                        "window {:p} (buffer inUse: {})",
+                        static_cast<int>(result), static_cast<void*>(comm), static_cast<void*>(entry.buffer.window),
+                        static_cast<int>(entry.inUse));
                 }
             }
 
@@ -802,17 +806,18 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
                     ncclResult_t ncclResult = ncclMemFree(entry.buffer.ptr);
                     if (ncclResult != ncclSuccess)
                     {
-                        TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed with error: %d", ncclResult);
+                        TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed with error: {}", static_cast<int>(ncclResult));
                     }
                 }
                 catch (...)
                 {
-                    TLLM_LOG_ERROR("[NCCLUtil] Exception during ncclMemFree for ptr %p", entry.buffer.ptr);
+                    TLLM_LOG_ERROR("[NCCLUtil] Exception during ncclMemFree for ptr {:p}",
+                        static_cast<void const*>(entry.buffer.ptr));
                 }
             }
 
-            TLLM_LOG_TRACE(
-                "[NCCLUtil] Freed NCCL window buffer: ptr=%p, size=%zu", entry.buffer.ptr, entry.buffer.size);
+            TLLM_LOG_TRACE("[NCCLUtil] Freed NCCL window buffer: ptr={:p}, size={}",
+                static_cast<void const*>(entry.buffer.ptr), entry.buffer.size);
         }
     }
 

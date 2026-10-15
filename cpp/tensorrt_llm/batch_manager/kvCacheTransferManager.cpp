@@ -50,7 +50,7 @@ static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string con
     ssize_t written = ::write(fd, hostBuffer.data(), numBytes);
     TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
 
-    TLLM_LOG_DEBUG("Wrote %zd bytes to %s (POSIX fallback)", written, filename.c_str());
+    TLLM_LOG_DEBUG("Wrote {} bytes to {} (POSIX fallback)", written, filename.c_str());
 
     ::close(fd);
     return true;
@@ -67,7 +67,7 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
     ssize_t bytesRead = ::read(fd, hostBuffer.data(), numBytes);
     TLLM_CHECK_WITH_INFO(bytesRead >= 0, "POSIX read error=%zd", bytesRead);
 
-    TLLM_LOG_DEBUG("Read %zd bytes from %s (POSIX fallback)", bytesRead, filename.c_str());
+    TLLM_LOG_DEBUG("Read {} bytes from {} (POSIX fallback)", bytesRead, filename.c_str());
 
     cudaError_t cpyErr = cudaMemcpy(dstPtr->data(), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
     TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
@@ -108,7 +108,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
-    TLLM_LOG_DEBUG("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
+    TLLM_LOG_DEBUG("copyBlock entered: srcId={}, dstId={}, isOffload={}, mode={}", src->getBlockId(), dst->getBlockId(),
         (isOffload ? "true" : "false"), static_cast<int>(mode));
 
     if (mode == executor::KvCacheTransferMode::DRAM)
@@ -222,7 +222,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
         if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
-            TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
+            TLLM_LOG_INFO("Forcing POSIX fallback for file: {}", filename.c_str());
             if (isOffload)
             {
                 gpuToFilePosix(ptr, filename);

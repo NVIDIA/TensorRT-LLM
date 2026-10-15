@@ -516,7 +516,7 @@ bool FusedMultiHeadAttentionXMMAKernelV2::checkIfKernelExist(MHARunnerFixedParam
                << std::dec << "\n\n";
         }
 
-        TLLM_LOG_WARNING(ss.str().c_str());
+        TLLM_LOG_WARNING("{}", ss.str().c_str());
     }
     return found;
 }

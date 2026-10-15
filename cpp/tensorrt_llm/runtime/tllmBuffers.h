@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -279,10 +279,10 @@ public:
     ~MemoryPool()
     {
         std::lock_guard<std::mutex> lock(mLock);
-        TLLM_LOG_DEBUG("MemoryPool: Deallocating %zu chunks", mAllocatedChunks.size());
+        TLLM_LOG_DEBUG("MemoryPool: Deallocating {} chunks", mAllocatedChunks.size());
         for (auto const& [ptr, size] : mAllocatedChunks)
         {
-            TLLM_LOG_DEBUG("MemoryPool: Deallocating %zu B", size);
+            TLLM_LOG_DEBUG("MemoryPool: Deallocating {} B", size);
             try
             {
                 mAllocator.deallocate(ptr, size);
@@ -363,7 +363,7 @@ private:
 
     void allocateChunk()
     {
-        TLLM_LOG_DEBUG("MemoryPool: Allocating %zu B", mChunkSize);
+        TLLM_LOG_DEBUG("MemoryPool: Allocating {} B", mChunkSize);
         auto basePointer = mAllocator.allocate(mChunkSize);
         mAllocatedChunks.emplace_back(basePointer, mChunkSize);
         mMemorySegments.push_back(MemorySegment{basePointer, mChunkSize});
@@ -381,7 +381,7 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, std::siz
     std::size_t const alignedRequest{
         requestedSize == 0 ? kAlignment : common::ceilDiv(requestedSize, kAlignment) * kAlignment};
 
-    TLLM_LOG_DEBUG("MemoryPool: Requested to reserve %zu B (%zu B aligned)", requestedSize, alignedRequest);
+    TLLM_LOG_DEBUG("MemoryPool: Requested to reserve {} B ({} B aligned)", requestedSize, alignedRequest);
 
     // Finds first free segment providing sufficient space
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
@@ -392,11 +392,11 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, std::siz
         // There is no space available for this request:
         // Adapt mChunkSize to the aligned requested size in case it doesn't fit,
         // allocate a chunk of mChunkSize and fulfill this request
-        TLLM_LOG_DEBUG("MemoryPool: Needs more space to accommodate request of %zu B", requestedSize);
+        TLLM_LOG_DEBUG("MemoryPool: Needs more space to accommodate request of {} B", requestedSize);
         if (mChunkSize < alignedRequest)
         {
             mChunkSize = alignedRequest;
-            TLLM_LOG_DEBUG("MemoryPool: Increasing chunk size to %zu B", mChunkSize);
+            TLLM_LOG_DEBUG("MemoryPool: Increasing chunk size to {} B", mChunkSize);
         }
         allocateChunk();
         it = std::prev(mMemorySegments.end());
@@ -435,7 +435,7 @@ void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, std::size_t n)
 
     if (it->size < n)
     {
-        TLLM_LOG_WARNING("MemoryPool: Requested to free %zu B, but only %zu B available", n, it->size);
+        TLLM_LOG_WARNING("MemoryPool: Requested to free {} B, but only {} B available", n, it->size);
     }
 
     // Check if previous segment is free, in which case, join
@@ -470,7 +470,8 @@ void MemoryPool<TAllocator>::logSegments() const
     TLLM_LOG_DEBUG("MemoryPool segments:");
     for (auto ms : mMemorySegments)
     {
-        TLLM_LOG_DEBUG("* Segment size %zu, tag %p, basePointer %p", ms.size, ms.tag, ms.basePointer);
+        TLLM_LOG_DEBUG("* Segment size {}, tag {:p}, basePointer {:p}", ms.size, static_cast<void const*>(ms.tag),
+            static_cast<void const*>(ms.basePointer));
     }
 }
 

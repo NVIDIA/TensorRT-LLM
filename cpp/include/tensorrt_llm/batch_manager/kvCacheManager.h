@@ -178,7 +178,7 @@ struct LinearAttentionMetadata
         // Allocate the last full block for maximum reuse opportunity.
         if (saveLastSnapshot && (currentBlockEndTokenIdx / tokensPerBlock == promptLen / tokensPerBlock))
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: saveLastSnapshot",
+            TLLM_LOG_DEBUG("Allocating recurrent states for block {}, reason: saveLastSnapshot",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
             return true;
         }
@@ -186,7 +186,7 @@ struct LinearAttentionMetadata
         // Allocate the block that contains the end of the current sequence to save the final state.
         if (currentBlockEndTokenIdx >= promptLen && currentBlockEndTokenIdx < promptLen + tokensPerBlock)
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: end of sequence",
+            TLLM_LOG_DEBUG("Allocating recurrent states for block {}, reason: end of sequence",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
             return true;
         }
@@ -195,7 +195,7 @@ struct LinearAttentionMetadata
         // initialization.
         if ((statesSnapshotInterval > 0) && (currentBlockEndTokenIdx % statesSnapshotInterval == 0))
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: statesSnapshotInterval",
+            TLLM_LOG_DEBUG("Allocating recurrent states for block {}, reason: statesSnapshotInterval",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
             return true;
         }

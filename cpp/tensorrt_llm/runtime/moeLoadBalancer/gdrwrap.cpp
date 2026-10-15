@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,7 +56,7 @@ static void* gGdrApiHandle = nullptr;
         *(void**) (&(funcptr)) = dlsym(handle, symbol);                                                                \
         if ((funcptr) == NULL)                                                                                         \
         {                                                                                                              \
-            TLLM_LOG_WARNING("dlsym failed on %s - %s", symbol, dlerror());                                            \
+            TLLM_LOG_WARNING("dlsym failed on {} - {}", symbol, dlerror());                                            \
             dlclose(handle);                                                                                           \
             gGdrApiHandle = nullptr;                                                                                   \
             gInitStatus = false;                                                                                       \
@@ -72,7 +72,7 @@ static void initialize_internal()
     gGdrApiHandle = dlopen(GDRAPI_LIBNAME, RTLD_NOW);
     if (!gGdrApiHandle)
     {
-        TLLM_LOG_INFO("Failed to open %s. GDRCopy support is disabled.", GDRAPI_LIBNAME);
+        TLLM_LOG_INFO("Failed to open {}. GDRCopy support is disabled.", GDRAPI_LIBNAME);
         gInitStatus = false;
         return;
     }
@@ -107,7 +107,7 @@ static void initialize_internal()
     if (libMajor < 2 || (libMajor == 2 && libMinor < 1) || drvMajor < 2 || (drvMajor == 2 && drvMinor < 1))
     {
         TLLM_LOG_WARNING(
-            "GDRCopy library version (%d.%d) or driver version (%d.%d) is too old. Required >= 2.1. GDRCopy support "
+            "GDRCopy library version ({}.{}) or driver version ({}.{}) is too old. Required >= 2.1. GDRCopy support "
             "is disabled.",
             libMajor, libMinor, drvMajor, drvMinor);
         dlclose(gGdrApiHandle);
@@ -116,7 +116,7 @@ static void initialize_internal()
         return;
     }
 
-    TLLM_LOG_INFO("GDRCopy enabled library %d.%d driver %d.%d", libMajor, libMinor, drvMajor, drvMinor);
+    TLLM_LOG_INFO("GDRCopy enabled library {}.{} driver {}.{}", libMajor, libMinor, drvMajor, drvMinor);
     gInitStatus = true;
     gGdrInitialized = true;
 }
@@ -245,9 +245,9 @@ void gdrCudaMalloc(void** ptr, void** devPtr, size_t mapSize, GdrMemDesc** memDe
     if (devPtr)
         *devPtr = (void*) (devMem + off + align);
 
-    TLLM_LOG_DEBUG("GDRCOPY : allocated devMem %p gdrMap %p offset %lx mh %lx mapSize %zu at %p",
-        (*memDesc)->gdrDeviceMem, (*memDesc)->gdrMap, (*memDesc)->gdrOffset, (*memDesc)->gdrMh.h,
-        (*memDesc)->gdrMapSize, *ptr);
+    TLLM_LOG_DEBUG("GDRCOPY : allocated devMem {:p} gdrMap {:p} offset {:x} mh {:x} mapSize {} at {:p}",
+        static_cast<void const*>((*memDesc)->gdrDeviceMem), static_cast<void const*>((*memDesc)->gdrMap),
+        (*memDesc)->gdrOffset, (*memDesc)->gdrMh.h, (*memDesc)->gdrMapSize, static_cast<void const*>(*ptr));
 }
 
 void gdrCudaFree(GdrMemDesc* memDesc, gdr_t handle)

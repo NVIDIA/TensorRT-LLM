@@ -77,7 +77,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         return std::nullopt;
     }
 
-    TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
+    TLLM_LOG_DEBUG("Creating response for request {}", mRequestId);
 
     executor::Result result;
     result.sequenceIndex = mSequenceIndex;
@@ -213,7 +213,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         {
             for (auto const& outputTensor : outputTensorMap)
             {
-                TLLM_LOG_DEBUG("Adding tensor %s with shape %s to result.", outputTensor.first.c_str(),
+                TLLM_LOG_DEBUG("Adding tensor {} with shape {} to result.", outputTensor.first.c_str(),
                     runtime::ITensor::toString(outputTensor.second->getShape()).c_str());
                 result.additionalOutputs.emplace_back(
                     prefix + outputTensor.first, executor::detail::ofITensor(outputTensor.second));
@@ -279,8 +279,8 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         {
             auto const newDraftLenPerEngineStep = maxInputLen - mPromptLen;
             TLLM_LOG_WARNING(
-                "Prompt length + number of draft tokens (%d + %d) exceeds maximum input length (%d)."
-                "Number of draft tokens is changed to (%d)",
+                "Prompt length + number of draft tokens ({} + {}) exceeds maximum input length ({})."
+                "Number of draft tokens is changed to ({})",
                 mPromptLen, draftLenPerEngineStep, maxInputLen, newDraftLenPerEngineStep);
             draftLenPerEngineStep = newDraftLenPerEngineStep;
             mDraftTokens->resize(draftLenPerEngineStep);
@@ -291,9 +291,9 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
     {
         auto const maxNewTokens = maxSequenceLen - mPromptLen - draftLenPerEngineStep;
         TLLM_LOG_WARNING(
-            "Prompt length + number of requested output tokens + draft tokens per step (%d + %d + %d) exceeds "
-            "maximum sequence length (%d). "
-            "Number of requested output tokens is changed to (%d).",
+            "Prompt length + number of requested output tokens + draft tokens per step ({} + {} + {}) exceeds "
+            "maximum sequence length ({}). "
+            "Number of requested output tokens is changed to ({}).",
             mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
         mMaxNewTokens = maxNewTokens;
     }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -277,7 +277,7 @@ void KVCacheEventManager::worker()
             SizeType32 numRemoved = std::min(static_cast<SizeType32>(mEvents.size()), elementsToRemove);
             mEvents.erase(mEvents.begin(), mEvents.begin() + numRemoved);
             elementsToRemove -= numRemoved;
-            TLLM_LOG_WARNING("The event queue has reached the max size of %d. Events have been discarded.", mMaxSize);
+            TLLM_LOG_WARNING("The event queue has reached the max size of {}. Events have been discarded.", mMaxSize);
         }
 
         // If there's still too many events, take from the front of the events queue.

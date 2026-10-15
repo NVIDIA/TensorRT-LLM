@@ -454,11 +454,11 @@ public:
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_WARNING("Failed to discard sender session for request %ld: %s", requestId, e.what());
+            TLLM_LOG_WARNING("Failed to discard sender session for request {}: {}", requestId, e.what());
         }
         catch (...)
         {
-            TLLM_LOG_WARNING("Failed to discard sender session for request %ld: unknown exception", requestId);
+            TLLM_LOG_WARNING("Failed to discard sender session for request {}: unknown exception", requestId);
         }
         if (!common::getEnvDisaggEnableInflightCancel())
         {
@@ -471,11 +471,11 @@ public:
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_WARNING("Failed to discard in-flight cancel flag for request %ld: %s", requestId, e.what());
+            TLLM_LOG_WARNING("Failed to discard in-flight cancel flag for request {}: {}", requestId, e.what());
         }
         catch (...)
         {
-            TLLM_LOG_WARNING("Failed to discard in-flight cancel flag for request %ld: unknown exception", requestId);
+            TLLM_LOG_WARNING("Failed to discard in-flight cancel flag for request {}: unknown exception", requestId);
         }
     }
 
@@ -555,9 +555,9 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
-        TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-submit begin.", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("KV cache transfer request {} phase=transfer-submit begin.", llmRequest.mRequestId);
         mCacheTransferLayer.format(*session);
-        TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-complete end.", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("KV cache transfer request {} phase=transfer-complete end.", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
@@ -604,7 +604,7 @@ public:
         }
         if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            TLLM_LOG_WARNING("Cannot cancel request {}", llmRequest.mRequestId);
         }
         else
         {
@@ -689,7 +689,7 @@ private:
                 {
                     if (!resource.mSendQueue.empty())
                     {
-                        TLLM_LOG_WARNING("There are still %zu requests in the mSendQueue, but encountered terminate.",
+                        TLLM_LOG_WARNING("There are still {} requests in the mSendQueue, but encountered terminate.",
                             resource.mSendQueue.size());
                     }
                     break;
@@ -716,7 +716,7 @@ private:
         }
         catch (std::exception const& err)
         {
-            TLLM_LOG_ERROR("Failed to unpin reuse-tree blocks: %s", err.what());
+            TLLM_LOG_ERROR("Failed to unpin reuse-tree blocks: {}", err.what());
         }
         response.mPinnedBlockIds.clear();
     }
@@ -740,7 +740,7 @@ private:
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: {} ", e.what());
             discardTransferState(id);
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
             failResponse(resp, std::make_exception_ptr(new_exception));
@@ -748,14 +748,14 @@ private:
         catch (std::exception const& e)
         {
             auto const exception = std::current_exception();
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: {} request id: {}", e.what(), id);
             discardTransferState(id);
             failResponse(resp, exception);
         }
         catch (...)
         {
             auto const exception = std::current_exception();
-            TLLM_LOG_ERROR("Unknown exception in sendAndRemoveResponse for request id: %ld", id);
+            TLLM_LOG_ERROR("Unknown exception in sendAndRemoveResponse for request id: {}", id);
             discardTransferState(id);
             failResponse(resp, exception);
         }
@@ -772,13 +772,13 @@ private:
         }
         catch (std::exception const& err)
         {
-            TLLM_LOG_ERROR("Failed to queue asynchronous KV cache send for request %zu: %s", id, err.what());
+            TLLM_LOG_ERROR("Failed to queue asynchronous KV cache send for request {}: {}", id, err.what());
             discardTransferState(id);
             failResponse(resp, std::current_exception());
         }
         catch (...)
         {
-            TLLM_LOG_ERROR("Unknown error while queueing asynchronous KV cache send for request %zu", id);
+            TLLM_LOG_ERROR("Unknown error while queueing asynchronous KV cache send for request {}", id);
             discardTransferState(id);
             failResponse(resp, std::current_exception());
         }
@@ -942,7 +942,7 @@ private:
                         if (pinnedIds.empty())
                         {
                             TLLM_LOG_ERROR(
-                                "Requested blocks do not exist in the source's reuse tree (request id: %lu). Notifying "
+                                "Requested blocks do not exist in the source's reuse tree (request id: {}). Notifying "
                                 "receiver.",
                                 reqId);
                             sendReadySignal(reqId, false);
@@ -993,7 +993,7 @@ private:
         }
         catch (std::exception const& err)
         {
-            TLLM_LOG_ERROR("Exception in CacheSender response: %s", err.what());
+            TLLM_LOG_ERROR("Exception in CacheSender response: {}", err.what());
             responseException = std::current_exception();
         }
         catch (...)
@@ -1064,7 +1064,7 @@ private:
         }
         catch (std::future_error const& err)
         {
-            TLLM_LOG_ERROR("Failed to set CacheSender response exception: %s", err.what());
+            TLLM_LOG_ERROR("Failed to set CacheSender response exception: {}", err.what());
         }
         releasePinnedBlocks(response);
     }
@@ -1445,7 +1445,7 @@ public:
             auto const& commState = llmRequest.getDataTransceiverState().getCommState();
             if (!commState.has_value())
             {
-                TLLM_LOG_WARNING("Cannot cancel request %zu: the request has no data-transceiver communication state",
+                TLLM_LOG_WARNING("Cannot cancel request {}: the request has no data-transceiver communication state",
                     llmRequest.mRequestId);
                 return false;
             }
@@ -1455,7 +1455,7 @@ public:
         auto const resourceIt = mInstanceToAsyncResource.find(processInfo);
         if (resourceIt == mInstanceToAsyncResource.end())
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu: receive worker %s is not registered", llmRequest.mRequestId,
+            TLLM_LOG_WARNING("Cannot cancel request {}: receive worker {} is not registered", llmRequest.mRequestId,
                 processInfo.c_str());
             return false;
         }
@@ -1509,7 +1509,7 @@ public:
         }
         if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            TLLM_LOG_WARNING("Cannot cancel request {}", llmRequest.mRequestId);
         }
         return isCancelled;
     }
@@ -1616,7 +1616,7 @@ private:
         auto const requestId = llmRequest.mRequestId;
         auto const contextRequestId = llmRequest.getContextPhaseParams().value().getReqId();
         char const* phase = "request-info";
-        TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu started.", requestId, contextRequestId);
+        TLLM_LOG_DEBUG("KV cache receive request {}, context request {} started.", requestId, contextRequestId);
         if (llmRequest.getKvCacheTransferStart() == LlmRequest::TimePoint{})
         {
             llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
@@ -1630,19 +1630,19 @@ private:
                 TLLM_THROW("KV cache receive request %zu cancelled before request-info", requestId);
             }
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
-                contextRequestId, phase);
+            TLLM_LOG_DEBUG(
+                "KV cache receive request {}, context request {} phase={} begin.", requestId, contextRequestId, phase);
             auto const* cancelFlag = common::getEnvDisaggEnableInflightCancel() ? &perRequestCancel : nullptr;
             session.emplace(sendRequestInfo(llmRequest, cancelFlag));
             session->setTime(TransferSession::kTimeRequestInfo);
             TLLM_LOG_DEBUG(
-                "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
+                "KV cache receive request {}, context request {} phase={} end.", requestId, contextRequestId, phase);
 
             phase = "ready-signal";
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
-                contextRequestId, phase);
+            TLLM_LOG_DEBUG(
+                "KV cache receive request {}, context request {} phase={} begin.", requestId, contextRequestId, phase);
             auto readyResult = receiveReadySignalDetailed(*session, perRequestCancel);
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s end: result=%d.", requestId,
+            TLLM_LOG_DEBUG("KV cache receive request {}, context request {} phase={} end: result={}.", requestId,
                 contextRequestId, phase, static_cast<int>(readyResult));
             if (readyResult == ReadySignalResult::kCancelled)
             {
@@ -1672,11 +1672,11 @@ private:
             }
 
             phase = "transfer-completion-notification";
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
-                contextRequestId, phase);
+            TLLM_LOG_DEBUG(
+                "KV cache receive request {}, context request {} phase={} begin.", requestId, contextRequestId, phase);
             receiveSync(*session);
             TLLM_LOG_DEBUG(
-                "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
+                "KV cache receive request {}, context request {} phase={} end.", requestId, contextRequestId, phase);
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
         }
         catch (std::exception const& err)
@@ -1686,7 +1686,7 @@ private:
                 session->poisonReservedRecvBuffers();
             }
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-            TLLM_LOG_ERROR("KV cache receive request %zu, context request %zu failed in phase=%s: %s", requestId,
+            TLLM_LOG_ERROR("KV cache receive request {}, context request {} failed in phase={}: {}", requestId,
                 contextRequestId, phase, err.what());
             throw;
         }
@@ -1698,13 +1698,13 @@ private:
             }
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
             TLLM_LOG_ERROR(
-                "KV cache receive request %zu, context request %zu failed in phase=%s with an unknown "
+                "KV cache receive request {}, context request {} failed in phase={} with an unknown "
                 "exception",
                 requestId, contextRequestId, phase);
             throw;
         }
 
-        TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu completed.", requestId, contextRequestId);
+        TLLM_LOG_DEBUG("KV cache receive request {}, context request {} completed.", requestId, contextRequestId);
     }
 
     void requestSync(LlmRequest& llmRequest)
@@ -1788,7 +1788,7 @@ private:
                     if (!resource.mRequestsQueue.empty())
                     {
                         TLLM_LOG_WARNING(
-                            "There are still %zu requests in the mRequestsQueue, but encountered terminate.",
+                            "There are still {} requests in the mRequestsQueue, but encountered terminate.",
                             resource.mRequestsQueue.size());
                     }
                     break;
@@ -1807,7 +1807,7 @@ private:
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
                 {
-                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%zu , request context id:%zu : %s",
+                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:{} , request context id:{} : {}",
                         requestAndPromise.mRequest->mRequestId,
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     auto new_exception = TLLM_REQUEST_EXCEPTION(
@@ -1816,7 +1816,7 @@ private:
                 }
                 catch (std::exception const& err)
                 {
-                    TLLM_LOG_ERROR("Exception in CacheReceiver request(): request id:%ld , request context id:%ld : %s",
+                    TLLM_LOG_ERROR("Exception in CacheReceiver request(): request id:{} , request context id:{} : {}",
                         requestAndPromise.mRequest->mRequestId,
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     requestAndPromise.mPromise->set_exception(std::current_exception());

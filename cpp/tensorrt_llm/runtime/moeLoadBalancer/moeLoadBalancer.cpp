@@ -974,7 +974,7 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
         if (numCopyThreadsFromEnv > 0)
         {
             TLLM_LOG_INFO(
-                "Setting TLLM_LOAD_BALANCE_NUM_COPY_THREADS to %d by environment variable", numCopyThreadsFromEnv);
+                "Setting TLLM_LOAD_BALANCE_NUM_COPY_THREADS to {} by environment variable", numCopyThreadsFromEnv);
             numCopyThreads = numCopyThreadsFromEnv;
         }
     }
@@ -983,7 +983,7 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
         if (cpuCountPerGpu > 0)
         {
             numCopyThreads = std::min(16, std::max(4, cpuCountPerGpu / 2));
-            TLLM_LOG_INFO("Auto-setting copy threads to %d based on NUMA topology (NUMA node %d, %d CPUs, arch: %s)",
+            TLLM_LOG_INFO("Auto-setting copy threads to {} based on NUMA topology (NUMA node {}, {} CPUs, arch: {})",
                 numCopyThreads, currentGpuNumaId, numaCpuCount, cpuArch.c_str());
         }
     }

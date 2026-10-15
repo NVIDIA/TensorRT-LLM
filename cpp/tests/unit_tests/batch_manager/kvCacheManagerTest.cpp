@@ -501,7 +501,7 @@ void runPartialCopyTest()
         T expectedValue = (token < partiallyReusedTokens) ? i & mask : 0;
         if (value != expectedValue)
         {
-            TLLM_LOG_WARNING("partialCopyBlock[%d,%d,%d,%d,%d] - expected %d, actual %d", kOrV, layer, head, token, j,
+            TLLM_LOG_WARNING("partialCopyBlock[{},{},{},{},{}] - expected {}, actual {}", kOrV, layer, head, token, j,
                 expectedValue, value);
             ++numBad;
         }

@@ -486,7 +486,7 @@ bool fusedBuildExpertMapsSortFirstTokenBlockSize(int const* token_selected_exper
     if (num_tokens > 256)
     {
         TLLM_LOG_TRACE(
-            "Number of tokens %d is greater than 256, which is not supported for fused moe prologues", num_tokens);
+            "Number of tokens {} is greater than 256, which is not supported for fused moe prologues", num_tokens);
         return false;
     }
 
@@ -545,7 +545,7 @@ bool fusedBuildExpertMapsSortFirstTokenBlockSize(int const* token_selected_exper
     }
     default:
     {
-        TLLM_LOG_TRACE("Top-K value %d does not have supported fused moe prologues", experts_per_token);
+        TLLM_LOG_TRACE("Top-K value {} does not have supported fused moe prologues", experts_per_token);
         return false;
     }
     }
@@ -574,7 +574,7 @@ bool fusedBuildExpertMapsSortFirstToken(int const* token_selected_experts, int* 
             unpermuted_row_to_permuted_row, expert_first_token_offset, num_tokens, num_experts_per_node,
             experts_per_token, start_expert, end_expert, stream);
     }
-    TLLM_LOG_TRACE("Experts per node %d does not have supported fused moe prologues", num_experts_per_node);
+    TLLM_LOG_TRACE("Experts per node {} does not have supported fused moe prologues", num_experts_per_node);
     return false;
 }
 
@@ -3432,7 +3432,7 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, En
     std::vector<size_t> sizes(sizes_map.size());
     std::transform(sizes_map.begin(), sizes_map.end(), sizes.begin(), [](auto& v) { return v.second.first; });
     size_t size = tensorrt_llm::common::calculateTotalWorkspaceSize(sizes.data(), sizes.size());
-    TLLM_LOG_TRACE("Mixture Of Experts Plugin requires workspace of %2f MiB", size / 1024.f / 1024.f);
+    TLLM_LOG_TRACE("Mixture Of Experts Plugin requires workspace of {:2f} MiB", size / 1024.f / 1024.f);
     return size;
 }
 
@@ -5684,7 +5684,7 @@ size_t GemmProfilerBackend::getWorkspaceSize(int maxM)
     std::vector<size_t> sizes(sizes_map.size());
     std::transform(sizes_map.begin(), sizes_map.end(), sizes.begin(), [](auto& v) { return v.second.first; });
     size_t size = calculateTotalWorkspaceSize(sizes.data(), sizes.size());
-    TLLM_LOG_TRACE("MOE profiler workspace size: %zu", size);
+    TLLM_LOG_TRACE("MOE profiler workspace size: {}", size);
     return size;
 }
 

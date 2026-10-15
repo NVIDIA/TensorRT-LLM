@@ -539,7 +539,8 @@ void runPrepareCustomMask(TllmGenFmhaRunnerParams const& runnerParams, FmhaKerne
     }
     else
     {
-        TLLM_LOG_ERROR("TRTLLM-GEN does not support kernel type: %d for custom mask preparation", kernelType);
+        TLLM_LOG_ERROR(
+            "TRTLLM-GEN does not support kernel type: {} for custom mask preparation", static_cast<int>(kernelType));
     }
 }
 

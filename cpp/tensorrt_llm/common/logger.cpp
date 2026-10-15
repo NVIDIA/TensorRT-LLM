@@ -179,7 +179,7 @@ Logger::Logger()
 
 void Logger::log(std::exception const& ex, Logger::Level level)
 {
-    log(level, "%s: %s", TllmException::demangle(typeid(ex).name()).c_str(), ex.what());
+    log(level, "{}: {}", TllmException::demangle(typeid(ex).name()).c_str(), ex.what());
 }
 
 Logger* Logger::getLogger()

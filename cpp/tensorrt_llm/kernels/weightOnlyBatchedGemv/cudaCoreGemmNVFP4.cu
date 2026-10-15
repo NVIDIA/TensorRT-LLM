@@ -290,11 +290,11 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
     if (!dispatched)
     {
         TLLM_LOG_WARNING(
-            "tensorrt_llm::kernels::cuda_core_gemm_nvfp4::cudaCoreGemmDispatcher [NOT DISPATCHED], inputType=%d, "
-            "outputType=%d, "
-            "m=%d, "
-            "n=%d, k=%d",
-            params.inputType, params.outputType, params.m, params.n, params.k);
+            "tensorrt_llm::kernels::cuda_core_gemm_nvfp4::cudaCoreGemmDispatcher [NOT DISPATCHED], inputType={}, "
+            "outputType={}, "
+            "m={}, "
+            "n={}, k={}",
+            static_cast<int>(params.inputType), static_cast<int>(params.outputType), params.m, params.n, params.k);
     }
     return dispatched;
 }

@@ -190,7 +190,7 @@ bool FmhaDispatcher::isSupported()
             int const sm = tensorrt_llm::common::getSMVersion();
             if (sm != kSM_90)
             {
-                TLLM_LOG_WARNING("fmha_v2 implements SageAttention on SM90 only, got sm_%d.", sm);
+                TLLM_LOG_WARNING("fmha_v2 implements SageAttention on SM90 only, got sm_{}.", sm);
                 return false;
             }
             if (mFixedParams.sageBlockSizeQ != 2 || mFixedParams.sageBlockSizeK != 16
@@ -198,7 +198,7 @@ bool FmhaDispatcher::isSupported()
             {
                 TLLM_LOG_WARNING(
                     "SageAttention on SM90 supports exactly one block-size combination, (q, k, v) = (2, 16, 1), "
-                    "got (%d, %d, %d).",
+                    "got ({}, {}, {}).",
                     mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, mFixedParams.sageBlockSizeV);
                 return false;
             }
@@ -207,7 +207,7 @@ bool FmhaDispatcher::isSupported()
     }
     if (!foundKernels)
     {
-        TLLM_LOG_WARNING("Fall back to unfused MHA for %s in sm_%d.", mFixedParams.convertToStrOutput().c_str(),
+        TLLM_LOG_WARNING("Fall back to unfused MHA for {} in sm_{}.", mFixedParams.convertToStrOutput().c_str(),
             tensorrt_llm::common::getSMVersion());
     }
     return foundKernels;

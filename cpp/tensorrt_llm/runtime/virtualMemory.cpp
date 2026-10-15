@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #include "bufferManager.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 
+#include <format>
 #include <forward_list>
 #include <shared_mutex>
 
@@ -61,7 +62,8 @@ void CUDAVirtualMemoryChunk::materialize()
 }
 
 template <typename Callable, typename... Args>
-static bool safe_invoke_helper(std::exception_ptr& ep, char const* msg, Callable&& f, Args&&... args) noexcept
+static bool safe_invoke_helper(
+    std::exception_ptr& ep, std::format_string<char const*> msg, Callable&& f, Args&&... args) noexcept
 {
     try
     {
@@ -98,7 +100,7 @@ void CUDAVirtualMemoryChunk::_release(bool destructing)
     // Never early returns on exceptions. The last exception will be rethrown, and
     // previous ones will be logged.
     std::exception_ptr ePtr{};
-    auto const* msg = "Multiple exceptions thrown during release. The previous exception is: %s";
+    constexpr auto const* msg = "Multiple exceptions thrown during release. The previous exception is: {}";
     for (size_t i = start; i < count; ++i)
     {
         safe_invoke_helper(
@@ -255,7 +257,7 @@ size_t CudaVirtualMemoryManager::releaseWithTag(std::string const& tag)
         if (memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED)
         {
             if (!safe_invoke_helper(ePtr,
-                    "Multiple exceptions thrown during releaseWithTag. The previous exception is: %s",
+                    "Multiple exceptions thrown during releaseWithTag. The previous exception is: {}",
                     &CUDAVirtualMemoryChunk::release, &memory))
             {
                 addBadHandle(handle);
@@ -309,7 +311,7 @@ size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
             {
                 addBadHandle(handle);
                 unsafeRemove(handle);
-                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithTag: %s", e.what());
+                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithTag: {}", e.what());
             }
         }
 

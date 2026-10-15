@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,10 +45,10 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mNcclComm = getComm(mGroup);
         TLLM_CHECK_WITH_INFO(mGroup.size() > 0, "group size should be greater than 0");
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         return 0;
     }
 

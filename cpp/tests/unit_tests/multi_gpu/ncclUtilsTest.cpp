@@ -112,7 +112,7 @@ std::shared_ptr<ncclComm_t> createSplitComm(ncclComm_t parentComm, int color, in
                 ncclResult_t result = ncclCommDestroy(*comm);
                 if (result != ncclSuccess)
                 {
-                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: %d", result);
+                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: {}", static_cast<int>(result));
                 }
 
                 // STEP 3: Free the memory

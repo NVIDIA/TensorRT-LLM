@@ -63,7 +63,7 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections)
 {
     size_t connIdx = pickUpConnections[localIdx];
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send localIdx: %ld connIdx: %ld", localIdx, connIdx);
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send localIdx: {} connIdx: {}", localIdx, connIdx);
     NVTX3_SCOPED_RANGE(sendBuffer);
     TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
     TLLM_CHECK(session.getConnections().size() > (connIdx / targetInfo.mPeerDupHeadFactor));
@@ -83,10 +83,10 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
 
     if (bufferIdx < bufferCoverTargetNum)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
-            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: {} bufferIdx: {} size:{}", connIdx, bufferIdx,
+            outputBuffers[bufferIdx]->getSizeInBytes());
         session.send(connIdx, outputBuffers[bufferIdx]->data(), outputBuffers[bufferIdx]->getSizeInBytes());
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send connIdx: {} bufferIdx: {} size:{}", connIdx,
             bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
     }
     else
@@ -224,7 +224,7 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::option
                     - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
             // TODO: promptLen to get the startBlockIdx
             SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
-            TLLM_LOG_DEBUG("getBlockRangeForSending windowSize: %d, startBlockIdx: %d  windowStartBlockIdx: %d",
+            TLLM_LOG_DEBUG("getBlockRangeForSending windowSize: {}, startBlockIdx: {}  windowStartBlockIdx: {}",
                 windowSize, startBlockIdx, windowStartBlockIdx);
             blockRange.setBlockIdsForWindow(windowSize,
                 std::vector<SizeType32>(
@@ -344,7 +344,7 @@ void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::
     for (int i = 0; i < numPools; i++)
     {
         poolIdxs[i] = cacheManager->getBlockManager().getLayerPoolIdx(i);
-        TLLM_LOG_DEBUG("poolIdxs[%d] = %d layerNum:%d", i, poolIdxs[i], layerNum);
+        TLLM_LOG_DEBUG("poolIdxs[{}] = {} layerNum:{}", i, poolIdxs[i], layerNum);
     }
 
     std::unordered_set<SizeType32> uniquePoolIdxs(poolIdxs.begin(), poolIdxs.end());
@@ -372,7 +372,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     if (llmRequest.has_value())
     {
         TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
+            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: {}.", (*llmRequest)->mRequestId);
         TLLM_CHECK_WITH_INFO(
             (*llmRequest)->mSamplingConfig.getBeamWidth() == 1, "Currently, only beam width 1 is supported.");
     }
@@ -421,7 +421,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
 
-    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%s",
+    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes={}, kvWindowSizes={}, numPools={}, requestId={}",
         allWindowSizes.size(), numKvPools, numPools,
         llmRequest.has_value() ? std::to_string((*llmRequest)->mRequestId).c_str() : "<request-free>");
 
@@ -450,12 +450,12 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     auto layer = runtime::ITensor::slice(it, offset, 1);
                     if (offset.d[1] == 0)
                     {
-                        TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
-                            runtime::ITensor::toString(it->getShape()).c_str());
+                        TLLM_LOG_DEBUG("Block {:p} of pool {} shape = {}", static_cast<void const*>(it->data()),
+                            poolIdx, runtime::ITensor::toString(it->getShape()).c_str());
                     }
                     for (size_t i = 0; i < pickUpConnections.size(); i++)
                     {
-                        TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
+                        TLLM_LOG_DEBUG("Send layer {}({}-{})", layerIdx, poolIdx, layerIdxInPool);
                         session.send(pickUpConnections[i], layer->data(), layer->getSizeInBytes());
                     }
                 }
@@ -468,7 +468,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         size_t allCacheBlockSize = 0;
         TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), " kvWindowSizes size: %d, numPools: %d", kvWindowSizes.size(), numPools);
+            mpi::MpiComm::world().getRank(), " kvWindowSizes size: {}, numPools: {}", kvWindowSizes.size(), numPools);
         // When recurrent state windows are present (unified pool), numKvPools < numPools.
         TLLM_CHECK_WITH_INFO(numKvPools <= numPools, "KV window sizes should not exceed numPools");
 
@@ -477,7 +477,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         for (auto const& windowSize : kvWindowSizes)
         {
             auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " format  windowSize: %d blockRangeForWindow size: %d",
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " format  windowSize: {} blockRangeForWindow size: {}",
                 windowSize, blockRangeForWindow.size());
             inputKvCacheBlocksPerWindow.emplace(windowSize, std::vector<runtime::ITensor::SharedPtr>());
             for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
@@ -487,9 +487,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 blockNum++;
             }
         }
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "inputKvCacheBlocks size: %ld,blockNum: %d , kvWindowSizes: %ld", inputKvCacheBlocksPerWindow.size(),
-            blockNum, kvWindowSizes.size());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "inputKvCacheBlocks size: {},blockNum: {} , kvWindowSizes: {}",
+            inputKvCacheBlocksPerWindow.size(), blockNum, kvWindowSizes.size());
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
@@ -527,7 +526,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             }
             if (llmRequest.has_value())
             {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: {}.",
                     (*llmRequest)->mRequestId);
             }
 
@@ -599,8 +598,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         auto& onlyUseDynamicBuffer = std::get<2>(result);
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            " format bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d duplicate:%d "
-            "bufferCoverTargetNum:%d pickUpConnections.size():%ld",
+            " format bufferTargetNum: {}, targetNum: {}, peerDuplicateHeadFactor: {} duplicate:{} "
+            "bufferCoverTargetNum:{} pickUpConnections.size():{}",
             bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor, bufferCoverTargetNum,
             pickUpConnections.size());
         auto const* agentConnection
@@ -650,7 +649,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     }
     if (llmRequest.has_value())
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ",
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:{} ",
             (*llmRequest)->mRequestId);
     }
 }
@@ -664,7 +663,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const& llmRequest = **llmRequestOpt;
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
+        "Start receiving KV cache for request ID: {}, context request ID: {}.", llmRequest.mRequestId, ctxReqId);
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -681,11 +680,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto localRankIndices = std::get<1>(pickRecvConnResult);
     if (pickUpConnections.empty())
     {
-        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: {}", llmRequest.mRequestId);
         return;
     }
 
-    TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
+    TLLM_LOG_DEBUG("pickUpConnections size: {} connections size: {}", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputBuffersPerWindow;
     auto const numPools = mCacheManager->getBlockManager().getNumPools(
@@ -707,14 +706,14 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     }
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
 
-    TLLM_LOG_DEBUG("CacheFormatter::unformat: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+    TLLM_LOG_DEBUG("CacheFormatter::unformat: allWindowSizes={}, kvWindowSizes={}, numPools={}, requestId={}",
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
 
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat kvWindowSizes size: %d", kvWindowSizes.size());
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat kvWindowSizes size: {}", kvWindowSizes.size());
     for (auto const& windowSize : kvWindowSizes)
     {
         auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "  unformat windowSize: %d blockRangeForWindow size: %d",
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "  unformat windowSize: {} blockRangeForWindow size: {}",
             windowSize, blockRangeForWindow.size());
         outputBuffersPerWindow.emplace(windowSize, std::vector<runtime::ITensor::SharedPtr>());
 
@@ -725,9 +724,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             blockNum++;
         }
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "outputBuffersPerWindow size: %ld,blockNum: %d , kvWindowSizes: %ld", outputBuffersPerWindow.size(), blockNum,
-        kvWindowSizes.size());
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "outputBuffersPerWindow size: {},blockNum: {} , kvWindowSizes: {}",
+        outputBuffersPerWindow.size(), blockNum, kvWindowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
 
     // An "empty" Helix CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
@@ -786,12 +784,12 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     if (layerIdxInPool == 0)
                     {
-                        TLLM_LOG_DEBUG("Buffer %d of pool %d shape = %s", idx, poolIdx,
+                        TLLM_LOG_DEBUG("Buffer {} of pool {} shape = {}", idx, poolIdx,
                             runtime::ITensor::toString(recvBufferTmps[idx]->getShape()).c_str());
                     }
                     for (size_t i = 0; i < pickUpConnections.size(); i++)
                     {
-                        TLLM_LOG_DEBUG("Receive layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
+                        TLLM_LOG_DEBUG("Receive layer {}({}-{})", layerIdx, poolIdx, layerIdxInPool);
                         // Buffer dim: [numLayersInPool * layerVolume]
                         auto layer
                             = runtime::ITensor::slice(recvBufferTmps[idx], layerIdxInPool * layerVolume, layerVolume);
@@ -835,7 +833,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     }
                 }
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                    "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
+                    "End receiving KV cache for request ID: {}, context request ID: {}.", llmRequest.mRequestId,
                     ctxReqId);
                 return;
             }
@@ -958,10 +956,10 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     llmRequest.updateKvCacheSize((*recvSplitCaches.at(processIdx)).getSizeInBytes());
                     auto& buffer = recvSplitCaches[processIdx];
                     size = buffer->getSizeInBytes();
-                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " start recv bufferIdx: %d size:%ld", processIdx,
+                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " start recv bufferIdx: {} size:{}", processIdx,
                         buffer->getSizeInBytes());
                     session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
-                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " recv bufferIdx: %d size:%ld", processIdx,
+                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " recv bufferIdx: {} size:{}", processIdx,
                         buffer->getSizeInBytes());
                 }
                 else
@@ -1057,7 +1055,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     }
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
+        "End receiving KV cache for request ID: {}, context request ID: {}.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
 }
 
@@ -1105,7 +1103,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     if (selfConfig.getParallelConfig().mContextParallelism != 1
         && destConfig.getParallelConfig().mContextParallelism != 1)
     {
-        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: Helix CP is decode-only (selfCP=%d, destCP=%d).",
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: Helix CP is decode-only (selfCP={}, destCP={}).",
             selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
@@ -1133,7 +1131,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of layers");
-        TLLM_LOG_WARNING("self: %zu dest %zu", selfConfig.getModelConfig().mNbKvHeadsPerLayer.size(),
+        TLLM_LOG_WARNING("self: {} dest {}", selfConfig.getModelConfig().mNbKvHeadsPerLayer.size(),
             destConfig.getModelConfig().mNbKvHeadsPerLayer.size());
         return false;
     }

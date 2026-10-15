@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -388,7 +388,7 @@ std::vector<T> loadWeightFromBinHelper(std::vector<size_t> shape, std::string fi
     size_t size = dim0 * dim1;
     if (size == 0)
     {
-        TLLM_LOG_WARNING("shape is zero, skip loading weight from file %s \n", filename.c_str());
+        TLLM_LOG_WARNING("shape is zero, skip loading weight from file {} \n", filename.c_str());
         return std::vector<T>();
     }
 
@@ -396,7 +396,7 @@ std::vector<T> loadWeightFromBinHelper(std::vector<size_t> shape, std::string fi
     std::ifstream in(filename, std::ios::in | std::ios::binary);
     if (!in.is_open())
     {
-        TLLM_LOG_WARNING("file %s cannot be opened, loading model fails! \n", filename.c_str());
+        TLLM_LOG_WARNING("file {} cannot be opened, loading model fails! \n", filename.c_str());
         return std::vector<T>();
     }
 
@@ -404,14 +404,14 @@ std::vector<T> loadWeightFromBinHelper(std::vector<size_t> shape, std::string fi
     in.seekg(0, in.end);
     in.seekg(0, in.beg);
 
-    TLLM_LOG_DEBUG("Read " + std::to_string(loaded_data_size) + " bytes from " + filename);
+    TLLM_LOG_DEBUG("{}", "Read " + std::to_string(loaded_data_size) + " bytes from " + filename);
     in.read((char*) host_array.data(), loaded_data_size);
 
     size_t in_get_size = in.gcount();
     if (in_get_size != loaded_data_size)
     {
-        TLLM_LOG_WARNING("file %s only has %ld, but request %ld, loading model fails! \n", filename.c_str(),
-            in_get_size, loaded_data_size);
+        TLLM_LOG_WARNING("file {} only has {}, but request {}, loading model fails! \n", filename.c_str(), in_get_size,
+            loaded_data_size);
         return std::vector<T>();
     }
     in.close();
@@ -479,7 +479,9 @@ int loadWeightFromBin(T* ptr, std::vector<size_t> shape, std::string filename, T
 #ifdef ENABLE_FP8
     case TRTLLMCudaDataType::FP8: loadWeightFromBinFunc<T, float>(ptr, shape, filename); break;
 #endif
-    default: TLLM_LOG_ERROR("Does not support TRTLLMCudaDataType=%d", model_file_type); TLLM_CHECK(false);
+    default:
+        TLLM_LOG_ERROR("Does not support TRTLLMCudaDataType={}", static_cast<int>(model_file_type));
+        TLLM_CHECK(false);
     }
     return 0;
 }

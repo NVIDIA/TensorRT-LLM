@@ -80,21 +80,21 @@ std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerC
     tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
     std::optional<uint64_t> deviceCacheByteBudget)
 {
-    TLLM_LOG_DEBUG("max1dModeSize=%llu", max1dModSize);
-    TLLM_LOG_DEBUG("pageWidth=%llu", pageWidth);
+    TLLM_LOG_DEBUG("max1dModeSize={}", max1dModSize);
+    TLLM_LOG_DEBUG("pageWidth={}", pageWidth);
     uint64_t const pageWidthSize = pageWidth * static_cast<uint64_t>(runtime::BufferDataType(dataType).getSize());
     uint64_t totalHostSlots, totalDeviceSlots;
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     if (config.numHostModuleLayer > 0)
     {
         totalHostSlots = static_cast<uint64_t>(config.numHostModuleLayer) * common::ceilDiv(max1dModSize, pageWidth);
-        TLLM_LOG_DEBUG("totalHostSlots=%llu", totalHostSlots);
+        TLLM_LOG_DEBUG("totalHostSlots={}", totalHostSlots);
     }
     else
     {
         auto const memSize = config.hostCacheSize.value_or(PeftCacheManagerConfig::kDefaultHostCacheSize);
         totalHostSlots = memSize / pageWidthSize;
-        TLLM_LOG_DEBUG("memSize: %llu, totalHostSlots: %llu", memSize, totalHostSlots);
+        TLLM_LOG_DEBUG("memSize: {}, totalHostSlots: {}", memSize, totalHostSlots);
     }
 
     if (config.numDeviceModuleLayer > 0)
@@ -111,10 +111,10 @@ std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerC
     auto hostMem = totalHostSlots * pageWidthSize;
     auto deviceMem = totalDeviceSlots * pageWidthSize;
 
-    TLLM_LOG_INFO("Using " + std::to_string(hostMem) + " bytes for LoRA host cache");
-    TLLM_LOG_INFO("Using " + std::to_string(deviceMem) + " bytes for LoRA device cache");
+    TLLM_LOG_INFO("{}", "Using " + std::to_string(hostMem) + " bytes for LoRA host cache");
+    TLLM_LOG_INFO("{}", "Using " + std::to_string(deviceMem) + " bytes for LoRA device cache");
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 
     return std::make_pair(totalHostSlots, totalDeviceSlots);
 }
@@ -148,12 +148,12 @@ PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, run
     for (auto const& module : modelConfig.getLoraModules())
     {
         uint64_t const oneDSize = static_cast<uint64_t>(module.localInDim(tpSize) + module.localOutDim(tpSize));
-        TLLM_LOG_DEBUG("oneDSize=%llu", oneDSize);
+        TLLM_LOG_DEBUG("oneDSize={}", oneDSize);
         min1dModSize = std::min(min1dModSize, oneDSize);
         max1dModSize = std::max(max1dModSize, oneDSize);
         total1dModSize += oneDSize;
     }
-    TLLM_LOG_DEBUG("total1dModSize=%llu", total1dModSize);
+    TLLM_LOG_DEBUG("total1dModSize={}", total1dModSize);
     auto const pageWidth = min1dModSize;
 
     for (auto const& module : modelConfig.getLoraModules())
@@ -167,7 +167,7 @@ PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, run
     uint64_t const minNumSlots = common::ceilDiv(config.maxAdapterSize * max1dModSize, pageWidth);
     uint64_t const numSlotsPerPage = std::max(totalSlots, minNumSlots);
     uint64_t const minTotalSlots = common::ceilDiv(config.maxAdapterSize * max1dLoraSize, pageWidth);
-    TLLM_LOG_DEBUG("max1dModSize=%llu", max1dModSize);
+    TLLM_LOG_DEBUG("max1dModSize={}", max1dModSize);
 
     auto [totalHostSlots, totalDeviceSlots]
         = getMaxNumSlots(config, dataType, pageWidth, max1dModSize, deviceCacheByteBudget);
@@ -185,10 +185,10 @@ PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, run
     uint64_t const totalMaxLorasHost = totalHostPages * numSlotsPerPage * pageWidth / maxLoraSize;
     uint64_t const totalMaxLorasDevice = totalDevicePages * numSlotsPerPage * pageWidth / maxLoraSize;
 
-    TLLM_LOG_INFO("Max LoRA size is %llu", maxLoraSize);
+    TLLM_LOG_INFO("Max LoRA size is {}", maxLoraSize);
 
-    TLLM_LOG_INFO("LoRA host Cache can hold %llu max sized LoRAs", totalMaxLorasHost);
-    TLLM_LOG_INFO("LoRA device Cache can hold %llu max sized LoRAs", totalMaxLorasDevice);
+    TLLM_LOG_INFO("LoRA host Cache can hold {} max sized LoRAs", totalMaxLorasHost);
+    TLLM_LOG_INFO("LoRA device Cache can hold {} max sized LoRAs", totalMaxLorasDevice);
 
     TLLM_CHECK(std::numeric_limits<SizeType32>::max() >= totalHostPages);
     TLLM_CHECK(std::numeric_limits<SizeType32>::max() >= totalDevicePages);
@@ -221,14 +221,14 @@ void PeftCacheManager::prefetchLoraWeights(std::string const& modelDir, runtime:
     //
     // If the name of the lora task is not digit, will print warning and
     // skip loading lora weight from the folder
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
 
     namespace fs = std::filesystem;
     std::vector<std::string> tasks;
 
     if (!fs::exists(modelDir) || !fs::is_directory(modelDir))
     {
-        TLLM_LOG_DEBUG("Cannot find the %s, skipping prefetching the lora weights.", modelDir.c_str());
+        TLLM_LOG_DEBUG("Cannot find the {}, skipping prefetching the lora weights.", modelDir.c_str());
         return;
     }
     // collect the lora tasks under modelDir
@@ -244,12 +244,12 @@ void PeftCacheManager::prefetchLoraWeights(std::string const& modelDir, runtime:
             else
             {
                 TLLM_LOG_WARNING(
-                    "lora task name %s is invalid, skipping to load lora weight from this folder.", task_name.c_str());
+                    "lora task name {} is invalid, skipping to load lora weight from this folder.", task_name.c_str());
             }
         }
     }
 
-    TLLM_LOG_DEBUG("find %u lora tasks to prefetch.", tasks.size());
+    TLLM_LOG_DEBUG("find {} lora tasks to prefetch.", tasks.size());
     // load lora tasks one by one
     using TensorPtr = runtime::ITensor::SharedPtr;
     auto const multiLoraPath = fs::path{modelDir};
@@ -259,11 +259,11 @@ void PeftCacheManager::prefetchLoraWeights(std::string const& modelDir, runtime:
         auto const configFn = (multiLoraPath / tasks[taskId] / "model.lora_config.npy").string();
         TensorPtr weights = runtime::utils::loadNpy(bufferManager, weightsFn, runtime::MemoryType::kCPU);
         TensorPtr config = runtime::utils::loadNpy(bufferManager, configFn, runtime::MemoryType::kCPU);
-        TLLM_LOG_DEBUG("prefetch lora task %s", tasks[taskId].c_str());
+        TLLM_LOG_DEBUG("prefetch lora task {}", tasks[taskId].c_str());
         configureDataType(weights->getDataType());
         mHostLoraCache->put(std::stoi(tasks[taskId]), weights, config, true);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 PeftCacheManager::PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
@@ -272,7 +272,7 @@ PeftCacheManager::PeftCacheManager(PeftCacheManagerConfig const& config, runtime
     , mWorldConfig(worldConfig)
     , mDevice{runtime::utils::initDevice(worldConfig)}
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
 
     mConfig = config;
     mConfig.optimalAdapterSize = std::min(mConfig.optimalAdapterSize, modelConfig.getMaxLoraRank());
@@ -296,12 +296,12 @@ PeftCacheManager::PeftCacheManager(PeftCacheManagerConfig const& config, runtime
         prefetchLoraWeights(config.loraPrefetchDir.value(), bufferManager);
     }
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     auto optTaskId = llmRequest->getLoraTaskId();
     auto optLoraWeights = llmRequest->getLoraWeights();
     auto optLoraConfig = llmRequest->getLoraConfig();
@@ -336,7 +336,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     }
 
     auto const reqId = llmRequest->mRequestId;
-    TLLM_LOG_DEBUG("addRequestPeft taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+    TLLM_LOG_DEBUG("{}", "addRequestPeft taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
 
     updateTaskState(taskId, reqId);
     {
@@ -344,7 +344,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         std::lock_guard<std::mutex> lk(mPutFuturesMutex);
         if (mPutFutures.count(taskId))
         {
-            TLLM_LOG_DEBUG(
+            TLLM_LOG_DEBUG("{}",
                 "addRequestPeft haveFuture skip taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
             return;
         }
@@ -355,13 +355,15 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     {
         if (optLoraWeights && optLoraConfig)
         {
-            TLLM_LOG_DEBUG("addRequestPeft put taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+            TLLM_LOG_DEBUG(
+                "{}", "addRequestPeft put taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
             mHostLoraCache->put(taskId, optLoraWeights.value(), optLoraConfig.value(), false);
             loadNeeded = true;
         }
         else
         {
-            TLLM_LOG_DEBUG("addRequestPeft bump taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+            TLLM_LOG_DEBUG(
+                "{}", "addRequestPeft bump taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
             mHostLoraCache->bump(taskId);
             loadNeeded = false;
         }
@@ -369,7 +371,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     catch (runtime::LoraCacheFullException const& e)
     {
         std::string errMsg("PEFT Cache is full. Could not store taskId=" + std::to_string(taskId));
-        TLLM_LOG_ERROR(errMsg);
+        TLLM_LOG_ERROR("{}", errMsg);
         updateTaskState(taskId, reqId, true, false);
         // re-throw with better error message
         throw runtime::LoraCacheFullException(errMsg);
@@ -386,7 +388,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         auto optConfig = req->getLoraConfig();
         if (loadNeeded && optWeights.has_value() && optConfig.has_value())
         {
-            TLLM_LOG_DEBUG(
+            TLLM_LOG_DEBUG("{}",
                 "addRequestPeft load taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(req->mRequestId));
             mHostLoraCache->loadWeights(taskId, optWeights.value(), optConfig.value());
             // free memory associated with lora weights in llmRequest
@@ -403,7 +405,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
             }
             catch (std::runtime_error& e)
             {
-                TLLM_LOG_DEBUG("failed to copy task " + std::to_string(taskId) + " to gpu cache -- " + e.what());
+                TLLM_LOG_DEBUG("{}", "failed to copy task " + std::to_string(taskId) + " to gpu cache -- " + e.what());
             }
         }
 #ifndef NDEBUG
@@ -423,7 +425,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         std::lock_guard<std::mutex> lk(mPutFuturesMutex);
         mPutFutures.try_emplace(taskId, std::move(putFuture));
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
@@ -489,7 +491,7 @@ PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVecto
                 taskIdToReqIds.at(taskId).push_back(llmReq->mRequestId);
                 if (mPutFutures.count(taskId))
                 {
-                    TLLM_LOG_DEBUG("Ensure batch, has future for " + std::to_string(taskId));
+                    TLLM_LOG_DEBUG("{}", "Ensure batch, has future for " + std::to_string(taskId));
                     taskIdToFuture.try_emplace(taskId, std::move(mPutFutures.at(taskId)));
                     mPutFutures.erase(taskId);
                 }
@@ -500,7 +502,7 @@ PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVecto
                      * taskIdToFutures (ie if 2 requests have the same taskId)
                      * If no future is found we create a dummy future for the task
                      */
-                    TLLM_LOG_DEBUG("Ensure batch, do not have future for " + std::to_string(taskId));
+                    TLLM_LOG_DEBUG("{}", "Ensure batch, do not have future for " + std::to_string(taskId));
                     std::promise<void> p;
                     p.set_value();
                     taskIdToFuture.try_emplace(taskId, p.get_future());
@@ -514,7 +516,7 @@ PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVecto
 PeftCacheManager::EnsureBatchTaskResult PeftCacheManager::ensureBatchMapTaskId(
     RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     if (resetGpuCache)
     {
         resetDeviceCache();
@@ -560,7 +562,7 @@ PeftCacheManager::EnsureBatchTaskResult PeftCacheManager::ensureBatchMapTaskId(
         auto const values = f.get();
         peftTable.try_emplace(taskId, values);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
     return {std::move(peftTable), std::move(taskIdToReqIds)};
 }
 
@@ -660,7 +662,7 @@ void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool ter
                 {
                     std::lock_guard<std::mutex> lk(mPutFuturesMutex);
                     mPutFutures.erase(taskId);
-                    TLLM_LOG_DEBUG(
+                    TLLM_LOG_DEBUG("{}",
                         "erase task " + std::to_string(taskId) + " future size=" + std::to_string(mPutFutures.size()));
                 }
                 mHostLoraCache->markTaskDone(taskId);
@@ -671,14 +673,14 @@ void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool ter
 
 void PeftCacheManager::resetDeviceCache()
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     mDeviceLoraCache->markAllDone();
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 void PeftCacheManager::markRequestDone(LlmRequest const& llmReq, bool pause)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     // mDeviceLoraCache->markAllDone();
     if (!llmReq.getLoraTaskId().has_value())
     {
@@ -687,7 +689,7 @@ void PeftCacheManager::markRequestDone(LlmRequest const& llmReq, bool pause)
     auto const taskId = llmReq.getLoraTaskId().value();
     auto const reqId = llmReq.mRequestId;
     updateTaskState(taskId, reqId, true, pause);
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 SizeType32 PeftCacheManager::getMaxDevicePages() const
@@ -702,7 +704,7 @@ SizeType32 PeftCacheManager::getMaxHostPages() const
 
 SizeType32 PeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     if (llmRequest->getLoraTaskId().has_value())
     {
         try
@@ -718,7 +720,7 @@ SizeType32 PeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmRe
             throw;
         }
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
     return 0;
 }
 

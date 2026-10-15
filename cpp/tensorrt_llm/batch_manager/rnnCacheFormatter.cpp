@@ -50,7 +50,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto llmRequestOpt = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
     auto const& llmRequest = **llmRequestOpt;
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start sending unified pool RNN state for request ID: %ld.",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start sending unified pool RNN state for request ID: {}.",
         llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.getBeamWidth() == 1, "Currently, only beam width 1 is supported.");
 
@@ -70,7 +70,7 @@ void RnnCacheFormatter::format(TransferSession& session)
         connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), targetInfo);
     if (rnnSendConns.empty())
     {
-        TLLM_LOG_DEBUG("No targets to send unified pool RNN state to for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("No targets to send unified pool RNN state to for request ID: {}", llmRequest.mRequestId);
         return;
     }
 
@@ -244,7 +244,7 @@ void RnnCacheFormatter::format(TransferSession& session)
         }
     }
 
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End sending unified pool RNN state for request ID: %ld.",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End sending unified pool RNN state for request ID: {}.",
         llmRequest.mRequestId);
 }
 
@@ -256,7 +256,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto llmRequestOpt = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
     auto const& llmRequest = **llmRequestOpt;
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start receiving unified pool RNN state for request ID: %ld.",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start receiving unified pool RNN state for request ID: {}.",
         llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.getBeamWidth() == 1, "Currently, only beam width 1 is supported.");
 
@@ -279,7 +279,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     if (rnnRecvConns.empty())
     {
-        TLLM_LOG_DEBUG("No sources to receive unified pool RNN state from for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("No sources to receive unified pool RNN state from for request ID: {}", llmRequest.mRequestId);
         return;
     }
 
@@ -431,8 +431,8 @@ void RnnCacheFormatter::unformat(TransferSession& session)
             }
 
             TLLM_LOG_DEBUG(
-                "RnnCacheFormatter::unformatUnifiedPool: blockSizeBytes=%zu, ssmBytes=%zu, numSources=%zu, "
-                "realBlocks=%zu, totalBytesRecv=%zu, requestId=%lu",
+                "RnnCacheFormatter::unformatUnifiedPool: blockSizeBytes={}, ssmBytes={}, numSources={}, "
+                "realBlocks={}, totalBytesRecv={}, requestId={}",
                 blockSizeBytes, ssmBytes, numSources, realBlockIndices.size(), totalBytesRecv, llmRequest.mRequestId);
 
             // Concat received buffers into the pool
@@ -449,7 +449,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     (void) session.releaseReservedRecvBuffer(*mRnnCacheTransBufferManager);
 
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End receiving unified pool RNN state for request ID: %ld.",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End receiving unified pool RNN state for request ID: {}.",
         llmRequest.mRequestId);
 }
 
@@ -462,14 +462,14 @@ bool RnnCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState 
 
     if (selfConfig.getConvStateDataType() != destConfig.getConvStateDataType())
     {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: conv state data type mismatch (self=%d, dest=%d)",
+        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: conv state data type mismatch (self={}, dest={})",
             static_cast<int>(selfConfig.getConvStateDataType()), static_cast<int>(destConfig.getConvStateDataType()));
         return false;
     }
 
     if (selfConfig.getSsmStateDataType() != destConfig.getSsmStateDataType())
     {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: SSM state data type mismatch (self=%d, dest=%d)",
+        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: SSM state data type mismatch (self={}, dest={})",
             static_cast<int>(selfConfig.getSsmStateDataType()), static_cast<int>(destConfig.getSsmStateDataType()));
         return false;
     }
@@ -490,7 +490,7 @@ bool RnnCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState 
 
     if (selfParallel.mContextParallelism != 1 || destParallel.mContextParallelism != 1)
     {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: RNN only supports CP=1 (selfCP=%d, destCP=%d)",
+        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: RNN only supports CP=1 (selfCP={}, destCP={})",
             selfParallel.mContextParallelism, destParallel.mContextParallelism);
         return false;
     }

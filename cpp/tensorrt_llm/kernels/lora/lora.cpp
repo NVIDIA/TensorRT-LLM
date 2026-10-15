@@ -79,12 +79,12 @@ LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool t
 {
     mOutHiddenSizes.resize(mNumLoraModules);
     mOutHiddenSizes.assign(out_hidden_sizes.begin(), out_hidden_sizes.end());
-    TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 }
 
 void LoraImpl::setGemmConfig()
 {
-    TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     if (mType == tensorrt_llm::DataType::kHALF)
     {
         mCublasWrapper->setFP16GemmConfig();
@@ -136,7 +136,7 @@ int64_t getGemmWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int64_
 size_t LoraImpl::getWorkspaceSize(
     int64_t const numTokens, int64_t const numReqs, tensorrt_llm::DataType const type) const noexcept
 {
-    TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     auto const typeSize = tensorrt_llm::common::getDTypeSize(type);
 
     return (size_t) getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices)
@@ -152,7 +152,7 @@ void LoraImpl::setBestTactic(std::optional<Config> config)
 int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
     void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     // inputs
     //     numTokens
     //     numReqs

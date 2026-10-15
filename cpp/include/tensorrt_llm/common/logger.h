@@ -17,11 +17,15 @@
 #pragma once
 
 #include <cstdlib>
+#include <format>
 #include <iostream>
 #include <map>
+#include <optional>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
@@ -37,34 +41,43 @@ namespace common
 /// getPrefix() prints the module name with no padding.
 constexpr std::string_view formatModule(std::string_view module)
 {
+    constexpr size_t kMinHashLength = 3;
+    auto const length = module.size();
+    if (length < kMinHashLength)
+    {
+        return module;
+    }
+
+    // Length and weighted first/third characters distinguish known modules.
+    // Duplicate case values catch collisions; equality rejects unknown names.
+#define TLLM_MODULE_HASH(LEN, FIRST, THIRD) (((LEN) << 6) + ((2 * ((FIRST) - 'a') - ((THIRD) - 'a')) & 63))
+
+#define TLLM_MODULE_CASE(LEN, FIRST, THIRD, NAME, DISPLAY)                                                             \
+    case TLLM_MODULE_HASH(LEN, FIRST, THIRD): return module == #NAME ? DISPLAY : module
+
     // Source modules (cpp/tensorrt_llm/*)
-    if (module == "batch_manager")
-        return "batchmgr";
-    else if (module == "common")
-        return "common";
-    else if (module == "cutlass_extensions")
-        return "cutl_ext";
-    else if (module == "deep_ep")
-        return "deep_ep";
-    else if (module == "deep_gemm")
-        return "deepgemm";
-    else if (module == "executor")
-        return "executor";
-    else if (module == "flash_mla")
-        return "flashmla";
-    else if (module == "kernels")
-        return "kernels";
-    else if (module == "layers")
-        return "layers";
-    else if (module == "nanobind")
-        return "nanobind";
-    else if (module == "runtime")
-        return "runtime";
-    else if (module == "testing")
-        return "testing";
-    else if (module == "thop")
-        return "thop";
-    return module;
+    // clang-format off
+    switch (TLLM_MODULE_HASH(length, module[0], module[2]))
+    {
+    default: return module;
+    TLLM_MODULE_CASE(13, 'b', 't', batch_manager,      "batchmgr");
+    TLLM_MODULE_CASE( 6, 'c', 'm', common,             "common");
+    TLLM_MODULE_CASE(18, 'c', 't', cutlass_extensions, "cutl_ext");
+    TLLM_MODULE_CASE( 7, 'd', 'e', deep_ep,            "deep_ep");
+    TLLM_MODULE_CASE( 9, 'd', 'e', deep_gemm,          "deepgemm");
+    TLLM_MODULE_CASE( 8, 'e', 'e', executor,           "executor");
+    TLLM_MODULE_CASE( 9, 'f', 'a', flash_mla,          "flashmla");
+    TLLM_MODULE_CASE( 7, 'k', 'r', kernels,            "kernels");
+    TLLM_MODULE_CASE( 6, 'l', 'y', layers,             "layers");
+    TLLM_MODULE_CASE( 8, 'n', 'n', nanobind,           "nanobind");
+    TLLM_MODULE_CASE( 7, 'r', 'n', runtime,            "runtime");
+    TLLM_MODULE_CASE( 7, 't', 's', testing,            "testing");
+    TLLM_MODULE_CASE( 4, 't', 'o', thop,               "thop");
+    }
+    // clang-format on
+
+#undef TLLM_MODULE_CASE
+#undef TLLM_MODULE_HASH
 }
 
 class Logger
@@ -87,16 +100,26 @@ public:
         ERROR = 40
     };
 
-    /// Tag type that carries a pre-extracted module name.
-    /// Used by the TLLM_LOG macros to disambiguate from char const* format strings.
+    /// Tag type that carries a module name.
+    /// Used by the TLLM_LOG macros to disambiguate module names from format strings.
     struct Module
     {
+        constexpr explicit Module(std::source_location const location = std::source_location::current())
+            : name{Logger::extractModule(location.file_name())}
+        {
+        }
+
+        constexpr explicit Module(std::string_view moduleName)
+            : name{moduleName}
+        {
+        }
+
         std::string_view name;
     };
 
     static Logger* getLogger();
 
-    /// Extract the first subdirectory after the *last* "tensorrt_llm/" from a __FILE__ path.
+    /// Extract the first subdirectory after the *last* "tensorrt_llm/" from a source file path.
     /// e.g. "/code/tensorrt_llm/cpp/tensorrt_llm/runtime/foo.cpp" -> "runtime"
     ///      "/code/tensorrt_llm/cpp/include/tensorrt_llm/common/logger.h" -> "common"
     static constexpr std::string_view extractModule(char const* filePath)
@@ -121,68 +144,42 @@ public:
 
     // ---- log overloads WITHOUT source file (used by internal helpers) --------
 
-#if defined(_MSC_VER)
+    //! Log a message using a checked std::format string and the configured rank.
+    //! Pass runtime message text as an argument to "{}".
     template <typename... Args>
-    void log(Level const level, char const* format, Args const&... args);
-
-    template <typename... Args>
-    void log(Level const level, int const rank, char const* format, Args const&... args);
-#else
-    template <typename... Args>
-    void log(Level const level, char const* format, Args const&... args) __attribute__((format(printf, 3, 0)));
-
-    template <typename... Args>
-    void log(Level const level, int const rank, char const* format, Args const&... args)
-        __attribute__((format(printf, 4, 0)));
-#endif
-
-    template <typename... Args>
-    void log(Level const level, std::string const& format, Args const&... args)
+    void log(Level const level, std::format_string<Args...> format, Args&&... args)
     {
-        return log(level, format.c_str(), args...);
+        logImpl(level, Module{""}, std::nullopt, format, std::forward<Args>(args)...);
     }
 
+    //! Log a message with an explicit rank.
     template <typename... Args>
-    void log(Level const level, int const rank, std::string const& format, Args const&... args)
+    void log(Level const level, int const rank, std::format_string<Args...> format, Args&&... args)
     {
-        return log(level, rank, format.c_str(), args...);
+        logImpl(level, Module{""}, rank, format, std::forward<Args>(args)...);
     }
 
     // ---- log overloads WITH module tag (used by TLLM_LOG macros) -------------
 
-#if defined(_MSC_VER)
+    //! Log a message with module filtering and the configured rank.
     template <typename... Args>
-    void log(Level const level, Module module, char const* format, Args const&... args);
-
-    template <typename... Args>
-    void log(Level const level, Module module, int const rank, char const* format, Args const&... args);
-#else
-    template <typename... Args>
-    void log(Level const level, Module module, char const* format, Args const&... args)
-        __attribute__((format(printf, 4, 0)));
-
-    template <typename... Args>
-    void log(Level const level, Module module, int const rank, char const* format, Args const&... args)
-        __attribute__((format(printf, 5, 0)));
-#endif
-
-    template <typename... Args>
-    void log(Level const level, Module module, std::string const& format, Args const&... args)
+    void log(Level const level, Module module, std::format_string<Args...> format, Args&&... args)
     {
-        return log(level, module, format.c_str(), args...);
+        logImpl(level, module, std::nullopt, format, std::forward<Args>(args)...);
     }
 
+    //! Log a message with module filtering and an explicit rank.
     template <typename... Args>
-    void log(Level const level, Module module, int const rank, std::string const& format, Args const&... args)
+    void log(Level const level, Module module, int const rank, std::format_string<Args...> format, Args&&... args)
     {
-        return log(level, module, rank, format.c_str(), args...);
+        logImpl(level, module, rank, format, std::forward<Args>(args)...);
     }
 
     // ---- exception logging --------------------------------------------------
 
     void log(std::exception const& ex, Level level = Level::ERROR);
 
-    Level getLevel() const
+    [[nodiscard]] Level getLevel() const
     {
         return level_;
     }
@@ -190,18 +187,18 @@ public:
     void setLevel(Level const level)
     {
         level_ = level;
-        log(INFO, "Set logger level to %s", getLevelName(level));
+        log(INFO, "Set logger level to {}", getLevelName(level));
     }
 
     /// Check whether logging is enabled at the given level (global check).
-    bool isEnabled(Level const level) const
+    [[nodiscard]] bool isEnabled(Level const level) const
     {
         return level_ <= level;
     }
 
     /// Check whether logging is enabled at the given level for a specific module.
     /// Per-module overrides (from TLLM_LOG_LEVEL_BY_MODULE) take precedence over the global level.
-    bool isEnabled(Level const level, std::string_view module) const
+    [[nodiscard]] bool isEnabled(Level const level, std::string_view module) const
     {
         if (!moduleLevels_.empty() && !module.empty())
         {
@@ -215,12 +212,12 @@ public:
     }
 
     /// Override the auto-detected rank. Use -1 to disable rank display.
-    void setRank(int const rank)
+    void setRank(int rank)
     {
         rank_ = rank;
     }
 
-    int getRank() const
+    [[nodiscard]] int getRank() const
     {
         return rank_;
     }
@@ -269,141 +266,69 @@ private:
         TLLM_THROW("Unknown log level: %d", level);
     }
 
-    // ---- getPrefix variants -------------------------------------------------
-
-    // No module, auto rank (for internal callers without __FILE__)
-    inline std::string getPrefix(Level const level) const
+    template <typename... Args>
+    void logImpl(
+        Level const level, Module module, std::optional<int> rank, std::format_string<Args...> format, Args&&... args)
     {
-        if (rank_ >= 0)
+        if (!isEnabled(level, module.name))
         {
-            return tensorrt_llm::common::fmtstr("%s [%s] [RANK %d] ", kPREFIX, getLevelName(level), rank_);
+            return;
         }
-        return tensorrt_llm::common::fmtstr("%s [%s] ", kPREFIX, getLevelName(level));
-    }
 
-    // No module, explicit rank
-    static inline std::string getPrefix(Level const level, int const rank)
-    {
-        return tensorrt_llm::common::fmtstr("%s [%s] [RANK %d] ", kPREFIX, getLevelName(level), rank);
-    }
-
-    // With module, auto rank
-    inline std::string getPrefix(Level const level, std::string_view module) const
-    {
-        if (rank_ >= 0)
+        if (!rank.has_value() && rank_ >= 0)
         {
-            return tensorrt_llm::common::fmtstr("%s [%s] [%.*s][RANK %d] ", kPREFIX, getLevelName(level),
-                static_cast<int>(module.size()), module.data(), rank_);
+            rank = rank_;
         }
-        return tensorrt_llm::common::fmtstr(
-            "%s [%s] [%.*s] ", kPREFIX, getLevelName(level), static_cast<int>(module.size()), module.data());
+
+        write(level, module.name, rank, std::format(format, std::forward<Args>(args)...));
     }
 
-    // With module, explicit rank
-    static inline std::string getPrefix(Level const level, std::string_view module, int const rank)
+    static std::string getPrefix(Level const level, std::string_view module, std::optional<int> rank)
     {
-        return tensorrt_llm::common::fmtstr("%s [%s] [%.*s][RANK %d] ", kPREFIX, getLevelName(level),
-            static_cast<int>(module.size()), module.data(), rank);
+        if (!module.empty())
+        {
+            if (rank.has_value())
+            {
+                return std::format("{} [{}] [{}][RANK {}] ", kPREFIX, getLevelName(level), module, *rank);
+            }
+            return std::format("{} [{}] [{}] ", kPREFIX, getLevelName(level), module);
+        }
+
+        if (rank.has_value())
+        {
+            return std::format("{} [{}] [RANK {}] ", kPREFIX, getLevelName(level), *rank);
+        }
+        return std::format("{} [{}] ", kPREFIX, getLevelName(level));
+    }
+
+    static void write(Level const level, std::string_view module, std::optional<int> rank, std::string_view message)
+    {
+        auto const line = std::format("{}{}", getPrefix(level, module, rank), message);
+        auto& out = level < WARNING ? std::cout : std::cerr;
+        out << line << std::endl;
     }
 };
 
-// ===========================================================================
-// Template implementations — no source file (internal callers)
-// ===========================================================================
-
+//! Log a checked format string with module filtering and the configured rank.
 template <typename... Args>
-void Logger::log(Logger::Level const level, char const* format, Args const&... args)
+void log(Logger::Level const level, Logger::Module module, std::format_string<Args...> format, Args&&... args)
 {
-    if (isEnabled(level))
-    {
-        auto const fmt = getPrefix(level) + format;
-        auto& out = level_ < WARNING ? std::cout : std::cerr;
-        if constexpr (sizeof...(args) > 0)
-        {
-            out << fmtstr(fmt.c_str(), args...);
-        }
-        else
-        {
-            out << fmt;
-        }
-        out << std::endl;
-    }
+    Logger::getLogger()->log(level, module, format, std::forward<Args>(args)...);
 }
 
+//! Log a checked format string with module filtering and an explicit rank.
 template <typename... Args>
-void Logger::log(Logger::Level const level, int const rank, char const* format, Args const&... args)
+void log(Logger::Level const level, Logger::Module module, int const rank, std::format_string<Args...> format,
+    Args&&... args)
 {
-    if (isEnabled(level))
-    {
-        auto const fmt = getPrefix(level, rank) + format;
-        auto& out = level_ < WARNING ? std::cout : std::cerr;
-        if constexpr (sizeof...(args) > 0)
-        {
-            out << fmtstr(fmt.c_str(), args...);
-        }
-        else
-        {
-            out << fmt;
-        }
-        out << std::endl;
-    }
+    Logger::getLogger()->log(level, module, rank, format, std::forward<Args>(args)...);
 }
 
-// ===========================================================================
-// Template implementations — with module tag (TLLM_LOG macros)
-// ===========================================================================
-
-template <typename... Args>
-void Logger::log(Logger::Level const level, Module module, char const* format, Args const&... args)
-{
-    if (isEnabled(level, module.name))
-    {
-        auto const fmt = getPrefix(level, module.name) + format;
-        auto& out = level_ < WARNING ? std::cout : std::cerr;
-        if constexpr (sizeof...(args) > 0)
-        {
-            out << fmtstr(fmt.c_str(), args...);
-        }
-        else
-        {
-            out << fmt;
-        }
-        out << std::endl;
-    }
-}
-
-template <typename... Args>
-void Logger::log(Logger::Level const level, Module module, int const rank, char const* format, Args const&... args)
-{
-    if (isEnabled(level, module.name))
-    {
-        auto const fmt = getPrefix(level, module.name, rank) + format;
-        auto& out = level_ < WARNING ? std::cout : std::cerr;
-        if constexpr (sizeof...(args) > 0)
-        {
-            out << fmtstr(fmt.c_str(), args...);
-        }
-        else
-        {
-            out << fmt;
-        }
-        out << std::endl;
-    }
-}
 } // namespace common
 
 TRTLLM_NAMESPACE_END
 
-#define TLLM_LOG(level, ...)                                                                                           \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        auto* const logger = tensorrt_llm::common::Logger::getLogger();                                                \
-        constexpr auto tllmModule_ = tensorrt_llm::common::Logger::extractModule(__FILE__);                            \
-        if (logger->isEnabled(level, tllmModule_))                                                                     \
-        {                                                                                                              \
-            logger->log(level, tensorrt_llm::common::Logger::Module{tllmModule_}, __VA_ARGS__);                        \
-        }                                                                                                              \
-    } while (0)
+#define TLLM_LOG(level, ...) ::tensorrt_llm::common::log((level), ::tensorrt_llm::common::Logger::Module{}, __VA_ARGS__)
 
 #define TLLM_LOG_TRACE(...) TLLM_LOG(tensorrt_llm::common::Logger::TRACE, __VA_ARGS__)
 #define TLLM_LOG_DEBUG(...) TLLM_LOG(tensorrt_llm::common::Logger::DEBUG, __VA_ARGS__)

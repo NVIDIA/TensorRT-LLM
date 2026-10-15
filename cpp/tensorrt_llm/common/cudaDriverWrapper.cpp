@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -268,7 +268,7 @@ CUresult CUDADriverWrapper::cuLaunchKernelEx(
     CUlaunchConfig const* config, CUfunction f, void** kernelParams, void** extra) const
 {
 
-    TLLM_LOG_DEBUG("Launch config: %s", stringify_launch_config(*config).c_str());
+    TLLM_LOG_DEBUG("Launch config: {}", stringify_launch_config(*config).c_str());
     TLLM_CHECK_DEBUG_WITH_INFO(
         (extra != nullptr) != (kernelParams != nullptr), "Exactly one of 'extra' and 'kernelParams' should be set.");
     return (*_cuLaunchKernelEx)(config, f, kernelParams, extra);

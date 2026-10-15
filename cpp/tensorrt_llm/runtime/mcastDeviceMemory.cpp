@@ -53,7 +53,7 @@ bool cleanupNoThrow(char const* resource, Cleanup cleanup) noexcept
     {
         try
         {
-            TLLM_LOG_WARNING("Failed to release %s during McastDeviceMemory cleanup: %s", resource, error.what());
+            TLLM_LOG_WARNING("Failed to release {} during McastDeviceMemory cleanup: {}", resource, error.what());
         }
         catch (...)
         {
@@ -65,7 +65,7 @@ bool cleanupNoThrow(char const* resource, Cleanup cleanup) noexcept
     {
         try
         {
-            TLLM_LOG_WARNING("Failed to release %s during McastDeviceMemory cleanup", resource);
+            TLLM_LOG_WARNING("Failed to release {} during McastDeviceMemory cleanup", resource);
         }
         catch (...)
         {
@@ -123,11 +123,11 @@ void runCollectivePhase(McastGroupComm& comm, char const* phase, Action action, 
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("[McastDeviceMemory] %s failed on group rank %d: %s", phase, comm.getRank(), error.what());
+            TLLM_LOG_ERROR("[McastDeviceMemory] {} failed on group rank {}: {}", phase, comm.getRank(), error.what());
         }
         catch (...)
         {
-            TLLM_LOG_ERROR("[McastDeviceMemory] %s failed on group rank %d", phase, comm.getRank());
+            TLLM_LOG_ERROR("[McastDeviceMemory] {} failed on group rank {}", phase, comm.getRank());
         }
     }
     if (failureIsTerminal)
@@ -210,9 +210,10 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
 
     TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] World Rank: %d, Group Rank: %u, Group size: %u, isMultiNode: %d, "
-        "device_idx: %d, Signal pad offset: %zu",
-        mGroupComm->getWorldRank(), mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+        "[McastDeviceMemory] World Rank: {}, Group Rank: {}, Group size: {}, isMultiNode: {}, "
+        "device_idx: {}, Signal pad offset: {}",
+        mGroupComm->getWorldRank(), mGroupRank, mGroupSize, static_cast<int>(mIsMNNvlink), mDeviceIdx,
+        mSignalPadOffset);
 
     if (mIsMNNvlink)
     {

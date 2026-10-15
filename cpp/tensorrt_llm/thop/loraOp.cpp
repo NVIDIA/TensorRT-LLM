@@ -66,7 +66,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     std::vector<int64_t> const& output_hidden_sizes, bool transA, bool transB, int64_t const max_low_rank,
     int64_t const& weight_index, bool isRemoveInputPadding)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto const numReqs = lora_ranks[0].sizes()[0];
@@ -183,7 +183,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
         weight_index, output.data(), workspace.data_ptr(), stream);
     sync_check_cuda_error(stream);
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return output_torch;
 }
 
@@ -202,7 +202,7 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     th::Tensor const& host_max_out_sizes, th::Tensor const& splitk_offsets, c10::ScalarType dtype, int64_t minKN,
     int64_t splitKSlices = 16)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -272,7 +272,7 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
         sync_check_cuda_error(stream);
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, // [module_count, max_lora_count, 3]
@@ -301,7 +301,7 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
     th::Tensor const& output_buffer,       // [batch_size, sum_output_hidden_size]
     c10::ScalarType dtype)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -357,7 +357,7 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
 
     sync_check_cuda_error(stream);
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 } // namespace torch_ext

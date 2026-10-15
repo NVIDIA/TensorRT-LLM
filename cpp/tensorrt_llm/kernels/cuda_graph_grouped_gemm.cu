@@ -206,7 +206,7 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
     cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     using namespace cute;
 
@@ -324,7 +324,7 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 CUDA graph grouped GEMM run failed: %s",
         cutlass::cutlassGetStatusString(status));
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,

@@ -1277,7 +1277,7 @@ int AttentionOp::mlaGeneration(
                     TLLM_CHECK_WITH_INFO(sumOfSeqLensKv <= std::numeric_limits<int32_t>::max(),
                         "Static sparse MLA cumulative KV length exceeds int32 capacity: %ld", sumOfSeqLensKv);
                     tllmRunnerParams.mSumOfSeqLensKv = static_cast<int32_t>(sumOfSeqLensKv);
-                    TLLM_LOG_DEBUG("Clamp static sparse MLA max KV length from %d to %d (TopK=%d)", originalMaxSeqLenKv,
+                    TLLM_LOG_DEBUG("Clamp static sparse MLA max KV length from {} to {} (TopK={})", originalMaxSeqLenKv,
                         effectiveMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
                 }
             }
@@ -3368,9 +3368,9 @@ int AttentionOp::initialize() noexcept
 #if ENABLE_MULTI_DEVICE
     if (mCpSize > 1 && COMM_SESSION.getSize() > 1)
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mCpNcclComm = getComm(mCpGroup);
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     }
 #endif // ENABLE_MULTI_DEVICE
     return 0;

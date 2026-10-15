@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -376,7 +376,7 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         SizeType32 tokensPerBlock = 8;
         SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         auto defaultTransSize = tensorrt_llm::common::getEnvMemSizeForKVCacheTransferBuffer();
-        TLLM_LOG_INFO("defaultTransSize: %d", defaultTransSize);
+        TLLM_LOG_INFO("defaultTransSize: {}", defaultTransSize);
         EXPECT_GT(defaultTransSize, 0);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());

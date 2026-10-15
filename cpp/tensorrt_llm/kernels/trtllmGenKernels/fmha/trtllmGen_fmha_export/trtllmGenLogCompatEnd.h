@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Restore the original TRT-LLM printf-style log macros saved by trtllmGenLogCompat.h.
+// Restore the original TRT-LLM std::format-style log macros saved by trtllmGenLogCompat.h.
 #pragma pop_macro("TLLM_LOG_TRACE")
 #pragma pop_macro("TLLM_LOG_INFO")
 #pragma pop_macro("TLLM_LOG_WARNING")

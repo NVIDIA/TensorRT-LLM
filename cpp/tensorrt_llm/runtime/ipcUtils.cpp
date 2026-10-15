@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ namespace tensorrt_llm::runtime
 
 bool canAccessPeer(WorldConfig const& worldConfig)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     auto const srcDevice = worldConfig.getDevice();
 
     for (SizeType32 rank : worldConfig.getTensorParallelGroup())
@@ -36,9 +36,9 @@ bool canAccessPeer(WorldConfig const& worldConfig)
         SizeType32 destDevice = worldConfig.getDeviceOf(rank);
         if (worldConfig.getNodeRankOf(rank) != worldConfig.getNodeRank())
         {
-            TLLM_LOG_INFO("Detect inter-node TP between rank %d and rank %d, fail to access peer GPU memory",
+            TLLM_LOG_INFO("Detect inter-node TP between rank {} and rank {}, fail to access peer GPU memory",
                 worldConfig.getRank(), rank);
-            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
             return false;
         }
         if (destDevice == srcDevice)
@@ -50,12 +50,12 @@ bool canAccessPeer(WorldConfig const& worldConfig)
         TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, srcDevice, destDevice));
         if (canAccessPeer == 0)
         {
-            TLLM_LOG_INFO("cudaDeviceCanAccessPeer failed for device: %d peerDevice: %d", srcDevice, destDevice);
-            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            TLLM_LOG_INFO("cudaDeviceCanAccessPeer failed for device: {} peerDevice: {}", srcDevice, destDevice);
+            TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
             return false;
         }
     }
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return true;
 }
 
@@ -72,7 +72,7 @@ IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, World
 
 void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     // Note: cudaIpcGet/OpenMemHandle does not work well with tiny allocations. The risk is that two small
     // allocations will get 'packed' together, and that we will get the same IPC handle for both using
@@ -116,7 +116,7 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
             mCommPtrs.at(nodeId) = foreignBuffer;
         }
     }
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 IpcMemory::~IpcMemory()
@@ -129,7 +129,7 @@ IpcMemory::~IpcMemory()
 
 void IpcMemory::destroyIpcMemory()
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     for (std::size_t nodeId = 0; nodeId < mCommPtrs.size(); ++nodeId)
     {
@@ -138,13 +138,13 @@ void IpcMemory::destroyIpcMemory()
             TLLM_CUDA_CHECK(cudaIpcCloseMemHandle(mCommPtrs.at(nodeId)));
         }
     }
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
     SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig, bool const fakeBuffers)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     if (fakeBuffers)
     {
         auto const tpSize = worldConfig.getTensorParallelism();
@@ -205,7 +205,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         }
 #endif
     }
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size)

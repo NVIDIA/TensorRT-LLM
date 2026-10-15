@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@ bool CudaMemPool::supportsMemoryPool(int deviceId)
 void CudaMemPool::Deleter::operator()(cudaMemPool_t pool) const
 {
     TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaMemPoolDestroy(pool));
-    TLLM_LOG_TRACE("Destroyed pool %p", pool);
+    TLLM_LOG_TRACE("Destroyed pool {:p}", static_cast<void const*>(pool));
 }
 
 namespace
@@ -79,7 +79,7 @@ namespace
 
 std::shared_ptr<CudaMemPool> createPrimaryDevicePool(int deviceId)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     ::cudaMemPool_t memPool = nullptr;
     ::cudaMemPoolProps poolProps{};
@@ -91,7 +91,7 @@ std::shared_ptr<CudaMemPool> createPrimaryDevicePool(int deviceId)
     // set memory pool threshold to avoid shrinking the pool
     auto maxThreshold = std::numeric_limits<std::uint64_t>::max();
     TLLM_CUDA_CHECK(cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &maxThreshold));
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return std::make_shared<CudaMemPool>(memPool);
 }
 
@@ -115,12 +115,12 @@ std::array<bool, maxDevicePerNode> primaryDevicePoolInitAttempted{};
 
 std::shared_ptr<CudaMemPool> CudaMemPool::getPrimaryPoolForDevice(int deviceId)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     // If we've already attempted, successfully or not, to initialize the pool for that device, we just return whatever
     // we have at the device index.
     if (primaryDevicePoolInitAttempted.at(deviceId))
     {
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
         return primaryDevicePools.at(deviceId);
     }
 
@@ -131,7 +131,7 @@ std::shared_ptr<CudaMemPool> CudaMemPool::getPrimaryPoolForDevice(int deviceId)
         // Check again that pool has not been initialized while this thread was waiting on the lock.
         if (primaryDevicePoolInitAttempted.at(deviceId))
         {
-            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
             return primaryDevicePools.at(deviceId);
         }
 
@@ -139,7 +139,7 @@ std::shared_ptr<CudaMemPool> CudaMemPool::getPrimaryPoolForDevice(int deviceId)
         if (!CudaMemPool::supportsMemoryPool(deviceId))
         {
             primaryDevicePoolInitAttempted.at(deviceId) = true;
-            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
             return {};
         }
 
@@ -148,15 +148,15 @@ std::shared_ptr<CudaMemPool> CudaMemPool::getPrimaryPoolForDevice(int deviceId)
         {
             primaryDevicePools.at(deviceId) = createPrimaryDevicePool(deviceId);
             primaryDevicePoolInitAttempted.at(deviceId) = true;
-            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
             return primaryDevicePools.at(deviceId);
         }
         catch (std::exception const& exception)
         {
-            TLLM_LOG_ERROR("Failed to initialized memory pool for device %i.", deviceId);
+            TLLM_LOG_ERROR("Failed to initialized memory pool for device {}.", deviceId);
             TLLM_LOG_EXCEPTION(exception);
             primaryDevicePoolInitAttempted.at(deviceId) = true;
-            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
             return {};
         }
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@
         retval = (statement);                                                                                          \
         if (retval == -1 && (errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN))                               \
         {                                                                                                              \
-            TLLM_LOG_INFO("Call to " name " returned %s, retrying", strerror(errno));                                  \
+            TLLM_LOG_INFO("Call to " name " returned {}, retrying", strerror(errno));                                  \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
@@ -55,7 +55,7 @@
         SYSCHECKSYNC((statement), name, retval);                                                                       \
         if (retval == -1)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_WARNING("Call to " name " failed: %s", strerror(errno));                                          \
+            TLLM_LOG_WARNING("Call to " name " failed: {}", strerror(errno));                                          \
             TLLM_NCCL_CHECK(ncclSystemError);                                                                          \
         }                                                                                                              \
     } while (false)
@@ -95,7 +95,7 @@ std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32
     handle->socketName[0] = '\0';
     if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0)
     {
-        TLLM_LOG_WARNING("UDS: Socket creation error : %s (%d)", strerror(errno), errno);
+        TLLM_LOG_WARNING("UDS: Socket creation error : {} ({})", strerror(errno), errno);
         TLLM_NCCL_CHECK(ncclSystemError); // throws
     }
 
@@ -113,7 +113,7 @@ std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32
     unlink(temp);
 #endif
 
-    TLLM_LOG_TRACE("UDS: Creating socket %s", temp);
+    TLLM_LOG_TRACE("UDS: Creating socket {}", temp);
 
     strncpy(cliaddr.sun_path, temp, len);
 #ifdef USE_ABSTRACT_SOCKET
@@ -121,7 +121,7 @@ std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32
 #endif
     if (bind(fd, (struct sockaddr*) &cliaddr, sizeof(cliaddr)) < 0)
     {
-        TLLM_LOG_WARNING("UDS: Binding to socket %s failed : %s (%d)", temp, strerror(errno), errno);
+        TLLM_LOG_WARNING("UDS: Binding to socket {} failed : {} ({})", temp, strerror(errno), errno);
         close(fd);
         TLLM_NCCL_CHECK(ncclSystemError); // throws
     }
@@ -194,7 +194,7 @@ void ncclIpcSocketRecvMsg(std::shared_ptr<NcclIpcSocket> handle, void* hdr, int 
     {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         {
-            TLLM_LOG_WARNING("UDS: Receiving data over socket failed : %d", errno);
+            TLLM_LOG_WARNING("UDS: Receiving data over socket failed : {}", errno);
             TLLM_NCCL_CHECK(ncclSystemError); // throws
         }
         if (handle->abortFlag && *handle->abortFlag)
@@ -217,10 +217,10 @@ void ncclIpcSocketRecvMsg(std::shared_ptr<NcclIpcSocket> handle, void* hdr, int 
         }
         else
         {
-            TLLM_LOG_WARNING("UDS: Receiving data over socket %s failed", handle->socketName);
+            TLLM_LOG_WARNING("UDS: Receiving data over socket {} failed", handle->socketName);
             TLLM_NCCL_CHECK(ncclSystemError); // throws
         }
-        TLLM_LOG_TRACE("UDS: Got recvFd %d from socket %s", *recvFd, handle->socketName);
+        TLLM_LOG_TRACE("UDS: Got recvFd {} from socket {}", *recvFd, handle->socketName);
     }
 }
 
@@ -264,11 +264,11 @@ void ncclIpcSocketSendMsg(
     cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
 #endif
 
-    TLLM_LOG_TRACE("UDS: Sending hdr %p len %d to UDS socket %s", hdr, hdrLen, temp);
+    TLLM_LOG_TRACE("UDS: Sending hdr {:p} len {} to UDS socket {}", static_cast<void const*>(hdr), hdrLen, temp);
 
     if (sendFd != -1)
     {
-        TLLM_LOG_TRACE("UDS: Sending fd %d to UDS socket %s", sendFd, temp);
+        TLLM_LOG_TRACE("UDS: Sending fd {} to UDS socket {}", sendFd, temp);
 
         msg.msg_control = control_un.control;
         msg.msg_controllen = sizeof(control_un.control);
@@ -302,7 +302,7 @@ void ncclIpcSocketSendMsg(
     {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         {
-            TLLM_LOG_WARNING("UDS: Sending data over socket %s failed : %s (%d)", temp, strerror(errno), errno);
+            TLLM_LOG_WARNING("UDS: Sending data over socket {} failed : {} ({})", temp, strerror(errno), errno);
             TLLM_NCCL_CHECK(ncclSystemError); // throws
         }
         if (handle->abortFlag && *handle->abortFlag)

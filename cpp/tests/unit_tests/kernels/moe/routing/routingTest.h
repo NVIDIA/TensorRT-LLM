@@ -107,7 +107,7 @@ constexpr void initData(T* data, int num, int rngSeed)
 inline void printSet(std::set<int32_t> const& s)
 {
     for (auto it = s.begin(); it != s.end(); ++it)
-        TLLM_LOG_DEBUG("%d%s ", *it, std::distance(it, s.end()) == 1 ? "" : ", ");
+        TLLM_LOG_DEBUG("{}{} ", *it, std::distance(it, s.end()) == 1 ? "" : ", ");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -116,7 +116,7 @@ inline bool checkSetEqual(int ie, std::set<int32_t> const& exp, std::set<int32_t
     bool result = true;
     if (exp != test)
     {
-        TLLM_LOG_DEBUG("Expert %d expected %s:\t", ie, name.c_str());
+        TLLM_LOG_DEBUG("Expert {} expected {}:\t", ie, name.c_str());
         printSet(exp);
         TLLM_LOG_DEBUG("\t but got:\t");
         printSet(test);
@@ -131,7 +131,7 @@ inline bool checkSetEqual(int ie, std::set<int32_t> const& exp, std::set<int32_t
 template <typename T>
 inline bool assertEqual(T* hostData, T* hostTest, int n, std::string const& name)
 {
-    TLLM_LOG_DEBUG("assertEqual %s", name.c_str());
+    TLLM_LOG_DEBUG("assertEqual {}", name.c_str());
     bool result = true;
     int count = 0;
     for (int ii = 0; ii < n; ++ii)
@@ -139,7 +139,7 @@ inline bool assertEqual(T* hostData, T* hostTest, int n, std::string const& name
         EXPECT_EQ(hostTest[ii], hostData[ii]);
         if (hostTest[ii] != hostData[ii])
         {
-            TLLM_LOG_ERROR("Unexpected result for '%s' at idx %d: exp %d != %d\n", name.c_str(), ii, (int) hostData[ii],
+            TLLM_LOG_ERROR("Unexpected result for '{}' at idx {}: exp {} != {}\n", name.c_str(), ii, (int) hostData[ii],
                 (int) hostTest[ii]);
             result = false;
             count++;
@@ -156,7 +156,7 @@ inline bool assertEqual(T* hostData, T* hostTest, int n, std::string const& name
 template <typename T>
 inline bool printTwoVar(T* hostData, T* hostTest, int n, std::string const& name)
 {
-    TLLM_LOG_INFO("printTwoVar %s", name.c_str());
+    TLLM_LOG_INFO("printTwoVar {}", name.c_str());
     for (int ii = 0; ii < n; ++ii)
     {
         std::cout << "[" << ii << "] " << hostData[ii] << " " << hostTest[ii] << " | ";
@@ -175,7 +175,7 @@ inline bool printTwoVar(T* hostData, T* hostTest, int n, std::string const& name
 template <typename T>
 inline bool isClose(T* hostData, T* hostTest, int n, std::string const& name, float atol = 0.001, float rtol = 0.01)
 {
-    TLLM_LOG_DEBUG("isClose %s", name.c_str());
+    TLLM_LOG_DEBUG("isClose {}", name.c_str());
     auto numErrors = 0;
     float maxAbsDiff = 0.F;
     float maxRelDiff = 0.F;
@@ -194,8 +194,8 @@ inline bool isClose(T* hostData, T* hostTest, int n, std::string const& name, fl
         bool error = std::isnan(test) || std::isinf(test) || (absDiff > tol);
         if (error)
         {
-            TLLM_LOG_ERROR("Unexpected result for '%s' at idx %d: exp %f, got %f, atol %f rtol %f\n", name.c_str(), ii,
-                exp, test, atol, rtol);
+            TLLM_LOG_ERROR("Unexpected result for '{}' at idx {}: exp {:f}, got {:f}, atol {:f} rtol {:f}\n",
+                name.c_str(), ii, exp, test, atol, rtol);
             maxAbsDiff = std::max(maxAbsDiff, absDiff);
             maxRelDiff = std::max(maxRelDiff, relDiff);
             numErrors++;
@@ -210,7 +210,7 @@ inline bool isClose(T* hostData, T* hostTest, int n, std::string const& name, fl
     }
     if (numErrors > 0)
     {
-        TLLM_LOG_ERROR("'%s': max abs diff: %f, max rel diff: %f\n", name.c_str(), maxAbsDiff, maxRelDiff);
+        TLLM_LOG_ERROR("'{}': max abs diff: {:f}, max rel diff: {:f}\n", name.c_str(), maxAbsDiff, maxRelDiff);
     }
     return result;
 }
@@ -555,7 +555,7 @@ public:
     {
         std::random_device rd;
         uint32_t seed = rd();
-        TLLM_LOG_DEBUG("Random device seed: %u", seed);
+        TLLM_LOG_DEBUG("Random device seed: {}", seed);
         return seed;
     }
 

@@ -756,8 +756,8 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     dim3 grid(numTokens, clusterSize, 1);
 
     TLLM_LOG_DEBUG(
-        "[MNNVL AllReduceOneShot] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: %d, "
-        "loads_per_thread: %d, deterministic_reduction_order: 1, threads_needed: %d",
+        "[MNNVL AllReduceOneShot] Dispatch: grid size: ({}, {}, 1), block_size: {}, cluster_size: {}, "
+        "loads_per_thread: {}, deterministic_reduction_order: 1, threads_needed: {}",
         numTokens, clusterSize, blockSize, clusterSize, loadsPerThread, divUp(tokenDim, eltsPerThread));
 
     TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
@@ -1222,7 +1222,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     };
 
     TLLM_LOG_DEBUG(
-        "[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128", numTokens, arNumBlocksPerToken);
+        "[MNNVL AllReduceTwoShot] Dispatch: grid size: ({}, {}, 1), block_size: 128", numTokens, arNumBlocksPerToken);
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                         \
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernel<WORLD_SIZE, T>, kernelParams));
@@ -1301,9 +1301,9 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         size_t const smemSize = 3 * rnBlockSize * iters * getDTypeSize(params.dType);
 
         TLLM_LOG_DEBUG(
-            "[MNNVL AllReduceTwoShotRMSNorm] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: %d, "
-            "loads_per_thread: %d, "
-            "threads_needed: %d",
+            "[MNNVL AllReduceTwoShotRMSNorm] Dispatch: grid size: ({}, {}, 1), block_size: {}, cluster_size: {}, "
+            "loads_per_thread: {}, "
+            "threads_needed: {}",
             numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread, divUp(tokenDim, numEltsPerThread));
 
 #define RUN_RMSNORM_KERNEL(T, PATTERN, USE_CGA, LOADS_PER_THREAD)                                                      \

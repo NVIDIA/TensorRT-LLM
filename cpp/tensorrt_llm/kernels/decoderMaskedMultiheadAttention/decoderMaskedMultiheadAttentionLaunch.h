@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -142,7 +142,7 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     static bool debug_flag_printed_once = false;
     if (multi_block_debug_flag && !debug_flag_printed_once)
     {
-        TLLM_LOG_INFO("MMHA kernel info: threads per block(%d), launched_blocks_per_sequence(%d), sequence_length(%d).",
+        TLLM_LOG_INFO("MMHA kernel info: threads per block({}), launched_blocks_per_sequence({}), sequence_length({}).",
             block_size, params.seq_len_tile, tlength + 1);
         debug_flag_printed_once = true;
     }

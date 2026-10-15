@@ -49,10 +49,10 @@ void promoteHostLibraryToGlobalScope()
             void* handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
             if (handle == nullptr)
             {
-                TLLM_LOG_DEBUG("global-scope promotion skipped for %s: %s", info.dli_fname, dlerror());
+                TLLM_LOG_DEBUG("global-scope promotion skipped for {}: {}", info.dli_fname, dlerror());
                 return;
             }
-            TLLM_LOG_DEBUG("promoted %s to the global symbol scope", info.dli_fname);
+            TLLM_LOG_DEBUG("promoted {} to the global symbol scope", info.dli_fname);
             // Keep the extra reference: the library must stay resident for the wrappers.
         });
 }
@@ -72,7 +72,7 @@ void promoteHostLibraryToGlobalScope()
     {
         return it->second;
     }
-    TLLM_LOG_INFO("dlopen: " + name);
+    TLLM_LOG_INFO("{}", "dlopen: " + name);
     void* handler = dlopen(name.c_str(), RTLD_LAZY);
     TLLM_CHECK_WITH_INFO(handler, "%s can not be loaded correctly: %s", name.c_str(), dlerror());
     mHandlers[name] = handler;
@@ -334,7 +334,7 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
 
     if (outSrc.size() != srcVec.size())
     {
-        TLLM_LOG_DEBUG("VmmDescSplitter::splitAndCoalesceTransferDescs: %zu pairs -> %zu pieces -> %zu transfers",
+        TLLM_LOG_DEBUG("VmmDescSplitter::splitAndCoalesceTransferDescs: {} pairs -> {} pieces -> {} transfers",
             srcVec.size(), numPieces, outSrc.size());
     }
 
@@ -413,7 +413,7 @@ MemoryDescs VmmDescSplitter::splitVmmDescs(MemoryDescs const& descs, size_t& det
 
     if (result.size() != descVec.size())
     {
-        TLLM_LOG_DEBUG("VmmDescSplitter::splitVmmDescs: split %zu -> %zu VRAM entries (chunkSize=%zu)", descVec.size(),
+        TLLM_LOG_DEBUG("VmmDescSplitter::splitVmmDescs: split {} -> {} VRAM entries (chunkSize={})", descVec.size(),
             result.size(), detectedChunkSize);
     }
 

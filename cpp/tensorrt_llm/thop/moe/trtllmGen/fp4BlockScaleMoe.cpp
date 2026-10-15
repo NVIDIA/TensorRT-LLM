@@ -538,7 +538,7 @@ public:
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_DEBUG("No %s FP4BlockScaleMoe runner for tileN=%d: %s",
+                TLLM_LOG_DEBUG("No {} FP4BlockScaleMoe runner for tileN={}: {}",
                     useFineGrained ? "FineGrained" : "non-FineGrained", tileN, e.what());
             }
             it = mRunners.emplace(std::move(key), std::move(runner)).first;

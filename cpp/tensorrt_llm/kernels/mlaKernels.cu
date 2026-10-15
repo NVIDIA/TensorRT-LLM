@@ -1859,9 +1859,10 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                 dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
-                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: ({}, {}, {}), threads_per_block: {}, "
+                    "total_kv_len: {}, acc_q_len: {}, absorption_mode: {}",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len,
+                    static_cast<int>(params.absorption_mode));
 
                 quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
                     <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
@@ -1878,9 +1879,10 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                 dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
-                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: ({}, {}, {}), threads_per_block: {}, "
+                    "total_kv_len: {}, acc_q_len: {}, absorption_mode: {}",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len,
+                    static_cast<int>(params.absorption_mode));
 
                 quantizeCopyInputToFp8Kernel<T, threads_per_block, 448, 64, 512, true>
                     <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
@@ -1902,9 +1904,10 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
             TLLM_LOG_DEBUG(
-                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: ({}, {}, {}), threads_per_block: {}, "
+                "total_kv_len: {}, acc_q_len: {}, absorption_mode: {}",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len,
+                static_cast<int>(params.absorption_mode));
 
             quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
                 <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),

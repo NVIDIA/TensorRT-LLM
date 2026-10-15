@@ -125,12 +125,12 @@ public:
         accessDesc.location.id = mDeviceIdx;
         TLLM_CU_CHECK(cuMemMap(mDevicePtr, mAllocSize, 0, mHandle, 0));
         TLLM_CU_CHECK(cuMemSetAccess(mDevicePtr, mAllocSize, &accessDesc, 1));
-        TLLM_LOG_DEBUG("FabricMemory::Impl::Impl mAllocSize:%ld", mAllocSize);
+        TLLM_LOG_DEBUG("FabricMemory::Impl::Impl mAllocSize:{}", mAllocSize);
     }
 
     ~Impl()
     {
-        TLLM_LOG_DEBUG("FabricMemory::Impl::~Impl mAllocSize:%ld", mAllocSize);
+        TLLM_LOG_DEBUG("FabricMemory::Impl::~Impl mAllocSize:{}", mAllocSize);
         TLLM_CU_CHECK(cuMemUnmap(mDevicePtr, mAllocSize));
         TLLM_CU_CHECK(cuMemRelease(mHandle));
         TLLM_CU_CHECK(cuMemAddressFree(mDevicePtr, mAllocSize));
@@ -208,8 +208,8 @@ bool FabricMemory::supportFabricMemory()
 
         CUresult ret1 = cuDeviceGetAttribute(&gpu_direct_rdma_with_cuda_vmm_supported,
             CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, deviceIdx);
-        TLLM_LOG_DEBUG("FabricMemory::supportFabricMemory fabric_handle_supported:%d", fabric_handle_supported);
-        TLLM_LOG_DEBUG("FabricMemory::supportFabricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
+        TLLM_LOG_DEBUG("FabricMemory::supportFabricMemory fabric_handle_supported:{}", fabric_handle_supported);
+        TLLM_LOG_DEBUG("FabricMemory::supportFabricMemory gpu_direct_rdma_with_cuda_vmm_supported:{}",
             gpu_direct_rdma_with_cuda_vmm_supported);
         if (ret0 != CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
             || gpu_direct_rdma_with_cuda_vmm_supported == 0)

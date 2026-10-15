@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -465,7 +465,7 @@ protected:
             if (!almostEqual(e, o, 1e-3, 1e-3))
             {
                 TLLM_LOG_ERROR(
-                    "Mismatch input value. Position of inputs: %d, expected value: %f, output value: %f", i, e, o);
+                    "Mismatch input value. Position of inputs: {}, expected value: {:f}, output value: {:f}", i, e, o);
                 return false;
             }
         }

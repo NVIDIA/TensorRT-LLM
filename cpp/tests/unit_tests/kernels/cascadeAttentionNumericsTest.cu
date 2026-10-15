@@ -380,8 +380,8 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
                 int seq = static_cast<int>(i / (tp.numHeads * kDh));
                 int head = static_cast<int>((i % (tp.numHeads * kDh)) / kDh);
                 int ch = static_cast<int>(i % kDh);
-                TLLM_LOG_ERROR("Mismatch at [seq=%d, head=%d, ch=%d]: baseline=%e, cascade=%e, diff=%e", seq, head, ch,
-                    baseline_val, cascade_val, cascade_val - baseline_val);
+                TLLM_LOG_ERROR("Mismatch at [seq={}, head={}, ch={}]: baseline={:e}, cascade={:e}, diff={:e}", seq,
+                    head, ch, baseline_val, cascade_val, cascade_val - baseline_val);
             }
             ++mismatches;
         }

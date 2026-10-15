@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,9 +54,9 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, -1);
+        TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, -1);
         mNcclComm = getComm(mGroup);
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, -1);
+        TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, -1);
         return 0;
     }
 
@@ -143,7 +143,7 @@ public:
 
     int initialize() noexcept
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, mProcessGroup->getRank());
+        TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, mProcessGroup->getRank());
         return 0;
     }
 

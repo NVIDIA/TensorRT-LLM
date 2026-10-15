@@ -82,8 +82,8 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     }
     else
     {
-        TLLM_LOG_DEBUG(
-            "No special cublasLt algo found for aType=%d, outType=%d, compType=%d\n", aType, outType, compType);
+        TLLM_LOG_DEBUG("No special cublasLt algo found for aType={}, outType={}, compType={}\n",
+            static_cast<int>(aType), static_cast<int>(outType), static_cast<int>(compType));
         return false;
     }
     if (auto algo_iter = algo_list->find({mp2, k, n}); algo_iter != algo_list->end())
@@ -91,7 +91,7 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         int const algoID = algo_iter->second[0];
         check_cuda_error(cublasLtMatmulAlgoInit(
             cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
-        TLLM_LOG_DEBUG("Found special cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+        TLLM_LOG_DEBUG("Found special cublasLt algo for m={}, k={}, n={}\n", m, k, n);
         set_algo_attr(algo, algo_iter->second);
     }
     else
@@ -99,10 +99,10 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         int const algoID = 66; // CUBLASLT_MATMUL_ALGO_NVJET
         check_cuda_error(cublasLtMatmulAlgoInit(
             cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
-        TLLM_LOG_DEBUG("No special cublasLt algo found for m=%d, k=%d, n=%d\n", m, k, n);
+        TLLM_LOG_DEBUG("No special cublasLt algo found for m={}, k={}, n={}\n", m, k, n);
         return false;
     }
-    TLLM_LOG_DEBUG("Found special cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+    TLLM_LOG_DEBUG("Found special cublasLt algo for m={}, k={}, n={}\n", m, k, n);
     return true;
 }
 

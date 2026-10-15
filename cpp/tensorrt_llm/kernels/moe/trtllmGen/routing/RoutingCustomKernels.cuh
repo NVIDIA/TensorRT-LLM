@@ -1671,7 +1671,7 @@ void launchClusterKernelForTier(Data const& data, void* stream)
     }
     else
     {
-        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput={}, dtypeInput={}",
             static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));
     }
 }
@@ -1688,7 +1688,7 @@ void launchClusterKernelForPolicy(Data const& data, void* stream)
         });
     if (!dispatched)
     {
-        TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+        TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);
     }
 }
 
@@ -1907,7 +1907,7 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
                 });
             if (!dispatched)
             {
-                TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+                TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);
             }
         });
 }
@@ -1959,7 +1959,7 @@ void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHi
     }
     else
     {
-        TLLM_LOG_ERROR("Coop kernel does not support numExperts > %d", NumExperts1024Experts);
+        TLLM_LOG_ERROR("Coop kernel does not support numExperts > {}", NumExperts1024Experts);
     }
 }
 

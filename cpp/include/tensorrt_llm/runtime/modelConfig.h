@@ -845,7 +845,7 @@ public:
     getNumKvHeadsPerLayerLocalRange(
         SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
     {
-        TLLM_LOG_TRACE("%s start: %d", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
         TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
 
         // count number of previous non-local attention layers
@@ -856,7 +856,7 @@ public:
             : mNumKvHeadsPerAttentionLayer.cbegin() + numPrevAttnLayers;
         auto const numLocalAttentionLayers
             = countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
-        TLLM_LOG_TRACE("%s stop: %d", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
         return std::make_pair(firstLocalAttentionLayerIt, firstLocalAttentionLayerIt + numLocalAttentionLayers);
     }
 

@@ -683,7 +683,7 @@ public:
     /// @brief Erases all previous generated tokens, only leaving the prompt.
     void clearGeneratedTokens()
     {
-        TLLM_LOG_DEBUG("Clearing generated tokens for request %ld with promptlen %d", mRequestId, mPromptLen);
+        TLLM_LOG_DEBUG("Clearing generated tokens for request {} with promptlen {}", mRequestId, mPromptLen);
         for (auto& beam : mTokens)
         {
             beam.resize(mPromptLen);
@@ -694,7 +694,7 @@ public:
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {
-        TLLM_LOG_DEBUG("Setting generated tokens for request %ld", mRequestId);
+        TLLM_LOG_DEBUG("Setting generated tokens for request {}", mRequestId);
         assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.getBeamWidth()));
 
         for (size_t beamId = 0; beamId < generatedBeamTokens.size(); ++beamId)
@@ -801,7 +801,7 @@ public:
             // generation-only requests, it could result in no KV cache being available, causing requests to remain
             // unscheduled indefinitely. We just issue a warning here.
             TLLM_LOG_WARNING(
-                "Pausing generation-only request, request_id: %lu, changes it to context init state, which may degrade "
+                "Pausing generation-only request, request_id: {}, changes it to context init state, which may degrade "
                 "performance.",
                 mRequestId);
         }
@@ -990,7 +990,7 @@ public:
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         // Add debug log for prepopulatedPromptLen
-        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i (promptLen=%i).", mRequestId,
+        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request {} to {} (promptLen={}).", mRequestId,
             prepopulatedPromptLen, getPromptLen());
 
         auto const promptLen = getPromptLen();
@@ -1282,7 +1282,8 @@ public:
 
     void setState(LlmRequestState state)
     {
-        TLLM_LOG_DEBUG("Set request %lu from state %d to %d", mRequestId, mState, state);
+        TLLM_LOG_DEBUG(
+            "Set request {} from state {} to {}", mRequestId, static_cast<int>(mState), static_cast<int>(state));
         mState = state;
     }
 
@@ -1647,12 +1648,12 @@ public:
     {
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
-            TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
+            TLLM_LOG_DEBUG("Request {} finished by timeout after {:f} sec", mRequestId,
                 std::chrono::duration<float>(getSteadyClockNow() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
-            TLLM_LOG_DEBUG("Request %ld finished by cancel", mRequestId);
+            TLLM_LOG_DEBUG("Request {} finished by cancel", mRequestId);
         }
 
         for (int beam = 0; beam < mSamplingConfig.getBeamWidth(); ++beam)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -70,7 +70,7 @@ WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParall
         {
             TLLM_LOG_WARNING("The user specified device IDs are not contiguous!");
         }
-        TLLM_LOG_INFO("Using user-specified devices: %s", tc::arr2str(mDeviceIds.data(), numDevices).c_str());
+        TLLM_LOG_INFO("Using user-specified devices: {}", tc::arr2str(mDeviceIds.data(), numDevices).c_str());
     }
 
     TLLM_CHECK(mTensorParallelism > 0);
@@ -98,11 +98,11 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
     auto const mpiSize = comm.getSize();
     auto const mpiRank = comm.getRank();
     auto const mpiLocalSize = LOCAL_COMM_SESSION.getSize();
-    TLLM_LOG_INFO("MPI size: %d, MPI local size: %d, rank: %d", mpiSize, mpiLocalSize, mpiRank);
+    TLLM_LOG_INFO("MPI size: {}, MPI local size: {}, rank: {}", mpiSize, mpiLocalSize, mpiRank);
     auto const pp = pipelineParallelism.value_or(1);
     auto const cp = contextParallelism.value_or(1);
     auto const tp = tensorParallelism.value_or(mpiSize / pp / cp);
-    TLLM_LOG_DEBUG("TP: %d, PP: %d, CP: %d, gpusPerNode: %d", tp, pp, cp, gpusPerNode);
+    TLLM_LOG_DEBUG("TP: {}, PP: {}, CP: {}, gpusPerNode: {}", tp, pp, cp, gpusPerNode);
     TLLM_CHECK_WITH_INFO(
         mpiSize == tp * pp * cp, "MPI size %d != TP size %d * PP size %d * CP Size %d", mpiSize, tp, pp, cp);
     SizeType32 deviceCount{0};
@@ -110,8 +110,8 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
     if (deviceCount < std::min(mpiSize, gpusPerNode))
     {
         TLLM_LOG_WARNING(
-            "gpusPerNode is %d and mpiSize is %d, but only %d GPUs detected, which is smaller than min(mpiSize, "
-            "gpusPerNode). gpusPerNode will be set to %d",
+            "gpusPerNode is {} and mpiSize is {}, but only {} GPUs detected, which is smaller than min(mpiSize, "
+            "gpusPerNode). gpusPerNode will be set to {}",
             gpusPerNode, mpiSize, deviceCount, deviceCount);
         gpusPerNode = deviceCount;
         if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr || std::getenv("NVIDIA_VISIBLE_DEVICES") != nullptr)
@@ -127,7 +127,7 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
             }
             std::string envStr = oss.str();
             TLLM_LOG_WARNING(
-                "Detect%s, please provide the full device list instead of limiting to device list, "
+                "Detect{}, please provide the full device list instead of limiting to device list, "
                 "otherwise allreduce performance may be sub-optimal "
                 "since custom allreduce kernel relies on P2P access to peer devices.",
                 envStr.c_str());

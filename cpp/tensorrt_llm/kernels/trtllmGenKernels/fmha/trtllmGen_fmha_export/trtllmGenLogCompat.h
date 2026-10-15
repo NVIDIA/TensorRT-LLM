@@ -17,15 +17,15 @@
 #pragma once
 
 // Compatibility layer: trtllm-gen export headers use streaming-style log macros
-// (e.g., TLLM_LOG_TRACE("val=", x)) while TensorRT-LLM's logger.h uses printf-style
-// (e.g., TLLM_LOG_TRACE("val=%d", x)). This header saves the original definitions
+// (e.g., TLLM_LOG_TRACE("val=", x)) while TensorRT-LLM's logger.h uses std::format-style
+// (e.g., TLLM_LOG_TRACE("val={}", x)). This header saves the original definitions
 // and replaces them with streaming-compatible versions.
 //
 // Usage in fmhaKernels.h:
-//   #include "tensorrt_llm/common/logger.h"                // TRT-LLM printf-style
+//   #include "tensorrt_llm/common/logger.h"                // TRT-LLM std::format-style
 //   #include "trtllmGen_fmha_export/trtllmGenLogCompat.h"  // switch to streaming
 //   #include "trtllmGen_fmha_export/FmhaOptions.h"         // export headers (streaming)
-//   #include "trtllmGen_fmha_export/trtllmGenLogCompatEnd.h" // restore printf-style
+//   #include "trtllmGen_fmha_export/trtllmGenLogCompatEnd.h" // restore std::format-style
 
 #include <sstream>
 #include "tensorrt_llm/common/logger.h"
@@ -41,7 +41,7 @@ inline void logStreaming(tensorrt_llm::common::Logger::Level level, Args const&.
     {
         std::ostringstream oss;
         (oss << ... << args);
-        logger->log(level, "%s", oss.str().c_str());
+        logger->log(level, "{}", oss.str().c_str());
     }
 }
 

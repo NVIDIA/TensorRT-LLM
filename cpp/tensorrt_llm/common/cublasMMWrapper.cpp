@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -460,8 +460,8 @@ static void print_algo(cublasLtMatmulAlgo_t const* matmulAlgo)
     cublasLtMatmulAlgoConfigGetAttribute(matmulAlgo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cga, sizeof(cga), NULL);
 
     TLLM_LOG_DEBUG(
-        "algo={ %d %d %d splitK=%d reduc=%d swizzle=%d custom=%d mma=%s cga=%s}"
-        " [-algo%d -m_tile%d -m_stages%d -m_numsK%d -m_reduction%d -m_swizzle%d -m_custom%d -m_mma%d -m_cga%d "
+        "algo={{ {} {} {} splitK={} reduc={} swizzle={} custom={} mma={} cga={}}}"
+        " [-algo{} -m_tile{} -m_stages{} -m_numsK{} -m_reduction{} -m_swizzle{} -m_custom{} -m_mma{} -m_cga{} "
         "\n",
         algoId, tile, stages, numSplitsK, reductionScheme, swizzle, customOption, mmaToString(mma), cgaToString(cga),
         algoId, tile, stages, numSplitsK, reductionScheme, swizzle, customOption, mma, cga);
@@ -482,8 +482,8 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
     if (algoStatus != CUBLAS_STATUS_SUCCESS || heurResult.state != CUBLAS_STATUS_SUCCESS
         || heurResult.workspaceSize > CUBLAS_WORKSPACE_SIZE)
     {
-        TLLM_LOG_WARNING("CheckTactic failed with status: %d and heuristic status: %d with workspace size: %d.\n",
-            algoStatus, heurResult.state, heurResult.workspaceSize);
+        TLLM_LOG_WARNING("CheckTactic failed with status: {} and heuristic status: {} with workspace size: {}.\n",
+            static_cast<int>(algoStatus), static_cast<int>(heurResult.state), heurResult.workspaceSize);
         return false;
     }
 

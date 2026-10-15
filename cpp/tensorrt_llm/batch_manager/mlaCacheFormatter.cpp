@@ -130,7 +130,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     if (llmRequest.has_value())
     {
         TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
+            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: {}.", (*llmRequest)->mRequestId);
         TLLM_CHECK_WITH_INFO(
             (*llmRequest)->mSamplingConfig.getBeamWidth() == 1, "Currently only supports beam width 1.");
     }
@@ -226,7 +226,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
             if (llmRequest.has_value())
             {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: {}.",
                     (*llmRequest)->mRequestId);
             }
 
@@ -430,7 +430,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
     if (llmRequest.has_value())
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: {}.",
             (*llmRequest)->mRequestId);
     }
 }
@@ -445,7 +445,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.getBeamWidth() == 1, "Currently only supports beam width 1.");
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
+        "Start receiving KV cache for request ID: {}, context request ID: {}.", llmRequest.mRequestId, ctxReqId);
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
@@ -457,7 +457,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto localRankIndices = std::get<1>(pickRecvConnResult);
     if (pickUpConnections.empty())
     {
-        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: {}", llmRequest.mRequestId);
         return;
     }
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
@@ -534,7 +534,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 }
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
+                "End receiving KV cache for request ID: {}, context request ID: {}.", llmRequest.mRequestId,
                 llmRequest.getContextPhaseParams().value().getReqId());
             return;
         }
@@ -725,7 +725,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
+        "End receiving KV cache for request ID: {}, context request ID: {}.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
 }
 
@@ -826,7 +826,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         {
             TLLM_LOG_WARNING(
                 "MLACacheFormatter::inquireSupport: both sides must own the same total number of indexer K cache "
-                "layers (self: %d, dest: %d)",
+                "layers (self: {}, dest: {})",
                 selfIndexerTotal, destIndexerTotal);
             return false;
         }

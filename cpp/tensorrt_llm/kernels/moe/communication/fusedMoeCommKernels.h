@@ -269,7 +269,7 @@ public:
         int smCount = tensorrt_llm::common::getMultiProcessorCount();
         if (maxUsableSmCount > smCount)
         {
-            TLLM_LOG_WARNING("setMaxUsableSmCount, maxUsableSmCount=%d, larger than smCount=%d, using smCount instead",
+            TLLM_LOG_WARNING("setMaxUsableSmCount, maxUsableSmCount={}, larger than smCount={}, using smCount instead",
                 maxUsableSmCount, smCount);
             maxUsableSmCount = smCount;
         }

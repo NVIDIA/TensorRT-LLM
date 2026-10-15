@@ -84,7 +84,7 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////
     /// GEMM kernel configurations
@@ -268,7 +268,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
     {
-        TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
+        TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, {} < {}.",
             gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
     }
 

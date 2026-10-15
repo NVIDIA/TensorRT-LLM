@@ -73,7 +73,7 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std:
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
     int splitKSlices, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     using ElementA = cutlassType;
     using ElementB = cutlassType;
     using ElementOutput = float;
@@ -197,7 +197,7 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std:
     sync_check_cuda_error(stream);
 
     std::free(host_workspace);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
@@ -231,7 +231,7 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
     bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
+    TLLM_LOG_TRACE("{} start, isLoraIn: {}, minKN = {}", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
 
 #ifdef ENABLE_FP8
     if (dataType == tensorrt_llm::DataType::kFP8)

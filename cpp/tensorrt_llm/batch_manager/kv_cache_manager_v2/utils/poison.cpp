@@ -68,7 +68,7 @@ void Poison::set(char const* context, char const* what) noexcept
             recorded = reasonStorage();
             sPoisoned.store(true, std::memory_order_release);
         }
-        TLLM_LOG_ERROR("KVCM2 poisoned, refusing further work: %s", recorded.c_str());
+        TLLM_LOG_ERROR("KVCM2 poisoned, refusing further work: {}", recorded.c_str());
     }
     catch (...)
     {

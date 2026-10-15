@@ -310,7 +310,7 @@ UcxConnectionManager::UcxConnectionManager()
             {
                 mRank = worldPg->getRank();
                 mWorldSize = worldPg->getSize();
-                TLLM_LOG_DEBUG(mRank, "UCX using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+                TLLM_LOG_DEBUG(mRank, "UCX using Torch process group - rank: {}, world size: {}", mRank, mWorldSize);
             }
             else
             {
@@ -348,14 +348,14 @@ UcxConnectionManager::UcxConnectionManager()
 
             localIp = "[" + localIp + "]";
         }
-        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager localIp: %s", localIp.c_str());
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager localIp: {}", localIp.c_str());
         mZmqRepSocket.bind("tcp://" + localIp + ":*");
         mZmqRepEndpoint = mZmqRepSocket.get(zmq::sockopt::last_endpoint);
-        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: %s", mZmqRepEndpoint.c_str());
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: {}", mZmqRepEndpoint.c_str());
         auto parse_result = parse_zmq_endpoint(mZmqRepEndpoint);
         TLLM_CHECK_WITH_INFO(parse_result.has_value(), "Failed to parse ZMQ endpoint");
         auto [ip, port] = parse_result.value();
-        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager ip: %s, port: %d", ip.c_str(), port);
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager ip: {}, port: {}", ip.c_str(), port);
 
         SocketState socketState{static_cast<uint16_t>(port), ip};
         std::vector<executor::kv_cache::SocketState> socketStates(mWorldSize);
@@ -397,7 +397,7 @@ UcxConnectionManager::UcxConnectionManager()
                     su::VectorWrapBuf<char> strbuf(serBuffer);
                     std::istream is(&strbuf);
                     socketStates[i] = su::deserialize<executor::kv_cache::SocketState>(is);
-                    TLLM_LOG_DEBUG(mRank, " recv  socketStates[%d]: %s", i, socketStates[i].toString().c_str());
+                    TLLM_LOG_DEBUG(mRank, " recv  socketStates[{}]: {}", i, socketStates[i].toString().c_str());
                 }
             }
             else
@@ -421,12 +421,12 @@ UcxConnectionManager::UcxConnectionManager()
                     su::VectorWrapBuf<char> strbuf(serBuffer);
                     std::istream is(&strbuf);
                     socketStates[r] = su::deserialize<executor::kv_cache::SocketState>(is);
-                    TLLM_LOG_DEBUG(mRank, " recv socketStates[%d]: %s", r, socketStates[r].toString().c_str());
+                    TLLM_LOG_DEBUG(mRank, " recv socketStates[{}]: {}", r, socketStates[r].toString().c_str());
                 }
             }
         }
         mCommState = CommState(socketStates, mRank);
-        TLLM_LOG_DEBUG(mRank, " ***** UCX    mCommState: %s", mCommState.toString().c_str());
+        TLLM_LOG_DEBUG(mRank, " ***** UCX    mCommState: {}", mCommState.toString().c_str());
 
         mZmqRepThread = std::thread(
             [this]()
@@ -659,7 +659,7 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
 
     TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
 
-    TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
+    TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: {} , sendIDData:{}", connectionId,
         *reinterpret_cast<uint64_t*>(state->mBuffer.data()));
 
     return mConnections[connectionId].get();

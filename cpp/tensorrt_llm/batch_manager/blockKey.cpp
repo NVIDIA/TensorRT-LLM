@@ -111,8 +111,8 @@ RunMetadataResolution resolveRunMetadata(OptionalSizeVectorPtr const& multimodal
     {
         TLLM_LOG_WARNING(
             "Incomplete multimodal run metadata; falling back to legacy multimodal cache hash extra keys: "
-            "hasItemRunCuOffsets=%d, hasRunPositions=%d, hasRunLengths=%d, "
-            "itemRunCuOffsets.size=%zu, runPositions.size=%zu, runLengths.size=%zu",
+            "hasItemRunCuOffsets={}, hasRunPositions={}, hasRunLengths={}, "
+            "itemRunCuOffsets.size={}, runPositions.size={}, runLengths.size={}",
             static_cast<int>(hasItemRunCuOffsets), static_cast<int>(hasRunPositions), static_cast<int>(hasRunLengths),
             getOptionalVectorSize(multimodalItemRunCuOffsets), getOptionalVectorSize(multimodalRunPositions),
             getOptionalVectorSize(multimodalRunLengths));
@@ -133,8 +133,8 @@ RunMetadataResolution resolveRunMetadata(OptionalSizeVectorPtr const& multimodal
     {
         TLLM_LOG_WARNING(
             "Invalid multimodal run metadata shape; falling back to legacy multimodal cache hash extra keys: "
-            "itemCount=%zu, itemRunCuOffsets.size=%zu, expectedItemRunCuOffsets.size=%zu, "
-            "itemRunCuOffsets.front=%d, itemRunCuOffsets.back=%d, runPositions.size=%zu, runLengths.size=%zu",
+            "itemCount={}, itemRunCuOffsets.size={}, expectedItemRunCuOffsets.size={}, "
+            "itemRunCuOffsets.front={}, itemRunCuOffsets.back={}, runPositions.size={}, runLengths.size={}",
             itemCount, itemRunCuOffsets.size(), itemCount + 1, itemRunCuOffsets.empty() ? 0 : itemRunCuOffsets.front(),
             itemRunCuOffsets.empty() ? 0 : itemRunCuOffsets.back(), runPositions.size(), runLengths.size());
         return {RunMetadataStatus::kInvalid, {}};
@@ -189,7 +189,7 @@ std::optional<std::vector<MmKey>> generateRunBasedExtraKeys(MultimodalHashes con
         {
             TLLM_LOG_WARNING(
                 "Invalid multimodal item run offsets; falling back to legacy multimodal cache hash extra keys: "
-                "itemIdx=%zu, runBegin=%d, runEnd=%d, runPositions.size=%zu",
+                "itemIdx={}, runBegin={}, runEnd={}, runPositions.size={}",
                 itemIdx, runBegin32, runEnd32, runPositions.size());
             return std::nullopt;
         }
@@ -207,7 +207,7 @@ std::optional<std::vector<MmKey>> generateRunBasedExtraKeys(MultimodalHashes con
                 auto const runEnd64 = static_cast<int64_t>(runStart) + static_cast<int64_t>(runLength);
                 TLLM_LOG_WARNING(
                     "Invalid multimodal run range; falling back to legacy multimodal cache hash extra keys: "
-                    "itemIdx=%zu, runIdx=%zu, runStart=%d, runLength=%d, runEnd=%lld, maxSizeType32=%d",
+                    "itemIdx={}, runIdx={}, runStart={}, runLength={}, runEnd={}, maxSizeType32={}",
                     itemIdx, runIdx, runStart, runLength, static_cast<long long>(runEnd64),
                     std::numeric_limits<SizeType32>::max());
                 return std::nullopt;
@@ -244,7 +244,7 @@ std::vector<MmKey> generateLegacyContiguousExtraKeys(MultimodalHashes const& mul
     {
         TLLM_LOG_WARNING(
             "Multimodal data arrays have mismatched sizes; disabling multimodal cache hash extra keys: "
-            "multimodalHashes.size=%zu, multimodalPositions.size=%zu, multimodalLengths.size=%zu",
+            "multimodalHashes.size={}, multimodalPositions.size={}, multimodalLengths.size={}",
             multimodalHashes.size(), positions.size(), lengths.size());
         return {};
     }
@@ -263,7 +263,7 @@ std::vector<MmKey> generateLegacyContiguousExtraKeys(MultimodalHashes const& mul
             auto const runEnd64 = static_cast<int64_t>(startPos) + static_cast<int64_t>(length);
             TLLM_LOG_WARNING(
                 "Invalid legacy multimodal range; disabling multimodal cache hash extra keys: "
-                "itemIdx=%zu, startPos=%d, length=%d, runEnd=%lld, maxSizeType32=%d",
+                "itemIdx={}, startPos={}, length={}, runEnd={}, maxSizeType32={}",
                 itemIdx, startPos, length, static_cast<long long>(runEnd64), std::numeric_limits<SizeType32>::max());
             return {};
         }

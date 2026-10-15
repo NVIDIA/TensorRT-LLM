@@ -716,7 +716,7 @@ struct DefaultRoutingLaunchConfig
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
+            TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);                      \
         }                                                                                                              \
     }(PolicyTraits<PreProc, PostProc>{})
 
@@ -747,7 +747,7 @@ struct DefaultRoutingLaunchConfig
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
+            TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);                      \
         }                                                                                                              \
     }(PolicyTraits<ExpertSelect, void>{})
 

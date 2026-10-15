@@ -94,7 +94,7 @@ inline std::string checkErrorStr(Args const&... args) {
 #define TLLM_CHECK_INFO(cond, ...)                                                                 \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
-      TLLM_LOG_INFO("[FMHA] %s", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());              \
+      TLLM_LOG_INFO("[FMHA] {}", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());              \
     }                                                                                              \
   } while (0)
 #endif
