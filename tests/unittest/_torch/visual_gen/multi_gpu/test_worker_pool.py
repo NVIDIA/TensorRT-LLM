@@ -110,7 +110,20 @@ def _read_pids(path, world_size):
     return [int(v) for v in _read_values(path, world_size)]
 
 
+def _proc_state(pid):
+    """Kernel process state letter, or None if the pid no longer exists."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
 def _pid_gone(pid):
+    """Dead, counting zombies: an orphan reparented to a PID 1 that never reaps
+    (as in some CI containers) stays a zombie forever but holds nothing."""
+    if sys.platform.startswith("linux"):
+        return _proc_state(pid) in (None, "Z", "X")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -327,7 +340,9 @@ signal.pause()
         owner.wait(timeout=10)
         deadline = time.monotonic() + 15
         while not all(_pid_gone(pid) for pid in ranks):
-            assert time.monotonic() < deadline, f"ranks {ranks} outlived their parent"
+            assert time.monotonic() < deadline, (
+                f"ranks {ranks} outlived their parent; states {[_proc_state(pid) for pid in ranks]}"
+            )
             time.sleep(0.2)
     finally:
         if owner.poll() is None:
