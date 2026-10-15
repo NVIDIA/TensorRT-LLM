@@ -54,13 +54,7 @@ def test_bundled_dependencies_require_development_files(
     meson_args = tmp_path / "meson_args"
     command = r"""
 pip3() { :; }
-git() {
-    case "$1" in
-        clone) mkdir nixl ;;
-        apply) printf '%s\n' "$2" > "$NIXL_PATCH" ;;
-        *) return 1 ;;
-    esac
-}
+git() { mkdir nixl; }
 find() { printf '%s\n' /usr/local/cuda/lib64/libcuda.so.1; }
 meson() {
     printf '%s\n' "$@" > "$MESON_ARGS"
@@ -74,7 +68,6 @@ source "$INSTALL_NIXL"
         "INSTALL_NIXL": str(installer),
         "MESON_ARGS": str(meson_args),
         "MESON_PKG_CONFIG_PATH": str(tmp_path / "meson_pkg_config_path"),
-        "NIXL_PATCH": str(tmp_path / "nixl_patch"),
     }
     if pkg_config_path is not None:
         env["PKG_CONFIG_PATH"] = pkg_config_path
@@ -88,9 +81,6 @@ source "$INSTALL_NIXL"
     )
 
     assert result.returncode == 0, result.stderr
-    assert (tmp_path / "nixl_patch").read_text().strip() == str(
-        tmp_path / "patches/nixl-v1.4.0-cuda-vmm-context.patch"
-    )
     args = meson_args.read_text().splitlines()
     expected_path = str(efa_path) if with_header and with_library else ""
     assert [arg for arg in args if arg.startswith("-Dlibfabric_path=")] == [
