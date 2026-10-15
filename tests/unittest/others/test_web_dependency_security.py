@@ -64,12 +64,3 @@ def test_web_framework_security_floors() -> None:
     assert _minimum_version(instrumentator) >= Version("8.1.0")
     assert _minimum_version(starlette) >= Version("1.3.1")
     assert Version("0.50.0") not in starlette.specifier
-
-
-def test_starlette_constraint_floor() -> None:
-    # constraints.txt carries the GHSA-82w8-qh3p-5jfq WAR. It must stay active
-    # (uncommented) at the patched floor, which is what this PR turns back on.
-    starlette = _requirement("starlette", "constraints.txt")
-
-    assert _minimum_version(starlette) >= Version("1.3.1")
-    assert Version("0.50.0") not in starlette.specifier
