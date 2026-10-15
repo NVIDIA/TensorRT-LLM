@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MNNVL Lamport workspaces of the target's hops.
+"""The MNNVL Lamport workspaces of the target's hops and exchanges.
 
 The hops (``mnnvl_hop``, ``mnnvl_moe_finalize_hop``) run on the MNNVL all-reduce workspace of the
 engine's ``AllReduce`` (``get_or_scale_allreduce_mnnvl_workspace``): three Lamport buffers whose
@@ -12,16 +12,25 @@ The workspace is replaced by a larger one when an all-reduce needs more than it 
 graph keeps the workspace it launches on alive only when it was fetched during that graph's
 capture. So the target fetches it for every hop it issues, eagerly and under capture, and never
 keeps it across forwards.
+
+The exchanges that are not all-reduces (``mnnvl_allgather``, the draft steps' argmax exchanges)
+each own a ``LamportExchangeWorkspace``, built once and kept.
 """
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+from tensorrt_llm._torch.distributed.ops import (
+    _get_mnnvl_workspace_comm,
+    _make_mnnvl_mcast_buffer,
+    _mnnvl_device_index,
+    _mnnvl_workspace_all_succeeded,
+    get_or_scale_allreduce_mnnvl_workspace,
+)
 from tensorrt_llm.mapping import Mapping
 
 # Lamport buffers of an MNNVL all-reduce workspace.
@@ -84,3 +93,71 @@ def publish_target(
     elements = NUM_LAMPORT_BUFFERS * workspace["buffer_size_bytes"] // torch.bfloat16.itemsize
     lamport = workspace["handle"].get_mc_buffer((elements,), torch.bfloat16, 0)
     return lamport, workspace["buffer_flags"].view(torch.int32)
+
+
+class LamportExchangeWorkspace:
+    """A private MNNVL Lamport workspace of the TP group, for an exchange that is not an all-reduce.
+
+    Three Lamport buffers whose unwritten 32-bit words hold 0xFFFFFFFF, so that every payload,
+    -0.0 included, travels unchanged, and their nine flags in the layout of the all-reduce
+    workspace's. Used by ``mnnvl_allgather`` (the verify logits) and by the draft-step kernels
+    that exchange each rank's argmax (index, value) packet, with the token-table row and the
+    hidden-half share where the next eh_proj comes from the token table (``draft_sample_glue``,
+    ``draft_ehproj_table``). Each of those kernels empties the buffer of its previous call with
+    its own threads, so every user owns its workspace, sized for its largest call.
+
+    Construction is collective over the TP group: every rank constructs the same workspaces in the
+    same order, outside CUDA graph capture (the target does it once, in ``post_load_weights``),
+    and a failure on any rank raises on every rank.
+
+    Args:
+        mapping: The tensor-parallel mapping of the group.
+        buffer_size_bytes: Bytes of one Lamport buffer, a positive multiple of 16.
+
+    Attributes:
+        comm_buffer: This rank's unicast view of the three buffers as 1-D int32, the kernels'
+            ``comm_buffer`` (``exchange_buffer``) operand.
+        buffer_flags: The nine uint32 Lamport flags, the kernels' ``buffer_flags``
+            (``exchange_flags``) operand.
+    """
+
+    def __init__(self, mapping: Mapping, buffer_size_bytes: int):
+        if buffer_size_bytes <= 0 or buffer_size_bytes % 16:
+            raise ValueError(
+                f"buffer_size_bytes must be a positive multiple of 16: {buffer_size_bytes}"
+            )
+        comm = _get_mnnvl_workspace_comm(mapping)
+        workspace_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+        state = None
+        error: Optional[Exception] = None
+        try:
+            handle = _make_mnnvl_mcast_buffer(
+                comm, workspace_bytes, mapping, mapping.is_multi_node()
+            )
+            comm_buffer = handle.get_uc_buffer(
+                mapping.tp_rank, (workspace_bytes // 4,), torch.int32, 0
+            )
+            # Filled under inference mode, like the all-reduce workspace: the engine may build
+            # it while CUDA graph warm-up runs in inference mode.
+            with torch.inference_mode():
+                comm_buffer.fill_(-1)
+                buffer_flags = torch.tensor(
+                    [0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
+                    dtype=torch.uint32,
+                    device=torch.device("cuda", _mnnvl_device_index(mapping)),
+                )
+            torch.cuda.synchronize()
+            state = (handle, comm_buffer, buffer_flags)
+        except Exception as e:
+            error = e
+        # Also fences the fill: no rank stores into a peer's buffer before the peer filled it.
+        if not _mnnvl_workspace_all_succeeded(comm, error is None):
+            raise RuntimeError(
+                "MNNVL Lamport exchange workspace construction failed on at least one rank"
+            ) from error
+        assert state is not None
+        # The handle keeps the multicast allocation mapped; the communicator stays with it.
+        self._handle, self.comm_buffer, self.buffer_flags = state
+        self._comm = comm
+        self.mapping = mapping
+        self.buffer_size_bytes = buffer_size_bytes
