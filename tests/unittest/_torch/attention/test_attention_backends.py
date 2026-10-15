@@ -83,16 +83,25 @@ def _phases_from_window(window: int) -> dict:
 _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
-# Model-agnostic sparse sweep dimensions, shared by every sparse config.
+# Model-agnostic sparse sweep dimensions. Each algorithm's cache manager fixes
+# its layout and manager version: DSA runs on the V1 head-major cache, and the
+# MiniMax-M3 manager is V2-only with NHD views for its Triton runtime.
 _SPARSE_COMPUTE_DTYPE = "bfloat16"
-_SPARSE_KV_LAYOUT = "HND"
 _SPARSE_PAGE_SIZE = 64
-_SPARSE_USE_KVM_V2 = False
+_SPARSE_CACHE = {
+    "dsa": dict(kv_layout="HND", use_kv_cache_manager_v2=False),
+    "minimax_m3": dict(kv_layout="NHD", use_kv_cache_manager_v2=True),
+}
+# Minimum SM per sparse algorithm. The DSA sweep includes TRTLLM's
+# Blackwell-only trtllm-gen sparse FMHA; MiniMax-M3's Triton runtime also runs
+# on Hopper.
+_SPARSE_MIN_SM_VERSION = {"dsa": 100}
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
     if cfg.sparse_attention_config is not None:
-        return _phases(cfg.sparse_topk + 32, gen_len=1)
+        # A long row past every selectable token keeps the selection sparse.
+        return _phases(cfg.sparse_selected_tokens + 32, gen_len=1)
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -158,14 +167,16 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     common = _common(cfg)
     phases = _phases_for(cfg)
 
-    # Sparse cases use one model-agnostic sweep (bf16 latent cache, fixed layout/
-    # page/manager). Every backend runs its own indexer over shared weights, so
-    # a case covers selection and execution together; the phase lengths
-    # (top-k + 32) keep every long row genuinely sparse.
+    # Sparse cases use one model-agnostic sweep per algorithm (bf16 cache, the
+    # algorithm's layout and manager, fixed page). Every backend runs its own
+    # selection over shared inputs, so a case covers selection and execution
+    # together; the phase lengths (selection budget + 32) keep every long row
+    # genuinely sparse.
     if cfg.sparse_attention_config is not None:
-        manager = "v2" if _SPARSE_USE_KVM_V2 else "v1"
+        cache = _SPARSE_CACHE[cfg.sparse_attention_config.algorithm]
+        manager = "v2" if cache["use_kv_cache_manager_v2"] else "v1"
         tag = (
-            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
+            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{cache['kv_layout']}"
             f"-p{_SPARSE_PAGE_SIZE}-{manager}"
         )
         for phase_name in ("ctx", "gen", "mix"):
@@ -173,9 +184,8 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
                 f"{cfg.id}-{phase_name}-{tag}",
                 BackendCase(
                     page_size=_SPARSE_PAGE_SIZE,
-                    kv_layout=_SPARSE_KV_LAYOUT,
                     dtype=_SPARSE_COMPUTE_DTYPE,
-                    use_kv_cache_manager_v2=_SPARSE_USE_KVM_V2,
+                    **cache,
                     **phases[phase_name],
                     **common,
                 ),
@@ -271,11 +281,12 @@ MODEL_CASES = _model_cases()
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
     case = MODEL_CASES[name]
-    if case.is_sparse and getSMVersion() < 100:
-        # The backend matrix includes the TRTLLM trtllm-gen sparse FMHA, which
-        # is Blackwell-only. The Vanilla reference itself remains usable below
-        # SM100 through the module's FlashMLA dispatch.
-        pytest.skip(f"DSA requires sm>=100/Blackwell (have sm{getSMVersion()})")
+    min_sm = _SPARSE_MIN_SM_VERSION.get(case.sparse_algorithm)
+    if min_sm is not None and getSMVersion() < min_sm:
+        pytest.skip(
+            f"{case.sparse_algorithm} sparse attention requires sm>={min_sm} "
+            f"(have sm{getSMVersion()})"
+        )
     run_case(case)
 
 

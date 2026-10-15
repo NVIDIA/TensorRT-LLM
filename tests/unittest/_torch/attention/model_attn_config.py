@@ -47,8 +47,8 @@ elsewhere):
   does not pass it to the dense attention backend.
 - Vision/text encoders (SigLip/Radio/CLIP/Parakeet, MiniMax-VL tower) collapse
   onto the bidirectional MHA tuples already listed (e.g. 16x64 / 12x64 full).
-- Sparse indexer kernels are covered in depth under ``sparse/``. This model
-  sweep runs the production indexer on every backend over shared weights, so it
+- Sparse indexer kernels are covered in depth under ``sparse/``. In this model
+  sweep every backend runs its own selection over shared inputs, so it
   validates selection and the selected-attention path against the Vanilla
   golden together.
 - Multimodal cross variants (Llama4-vision, Gemma4-MM) reuse the cross tuples.
@@ -57,7 +57,11 @@ elsewhere):
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    MiniMaxM3SparseAttentionConfig,
+    SparseAttentionConfig,
+)
 
 AttentionPhase = Literal["ctx", "gen"]
 
@@ -87,16 +91,30 @@ class ModelAttnConfig:
     v_head_dim: Optional[int] = None
     hidden_size: Optional[int] = None
     # User-facing sparse config, lowered by production `to_sparse_params()`. The
-    # sparse sweep derives its other parameters from this and `is_mla`.
+    # sparse sweep derives its other parameters from this config's algorithm.
     sparse_attention_config: Optional[SparseAttentionConfig] = None
 
     @property
-    def sparse_topk(self) -> Optional[int]:
-        """Per-token selection budget (``index_topk``) from the sparse config."""
+    def sparse_selected_tokens(self) -> Optional[int]:
+        """Upper bound on the KV tokens one query row may select.
+
+        DSA selects ``index_topk`` tokens. A MiniMax-M3 KV head attends to the
+        union of its index heads' top-k blocks; the bound counts the forced
+        init and local blocks once more on top of that.
+        """
         cfg = self.sparse_attention_config
         if cfg is None:
             return None
-        return cfg.index_topk
+        if cfg.algorithm == "dsa":
+            return cfg.index_topk
+        if cfg.algorithm == "minimax_m3":
+            index_heads_per_kv = cfg.sparse_num_index_heads // cfg.num_key_value_heads
+            return cfg.sparse_block_size * (
+                cfg.sparse_topk_blocks * index_heads_per_kv
+                + cfg.sparse_init_blocks
+                + cfg.sparse_local_blocks
+            )
+        raise ValueError(f"No selection budget for sparse algorithm {cfg.algorithm!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +531,36 @@ _STANDARD = [
 ]
 
 # ---------------------------------------------------------------------------
+# Block-sparse GQA. The model applies QK-norm and RoPE before the backend, so
+# the backends receive post-RoPE inputs (rope=None).
+# ---------------------------------------------------------------------------
+_SPARSE_GQA = [
+    # MiniMax-M3 sparse layers keep the checkpoint's head and index widths (128)
+    # but use fewer heads and smaller blocks. Two index heads per KV head
+    # exercise the union of a KV group's selections (every checkpoint rank has
+    # one index head per KV head), and both forced block kinds are enabled.
+    ModelAttnConfig(
+        "minimax_m3_sparse_gqa_nope",
+        "MiniMax-M3 sparse layers (reduced: 16 Q / 2 KV heads, 2 index heads per KV head)",
+        num_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+        rope=None,
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+            sparse_num_index_heads=4,
+            sparse_index_dim=128,
+            sparse_block_size=16,
+            sparse_topk_blocks=4,
+            sparse_init_blocks=1,
+            sparse_local_blocks=1,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            implementation="triton",
+        ),
+    ),
+]
+
+# ---------------------------------------------------------------------------
 # MLA (DeepSeek-style absorbed latent attention). num_kv_heads == 1 latent head.
 # ---------------------------------------------------------------------------
 _MLA = [
@@ -787,4 +835,4 @@ _NO_CACHE = [
     ),
 ]
 
-MODEL_CONFIGS: list[ModelAttnConfig] = _STANDARD + _MLA + _CROSS + _NO_CACHE
+MODEL_CONFIGS: list[ModelAttnConfig] = _STANDARD + _SPARSE_GQA + _MLA + _CROSS + _NO_CACHE

@@ -67,6 +67,11 @@ BACKEND_CAPS = {
     ),
 }
 
+# Sparse algorithms whose backends store the paged cache in a fixed layout of
+# their own. MiniMax-M3 resolves TRTLLM to its Triton runtime, which reads the
+# NHD views of the MiniMax-M3 V2 cache manager.
+_SPARSE_KV_LAYOUTS = {"minimax_m3": ("NHD",)}
+
 _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96, 512)
 
 _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
@@ -119,7 +124,11 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     # head-major HND only). The Vanilla golden always runs in its native NHD and
     # is not gated here (run_case drives it directly, not via this check).
     kv_layout = getattr(case, "kv_layout", None)
-    if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
+    kv_layouts = caps.get("kv_layouts", ())
+    sparse_config = getattr(case, "sparse_attention_config", None)
+    if sparse_config is not None:
+        kv_layouts = _SPARSE_KV_LAYOUTS.get(sparse_config.algorithm, kv_layouts)
+    if kv_layout is not None and kv_layout not in kv_layouts:
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
     # FlashInfer's standard paged kernels reject these head dimensions. Keep

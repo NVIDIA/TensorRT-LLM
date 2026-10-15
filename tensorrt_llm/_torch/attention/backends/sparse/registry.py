@@ -87,7 +87,12 @@ def get_vanilla_sparse_attn_attention_backend(
 
         return DSAVanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
-        return _resolve_minimax_m3_backend_cls(sparse_params)
+        from .minimax_m3 import MiniMaxM3VanillaAttention
+
+        # VANILLA selects the golden of the Triton implementation; the MSA
+        # implementation has no Vanilla reference and is rejected here.
+        MiniMaxM3VanillaAttention.validate_sparse_params(sparse_params)
+        return MiniMaxM3VanillaAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in vanilla attention backend: {sparse_params.algorithm}"

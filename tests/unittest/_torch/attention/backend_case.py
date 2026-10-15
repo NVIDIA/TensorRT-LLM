@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSABackendForwardArgs
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -100,9 +101,8 @@ class BackendCase:
     page_size: int = 64
     cache: str = "paged"  # "paged" | "none"
     # User-facing sparse config, lowered into backend params, metadata params, and
-    # the sparse KV-cache manager exactly as in production. The selection unit and
-    # top-k are derived from it (properties below); the attention family is
-    # ``is_mla``.
+    # the sparse KV-cache manager exactly as in production. Its algorithm
+    # (``sparse_algorithm``) selects the harness contract.
     sparse_attention_config: Optional[SparseAttentionConfig] = None
     # RoPE config: RopeParams kwargs (+ optional "is_neox"), or None to disable.
     rope: Optional[dict] = None
@@ -149,6 +149,12 @@ class BackendCase:
     @property
     def is_sparse(self) -> bool:
         return self.sparse_attention_config is not None
+
+    @property
+    def sparse_algorithm(self) -> Optional[str]:
+        """The sparse config's ``algorithm``, or None for a dense case."""
+        config = self.sparse_attention_config
+        return None if config is None else config.algorithm
 
     @property
     def prompt_lens(self) -> List[int]:
@@ -924,6 +930,202 @@ def _run_sparse_mla_backend(
         mgr.shutdown()
 
 
+# ---------------------------------------------------------------------------
+# MiniMax-M3 block-sparse GQA. The model normalizes and rotates the main and
+# index branches before the backend, so every backend receives the same
+# post-RoPE inputs. TRTLLM resolves to the Triton runtime and VANILLA to its
+# golden; both append the new tokens themselves and read the V2 manager's NHD
+# views. The Triton path exposes no selection, so cases compare outputs and
+# cache contents only.
+# ---------------------------------------------------------------------------
+def _minimax_m3_config(case: BackendCase) -> MiniMaxM3SparseConfig:
+    """Per-rank MiniMax-M3 geometry of ``case``, derived as the backends do."""
+    sparse_params = case.sparse_attention_config.to_sparse_params(
+        layer_idx=None, pretrained_config=None
+    )
+    return MiniMaxM3SparseConfig.from_sparse_params(
+        sparse_params,
+        num_q_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=case.head_dim,
+    )
+
+
+def generate_minimax_m3_inputs(case: BackendCase, seed: int = 0) -> Dict:
+    """Standard q/k/v inputs plus the index branch, shared by every backend.
+
+    ``idx_q`` carries this rank's index heads, ``idx_k`` the single index key
+    of each new token and ``cached_idx_k`` each request's cached index keys.
+    """
+    inputs = generate_inputs(case, seed)
+    config = _minimax_m3_config(case)
+    index_dim = config.sparse_index_dim
+    gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    cdt = case.compute_dtype
+    inputs.update(
+        idx_q=_randn(gen, cdt, case.nnz_q, config.num_index_heads * index_dim),
+        idx_k=_randn(gen, cdt, case.nnz_q, index_dim),
+        cached_idx_k=[_randn(gen, cdt, c, 1, index_dim) for c in case.num_cached_tokens],
+    )
+    return inputs
+
+
+def _build_minimax_m3_kv_cache_manager(case: BackendCase):
+    """A one-layer MiniMax-M3 V2 cache: NHD main K/V plus a paged index-K pool."""
+    sparse_config = case.sparse_attention_config
+    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
+    tokens_per_block = case.page_size
+    pages_per_seq = math.ceil(max(case.token_nums) / tokens_per_block)
+    num_blocks = case.num_seqs * pages_per_seq
+    cache_types = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    cls = get_sparse_attn_kv_cache_manager(sparse_config, use_kv_cache_manager_v2=True)
+    return cls(
+        KvCacheConfig(max_tokens=num_blocks * tokens_per_block, enable_block_reuse=False),
+        cache_types.SELF,
+        num_layers=1,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=case.head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=pages_per_seq * tokens_per_block,
+        max_batch_size=case.num_seqs,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=torch_dtype_to_binding(case.compute_dtype),
+        # Like the pool, the manager's token budget is sized to the case.
+        max_num_tokens=max(case.nnz_q, case.nnz_kv, *case.token_nums),
+        sparse_layer_ids=[0],
+        disable_index_value_layer_ids=[0] if sparse_params.disable_index_value else [],
+        sparse_index_dim=sparse_params.sparse_index_dim,
+        sparse_attention_config=sparse_config,
+    )
+
+
+def _minimax_m3_index_k_view(mgr) -> torch.Tensor:
+    """The layer's index-K pool as ``[num_pages, tokens_per_block, 1, D_idx]``."""
+    buf = mgr.get_index_k_buffer(0)
+    # The Triton implementation selects the NHD view; HND would put the head
+    # axis second.
+    assert buf.ndim == 4 and buf.shape[2] == 1, f"expected an NHD index-K view, got {buf.shape}"
+    return buf
+
+
+def _paged_rows(blocks: List[int], start: int, count: int, tokens_per_block: int, device):
+    """(page, row) indices of a request's positions ``start .. start + count - 1``."""
+    positions = torch.arange(start, start + count, device=device)
+    live_blocks = torch.tensor([b for b in blocks if b != -1], dtype=torch.long, device=device)
+    return live_blocks[positions // tokens_per_block], positions % tokens_per_block
+
+
+def _fill_minimax_m3_index_cache(mgr, request_ids, cached_idx_k) -> None:
+    """Write each request's cached index keys ``[cached_len, 1, D_idx]`` into its pages."""
+    buf = _minimax_m3_index_k_view(mgr)
+    buf.zero_()
+    blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), 0)
+    for rows, blocks in zip(cached_idx_k, blocks_per_req, strict=True):
+        pages, offsets = _paged_rows(blocks, 0, rows.shape[0], buf.shape[1], buf.device)
+        buf[pages, offsets] = rows.to(buf.dtype)
+
+
+def _assert_minimax_m3_index_cache(mgr, request_ids, case: BackendCase, new_idx_k) -> None:
+    """Assert the backend appended each request's new index keys after its prefix."""
+    buf = _minimax_m3_index_k_view(mgr)
+    blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), 0)
+    expected_per_seq = _split_packed_tokens(new_idx_k, case.seq_lens)
+    for blocks, start, expected in zip(
+        blocks_per_req, case.num_cached_tokens, expected_per_seq, strict=True
+    ):
+        pages, offsets = _paged_rows(blocks, start, expected.shape[0], buf.shape[1], buf.device)
+        torch.testing.assert_close(buf[pages, offsets, 0], expected.to(buf.dtype), atol=0, rtol=0)
+
+
+def _run_minimax_m3_backend(case: BackendCase, backend: str, inputs: Dict) -> torch.Tensor:
+    """Run one MiniMax-M3 sparse layer the way the model's Triton path does.
+
+    The backend and its V2 cache manager come from production lowering. After
+    the cached K/V and index-K prefixes are seeded, ``MiniMaxM3AttentionMetadata``
+    is prepared and ``forward`` is called with ``metadata=None`` and the
+    ``minimax_m3`` attachment, as ``MiniMaxM3Attention`` does. Each backend
+    gets its own manager and copies of the inputs, and must append the new
+    K/V and index keys to each request's own pages.
+    """
+    sparse_config = case.sparse_attention_config
+    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(pretrained_config=None)
+    AttentionCls = get_attention_backend(backend, sparse_params=sparse_params)
+    request_ids = list(range(case.num_seqs))
+    attn = create_attention(
+        backend,
+        layer_idx=0,
+        num_heads=case.num_heads,
+        head_dim=case.head_dim,
+        num_kv_heads=case.num_kv_heads,
+        q_scaling=case.q_scaling,
+        sparse_params=sparse_params,
+        dtype=case.compute_dtype,
+    )
+    mgr = _build_minimax_m3_kv_cache_manager(case)
+    try:
+        mgr.add_dummy_requests(request_ids, case.token_nums)
+        # The Triton runtime reads every request up to the batch's longest KV
+        # length with zero weight past its own; zeroed slots keep stale NaN
+        # bytes from turning that zero weight into a NaN output.
+        mgr.get_buffers(0, kv_layout="NHD").zero_()
+        fill_kv_cache_logical(
+            mgr, 0, request_ids, inputs["cached_k"], inputs["cached_v"], kv_layout="NHD"
+        )
+        _fill_minimax_m3_index_cache(mgr, request_ids, inputs["cached_idx_k"])
+        metadata = _make_sparse_metadata(
+            AttentionCls,
+            case,
+            mgr,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            case.num_contexts,
+            case.prompt_lens,
+            kv_layout="NHD",
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            sparse_metadata_params=sparse_metadata_params,
+        )
+        attachment = metadata.minimax_m3
+        if attachment is None:
+            raise RuntimeError("MiniMaxM3AttentionMetadata.prepare built no minimax_m3 attachment")
+        kv_pool = mgr.get_buffers(0, kv_layout="NHD")
+        output = torch.empty(
+            case.nnz_q, case.num_heads * case.head_dim, dtype=case.compute_dtype, device="cuda"
+        )
+        result = attn.forward(
+            inputs["q"].clone(),
+            inputs["new_k"].clone(),
+            inputs["new_v"].clone(),
+            None,
+            output=output,
+            idx_q=inputs["idx_q"].clone(),
+            idx_k=inputs["idx_k"].clone(),
+            idx_v=None,
+            k_cache=kv_pool[:, 0],
+            v_cache=kv_pool[:, 1],
+            idx_k_cache=_minimax_m3_index_k_view(mgr),
+            idx_v_cache=mgr.get_index_v_buffer(0),
+            out_cache_loc=attachment["out_cache_loc"],
+            m3_metadata=attachment["metadata"],
+        )
+        assert result.data_ptr() == output.data_ptr()
+        _assert_cache_contains_new_tokens(
+            mgr,
+            0,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            _expected_standard_cache_tokens(case, inputs["new_k"], inputs["new_v"]),
+            kv_layout="NHD",
+            cache_kind="kv",
+        )
+        _assert_minimax_m3_index_cache(mgr, request_ids, case, inputs["idx_k"])
+        return result
+    finally:
+        mgr.shutdown()
+
+
 def _run_mla_gen_backend(
     case, backend, inputs, *, kv_layout: str, cuda_graph=False
 ) -> torch.Tensor:
@@ -1223,8 +1425,10 @@ def _tolerances(case: "BackendCase", kv_dtype) -> tuple:
     fp8/fp4 quantization error dominates, so it sets the atol. When the compute
     dtype is bf16 its coarser mantissa compounds with the quant error, so the
     quantized atol gets extra headroom and the rtol relaxes to the bf16 rtol.
+    MiniMax-M3 keeps the dense tolerances: its golden and the Triton path select
+    identically and both accumulate in FP32.
     """
-    if case.is_sparse:
+    if case.sparse_algorithm == "dsa":
         return SPARSE_ATOL, SPARSE_RTOL
 
     bf16 = case.compute_dtype == torch.bfloat16
@@ -1550,20 +1754,23 @@ def run_backend(
     captured into a CUDA graph and replayed, exercising the graph-reuse path.
     ``kv_layout`` is the paged-cache block layout to fill + read ("NHD"/"HND");
     the caller passes a layout the backend supports (gated by the capability
-    matrix). MLA cases are dispatched to the absorbed-generation path.
+    matrix). MLA cases are dispatched to the absorbed-generation path; sparse
+    cases go to their algorithm's runner.
     """
+    if case.sparse_algorithm == "dsa":
+        return _run_sparse_mla_backend(
+            case,
+            backend,
+            inputs,
+            kv_layout=kv_layout,
+            indexer_outputs=sparse_indexer_outputs,
+            indexer_topk_override=sparse_topk_override,
+            native_outputs=sparse_native_outputs,
+        )
+    if case.sparse_algorithm == "minimax_m3":
+        return _run_minimax_m3_backend(case, backend, inputs)
     if case.is_sparse:
-        if case.is_mla:
-            return _run_sparse_mla_backend(
-                case,
-                backend,
-                inputs,
-                kv_layout=kv_layout,
-                indexer_outputs=sparse_indexer_outputs,
-                indexer_topk_override=sparse_topk_override,
-                native_outputs=sparse_native_outputs,
-            )
-        raise ValueError(f"Unsupported sparse contract: is_mla={case.is_mla}")
+        raise ValueError(f"Unsupported sparse algorithm: {case.sparse_algorithm}")
 
     if case.is_mla:
         if case.is_context_only:
@@ -1748,21 +1955,25 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     Handles both standard attention and absorbed-MLA generation (dispatched
     inside ``run_backend``). The Vanilla golden always runs in its native NHD
     layout; each backend under test runs in the case's requested layout (or HND).
-    Sparse cases compare each backend's Indexer selection against Vanilla by
-    set overlap, run attention with Vanilla's exact selection to isolate the
+    DSA cases compare each backend's Indexer selection against Vanilla by set
+    overlap, run attention with Vanilla's exact selection to isolate the
     attention implementation, and retain a bounded end-to-end check with the
-    backend's own selection.
+    backend's own selection. MiniMax-M3 cases compare outputs directly: the
+    Triton path exposes no selection and selects exactly as the golden does.
     A gen-only batch is additionally replayed through a captured CUDA graph.
 
     Returns the per-backend outputs (including ``"VANILLA"`` golden) for callers
     that want the raw tensors (e.g. the minimizer).
     """
     is_mla = case.is_mla
-    if case.is_sparse:
-        if case.is_mla:
-            inputs = generate_sparse_mla_inputs(case, seed)
-        else:
-            raise ValueError(f"Unsupported sparse contract: is_mla={case.is_mla}")
+    # Only DSA exposes its selection for a separate comparison.
+    is_dsa = case.sparse_algorithm == "dsa"
+    if is_dsa:
+        inputs = generate_sparse_mla_inputs(case, seed)
+    elif case.sparse_algorithm == "minimax_m3":
+        inputs = generate_minimax_m3_inputs(case, seed)
+    elif case.is_sparse:
+        raise ValueError(f"Unsupported sparse algorithm: {case.sparse_algorithm}")
     elif is_mla:
         if case.is_context_only:
             inputs = generate_mla_context_inputs(case, seed)
@@ -1770,7 +1981,7 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
             inputs = generate_mla_gen_inputs(case, seed)
     else:
         inputs = generate_inputs(case, seed)
-    golden_indexer_outputs = {} if case.is_sparse else None
+    golden_indexer_outputs = {} if is_dsa else None
     golden = run_backend(
         case,
         "VANILLA",
@@ -1791,8 +2002,8 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         # Fused RoPE only applies to TRTLLM (the sole support_fused_rope backend).
         fuse_rope = case.fused_rope and backend == "TRTLLM"
         layout = case.kv_layout or "HND"  # native for TRTLLM/FlashInfer
-        backend_indexer_outputs = {} if case.is_sparse else None
-        backend_native_outputs = {} if case.is_sparse else None
+        backend_indexer_outputs = {} if is_dsa else None
+        backend_native_outputs = {} if is_dsa else None
         out = run_backend(
             case,
             backend,
@@ -1807,7 +2018,7 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         results[backend] = out
 
         atol, rtol = _tolerances(case, kv_dtype)
-        if case.is_sparse:
+        if is_dsa:
             try:
                 _assert_sparse_indexer_matches_golden(
                     backend_indexer_outputs,
