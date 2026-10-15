@@ -2741,6 +2741,10 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         lora=object(),
     )
     attention.register_to_config = False
+    attention.layer_idx = 3
+    aligned_layers = {3}
+    manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
+    manager.nvfp4_scale_pool_aligned.side_effect = lambda layer: layer in aligned_layers
     attention.num_heads = 2
     attention.head_dim = 32
     attention.attn_activation_dtype = torch.bfloat16
@@ -2752,7 +2756,7 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         None,
         None,
         None,
-        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2, kv_cache_manager=manager),
     )
     default_context_output = attention._forward_attention_core(
         q,
@@ -2760,7 +2764,7 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         None,
         None,
         None,
-        SimpleNamespace(num_contexts=1, num_generations=0, num_tokens=2),
+        SimpleNamespace(num_contexts=1, num_generations=0, num_tokens=2, kv_cache_manager=manager),
     )
 
     assert decode_output.dtype == torch.float8_e4m3fn
@@ -2772,7 +2776,7 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         None,
         None,
         None,
-        SimpleNamespace(num_contexts=1, num_generations=1, num_tokens=2),
+        SimpleNamespace(num_contexts=1, num_generations=1, num_tokens=2, kv_cache_manager=manager),
     )
     assert mixed_output.dtype == torch.bfloat16
     attention.o_proj.quant_method.supports_e4m3_input = False
@@ -2782,10 +2786,22 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         None,
         None,
         None,
-        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2, kv_cache_manager=manager),
     )
     assert incompatible_output.dtype == torch.bfloat16
     attention.o_proj.quant_method.supports_e4m3_input = True
+    # Data/scale pools that one block table cannot address keep BF16 output.
+    aligned_layers.clear()
+    misaligned_output = attention._forward_attention_core(
+        q,
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2, kv_cache_manager=manager),
+    )
+    assert misaligned_output.dtype == torch.bfloat16
+    aligned_layers.add(3)
     monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "triton")
     opt_out_output = attention._forward_attention_core(
         q,
@@ -2793,7 +2809,7 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         None,
         None,
         None,
-        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2, kv_cache_manager=manager),
     )
     assert opt_out_output.dtype == torch.bfloat16
 

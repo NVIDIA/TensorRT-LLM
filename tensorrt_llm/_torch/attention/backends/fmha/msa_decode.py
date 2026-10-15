@@ -203,7 +203,11 @@ class MsaDecodeFmha(PhasedFmha):
             if params.fwd.kv_scale_quant_orig is None:
                 raise RuntimeError("NVFP4 sparse decode requires dequantization scales")
             k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, params.fwd.kv_scale_quant_orig)
-            if use_trtllm_gen_sparse_decode() and params.output.dtype == torch.float8_e4m3fn:
+            if (
+                use_trtllm_gen_sparse_decode()
+                and params.output.dtype == torch.float8_e4m3fn
+                and manager.nvfp4_scale_pool_aligned(attn.layer_idx)
+            ):
                 from ..sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
                     minimax_m3_trtllm_gen_sparse_decode,
                 )

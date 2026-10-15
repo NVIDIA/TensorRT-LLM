@@ -1978,6 +1978,7 @@ class MiniMaxM3Attention(Attention):
             and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
             and use_trtllm_gen_sparse_decode()
             and attn_metadata.num_contexts == 0
+            and attn_metadata.kv_cache_manager.nvfp4_scale_pool_aligned(self.layer_idx)
             and self.o_proj.has_mxfp8
             and getattr(self.o_proj.quant_method, "supports_e4m3_input", False)
         )

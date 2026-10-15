@@ -56,6 +56,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+# Storage-only NVFP4 scale-pool padding. When INDEX_KEY coalesces into the
+# packed K/V data pool, one of these per sparse layer makes the scale pool
+# mirror the data pool's sub-pages per slot, so one block table addresses both.
+NVFP4_SCALE_PAD_ROLE = DataRole("minimax_m3_nvfp4_scale_pad")
+
 
 class MiniMaxM3SparseIndexCache:
     """Plain-tensor side cache for the M3 sparse index branch.
@@ -341,6 +346,31 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 f"{len(self._shared_draft_layer_ids)} shared Eagle layer(s)=FP8/P128"
             )
 
+        # Resolve NVFP4 data/scale geometry eagerly: the nanobind queries are
+        # not Dynamo-traceable, and the pool layout is fixed for the manager's
+        # lifetime. NVFP4_SCALE_PAD_ROLE normally keeps the pools aligned.
+        self._nvfp4_shared_geometry_layers: frozenset[int] = frozenset()
+        if self.dtype == DataType.NVFP4:
+            kv_layout = self._main_kv_layout_name()
+            aligned, misaligned = set(), []
+            for layer_idx in self.sparse_layer_ids:
+                if layer_idx not in self.layer_offsets or not self.is_nvfp4_layer(layer_idx):
+                    continue
+                data = self._kv_slot_geometry(layer_idx, kv_layout)[2:4]
+                scale = self._kv_scale_slot_geometry(layer_idx, kv_layout)[2:4]
+                if data == scale:
+                    aligned.add(layer_idx)
+                else:
+                    misaligned.append((layer_idx, data, scale))
+            if misaligned:
+                layer_idx, data, scale = misaligned[0]
+                logger.warning(
+                    f"[m3-kv] {len(misaligned)} NVFP4 sparse layer(s) have mismatched "
+                    f"data/scale pool geometry (e.g. layer {layer_idx}: (slots, sub-pages) "
+                    f"data={data} scale={scale}); their decode uses Triton instead of TRTLLM-Gen."
+                )
+            self._nvfp4_shared_geometry_layers = frozenset(aligned)
+
         self._draft_kv_cache_view: Optional["MiniMaxM3DraftKVCacheView"] = None
         index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
         if self.is_disagg and index_v_layer_ids:
@@ -601,11 +631,30 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
         bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
         size_per_block = bytes_per_token * tokens_per_block
-        return {
-            self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
-            for layer_id in self.sparse_layer_ids
-            if layer_id in self.layer_offsets
-        }
+        extra = {}
+        for layer_id in self.sparse_layer_ids:
+            if layer_id not in self.layer_offsets:
+                continue
+            local_layer = self.layer_offsets[layer_id]
+            buffers = [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
+            # V2 coalesces by (life_cycle, size): an INDEX_KEY page the size of
+            # a packed K page joins the data pool, giving it 3 sub-pages per
+            # layer while the scale pool keeps 2. A scale-sized pad restores
+            # the shared page-index geometry trtllm-gen relies on.
+            if self.dtype == DataType.NVFP4:
+                k_page = self.get_layer_bytes_per_token(local_layer, Role.KEY) * tokens_per_block
+                if k_page == size_per_block:
+                    scale_page = (
+                        self.get_layer_bytes_per_token(local_layer, Role.KEY_BLOCK_SCALE)
+                        * tokens_per_block
+                    )
+                    buffers.append(BufferConfig(role=NVFP4_SCALE_PAD_ROLE, size=scale_page))
+            extra[local_layer] = buffers
+        return extra
+
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """Exclude the storage-only NVFP4 scale-pool pad from transfers."""
+        return super().get_disagg_ignored_roles() | {NVFP4_SCALE_PAD_ROLE}
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Declare the backend's main K/V layout and replicated index-K."""
@@ -844,14 +893,24 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return flat, scale
 
+    def nvfp4_scale_pool_aligned(self, layer_idx: int) -> bool:
+        """Whether one block table addresses this layer's NVFP4 data and scales.
+
+        trtllm-gen sparse decode reads packed data and E4M3 block scales through
+        a single block table, so both pools must share (slots, sub-pages per
+        slot). Callers fall back to Triton when this is False.
+        """
+        return layer_idx in self._nvfp4_shared_geometry_layers
+
     def get_kv_scale_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
     ) -> Tuple[torch.Tensor, int]:
         """Return the flat NVFP4 scale pool paired with ``get_kv_subpage_pool``.
 
-        Packed data and E4M3 block scales use separate allocations but the
-        same page-index geometry.  Keeping that equality explicit lets a
-        direct block-table consumer address both pools with one table.
+        Packed data and E4M3 block scales use separate allocations; the
+        scale pool is padded to the data pool's page-index geometry so one
+        block table addresses both. Check :meth:`nvfp4_scale_pool_aligned`
+        before calling.
         """
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
             layer_idx, kv_layout
