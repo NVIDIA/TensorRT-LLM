@@ -49,9 +49,15 @@ class CuteDslMlaFmha(PhasedFmha):
             logger.debug("CuTe DSL MLA FMHA is unavailable: nvidia-cutlass-dsl is not installed.")
             return False
 
+        # SM107 (Rubin) also relies on the tcgen05 arch branches inside
+        # mla_decode_fp{16,8}.py covering it; widening this gate alone makes the
+        # kernel run but emit all-NaN (the softmax row_max LdRed atom falls
+        # through to the wrong branch).
         sm = get_sm_version()
-        if sm not in (100, 103):
-            logger.debug(f"CuTe DSL MLA FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
+        if sm not in (100, 103, 107):
+            logger.debug(
+                f"CuTe DSL MLA FMHA is unavailable: requires SM100, SM103 or SM107, got SM{sm}."
+            )
             return False
 
         if not attn.is_mla_enable:
@@ -461,7 +467,12 @@ class CuteDslMlaFmha(PhasedFmha):
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
-        page_table = page_table_layer[meta.num_contexts :].transpose(0, 1).to(torch.int32)
+        # The page-table batch dimension determines the kernel launch batch.
+        page_table = (
+            page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
+            .transpose(0, 1)
+            .to(torch.int32)
+        )
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
 

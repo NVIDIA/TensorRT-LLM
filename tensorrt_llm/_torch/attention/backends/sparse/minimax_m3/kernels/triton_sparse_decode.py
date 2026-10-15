@@ -812,11 +812,9 @@ def _sm100f_nvfp4_num_topk_chunks(
     gqa_group_size: int,
     max_topk: int,
     decode_query_len: int,
-    capability: Optional[tuple[int, int]] = None,
+    capability: tuple[int, int],
 ) -> Optional[int]:
     """Select GB300-measured split-K factors for M3's SM100-family decode shape."""
-    if capability is None:
-        capability = torch.cuda.get_device_capability()
     if (
         capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads != 4
@@ -851,11 +849,9 @@ def _sm100f_nvfp4_use_linear_softmax(
     gqa_group_size: int,
     max_topk: int,
     decode_query_len: int,
-    capability: Optional[tuple[int, int]] = None,
+    capability: tuple[int, int],
 ) -> bool:
     """Use the GB300-measured lower-register recurrence on validated M3 shapes."""
-    if capability is None:
-        capability = torch.cuda.get_device_capability()
     if (
         capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads not in (1, 2, 4)
@@ -879,11 +875,9 @@ def _sm100f_nvfp4_query_group_size(
     gqa_group_size: int,
     max_topk: int,
     decode_query_len: int,
-    capability: Optional[tuple[int, int]] = None,
+    capability: tuple[int, int],
 ) -> int:
     """Group Eagle queries using the GB300-measured shared-page policy."""
-    if capability is None:
-        capability = torch.cuda.get_device_capability()
     if (
         capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads != 4
@@ -906,7 +900,7 @@ def _sm100f_nvfp4_launch_options(
     gqa_group_size: int,
     max_topk: int,
     decode_query_len: int,
-    capability: Optional[tuple[int, int]] = None,
+    capability: tuple[int, int],
 ) -> dict[str, int]:
     """Select native-NVFP4 launch geometry for the SM100 family.
 
@@ -916,8 +910,6 @@ def _sm100f_nvfp4_launch_options(
     unmeasured architecture, model geometry, and larger batch on Triton's
     established defaults.
     """
-    if capability is None:
-        capability = torch.cuda.get_device_capability()
     if (
         capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads != 4
@@ -945,11 +937,9 @@ def _sm100f_nvfp4_merge_launch_options(
     gqa_group_size: int,
     max_topk: int,
     decode_query_len: int,
-    capability: Optional[tuple[int, int]] = None,
+    capability: tuple[int, int],
 ) -> dict[str, int]:
     """Select GB300-measured one-warp merges for M3's SM100-family graphs."""
-    if capability is None:
-        capability = torch.cuda.get_device_capability()
     if (
         capability in _NVFP4_TUNED_CAPABILITIES
         and num_kv_heads == 4
@@ -1113,6 +1103,7 @@ def minimax_m3_sparse_attn_decode(
             gqa_group_size=gqa_group_size,
             max_topk=max_topk,
             decode_query_len=decode_query_len,
+            capability=capability,
         )
         if kv_nvfp4
         else 1
@@ -1128,6 +1119,7 @@ def minimax_m3_sparse_attn_decode(
                     gqa_group_size=gqa_group_size,
                     max_topk=max_topk,
                     decode_query_len=decode_query_len,
+                    capability=capability,
                 )
                 if kv_nvfp4
                 else None
@@ -1177,6 +1169,7 @@ def minimax_m3_sparse_attn_decode(
         gqa_group_size=gqa_group_size,
         max_topk=max_topk,
         decode_query_len=decode_query_len,
+        capability=capability,
     )
     if query_group_size == 2:
         launch_options = {"num_warps": 4, "num_stages": 1}
@@ -1188,6 +1181,7 @@ def minimax_m3_sparse_attn_decode(
                 gqa_group_size=gqa_group_size,
                 max_topk=max_topk,
                 decode_query_len=decode_query_len,
+                capability=capability,
             )
             if kv_nvfp4
             else {}
@@ -1276,6 +1270,7 @@ def minimax_m3_sparse_attn_decode(
                 gqa_group_size=gqa_group_size,
                 max_topk=max_topk,
                 decode_query_len=decode_query_len,
+                capability=capability,
             )
             if kv_nvfp4
             else {}
