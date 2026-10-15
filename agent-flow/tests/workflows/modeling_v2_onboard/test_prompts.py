@@ -28,7 +28,7 @@ def test_worker_prompt_carries_exactly_its_tags_in_order():
     merge = prompt.index("## Tag `merge`")
     target = prompt.index("## Tag `target`")
     assert merge < target
-    for other in ("new_op", "module_accuracy", "e2e_accuracy"):
+    for other in ("new_op", "module_accuracy", "e2e_accuracy", "perf"):
         assert f"## Tag `{other}`" not in prompt
 
 
@@ -39,9 +39,24 @@ def test_slurm_block_only_when_the_task_uses_slurm():
 
 
 def test_planner_prompt_lists_every_tag():
-    prompt = build_planner_system_prompt()
+    prompt = build_planner_system_prompt(max_parallel=8)
     for tag in TAGS:
         assert f"| `{tag}` |" in prompt
+
+
+def test_planner_prompt_states_the_parallelism():
+    prompt = build_planner_system_prompt(max_parallel=6)
+    assert "Up to **6** tasks run at once" in prompt
+    assert "keep every worker busy" in prompt.lower()
+
+
+def test_planner_example_plan_validates():
+    from agent_flow.workflows.modeling_v2_onboard.plan import parse_plan
+    from agent_flow.workflows.modeling_v2_onboard.prompts import PLAN_EXAMPLE
+
+    spec = parse_plan(PLAN_EXAMPLE)
+    assert spec.sink_id() == "land"
+    assert spec.tags["perf-moe-gemm"] == ("perf",)
 
 
 def test_worker_turn_prompt_names_every_path(tmp_path: Path):

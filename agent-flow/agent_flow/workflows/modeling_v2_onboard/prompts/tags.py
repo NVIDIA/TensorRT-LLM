@@ -18,6 +18,7 @@ TAG_SUMMARIES: dict[str, str] = {
     "merge": "join several upstream branches into one, resolve conflicts, prove the join works",
     "module_accuracy": "check one module of the target (e.g. attention, MoE) against a reference",
     "e2e_accuracy": "run or debug the whole-model accuracy gate against the anchor",
+    "perf": "make one entry, or one fusion of entries, measurably faster without changing its math",
 }
 
 _NEW_OP = """\
@@ -187,10 +188,48 @@ When the task asks you to add the gate to CI, add the case to
 existing cases, with `modeling_v2="require"`.
 """
 
+_PERF = """\
+## Tag `perf` — making the target faster
+
+You make **one** thing faster — one entry, or one run of consecutive entries
+fused into one — at the values the target actually passes. The task names it.
+
+1. **Measure first.** Benchmark the current entry on this machine at the
+   cells the target runs (the decode batch sizes CUDA graphs capture, the
+   prefill token budget): warm up, synchronize, time with CUDA events or
+   `triton.testing.do_bench`, report the median and the run-to-run spread.
+   Write the baseline in `notes.md` before you change anything.
+2. **Take one approach:**
+   - *another implementation* — a different TensorRT-LLM kernel or backend
+     for the same op, wrapped as its own entry;
+   - *a new kernel* — Triton, CuTe DSL or CUDA, wrapped as a new entry;
+   - *fusion* — one new entry whose single call computes what several
+     consecutive entries did, which the target then calls in their place.
+     Fusion lives inside one op call, never as Python-level composition.
+
+   A new entry follows the `new_op` rules in full: a `reference` with the
+   unfused math, `is_valid`, `CELLS`, `ARCHS`, `note`, and its GPU test.
+3. **Prove it is correct and faster.** The entry's test passes, the
+   source-level gates pass and, if you changed the target, its boot gate
+   passes under `modeling_v2="require"`. Re-measure with the same method; a
+   win is a speedup larger than the spread you measured.
+4. **Adopt or revert.** Keep the change on your branch only if it won.
+   Otherwise `git revert` your commits so your branch lands nothing, and
+   report `DONE` with the numbers: a measured "no" is a result. Report
+   `FAILED` only when the plan is wrong (the op is not where the task says,
+   an input is missing).
+
+Never trade accuracy for speed: no wider tolerance, no lower precision, no
+dropped cell, unless the task explicitly asks for it. A later
+`e2e_accuracy` task re-checks the whole model, so name every change of
+numerics (accumulation order, precision, algorithm) in your result.
+"""
+
 TAG_PROMPTS: dict[str, str] = {
     "new_op": _NEW_OP,
     "target": _TARGET,
     "merge": _MERGE,
     "module_accuracy": _MODULE_ACCURACY,
     "e2e_accuracy": _E2E_ACCURACY,
+    "perf": _PERF,
 }

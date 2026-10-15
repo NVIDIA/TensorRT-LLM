@@ -37,7 +37,14 @@ __all__ = [
 
 # The task tags a plan may use. Each one selects an extra block of worker
 # system prompt (see ``prompts.tags``).
-TAGS: tuple[str, ...] = ("new_op", "target", "merge", "module_accuracy", "e2e_accuracy")
+TAGS: tuple[str, ...] = (
+    "new_op",
+    "target",
+    "merge",
+    "module_accuracy",
+    "e2e_accuracy",
+    "perf",
+)
 
 # Task ids become git branch names (``node/<id>``) and file names, so keep them
 # to a character set that is safe in both.

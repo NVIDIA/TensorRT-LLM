@@ -56,6 +56,21 @@ Goal, inputs, definition of done (the evidence that closes it), and scope.
 ### gsm8k
 ...
 
+### feat-fp8-kv
+...
+
+### perf-fuse-add-norm
+...
+
+### perf-moe-gemm
+...
+
+### join-all
+...
+
+### gsm8k-final
+...
+
 ### land
 Merge the verified result into the checkout and confirm it is clean.
 
@@ -80,11 +95,27 @@ nodes:
   - id: gsm8k
     type: e2e_accuracy
     depends_on: [join-core]
+  - id: feat-fp8-kv
+    type: target
+    depends_on: [join-core]
+  - id: perf-fuse-add-norm
+    type: perf
+    depends_on: [join-core]
+  - id: perf-moe-gemm
+    type: perf
+    depends_on: [join-core]
+  - id: join-all
+    type: merge
+    kind: merge
+    depends_on: [gsm8k, feat-fp8-kv, perf-fuse-add-norm, perf-moe-gemm]
+  - id: gsm8k-final
+    type: e2e_accuracy
+    depends_on: [join-all]
   - id: land
     type: merge
     kind: merge
     isolation: shared
-    depends_on: [gsm8k]
+    depends_on: [gsm8k-final]
 ```
 """
 
@@ -94,7 +125,7 @@ def _tag_table() -> str:
     return f"| tag | a worker with this tag is briefed to |\n|---|---|\n{rows}"
 
 
-_PLANNER = f"""\
+_PLANNER = """\
 You are the **planner** of a ModelingV2 onboarding run. One checkpoint (or
 one new capability of an existing target) is being brought up as a gated
 ModelingV2 target in TensorRT-LLM. You do not write code: you write
@@ -131,7 +162,7 @@ Every task has a primary tag (`type`) and optional extra `tags`. A worker is
 briefed by the blocks of its tags, so tag each task with what it actually
 does:
 
-{_tag_table()}
+{tag_table}
 
 A task that does two things carries two tags, e.g. a `merge` task that then
 assembles the target on the joined code: `type: merge`, `tags: [target]`.
@@ -175,7 +206,41 @@ just before the final one.
 
 Shape of a typical plan:
 
-{PLAN_EXAMPLE}
+{plan_example}
+## Keep every worker busy
+
+Up to **{max_parallel}** tasks run at once. You plan only at the start and
+after a failure, so the graph you write is all the work the run has until
+then: a task that is not in it never runs, however idle the workers are.
+Shape the graph so that at every stage about {max_parallel} tasks are ready.
+
+- **Split along independent outcomes.** Every missing entry is its own
+  `new_op` task, and they all run side by side. Checks of different modules
+  are separate tasks. Nothing waits on a task whose code or result it does
+  not use.
+- **Do not idle behind the accuracy gate.** An `e2e_accuracy` task can run
+  and debug for hours. While it does, the next work starts from the same
+  code: the further features `task.yaml` asks for (another parallel
+  topology, a quantization, a runtime capability), their module checks, and
+  performance work. They depend on the task that produced the code they build
+  on, not on the gate; a later `merge` task joins them with the gate's fixes.
+- **Fill the remaining slots with `perf` tasks.** When correctness and
+  feature work cannot use every slot, add performance tasks, largest share of
+  runtime first (the big GEMMs, attention, MoE): try another existing
+  implementation of an entry, write a new kernel as a new entry, or fuse
+  consecutive entries into one. One entry or one fusion per task, naming the
+  values to measure at. A `perf` task that finds no win is still `DONE`; it
+  lands only a change that measured faster.
+- **Give parallel tasks disjoint edits.** Two tasks rewriting the same part
+  of `modeling.py` leave a conflict for their merge task. Give each its own
+  entry file and its own call site, and say so in the task sections.
+- **Everything still reaches the final task.** Feature and performance
+  branches join the main line through `merge` tasks, and an `e2e_accuracy`
+  task on the joined code runs after the last of them, before the final task.
+
+When you revise the plan after a failure, count the tasks that can run now
+and add work again until the slots are used.
+
 ## Revising the plan
 
 When a task reports `FAILED`, the run pauses (running tasks are interrupted
@@ -199,10 +264,10 @@ failed task's result first, then decide:
   reached at all (a computation with no implementable server anywhere, an
   anchor that cannot exist), with the evidence.
 
-{MODELING_V2_LAYOUT}
-{MODELING_V2_SWITCH}
-{SOURCE_BOUNDARY}
-{CITATION_DISCIPLINE}
+{modeling_v2_layout}
+{modeling_v2_switch}
+{source_boundary}
+{citation_discipline}
 
 ## Red flags
 
@@ -210,6 +275,8 @@ failed task's result first, then decide:
 |---|---|
 | "This coverage question is unclear; let a worker figure it out" | Read the entry's `CELLS` again. Judging coverage is your job. |
 | "Make every task depend on the previous one, to be safe" | Each spurious edge serializes work that would have run in parallel. |
+| "The plan is one chain: ops, target, accuracy, land" | Workers sit idle. Run independent work side by side and fill the rest with `perf` tasks. |
+| "Start the features once the accuracy gate passes" | The gate's fixes join later through a `merge`. Start the feature work now, from the same code. |
 | "One big task: implement the model" | A worker owns one outcome. Split by entry, by module, by gate. |
 | "The anchor is probably around X" | Anchors come from a written source or a measured oracle. |
 | "The failed task was nearly done; mark the run DONE" | `DONE` needs evidence for every completion criterion. |
@@ -217,9 +284,23 @@ failed task's result first, then decide:
 """
 
 
-def build_planner_system_prompt() -> str:
-    """The planner's system prompt."""
-    return tidy(_PLANNER)
+def build_planner_system_prompt(*, max_parallel: int) -> str:
+    """The planner's system prompt.
+
+    Args:
+        max_parallel: The most tasks the run executes at once.
+    """
+    return tidy(
+        _PLANNER.format(
+            tag_table=_tag_table(),
+            plan_example=PLAN_EXAMPLE,
+            max_parallel=max_parallel,
+            modeling_v2_layout=MODELING_V2_LAYOUT,
+            modeling_v2_switch=MODELING_V2_SWITCH,
+            source_boundary=SOURCE_BOUNDARY,
+            citation_discipline=CITATION_DISCIPLINE,
+        )
+    )
 
 
 def initial_plan_prompt(*, task_yaml: Path, plan: Path, repo: Path) -> str:

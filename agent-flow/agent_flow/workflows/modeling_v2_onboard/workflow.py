@@ -246,7 +246,10 @@ class ModelingV2OnboardWorkflow:
     async def _planner_session(self, prompt: str, check: Callable[[], T]) -> T:
         """Run one planner session, feeding validation errors back until ``check`` passes."""
         agent = self.agent_factory(
-            "planner", build_planner_system_prompt(), self.repo_path, "persistent"
+            "planner",
+            build_planner_system_prompt(max_parallel=self.max_parallel),
+            self.repo_path,
+            "persistent",
         )
         try:
             await agent.aforward(prompt)

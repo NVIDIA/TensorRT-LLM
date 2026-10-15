@@ -5,7 +5,10 @@ Bring up a new model, or a new target of an existing model, in ModelingV2
 
 - **planner** — reads the task, the checkpoint and the catalog, and writes
   `plan.md`: tagged tasks plus an `## Execution Graph` of their dependencies.
-  It never writes code. It is called again whenever a task fails.
+  It never writes code. It is called again whenever a task fails. It is told
+  `--max-parallel` and shapes the graph to keep that many workers busy:
+  independent work side by side, feature work alongside the accuracy gate,
+  and `perf` tasks in the slots left over.
 - **worker** — runs one task in its own git worktree and ends by writing
   `task_results/task_result_<id>.md`. Workers run in parallel.
 
@@ -48,6 +51,7 @@ starts on a fresh branch; its earlier results are kept as
 | `merge` | join several upstream branches, resolve conflicts, prove the join works |
 | `module_accuracy` | check one module (attention, MoE, ...) against a reference |
 | `e2e_accuracy` | run or debug the whole-model accuracy gate against the anchor |
+| `perf` | make one entry, or one fusion of entries, measurably faster without changing its math |
 
 A node's `type` is its primary tag; `tags: [...]` adds more. Each tag adds a
 block to the worker's system prompt (`prompts/tags.py`).
