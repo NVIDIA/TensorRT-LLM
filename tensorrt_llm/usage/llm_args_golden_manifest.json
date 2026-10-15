@@ -961,6 +961,16 @@
       "path": "mm_encoder_only"
     },
     {
+      "allowed_values": [
+        "off",
+        "auto",
+        "require"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "modeling_v2"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_cluster_parallel_size"
@@ -1869,6 +1879,11 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "torch_compile_config.capture_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.compile_only_piecewise_graphs"
     },
     {
       "capture_policy": "bool",

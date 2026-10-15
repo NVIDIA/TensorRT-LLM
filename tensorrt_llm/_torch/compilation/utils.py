@@ -227,10 +227,11 @@ def inplace_info():
             1: "output"
         },
         # The ordinary outputs are compact Q/index-Q; the next
-        # two outputs of auto_functionalized are the mutated paged caches.
+        # three outputs of auto_functionalized are the mutated paged caches.
         "minimax_m3_fused_sparse_qkv_producer": {
             2: "kv_cache",
-            3: "index_k_cache"
+            3: "index_k_cache",
+            4: "kv_scale_cache"
         },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"

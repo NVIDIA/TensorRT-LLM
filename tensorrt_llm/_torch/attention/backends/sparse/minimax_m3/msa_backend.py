@@ -154,7 +154,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_out_cache_loc: Optional[torch.Tensor] = None
     # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
     # to its mutable producer instead of hiding writes behind runtime metadata.
-    msa_layer_cache_tensors: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
+    msa_layer_cache_tensors: Optional[
+        dict[int, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
+    ] = None
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
@@ -412,6 +414,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             layer_idx: (
                 kv_cache_manager.get_buffers(layer_idx, kv_layout="HND"),
                 self.msa_idx_k_cache(layer_idx),
+                (
+                    kv_cache_manager.get_block_scale_buffers(layer_idx, kv_layout="HND")
+                    if kv_cache_manager.is_nvfp4_layer(layer_idx)
+                    else None
+                ),
             )
             for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
             if layer_idx in kv_cache_manager.layer_offsets
@@ -971,8 +978,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
+        # NVFP4 sparse layers run the MSA CSR kernel, which takes no plan.
         self._msa_prefill_gqa_plan = plan_for(
-            attn_rows,
+            None if self.kv_cache_manager.dtype == DataType.NVFP4 else attn_rows,
             num_qo_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             kv_block_num=params.topk,

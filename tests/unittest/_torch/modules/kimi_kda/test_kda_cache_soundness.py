@@ -25,9 +25,17 @@ Covers the two classes of bug that ordinary op-math parity tests cannot see:
    against FLA. ``test_repeated_single_sequence_metadata_matches_fla``
    additionally covers the Phase 2.1 poisoning case (same cu_seqlens object,
    two calls).
+
+3. Bounded scratch. The prefill scratch cache ``_buf_cache`` keeps at most
+   ``_BUF_CACHE_MAX_ENTRIES`` token-count shapes, and the runtime calls with a
+   new token count for most prefill batches, so entries are evicted all the
+   time. ``test_evicted_prefill_scratch_is_released`` checks that an evicted
+   entry's scratch is freed: nothing else, such as a cached CuTe wrapper, may
+   keep it alive.
 """
 
 import gc
+import weakref
 
 import pytest
 import torch
@@ -145,6 +153,10 @@ def _allocate_with_recycled_id(target_id: int, make, attempts: int = 512):
     return None
 
 
+def _tensor_weakrefs(values) -> list[weakref.ref]:
+    return [weakref.ref(value) for value in values if isinstance(value, torch.Tensor)]
+
+
 @pytest.mark.parametrize("regime", ["eqlen", "varlen"])
 @torch.no_grad()
 def test_indexed_prefill_uses_current_stream(
@@ -244,6 +256,46 @@ def test_recycled_cu_seqlens_id_matches_fla(
     assert_kda_close("recycled_id/output", actual_output, expected_output)
     assert_kda_close("recycled_id/state", actual_state, expected_state)
     assert module._varlen_pure_cache.get(id(cu_seqlens)) is False
+
+
+@torch.no_grad()
+def test_evicted_prefill_scratch_is_released(
+    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
+    gate_params: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Scratch evicted from the bounded prefill buffer cache is freed."""
+    optimized, _ = dispatch_pair
+    module = _op_module()
+    # Every call has its own token count, and one pass has more shapes than the
+    # cache holds, so the cyclic passes below miss and evict on every call.
+    # Two sequences per call keep the batch at four or more chunks.
+    first_lengths = [300 + 64 * i for i in range(module._BUF_CACHE_MAX_ENTRIES + 4)]
+
+    def run_pass() -> None:
+        for i, first_length in enumerate(first_lengths):
+            sequence_lengths = [first_length, 200]
+            inputs = _make_inputs(sum(sequence_lengths), seed=500 + i)
+            run_indexed_prefill(optimized, gate_params, inputs, _make_cu_seqlens(sequence_lengths))
+        torch.cuda.synchronize()
+        _flush_tensor_cache_pins()
+        gc.collect()
+
+    # The first pass compiles the kernels and leaves the cache holding the last
+    # shapes of the cycle; every later pass evicts all of those entries and
+    # ends with the same shapes cached again.
+    run_pass()
+    baseline = torch.cuda.memory_allocated()
+    evicted_scratch = _tensor_weakrefs(next(iter(module._buf_cache.values())))
+    assert evicted_scratch
+    for iteration in range(2):
+        run_pass()
+        assert len(module._buf_cache) <= module._BUF_CACHE_MAX_ENTRIES
+        grown = torch.cuda.memory_allocated() - baseline
+        assert grown <= 16 << 20, (
+            f"pass {iteration}: {grown / (1 << 20):.1f} MiB more allocated after the evictions"
+        )
+        alive = sum(ref() is not None for ref in evicted_scratch)
+        assert alive == 0, f"pass {iteration}: {alive} tensors of an evicted entry are still alive"
 
 
 @torch.no_grad()
