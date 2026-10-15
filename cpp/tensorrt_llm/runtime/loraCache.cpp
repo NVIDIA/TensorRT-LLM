@@ -559,8 +559,8 @@ void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, Si
     auto const hiddenSize = input.getShape().d[1];
     auto const splitHiddenSize = static_cast<SizeType32>(hiddenSize / tpSize);
 
-    auto outputPtr = bufferCast<T>(output);
-    auto const inputPtr = bufferCast<T>(input);
+    auto outputPtr = output.getBufferPtr<T>();
+    auto const inputPtr = input.getBufferPtr<T>();
 
     for (SizeType32 adapterIdx = 0; adapterIdx < adapterSize; ++adapterIdx)
     {

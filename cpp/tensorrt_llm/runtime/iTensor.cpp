@@ -188,11 +188,11 @@ void printTensor(ITensor const& tensor, std::ostream& out)
         BufferManager manager{streamPtr};
         host = manager.copyFrom(tensor, MemoryType::kCPU);
         streamPtr->synchronize();
-        hostData = bufferCast<T>(*host);
+        hostData = host->getBufferPtr<T>();
     }
     else
     {
-        hostData = bufferCast<T>(tensor);
+        hostData = tensor.getBufferPtr<T>();
     }
 
     if (shape.nbDims > 3)
