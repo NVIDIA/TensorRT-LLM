@@ -1012,11 +1012,107 @@ class ModelEngine:
             return None
         return self._mm_item_scheduler.item_cache_keys(request)
 
-    def invalidate_multimodal_encoder_cache(self) -> None:
-        """Clear cached MM encoder outputs when no request is using them."""
-        encoder_cache = self.mm_encoder_cache
-        if encoder_cache is not None:
-            encoder_cache.clear()
+    def _resolve_bytes_per_mm_encoder_embedding(self) -> int:
+        """Bytes occupied by one multimodal encoder output embedding.
+
+        Prefers the mixin's explicit `embedding_dim`/`embedding_dtype`
+        contract, then the text embedding layer's weight, then the
+        pretrained config's hidden size with the loaded weights' dtype —
+        both mixin properties are optional and most VLMs implement
+        neither.
+        """
+        model = self.model
+        try:
+            return (model.embedding_dim * torch.empty(
+                (), dtype=model.embedding_dtype).element_size())
+        except NotImplementedError:
+            pass
+        try:
+            weight = model.text_embedding_layer.weight
+            return weight.shape[-1] * weight.element_size()
+        except NotImplementedError:
+            pass
+        pretrained = model.model_config.pretrained_config
+        hidden_size = getattr(pretrained, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(getattr(pretrained, "text_config", None),
+                                  "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(
+                "Cannot derive the MM embedding row size: the model "
+                "implements neither embedding_dim/embedding_dtype nor "
+                "text_embedding_layer, and its pretrained config exposes "
+                "no (text_config.)hidden_size")
+        element_size = next(model.parameters()).dtype.itemsize
+        return hidden_size * element_size
+
+    def _set_up_multimodal_encoder_attn_metadata(self) -> None:
+        """Construct AttentionMetadata for any multimodal encoders inside the
+        loaded model, using the engine's encoder token budget
+        (`encoder_max_num_tokens`, falling back to the LLM-side
+        `max_num_tokens`).
+
+        Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
+        by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
+        so the sizes match the resolved encoder token budget rather than being
+        hardcoded inside each encoder's `__init__`. The optional
+        per-segment capacity combines the encoder token budget with the input
+        processor's largest supported item.
+        """
+        max_seq_len = self.encoder_max_num_tokens
+        if isinstance(self.input_processor, BaseMultimodalDummyInputsBuilder):
+            max_tokens_per_item = (
+                self.input_processor.get_mm_max_tokens_per_item())
+            max_seq_len = max(max_seq_len,
+                              max(max_tokens_per_item.values(), default=0))
+
+        for module in self.model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                setup_kwargs: Dict[str, Any] = dict(
+                    max_num_tokens=self.encoder_max_num_tokens)
+                if self.mm_encoder_attention_metadata_capacity is not None:
+                    setup_kwargs["attention_metadata_capacity"] = (
+                        self.mm_encoder_attention_metadata_capacity)
+                module.setup_attn_metadata(**setup_kwargs)
+                module.set_attn_max_seq_len(max_seq_len)
+
+    def _set_up_spec_metadata(
+            self,
+            spec_resource_manager: Optional[BaseResourceManager],
+            no_cache=False):
+        spec_config = self.spec_config if self.enable_spec_decode else None
+        # The disaggregated attention-DP overlap path opts into larger metadata
+        # buffers. Passing None preserves the established max_num_requests
+        # fallback for other configurations, including PP.
+        # Size slot-indexed spec buffers (e.g. rejection-sampling draft_probs)
+        # by the same pool that sizes the SeqSlotManager
+        # (py_executor_creator passes model_engine.max_num_seq_slots), so every
+        # py_seq_slot has a row. With max_num_requests only, DSpark + rejection
+        # sampling on disaggregated attention-DP gen indexed past the buffer.
+        num_seq_slots = self.max_num_seq_slots
+        if no_cache:
+            return get_spec_metadata(
+                spec_config,
+                self.model.config,
+                self.batch_size,
+                max_num_tokens=self.max_num_tokens,
+                spec_resource_manager=spec_resource_manager,
+                is_draft_model=self.is_draft_model,
+                max_seq_len=self.max_seq_len,
+                num_seq_slots=num_seq_slots)
+
+        if self.spec_metadata is not None:
+            return self.spec_metadata
+        self.spec_metadata = get_spec_metadata(
+            spec_config,
+            self.model.config,
+            self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            spec_resource_manager=spec_resource_manager,
+            is_draft_model=self.is_draft_model,
+            max_seq_len=self.max_seq_len,
+            num_seq_slots=num_seq_slots)
+        return self.spec_metadata
 
     def cleanup(self) -> None:
         """Release resources owned by this model engine.
