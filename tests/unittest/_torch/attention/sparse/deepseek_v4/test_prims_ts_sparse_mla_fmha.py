@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the PrimTS native sparse MLA FMHA library (DeepSeek-V4, SM100/SM103)."""
 
+import math
+from types import SimpleNamespace
+
 import pytest
 import torch
 import triton
@@ -50,6 +53,20 @@ def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
     assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes()
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")
     assert PrimsTSSparseMlaFmha not in registry.get_enabled_fmha_lib_classes()
+
+
+def test_softmax_scale_follows_qk_head_dim() -> None:
+    """The scale uses ``qk_nope + qk_rope`` like attentionOp.cpp, not the 512 latent.
+
+    DeepSeek-V4 checkpoints have 448 + 64 = 512, so only a narrower nope width
+    (the 128 + 64 scenario of ``test_deepseek_v4_sparse_mla``) tells the two apart;
+    L0 #64329 caught the latent-width version as a ~0.3 BF16 output mismatch.
+    """
+    attn = SimpleNamespace(qk_nope_head_dim=128, qk_rope_head_dim=64, q_scaling=0.5336)
+    expected = 1.0 / (0.5336 * math.sqrt(192.0))
+    assert PrimsTSSparseMlaFmha._softmax_scale(attn) == pytest.approx(expected, rel=1e-12)
+    attn = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64, q_scaling=1.0)
+    assert PrimsTSSparseMlaFmha._softmax_scale(attn) == pytest.approx(LATENT**-0.5, rel=1e-12)
 
 
 def _rope_table(max_positions: int, device: torch.device) -> torch.Tensor:
