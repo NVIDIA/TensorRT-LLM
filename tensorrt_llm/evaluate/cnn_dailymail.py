@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,7 +40,7 @@ class CnnDailymail(Evaluator):
                          system_prompt=system_prompt,
                          output_dir=output_dir)
         if dataset_path is None:
-            dataset_path = "abisee/cnn_dailymail"
+            dataset_path = "cnn_dailymail"
         self.data = datasets.load_dataset(dataset_path, "3.0.0", split="test")
         self.data = self.data.shuffle(random_seed)
         if num_samples is None:

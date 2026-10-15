@@ -208,6 +208,68 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         # Synchronize before cleanup
         comm.Barrier()
 
+    def test_host_tensor_sharing_3d(self):
+        """Share 3D expert tensors, e.g. TRTLLM-Gen BlockMajorK weights."""
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+        if size > 8:
+            self.skipTest("This test supports up to 8 MPI processes")
+
+        experts_per_rank = 2
+        expert_count = size * experts_per_rank
+        tensor_shape = (4, 8, 64)  # [K / block_k, Mn, block_k]
+        numel = 4 * 8 * 64
+
+        def expert_tensor(expert_id):
+            return (torch.arange(numel, dtype=torch.float32) +
+                    expert_id * numel).reshape(tensor_shape)
+
+        shared_comm = comm.Split_type(split_type=MPI.COMM_TYPE_SHARED)
+        sharer = HostMoeTensorSharer(0, expert_count, shared_comm)
+        sharer.set_shared_memory_base_name("test_host_sharer_3d")
+
+        my_expert_ids = range(rank * experts_per_rank,
+                              (rank + 1) * experts_per_rank)
+        for expert_id in range(expert_count):
+            if expert_id in my_expert_ids:
+                sharer.share_host_tensor_with_shape(expert_id, "weight",
+                                                    expert_tensor(expert_id))
+            else:
+                sharer.pre_register_host_tensor_with_shape(
+                    expert_id, "weight", torch.float32,
+                    torch.Size(tensor_shape))
+
+        sharer.finalize_layer_weights()
+        comm.Barrier()
+
+        received = {}
+
+        def tensor_callback(expert_id, tensor_name, tensor_data):
+            received[(expert_id, tensor_name)] = tensor_data
+            return True
+
+        sharer.finalize_host_tensor_sharing(tensor_callback)
+        comm.Barrier()
+
+        failures = []
+        for expert_id in range(expert_count):
+            t = received.get((expert_id, "weight"))
+            if t is None:
+                failures.append(f"rank {rank}: expert {expert_id} missing")
+            elif tuple(t.shape) != tensor_shape:
+                failures.append(
+                    f"rank {rank}: expert {expert_id} shape {tuple(t.shape)}")
+            elif not torch.equal(t.cpu(), expert_tensor(expert_id)):
+                failures.append(f"rank {rank}: expert {expert_id} data differs")
+        all_failures = [f for fs in comm.allgather(failures) for f in fs]
+        if all_failures:
+            self.fail("\n".join(all_failures))
+
+        comm.Barrier()
+        sharer.pre_shutdown_cleanup()
+        comm.Barrier()
+
 
 if __name__ == "__main__":
     # This file should be run with mpirun, for example:

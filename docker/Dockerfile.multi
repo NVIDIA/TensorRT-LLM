@@ -15,8 +15,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.08-py3
-ARG TRITON_BASE_TAG=26.08-py3
+ARG BASE_TAG=26.09-py3
+ARG TRITON_BASE_TAG=26.09-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -46,6 +46,9 @@ RUN echo "Using Python version: $PYTHON_VERSION"
 SHELL ["/bin/bash", "-c"]
 
 FROM base AS devel
+
+# Spectrum-X loads its bundled GPUNetIO library separately from the NCCL plugin.
+ENV NCCL_GIN_GPUNETIO_PATH=/opt/hpcx/nccl_spectrum-x_plugin/lib/libdoca_gpunetio_host.so
 
 #
 # NB: PyTorch requires this to be < 1.0

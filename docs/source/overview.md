@@ -8,7 +8,7 @@
 
 ## Key Capabilities
 
-### 🔥 **Architected on Pytorch**
+### 🔥 **Architected on PyTorch**
 
 TensorRT LLM provides a high-level Python [LLM API](./quick-start-guide.md#run-offline-inference-with-llm-api) that supports a wide range of inference setups - from single-GPU to multi-GPU or multi-node deployments. It includes built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA [Dynamo](https://github.com/ai-dynamo/dynamo) and the [Triton Inference Server](https://github.com/triton-inference-server/server).
 
