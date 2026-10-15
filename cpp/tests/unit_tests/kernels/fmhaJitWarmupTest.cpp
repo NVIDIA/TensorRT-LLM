@@ -15,9 +15,9 @@
  */
 
 // Host-only tests for the asynchronous TRTLLM-Gen FMHA JIT warmup building
-// blocks (fmhaJitWarmup.h): the background worker's lifecycle and the sweep
-// registry's state machine. No GPU is involved; the "sweeps" here are plain
-// callbacks.
+// blocks (fmhaJitWarmup.h): the background worker's lifecycle, the sweep
+// registry's state machine, and the scheduling path the kernel runs them
+// through. No GPU is involved; the "sweeps" here are plain callbacks.
 
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaJitWarmup.h"
 
@@ -34,7 +34,9 @@
 namespace
 {
 
+using tensorrt_llm::kernels::JITWarmupScheduleResult;
 using tensorrt_llm::kernels::JITWarmupState;
+using tensorrt_llm::kernels::scheduleJITWarmupSweep;
 using tensorrt_llm::kernels::TllmGenFmhaAsyncWarmupWorker;
 using tensorrt_llm::kernels::TllmGenFmhaJitCompileStats;
 using tensorrt_llm::kernels::TllmGenFmhaJitWarmupRegistry;
@@ -340,46 +342,40 @@ TEST(TllmGenFmhaJitCompileStats, CountsEveryMissIncludingRepeatsOfTheSameKey)
 // Worker + registry together: the scheduling protocol used by fmhaKernels.h.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Mirrors runJITWarmupGridIfRequested(): register, queue the sweep, mark done on
-// completion or failure, then verify on the foreground.
+// Drives the kernel's scheduling path, scheduleJITWarmupSweep(), with the
+// real worker and registry; only the sweep body is a stand-in. Sweeps are
+// tallied by the thread they ran on, so a test can tell background runs from
+// inline runs and verify-pass re-runs.
 struct Scheduler
 {
-    TllmGenFmhaAsyncWarmupWorker mWorker;
+    // The registry is declared first so it outlives the worker's shutdown, which
+    // runs any still-queued task against it.
     Registry mRegistry;
+    TllmGenFmhaAsyncWarmupWorker mWorker;
+    std::thread::id const mMainThread{std::this_thread::get_id()};
     std::atomic<int> mBackgroundSweeps{0};
     std::atomic<int> mForegroundSweeps{0};
 
-    void schedule(uint64_t fingerprint, FakeParams const& params, FakeKernel* kernel, bool failInBackground)
+    JITWarmupScheduleResult schedule(uint64_t fingerprint, FakeParams const& params, FakeKernel* kernel,
+        bool failInBackground, bool async = true, int deviceId = 0)
     {
-        if (mRegistry.tryRegister(fingerprint, params, JITWarmupState::kScheduled, 0, kernel))
-        {
-            return;
-        }
-        bool const queued = mWorker.enqueue(
-            [this, fingerprint, failInBackground]()
+        return scheduleJITWarmupSweep(mRegistry, async ? &mWorker : nullptr, fingerprint, params, deviceId, kernel,
+            [this, failInBackground](FakeParams const&, int)
             {
-                try
+                if (std::this_thread::get_id() == mMainThread)
                 {
-                    if (failInBackground)
-                    {
-                        throw std::runtime_error("nvrtc failed");
-                    }
-                    ++mBackgroundSweeps;
+                    ++mForegroundSweeps;
+                    return;
                 }
-                catch (...)
+                if (failInBackground)
                 {
-                    mRegistry.markBackgroundDone(fingerprint);
-                    throw;
+                    throw std::runtime_error("nvrtc failed");
                 }
-                mRegistry.markBackgroundDone(fingerprint);
+                ++mBackgroundSweeps;
             });
-        if (!queued)
-        {
-            ++mForegroundSweeps;
-            mRegistry.markBackgroundDone(fingerprint);
-        }
     }
 
+    // The pre-capture barrier: drain, then re-run every finished sweep once.
     int drainAndVerifyAll()
     {
         mWorker.drain();
@@ -397,9 +393,10 @@ TEST(TllmGenFmhaJitWarmupProtocol, EveryScheduledSweepIsVerifiedExactlyOnceBefor
 {
     Scheduler scheduler;
     FakeKernel kernel{1};
-    scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, /*failInBackground=*/false);
-    scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false); // duplicate: dropped
-    scheduler.schedule(0xB, FakeParams{1, 1024}, &kernel, false);
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, /*failInBackground=*/false),
+        JITWarmupScheduleResult::kQueued);
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false), JITWarmupScheduleResult::kDuplicate);
+    EXPECT_EQ(scheduler.schedule(0xB, FakeParams{1, 1024}, &kernel, false), JITWarmupScheduleResult::kQueued);
 
     EXPECT_EQ(scheduler.drainAndVerifyAll(), 2);
     EXPECT_EQ(scheduler.mBackgroundSweeps, 2);
@@ -413,7 +410,8 @@ TEST(TllmGenFmhaJitWarmupProtocol, BackgroundFailureIsRetriedOnTheForeground)
 {
     Scheduler scheduler;
     FakeKernel kernel{1};
-    scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, /*failInBackground=*/true);
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, /*failInBackground=*/true),
+        JITWarmupScheduleResult::kQueued);
     scheduler.mWorker.drain();
     // The failed sweep is not stranded in kScheduled: it is handed to the verify pass.
     EXPECT_EQ(scheduler.mRegistry.state(0xA), JITWarmupState::kBackgroundDone);
@@ -429,12 +427,48 @@ TEST(TllmGenFmhaJitWarmupProtocol, ShutDownWorkerFallsBackToInlineCompilation)
     Scheduler scheduler;
     FakeKernel kernel{1};
     scheduler.mWorker.shutdown();
-    scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false);
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false), JITWarmupScheduleResult::kRanInline);
     // Compiled inline by the caller, and still verified exactly once.
     EXPECT_EQ(scheduler.mForegroundSweeps, 1);
     EXPECT_EQ(scheduler.drainAndVerifyAll(), 1);
     EXPECT_EQ(scheduler.mForegroundSweeps, 2);
     EXPECT_EQ(scheduler.mBackgroundSweeps, 0);
+}
+
+TEST(TllmGenFmhaJitWarmupProtocol, SyncModeRunsInlineAndStillDeduplicates)
+{
+    // Async warmup disabled: the sweep runs on the caller, is registered as
+    // verified, and an identical later request is dropped just as in async mode.
+    Scheduler scheduler;
+    FakeKernel kernel{1};
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false, /*async=*/false),
+        JITWarmupScheduleResult::kRanInline);
+    EXPECT_EQ(scheduler.mForegroundSweeps, 1);
+    EXPECT_EQ(scheduler.mRegistry.state(0xA), JITWarmupState::kVerified);
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false, /*async=*/false),
+        JITWarmupScheduleResult::kDuplicate);
+    EXPECT_EQ(scheduler.mForegroundSweeps, 1);
+    // Nothing for the barrier to verify.
+    EXPECT_EQ(scheduler.drainAndVerifyAll(), 0);
+    EXPECT_EQ(scheduler.mBackgroundSweeps, 0);
+}
+
+TEST(TllmGenFmhaJitWarmupProtocol, BackgroundSweepRunsOnItsOwnDevice)
+{
+    // The sweep body receives the device the request was registered on, not
+    // whatever is current on the worker thread.
+    Registry registry;
+    TllmGenFmhaAsyncWarmupWorker worker;
+    FakeKernel kernel{1};
+    std::atomic<int> seenDevice{-1};
+    EXPECT_EQ(scheduleJITWarmupSweep(registry, &worker, 0xA, FakeParams{4, 1024}, /*deviceId=*/3, &kernel,
+                  [&seenDevice](FakeParams const&, int deviceId) { seenDevice = deviceId; }),
+        JITWarmupScheduleResult::kQueued);
+    worker.drain();
+    EXPECT_EQ(seenDevice.load(), 3);
+    auto const sweep = registry.claimUnverified(3, &kernel);
+    ASSERT_TRUE(sweep.has_value());
+    EXPECT_EQ(sweep->mDeviceId, 3);
 }
 
 } // namespace

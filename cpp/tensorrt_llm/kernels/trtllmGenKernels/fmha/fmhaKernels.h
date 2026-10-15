@@ -564,14 +564,19 @@ private:
         }
     }
 
+public:
     // The set of kernels a warmup sweep compiles only depends on this kernel
-    // instance (dtypes/SM/sage), the current device (modules load into the
-    // calling device's CUDA context), and the scalar runner params hashed
-    // below, not on the calling layer. Every attention layer with the same configuration
-    // requests an identical sweep during the warmup forward, and (with eagle3
-    // one-model speculative decoding) the target layers and the draft layers
-    // request sweeps that differ only in the spec-decoding fields.
-    uint64_t jitWarmupFingerprint(RunnerParams const& params) const
+    // instance (dtypes/SM/sage), the device the sweep runs on (modules load
+    // into that device's CUDA context, so an identical configuration on
+    // another device still needs its own sweep), and the scalar runner params
+    // hashed below, not on the calling layer. Every attention layer with the
+    // same configuration requests an identical sweep during the warmup
+    // forward, and (with eagle3 one-model speculative decoding) the target
+    // layers and the draft layers request sweeps that differ only in the
+    // spec-decoding fields. Every runner param that selectKernel() reads must
+    // be hashed here: sweeps with equal fingerprints are deduplicated, in sync
+    // mode as well as in async mode.
+    uint64_t jitWarmupFingerprint(RunnerParams const& params, int deviceId) const
     {
         auto combine = [](uint64_t seed, uint64_t value)
         { return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2)); };
@@ -582,23 +587,18 @@ private:
         uint32_t scaleQBits = 0;
         std::memcpy(&scaleQBits, &params.mScaleQ, sizeof(scaleQBits));
         uint64_t fingerprint = 0;
-        // Include the current device: compiled modules are loaded into the calling
-        // device's CUDA context, so an identical configuration on another device
-        // still needs its own sweep. Warmup requests always run with the target
-        // device current.
         for (uint64_t value :
-            std::initializer_list<uint64_t>{static_cast<uint64_t>(tensorrt_llm::common::getDevice()),
-                static_cast<uint64_t>(mSM), static_cast<uint64_t>(mDtypeQ), static_cast<uint64_t>(mDtypeK),
-                static_cast<uint64_t>(mDtypeV), static_cast<uint64_t>(mDtypeOut),
-                static_cast<uint64_t>(mNumEltsPerSageAttnBlkQ), static_cast<uint64_t>(mNumEltsPerSageAttnBlkK),
-                static_cast<uint64_t>(mNumEltsPerSageAttnBlkP), static_cast<uint64_t>(mNumEltsPerSageAttnBlkV),
-                static_cast<uint64_t>(params.mQkvLayout), static_cast<uint64_t>(params.mMaskType),
-                static_cast<uint64_t>(params.mKernelType), static_cast<uint64_t>(params.mTileScheduler),
-                static_cast<uint64_t>(params.mMultiCtasKvMode), static_cast<uint64_t>(params.mUseBlockSparseAttention),
-                static_cast<uint64_t>(params.mHeadDimQk), static_cast<uint64_t>(params.mHeadDimV),
-                static_cast<uint64_t>(params.mNumHeadsQ), static_cast<uint64_t>(params.mNumHeadsKv),
-                static_cast<uint64_t>(params.mNumHeadsQPerKv), static_cast<uint64_t>(params.mMaxSeqLenQ),
-                static_cast<uint64_t>(params.mUseGenKernelForPrefill),
+            std::initializer_list<uint64_t>{static_cast<uint64_t>(deviceId), static_cast<uint64_t>(mSM),
+                static_cast<uint64_t>(mDtypeQ), static_cast<uint64_t>(mDtypeK), static_cast<uint64_t>(mDtypeV),
+                static_cast<uint64_t>(mDtypeOut), static_cast<uint64_t>(mNumEltsPerSageAttnBlkQ),
+                static_cast<uint64_t>(mNumEltsPerSageAttnBlkK), static_cast<uint64_t>(mNumEltsPerSageAttnBlkP),
+                static_cast<uint64_t>(mNumEltsPerSageAttnBlkV), static_cast<uint64_t>(params.mQkvLayout),
+                static_cast<uint64_t>(params.mMaskType), static_cast<uint64_t>(params.mKernelType),
+                static_cast<uint64_t>(params.mTileScheduler), static_cast<uint64_t>(params.mMultiCtasKvMode),
+                static_cast<uint64_t>(params.mUseBlockSparseAttention), static_cast<uint64_t>(params.mHeadDimQk),
+                static_cast<uint64_t>(params.mHeadDimV), static_cast<uint64_t>(params.mNumHeadsQ),
+                static_cast<uint64_t>(params.mNumHeadsKv), static_cast<uint64_t>(params.mNumHeadsQPerKv),
+                static_cast<uint64_t>(params.mMaxSeqLenQ), static_cast<uint64_t>(params.mUseGenKernelForPrefill),
                 static_cast<uint64_t>(params.mJITWarmupMaxNumRequests),
                 static_cast<uint64_t>(params.mJITWarmupMaxSeqLenQ), static_cast<uint64_t>(params.mJITWarmupMaxSeqLenKv),
                 static_cast<uint64_t>(params.mAttentionWindowSize), static_cast<uint64_t>(params.mChunkedAttentionSize),
@@ -607,13 +607,15 @@ private:
                 static_cast<uint64_t>(skipSoftmaxBits), static_cast<uint64_t>(scaleQBits),
                 static_cast<uint64_t>(params.mSparseAttention), static_cast<uint64_t>(params.mSparseTopK),
                 static_cast<uint64_t>(params.mIsSpecDecTree),
-                static_cast<uint64_t>(params.mSpecDecodingTargetMaxGenLen)})
+                static_cast<uint64_t>(params.mSpecDecodingTargetMaxGenLen),
+                static_cast<uint64_t>(params.mDsv4EpilogueFusion.enabled)})
         {
             fingerprint = combine(fingerprint, value);
         }
         return fingerprint;
     }
 
+private:
     using JITWarmupRegistry = TllmGenFmhaJitWarmupRegistry<RunnerParams, TllmGenFmhaKernel>;
 
     // Process-wide; intentionally leaked (heap-allocated, never destroyed) so a
@@ -645,19 +647,6 @@ private:
             result = CacheResult::kMiss;
         }
         getJITCompileStats().record(result);
-    }
-
-    // Registers a warmup sweep for this kernel object on the current device;
-    // returns true if an identical sweep was already registered.
-    bool tryRegisterJITWarmupConfig(RunnerParams const& params, JITWarmupState initialState)
-    {
-        return getJITWarmupRegistry().tryRegister(
-            jitWarmupFingerprint(params), params, initialState, tensorrt_llm::common::getDevice(), this);
-    }
-
-    static void markJITWarmupBackgroundDone(uint64_t fingerprint)
-    {
-        getJITWarmupRegistry().markBackgroundDone(fingerprint);
     }
 
     // Re-runs a finished background sweep on the calling thread. A cache-hit loop
@@ -745,59 +734,32 @@ private:
         TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
             "TRTLLM-Gen Fmha Warmup Param is invalid.");
 
-        // Deduplicate identical sweeps: every layer of the warmup forward requests
-        // the same grid, and only the first request per distinct configuration
-        // compiles anything (the rest would be pure cache-hit loops).
         // Snapshot the runner params: the warmup sweep only reads scalar fields
         // and never dereferences device pointers or the stream.
         auto warmupParams = runnerParams;
         warmupParams.stream = nullptr;
-        if (tryRegisterJITWarmupConfig(
-                warmupParams, asyncJITWarmupEnabled() ? JITWarmupState::kScheduled : JITWarmupState::kVerified))
+        int const deviceId = tensorrt_llm::common::getDevice();
+        uint64_t const fingerprint = jitWarmupFingerprint(warmupParams, deviceId);
+        // Identical sweeps are deduplicated by scheduleJITWarmupSweep(): every
+        // layer of the warmup forward requests the same grid, and only the first
+        // request per distinct configuration compiles anything (the rest would
+        // be pure cache-hit loops).
+        auto const result = scheduleJITWarmupSweep(getJITWarmupRegistry(),
+            asyncJITWarmupEnabled() ? &getAsyncJITWarmupWorker() : nullptr, fingerprint, warmupParams, deviceId, this,
+            [this, fingerprint](RunnerParams const& params, int device)
+            {
+                TLLM_CUDA_CHECK(cudaSetDevice(device));
+                runJITWarmupGrid(params);
+                TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: generation-kernel grid sweep finished (fingerprint=%llx).",
+                    static_cast<unsigned long long>(fingerprint));
+            });
+        if (result == JITWarmupScheduleResult::kQueued)
         {
-            return;
-        }
-
-        if (asyncJITWarmupEnabled())
-        {
-            uint64_t const fingerprint = jitWarmupFingerprint(warmupParams);
-            int const deviceId = tensorrt_llm::common::getDevice();
             TLLM_LOG_INFO(
-                "TRTLLM-Gen FMHA JIT warmup: scheduling background compilation of the generation-kernel grid "
+                "TRTLLM-Gen FMHA JIT warmup: scheduled background compilation of the generation-kernel grid "
                 "(device=%d, maxBatchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d, fingerprint=%llx).",
                 deviceId, maxBatchSize, maxSeqLenQ, maxSeqLenKv, static_cast<unsigned long long>(fingerprint));
-            bool const queued = getAsyncJITWarmupWorker().enqueue(
-                [this, warmupParams, deviceId, fingerprint]()
-                {
-                    try
-                    {
-                        TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-                        runJITWarmupGrid(warmupParams);
-                    }
-                    catch (...)
-                    {
-                        // Mark done even on failure so the fingerprint is not stranded in
-                        // kScheduled: the foreground verify pass then re-runs this sweep
-                        // and compiles whatever the background pass did not finish,
-                        // instead of dedupe silently suppressing it forever.
-                        markJITWarmupBackgroundDone(fingerprint);
-                        throw;
-                    }
-                    markJITWarmupBackgroundDone(fingerprint);
-                    TLLM_LOG_INFO(
-                        "TRTLLM-Gen FMHA JIT warmup: background compilation of the generation-kernel grid "
-                        "finished (fingerprint=%llx).",
-                        static_cast<unsigned long long>(fingerprint));
-                });
-            if (!queued)
-            {
-                runJITWarmupGrid(runnerParams);
-                markJITWarmupBackgroundDone(fingerprint);
-            }
-            return;
         }
-
-        runJITWarmupGrid(runnerParams);
     }
 
     void runJITWarmupGrid(RunnerParams const& runnerParams)

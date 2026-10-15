@@ -339,6 +339,74 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Outcome of scheduleJITWarmupSweep().
+enum class JITWarmupScheduleResult : int
+{
+    kDuplicate = 0, // An identical sweep was already registered; nothing ran.
+    kQueued,        // Queued on the background worker.
+    kRanInline,     // Ran on the calling thread: async disabled, or the worker could not accept work.
+};
+
+// Registers one warmup sweep and either queues it on the background worker or
+// runs it inline. This is the single scheduling path, shared by the kernel and
+// by the protocol tests.
+//
+// - Deduplication: a sweep whose fingerprint is already registered, whether
+//   scheduled, finished, or verified, is dropped. This applies in async and in
+//   sync mode alike, so the fingerprint must cover every input that changes
+//   the set of kernels a sweep compiles.
+// - Async mode (`worker` non-null): the sweep is registered as kScheduled and
+//   queued. The background task marks it kBackgroundDone whether or not
+//   `runSweep` throws, so a failed sweep is re-run by the verify pass instead
+//   of being deduplicated away. If the worker cannot accept work (its thread
+//   failed to start, or it is shut down), the sweep runs inline and is marked
+//   done from the calling thread.
+// - Sync mode (`worker` null): the sweep is registered as kVerified and run
+//   inline.
+//
+// `runSweep(params, deviceId)` performs the sweep; when it runs on the worker
+// thread it is responsible for making `deviceId` current. `registry` must
+// outlive every queued task.
+template <typename TRegistry, typename TParams, typename TInstance, typename TRunSweep>
+JITWarmupScheduleResult scheduleJITWarmupSweep(TRegistry& registry, TllmGenFmhaAsyncWarmupWorker* worker,
+    uint64_t fingerprint, TParams const& params, int deviceId, TInstance* instance, TRunSweep runSweep)
+{
+    bool const async = worker != nullptr;
+    if (registry.tryRegister(
+            fingerprint, params, async ? JITWarmupState::kScheduled : JITWarmupState::kVerified, deviceId, instance))
+    {
+        return JITWarmupScheduleResult::kDuplicate;
+    }
+    if (!async)
+    {
+        runSweep(params, deviceId);
+        return JITWarmupScheduleResult::kRanInline;
+    }
+    bool const queued = worker->enqueue(
+        [&registry, fingerprint, params, deviceId, runSweep]()
+        {
+            try
+            {
+                runSweep(params, deviceId);
+            }
+            catch (...)
+            {
+                registry.markBackgroundDone(fingerprint);
+                throw;
+            }
+            registry.markBackgroundDone(fingerprint);
+        });
+    if (queued)
+    {
+        return JITWarmupScheduleResult::kQueued;
+    }
+    runSweep(params, deviceId);
+    registry.markBackgroundDone(fingerprint);
+    return JITWarmupScheduleResult::kRanInline;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Process-wide tally of the export library's kernel-cache results, one entry
 // per generateAndCompileKernel() call. A cache miss is a compile, so a miss
 // count that does not change across a request proves the request compiled

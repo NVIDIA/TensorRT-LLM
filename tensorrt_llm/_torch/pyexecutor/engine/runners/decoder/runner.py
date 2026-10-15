@@ -773,18 +773,7 @@ class DecoderRunner(ScheduledModelRunner):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Warm up every graph shape before capturing any graph. Attention
-        # kernels can switch implementations at smaller batch sizes and require
-        # a larger workspace, so the first pass grows the workspace to its
-        # maximum size. The second pass runs the final per-shape warmup and
-        # captures without resizing the workspace.
-        # Capture with the steady-state MoE all-to-all budget: the timeout is a
-        # launch argument and is baked into every later replay.
-        with (
-            self._warmup_timer.phase("cuda_graph_capture"),
-            moe_a2a_steady_state_budget_for_capture(),
-        ):
-            self._run_cuda_graph_warmup_and_capture(resource_manager)
+        self._run_cuda_graph_warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -1902,23 +1891,36 @@ class DecoderRunner(ScheduledModelRunner):
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes for draft_len in draft_lengths]
 
     def _run_cuda_graph_warmup_and_capture(self, resource_manager: ResourceManager) -> None:
-        """Run the graph-shape warmup pass, then capture.
+        """Finish the TRTLLM-Gen FMHA JIT warmup, then warm up every graph shape and capture.
 
-        The two passes are separated by the TRTLLM-Gen FMHA JIT warmup barrier:
-        every attention kernel the warmup derived must be compiled before any
-        launch is captured into a graph, and before the engine reports ready.
-        The barrier runs regardless of whether CUDA graphs or the general
+        The JIT warmup barrier comes first, before the steady-state MoE
+        all-to-all budget is entered: every sweep was queued during the
+        attention warmup, and the graph-shape warmup pass runs eager forwards
+        with real collectives under that budget, so compiling (or waiting on a
+        background compile) between two all-to-alls on one rank would spend
+        it. The barrier runs regardless of whether CUDA graphs or the general
         warmup are enabled, so configurations without graphs still finish
         verification before readiness.
+
+        Attention kernels can switch implementations at smaller batch sizes
+        and require a larger workspace, so the first graph pass grows the
+        workspace to its maximum size. The second pass runs the final
+        per-shape warmup and captures without resizing the workspace. Both
+        run with the steady-state budget: the timeout is a launch argument
+        and is baked into every later replay.
         """
-        with self.cuda_graph_runner.allow_capture():
+        self._drain_and_verify_trtllm_gen_fmha_jit_warmup()
+        with (
+            self._warmup_timer.phase("cuda_graph_capture"),
+            moe_a2a_steady_state_budget_for_capture(),
+            self.cuda_graph_runner.allow_capture(),
+        ):
             self.cuda_graph_runner.is_warmup_only = True
             try:
                 self._run_cuda_graph_warmup(resource_manager)
             finally:
                 self.cuda_graph_runner.is_warmup_only = False
             self.cuda_graph_runner.padding_dummy_requests = {}
-            self._drain_and_verify_trtllm_gen_fmha_jit_warmup()
             self._run_cuda_graph_warmup(resource_manager)
 
     def _drain_and_verify_trtllm_gen_fmha_jit_warmup(self) -> None:
@@ -1942,10 +1944,11 @@ class DecoderRunner(ScheduledModelRunner):
                     f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} "
                     "background warmup sweep(s) before CUDA graph capture."
                 )
-            # Each rank only waited for its own compilation. The capture forwards
-            # below run collectives under the steady-state MoE all-to-all budget,
-            # so a rank that enters one while a peer is still compiling could
-            # exhaust that budget waiting. Meet the peers here first.
+            # Each rank only waited for its own compilation. The graph-shape
+            # warmup and capture forwards that follow run collectives under the
+            # steady-state MoE all-to-all budget, so a rank that enters one
+            # while a peer is still compiling could exhaust that budget
+            # waiting. Meet the peers here first.
             allgather = self._warmup_agreement_allgather()
             if allgather is not None:
                 allgather(1)

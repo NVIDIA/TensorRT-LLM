@@ -105,6 +105,7 @@ endif()
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
 add_gtest(fmhaJitWarmupTest fmhaJitWarmupTest.cpp)
+add_gtest(fmhaJitWarmupFingerprintTest fmhaJitWarmupFingerprintTest.cpp)
 add_gtest(fmhaJitWarmupProcessExitTest fmhaJitWarmupProcessExitTest.cpp)
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
