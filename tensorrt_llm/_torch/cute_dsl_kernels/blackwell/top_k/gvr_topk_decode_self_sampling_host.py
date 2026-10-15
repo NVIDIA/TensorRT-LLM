@@ -316,6 +316,9 @@ def route(
         if streaming_splits <= 4 or (b <= 16 and n == 32768):
             return _reg(1024, (n4 + 1023) // 1024, 1, 2 * NB)
 
+    if n <= 12288:
+        return _reg(512, (n4 + 511) // 512, 2, NBSEL)
+
     # ====================== streaming / collect path ========================
     R = 1
     if b <= 32:
