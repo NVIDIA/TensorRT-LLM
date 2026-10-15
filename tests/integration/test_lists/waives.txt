@@ -201,6 +201,8 @@ test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert
 test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/6891165)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
 unittest/_torch/attention/test_attention_mla.py::test_attention_mla SKIP (https://nvbugs/6862662)
+unittest/_torch/compilation/test_phase_selective_forward.py::test_decoder_runner_warmup_bypasses_only_auxiliary_phases[False] SKIP (https://nvbugs/6934434)
+unittest/_torch/compilation/test_phase_selective_forward.py::test_decoder_runner_warmup_bypasses_only_auxiliary_phases[True] SKIP (https://nvbugs/6934434)
 unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestExternalDrafterKvDtype SKIP (https://nvbugs/6800223)
 unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestSplitGpuBudgetForDraft::test_both_managers_can_be_fixed_only SKIP (https://nvbugs/6800223)
 unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestSplitGpuBudgetForDraft::test_exact_fixed_budget_rejects_a_linear_manager SKIP (https://nvbugs/6800223)
