@@ -197,9 +197,10 @@ block with a flat `nodes:` list. Each node is a task:
   task's `### <id>` heading.
 - `type` — the primary tag; `tags` — optional list of extra tags.
 - `priority` — the task's claim on shared GPUs, one of `accuracy`, `feature`,
-  `perf` (see Keep every worker busy). Optional: left out, a `perf`-tagged
-  task is `perf`, the path to the first whole-model accuracy result is
-  `accuracy`, and the rest is `feature`. Change it whenever the situation
+  `perf` (see Keep every worker busy). Optional: left out, the first
+  whole-model accuracy gate on the target and everything upstream of it is
+  `accuracy`, other `perf`-tagged tasks are `perf`, and the rest is
+  `feature`. Change it whenever the situation
   does; it never re-runs a task.
 - `depends_on` — the tasks that must finish first. **A task starts from the
   merged code of the tasks it depends on**; this is the only way code reaches

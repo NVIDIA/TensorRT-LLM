@@ -204,7 +204,7 @@ def test_priorities_default_by_role_and_can_be_set():
     assert spec.priorities["op-gated-delta"] == "accuracy"
     assert spec.priorities["feat-fp8-kv"] == "feature"
     assert spec.priorities["perf-moe-gemm"] == "perf"
-    # Defaults: gsm8k-final follows perf work, so only the first gate's path is accuracy.
+    # Defaults: gsm8k is the first gate on a target; gsm8k-final has it upstream.
     bare = PLAN_EXAMPLE.replace("    priority: accuracy\n", "").replace(
         "    priority: feature\n", ""
     )
@@ -231,3 +231,43 @@ def test_changing_a_running_task_priority_is_allowed():
         _VALID_NODES.replace("type: new_op", "type: new_op\n    priority: perf"), ["a", "b", "land"]
     )
     assert parse_plan(text, previous=previous, states=states).priorities["a"] == "perf"
+
+
+def test_a_perf_task_on_the_way_to_the_first_gate_is_accuracy():
+    nodes = """\
+  - id: op
+    type: new_op
+  - id: fuse
+    type: perf
+    depends_on: [op]
+  - id: protocol
+    type: e2e_accuracy
+  - id: tgt
+    type: merge
+    kind: merge
+    tags: [target]
+    depends_on: [op, fuse]
+  - id: gate
+    type: merge
+    kind: merge
+    tags: [e2e_accuracy]
+    depends_on: [tgt, protocol]
+  - id: tune
+    type: perf
+    depends_on: [tgt]
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [gate, tune]
+"""
+    spec = parse_plan(_plan(nodes, ["op", "fuse", "protocol", "tgt", "gate", "tune", "land"]))
+    assert spec.priorities == {
+        "op": "accuracy",
+        "fuse": "accuracy",
+        "protocol": "accuracy",
+        "tgt": "accuracy",
+        "gate": "accuracy",
+        "tune": "perf",
+        "land": "feature",
+    }

@@ -77,9 +77,9 @@ block to the worker's system prompt (`prompts/tags.py`).
 
 A node's optional `priority` (`accuracy` > `feature` > `perf`) is its claim on
 shared GPUs; the orchestrator publishes it in `gpu_priorities.json` for a GPU
-pool to serve. Left out, `perf`-tagged tasks are `perf`, an `e2e_accuracy`
-task with no `perf` task upstream and everything upstream of it are
-`accuracy`, and the rest are `feature`. Changing it never re-runs a task.
+pool to serve. Left out, the first `e2e_accuracy` gate built on a `target`
+task (one with no such gate upstream) and everything upstream of it are
+`accuracy`, other `perf`-tagged tasks are `perf`, and the rest are `feature`. Changing it never re-runs a task.
 
 ## Plan rules
 

@@ -162,20 +162,28 @@ def default_priorities(
 ) -> dict[str, str]:
     """The priority class of each task when the plan does not set one.
 
-    ``perf``-tagged tasks are ``perf``. An ``e2e_accuracy`` task with no
-    ``perf`` task upstream is on the path to the first accuracy result, so it
-    and everything upstream of it are ``accuracy``. The rest are ``feature``.
+    The first accuracy gates are the ``e2e_accuracy`` tasks that build on a
+    ``target`` task with no such gate upstream (without a ``target`` task,
+    the ``e2e_accuracy`` tasks with none upstream). They and everything
+    upstream of them are ``accuracy``, ``perf``-tagged tasks among them
+    included: they are on the way to the first result. The other ``perf``
+    tasks are ``perf``, and the rest are ``feature``.
     """
-    perf = {tid for tid, t in tags.items() if "perf" in t}
-    accuracy: set[str] = set()
-    for node in graph.nodes:
-        if "e2e_accuracy" not in tags[node.id] or node.id in perf:
-            continue
-        upstream = _ancestors(graph, node.id)
-        if not upstream & perf:
-            accuracy |= {node.id} | upstream
+    ancestors = {node.id: _ancestors(graph, node.id) for node in graph.nodes}
+    targets = {tid for tid, t in tags.items() if "target" in t}
+    gates = {
+        tid
+        for tid, t in tags.items()
+        if "e2e_accuracy" in t and (not targets or ancestors[tid] & targets)
+    }
+    first = {tid for tid in gates if not ancestors[tid] & gates}
+    accuracy = first.union(*(ancestors[tid] for tid in first))
     return {
-        node.id: "perf" if node.id in perf else "accuracy" if node.id in accuracy else "feature"
+        node.id: "accuracy"
+        if node.id in accuracy
+        else "perf"
+        if "perf" in tags[node.id]
+        else "feature"
         for node in graph.nodes
     }
 
