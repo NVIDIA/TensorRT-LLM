@@ -126,6 +126,7 @@ class _SparseRuntime:
 
 def _manager(tokens_per_block=128):
     manager = object.__new__(DeepseekV4CacheManager)
+    manager.kv_cache_type = CacheTypeCpp.SELFKONLY
     manager._enable_kv_cache_offload = True
     manager.max_beam_width = 1
     manager.max_draft_len = 0
@@ -231,6 +232,7 @@ def _history_case(
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.conversation_manager = None
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     cache = _HistoryCache(tokens_per_block, manager._stream.cuda_stream)
     manager.kv_cache_map = {20: cache}
     request = SimpleNamespace(

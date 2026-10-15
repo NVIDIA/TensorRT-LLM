@@ -112,7 +112,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     max_draft_tokens: int = 0
     # Indexer head dimension
     indexer_head_dim: int = 128
-    # Indexer quant block size
+    # Elements per four-byte scale word, matching Indexer.prepare().
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
@@ -573,8 +573,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         msl_c = int(self.get_indexer_max_seq_len())
         # Prefill leg first: the decode-stride guard below may return early for
         # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
+        # forwarded only when enabled (keeps the default warmup calls unchanged)
+        det_kw = (
+            {"deterministic": True}
+            if getattr(self.sparse_metadata_params, "gvr_deterministic_topk", False)
+            else {}
+        )
         try:
-            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
+            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768), **det_kw)
         except torch.cuda.OutOfMemoryError:
             logger.warning(
                 "self-sampling GVR prefill warmup ran out of memory; prefill "
@@ -602,6 +608,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
+                **det_kw,
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines
@@ -661,6 +668,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.refresh_ragged_row_kv_lens()
             self.refresh_token_major_gen_rows()
 
+        # Uncached DSA prefill aliases these scatter maps as gather maps.
         if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
@@ -687,7 +695,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 req_indices,
                 index_head_dim,
                 self._tokens_per_block,
-                self.kv_cache_manager.quant_block_size,
+                self.indexer_quant_block_size,
                 data_bytes_per_token=data_bytes_per_token,
             )
             self.slot_mapping_fp8[: self.num_tokens] = fp8_indices
@@ -799,7 +807,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             max_query_len=1 + self.max_draft_tokens,
             tokens_per_block=self._tokens_per_block,
             index_head_dim=index_head_dim,
-            quant_block_size=self.kv_cache_manager.quant_block_size,
+            quant_block_size=self.indexer_quant_block_size,
             data_bytes_per_token=data_bytes_per_token,
         )
 

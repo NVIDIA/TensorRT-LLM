@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import faulthandler
 import json
@@ -302,6 +305,12 @@ class GenerationExecutor(ABC):
                 self.shutdown()
             raise error
 
+        # Called once per streamed response: skip the get_nowait() raise/catch
+        # of Empty in the common no-error case. An error enqueued concurrently
+        # is picked up on the next call.
+        if self._error_queue.empty():
+            return
+
         # Drain the first error from the queue using get_nowait() to
         # avoid blocking if another thread consumed the item between
         # the empty() check and the get() call.  Per-request errors
@@ -435,6 +444,14 @@ class GenerationExecutor(ABC):
         Returns:
             dict: Primary/GPU KV cache capacity.
         """
+        return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Get startup OpenEngine node and KV publisher discovery metadata."""
+        return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a non-destructive primary/GPU KV cache load snapshot."""
         return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:

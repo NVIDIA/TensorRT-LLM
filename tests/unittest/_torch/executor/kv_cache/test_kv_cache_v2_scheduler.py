@@ -22,12 +22,14 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -50,6 +52,7 @@ def test_generation_admits_decode_before_capacity_growth(
     manager._ensure_generation_beam_width = Mock(return_value=beam_admitted)
     manager._generation_draft_slots = Mock(return_value=0)
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._has_cp_helix = False
     manager._fill_fresh_kv_pages = Mock()
     manager._log_window_crossing = Mock()
@@ -95,7 +98,7 @@ def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager.is_draft = is_draft
     manager._stream = Mock(cuda_stream=123)
     manager.sparse_metadata_batch = Mock()
-    manager.kv_connector_manager = Mock()
+    manager.kv_connector_manager = Mock(capacity_only=False)
     manager._prepare_draft_resources = order.prepare_draft
     manager._run_kv_connector_hooks = order.connector
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
@@ -335,6 +338,7 @@ def make_gen_request(
     request_id, beam_width=1, num_draft_tokens=0, lora_task_id=None, is_first_context_chunk=False
 ):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = GEN_IN_PROGRESS
@@ -363,13 +367,14 @@ def make_ctx_request(
     encoder_output_len: int | None = None,
 ) -> Mock:
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = CONTEXT_INIT
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
     req.context_current_position = 0
-    req.py_connector_served_position = 0
+    req.py_served_prefix_end = 0
     req.expect_snapshot_points = []
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
@@ -388,6 +393,7 @@ def make_ctx_request(
 
 def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = ENCODER_INIT
@@ -407,6 +413,7 @@ def make_disagg_request(
     prompt_len=None,
 ):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
@@ -424,6 +431,7 @@ def make_disagg_request(
 
 def make_filtered_request(request_id, state_value=0):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = state_value
@@ -432,6 +440,145 @@ def make_filtered_request(request_id, state_value=0):
     req.is_first_context_chunk = True
     req.py_draft_tokens = None
     return req
+
+
+def make_replay_request(new_tokens=1000, **kwargs):
+    req = make_ctx_request(7, new_tokens, **kwargs)
+    req.py_multimodal_data = None
+    req.py_ced_replay = EncoderReplay(7, 123, 4000, 3872)
+    return req
+
+
+class TestEncoderReplayBudget:
+    @pytest.mark.parametrize("prefix_aware", [False, True])
+    @pytest.mark.parametrize(
+        "suffix,replay_rows,budget,expected_rows",
+        [(128, 0, 128, 128), (127, 128, 255, 255), (256, 0, 128, 128)],
+    )
+    def test_budget_uses_manager_reported_replay_rows(
+        self, prefix_aware, suffix, replay_rows, budget, expected_rows
+    ):
+        req = make_replay_request(suffix, prompt_len=4000 + suffix)
+        mgr = make_kv_cache_manager()
+        mgr.context_replay_tokens.side_effect = None
+        mgr.context_replay_tokens.return_value = replay_rows
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=budget,
+            ctx_chunk_config=(None, 128),
+            enable_prefix_aware_scheduling=prefix_aware,
+        )
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.SCHEDULED
+        expected_chunk = min(suffix, budget - replay_rows)
+        assert req.context_chunk_size == expected_chunk
+        assert cost == expected_rows
+        mgr.resize_context.assert_called_once_with(req, expected_chunk)
+
+    @pytest.mark.parametrize(
+        "budget,new_tokens,expected",
+        [(1128, 1000, 1000), (1024, 1000, 896), (129, 1, 1)],
+    )
+    @pytest.mark.parametrize("prefix_aware", [False, True])
+    def test_claim_reserves_physical_replay_rows(self, budget, new_tokens, expected, prefix_aware):
+        req = make_ctx_request(7, 4000 + new_tokens)
+        req.py_multimodal_data = None
+        req.py_ced_replay = None
+        mgr = make_kv_cache_manager()
+
+        def claim(request):
+            request.context_current_position = 4000
+            request.context_remaining_length = new_tokens
+            request.py_ced_replay = EncoderReplay(7, 123, 4000, 3872)
+            return True
+
+        mgr.prepare_context.side_effect = claim
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=budget,
+            ctx_chunk_config=(None, 128),
+            enable_prefix_aware_scheduling=prefix_aware,
+        )
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+        )
+        assert req.context_current_position == 4000
+        assert not req.py_ced_replay.consumed
+        assert action is ScheduleAction.SCHEDULED
+        assert req.context_chunk_size == expected
+        assert cost == expected + 128
+        mgr.resize_context.assert_called_once_with(req, expected)
+
+    @pytest.mark.parametrize("budget", [128, 129, 255])
+    def test_long_suffix_rejects_budget_that_can_never_make_progress(self, budget):
+        req = make_replay_request()
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=budget, ctx_chunk_config=(None, 128))
+        with pytest.raises(ValueError, match="Encoder replay cannot make progress"):
+            sched._try_schedule_context_chunked(
+                req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+            )
+        mgr.resize_context.assert_not_called()
+
+    def test_busy_batch_defers_replay_until_budget_is_available(self):
+        req = make_replay_request()
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 128))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(128, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.SKIP
+        assert cost == 0
+        mgr.resize_context.assert_not_called()
+
+    @pytest.mark.parametrize("snapshot_offset", [1, 100])
+    def test_forced_snapshot_boundary_controls_minimum_replay_budget(self, snapshot_offset):
+        req = make_replay_request(prompt_len=5000)
+        req.context_current_position = 4000
+        req.expect_snapshot_points = [4000 + snapshot_offset]
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr, max_num_tokens=129, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128)
+        )
+        if snapshot_offset == 1:
+            action, cost, _ = sched._try_schedule_context_chunked(
+                req, BudgetTracker(129, 1), preempt_for_pages=lambda _req: False
+            )
+            assert action is ScheduleAction.SCHEDULED
+            assert cost == 129
+            assert req.context_chunk_size == 1
+        else:
+            with pytest.raises(ValueError, match="Encoder replay cannot make progress"):
+                sched._try_schedule_context_chunked(
+                    req, BudgetTracker(129, 1), preempt_for_pages=lambda _req: False
+                )
+            mgr.resize_context.assert_not_called()
+
+    def test_consumed_replay_does_not_charge_later_chunk(self):
+        req = make_ctx_request(7, 1000, is_first_context_chunk=False)
+        req.py_multimodal_data = None
+        req.context_current_position = 4896
+        req.py_ced_replay = EncoderReplay(7, 123, 4000, 3872, consumed=True)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 128))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(1024, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.SCHEDULED
+        assert cost == 1000
+        assert req.context_chunk_size == 1000
+
+    def test_full_context_admission_includes_replay(self):
+        req = make_replay_request(1)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=128)
+        action, _, _ = sched._try_schedule_context_full(
+            req, BudgetTracker(128, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.STOP
+        mgr.resize_context.assert_not_called()
 
 
 class _KVCacheMap(dict):
@@ -478,6 +625,9 @@ def make_kv_cache_manager(
     # and both feed _spec_recompute_tail/is_draft into the reuse-claim cap.
     mgr._spec_recompute_tail = 0
     mgr.is_draft = False
+    mgr.context_replay_tokens.side_effect = lambda req: (
+        encoder_replay_tokens(req) if isinstance(req.py_ced_replay, EncoderReplay) else None
+    )
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
     mgr.is_vswa = is_vswa
@@ -2606,6 +2756,31 @@ class TestEncoder:
         cross_mgr.prepare_context.assert_not_called()
         cross_mgr.resize_context.assert_not_called()
         cross_mgr.try_allocate_generation.assert_not_called()
+        cross_mgr._create_kv_cache.assert_not_called()
+        cross_mgr._resume_and_restore.assert_not_called()
+        assert not cross_mgr.kv_cache_map
+
+    @pytest.mark.parametrize("ctx_chunk_config", [None, (None, 64)], ids=["full", "chunked"])
+    def test_encoder_is_not_an_eviction_or_recompute_victim(
+        self, ctx_chunk_config: tuple | None
+    ) -> None:
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            can_evict=True,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_encoder_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=ctx_chunk_config)
+        context = make_ctx_request(0, context_remaining_length=64, encoder_output_len=80)
+        encoder = make_encoder_request(1, encoder_output_len=80)
+
+        out = sched.schedule_request([context, encoder], set())
+
+        assert ids(out.encoder_requests) == [1]
+        assert not out.context_requests
+        assert not out.paused_requests
+        mgr.preempt_request.assert_not_called()
+        mgr.suspend_request.assert_not_called()
+        assert encoder not in [entry.args[0] for entry in mgr.free_resources.call_args_list]
 
     def test_encoder_without_cross_manager_raises(self):
         """No cross_kv_cache_manager -> encoder request cannot be admitted.
@@ -2687,6 +2862,94 @@ class TestEncoder:
         self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
         cross_mgr.prepare_context.assert_not_called()
         cross_mgr.resize_context.assert_not_called()
+
+
+class TestCrossKVAllocationFailures:
+    @pytest.mark.parametrize("failure", ["resume", "resize"])
+    @pytest.mark.parametrize("ctx_chunk_config", [None, (None, 64)], ids=["full", "chunked"])
+    def test_failed_admission_releases_both_pools_and_retries(
+        self, failure: str, ctx_chunk_config: tuple | None
+    ) -> None:
+        """A failed cross allocation must leave capacity for later requests and retries."""
+        self_mgr = make_kv_cache_manager(can_evict=True)
+        cross_mgr = make_kv_cache_manager()
+        cross_mgr.num_extra_kv_tokens = 2
+        failed_cache = Mock(capacity=0)
+        failed_cache.resize.return_value = failure != "resize"
+        cross_mgr.kv_cache_map[0] = failed_cache
+        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: not (
+            failure == "resume" and cache is failed_cache
+        )
+
+        def prepare_context(req: Mock, reuse_limit: int | None = None) -> bool:
+            self_mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        self_mgr.prepare_context.side_effect = prepare_context
+        for manager in (self_mgr, cross_mgr):
+            manager.free_resources.side_effect = (
+                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            )
+        sched = make_encoder_scheduler(
+            self_mgr,
+            cross_kv_cache_manager=cross_mgr,
+            max_batch_size=1,
+            max_num_tokens=128,
+            ctx_chunk_config=ctx_chunk_config,
+        )
+        prompt_len = 256 if ctx_chunk_config else 128
+        blocked = make_ctx_request(0, context_remaining_length=prompt_len, encoder_output_len=80)
+        following = make_ctx_request(1, context_remaining_length=128, encoder_output_len=80)
+
+        out = sched.schedule_request([blocked, following], set())
+
+        # The failed request consumes neither the token budget nor the single batch slot.
+        assert ids(out.context_requests) == [1]
+        assert out.num_fitting_requests == 1
+        assert not out.paused_requests
+        self_mgr.resize_context.assert_any_call(blocked, 128)
+        self_mgr.suspend_request.assert_called_once_with(blocked)
+        cross_mgr._resume_and_restore.assert_any_call(0, failed_cache)
+        if failure == "resume":
+            failed_cache.resize.assert_not_called()
+            failed_cache.suspend.assert_not_called()
+        else:
+            failed_cache.resize.assert_called_once_with(82)
+            failed_cache.suspend.assert_called_once_with()
+        for manager in (self_mgr, cross_mgr):
+            manager.free_resources.assert_called_once_with(blocked)
+            assert 0 not in manager.kv_cache_map
+            assert 1 in manager.kv_cache_map
+        blocked.set_prepopulated_prompt_len.assert_called_once_with(0, 64)
+        assert blocked.context_current_position == 0
+        assert blocked.context_remaining_length == prompt_len
+        assert blocked.context_chunk_size == prompt_len
+        assert blocked.py_batch_idx is None
+
+        retry = sched.schedule_request([blocked], set())
+
+        assert ids(retry.context_requests) == [0]
+        assert retry.num_fitting_requests == 1
+        assert not retry.paused_requests
+        assert blocked.context_chunk_size == 128
+        assert blocked.context_current_position == 0
+        assert self_mgr.prepare_context.call_args_list == [
+            call(blocked),
+            call(following),
+            call(blocked),
+        ]
+        assert self_mgr.resize_context.call_args_list == [
+            call(blocked, 128),
+            call(following, 128),
+            call(blocked, 128),
+        ]
+        retry_cache = cross_mgr.kv_cache_map[0]
+        assert retry_cache is not failed_cache
+        cross_mgr._create_kv_cache.assert_any_call(0, blocked.lora_task_id, None)
+        cross_mgr._resume_and_restore.assert_called_with(0, retry_cache)
+        retry_cache.resize.assert_called_once_with(82)
+        for manager in (self_mgr, cross_mgr):
+            manager.free_resources.assert_called_once_with(blocked)
 
 
 # ===========================================================================
@@ -2987,6 +3250,30 @@ class TestChunkedContext:
         assert req.context_chunk_size == 256
         mgr.resize_context.assert_called_once_with(req, 256)
         draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 256)
+
+    def test_remote_tail_source_larger_than_budget_is_chunked(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000)
+        req.py_csa2_remote_tail_mode = "source"
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 192
+
+    def test_remote_tail_destination_requires_whole_tail_budget(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        first = make_ctx_request(0, context_remaining_length=128)
+        first.py_csa2_remote_tail_mode = "destination"
+        pending = make_ctx_request(1, context_remaining_length=100)
+        pending.py_csa2_remote_tail_mode = "destination"
+
+        out = sched.schedule_request([first, pending], set())
+
+        assert ids(out.context_requests) == [0]
+        assert pending.context_chunk_size == 0
 
     def test_min_budget_check(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -4666,3 +4953,66 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
     output = scheduler.schedule_request([loading, generation], set())
     assert output.generation_requests == []
     assert output.recompute_paused_requests == []
+
+
+@pytest.mark.parametrize("remote_mode", [None, "source", "destination"])
+def test_replay_only_batch_clears_deferred_generation_overlap_state(
+    remote_mode: str | None,
+) -> None:
+    """A resumed decode must not compensate for a token already harvested on CPU."""
+    manager = make_kv_cache_manager()
+    scheduler = make_scheduler(manager, max_num_tokens=256)
+    decoding = make_gen_request(0)
+    decoding.py_batch_idx = 7
+    replay = make_ctx_request(1, context_remaining_length=128)
+    replay.py_csa2_remote_tail_mode = remote_mode
+
+    first = scheduler.schedule_request([decoding, replay], set())
+    assert ids(first.context_requests) == [1]
+    if remote_mode is None:
+        assert ids(first.generation_requests) == [0]
+        assert decoding.py_batch_idx == 7
+    else:
+        assert not first.generation_requests
+        assert decoding.py_batch_idx is None
+        manager.try_allocate_generation.assert_not_called()
+        manager.suspend_request.assert_not_called()
+
+    # After replay finishes, the deferred request resumes without losing KV.
+    resumed = scheduler.schedule_request([decoding], set())
+    assert ids(resumed.generation_requests) == [0]
+    manager.try_allocate_generation.assert_called_with(decoding)
+
+
+@pytest.mark.parametrize("prompt_len", [0, 8])
+def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
+    prompt_len: int,
+) -> None:
+    """A Helix CP rank can hold none of the prompt (promptLen 0); the
+    prepopulated-length setter rejects any value there, so rewinding must not
+    call it, while the context cursor is still reset."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
+
+    def set_prepopulated_prompt_len(value: int, tokens_per_block: int) -> None:
+        if not value < prompt_len:
+            raise RuntimeError("prepopulatedPromptLen >= promptLen")
+
+    request = Mock(
+        prompt_len=prompt_len,
+        context_current_position=4,
+        context_chunk_size=2,
+        estimated_reusable_tokens=4,
+        py_ctx_pre_resize_cap=16,
+    )
+    request.set_prepopulated_prompt_len = Mock(side_effect=set_prepopulated_prompt_len)
+
+    rewind_context_after_cache_drop(request, 32)
+
+    if prompt_len > 0:
+        request.set_prepopulated_prompt_len.assert_called_once_with(0, 32)
+    else:
+        request.set_prepopulated_prompt_len.assert_not_called()
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == prompt_len
+    assert request.estimated_reusable_tokens == 0
+    assert request.py_ctx_pre_resize_cap is None

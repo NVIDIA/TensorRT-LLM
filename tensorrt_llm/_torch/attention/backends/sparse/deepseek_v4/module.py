@@ -277,6 +277,11 @@ def prepare_sparse_attn_outputs(
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
+        if get_sm_version() == 107:
+            # is_sm_100f() is true on Rubin, but its quantized-attention output
+            # is not numerically compatible with this FMHA epilogue; keep the
+            # standard O-LoRA projection path there.
+            return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):
@@ -1096,6 +1101,7 @@ def forward_sparse_attn(
         and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
         and self.q_b_proj.bias is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
+        and getattr(self.q_b_proj, "_locality_domain_weight_shards", None) is None
         and not _is_fused_q_fp8_quant_enabled(
             self, num_generations=num_generations, num_contexts=num_contexts
         )

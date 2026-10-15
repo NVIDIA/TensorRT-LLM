@@ -9,7 +9,9 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          is_speculators_dspark_config,
+                                          translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -45,7 +47,9 @@ def resolve_cache_transceiver_config(
             "enable_pipelined_transfer is set; auto-selecting the Python "
             "transceiver instead of the C++ transceiver to enable "
             "pipelined KV cache transfer. "
-            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+            "Set transceiver_runtime='CPP' and "
+            "kv_cache_config.use_kv_cache_manager_v2=False to select C++ "
+            "with a model that supports V1; disable pipelined transfer too.")
         cache_transceiver_config.transceiver_runtime = "PYTHON"
     elif runtime == "CPP" and enable_pipelined_transfer:
         raise ValueError(
@@ -58,8 +62,9 @@ def resolve_cache_transceiver_config(
         raise ValueError(
             f"Python transceiver currently only supports NIXL backend, "
             f"got {effective_backend}. "
-            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-        )
+            "Please use transceiver_runtime='CPP' with "
+            "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+            "or MOONCAKE backends, with a model that supports V1.")
 
 
 def uses_vswa_kv_cache_layout(
@@ -987,6 +992,18 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif is_speculators_dspark_config(config_dict):
+        # A DSpark drafter in the vLLM speculators format: no top-level
+        # model_type, and its auto_map needs the speculators package. Build
+        # the backbone's config from the translation the spec config uses.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        translated = translate_speculators_dspark_config(config_dict)
+        model_config = CONFIG_MAPPING["qwen3"].from_dict(translated)
+        logger.info(
+            f"{model_name_or_path}: speculators-format DSpark drafter, read as "
+            f"qwen3 with target_layer_ids "
+            f"{translated['dflash_config']['target_layer_ids']} "
+            f"(aux_hidden_state_layer_ids - 1) and no sliding window")
     elif model_type in ("glm5_next", "glm5_next_text"):
         from tensorrt_llm._torch import configs
         config_name = ("Glm5NextConfig"
@@ -1073,6 +1090,30 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # Preserve the composite config and propagate its dtype to the text tower.
+        # Vision checkpoints use the internal ConditionalGeneration dispatch alias.
+        from tensorrt_llm._torch.configs import (DeepseekV41Config,
+                                                 DeepseekV41TextConfig)
+        nested_text = config_dict.get("text_config")
+        if isinstance(nested_text, dict) and nested_text:
+            resolved_dtype = _resolve_composite_torch_dtype(
+                config_dict, nested_text)
+            model_config = DeepseekV41Config.from_dict(config_dict, **kwargs)
+            model_config.text_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_config.text_config.torch_dtype = resolved_dtype
+            model_config.torch_dtype = resolved_dtype
+        else:
+            # ``dict(config_dict)`` already carries the top-level
+            # ``quantization_config``, and ``DeepseekV41TextConfig`` propagates it
+            # in ``__init__`` (see the note above), so the flat branch needs no
+            # hoisting step of its own.
+            model_config = DeepseekV41TextConfig.from_dict(
+                dict(config_dict), **kwargs)
+        model_config.architectures = ["DeepseekV41ForCausalLM"]
+        vision_config = getattr(model_config, "vision_config", None)
+        if getattr(vision_config, "num_hidden_layers", 0) > 0:
+            model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

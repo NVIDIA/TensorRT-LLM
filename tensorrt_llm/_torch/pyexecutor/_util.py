@@ -42,6 +42,8 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..attention.backends.sparse.params import \
+    get_indexer_mqa_logits_workspace_bytes
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -108,7 +110,9 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
 
 
 def kv_cache_manager_v2_incompatible_features(
-        max_beam_width: Optional[int]) -> List[str]:
+        max_beam_width: Optional[int],
+        *,
+        enable_sleep: bool = False) -> List[str]:
     """Runtime features a V2 manager cannot serve.
 
     ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
@@ -124,11 +128,14 @@ def kv_cache_manager_v2_incompatible_features(
     """
     # The C++ backend supports beam search. Model-specific restrictions are
     # validated by KvCacheCreator before constructing the manager.
-    return []
+    # V2's native allocations are not tracked by release_with_tag.
+    return ["SleepConfig"] if enable_sleep else []
 
 
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
-                                    max_beam_width: Optional[int]) -> bool:
+                                    max_beam_width: Optional[int],
+                                    *,
+                                    enable_sleep: bool = False) -> bool:
     """Whether the executor will actually hold a V2 manager.
 
     ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
@@ -137,7 +144,8 @@ def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
     a pool from the request would leave V2 geometry on a V1 executor.
     """
     return (kv_cache_config.use_kv_cache_manager_v2 is True
-            and not kv_cache_manager_v2_incompatible_features(max_beam_width))
+            and not kv_cache_manager_v2_incompatible_features(
+                max_beam_width, enable_sleep=enable_sleep))
 
 
 def _resolve_disagg_transceiver_route(
@@ -268,22 +276,11 @@ def get_kv_cache_manager_cls(
                 Glm5NextCacheManager
             return Glm5NextCacheManager
 
-        # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
-        # (CppMambaHybridCacheManager) like the other hybrid linear models —
-        # per-block KDA state snapshots every mamba_state_cache_interval
-        # tokens with FORCE_CHUNK context chunking. Without block reuse the
-        # Mixed manager (separate KV / recurrent-state pools) stays the
-        # default. SA speculative decoding is validated on the Mixed
-        # manager's SpeculativeState scratch path only; reuse + SA is
-        # unvalidated. Disaggregated serving (TRTLLM-14815) routes through
-        # the shared hybrid transceiver validation below: the Python NIXL
-        # transceiver selects the Mixed manager, whose KDA recurrent/conv
-        # states transfer through the bounce buffer.
         # Helix x speculation bookkeeping (per-token verify groups on the
         # superblock ledger, py_helix_decode_group_index advancement) exists
         # only in KVCacheManagerV2. The V1-family hybrid managers account
         # helix decode one token per iteration and have no helix-x-spec
-        # path, so a default (V1) resolution would run silently wrong.
+        # path, so selecting V1 would run silently wrong.
         if (model_config.mapping is not None
                 and model_config.mapping.has_cp_helix()
                 and model_config.spec_config is not None and not use_v2):
@@ -293,6 +290,12 @@ def get_kv_cache_manager_cls(
                 "hybrid managers do not implement per-token verify-group "
                 "bookkeeping.")
 
+        # Kimi uses MambaHybridCacheManagerV2 with or without reuse when
+        # use_kv_cache_manager_v2=True, the KvCacheConfig default. V1 can
+        # be selected explicitly or resolved from "auto". Aggregated V1
+        # uses Mixed without reuse and the C++ hybrid manager with reuse.
+        # Disaggregated serving requires Python NIXL below, using V2 for
+        # the configured default or Mixed for V1 without reuse.
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
@@ -517,6 +520,15 @@ def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
             model_config)
 
 
+def get_attention_workspace_fixed_bytes(model_config, mapping,
+                                        **capacities) -> int:
+    """Capacity-sized reserve declared by the model's selected backend."""
+    from ..attention.backends.utils import get_attention_backend
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_fixed_bytes(
+            model_config, mapping, **capacities)
+
+
 def get_mla_context_workspace_kv_len_cap(
         kv_cache_config,
         max_batch_size,
@@ -557,6 +569,26 @@ def get_mla_context_workspace_kv_len_cap(
     if override is None:
         return worst_case
     return min(max(int(override), max_seq_len), worst_case)
+
+
+def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
+                                             workspace_memory: int) -> int:
+    """Bytes to carve out of the KV cache budget for the Indexer MQA-logits tile.
+
+    The profiling forward does not reach the largest logits tile the runtime can
+    allocate (fresh-prefill dummies attend only their own tokens), so reserve the
+    full reachable tile. Returns 0 if either input is non-positive, and raises if
+    the tile would leave no KV cache budget.
+    """
+    if kv_cache_memory <= 0 or workspace_memory <= 0:
+        return 0
+    if workspace_memory >= kv_cache_memory:
+        raise ValueError(
+            f"The DeepSeek-V4 Indexer MQA-logits workspace ({workspace_memory} bytes) "
+            f"needs the whole KV cache budget ({kv_cache_memory} bytes). Lower "
+            "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET or max_num_tokens, or raise "
+            "kv_cache_config.free_gpu_memory_fraction.")
+    return workspace_memory
 
 
 def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
@@ -933,7 +965,8 @@ class KvCacheCreator:
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
             incompat = kv_cache_manager_v2_incompatible_features(
-                self._max_beam_width)
+                self._max_beam_width,
+                enable_sleep=self._llm_args.sleep_config is not None)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's
@@ -974,10 +1007,22 @@ class KvCacheCreator:
                         "features to run FP4 MLA.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
-                        "Hybrid Mamba cache managers do not support "
-                        f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "to run hybrid linear models.")
+                        "Hybrid Mamba KVCacheManagerV2 does not support "
+                        f"{incompat_str}; automatic fallback is unavailable "
+                        "for hybrid linear models. Disable the "
+                        "incompatible features to run hybrid linear models.")
+                if kv_cache_config is None:
+                    kv_cache_config = self._kv_cache_config
+                if kv_cache_config.block_reuse_config.policy != "all_reusable":
+                    raise NotImplementedError(
+                        "Non-default block_reuse_config.policy requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
+                if kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens > 0:
+                    raise NotImplementedError(
+                        "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -1384,7 +1429,7 @@ class KvCacheCreator:
         return [MultimodalParams(multimodal_data=mm_data)]
 
     def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
-        """Run the full-budget MM encoder and retain request-owned output storage."""
+        """Run the full-budget MM encoder and retain equivalent store output."""
         if not self._dummy_encoder_inputs:
             return None
 
@@ -1404,7 +1449,7 @@ class KvCacheCreator:
                     )
                 output = self._model_engine.model.encode_multimodal_inputs(
                     encoder_inputs)
-                # Runtime item state owns detached copies rather than views of
+                # The runtime store owns detached copies rather than views of
                 # an encoder batch. Reproduce that allocation boundary here.
                 return output.detach().clone()
         finally:
@@ -1413,20 +1458,26 @@ class KvCacheCreator:
     def _get_multimodal_encoder_memory_reserve(self,
                                                profiled_output_bytes: int = 0
                                                ) -> int:
-        """Return output and cache capacity absent from the measured peak."""
-        output_budget = getattr(self._model_engine,
-                                "mm_encoder_output_budget_bytes", None)
-        unprofiled_output_bytes = max(0, (output_budget or 0) -
-                                      profiled_output_bytes)
-
-        model = self._model_engine.model
-        cache_bytes = 0
-        if (isinstance(model, MultimodalModelMixin)
-                and model.encoder_cache_active
-                and model.model_config.multimodal_config is not None):
-            cache_bytes = (
-                model.model_config.multimodal_config.encoder_cache_max_bytes)
-        return unprofiled_output_bytes + cache_bytes
+        """Reserve the unprofiled encoder store and chunk-assembly copies."""
+        encoder_cache = self._model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            return 0
+        reserve = encoder_cache.max_bytes
+        if self._model_engine.mm_encoder_item_scheduling_enabled:
+            # Item outputs live only in the store, so the retained profiling
+            # output already occupies part of it. Inline encoding keeps its
+            # batch output beside the store's copies; the retained output
+            # stands in for that batch, so the whole store stays unprofiled.
+            reserve = max(0, reserve - profiled_output_bytes)
+            # The text-only dummy does not assemble cached MM rows for LLM
+            # prefill. Per-request joins and their batch-wide join can coexist.
+            # Both contain only current-chunk rows, bounded by the LLM token
+            # budget even when many requests reuse the same cached item.
+            chunk_output_bytes = (
+                self._max_num_tokens *
+                self._model_engine.bytes_per_mm_encoder_embedding)
+            reserve += 2 * chunk_output_bytes
+        return reserve
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -1535,6 +1586,12 @@ class KvCacheCreator:
                 self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
+            # Make build_managers call configure_kv_cache_capacity() for
+            # the V2 memory quota. Non-HELIX CP has no sizing path there;
+            # HELIX is handled above.
+            if (self._is_kv_cache_manager_v2
+                    and 'cp_type' not in self._mapping.cp_config):
+                self._skip_est = True
             estimating_kv_cache = False
             logger.info(
                 "KV cache size estimation is not supported for Vanilla attention backend, disable it."
@@ -1650,7 +1707,7 @@ class KvCacheCreator:
 
         if py_executor is not None and not self._skip_est:
             # Run the MM encoder at its independent token budget, then keep the
-            # resulting request-owned embeddings resident while the text-only
+            # equivalent runtime-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
             encoder_profile_output = self._encode_dummy_inputs()
             if encoder_profile_output is not None:
@@ -1737,6 +1794,22 @@ class KvCacheCreator:
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
 
+        fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
+            self._model_engine.model.model_config,
+            self._mapping,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            max_seq_len=self._max_seq_len,
+            enable_cuda_graph=self._llm_args.cuda_graph_config is not None,
+        )
+        # A decode arena can first appear after the peak prefill step. Reserve
+        # its full capacity for coexistence with the profiled transient peak.
+        peak_memory += fixed_workspace_reserve
+        if fixed_workspace_reserve:
+            logger.info(
+                f"Reserving {fixed_workspace_reserve / GB:.2f} GiB for capacity-sized "
+                "attention workspace across serving steps.")
+
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
@@ -1746,6 +1819,21 @@ class KvCacheCreator:
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+
+        if getattr(self._sparse_attention_config, "algorithm",
+                   None) == "deepseek_v4":
+            workspace_memory = get_indexer_mqa_logits_workspace_bytes(
+                self._max_num_tokens, self._max_seq_len)
+            budget_before = kv_cache_max_memory
+            workspace_reserve = get_indexer_mqa_logits_workspace_reserve(
+                budget_before, workspace_memory)
+            if workspace_reserve > 0:
+                kv_cache_max_memory = int(budget_before - workspace_reserve)
+                logger.info(
+                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the DeepSeek-V4 Indexer MQA "
+                    f"logits workspace (workspace cap {workspace_memory / (GB):.2f} GiB): KV cache "
+                    f"budget {budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
+                )
 
         # Reserve headroom for attention workspace the selected backend declares and the profiling forward
         # under-measures. KV-cache reuse can push summed attended KV past the profiled floor. Chunked prefill
@@ -3318,13 +3406,23 @@ def _create_kv_cache_manager(
             **kda_extra_kwargs,
             **manager_extra_kwargs,
         )
-    elif is_mla(config):
+    elif (getattr(sparse_attention_config, "algorithm", None) == "csa2"
+          or is_mla(config)):
+        if getattr(sparse_attention_config, "algorithm", None) == "csa2":
+            manager_extra_kwargs["context_swa_layer_limit"] = (
+                _model_config.extra_attrs.get("csa2_context_swa_layer_limit"))
+            manager_extra_kwargs["bounded_replay_on_generation"] = (
+                _model_config.extra_attrs.get("bounded_replay_on_generation",
+                                              False))
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_hidden_layers,
             num_kv_heads=1,
-            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            head_dim=(getattr(config, "head_dim", 512)
+                      if sparse_attention_config is not None
+                      and sparse_attention_config.algorithm == "csa2" else
+                      config.kv_lora_rank + config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
@@ -4198,7 +4296,8 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
-    if getattr(model_engine, "mm_encoder_item_scheduling_enabled", False):
+    if (getattr(model_engine, "mm_encoder_item_scheduling_enabled", False)
+            and model_engine.mapping.is_first_pp_rank()):
         # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
         # already validated model-capability-dependent feature combinations.
         multimodal_config = llm_args.multimodal_config
@@ -4211,13 +4310,19 @@ def create_py_executor_instance(
             logger.info("Eager multimodal encoder scheduling is enabled for "
                         "capacity-rejected active requests.")
             scheduler_cls = MultimodalEagerEncoderScheduler
+        encoder_cache = model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "MM encoder item scheduling requires its unified output cache")
         scheduler = scheduler_cls(
             scheduler,
             max_batch_size=model_engine.encoder_batch_size,
             max_num_tokens=model_engine.encoder_max_num_tokens,
-            output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
+            encoder_cache=encoder_cache,
+            get_item_cache_keys=model_engine.get_mm_encoder_item_cache_keys,
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
+            retain_cache_entries=model_engine.model.encoder_cache_active,
         )
 
     config = model_engine.model.model_config.pretrained_config

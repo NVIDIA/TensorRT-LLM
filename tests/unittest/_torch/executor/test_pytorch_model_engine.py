@@ -29,8 +29,11 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
-    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch)
+    PrefillCompiledModel, _get_context_prompt_lookahead_token,
+    _make_single_token_context_graph_batch, _zero_fill_row_spans)
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -39,24 +42,23 @@ from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           TorchLlmArgs)
 
 # isort: off
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             ResourceManager,
-                                                             ResourceManagerType
-                                                             )
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 # isort: on
-from utils.util import skip_ray
+from utils.util import skip_pre_blackwell_unittest, skip_ray
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import \
+    TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import \
     INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor)
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 
@@ -205,6 +207,18 @@ class DummyModelEngine(PyTorchModelEngine):
                          spec_config=spec_config)
 
 
+def _prepare_kv_cache_resources(manager: KVCacheManagerV2,
+                                batch: ScheduledRequests) -> None:
+    # These model-engine tests bypass the scheduler, which owns V2 allocation.
+    for request in batch.context_requests:
+        assert manager.prepare_context(request)
+        assert manager.resize_context(
+            request, request.prompt_len - request.context_current_position)
+    for request in batch.generation_requests:
+        assert manager.try_allocate_generation(request)
+    manager.prepare_resources(batch)
+
+
 def _create_request(num_tokens, req_id: int):
     sampling_params = SamplingParams()
     kwargs = {
@@ -262,6 +276,18 @@ def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
         request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
 
 
+def test_zero_fill_row_spans_merges_unsorted_and_adjacent_spans() -> None:
+    buffer = torch.arange(1, 13, dtype=torch.int32)
+    _zero_fill_row_spans(buffer, [(9, 11), (2, 4), (4, 5), (7, 8)])
+    assert buffer.tolist() == [1, 2, 0, 0, 0, 6, 7, 0, 9, 0, 0, 12]
+
+
+def test_zero_fill_row_spans_without_spans_is_noop() -> None:
+    buffer = torch.arange(4, dtype=torch.int32)
+    _zero_fill_row_spans(buffer, [])
+    assert buffer.tolist() == [0, 1, 2, 3]
+
+
 def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=req_id,
@@ -291,6 +317,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
 def _make_forward_only_engine(
     graph_key: KeyType | None,
     runner_enabled: bool = True,
+    private_decoder: bool = False,
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
     decoder = object.__new__(DecoderRunner)
@@ -301,6 +328,8 @@ def _make_forward_only_engine(
     decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     decoder._config = SimpleNamespace(
+        compile_only_piecewise_graphs=False,
+        disable_overlap_scheduler=True,
         is_spec_decode=False,
         max_beam_width=1,
         is_encode_only=False,
@@ -327,6 +356,7 @@ def _make_forward_only_engine(
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
     decoder._force_lora_graph_for_capture = None
+    decoder._trtllm_gen_jit_warmup = False
 
     semantic_attn_metadata = Mock()
     graph_attn_metadata = Mock()
@@ -371,17 +401,66 @@ def _make_forward_only_engine(
     def get_resource_manager(resource_type):
         if resource_type == ResourceManagerType.PEFT_CACHE_MANAGER:
             return peft_cache_manager
+        if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
+            return SimpleNamespace(has_private_swa_suffix=Mock(
+                return_value=private_decoder))
         return object()
 
     resource_manager.get_resource_manager.side_effect = get_resource_manager
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "ordinary_capture,eligible",
+    [(False, True), (False, False), (True, True), (True, False)],
+)
+def test_decoder_forward_routes_compile_bypass(enabled: bool,
+                                               ordinary_capture: bool,
+                                               eligible: bool) -> None:
+    """Exercise both the regular forward and ordinary-graph capture callbacks."""
+    key = KeyType(batch_size=1, draft_len=0,
+                  is_first_draft=False) if ordinary_capture else None
+    engine, graph_runner, resources, _, outputs = _make_forward_only_engine(key)
+    eager = torch.nn.Identity()
+    compiled = torch.nn.Identity()
+    eager.forward = Mock(return_value=outputs)
+    compiled.forward = Mock(return_value=outputs)
+    wrapper = PrefillCompiledModel(eager, compiled)
+    engine._runner._config.compile_only_piecewise_graphs = enabled
+    engine._runner.model.model = wrapper
+    engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
+    graph_runner.needs_capture.return_value = ordinary_capture
+    graph_runner.is_warmup_only = ordinary_capture
+    graph_runner.capture.side_effect = lambda key, forward, inputs, **kwargs: forward(
+        inputs)
+    batch = ScheduledRequests()
+    batch.generation_requests = [_make_request_stub(1)]
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+            return_value=Mock()
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
+            return_value=eligible,
+    ):
+        result = engine.forward(batch, resources)
+
+    assert result["logits"] is outputs["logits"]
+    expected_compiled = eligible and not (enabled and ordinary_capture)
+    selected = compiled.forward if expected_compiled else eager.forward
+    other = eager.forward if expected_compiled else compiled.forward
+    selected.assert_called_once_with()
+    other.assert_not_called()
+    assert not wrapper._bypass_active
+
+
 def create_model_engine_and_kvcache(
     llm_args: TorchLlmArgs | None = None,
     execution_stream: torch.cuda.Stream | None = None,
     spec_config: DecodingBaseConfig | None = None,
-) -> tuple[PyTorchModelEngine, KVCacheManager]:
+) -> tuple[PyTorchModelEngine, KVCacheManagerV2]:
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
@@ -407,7 +486,7 @@ def create_model_engine_and_kvcache(
 
     kv_cache_config = KvCacheConfig(max_tokens=max_tokens)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    kv_cache_manager = KVCacheManager(
+    kv_cache_manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,
@@ -1015,7 +1094,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({1}))
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
-        runner.replay.assert_called_once_with(key, prepared_inputs)
+        runner.replay.assert_called_once_with(key,
+                                              prepared_inputs,
+                                              position_id_offsets=None)
         engine._runner._forward_step.assert_not_called()
         engine._runner._execute_logit_post_processors.assert_called_once_with(
             batch, outputs)
@@ -1050,6 +1131,28 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.replay.assert_not_called()
         engine._runner._execute_logit_post_processors.assert_called_once_with(
             batch, outputs)
+
+    def test_ced_final_context_cannot_promote_to_decode_graph(self) -> None:
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        engine, runner, resource_manager, metadata, outputs = \
+            _make_forward_only_engine(key, private_decoder=True)
+        engine.model.model = SimpleNamespace(ced_kv_precompute=True,
+                                             decoder_replay_split=20)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [_make_request_stub(1)]
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event"
+        ), patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner._make_single_token_context_graph_batch"
+        ) as promote:
+            actual_outputs = engine.forward(batch, resource_manager)
+            self.assertEqual(actual_outputs, outputs)
+            self.assertIs(actual_outputs["logits"], outputs["logits"])
+        promote.assert_not_called()
+        runner.replay.assert_not_called()
+        engine._runner._forward_step.assert_called_once()
+        self.assertIs(engine._runner._prepare_inputs.call_args.args[2],
+                      metadata)
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:
@@ -1094,7 +1197,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             semantic_attn_metadata.update_spec_dec_param.call_args.
             kwargs["num_contexts"], 1)
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
-        runner.replay.assert_called_once_with(key, prepared_inputs)
+        runner.replay.assert_called_once_with(key,
+                                              prepared_inputs,
+                                              position_id_offsets=None)
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(
             self) -> None:
@@ -1181,7 +1286,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({context.py_request_id}))
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
-        runner.replay.assert_called_once_with(key, prepared_inputs)
+        runner.replay.assert_called_once_with(key,
+                                              prepared_inputs,
+                                              position_id_offsets=None)
 
     def test_multimodal_graph_miss_preserves_semantic_payload(self) -> None:
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(None)
@@ -1295,6 +1402,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "ple_recurrent_state",
             "nested_ple_recurrent_state",
             "context_parallel",
+            "context_only_cache",
         )
         for case in cases:
             with self.subTest(case=case):
@@ -1319,6 +1427,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                         model=SimpleNamespace(has_ple=True)))
                 elif case == "context_parallel":
                     engine.mapping.cp_size = 2
+                elif case == "context_only_cache":
+                    resource_manager.get_resource_manager.side_effect = (
+                        lambda _: SimpleNamespace(context_swa_layer_limit=20))
 
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = [_make_request_stub(1)]
@@ -1682,6 +1793,47 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertIsNone(model_engine._runner._steady_gen_cache)
         kv_cache_manager.shutdown()
 
+    def test_padding_request_input_id_rows_are_zeroed(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        generation = _create_request_with_tokens([50, 51, 52, 53, 54], 1)
+        generation.py_seq_slot = 0
+        generation.py_batch_idx = 0
+        padding = _create_request_with_tokens([60, 61, 62], 2)
+        padding.is_cuda_graph_dummy = True
+        padding.py_seq_slot = 1
+
+        graph_batch = ScheduledRequests()
+        graph_batch.generation_requests = [generation, padding]
+        new_tokens = torch.zeros((1, 4, 1), dtype=torch.int32, device="cuda")
+        new_tokens[0, 0, 0] = 777
+        overlap_state = SimpleNamespace(new_tokens=new_tokens)
+        model_engine._runner._can_use_steady_gen_fast_prepare = Mock(
+            return_value=False)
+        # The padding row is written by neither input-id copy, so poison the
+        # buffer with an out-of-vocabulary id to catch a stale read.
+        model_engine._runner.input_ids_cuda.fill_(1 << 30)
+
+        inputs, _, _ = model_engine._runner._prepare_tp_inputs(
+            scheduled_requests=graph_batch,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            new_tensors_device=overlap_state,
+            resource_manager=resource_manager,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
+        )
+
+        self.assertEqual(inputs["input_ids"][:2].cpu().tolist(), [777, 0])
+        kv_cache_manager.shutdown()
+
     def test_promoted_context_precedes_speculative_overlap_generation(
             self) -> None:
         spec_config = SADecodingConfig(
@@ -1811,6 +1963,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
+        def free_blocks() -> int:
+            return kv_cache_manager.get_kv_cache_stats().free_num_blocks
+
         batch_sizes_and_seqlens = [
             (5, 1),
             (13, 1),
@@ -1823,17 +1978,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch = ScheduledRequests()
             batch.context_requests_last_chunk = requests
 
-            pages_before = kv_cache_manager.get_num_free_blocks()
+            pages_before = free_blocks()
             with model_engine.cuda_graph_runner.pad_batch(
                     batch, resource_manager) as padded_batch:
                 # No padding for prefill
                 self.assertIs(batch, padded_batch)
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(),
-                             pages_before)
+            self.assertEqual(free_blocks(), pages_before)
 
             batch = ScheduledRequests()
             batch.generation_requests = requests
-            pages_before = kv_cache_manager.get_num_free_blocks()
+            pages_before = free_blocks()
             new_dummy_block = 1 if not model_engine.cuda_graph_runner.padding_dummy_requests else 0
             with model_engine.cuda_graph_runner.pad_batch(
                     batch, resource_manager) as padded_batch:
@@ -1847,9 +2001,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     # The seqlen check makes sure we don't exceed the KV cache memory
                     # budget.
                     self.assertIs(batch, padded_batch)
-            self.assertEqual(
-                kv_cache_manager.get_num_free_blocks() + new_dummy_block,
-                pages_before)
+            self.assertEqual(free_blocks() + new_dummy_block, pages_before)
 
         kv_cache_manager.shutdown()
 
@@ -1954,7 +2106,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # Prefill run
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         expected_prefill_pos_ids = torch.arange(0,
@@ -1972,7 +2124,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # Generation run
         batch = ScheduledRequests()
         batch.generation_requests = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
 
         model_engine.forward(batch, resource_manager)
         expected_gen_pos_id = torch.tensor([prompt_len],
@@ -2140,7 +2292,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         expected_prefill_pos_ids = torch.arange(0,
@@ -2183,7 +2335,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         mock_callable.assert_called_once()
@@ -2202,7 +2354,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         mock_callable.assert_called_once()
@@ -2221,7 +2373,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
     def test_foward_pass_callable_backward_compat(self):
@@ -2238,7 +2390,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
     @skip_ray
@@ -2281,8 +2433,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         scheduled_requests.generation_requests = gen_requests
 
         # Create KV cache manager for attention metadata.
-        kv_cache_config = KvCacheConfig(max_tokens=512)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_config = KvCacheConfig(max_tokens=512,
+                                        enable_block_reuse=False)
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -2294,9 +2447,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.HALF,
         )
-        attn_metadata = AttentionMetadata(max_num_requests=4,
-                                          max_num_tokens=512,
-                                          kv_cache_manager=kv_cache_manager)
+        kv_cache_manager.add_dummy_requests([1, 2], prompt_lens, is_gen=True)
+        attn_metadata = TrtllmAttentionMetadata(
+            max_num_requests=4,
+            max_num_tokens=512,
+            kv_cache_manager=kv_cache_manager,
+            mapping=mapping)
         attn_metadata.is_cuda_graph = False
 
         # Initialize model engine buffers.
@@ -2364,7 +2520,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=32)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -2459,7 +2615,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=max_num_tokens)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -2561,6 +2717,118 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
         kv_cache_manager.shutdown()
 
+    @skip_pre_blackwell_unittest
+    def test_ced_warmup_passes_dummy_context_requests(self) -> None:
+        for warmup in (False, True):
+            with self.subTest(warmup=warmup):
+                engine, manager, metadata = self._setup_mrope_engine(1024)
+                manager.has_private_swa_suffix = Mock(return_value=True)
+                engine.model.model_config.pretrained_config.rope_scaling = None
+                engine.model.model = SimpleNamespace(ced_kv_precompute=True,
+                                                     decoder_replay_split=20)
+                engine._runner._config = replace(engine._runner._config,
+                                                 use_mrope=False,
+                                                 disable_overlap_scheduler=True)
+                engine._runner.is_warmup = warmup
+                engine._runner.cuda_graph_runner = SimpleNamespace(
+                    enabled=False)
+                scheduled = ScheduledRequests()
+                scheduled.reset_context_requests(
+                    manager.add_dummy_requests([0],
+                                               token_nums=[257],
+                                               is_gen=False))
+                try:
+                    inputs, _, _ = engine._runner._prepare_inputs(
+                        scheduled,
+                        manager,
+                        metadata,
+                        enable_spec_decode=False,
+                        runtime_draft_len=0,
+                        is_dummy=warmup)
+                    self.assertEqual(inputs['context_requests'],
+                                     scheduled.context_requests)
+                    self.assertTrue(inputs['context_requests'][0].is_dummy)
+                    self.assertEqual(metadata.seq_lens.tolist(), [257])
+                    self.assertEqual(inputs['input_ids'].numel(), 257)
+                finally:
+                    for req in scheduled.context_requests:
+                        manager.free_resources(req)
+                    manager.shutdown()
+
+    @skip_pre_blackwell_unittest
+    def test_ced_inputs_preserve_physical_rows_and_token_sources(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+
+        for overlap, mixed in ((False, True), (True, True), (True, False)):
+            with self.subTest(overlap=overlap, mixed=mixed):
+                engine, manager, metadata = self._setup_mrope_engine(5001)
+                manager.has_private_swa_suffix = Mock(return_value=True)
+                engine.model.model_config.pretrained_config.rope_scaling = None
+                engine.model.model = SimpleNamespace(ced_kv_precompute=True,
+                                                     decoder_replay_split=20)
+                engine._runner._config = replace(
+                    engine._runner._config,
+                    use_mrope=False,
+                    disable_overlap_scheduler=not overlap)
+                engine._runner.is_warmup = False
+                engine._runner.cuda_graph_runner = SimpleNamespace(
+                    enabled=not mixed)
+                scheduled = ScheduledRequests()
+                if mixed:
+                    context = _create_request_with_tokens(list(range(5000)), 7)
+                    context.context_current_position = 4000
+                    context.context_chunk_size = 1000
+                    context.py_seq_slot = 0
+                    context.py_ced_replay = EncoderReplay(7, 123, 4000, 3872)
+                    scheduled.context_requests_last_chunk = [context]
+                for index, (length, previous_index) in enumerate(
+                    ((20, 2), (30, 0))):
+                    req = _create_request(length, 8 + index)
+                    req.py_seq_slot = index + 1
+                    req.py_batch_idx = previous_index
+                    scheduled.generation_requests.append(req)
+                new_tokens = torch.tensor([[[222], [999], [111]]],
+                                          dtype=torch.int32,
+                                          device='cuda')
+                try:
+                    inputs, gather_ids, _ = engine._runner._prepare_inputs(
+                        scheduled,
+                        manager,
+                        metadata,
+                        new_tensors_device=SimpleNamespace(
+                            new_tokens=new_tokens) if overlap else None,
+                        enable_spec_decode=False,
+                        runtime_draft_len=0,
+                        is_dummy=False)
+                    expected_context = list(range(3872, 5000)) if mixed else []
+                    self.assertEqual(
+                        inputs['input_ids'].cpu().tolist(),
+                        expected_context + ([111, 222] if overlap else [0, 0]))
+                    self.assertEqual(
+                        inputs['position_ids'].view(-1).cpu().tolist(),
+                        expected_context + ([20, 30] if overlap else [19, 29]))
+                    self.assertIsNone(gather_ids)
+                    if mixed:
+                        self.assertEqual(inputs['context_requests'], [context])
+                        self.assertEqual(metadata.seq_lens.tolist(),
+                                         [1128, 1, 1])
+                        self.assertEqual(context.context_current_position, 4000)
+                        self.assertEqual(context.context_chunk_size, 1000)
+                        self.assertEqual(context.cached_tokens, 4000)
+                        if not overlap:
+                            self.assertEqual(
+                                list(metadata.kv_cache_params.
+                                     num_cached_tokens_per_seq), [3872, 19, 29])
+                    else:
+                        self.assertNotIn('context_requests', inputs)
+                    # GPU sampling is one step ahead of CPU token append.
+                    self.assertEqual([
+                        r.max_beam_num_tokens
+                        for r in scheduled.generation_requests
+                    ], [20, 30])
+                finally:
+                    manager.shutdown()
+
     def test_prepare_tp_inputs_all_text_only_drops_mrope_deltas(self) -> None:
         """A generation batch with no MRoPE metadata at all emits no delta
         tensors, so the steady-state generation fast path stays reachable."""
@@ -2659,8 +2927,49 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(attn_metadata.num_contexts, 0)
         kv_cache_manager.shutdown()
 
+    def test_item_scheduled_chunk_embedding_is_not_retained(self) -> None:
+        """The per-forward item-scheduler payload must not replace the
+        request's own multimodal data, or each chunked prefill would keep its
+        last chunk's joined embedding rows until prefill completes."""
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine.model.config.vocab_size = 100
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        context = _create_request_with_tokens([11, 22, 33, 44], 1)
+        context.context_chunk_size = 2
+        context.py_seq_slot = 0
+        context.py_mm_encoder_state = object()
+        multimodal_data = {"multimodal_embedding_lengths": [2]}
+        context.py_multimodal_data = multimodal_data
+        model_engine._mm_item_scheduler = Mock()
+        model_engine._runner._mm_item_scheduler = model_engine._mm_item_scheduler
+        model_engine._mm_item_scheduler.build_multimodal_data_for_llm.return_value = {
+            "multimodal_embedding": torch.ones((2, 1), dtype=torch.float16),
+            "multimodal_embedding_is_chunk": True,
+        }
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_chunking = [context]
+
+        model_engine._runner._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
+        )
+
+        model_engine._mm_item_scheduler.build_multimodal_data_for_llm.assert_called_once(
+        )
+        self.assertIs(context.py_multimodal_data, multimodal_data)
+        self.assertNotIn("multimodal_embedding", multimodal_data)
+        kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self) -> None:
-        """Test that KVCacheManager uses the provided execution_stream.
+        """Test that KVCacheManagerV2 uses the provided execution_stream.
         """
         # Create a dedicated execution stream
         execution_stream = torch.cuda.Stream()
@@ -2668,10 +2977,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
             execution_stream=execution_stream)
 
-        # Verify the KVCacheManager uses the provided execution stream
+        # Verify the KVCacheManagerV2 uses the provided execution stream
         self.assertEqual(
             kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
-            "KVCacheManager should use the provided execution_stream")
+            "KVCacheManagerV2 should use the provided execution_stream")
 
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
@@ -2681,14 +2990,14 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         with torch.cuda.stream(execution_stream):
             model_engine.forward(batch, resource_manager)
 
         # Verify the stream is still the same after forward pass
         self.assertEqual(
             kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
-            "KVCacheManager should still use the provided execution_stream after forward"
+            "KVCacheManagerV2 should still use the provided execution_stream after forward"
         )
 
         kv_cache_manager.shutdown()
@@ -2765,6 +3074,120 @@ def test_runner_input_buffers_support_repeated_cuda_graph_replay(
         assert output.data_ptr() == output_ptr
         assert buffers.input_ids_cuda.data_ptr() == input_ptr
     graph.reset()
+
+
+class TestDecodeGraphMetadataPreparation(unittest.TestCase):
+
+    @staticmethod
+    def _metadata():
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import \
+            CSA2TrtllmMetadata
+        metadata = object.__new__(CSA2TrtllmMetadata)
+        metadata.is_cuda_graph = True
+        return metadata
+
+    def test_scope_requires_selected_ordinary_decode_graph(self):
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        cases = (
+            "ordinary",
+            "ordinary_overlap",
+            "graph_miss",
+            "eager_metadata",
+            "context",
+            "promoted_context",
+            "speculative",
+            "beam",
+            "encoder_decoder",
+            "context_parallel",
+            "draft_key",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                engine, _, _, _, _ = _make_forward_only_engine(key)
+                metadata = self._metadata()
+                batch = ScheduledRequests()
+                batch.generation_requests = [_make_request_stub(1)]
+                selected = key
+                promoted = frozenset()
+                engine._runner._config.disable_overlap_scheduler = case != "ordinary_overlap"
+                if case == "graph_miss":
+                    selected = None
+                elif case == "eager_metadata":
+                    metadata.is_cuda_graph = False
+                elif case == "context":
+                    batch.context_requests_last_chunk = [_make_request_stub(2)]
+                elif case == "promoted_context":
+                    promoted = frozenset({1})
+                elif case == "speculative":
+                    engine.enable_spec_decode = True
+                elif case == "beam":
+                    engine._runner._config.max_beam_width = 2
+                elif case == "encoder_decoder":
+                    engine._runner._context_graph_promotion_supported = False
+                elif case == "context_parallel":
+                    engine.mapping.cp_size = 2
+                elif case == "draft_key":
+                    selected = key._replace(draft_len=1)
+                with engine._runner._cuda_graph_metadata_prepare_scope(
+                        metadata,
+                        selected,
+                        batch,
+                        promoted,
+                        enable_spec_decode=engine.enable_spec_decode):
+                    self.assertEqual(metadata._csa2_defer_decode_outputs, case
+                                     in ("ordinary", "ordinary_overlap"))
+                self.assertFalse(metadata._csa2_defer_decode_outputs)
+
+    def test_forward_scopes_proof_to_prepare_for_capture_replay_and_fallback(
+            self):
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        for mode in ("warmup", "capture", "replay", "fallback",
+                     "prepare_error"):
+            with self.subTest(mode=mode):
+                selected = None if mode == "fallback" else key
+                engine, runner, resource_manager, _, outputs = _make_forward_only_engine(
+                    selected)
+                metadata = self._metadata()
+                engine._runner.attn_metadata = metadata
+                engine._runner._set_up_attn_metadata.return_value = metadata
+                runner.maybe_get_cuda_graph.return_value = (metadata, None,
+                                                            selected)
+                runner.needs_capture.return_value = mode in ("warmup",
+                                                             "capture")
+                runner.is_warmup_only = mode == "warmup"
+                runner.capture.return_value = outputs
+                batch = ScheduledRequests()
+                batch.generation_requests = [_make_request_stub(1)]
+                prepared = engine._runner._prepare_inputs.return_value
+
+                def prepare(*args, **kwargs):
+                    self.assertIs(metadata.trtllm_gen_jit_warmup, False)
+                    self.assertEqual(metadata._csa2_defer_decode_outputs, mode
+                                     != "fallback")
+                    if mode == "prepare_error":
+                        raise RuntimeError("prepare failed")
+                    return prepared
+
+                engine._runner._prepare_inputs.side_effect = prepare
+                with patch(
+                        "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                        return_value=Mock()):
+                    if mode == "prepare_error":
+                        with self.assertRaisesRegex(RuntimeError,
+                                                    "prepare failed"):
+                            engine.forward(batch, resource_manager)
+                    else:
+                        actual_outputs = engine.forward(batch, resource_manager)
+                        self.assertEqual(actual_outputs, outputs)
+                        self.assertIs(actual_outputs["logits"],
+                                      outputs["logits"])
+                self.assertFalse(metadata._csa2_defer_decode_outputs)
+                if mode in ("warmup", "capture"):
+                    runner.capture.assert_called_once()
+                if mode in ("capture", "replay"):
+                    runner.replay.assert_called_once()
+                if mode == "fallback":
+                    engine._runner._forward_step.assert_called_once()
 
 
 if __name__ == "__main__":

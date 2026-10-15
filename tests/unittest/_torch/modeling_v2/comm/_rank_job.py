@@ -11,16 +11,14 @@ deadline is load-bearing and the ``mpi_pool_executor`` fixture has none.
 So this does not reimplement any of that. It selects the devices, starts the
 launcher in a fresh interpreter, and turns its exit code into an assertion.
 
-Fresh interpreter is required, not tidiness: the launcher must not have
-initialized MPI, and a pytest process that has imported ``tensorrt_llm``
-already has.
+Fresh interpreter is required, not tidiness: the launcher owns the deadline
+that kills a wedged collective's process sessions, and it must carry no CUDA
+or torch.distributed state of its own -- a pytest process that has imported
+``tensorrt_llm`` does.
 
-Everything here is started **by file path**. The launcher must not import
-``tensorrt_llm`` -- that calls ``MPI_Init``, and an MPI-initialized process
-cannot start ``mpirun`` at all (measured: it exits 1 with no output from any
-rank) -- and the ranks it spawns reach the catalog by absolute import, so
-neither half needs a package context. This tree does not have one to give:
-it is tests/, not a package.
+Everything here is started **by file path**: the ranks reach the catalog by
+absolute import, so neither half needs a package context. This tree does not
+have one to give: it is tests/, not a package.
 """
 
 from __future__ import annotations
