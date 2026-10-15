@@ -8,4 +8,6 @@ No module here imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK 
   object is laid out in a store is its driver's private format.
 - ``backend`` (the public backend over a driver) imports only ``store``, ``keys`` and
   ``base.backend``, plus numpy and ``tensorrt_llm.logger``.
+- ``mooncake`` (the Mooncake driver) imports only ``store`` and ``tensorrt_llm.logger``; it takes
+  an SDK object already set up.
 """
