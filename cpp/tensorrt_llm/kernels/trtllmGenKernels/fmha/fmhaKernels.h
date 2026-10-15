@@ -675,7 +675,10 @@ private:
         if (mSM != kSM_107)
         {
             FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
-            return autoTuner.selectKernel();
+            int32_t ctaDim = 512;
+            std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+            padTokenSparseMlaQTile(options);
+            return {options, optionsFromArgs, ctaDim};
         }
 
         if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
@@ -692,8 +695,21 @@ private:
         int32_t ctaDim = 512;
         FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        padTokenSparseMlaQTile(options);
         limitCgaSmemReductionCtasKv(options);
         return {options, optionsFromArgs, ctaDim};
+    }
+
+    // The token-sparse MLA selection sets tileSizeQ to the Q heads per KV head, while the SwapsMmaAb kernels need a
+    // multiple of 8 Q-tile rows (SmemTile). With fewer than 8 heads per rank (for example 64 MLA heads over 16 ranks)
+    // pad the tile to 8, as the dense MLA selection does; the kernel masks the rows past the heads.
+    static void padTokenSparseMlaQTile(FmhaOptions& options)
+    {
+        if (options.mIsMlaGen && isTokenSparse(options.mSparseType)
+            && options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && options.mTileSizeQ < 8)
+        {
+            options.mTileSizeQ = 8;
+        }
     }
 
     void limitCgaSmemReductionCtasKv(FmhaOptions& options) const
