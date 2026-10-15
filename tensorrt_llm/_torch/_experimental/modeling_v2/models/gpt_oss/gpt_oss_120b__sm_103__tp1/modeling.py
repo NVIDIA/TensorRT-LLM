@@ -17,6 +17,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
+    fused_qk_norm_rope,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -33,7 +36,6 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 
 from . import weights as _weights
-from .ops.attention.fused_qk_norm_rope import fused_qk_norm_rope
 from .ops.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
     ACT_TYPE_SWIGLU,
     ROUTING_METHOD_RENORMALIZE,
