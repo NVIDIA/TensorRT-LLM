@@ -86,6 +86,18 @@ class PlanSpec:
         """The id of the plan's single final task."""
         return _sinks(self.graph)[0]
 
+    def entry(self, node_id: str) -> tuple[object, ...]:
+        """Everything that defines task ``node_id``: its graph entry and its section."""
+        node = self.graph.by_id[node_id]
+        return (
+            node.type,
+            node.depends_on,
+            node.kind,
+            node.isolation,
+            self.tags[node_id],
+            _section(self.text, node_id),
+        )
+
 
 def _graph_block(text: str) -> str | None:
     """Return the body of the first fenced block under ``## Execution Graph``."""
@@ -140,8 +152,24 @@ def _task_tags(node_type: str, extra: object, problems: list[str], node_id: str)
     return tags
 
 
+def _heading_re(node_id: str) -> re.Pattern[str]:
+    # The id must end at whitespace or end of line, so `gsm8k` does not match
+    # the heading of `gsm8k-final`.
+    return re.compile(rf"^###\s+{re.escape(node_id)}(?=\s|$).*$", flags=re.MULTILINE)
+
+
 def _has_task_section(text: str, node_id: str) -> bool:
-    return re.search(rf"^###\s+{re.escape(node_id)}\b", text, flags=re.MULTILINE) is not None
+    return _heading_re(node_id).search(text) is not None
+
+
+def _section(text: str, node_id: str) -> str | None:
+    """The body of task ``node_id``'s ``###`` section, up to the next heading."""
+    heading = _heading_re(node_id).search(text)
+    if heading is None:
+        return None
+    body = text[heading.end() :]
+    end = re.search(r"^#{1,3}\s", body, flags=re.MULTILINE)
+    return (body[: end.start()] if end else body).strip()
 
 
 def parse_plan(
@@ -154,9 +182,10 @@ def parse_plan(
 
     Args:
         text: The full ``plan.md``.
-        previous: The plan the last build ran, when this is a revision.
-        states: The task states that build ended with. A ``DONE`` task of
-            ``previous`` must keep its definition, so it is never re-run.
+        previous: The plan currently running, when this is a revision.
+        states: The current task states. A ``DONE`` or ``RUNNING`` task of
+            ``previous`` must keep its graph entry and its section: finished
+            work is never re-run, and a running worker is never re-briefed.
 
     Returns:
         The validated :class:`PlanSpec`.
@@ -216,25 +245,26 @@ def parse_plan(
     elif "merge" not in tags[shared[0]]:
         problems.append(f"the final task {shared[0]!r} must be tagged `merge`")
 
+    spec = PlanSpec(graph=graph, tags=tags, text=text)
     if previous is not None and states is not None:
         for node_id, state in states.items():
-            if state != NodeState.DONE or node_id not in previous.graph.by_id:
+            frozen = state in (NodeState.DONE, NodeState.RUNNING)
+            if not frozen or node_id not in previous.graph.by_id:
                 continue
-            old = previous.graph.by_id[node_id]
-            new = graph.by_id.get(node_id)
-            if new is None:
-                problems.append(f"task {node_id!r} is DONE and cannot be removed")
-            elif (old.type, old.depends_on, old.kind, old.isolation) != (
-                new.type,
-                new.depends_on,
-                new.kind,
-                new.isolation,
-            ) or previous.tags.get(node_id) != tags.get(node_id):
+            label = state.name
+            if node_id not in graph.by_id:
+                problems.append(f"task {node_id!r} is {label} and cannot be removed")
+            elif previous.entry(node_id) != spec.entry(node_id):
+                remedy = (
+                    "add a new task for follow-up work instead"
+                    if state == NodeState.DONE
+                    else "list it under `cancel` to change it"
+                )
                 problems.append(
-                    f"task {node_id!r} is DONE and its graph entry cannot change; add a new "
-                    "task for follow-up work instead"
+                    f"task {node_id!r} is {label}; its graph entry and section cannot "
+                    f"change; {remedy}"
                 )
 
     if problems:
         raise PlanError(problems)
-    return PlanSpec(graph=graph, tags=tags, text=text)
+    return spec

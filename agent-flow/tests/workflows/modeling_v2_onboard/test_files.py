@@ -37,9 +37,13 @@ def test_malformed_task_results_are_rejected(text, message):
 
 
 def test_planner_decision_is_validated():
-    assert parse_planner_decision("decision: revised\nsummary: x\n").decision == "REVISED"
-    with pytest.raises(HandoffError, match="REVISED, DONE, ABORT"):
-        parse_planner_decision("decision: CONTINUE\n")
+    decision = parse_planner_decision("decision: finish\nsummary: x\nretry: [c, c]\ncancel: [p]\n")
+    assert (decision.decision, decision.retry, decision.cancel) == ("FINISH", ("c",), ("p",))
+    assert parse_planner_decision("decision: CONTINUE\n").retry == ()
+    with pytest.raises(HandoffError, match="CONTINUE, FINISH, ABORT"):
+        parse_planner_decision("decision: REVISED\n")
+    with pytest.raises(HandoffError, match="`cancel` must be a list"):
+        parse_planner_decision("decision: CONTINUE\ncancel: p\n")
 
 
 def test_missing_handoff_file_is_an_error(tmp_path):

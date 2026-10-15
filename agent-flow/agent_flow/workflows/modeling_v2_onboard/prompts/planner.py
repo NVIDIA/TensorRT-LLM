@@ -24,7 +24,7 @@ __all__ = [
     "build_planner_system_prompt",
     "initial_plan_prompt",
     "plan_fix_prompt",
-    "replan_prompt",
+    "planner_turn_prompt",
 ]
 
 PLAN_EXAMPLE = """\
@@ -130,7 +130,9 @@ You are the **planner** of a ModelingV2 onboarding run. One checkpoint (or
 one new capability of an existing target) is being brought up as a gated
 ModelingV2 target in TensorRT-LLM. You do not write code: you write
 `plan.md`, a set of tasks that workers execute **in parallel**, each in its
-own git worktree, and you revise it when a task fails.
+own git worktree. You run alongside them: every time a worker finishes, you
+are woken to read its result and extend or revise the plan while the other
+workers keep going.
 
 ## What to read before planning
 
@@ -200,19 +202,21 @@ block with a flat `nodes:` list. Each node is a task:
   commits are what the run delivers. Make it a `merge` task that only lands
   verified work: do the verifying in the tasks before it.
 
-The run finishes when every task is `DONE`, so the plan must contain the
-tasks that prove `completion_criteria` — typically an `e2e_accuracy` task
-just before the final one.
+The final task does not start until you decide `FINISH`, and the run ends
+when it is `DONE`. Before it, the plan must contain the tasks that prove
+`completion_criteria` — typically an `e2e_accuracy` task on the fully joined
+code just before the final one.
 
 Shape of a typical plan:
 
 {plan_example}
 ## Keep every worker busy
 
-Up to **{max_parallel}** tasks run at once. You plan only at the start and
-after a failure, so the graph you write is all the work the run has until
-then: a task that is not in it never runs, however idle the workers are.
-Shape the graph so that at every stage about {max_parallel} tasks are ready.
+Up to **{max_parallel}** workers run at once, and the goal is that
+{max_parallel} are always working. A worker slot only fills with a task that
+is in the graph and whose dependencies are done, so at every turn count the
+running tasks and the tasks ready to start, and if together they are fewer
+than {max_parallel}, add work that can start now.
 
 - **Split along independent outcomes.** Every missing entry is its own
   `new_op` task, and they all run side by side. Checks of different modules
@@ -238,31 +242,54 @@ Shape the graph so that at every stage about {max_parallel} tasks are ready.
   branches join the main line through `merge` tasks, and an `e2e_accuracy`
   task on the joined code runs after the last of them, before the final task.
 
-When you revise the plan after a failure, count the tasks that can run now
-and add work again until the slots are used.
+## Each turn
 
-## Revising the plan
+You are woken whenever one or more workers finish, and told which ones, what
+every task's state is and how many slots are free. Workers keep running while
+you think, so keep a turn short and decisive. In a turn:
 
-When a task reports `FAILED`, the run pauses (running tasks are interrupted
-and resume later) and you are called with every result so far. Read the
-failed task's result first, then decide:
+1. Read the results of the tasks that just finished.
+2. Edit `plan.md` in place if the plan should change, then write the turn
+   file the turn prompt names. Write it every turn, even when nothing changes.
 
-- **Fix forward**: rewrite the failed task's section (narrower scope, the
-  missing input, the evidence that was wrong), split it, add `new_op` tasks
-  for missing entries and make it depend on them, or rewire dependencies.
-  A rewritten failed task re-runs from scratch on a fresh branch; its earlier
-  result stays available to the next attempt.
-- **Never change a `DONE` task's graph entry** (its id, tags, `depends_on`,
-  `kind`, `isolation`) and never remove it. Follow-up work on finished code
-  is a new task that depends on it.
-- Changing a not-yet-finished task's graph entry re-runs it and everything
-  downstream of it, so change only what the failure requires.
-- Decide `DONE` only when the results already prove every
-  `completion_criteria` item. It stops the run where it is: work the final
-  task has not landed stays on its `node/<id>` branch, so prefer `REVISED`
-  while landing is still needed. Decide `ABORT` only when the goal cannot be
-  reached at all (a computation with no implementable server anywhere, an
-  anchor that cannot exist), with the evidence.
+What you may change depends on each task's state:
+
+| state | what you may do |
+|---|---|
+| `DONE` | nothing: its graph entry and its section are fixed and it stays in the plan. Follow-up work on finished code is a new task that depends on it. |
+| `RUNNING` | nothing, unless you list it under `cancel`: it is stopped, its branch is dropped, and it starts over from its (possibly rewritten) definition, or goes away if you remove it. Cancel only work that has become wrong or useless. |
+| `FAILED` | rewrite it (it re-runs from scratch on a fresh branch), list it under `retry` to re-run it unchanged, or remove it. Until you do one of these, it stays `FAILED` and every task depending on it waits. Its result, and every earlier attempt, stays available to the next attempt. |
+| `PENDING` | anything: rewrite, rewire, remove. |
+| new | add as many as the free slots and the goal call for. |
+
+A task can start in the middle of your turn when its last dependency
+finishes; if your edit then touches a running task, the plan is sent back
+to you to fix.
+
+On a `FAILED` task, fix forward: narrow its scope, supply the missing input,
+correct the evidence that was wrong, split it, or add `new_op` tasks for
+missing entries and make it depend on them.
+
+The turn file:
+
+```yaml
+decision: CONTINUE   # CONTINUE | FINISH | ABORT
+summary: |
+  what you changed and why
+retry: []            # FAILED tasks to run again unchanged
+cancel: []           # RUNNING tasks to stop
+```
+
+- `CONTINUE` — keep going.
+- `FINISH` — let the final task start as soon as all of its dependencies are
+  `DONE`. Decide it when the plan already holds every task the run should
+  do: the tasks that prove each `completion_criteria` item and the
+  performance work worth doing. You keep being woken until the final task
+  is done and can still add tasks before it starts.
+- `ABORT` — stop the run now, only when the goal cannot be reached at all (a
+  computation with no implementable server anywhere, an anchor that cannot
+  exist), with the evidence. Running workers are stopped and every branch is
+  kept.
 
 {modeling_v2_layout}
 {modeling_v2_switch}
@@ -281,6 +308,8 @@ failed task's result first, then decide:
 | "The anchor is probably around X" | Anchors come from a written source or a measured oracle. |
 | "The failed task was nearly done; mark the run DONE" | `DONE` needs evidence for every completion criterion. |
 | "Rewire this DONE task so the graph reads better" | A DONE task's graph entry is fixed and the plan will not validate. Add a new task instead. |
+| "Nothing to change this turn, but slots are free" | Free slots are the cue to add work: the next feature, a module check, a `perf` task. |
+| "FINISH now; perf tasks can come later" | Nothing comes after the final task. Add the work first, then `FINISH`. |
 """
 
 
@@ -314,43 +343,92 @@ def initial_plan_prompt(*, task_yaml: Path, plan: Path, repo: Path) -> str:
     )
 
 
-def replan_prompt(
+def planner_turn_prompt(
     *,
-    task_yaml: Path,
+    turn_file: Path,
     plan: Path,
+    task_yaml: Path,
     results_dir: Path,
-    failed: Sequence[tuple[str, Path]],
-    interrupted: Sequence[str],
-    done: Sequence[str],
-    decision: Path,
+    finished: Sequence[tuple[str, str, str, Path]],
+    states: Sequence[tuple[str, str]],
+    running: int,
+    ready: int,
+    max_parallel: int,
+    finish: bool,
+    stalled: bool,
+    resumed: bool,
+    rejected: Sequence[str],
 ) -> str:
-    """The turn that revises the plan after a task failed."""
-    failed_lines = "\n".join(f"- `{tid}`: `{path}`" for tid, path in failed)
-    return (
-        f"The run is paused because these tasks reported FAILED:\n\n{failed_lines}\n\n"
-        f"- DONE: {', '.join(f'`{t}`' for t in done) or 'none'}\n"
-        f"- Interrupted (they resume after your revision): "
-        f"{', '.join(f'`{t}`' for t in interrupted) or 'none'}\n"
-        f"- Every result so far, including earlier attempts: `{results_dir}`\n"
-        f"- The user's task: `{task_yaml}`\n"
-        f"- The plan: `{plan}`\n\n"
-        f"Revise `{plan}` in place if the run should continue. Then write "
-        f"`{decision}` as YAML:\n\n"
-        f"```yaml\n"
-        f"decision: REVISED   # one of {', '.join(PLANNER_DECISIONS)}\n"
-        f"summary: |\n"
-        f"  what you changed and why, or why the run should stop\n"
-        f"```\n\n"
-        f"`REVISED` resumes the run on the revised plan; `DONE` stops it because "
-        f"the results already prove every completion criterion; `ABORT` stops it "
-        f"because the goal cannot be reached.\n"
-    )
+    """One planner turn while the workers run.
+
+    Args:
+        turn_file: Where the planner writes this turn's decision.
+        plan: ``plan.md``.
+        task_yaml: The user's task.
+        results_dir: Every task result, including earlier attempts.
+        finished: ``(id, status, summary, result file)`` of each task that
+            finished since the last turn.
+        states: ``(id, state)`` of every task in the plan; ``state`` may be
+            annotated (e.g. ``pending — waiting on a``).
+        running: How many workers are running.
+        ready: How many tasks can start now but wait for a slot.
+        max_parallel: The most workers that run at once.
+        finish: Whether ``FINISH`` was already decided.
+        stalled: Nothing is running and nothing can start.
+        resumed: The orchestrator restarted since the last turn.
+        rejected: Problems that made the orchestrator discard the previous
+            turn's changes.
+    """
+    lines: list[str] = []
+    if resumed:
+        lines += [
+            "The orchestrator restarted. Tasks that were running have been restarted "
+            "on their branches.",
+            "",
+        ]
+    if rejected:
+        lines += [
+            "Your previous turn's changes were discarded and `plan.md` was restored "
+            "to the running plan, because:",
+            *(f"- {p}" for p in rejected),
+            "",
+        ]
+    if finished:
+        lines += ["Finished since your last turn:"]
+        lines += [
+            f"- `{tid}` {status}: {summary or '(no summary)'} — `{path}`"
+            for tid, status, summary, path in finished
+        ]
+        lines.append("")
+    if stalled:
+        lines += [
+            "**The run is stalled: nothing is running and nothing can start.** Retry, "
+            "rewrite or remove a FAILED task, add work, decide FINISH, or ABORT.",
+            "",
+        ]
+    free = max(max_parallel - running - ready, 0)
+    lines += [
+        f"Workers: {running} running, {ready} ready and waiting for a slot, "
+        f"{free} of {max_parallel} slots free for new work."
+        + ("" if finish else " The final task is held until you decide FINISH."),
+        "",
+        "Tasks:",
+        *(f"- `{tid}`: {state}" for tid, state in states),
+        "",
+        f"- The plan (edit in place): `{plan}`",
+        f"- The user's task: `{task_yaml}`",
+        f"- Every result, including earlier attempts: `{results_dir}`",
+        "",
+        f"End the turn by writing `{turn_file}` (decision: one of "
+        f"{', '.join(PLANNER_DECISIONS)}; optional `retry` and `cancel` lists).",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def plan_fix_prompt(problems: Sequence[str], *, plan: Path) -> str:
     """The follow-up sent when the plan (or the decision file) does not validate."""
     listed = "\n".join(f"- {p}" for p in problems)
     return (
-        f"`{plan}` (or your decision file) cannot be run as written:\n\n{listed}\n\n"
+        f"`{plan}` (or your turn file) cannot be run as written:\n\n{listed}\n\n"
         f"Fix every item and write the files again.\n"
     )

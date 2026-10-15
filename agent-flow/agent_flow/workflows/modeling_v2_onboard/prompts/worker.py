@@ -43,11 +43,11 @@ files you read and write are in your turn prompt.
   claims you build on, including what they could not finish.
 - **Commit as you go**, by explicit file path (`git add <paths>`, never
   `git add -A` or a bare directory), with a short message and no AI
-  attribution. Your turn can be paused at any time; uncommitted edits are
+  attribution. Your session can be stopped at any time; uncommitted edits are
   lost when it is, committed ones are not. Never push, rebase or switch
   branches.
 - **Keep notes** in your task directory (`notes.md`): what you tried, what
-  worked, the commands you ran. If this task was paused and resumed, read
+  worked, the commands you ran. If this task was restarted, read
   them and `git log` in your worktree first and continue from there.
 - New files carry the NVIDIA SPDX copyright header; follow
   `CODING_GUIDELINES.md`.
@@ -74,8 +74,9 @@ a follow-up task>
 - `DONE` — the task's definition of done holds, with evidence.
 - `FAILED` — it does not, and you cannot make it hold within this task's
   scope. Say precisely why and what would unblock it. A `FAILED` result
-  pauses the run so the planner can revise the plan, so use it when the plan
-  needs to change — not to report a caveat on finished work.
+  holds back every task that depends on yours until the planner revises
+  the plan, so use it when the plan needs to change — not to report a caveat
+  on finished work.
 
 The orchestrator reads `status` and nothing else; a task that ends without a
 valid result file is treated as `FAILED`.

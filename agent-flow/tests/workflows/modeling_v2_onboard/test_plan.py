@@ -124,14 +124,16 @@ def test_unsafe_ids_and_nested_children_are_rejected():
 
 def test_a_done_task_cannot_be_changed_or_removed():
     previous = parse_plan(_plan(_VALID_NODES, ["a", "b", "land"]))
-    states = {"a": NodeState.DONE, "b": NodeState.FAILED, "land": NodeState.BLOCKED}
+    states = {"a": NodeState.DONE, "b": NodeState.FAILED, "land": NodeState.PENDING}
 
     changed = _VALID_NODES.replace("type: new_op", "type: new_op\n    tags: [target]")
     problems = _problems(_plan(changed, ["a", "b", "land"]), previous=previous, states=states)
     assert problems == [
-        "task 'a' is DONE and its graph entry cannot change; add a new task for "
-        "follow-up work instead"
+        "task 'a' is DONE; its graph entry and section cannot change; add a new task "
+        "for follow-up work instead"
     ]
+    rewritten = _plan(_VALID_NODES, ["a", "b", "land"]).replace("### a\nDo it.", "### a\nRedo.")
+    assert _problems(rewritten, previous=previous, states=states) == problems
 
     without_a = """\
   - id: b
@@ -146,9 +148,39 @@ def test_a_done_task_cannot_be_changed_or_removed():
     assert problems == ["task 'a' is DONE and cannot be removed"]
 
 
+def test_a_running_task_cannot_be_changed_or_removed():
+    previous = parse_plan(_plan(_VALID_NODES, ["a", "b", "land"]))
+    states = {"a": NodeState.RUNNING, "b": NodeState.PENDING, "land": NodeState.PENDING}
+    rewritten = _plan(_VALID_NODES, ["a", "b", "land"]).replace("### a\nDo it.", "### a\nRedo.")
+    assert _problems(rewritten, previous=previous, states=states) == [
+        "task 'a' is RUNNING; its graph entry and section cannot change; list it under "
+        "`cancel` to change it"
+    ]
+    # The same edit is fine once a is no longer running (e.g. cancelled).
+    states["a"] = NodeState.PENDING
+    assert parse_plan(rewritten, previous=previous, states=states).entry("a")[-1] == "Redo."
+
+
+def test_a_task_id_that_prefixes_another_has_its_own_section():
+    nodes = """\
+  - id: gsm8k
+    type: e2e_accuracy
+  - id: gsm8k-final
+    type: e2e_accuracy
+    depends_on: [gsm8k]
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [gsm8k-final]
+"""
+    problems = _problems(_plan(nodes, ["gsm8k-final", "land"]))
+    assert problems == ["task 'gsm8k' has no `### gsm8k` section describing it"]
+
+
 def test_a_revision_may_rewrite_unfinished_tasks_and_add_new_ones():
     previous = parse_plan(_plan(_VALID_NODES, ["a", "b", "land"]))
-    states = {"a": NodeState.DONE, "b": NodeState.FAILED, "land": NodeState.BLOCKED}
+    states = {"a": NodeState.DONE, "b": NodeState.FAILED, "land": NodeState.PENDING}
     revised = """\
   - id: a
     type: new_op

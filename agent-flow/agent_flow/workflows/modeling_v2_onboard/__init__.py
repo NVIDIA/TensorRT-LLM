@@ -5,8 +5,9 @@
 
 A planner writes ``plan.md``: tagged tasks plus an ``## Execution Graph`` of
 their dependencies. Workers run the tasks in parallel, each in its own git
-worktree, and each writes ``task_result_<id>.md``. When a task fails the run
-pauses and the planner revises the plan. See ``README.md``.
+worktree, and each writes ``task_result_<id>.md``. The planner runs alongside
+them and is woken whenever a worker finishes, to extend or revise the plan.
+See ``README.md``.
 """
 
 from typing import Any

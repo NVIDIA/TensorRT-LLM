@@ -8,7 +8,7 @@ from .planner import (
     build_planner_system_prompt,
     initial_plan_prompt,
     plan_fix_prompt,
-    replan_prompt,
+    planner_turn_prompt,
 )
 from .tags import TAG_PROMPTS, TAG_SUMMARIES
 from .worker import WorkerTask, build_worker_system_prompt, worker_retry_prompt, worker_turn_prompt
@@ -22,7 +22,7 @@ __all__ = [
     "build_worker_system_prompt",
     "initial_plan_prompt",
     "plan_fix_prompt",
-    "replan_prompt",
+    "planner_turn_prompt",
     "worker_retry_prompt",
     "worker_turn_prompt",
 ]

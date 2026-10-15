@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run one task with one worker: the scheduler's ``run_node`` callback.
+"""Run one task with one worker.
 
 A worker is one agent session pinned to the task's worktree. It gets the base
 worker prompt plus the block of each of the task's tags, runs the task in a
@@ -12,17 +12,16 @@ turn to write it, and the task is ``FAILED`` if it still does not.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
-from agent_flow.orchestration import Node, NodeOutcome, NodeState, RunNode
+from agent_flow.orchestration import Node
 
 from .files import HandoffError, Layout, TaskResult, parse_task_result, read_handoff
-from .plan import PlanSpec
 from .prompts import WorkerTask, build_worker_system_prompt, worker_retry_prompt, worker_turn_prompt
 
-__all__ = ["Agent", "AgentFactory", "make_run_node"]
+__all__ = ["Agent", "AgentFactory", "RunTask", "make_run_task"]
 
 
 class Agent(Protocol):
@@ -36,6 +35,9 @@ class Agent(Protocol):
 # ``(name, system_prompt, cwd, session_mode) -> Agent``. Injected so tests can
 # substitute scripted agents for real backends.
 AgentFactory = Callable[[str, str, Path, str], Agent]
+
+# ``(node, worktree, tags, is_final) -> result``.
+RunTask = Callable[[Node, Path, tuple[str, ...], bool], Awaitable[TaskResult]]
 
 
 def _write_failure(path: Path, reason: str) -> TaskResult:
@@ -63,27 +65,21 @@ async def _run_worker(agent: Agent, prompt: str, result_path: Path) -> TaskResul
         return _write_failure(result_path, str(exc))
 
 
-def make_run_node(
+def make_run_task(
     *,
     layout: Layout,
-    plan: PlanSpec,
-    repo_path: Path,
     agent_factory: AgentFactory,
     slurm: bool,
-) -> RunNode:
-    """Build the scheduler callback that runs each task of ``plan``.
+) -> RunTask:
+    """Build the callback that runs one task with a fresh worker.
 
     Args:
         layout: The workspace layout.
-        plan: The plan being built; it supplies each task's tags.
-        repo_path: The TensorRT-LLM checkout the final task runs in.
         agent_factory: Builds each worker's agent.
         slurm: Whether ``task.yaml`` carries a ``slurm-environment``.
     """
-    final_id = plan.sink_id()
 
-    async def run_node(node: Node, cwd: Path) -> NodeOutcome:
-        tags = plan.tags[node.id]
+    async def run_task(node: Node, cwd: Path, tags: tuple[str, ...], is_final: bool) -> TaskResult:
         result_path = layout.result_path(node.id)
         # A result left by an interrupted turn of this same attempt is stale.
         result_path.unlink(missing_ok=True)
@@ -93,7 +89,7 @@ def make_run_node(
             task_id=node.id,
             tags=tags,
             worktree=Path(cwd),
-            is_final=node.id == final_id,
+            is_final=is_final,
             task_yaml=layout.task_path,
             plan=layout.plan_path,
             result=result_path,
@@ -109,16 +105,12 @@ def make_run_node(
             Path(cwd),
             "persistent",
         )
-        info: dict[str, Any] = {"node_id": node.id, "tags": list(tags)}
         try:
-            result = await _run_worker(agent, worker_turn_prompt(task), result_path)
+            return await _run_worker(agent, worker_turn_prompt(task), result_path)
         except Exception as exc:
             # A crashed session fails this task, not the run: the planner decides.
-            result = _write_failure(result_path, f"The worker's session raised: {exc!r}")
+            return _write_failure(result_path, f"The worker's session raised: {exc!r}")
         finally:
             await agent.__aexit__(None, None, None)
-        info["summary"] = result.summary
-        state = NodeState.DONE if result.status == "DONE" else NodeState.FAILED
-        return NodeOutcome(terminal_state=state, info=info)
 
-    return run_node
+    return run_task

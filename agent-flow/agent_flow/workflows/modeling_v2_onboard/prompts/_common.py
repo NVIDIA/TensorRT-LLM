@@ -130,11 +130,11 @@ whole.
 DETACHED_JOBS = """\
 ## Long-running commands — launch them detached
 
-Your turn can be paused and resumed (when another task fails the whole run
-pauses so the planner can revise the plan). A blocking `srun`, long build or
-long eval dies with a paused turn. For anything longer than a few minutes,
-launch it detached through the framework wrapper, which records it in your
-task's `jobs.json` so it survives a pause:
+Your session can be stopped and restarted (the orchestrator itself is
+restarted). A blocking `srun`, long build or long eval dies with the session.
+For anything longer than a few minutes, launch it detached through the
+framework wrapper, which records it in your task's `jobs.json` so it survives
+a restart:
 
     python -m agent_flow.jobs.run_detached \\
       --registry <your jobs.json> \\

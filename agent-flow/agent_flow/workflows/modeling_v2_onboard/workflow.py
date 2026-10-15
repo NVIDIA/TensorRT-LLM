@@ -1,60 +1,66 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The planner/worker loop.
+"""The planner/worker loop: the planner runs alongside the workers.
 
-    plan     planner writes plan.md (re-prompted until it validates)
-    build    NodeScheduler runs the plan's tasks in parallel, one worker per
-             task, each in its own git worktree; pauses on the first FAILED
-    replan   planner reads every result and decides:
-               REVISED  reset the failed and changed tasks, back to build
-               DONE     stop; the results already meet the completion criteria
-               ABORT    stop; the goal cannot be reached
-    done
+    plan   planner writes plan.md (re-prompted until it validates)
+    run    every task whose dependencies are DONE starts at once, up to
+           max_parallel, each with its own worker in its own git worktree.
+           Whenever workers finish, the planner is woken with their results
+           and may, while the others keep running:
+             - add tasks, or rewrite, rewire or remove tasks not yet started;
+             - retry, rewrite or remove FAILED tasks;
+             - cancel RUNNING tasks;
+             - FINISH: let the final task start once its dependencies are DONE;
+             - ABORT the run.
+    done   the final task is DONE, or the planner aborted
 
-There is no round limit: the run ends when every task is DONE or the planner
-stops it. Every phase transition is checkpointed in ``.state.json`` and the
-scheduler checkpoints task states in ``.graph_state.json``, so rerunning the
-same command after an interruption resumes where it stopped.
+A ``FAILED`` task only holds back the tasks that depend on it; nothing pauses.
+There is no turn limit. When nothing is running and nothing can start, the
+planner gets a stalled turn; ``MAX_STALLED_TURNS`` in a row that change
+nothing stop the run with an error. Task states are checkpointed in
+``.state.json`` on every change and the running plan in ``.running_plan.md``,
+so rerunning the same command after an interruption resumes: running tasks
+restart on their branches and the planner is told.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TypeVar
-
-import anyio
 
 from agent_flow.console import print_message, print_rule
 from agent_flow.git_worktree import GitWorktreeIsolation
 from agent_flow.jobs.kinds import KINDS
 from agent_flow.jobs.registry import JobRegistry
 from agent_flow.logger import get_logger
-from agent_flow.orchestration import GraphResult, GraphState, Node, NodeScheduler, NodeState
-from agent_flow.orchestration.invalidation import invalidation_set
+from agent_flow.orchestration import Node, NodeState
 
 from .files import HandoffError, Layout, PlannerDecision, parse_planner_decision, read_handoff
-from .node_runner import AgentFactory, make_run_node
+from .node_runner import Agent, AgentFactory, make_run_task
 from .plan import PlanError, PlanSpec, parse_plan
 from .prompts import (
     build_planner_system_prompt,
     initial_plan_prompt,
     plan_fix_prompt,
-    replan_prompt,
+    planner_turn_prompt,
 )
 
 __all__ = ["ModelingV2OnboardWorkflow", "RunOutcome", "WorkflowError"]
 
-# How many times the planner is sent its validation errors before the run stops.
+# How many times the planner is sent its validation errors within one turn.
 MAX_PLAN_FIXES = 3
+# How many stalled turns in a row the planner gets before the run stops.
+MAX_STALLED_TURNS = 3
 
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 
 T = TypeVar("T")
 
@@ -66,62 +72,53 @@ class WorkflowError(RuntimeError):
 class RunOutcome(str, Enum):
     """How a run ended."""
 
-    SUCCEEDED = "succeeded"  # every task DONE
-    PLANNER_DONE = "planner_done"  # the planner judged the criteria met
+    SUCCEEDED = "succeeded"  # the final task landed
     ABORTED = "aborted"  # the planner judged the goal unreachable
 
 
 @dataclass
 class _State:
-    phase: str = "plan"  # plan | build | replan | done
-    round: int = 0
+    phase: str = "plan"  # plan | run | done
     outcome: str | None = None
+    turn: int = 0
+    finish: bool = False
+    tasks: dict[str, NodeState] = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
+        data = {"version": _STATE_VERSION, **asdict(self)}
+        data["tasks"] = {tid: state.value for tid, state in self.tasks.items()}
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"version": _STATE_VERSION, **asdict(self)}), encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
         tmp.replace(path)
 
     @classmethod
     def load(cls, path: Path) -> _State:
         data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("version") != _STATE_VERSION:
-            raise WorkflowError(f"{path} has unsupported version {data.get('version')!r}")
-        return cls(phase=data["phase"], round=data["round"], outcome=data.get("outcome"))
+            raise WorkflowError(
+                f"{path} has unsupported version {data.get('version')!r}; pass --clean to "
+                "start over"
+            )
+        return cls(
+            phase=data["phase"],
+            outcome=data.get("outcome"),
+            turn=data["turn"],
+            finish=data["finish"],
+            tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
+        )
 
 
-class _KeepBranches:
-    """Delegate to a worktree provider, but keep every task branch until the end.
+@dataclass
+class _Change:
+    """A validated planner turn, ready to apply."""
 
-    The scheduler reclaims a task's branch once its dependents are terminal —
-    including a dependent that just FAILED. A failed task that the planner
-    re-runs must start from its dependencies' code again, so their branches
-    must outlive the build. The workflow reclaims explicitly instead: a reset
-    task as soon as it is reset, and every task once the run is over.
-    """
-
-    def __init__(self, inner: GitWorktreeIsolation) -> None:
-        self.inner = inner
-
-    async def acquire(self, node: Node) -> Path:
-        return await self.inner.acquire(node)
-
-    async def prepare(self, node: Node, dep_nodes: list[Node], cwd: Path) -> object:
-        return await self.inner.prepare(node, dep_nodes, cwd)
-
-    async def commit(self, node: Node, cwd: Path) -> str | None:
-        return await self.inner.commit(node, cwd)
-
-    async def release(self, node: Node) -> None:
-        await self.inner.release(node)
-
-    async def reclaim(self, node: Node) -> None:
-        return None
-
-    async def discard(self, node: Node) -> None:
-        """Drop ``node``'s worktree and branch so it re-runs from scratch."""
-        await self.inner.release(node)
-        await self.inner.reclaim(node)
+    decision: PlannerDecision
+    plan: PlanSpec
+    old_plan: PlanSpec
+    # Tasks whose worker, branch and jobs are dropped: cancelled, retried,
+    # rewritten after FAILED, or removed.
+    reset: set[str]
+    removed: set[str]
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -131,7 +128,7 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 class ModelingV2OnboardWorkflow:
-    """Plan, build in parallel, and replan on failure until the plan is done.
+    """Run the planner alongside parallel workers until the final task lands.
 
     Args:
         workspace: Where plan.md, results and all run state live. Must be
@@ -139,7 +136,7 @@ class ModelingV2OnboardWorkflow:
         task_path: The user's ``task.yaml``; copied into the workspace.
         task_data: Its validated contents.
         agent_factory: Builds the planner's and the workers' agents.
-        max_parallel: The most tasks that run at once.
+        max_parallel: The most workers that run at once.
     """
 
     def __init__(
@@ -157,8 +154,11 @@ class ModelingV2OnboardWorkflow:
         self.slurm = "slurm-environment" in task_data
         self.agent_factory = agent_factory
         self.max_parallel = max_parallel
-        self.isolation = _KeepBranches(
-            GitWorktreeIsolation(repo_path=self.repo_path, worktrees_root=self.layout.worktrees_dir)
+        self.isolation = GitWorktreeIsolation(
+            repo_path=self.repo_path, worktrees_root=self.layout.worktrees_dir
+        )
+        self._run_task = make_run_task(
+            layout=self.layout, agent_factory=agent_factory, slurm=self.slurm
         )
         self._log = get_logger().console
 
@@ -191,14 +191,14 @@ class ModelingV2OnboardWorkflow:
         layout.workspace.mkdir(parents=True, exist_ok=True)
         if layout.state_path.is_file():
             return _State.load(layout.state_path)
-        if layout.plan_path.exists() or layout.graph_state_path.exists():
+        if layout.plan_path.exists() or layout.running_plan_path.exists():
             raise WorkflowError(
                 f"{layout.workspace} holds files from an earlier run but no .state.json; "
                 "pass --clean to start over"
             )
         if self.task_path.resolve() != layout.task_path.resolve():
             shutil.copyfile(self.task_path, layout.task_path)
-        for directory in (layout.results_dir, layout.decisions_dir, layout.nodes_dir):
+        for directory in (layout.results_dir, layout.turns_dir, layout.nodes_dir):
             directory.mkdir(parents=True, exist_ok=True)
         if self.slurm:
             layout.test_commands_path.touch()
@@ -212,15 +212,14 @@ class ModelingV2OnboardWorkflow:
         self._drop_task_branches()
         for path in (
             layout.state_path,
-            layout.graph_state_path,
             layout.plan_path,
-            layout.built_plan_path,
+            layout.running_plan_path,
             layout.test_commands_path,
         ):
             path.unlink(missing_ok=True)
         for directory in (
             layout.results_dir,
-            layout.decisions_dir,
+            layout.turns_dir,
             layout.nodes_dir,
             layout.worktrees_dir,
         ):
@@ -241,98 +240,79 @@ class ModelingV2OnboardWorkflow:
         if branches:
             _git(repo, "branch", "-D", *branches)
 
-    # ---------------------------------------------------------------- planner
+    # ---------------------------------------------------------------- workers
 
-    async def _planner_session(self, prompt: str, check: Callable[[], T]) -> T:
-        """Run one planner session, feeding validation errors back until ``check`` passes."""
-        agent = self.agent_factory(
-            "planner",
-            build_planner_system_prompt(max_parallel=self.max_parallel),
-            self.repo_path,
-            "persistent",
-        )
+    def _save(self) -> None:
+        self._state.save(self.layout.state_path)
+
+    def _set(self, task_id: str, state: NodeState) -> None:
+        old = self._state.tasks.get(task_id)
+        self._state.tasks[task_id] = state
+        self._save()
+        if old != state:
+            before = old.value if old else "new"
+            print_message(f"  task {task_id}: {before} → {state.value}", self._log)
+
+    def _adopt(self, plan: PlanSpec) -> None:
+        self._plan = plan
+        self.layout.running_plan_path.write_text(plan.text, encoding="utf-8")
+
+    def _startable(self, node: Node) -> bool:
+        tasks = self._state.tasks
+        if node.id in self._running or node.id in self._resetting:
+            return False
+        if tasks[node.id] == NodeState.RUNNING:
+            # Started before the orchestrator restarted: resume it.
+            return True
+        if tasks[node.id] != NodeState.PENDING:
+            return False
+        if node.id == self._plan.sink_id() and not self._state.finish:
+            return False
+        return all(tasks.get(dep) == NodeState.DONE for dep in node.depends_on)
+
+    def _ready(self) -> list[Node]:
+        """Tasks that can start now but have no worker yet, resumed ones first."""
+        nodes = [n for n in self._plan.graph.nodes if self._startable(n)]
+        return sorted(nodes, key=lambda n: self._state.tasks[n.id] != NodeState.RUNNING)
+
+    def _dispatch(self) -> None:
+        """Start ready tasks until every worker slot is taken."""
+        if self._outcome is not None or self._crash is not None:
+            return
+        for node in self._ready():
+            if len(self._running) >= self.max_parallel:
+                break
+            self._set(node.id, NodeState.RUNNING)
+            self._running[node.id] = asyncio.create_task(self._task(node))
+
+    async def _task(self, node: Node) -> None:
+        """One task end to end: worktree, merge of its dependencies, worker, commit."""
+        tags = self._plan.tags[node.id]
+        is_final = node.id == self._plan.sink_id()
+        dep_nodes = [self._plan.graph.by_id[dep] for dep in node.depends_on]
         try:
-            await agent.aforward(prompt)
-            for _ in range(MAX_PLAN_FIXES):
-                try:
-                    return check()
-                except PlanError as exc:
-                    problems = exc.problems
-                except HandoffError as exc:
-                    problems = [str(exc)]
-                print_message(
-                    f"[yellow]plan rejected: {len(problems)} problem(s); asking the planner "
-                    "to fix them[/yellow]",
-                    self._log,
-                )
-                await agent.aforward(plan_fix_prompt(problems, plan=self.layout.plan_path))
-            return check()
-        finally:
-            await agent.__aexit__(None, None, None)
-
-    def _read_plan(self, **kwargs) -> PlanSpec:
-        if not self.layout.plan_path.is_file():
-            raise PlanError([f"{self.layout.plan_path} was not written"])
-        return parse_plan(self.layout.plan_path.read_text(encoding="utf-8"), **kwargs)
-
-    def _plan(self) -> PlanSpec:
-        prompt = initial_plan_prompt(
-            task_yaml=self.layout.task_path, plan=self.layout.plan_path, repo=self.repo_path
-        )
-        return anyio.run(self._planner_session, prompt, self._read_plan)
-
-    def _replan(
-        self, round_index: int, built: PlanSpec, states: dict[str, NodeState]
-    ) -> tuple[PlannerDecision, PlanSpec | None]:
-        decision_path = self.layout.decision_path(round_index)
-        decision_path.unlink(missing_ok=True)
-
-        def by_state(state: NodeState) -> list[str]:
-            return [tid for tid, s in states.items() if s == state and tid in built.graph.by_id]
-
-        failed = by_state(NodeState.FAILED)
-        prompt = replan_prompt(
-            task_yaml=self.layout.task_path,
-            plan=self.layout.plan_path,
-            results_dir=self.layout.results_dir,
-            failed=[(tid, self.layout.result_path(tid)) for tid in failed],
-            interrupted=by_state(NodeState.INTERRUPTED),
-            done=by_state(NodeState.DONE),
-            decision=decision_path,
-        )
-
-        def check() -> tuple[PlannerDecision, PlanSpec | None]:
-            decision = read_handoff(decision_path, parse_planner_decision)
-            if decision.decision != "REVISED":
-                return decision, None
-            return decision, self._read_plan(previous=built, states=states)
-
-        return anyio.run(self._planner_session, prompt, check)
-
-    # ------------------------------------------------------------------ build
-
-    def _build(self, plan: PlanSpec) -> GraphResult:
-        self.layout.built_plan_path.write_text(plan.text, encoding="utf-8")
-
-        def on_transition(node_id: str, old: NodeState, new: NodeState) -> None:
-            print_message(f"  task {node_id}: {old.value} → {new.value}", self._log)
-
-        scheduler = NodeScheduler(
-            plan.graph,
-            make_run_node(
-                layout=self.layout,
-                plan=plan,
-                repo_path=self.repo_path,
-                agent_factory=self.agent_factory,
-                slurm=self.slurm,
-            ),
-            self.isolation,
-            on_transition=on_transition,
-            max_parallel=self.max_parallel,
-            checkpoint_path=self.layout.graph_state_path,
-            pause_on_failure=True,
-        )
-        return anyio.run(scheduler.run)
+            path = await self.isolation.acquire(node)
+            try:
+                if dep_nodes:
+                    await self.isolation.prepare(node, dep_nodes, path)
+                result = await self._run_task(node, path, tags, is_final)
+                await self.isolation.commit(node, path)
+            finally:
+                await self.isolation.release(node)
+        except Exception as exc:
+            # Worker failures arrive as FAILED results; an exception here is the
+            # orchestrator's own git machinery failing, which stops the run.
+            self._crash = exc
+            self._wake.set()
+            return
+        del self._running[node.id]
+        state = NodeState.DONE if result.status == "DONE" else NodeState.FAILED
+        self._set(node.id, state)
+        self._finished.append((node.id, result.status, result.summary))
+        if is_final and state == NodeState.DONE:
+            self._outcome = RunOutcome.SUCCEEDED
+        self._wake.set()
+        self._dispatch()
 
     def _cancel_jobs(self, task_id: str) -> None:
         jobs_path = self.layout.jobs_path(task_id)
@@ -345,58 +325,259 @@ class ModelingV2OnboardWorkflow:
             try:
                 kind.cancel(entry.handle)
             except (OSError, KeyError, subprocess.SubprocessError):
-                # A job that is already gone must not stop the replan.
+                # A job that is already gone must not stop the run.
                 continue
 
-    def _reset(self, old: PlanSpec, new: PlanSpec, failed: set[str]) -> list[str]:
-        """Reset every task the revision invalidates; return their ids.
+    async def _stop_workers(self) -> None:
+        """Cancel every running worker; its state stays RUNNING for a resume."""
+        tasks = list(self._running.values())
+        self._running.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        That is the failed tasks, the tasks whose graph entry changed or that
-        were added, everything downstream of those, and the removed tasks. Each
-        loses its detached jobs, notes, worktree and branch; its last result is
-        kept as an earlier attempt for the next worker to read. ``DONE`` tasks
-        and untouched interrupted tasks keep everything and resume.
+    async def _discard(self, node: Node) -> None:
+        await self.isolation.release(node)
+        await self.isolation.reclaim(node)
+
+    # ---------------------------------------------------------------- planner
+
+    async def _converse(self, prompt: str, check: Callable[[], T]) -> T:
+        """Send ``prompt``, then validation errors, until ``check`` passes.
+
+        ``check`` validates the planner's files and applies them without
+        awaiting, so the task states it validated against are the ones it
+        changes. Raises the last :class:`PlanError` when the planner runs out
+        of fixes.
         """
-        graph_state = GraphState.load(self.layout.graph_state_path)
-        removed = set(old.graph.by_id) - set(new.graph.by_id)
-        frontier = failed | invalidation_set(old.graph, new.graph) | removed
-        reset: list[str] = []
-        for task_id in sorted(frontier):
-            if graph_state.states.get(task_id) == NodeState.DONE:
-                continue
-            node = new.graph.by_id.get(task_id) or old.graph.by_id[task_id]
-            self._cancel_jobs(task_id)
-            result = self.layout.result_path(task_id)
-            if result.is_file():
-                attempt = len(self.layout.previous_attempts(task_id)) + 1
-                result.replace(self.layout.attempt_path(task_id, attempt))
-            shutil.rmtree(self.layout.node_dir(task_id), ignore_errors=True)
-            anyio.run(self.isolation.discard, node)
-            graph_state.worktrees.pop(task_id, None)
-            if task_id in removed:
-                graph_state.states.pop(task_id, None)
+        await self._planner.aforward(prompt)
+        for attempt in range(MAX_PLAN_FIXES + 1):
+            try:
+                return check()
+            except PlanError as exc:
+                problems = exc.problems
+            except HandoffError as exc:
+                problems = [str(exc)]
+            if attempt == MAX_PLAN_FIXES:
+                raise PlanError(problems)
+            print_message(
+                f"[yellow]planner output rejected: {len(problems)} problem(s); sending "
+                "them back[/yellow]",
+                self._log,
+            )
+            await self._planner.aforward(plan_fix_prompt(problems, plan=self.layout.plan_path))
+        raise AssertionError("unreachable")
+
+    def _read_plan_md(self) -> str:
+        if not self.layout.plan_path.is_file():
+            raise PlanError([f"{self.layout.plan_path} was not written"])
+        return self.layout.plan_path.read_text(encoding="utf-8")
+
+    async def _initial_plan(self) -> None:
+        def check() -> None:
+            plan = parse_plan(self._read_plan_md())
+            self._adopt(plan)
+            self._state.tasks = {node.id: NodeState.PENDING for node in plan.graph.nodes}
+            self._state.phase = "run"
+            self._save()
+
+        print_rule("[bold magenta]Plan[/bold magenta]", self._log)
+        await self._converse(
+            initial_plan_prompt(
+                task_yaml=self.layout.task_path,
+                plan=self.layout.plan_path,
+                repo=self.repo_path,
+            ),
+            check,
+        )
+        print_message(f"plan: {len(self._plan.graph.nodes)} tasks", self._log)
+
+    def _validate(self, turn_file: Path) -> _Change:
+        """Check the planner's turn against the current task states."""
+        decision = read_handoff(turn_file, parse_planner_decision)
+        tasks = self._state.tasks
+        problems: list[str] = []
+        for tid in decision.cancel:
+            if tasks.get(tid) != NodeState.RUNNING:
+                state = tasks[tid].value if tid in tasks else "not in the plan"
+                problems.append(f"`cancel`: task {tid!r} is not running ({state})")
+        for tid in decision.retry:
+            if tasks.get(tid) != NodeState.FAILED:
+                state = tasks[tid].value if tid in tasks else "not in the plan"
+                problems.append(f"`retry`: task {tid!r} is not FAILED ({state})")
+        text = self._read_plan_md()
+        plan = self._plan
+        if text != self._plan.text:
+            cancelled = set(decision.cancel)
+            effective = {
+                tid: NodeState.PENDING if tid in cancelled else state
+                for tid, state in tasks.items()
+            }
+            try:
+                plan = parse_plan(text, previous=self._plan, states=effective)
+            except PlanError as exc:
+                problems += exc.problems
+        if problems:
+            raise PlanError(problems)
+
+        old = self._plan
+        removed = set(old.graph.by_id) - set(plan.graph.by_id)
+        rewritten_failed = {
+            tid
+            for tid in old.graph.by_id
+            if tid in plan.graph.by_id
+            and tasks.get(tid) == NodeState.FAILED
+            and old.entry(tid) != plan.entry(tid)
+        }
+        reset = set(decision.cancel) | set(decision.retry) | rewritten_failed | removed
+        return _Change(decision=decision, plan=plan, old_plan=old, reset=reset, removed=removed)
+
+    def _apply(self, change: _Change) -> list[asyncio.Task[None]]:
+        """Apply a validated turn to the run state; return the cancelled workers."""
+        cancelled = []
+        for tid in change.decision.cancel:
+            task = self._running.pop(tid)
+            task.cancel()
+            cancelled.append(task)
+        self._resetting |= change.reset
+        self._adopt(change.plan)
+        tasks = self._state.tasks
+        for tid in sorted(change.reset):
+            if tid in change.removed:
+                tasks.pop(tid, None)
+                print_message(f"  task {tid}: removed", self._log)
             else:
-                graph_state.states[task_id] = NodeState.PENDING
-            reset.append(task_id)
-        graph_state.save(self.layout.graph_state_path)
-        return reset
+                self._set(tid, NodeState.PENDING)
+        for node in change.plan.graph.nodes:
+            if node.id not in tasks:
+                self._set(node.id, NodeState.PENDING)
+        if change.decision.decision == "FINISH":
+            self._state.finish = True
+        if change.decision.decision == "ABORT":
+            self._outcome = RunOutcome.ABORTED
+        self._save()
+        return cancelled
 
-    # -------------------------------------------------------------------- run
+    async def _reset(self, change: _Change, cancelled: list[asyncio.Task[None]]) -> None:
+        """Drop the reset tasks' workers, jobs, notes and branches.
 
-    def _finish(self, state: _State, outcome: RunOutcome, plan: PlanSpec) -> RunOutcome:
+        Each reset task's last result is kept as an earlier attempt for the
+        next worker and the planner to read.
+        """
+        await asyncio.gather(*cancelled, return_exceptions=True)
+        for tid in sorted(change.reset):
+            node = change.plan.graph.by_id.get(tid) or change.old_plan.graph.by_id[tid]
+            self._cancel_jobs(tid)
+            result = self.layout.result_path(tid)
+            if result.is_file():
+                attempt = len(self.layout.previous_attempts(tid)) + 1
+                result.replace(self.layout.attempt_path(tid, attempt))
+            shutil.rmtree(self.layout.node_dir(tid), ignore_errors=True)
+            await self._discard(node)
+            self._resetting.discard(tid)
+
+    def _describe(self, node: Node) -> str:
+        tasks = self._state.tasks
+        state = tasks[node.id]
+        if state == NodeState.RUNNING:
+            return "running" if node.id in self._running else "running — waiting for a slot"
+        if state != NodeState.PENDING:
+            return state.value
+        waiting = [dep for dep in node.depends_on if tasks.get(dep) != NodeState.DONE]
+        if waiting:
+            return f"pending — waiting on {', '.join(waiting)}"
+        if node.id == self._plan.sink_id() and not self._state.finish:
+            return "pending — held until FINISH"
+        return "pending — ready, waiting for a slot"
+
+    async def _turn(self, *, stalled: bool, resumed: bool) -> None:
+        """Wake the planner with what changed and apply its answer."""
+        finished, self._finished = self._finished, []
+        state = self._state
+        state.turn += 1
+        self._save()
+        turn_file = self.layout.turn_path(state.turn)
+        turn_file.unlink(missing_ok=True)
+        prompt = planner_turn_prompt(
+            turn_file=turn_file,
+            plan=self.layout.plan_path,
+            task_yaml=self.layout.task_path,
+            results_dir=self.layout.results_dir,
+            finished=[
+                (tid, status, summary, self.layout.result_path(tid))
+                for tid, status, summary in finished
+            ],
+            states=[(n.id, self._describe(n)) for n in self._plan.graph.nodes],
+            running=len(self._running),
+            ready=len(self._ready()),
+            max_parallel=self.max_parallel,
+            finish=state.finish,
+            stalled=stalled,
+            resumed=resumed,
+            rejected=self._rejected,
+        )
+        self._rejected = []
+        print_rule(f"[bold magenta]Planner turn {state.turn}[/bold magenta]", self._log)
+        applied: list[tuple[_Change, list[asyncio.Task[None]]]] = []
+
+        def check() -> None:
+            change = self._validate(turn_file)
+            applied.append((change, self._apply(change)))
+
+        try:
+            await self._converse(prompt, check)
+        except PlanError as exc:
+            # Keep running the current plan; the planner hears why next turn.
+            self._rejected = exc.problems
+            self.layout.plan_path.write_text(self._plan.text, encoding="utf-8")
+            print_message("[yellow]planner turn discarded[/yellow]", self._log)
+            return
+        change, cancelled = applied[0]
+        decision = change.decision
+        print_message(f"planner: {decision.decision} — {decision.summary}", self._log)
+        await self._reset(change, cancelled)
+        self._dispatch()
+
+    def _idle(self) -> bool:
+        return not self._running and not self._ready()
+
+    async def _loop(self, *, resumed: bool) -> RunOutcome:
+        stalled_turns = 0
+        self._dispatch()
+        while True:
+            if self._crash is not None:
+                raise self._crash
+            if self._outcome is not None:
+                return await self._finish(self._outcome)
+            stalled = self._idle() and not self._finished
+            if not (self._finished or stalled or resumed):
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            stalled_turns = stalled_turns + 1 if stalled else 0
+            if stalled_turns > MAX_STALLED_TURNS:
+                raise WorkflowError(
+                    f"nothing has run for {MAX_STALLED_TURNS} planner turns in a row; "
+                    f"inspect {self.layout.plan_path} and the results, then rerun to resume"
+                )
+            await self._turn(stalled=stalled, resumed=resumed)
+            resumed = False
+
+    async def _finish(self, outcome: RunOutcome) -> RunOutcome:
         """Record the outcome; free task branches only when everything landed.
 
-        When the planner stops the run early, work the final task has not
-        landed exists only on its ``node/<id>`` branch, so every branch is kept.
+        After an ABORT, work the final task has not landed exists only on its
+        ``node/<id>`` branch, so every branch is kept.
         """
-        states = GraphState.load(self.layout.graph_state_path).states
-        for node in plan.graph.nodes:
-            if states.get(node.id) != NodeState.DONE:
-                self._cancel_jobs(node.id)
-            if outcome == RunOutcome.SUCCEEDED:
-                anyio.run(self.isolation.discard, node)
-        state.phase, state.outcome = "done", outcome.value
-        state.save(self.layout.state_path)
+        await self._stop_workers()
+        for tid, state in self._state.tasks.items():
+            if state != NodeState.DONE:
+                self._cancel_jobs(tid)
+        if outcome == RunOutcome.SUCCEEDED:
+            for node in self._plan.graph.nodes:
+                await self._discard(node)
+        self._state.phase, self._state.outcome = "done", outcome.value
+        self._save()
         print_rule(f"[bold]Run finished: {outcome.value}[/bold]", self._log)
         if outcome != RunOutcome.SUCCEEDED:
             print_message(
@@ -406,50 +587,43 @@ class ModelingV2OnboardWorkflow:
             )
         return outcome
 
+    async def _main(self) -> RunOutcome:
+        self._running: dict[str, asyncio.Task[None]] = {}
+        self._resetting: set[str] = set()
+        self._finished: list[tuple[str, str, str]] = []
+        self._wake = asyncio.Event()
+        self._outcome: RunOutcome | None = None
+        self._crash: Exception | None = None
+        self._rejected: list[str] = []
+        self._planner: Agent = self.agent_factory(
+            "planner",
+            build_planner_system_prompt(max_parallel=self.max_parallel),
+            self.repo_path,
+            "persistent",
+        )
+        try:
+            resumed = self._state.phase == "run"
+            if resumed:
+                text = self.layout.running_plan_path.read_text(encoding="utf-8")
+                self._plan = parse_plan(text)
+            else:
+                await self._initial_plan()
+            print_rule(f"[bold cyan]Run (up to {self.max_parallel} workers)[/bold cyan]", self._log)
+            return await self._loop(resumed=resumed)
+        finally:
+            await self._stop_workers()
+            await self._planner.__aexit__(None, None, None)
+
     def run(self) -> RunOutcome:
         """Run (or resume) the workflow to completion."""
         self._check_workspace()
-        state = self._init()
-        layout = self.layout
-        if state.phase == "done":
+        self._state = self._init()
+        if self._state.phase == "done":
             print_message(
-                f"[bold]This run already finished ({state.outcome}); pass --clean to start "
-                "over.[/bold]",
+                f"[bold]This run already finished ({self._state.outcome}); pass --clean to "
+                "start over.[/bold]",
                 self._log,
             )
-            return RunOutcome(state.outcome)
+            return RunOutcome(self._state.outcome)
         self._check_checkout()
-
-        if state.phase == "plan":
-            print_rule("[bold magenta]Plan[/bold magenta]", self._log)
-            self._plan()
-            state.phase = "build"
-            state.save(layout.state_path)
-
-        while True:
-            if state.phase == "build":
-                plan = self._read_plan()
-                print_rule(
-                    f"[bold cyan]Build ({len(plan.graph.nodes)} tasks)[/bold cyan]", self._log
-                )
-                result = self._build(plan)
-                if result.succeeded:
-                    return self._finish(state, RunOutcome.SUCCEEDED, plan)
-                state.phase = "replan"
-                state.round += 1
-                state.save(layout.state_path)
-
-            built = parse_plan(layout.built_plan_path.read_text(encoding="utf-8"))
-            states = GraphState.load(layout.graph_state_path).states
-            print_rule(f"[bold magenta]Replan {state.round}[/bold magenta]", self._log)
-            decision, revised = self._replan(state.round, built, states)
-            print_message(f"planner: {decision.decision} — {decision.summary}", self._log)
-            if decision.decision == "DONE":
-                return self._finish(state, RunOutcome.PLANNER_DONE, built)
-            if decision.decision == "ABORT":
-                return self._finish(state, RunOutcome.ABORTED, built)
-            failed = {tid for tid, s in states.items() if s == NodeState.FAILED}
-            reset = self._reset(built, revised, failed)
-            print_message(f"reset: {', '.join(reset) or 'none'}", self._log)
-            state.phase = "build"
-            state.save(layout.state_path)
+        return asyncio.run(self._main())

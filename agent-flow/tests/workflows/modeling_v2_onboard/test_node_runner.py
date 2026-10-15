@@ -8,9 +8,8 @@ from __future__ import annotations
 import anyio
 import pytest
 
-from agent_flow.orchestration import NodeState
 from agent_flow.workflows.modeling_v2_onboard.files import Layout, parse_task_result
-from agent_flow.workflows.modeling_v2_onboard.node_runner import make_run_node
+from agent_flow.workflows.modeling_v2_onboard.node_runner import make_run_task
 from agent_flow.workflows.modeling_v2_onboard.plan import parse_plan
 from agent_flow.workflows.modeling_v2_onboard.prompts import PLAN_EXAMPLE
 
@@ -21,16 +20,11 @@ _PLAN = parse_plan(PLAN_EXAMPLE)
 
 def _run(tmp_path, factory, node_id="join-core", *, slurm=False):
     layout = Layout(tmp_path / "ws")
-    run_node = make_run_node(
-        layout=layout,
-        plan=_PLAN,
-        repo_path=tmp_path / "repo",
-        agent_factory=factory,
-        slurm=slurm,
-    )
+    run_task = make_run_task(layout=layout, agent_factory=factory, slurm=slurm)
     node = _PLAN.graph.by_id[node_id]
-    outcome = anyio.run(run_node, node, tmp_path / "wt")
-    return layout, outcome
+    is_final = node_id == _PLAN.sink_id()
+    result = anyio.run(run_task, node, tmp_path / "wt", _PLAN.tags[node_id], is_final)
+    return layout, result
 
 
 @pytest.mark.parametrize("status", ["DONE", "FAILED"])
@@ -39,13 +33,8 @@ def test_status_in_the_result_file_is_the_outcome(tmp_path, status):
         write_result(result_path_in(prompt), status, "did it")
 
     factory = FakeFactory(worker=worker)
-    layout, outcome = _run(tmp_path, factory)
-    assert outcome.terminal_state == NodeState[status]
-    assert outcome.info == {
-        "node_id": "join-core",
-        "tags": ["merge", "target"],
-        "summary": "did it",
-    }
+    layout, result = _run(tmp_path, factory)
+    assert (result.status, result.summary) == (status, "did it")
 
     (agent,) = factory.agents
     assert agent.closed and agent.session_mode == "persistent"
@@ -63,8 +52,8 @@ def test_a_missing_result_gets_one_follow_up_turn(tmp_path):
             write_result(result_path_in(prompt), "DONE")
 
     factory = FakeFactory(worker=worker)
-    _, outcome = _run(tmp_path, factory)
-    assert outcome.terminal_state == NodeState.DONE
+    _, result = _run(tmp_path, factory)
+    assert result.status == "DONE"
     assert len(factory.agents[0].prompts) == 2
 
 
@@ -72,8 +61,8 @@ def test_no_result_after_the_follow_up_fails_the_task_with_a_written_reason(tmp_
     async def worker(agent, prompt):
         result_path_in(prompt).write_text("no front matter\n")
 
-    layout, outcome = _run(tmp_path, FakeFactory(worker=worker))
-    assert outcome.terminal_state == NodeState.FAILED
+    layout, result = _run(tmp_path, FakeFactory(worker=worker))
+    assert result.status == "FAILED"
     text = layout.result_path("join-core").read_text()
     assert parse_task_result(text).status == "FAILED"
     assert "must start with" in text
@@ -84,8 +73,8 @@ def test_a_crashing_session_fails_only_the_task(tmp_path):
         raise RuntimeError("backend died")
 
     factory = FakeFactory(worker=worker)
-    layout, outcome = _run(tmp_path, factory)
-    assert outcome.terminal_state == NodeState.FAILED
+    layout, result = _run(tmp_path, factory)
+    assert result.status == "FAILED"
     assert "backend died" in layout.result_path("join-core").read_text()
     assert factory.agents[0].closed
 
@@ -98,8 +87,8 @@ def test_a_stale_result_from_an_interrupted_turn_is_not_reused(tmp_path):
     async def worker(agent, prompt):
         return None
 
-    _, outcome = _run(tmp_path, FakeFactory(worker=worker))
-    assert outcome.terminal_state == NodeState.FAILED
+    _, result = _run(tmp_path, FakeFactory(worker=worker))
+    assert result.status == "FAILED"
 
 
 def test_final_task_and_slurm_are_announced(tmp_path):

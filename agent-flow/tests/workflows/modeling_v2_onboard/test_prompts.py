@@ -14,6 +14,7 @@ from agent_flow.workflows.modeling_v2_onboard.prompts import (
     WorkerTask,
     build_planner_system_prompt,
     build_worker_system_prompt,
+    planner_turn_prompt,
     worker_turn_prompt,
 )
 from agent_flow.workflows.modeling_v2_onboard.prompts._common import SLURM_ENVIRONMENT
@@ -46,7 +47,7 @@ def test_planner_prompt_lists_every_tag():
 
 def test_planner_prompt_states_the_parallelism():
     prompt = build_planner_system_prompt(max_parallel=6)
-    assert "Up to **6** tasks run at once" in prompt
+    assert "Up to **6** workers run at once, and the goal is that\n6 are always working" in prompt
     assert "keep every worker busy" in prompt.lower()
 
 
@@ -86,3 +87,34 @@ def test_worker_turn_prompt_names_every_path(tmp_path: Path):
     assert "### op-a" in prompt
     assert "final task" not in prompt
     assert "final task" in worker_turn_prompt(WorkerTask(**{**task.__dict__, "is_final": True}))
+
+
+def test_planner_turn_prompt_reports_what_changed(tmp_path: Path):
+    def prompt(**overrides):
+        args = dict(
+            turn_file=tmp_path / "turn_3.yaml",
+            plan=tmp_path / "plan.md",
+            task_yaml=tmp_path / "task.yaml",
+            results_dir=tmp_path / "task_results",
+            finished=[("c", "FAILED", "no entry", tmp_path / "task_result_c.md")],
+            states=[("a", "done"), ("c", "failed"), ("p", "running")],
+            running=5,
+            ready=1,
+            max_parallel=8,
+            finish=False,
+            stalled=False,
+            resumed=False,
+            rejected=[],
+        )
+        return planner_turn_prompt(**{**args, **overrides})
+
+    text = prompt()
+    assert "- `c` FAILED: no entry" in text
+    assert "5 running, 1 ready and waiting for a slot, 2 of 8 slots free" in text
+    assert "held until you decide FINISH" in text
+    assert f"End the turn by writing `{tmp_path / 'turn_3.yaml'}`" in text
+    assert "restarted" not in text and "stalled" not in text and "discarded" not in text
+    assert "held" not in prompt(finish=True)
+    assert "The run is stalled" in prompt(stalled=True)
+    assert "orchestrator restarted" in prompt(resumed=True)
+    assert "- task 'a' is DONE" in prompt(rejected=["task 'a' is DONE"])

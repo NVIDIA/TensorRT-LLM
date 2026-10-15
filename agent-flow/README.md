@@ -148,7 +148,8 @@ Ready-to-run multi-agent workflows ship as subpackages of
   planner ↔ parallel workers for bringing up ModelingV2 models and targets.
   The planner publishes tagged tasks and their dependencies in `plan.md`;
   workers run them concurrently in git worktrees, each writing
-  `task_result_<id>.md`; a failed task pauses the run for a replan. Launch via
+  `task_result_<id>.md`. The planner runs alongside them, woken whenever a
+  worker finishes, to extend or revise the plan. Launch via
   `modeling-v2-onboard`.
 - [`agent_flow.workflows.perf_analyze`](agent_flow/workflows/perf_analyze) —
   one-shot **diagnosis** of a `trtllm-serve` deployment (Benchmarker →

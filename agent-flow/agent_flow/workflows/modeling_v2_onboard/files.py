@@ -5,9 +5,9 @@
 
 A worker ends its task by writing ``task_results/task_result_<id>.md``: a YAML
 front matter block whose ``status`` the orchestrator branches on, followed by a
-free-form markdown report for the planner and for downstream workers. A planner
-ends a replan by writing ``planner_decisions/round_<n>.yaml``. Both are plain
-files so the claude-code and codex backends behave identically.
+free-form markdown report for the planner and for downstream workers. The
+planner ends every turn by writing ``planner_turns/turn_<n>.yaml``. Both are
+plain files so the claude-code and codex backends behave identically.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ __all__ = [
 ]
 
 TASK_STATUSES: tuple[str, ...] = ("DONE", "FAILED")
-PLANNER_DECISIONS: tuple[str, ...] = ("REVISED", "DONE", "ABORT")
+PLANNER_DECISIONS: tuple[str, ...] = ("CONTINUE", "FINISH", "ABORT")
 
 
 class HandoffError(ValueError):
@@ -49,10 +49,21 @@ class TaskResult:
 
 @dataclass(frozen=True)
 class PlannerDecision:
-    """A planner's verdict at the end of a replan."""
+    """What a planner turn asks of the orchestrator, besides any plan.md edit.
+
+    Attributes:
+        decision: ``CONTINUE``; ``FINISH`` to let the final task start once its
+            dependencies are done; ``ABORT`` to stop the run.
+        summary: What the planner changed and why.
+        retry: ``FAILED`` tasks to run again unchanged.
+        cancel: ``RUNNING`` tasks to stop; they start over unless the plan
+            removes or rewrites them.
+    """
 
     decision: str
     summary: str
+    retry: tuple[str, ...] = ()
+    cancel: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,25 +81,21 @@ class Layout:
         return self.workspace / "plan.md"
 
     @property
-    def built_plan_path(self) -> Path:
-        """The plan.md the last build ran, which a replan is diffed against."""
-        return self.workspace / ".built_plan.md"
+    def running_plan_path(self) -> Path:
+        """The last plan.md that validated: the plan the orchestrator runs."""
+        return self.workspace / ".running_plan.md"
 
     @property
     def state_path(self) -> Path:
         return self.workspace / ".state.json"
 
     @property
-    def graph_state_path(self) -> Path:
-        return self.workspace / ".graph_state.json"
-
-    @property
     def results_dir(self) -> Path:
         return self.workspace / "task_results"
 
     @property
-    def decisions_dir(self) -> Path:
-        return self.workspace / "planner_decisions"
+    def turns_dir(self) -> Path:
+        return self.workspace / "planner_turns"
 
     @property
     def nodes_dir(self) -> Path:
@@ -121,8 +128,8 @@ class Layout:
     def jobs_path(self, task_id: str) -> Path:
         return self.node_dir(task_id) / "jobs.json"
 
-    def decision_path(self, round_index: int) -> Path:
-        return self.decisions_dir / f"round_{round_index}.yaml"
+    def turn_path(self, turn: int) -> Path:
+        return self.turns_dir / f"turn_{turn}.yaml"
 
 
 def _front_matter(text: str) -> str:
@@ -166,16 +173,26 @@ def parse_task_result(text: str) -> TaskResult:
     )
 
 
+def _ids(data: dict, key: str) -> tuple[str, ...]:
+    value = data.get(key) or []
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise HandoffError(f"`{key}` must be a list of task ids, got {value!r}")
+    return tuple(dict.fromkeys(value))
+
+
 def parse_planner_decision(text: str) -> PlannerDecision:
-    """Parse a planner's ``round_<n>.yaml``.
+    """Parse a planner's ``turn_<n>.yaml``.
 
     Raises:
-        HandoffError: When ``decision`` is not one of :data:`PLANNER_DECISIONS`.
+        HandoffError: When ``decision`` is not one of :data:`PLANNER_DECISIONS`
+            or ``retry``/``cancel`` is not a list of ids.
     """
     data = _mapping(text)
     return PlannerDecision(
         decision=_choice(data, "decision", PLANNER_DECISIONS),
         summary=str(data.get("summary", "")).strip(),
+        retry=_ids(data, "retry"),
+        cancel=_ids(data, "cancel"),
     )
 
 

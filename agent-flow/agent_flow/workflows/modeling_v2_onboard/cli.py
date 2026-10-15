@@ -76,7 +76,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--max-parallel",
         type=int,
         default=8,
-        help="The most tasks that run at the same time (default: 8).",
+        help="The most workers that run at the same time (default: 8).",
     )
     parser.add_argument(
         "--clean",
