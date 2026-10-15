@@ -23,15 +23,17 @@ processes, without launching anything on the GPU and without adding work to
 warmup.
 
 Variant providers, one per module next to its kernels, say which variants to
-compile. Once a batch is scheduled, a provider replays the module's real
-Triton launchers on ``meta`` tensors under :func:`shadow_launches`, which
-records each ``run`` instead of executing it, so the recorded arguments are
-exactly those of the real launch. On the first plan, a background thread also
-plans one batch per kernel-signature class the provider can reach within the
-engine limits, so a process that has never run this model before is covered.
-DeepGEMM and CuTe DSL providers do the same through those libraries'
-compile-only entry points (``jit_prefetch_deep_gemm.py``,
-``jit_prefetch_cute_dsl.py``).
+compile. A provider replays the module's real Triton launchers on ``meta``
+tensors under :func:`shadow_launches`, which records each ``run`` instead of
+executing it, so the recorded arguments are exactly those of the real launch.
+At the end of warmup a background thread plans one batch per kernel-signature
+class each provider can reach within the engine limits, so a process that
+has never run this model before is covered; a scheduled batch is planned too,
+ahead of that. Some providers take the batch-independent part of a launch
+(pool layouts, fixed scalars) from the launches warmup made; they are
+enumerated again after each warmup. DeepGEMM and CuTe DSL providers do the
+same through those libraries' compile-only entry points
+(``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``).
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -40,8 +42,9 @@ minus the launch). Misses go to the helpers, which call ``triton.compile``
 into the on-disk cache, so the real launch loads the cubin in about a
 millisecond. A priority queue orders the work: a variant the executor is
 about to wait on, then the scheduled batch, then provider enumeration. If the
-executor reaches a variant a helper is still compiling, it waits for that
-compile instead of compiling it a second time.
+executor reaches a variant a helper is already compiling, it waits for that
+compile instead of compiling it a second time; one still queued it compiles
+itself.
 
 Autotuned kernels: if the autotuner already picked a config for a key, only
 that config is planned; otherwise every candidate config is compiled, so the

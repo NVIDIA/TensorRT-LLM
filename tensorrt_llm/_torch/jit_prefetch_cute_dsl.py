@@ -22,7 +22,7 @@ point it would call ``cute.compile``, loads that file with
 ``cute.runtime.load_module``: a ~1 ms load replaces a compile of 0.2 s to
 several seconds.
 
-Covered kernels, each a builder in ``_BUILDERS``:
+Covered kernels, each a builder in ``_BUILDERS`` / ``_PRECOMPILED``:
 
 * the fused K1+K2+K3 kernel of Kimi K3's KDA prefill
   (``_launch_fused_k123_inv``). Its compiled form depends only on constexpr
@@ -34,13 +34,18 @@ Covered kernels, each a builder in ``_BUILDERS``:
   version and whether the rows are contiguous (``flashinfer.norm``'s own
   cache key); every combination an engine's norm layers can reach is
   enumerated once from the model.
+* the radix top-k runners of the sparse-attention indexers (TVM-FFI),
+  keyed on the score width bucket, the decode row band and the
+  engine-fixed top_k / next_n / dtype (``TopKProvider``).
+* CSA2's candidate publication (``Csa2PublishProvider``), keyed on the
+  layer's block geometry and the power-of-two block capacity.
 
 A spec is canonical JSON naming the kernel and its compile-time arguments;
 its SHA-1 is the file name, so helper and executor agree without sharing
-state. The helper runs with no visible GPU: the few device properties kernel
-constructors read (shared memory per block, SM version) are taken from the
-executor's device and answered by a shim (``device_props`` /
-``install_device_shim``).
+state. The helper runs with no visible GPU: the device properties kernel
+constructors and the CuTe DSL compiler read (SM version, SM count, shared
+memory, the largest cluster) are taken from the executor's device and
+answered by a shim (``device_props`` / ``install_device_shim``).
 """
 
 # No ``from __future__ import annotations``: CuTe DSL reads the scalar
