@@ -1316,18 +1316,19 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             f"the KV cache manager {type(cm).__name__} reports is_speculative() False, "
             "so it allocated none of the per-step state buffers the verify path writes"
         )
-        assert not getattr(cm, "use_replay_state_update", False), (
+        assert not cm.use_gdn_cached_replay_all_layer_commit, (
             "the GDN cached-replay verify path is on. Export TRTLLM_USE_GDN_REPLAY=0 "
             "before the ranks start; see this target's __init__ for why"
         )
         _require(
             cm,
-            ("get_intermediate_conv_states", "get_intermediate_ssm_states"),
+            ("mamba_layer_cache",),
             "reads both per-step state buffers",
         )
-        # `get_intermediate_*` builds a fresh view per call, so bind them here.
-        int_conv = {i: cm.get_intermediate_conv_states(i) for i in self.gdn_layers}
-        int_ssm = {i: cm.get_intermediate_ssm_states(i) for i in self.gdn_layers}
+        # Bind the per-layer views once for subsequent forwards.
+        layer_caches = {i: cm.mamba_layer_cache(i) for i in self.gdn_layers}
+        int_conv = {i: cache.intermediate_conv_window for i, cache in layer_caches.items()}
+        int_ssm = {i: cache.intermediate_ssm for i, cache in layer_caches.items()}
         int_idx = getattr(cm, "intermediate_state_indices", None)
         g0 = self.gdn_layers[0]
         check_step_buffers(g, int_conv[g0], int_ssm[g0], conv0, ssm0, int_idx)
