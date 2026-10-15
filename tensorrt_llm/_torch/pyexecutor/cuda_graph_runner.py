@@ -796,10 +796,6 @@ class CUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            # A captured forward does not run, so there is no in-place input
-            # change to undo (postprocess_fn is for the warmup forwards above).
-            # Undoing one here would shift the static inputs, which are the
-            # engine's own buffers when static_input_ids is set.
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
             # The addresses the graph baked in, for the strict buffer check.
