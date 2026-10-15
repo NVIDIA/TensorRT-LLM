@@ -894,11 +894,16 @@ class Csa2PublishProvider:
     def __init__(self, model, max_seq_len: int):
         self.geometries = set()
         for mod in _modules_with_attention_backends(model):
+            # A CSA2 indexer (layer_idx) or attention module (its layer).
             layout = getattr(mod, "layout", None)
             layer_of = getattr(layout, "layer", None)
-            idx = getattr(mod, "layer_idx", None)
             block_size = getattr(layout, "candidate_block_size", None)
-            if layer_of is None or idx is None or block_size is None:
+            if layer_of is None or block_size is None:
+                continue
+            idx = getattr(mod, "layer_idx", None)
+            if idx is None:
+                idx = getattr(getattr(mod, "layer", None), "layer_idx", None)
+            if idx is None:
                 continue
             try:
                 layer = layer_of(idx)
