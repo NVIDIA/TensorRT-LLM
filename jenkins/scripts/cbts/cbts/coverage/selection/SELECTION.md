@@ -1,4 +1,8 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS Coverage Selection
+
 
 How the touch DB is turned into a decision about which cases to run. Collection side:
 `../collection/COLLECTION.md`.
@@ -82,6 +86,14 @@ the local functions and methods that consume the changed binding:
   `staticmethod` decorators, literal defaults, and annotations validated as safe name loads or
   supported builtin / `typing` / `collections.abc` forms; plain, unshadowed `torch.Tensor` and
   `torch.dtype` annotation loads are also supported;
+- a new top-level dataclass using a unique, unchanged `from dataclasses import dataclass`
+  binding (aliases are supported), optionally called with a literal `frozen` boolean. These
+  classes must have no bases, metaclass keywords, type parameters, or executable class-body
+  statements. Fields require unshadowed builtin type annotations and immutable literal defaults
+  in valid order. Methods use the safe declaration checks above with builtin eager annotations;
+  duplicate members, special methods, namespace reflection, and unsupported decorators decline.
+  The class body and its new methods are bounded together by functions consuming the class
+  binding, retaining external reference checks and the normal no-data fallback;
 - added parameters on undecorated functions or methods with safe annotations and literal defaults
   when provided, preserving the existing parameters' declarations, relative order, and defaults,
   along with positional-only parameters, variadic parameters, and the type comment;
@@ -102,6 +114,11 @@ binding, because the attribute receiver may alias the module and its consumers a
 direct name loads. Signature additions on decorated functions or methods decline even when the
 decorator expression is unchanged: decorators can inspect signatures and register schemas during
 import, with consumers that never execute the Python function.
+
+Validated annotation loads of new class bindings do not count as import-time execution consumers;
+their function declarations already contribute impact. Other import-time uses of the class, such
+as registration calls or module-level construction, still decline. Changes to existing decorated
+method signatures remain unsupported even when safe dataclass additions occur in the same file.
 
 The analysis also declines if the binding is consumed by import-executed code. Otherwise its consumers
 are resolved exactly like changed function bodies. If a consumer is new or absent from the DB, Tier 2

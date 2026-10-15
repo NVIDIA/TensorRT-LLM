@@ -200,6 +200,74 @@ def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
 
 
+def _added_dataclass_change(
+    declaration: str, *, prefix: str = "from dataclasses import dataclass\n\n"
+) -> tuple[str, str]:
+    helper = "def helper():\n    return Budget(2).doubled\n\n"
+    caller = "def caller():\n    return helper()\n"
+    before = prefix + "def helper():\n    return None\n\n" + caller
+    source = prefix + declaration + "\n" + helper + caller
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    return source, diff
+
+
+_ADDED_DATACLASS = (
+    "@dataclass(frozen=True)\n"
+    "class Budget:\n"
+    '    "A value produced by helper."\n'
+    "    amount: int\n\n"
+    "    @property\n"
+    "    def doubled(self) -> int:\n"
+    "        return self.amount * 2\n"
+)
+
+
+@pytest.mark.parametrize("covered_caller", (True, False))
+def test_selector_bounds_new_dataclass_methods_by_existing_binding_consumers(
+    covered_caller: bool,
+) -> None:
+    source, diff = _added_dataclass_change(_ADDED_DATACLASS)
+    checked_bindings: set[str] = set()
+
+    def external(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.update(names)
+        return set()
+
+    db = _FakeDB()
+    if not covered_caller:
+        db.rows["caller"] = set()
+    selector = CoverageSelector(
+        db, REPO_ROOT, read_source=lambda _path: source, external_references=external
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert result.ok, result.reason
+    assert "Budget" in checked_bindings
+    assert result.impacted == {
+        "A10-PyTorch": {"test_caller"} | (set() if covered_caller else {"test_unrelated"})
+    }
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"} if covered_caller else set()}
+    assert result.caller_bounded_funcs == (
+        ["tensorrt_llm/example.py::helper"] if covered_caller else []
+    )
+
+
+def test_selector_preserves_external_references_to_new_dataclasses() -> None:
+    source, diff = _added_dataclass_change(_ADDED_DATACLASS)
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"Budget"},
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert not result.ok
+    assert "external binding" in result.reason
+
+
 @pytest.mark.parametrize("reference_api", ("names", "paths"))
 def test_selector_rejects_external_transitive_no_data_caller(reference_api: str) -> None:
     path = "tensorrt_llm/example.py"
