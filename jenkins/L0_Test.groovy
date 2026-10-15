@@ -6337,63 +6337,79 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     }
 }
 
-// Cluster pins live in the job's Artifactory folder (shared across its builds), keyed by (commit, frontend platform) so that
-// re-runs of the same commit land on the same cluster (and its durations/caches).
-def clusterPinUrl(String platform) {
-    def safePlatform = platform.replaceAll('[^a-zA-Z0-9._-]', '_')
-    return "${URM_ARTIFACTORY_BASE}/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/cluster-pins/${env.gitlabCommit}/${safePlatform}"
+// Cluster pins: one JSON per commit, <commit>.json, stored next to the build
+// artifacts in the parent job's folder (UPLOAD_PATH minus its trailing build
+// number, so it is shared by every build of that job). Keys are test group names,
+// values are the backend platform pinned for that group, so re-runs of the same
+// commit land on the same cluster (and its durations/caches).
+def clusterPinsUrl() {
+    def jobFolder = UPLOAD_PATH.replaceFirst('/[^/]+$', '')
+    return "${URM_ARTIFACTORY_BASE}/${jobFolder}/${env.gitlabCommit}.json"
 }
 
-def readClusterPin(String platform) {
+// Returns the commit's pins as a Map ([:] when none are stored yet), or null if
+// the store could not be read; callers must not write after a null read, or
+// they would overwrite pins they failed to load.
+def readClusterPins() {
+    def pinFile = "cluster_pins_${env.gitlabCommit}.json"
     try {
         withCredentials([usernamePassword(
                 credentialsId: 'urm-artifactory-creds',
                 usernameVariable: 'ART_USER',
                 passwordVariable: 'ART_PASS')]) {
-            def pinned = sh(
-                script: "curl -fsS --max-time 30 -u \"\$ART_USER:\$ART_PASS\" '${clusterPinUrl(platform)}' 2>/dev/null || true",
+            def status = sh(
+                script: "curl -sS --max-time 30 -u \"\$ART_USER:\$ART_PASS\" -o '${pinFile}' -w '%{http_code}' '${clusterPinsUrl()}'",
                 returnStdout: true).trim()
-            return pinned ?: null
+            if (status == "404") {
+                return [:]
+            }
+            if (status != "200") {
+                echo "Failed to read cluster pins from ${clusterPinsUrl()}: HTTP ${status}"
+                return null
+            }
+            return readJSON(file: pinFile, returnPojo: true) as Map
         }
     } catch (Exception e) {
-        echo "Failed to read cluster pin for ${platform}: ${e.toString()}"
+        echo "Failed to read cluster pins from ${clusterPinsUrl()}: ${e.toString()}"
         return null
     }
 }
 
-def writeClusterPin(String platform, String backendPlatform) {
+def writeClusterPins(Map pins) {
+    def pinFile = "cluster_pins_${env.gitlabCommit}.json"
     try {
+        writeFile(file: pinFile, text: JsonOutput.prettyPrint(JsonOutput.toJson(pins)))
         withCredentials([usernamePassword(
                 credentialsId: 'urm-artifactory-creds',
                 usernameVariable: 'ART_USER',
                 passwordVariable: 'ART_PASS')]) {
-            sh "printf '%s' '${backendPlatform}' | curl -fsS --max-time 30 -u \"\$ART_USER:\$ART_PASS\" -X PUT --data-binary @- '${clusterPinUrl(platform)}' > /dev/null"
+            sh "curl -fsS --max-time 30 -u \"\$ART_USER:\$ART_PASS\" -T '${pinFile}' '${clusterPinsUrl()}' > /dev/null"
         }
     } catch (Exception e) {
-        echo "Failed to write cluster pin for ${platform}: ${e.toString()}"
+        echo "Failed to write cluster pins to ${clusterPinsUrl()}: ${e.toString()}"
     }
 }
 
-def pinStageClusterPlatform(String platform) {
+def pinStageClusterPlatform(String stageName, String platform) {
     if (!platform.startsWith("auto:")) {
         return platform
     }
-    if (env.gitlabCommit) {
-        def cached = readClusterPin(platform)
-        if (cached) {
-            try {
-                SlurmConfig.resolvePlatform(cached)
-                echo "Reusing cached pin ${platform} -> ${cached} for commit ${env.gitlabCommit}"
-                return cached
-            } catch (Exception e) {
-                echo "Cached pin '${cached}' for ${platform} is no longer valid (${e.toString()}); re-selecting"
-            }
+    def pins = env.gitlabCommit ? readClusterPins() : null
+    def cached = pins?.get(stageName)
+    if (cached) {
+        try {
+            SlurmConfig.resolvePlatform(cached)
+            echo "Reusing cached pin for ${stageName}: ${platform} -> ${cached} (commit ${env.gitlabCommit})"
+            return cached
+        } catch (Exception e) {
+            echo "Cached pin '${cached}' for ${stageName} is no longer valid (${e.toString()}); re-selecting"
         }
     }
     def backendPlatform = SlurmConfig.frontendPlatforms[platform].selectItem()
-    echo "Pinned ${platform} -> ${backendPlatform} for all shards of the group"
-    if (env.gitlabCommit) {
-        writeClusterPin(platform, backendPlatform)
+    echo "Pinned ${stageName}: ${platform} -> ${backendPlatform} for all shards of the group"
+    if (pins != null) {
+        pins[stageName] = backendPlatform
+        writeClusterPins(pins)
     }
     return backendPlatform
 }
@@ -6404,7 +6420,7 @@ def pinStageClusterPlatform(String platform) {
 // k in 1..splitCount. Each named param applies identically to every shard.
 def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount = 1, nodeCount = 1, runWithSbatch = false) {
     def configs = [:]
-    platform = pinStageClusterPlatform(platform)
+    platform = pinStageClusterPlatform(stageName, platform)
     for (int k = 1; k <= splitCount; k++) {
         configs["${stageName}-${k}"] = [platform, testlist, k, splitCount, gpuCount, nodeCount, runWithSbatch]
     }
