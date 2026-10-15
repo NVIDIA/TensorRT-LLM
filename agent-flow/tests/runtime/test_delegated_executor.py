@@ -166,9 +166,7 @@ def test_the_environment_travels_as_exports(tmp_path):
 
 def test_the_environment_reaches_the_command(tmp_path):
     record = _executor(tmp_path, FakeAgent()).execute(
-        CommandSpec(
-            argv="echo $STAIRCASE_DELEGATED", env={"STAIRCASE_DELEGATED": "yes"}, timeout_s=30
-        )
+        CommandSpec(argv="echo $MV2FLOW_DELEGATED", env={"MV2FLOW_DELEGATED": "yes"}, timeout_s=30)
     )
     assert record.stdout.strip() == "yes"
 

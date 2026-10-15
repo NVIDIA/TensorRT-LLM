@@ -13,7 +13,7 @@ half, and cannot:
     the staged store holds a copy of a refresh token the parent also holds,
     and a refresh rotates it. One of the two copies then loses.
 
-Measured twice on the staircase project. One run recorded "works for about
+Measured twice on the onboarding workflow's runs. One run recorded "works for about
 forty minutes"; the next saw a staged home authenticate cleanly at 12:12 and
 fail with `Not logged in · Please run /login` at 12:25, with byte-identical
 credentials. Copying harder does not fix a single-use token, and doing it
@@ -458,7 +458,7 @@ class FileDispatchTurnExecutor(TurnExecutor):
 
         Kept because a transport that can be dropped in where an
         ``AgentLayer`` was is the cheapest possible migration, and because
-        the staircase orchestrator was wired this way before
+        the trtllm_modeling_v2 orchestrator was wired this way before
         :class:`TurnRequest` existed.
         """
         return self.run(

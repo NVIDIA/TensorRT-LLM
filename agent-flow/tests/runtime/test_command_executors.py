@@ -90,9 +90,7 @@ def test_env_is_layered_over_the_parent_rather_than_replacing_it():
     a working host into a broken one.
     """
     record = LocalCommandExecutor().execute(
-        CommandSpec(
-            argv="echo $STAIRCASE_PROBE:$PATH", env={"STAIRCASE_PROBE": "set"}, timeout_s=30
-        )
+        CommandSpec(argv="echo $MV2FLOW_PROBE:$PATH", env={"MV2FLOW_PROBE": "set"}, timeout_s=30)
     )
     assert record.stdout.startswith("set:")
     assert len(record.stdout.strip()) > len("set:")
@@ -130,10 +128,10 @@ def test_a_command_that_outlives_its_deadline_is_timed_out_not_merely_failed():
 def test_a_missing_executable_is_distinguishable_from_a_disagreement():
     """127 says the probe could not run; non-zero says it ran and disagreed."""
     record = LocalCommandExecutor().execute(
-        CommandSpec(argv=("staircase-no-such-binary-xyz",), timeout_s=30)
+        CommandSpec(argv=("mv2flow-no-such-binary-xyz",), timeout_s=30)
     )
     assert record.returncode == NOT_FOUND_RETURNCODE
-    assert "staircase-no-such-binary-xyz" in record.stderr
+    assert "mv2flow-no-such-binary-xyz" in record.stderr
 
 
 def test_an_interrupt_is_not_turned_into_a_failed_record(monkeypatch):

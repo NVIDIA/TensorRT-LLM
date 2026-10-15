@@ -205,7 +205,7 @@ model or a broken build, and none of them is. Check them before debugging modeli
 | the import resolves to a different checkout | `/root/.local` is shared across container runs on some clusters | `PYTHONNOUSERSITE=1` at runtime — but **not** during the native build, which needs the user site for `cutlass_library` |
 
 A longer list, with the wrong diagnoses recorded alongside the right ones, is in
-[`agent-flow/agent_flow/workflows/staircase_onboard/TROUBLESHOOTING.md`](agent-flow/agent_flow/workflows/staircase_onboard/TROUBLESHOOTING.md).
+[`agent-flow/agent_flow/workflows/trtllm_modeling_v2/TROUBLESHOOTING.md`](agent-flow/agent_flow/workflows/trtllm_modeling_v2/TROUBLESHOOTING.md).
 It is keyed on verbatim error text, so search it for the string you saw.
 
 ## Key Documentation
