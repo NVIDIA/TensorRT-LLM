@@ -726,6 +726,9 @@ class MiniMaxM3MoE(nn.Module):
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
             activation=self.moe_activation,
+            # ``routed_output_is_global`` keeps FUSED_COMM output out of the
+            # external all-reduce, so it must stay global on every rank.
+            accepts_global_routed_output=True,
         )
         self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Shared expert: dense MLP fused into MoE output. Constructed

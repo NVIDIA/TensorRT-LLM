@@ -1169,6 +1169,9 @@ class KimiK3MoERuntime(nn.Module):
             # Kimi owns the latent reduction so it can order that collective
             # after the shared expert's auxiliary-stream reduction.
             reduce_results=False,
+            # ``_reduce_routed_output`` skips that reduction for FUSED_COMM
+            # backends, so their routed output must stay global on every rank.
+            accepts_global_routed_output=True,
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,

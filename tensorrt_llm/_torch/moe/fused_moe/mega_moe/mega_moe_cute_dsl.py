@@ -517,21 +517,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
-        is_kimi_situ = (
-            p.activation_type == ActivationType.SiTu
-            and p.bias is False
-            and p.activation_constants == frozenset({"alpha", "beta"})
-        )
-        # The fused kernel returns a globally combined routed output. MiniMax-M3
-        # and Kimi K3 skip the routed AllReduce for FUSED_COMM backends; other
-        # model wrappers would reduce this output twice under TEP.
-        if d.parallel_size > 1 and not d.use_dp and not (is_minimax_swiglu_bias or is_kimi_situ):
-            return _reject(
-                MoERejectReason.TOPOLOGY_UNSUPPORTED,
-                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
-                "SwigluBias or Kimi SiTU; other model compositions would reduce its already-global "
-                "routed output twice.",
-            )
+        # TEP (attention TP + MoE EP) needs no gate here: the fused kernel
+        # returns a globally combined routed output, and FusedCommMoEScheduler
+        # hands it to callers that reduce externally as a rank partial.
         # ADP wider than EP would need an outer allgather + reducescatter
         # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:

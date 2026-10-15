@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -2147,31 +2147,10 @@ def test_megamoe_cutedsl_rejects_non_minimax_swiglu_bias_package(
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("parallel_size", [2, 8])
-@pytest.mark.parametrize(
-    "activation,bias,constants,eligible",
-    [
-        pytest.param(
-            ActivationType.SwigluBias, False, {"alpha", "beta", "clamp"}, True, id="minimax"
-        ),
-        pytest.param(ActivationType.SiTu, False, {"alpha", "beta"}, True, id="kimi"),
-        pytest.param(ActivationType.Swiglu, False, set(), False, id="plain-swiglu"),
-        pytest.param(ActivationType.SiTu, True, {"alpha", "beta"}, False, id="situ-expert-bias"),
-        pytest.param(ActivationType.SiTu, False, {"alpha"}, False, id="situ-missing-softcap"),
-    ],
-)
-def test_megamoe_cutedsl_tep_requires_compatible_model_activation(
-    parallel_size: int,
-    activation: ActivationType,
-    bias: bool,
-    constants: set[str],
-    eligible: bool,
-) -> None:
-    deployment = _make_megamoe_cutedsl_test_deployment(
-        ep_size=parallel_size, parallel_size=parallel_size
-    )
-    problem = MoEProblem(
+def _make_megamoe_cutedsl_tep_problem(
+    activation: ActivationType, constants: set[str]
+) -> MoEProblem:
+    return MoEProblem(
         quant=QuantAlgo.NVFP4.value,
         dtype_act=torch.bfloat16,
         hidden_size=512,
@@ -2179,15 +2158,119 @@ def test_megamoe_cutedsl_tep_requires_compatible_model_activation(
         num_experts=8,
         top_k=2,
         swiglu_gptoss_style=activation is ActivationType.SwigluBias,
-        bias=bias,
+        bias=False,
         activation=activation.name,
         activation_constants=frozenset(constants),
     )
-    verdict = MegaMoECuteDsl.can_implement(problem, deployment)
 
-    assert verdict.eligible is eligible, verdict.detail
-    if not eligible:
-        assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+_MEGAMOE_CUTEDSL_TEP_ACTIVATIONS = [
+    pytest.param(ActivationType.SwigluBias, {"alpha", "beta", "clamp"}, id="minimax"),
+    pytest.param(ActivationType.SiTu, {"alpha", "beta"}, id="kimi"),
+    pytest.param(ActivationType.Swiglu, set(), id="plain-swiglu"),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("parallel_size", [2, 8])
+@pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
+def test_megamoe_cutedsl_accepts_tep_for_every_model(
+    parallel_size: int, activation: ActivationType, constants: set[str]
+) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(activation, constants),
+        _make_megamoe_cutedsl_test_deployment(ep_size=parallel_size, parallel_size=parallel_size),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
+def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
+    activation: ActivationType, constants: set[str]
+) -> None:
+    deployment = dataclasses.replace(
+        _make_megamoe_cutedsl_test_deployment(ep_size=2, parallel_size=4), tp_size=2
+    )
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(activation, constants), deployment
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+
+def _fused_comm_scheduler(
+    *,
+    rank: int,
+    tp_size: int = 4,
+    enable_attention_dp: bool = False,
+    reduce_results: bool = False,
+    accepts_global_routed_output: bool = False,
+) -> FusedCommMoEScheduler:
+    mapping = Mapping(
+        world_size=tp_size,
+        rank=rank,
+        tp_size=tp_size,
+        moe_tp_size=1,
+        moe_ep_size=tp_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+    moe = Mock(
+        spec_set=[
+            "parallel_size",
+            "use_dp",
+            "reduce_results",
+            "accepts_global_routed_output",
+            "mapping",
+        ]
+    )
+    moe.parallel_size = tp_size
+    moe.use_dp = enable_attention_dp
+    moe.reduce_results = reduce_results
+    moe.accepts_global_routed_output = accepts_global_routed_output
+    moe.mapping = mapping
+    return FusedCommMoEScheduler(moe)
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_tep_output_is_a_rank_partial_for_external_all_reduce() -> None:
+    """The caller's TP all-reduce of the per-rank outputs restores the global
+    routed output exactly once, as it does for external-comm backends."""
+    tp_size = 4
+    global_output = torch.randn(5, 16, dtype=torch.bfloat16)
+    partials = [
+        _fused_comm_scheduler(rank=rank, tp_size=tp_size)._as_rank_partial_if_reduced_externally(
+            global_output.clone()
+        )
+        for rank in range(tp_size)
+    ]
+
+    assert torch.equal(partials[0], global_output)
+    for partial in partials[1:]:
+        assert partial.shape == global_output.shape
+        assert partial.dtype == global_output.dtype
+        assert not partial.any()
+    assert torch.equal(torch.stack(partials).sum(dim=0), global_output)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"reduce_results": True}, id="layer-reduces"),
+        pytest.param({"accepts_global_routed_output": True}, id="caller-takes-global"),
+        pytest.param({"enable_attention_dp": True}, id="attention-dp"),
+        pytest.param({"tp_size": 1}, id="single-rank"),
+    ],
+)
+def test_fused_comm_output_stays_global_when_nobody_reduces_it_again(overrides: dict) -> None:
+    tp_size = overrides.get("tp_size", 4)
+    global_output = torch.randn(5, 16, dtype=torch.bfloat16)
+    for rank in range(tp_size):
+        scheduler = _fused_comm_scheduler(rank=rank, **overrides)
+        assert scheduler._as_rank_partial_if_reduced_externally(global_output) is global_output
 
 
 @pytest.mark.cpu_only
