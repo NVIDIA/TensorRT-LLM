@@ -44,9 +44,8 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
-from ..disaggregation.kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver)
+from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
+                                                   create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -294,8 +293,8 @@ def get_kv_cache_manager_cls(
         # use_kv_cache_manager_v2=True, the KvCacheConfig default. V1 can
         # be selected explicitly or resolved from "auto". Aggregated V1
         # uses Mixed without reuse and the C++ hybrid manager with reuse.
-        # Disaggregated serving requires Python NIXL below, using V2 for
-        # the configured default or Mixed for V1 without reuse.
+        # Disaggregated serving requires Python NIXL below. The Python
+        # transceiver rejects a V1 manager at creation.
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
@@ -912,11 +911,6 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
-        self._maybe_enable_fabric_memory_for_python_transceiver()
-
-    def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
-        maybe_enable_fabric_memory_for_python_transceiver(
-            self._cache_transceiver_config, self._kv_cache_manager_cls)
 
     def _get_model_kv_cache_manager_cls(
         self,
