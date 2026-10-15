@@ -32,7 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -59,13 +59,14 @@ from coverage_tier import (  # noqa: E402
     open_db,
     write_coverage_test_db,
 )
-from rules._helpers import strip_noop_diff_lines  # noqa: E402
+from python_docstring_analysis import split_docstring_diff  # noqa: E402
+from rules._helpers import iter_diff_changes, strip_noop_diff_lines  # noqa: E402
 from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult, format_reason  # noqa: E402
 from rules.docs_rule import DocsRule  # noqa: E402
 from rules.modeling_v2_rule import ModelingV2Rule  # noqa: E402
 from rules.openengine_rule import OpenEngineRule  # noqa: E402
-from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
+from rules.out_of_scope_rule import OutOfScopeRule, is_out_of_scope  # noqa: E402
 from rules.spec_dec_rule import SpecDecRule  # noqa: E402
 from rules.test_list_rule import TestListRule  # noqa: E402
 from rules.tests_def_rule import TestsDefRule  # noqa: E402
@@ -107,7 +108,7 @@ def build_rules(
         AgentFlowRule(yaml_index, stages),
         OpenEngineRule(yaml_index, stages),
         DocsRule(yaml_index, stages),
-        OutOfScopeRule(yaml_index, stages),
+        OutOfScopeRule(yaml_index, stages, repo_root=repo_root),
     ]
 
 
@@ -273,9 +274,15 @@ class Selector:
         self.stages = stages
 
     def run(self, pr: PRInputs, rules: list[Rule]) -> SelectionResult:
+        code_pr = replace(
+            pr,
+            changed_files=[
+                path for path in pr.changed_files if path not in pr.docstring_only_files
+            ],
+        )
         pairs: list[tuple[Rule, RuleResult]] = []
         for rule in rules:
-            result = rule.apply(pr)
+            result = rule.apply(pr if rule.handles_docstrings else code_pr)
             if result is not None:
                 pairs.append((rule, result))
 
@@ -353,7 +360,7 @@ class Selector:
 # --- Input loading ----------------------------------------------------------
 
 
-def _load_pr_inputs(input_json_path: Path) -> PRInputs:
+def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     data = json.loads(input_json_path.read_text())
     # Pre-strip blank- and comment-only `+/-` lines once so every rule
     # sees a "meaningful changes only" diff. Avoids spurious anchor
@@ -362,11 +369,28 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     # too-large diffs) normalizes to an empty diff.
     raw_diffs = {path: d or "" for path, d in data.get("diffs", {}).items()}
     diffs = {path: strip_noop_diff_lines(diff) for path, diff in raw_diffs.items()}
+    docstring_files: set[str] = set()
+    docstring_only_files: set[str] = set()
+    for path, raw_diff in raw_diffs.items():
+        if not path.endswith(".py") or not raw_diff or is_out_of_scope(path):
+            continue
+        try:
+            source = (repo_root / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        executable, changed = split_docstring_diff(source, raw_diff)
+        if changed:
+            docstring_files.add(path)
+            diffs[path] = strip_noop_diff_lines(executable)
+            if not any(iter_diff_changes(diffs[path])):
+                docstring_only_files.add(path)
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
         post_merge=bool(data.get("post_merge", False)),
         raw_diffs=raw_diffs,
+        docstring_files=docstring_files,
+        docstring_only_files=docstring_only_files,
     )
 
 
@@ -466,7 +490,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Include post-merge stages; the trigger-mode filter below selects the
     # subset matching the user's flag.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
-    pr = _load_pr_inputs(input_path)
+    pr = _load_pr_inputs(input_path, repo_root)
     rules = build_rules(yaml_index, stages, repo_root)
     selector = Selector(stages)
     result = selector.run(pr, rules)
