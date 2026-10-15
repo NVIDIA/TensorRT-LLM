@@ -104,9 +104,15 @@ CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize
 CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToHost(std::vector<Task<MemAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-//! copyHostToDevice / copyDeviceToHost use the copy engines when useCopyEngineForHostCopy() says so and the batched
-//! copy kernel otherwise. The kernel needs numBytes to be a multiple of 16 and throws when it is not; the copy engines
-//! accept any size. copyDeviceToDevice always uses the kernel.
+//! copyHostToDevice / copyDeviceToHost use the hardware copy engines when numBytes > 0, tasks is non-empty and
+//! useCopyEngineForHostCopy() says so, and the batched copy kernel otherwise (an empty call or numBytes == 0 takes the
+//! kernel, which then enqueues nothing). The kernel moves 16 B grains: it throws when numBytes is not a multiple of 16
+//! and, unchecked, faults on a task address that is not 16 B aligned, and it takes less than 4 GiB per task (the
+//! launcher's byte count is a uint32_t); the copy engines accept any size and any alignment. Any stream is accepted;
+//! on the copy-engine path the legacy NULL stream, as 0 or as CU_STREAM_LEGACY, takes one cuMemcpy{HtoD,DtoH}Async per
+//! task. Both throw TllmException on a negative numBytes. On main, hot<->host migrations go through
+//! IKvCacheColdPageCodec / BatchedPageCopier; these two functions serve CopyEngine::transfer (migrations between two
+//! cold levels when one of them is GPU_MEM) and the bindings. copyDeviceToDevice always uses the kernel.
 CUresult copyHostToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 CUresult copyDeviceToHost(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
@@ -115,8 +121,16 @@ CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tas
 //! kernel. From TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES (default 4 MiB; 0 = any size, negative = never), read
 //! once per process.
 size_t hostCopyDmaMinBytes() noexcept;
-//! True when a host<->device call with numBytes per task takes the copy-engine path in this process. Always false where
-//! pinned host memory is registered in chunks (HostMem::shouldUseChunkedRegistration()).
+//! Name of the environment variable behind hostCopyDmaMinBytes().
+inline constexpr char const kHostCopyDmaMinBytesEnv[] = "TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES";
+//! The threshold for a raw value of that variable (nullptr = unset): the default for an unset, empty, non-integer or
+//! out-of-range value (the last two are reported at WARNING), SIZE_MAX for a negative value. hostCopyDmaMinBytes() is
+//! this function applied to the process environment, cached.
+size_t hostCopyDmaMinBytesFor(char const* rawValue) noexcept;
+//! True when a host<->device call with numBytes per task takes the hardware copy-engine (DMA) path rather than the
+//! batched copy kernel in this process; "copy engine" here means the GPU DMA engines, not the CopyEngine class in
+//! kv_cache_manager_v2/copyEngine.h. Always false where pinned host memory is registered in chunks
+//! (HostMem::shouldUseChunkedRegistration()).
 bool useCopyEngineForHostCopy(size_t numBytes) noexcept;
 
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
