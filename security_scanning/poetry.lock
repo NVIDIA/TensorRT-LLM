@@ -442,13 +442,13 @@ virtualenv = ["virtualenv (>=20.36.1)"]
 
 [[package]]
 name = "cache-dit"
-version = "1.5.2"
+version = "1.5.3"
 description = "Cache-DiT: A PyTorch-native Inference Engine with Cache, Parallelism, Quantization and CPU Offload for DiTs."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cache_dit-1.5.2-py3-none-any.whl", hash = "sha256:411496be0d44ed8ed7d0449c2693deef6fa46686db8cab51682e5033a36d153f"},
+    {file = "cache_dit-1.5.3-py3-none-any.whl", hash = "sha256:f4564e68b5f6206d25712b06b4d9e0321ef96aadcd00e0ed4645be92d3fd9e75"},
 ]
 
 [package.dependencies]
@@ -459,7 +459,7 @@ torch = ">=2.7.1"
 transformers = ">=4.55.2"
 
 [package.extras]
-all = ["cache-dit[metrics]", "cache-dit[parallelism]", "cache-dit[quantization]"]
+all = ["cache_dit[metrics]", "cache_dit[parallelism]", "cache_dit[quantization]"]
 dev = ["accelerate", "expecttest", "ftfy", "hypothesis", "opencv-python-headless", "packaging", "peft", "pre-commit", "protobuf", "pytest (>=7.0.0,<8.0.0)", "pytest-html", "scikit-image", "sentencepiece"]
 docs = ["mkdocs (==1.6.1)", "mkdocs-api-autonav", "mkdocs-awesome-nav", "mkdocs-gen-files", "mkdocs-git-revision-date-localized-plugin", "mkdocs-glightbox", "mkdocs-material (==9.7.1)", "mkdocs-minify-plugin", "mkdocstrings-python", "pydantic", "regex", "ruff"]
 metrics = ["image-reward", "lpips (==0.1.4)", "scikit-image", "scipy"]

@@ -1383,6 +1383,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._kv_reserve_draft_tokens = 4
     manager.enable_block_reuse = False
     manager._effective_draft_len = Mock(return_value=2)
@@ -1393,6 +1394,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
     assert manager._allocated_draft_lens[request.py_request_id] == 4
+    assert manager._inflight_draft_lens[request.py_request_id] == [4]
 
     batch = ScheduledRequests()
     batch.generation_requests.append(request)
@@ -1404,6 +1406,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     assert kv_cache.resize.call_args_list[1].args == (103, 102)
     assert request.py_request_id not in manager._allocated_draft_lens
+    assert request.py_request_id not in manager._inflight_draft_lens
 
 
 def _revert_context_request(request_id: int) -> SimpleNamespace:

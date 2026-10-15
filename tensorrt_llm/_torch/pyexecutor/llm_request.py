@@ -5,8 +5,8 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, Container, Dict, Hashable, Iterable,
-                    List, Optional, Union, cast)
+from typing import (Any, Container, Dict, Hashable, Iterable, List, Optional,
+                    Union, cast)
 
 import torch
 
@@ -224,10 +224,6 @@ class MultimodalEncoderRequestState:
         self.item_cache_keys = [None] * len(self.item_cache_keys)
         self.item_ready = [False] * len(self.item_ready)
         return cache_keys
-
-
-if TYPE_CHECKING:
-    from .sampler.sampler_strategy import Strategy
 
 
 @dataclass(slots=True)
@@ -872,8 +868,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
             **kwargs):
-        self.py_sampling_strategy: "Strategy | None" = None
-
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
@@ -919,7 +913,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             super().__init__(llm_request)
         else:
             super().__init__(*args,
-                             client_id=client_id,
                              return_log_probs=return_log_probs,
                              return_context_logits=False,
                              return_generation_logits=False,
@@ -942,17 +935,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Manager-owned helix decode-step counter; see
         # KVCacheManagerV2._set_helix_rank_fields.
         self.py_helix_decode_group_index = 0
-        self.py_draft_logits = None
-        self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
         # RequestPerfMetrics.speculative_decoding for return_perf_metrics. The
-        # C++ runtime fills that section in updateNumTokensPerIteration(),
-        # which the PyTorch flow (TorchSampler) never calls, so the PyTorch
-        # executor accumulates these instead (exact, unlike the per-pos arrays
-        # capped at MAX_SPEC_DECODE_POSITIONS) and attaches them to the
-        # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
+        # PyTorch executor owns and accumulates these exact counters and
+        # attaches them to the response; unlike these counters, the per-pos
+        # arrays are capped at MAX_SPEC_DECODE_POSITIONS. See
+        # PyExecutor._handle_responses and LlmResult.spec_dec_totals.
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
         self.is_attention_dp_dummy = False
@@ -1696,7 +1686,10 @@ def executor_request_to_llm_request(
 def rewind_context_after_cache_drop(request: LlmRequest,
                                     tokens_per_block: int) -> None:
     """Reset context progress after callers release the request's KV caches."""
-    request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # The setter requires prepopulated < promptLen. A Helix CP rank that holds
+    # none of the prompt has promptLen 0, so there is nothing to reset.
+    if request.prompt_len > 0:
+        request.set_prepopulated_prompt_len(0, tokens_per_block)
     # Clearing prepopulation does not rewind the native context cursor.
     request.context_current_position = 0
     request.context_chunk_size = request.prompt_len
