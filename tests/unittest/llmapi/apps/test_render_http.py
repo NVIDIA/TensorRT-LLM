@@ -23,8 +23,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.serve.render import (
-    GENERATE_REQUEST_SCHEMA_VERSION,
-    GenerateRequest,
+    RENDERED_REQUEST_SCHEMA_VERSION,
+    RenderedRequest,
     ServingRender,
     attach_render_routes,
     mount_render_endpoints,
@@ -86,14 +86,14 @@ class TestStandaloneApp:
 
         assert info["role"] == "renderer"
         assert info["model"] == "m"
-        assert info["schema_version"] == GENERATE_REQUEST_SCHEMA_VERSION
+        assert info["schema_version"] == RENDERED_REQUEST_SCHEMA_VERSION
         assert info["render_fingerprint"] == resources(tokenizer).fingerprint()
 
     def test_chat_render_returns_the_prepared_request(self, client, tokenizer) -> None:
         response = client.post("/v1/chat/completions/render", json=CHAT_BODY)
 
         assert response.status_code == 200, response.text
-        prepared = GenerateRequest.model_validate(response.json())
+        prepared = RenderedRequest.model_validate(response.json())
         expected = render_chat(chat_request(), resources(tokenizer)).token_ids
         assert prepared.token_ids == expected
         assert prepared.kind == "chat"

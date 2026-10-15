@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Version of the prepared-request wire format. Bump on an incompatible change;
 # a worker rejects a version it does not understand.
-GENERATE_REQUEST_SCHEMA_VERSION = 1
+RENDERED_REQUEST_SCHEMA_VERSION = 1
 
 
 class UnsupportedRenderError(ValueError):
@@ -85,7 +85,7 @@ class PreparedContext(BaseModel):
         return self.prompt_tokens_excluded_from_usage == 0 and not self.resolved_thinking
 
 
-class GenerateRequest(BaseModel):
+class RenderedRequest(BaseModel):
     """What a render route returns: the prompt token ids plus what a consumer needs to use them.
 
     ``token_ids`` are the tokens the worker's own chat route would render for the original
@@ -103,7 +103,7 @@ class GenerateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = GENERATE_REQUEST_SCHEMA_VERSION
+    schema_version: int = RENDERED_REQUEST_SCHEMA_VERSION
     # Which inference route the ``request`` body belongs to.
     kind: Literal["chat", "completion"] = "chat"
     token_ids: List[int]

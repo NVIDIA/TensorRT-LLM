@@ -22,7 +22,7 @@ from typing import Any, List, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .prompt_types import GenerateRequest
+from .prompt_types import RenderedRequest
 from .resources import RenderResources
 from .serving import RenderRequestError, ServingRender
 
@@ -83,13 +83,13 @@ def attach_render_routes(app: FastAPI, serving: ServingRender) -> None:
         CHAT_RENDER_PATH,
         render_chat_completions,
         methods=["POST"],
-        response_model=GenerateRequest,
+        response_model=RenderedRequest,
     )
     app.add_api_route(
         COMPLETION_RENDER_PATH,
         render_completions,
         methods=["POST"],
-        response_model=List[GenerateRequest],
+        response_model=List[RenderedRequest],
     )
 
 
@@ -100,7 +100,7 @@ def mount_render_endpoints(app: FastAPI, server: Any, *, enabled: Optional[bool]
     ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1`` (or ``enabled`` says so). Returns
     whether they were mounted. A consumer that wants the worker to execute the
     ids it got back uses the worker's existing token-in routes (see
-    :class:`~.prompt_types.GenerateRequest`).
+    :class:`~.prompt_types.RenderedRequest`).
     """
     if not (render_endpoints_enabled() if enabled is None else enabled):
         return False

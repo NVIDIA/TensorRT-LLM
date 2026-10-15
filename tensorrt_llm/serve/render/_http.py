@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import FastAPI
 
 from .api_router import attach_render_routes
-from .prompt_types import GENERATE_REQUEST_SCHEMA_VERSION
+from .prompt_types import RENDERED_REQUEST_SCHEMA_VERSION
 from .resources import RenderResources
 from .serving import ServingRender
 
@@ -49,7 +49,7 @@ def build_render_app(
         return {
             "role": "renderer",
             "model": served_model_name,
-            "schema_version": GENERATE_REQUEST_SCHEMA_VERSION,
+            "schema_version": RENDERED_REQUEST_SCHEMA_VERSION,
             "render_fingerprint": serving.fingerprint(),
         }
 
