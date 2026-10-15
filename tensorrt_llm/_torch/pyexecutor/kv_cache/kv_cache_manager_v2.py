@@ -5526,6 +5526,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens
+                # Materialized history stays uncommitted, and a cache with SWA scratch
+                # reuse cannot grow past uncommitted tokens, so reserve the draft
+                # capacity here instead of growing in the generation branch below.
+                reserve_draft_upfront = is_gen and materialize_history
+                if reserve_draft_upfront:
+                    dummy_capacity += _kv_draft
                 if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
@@ -5580,22 +5586,24 @@ class KVCacheManagerV2(BaseResourceManager):
                     if not self._ensure_generation_beam_width(req, kv_cache):
                         release_resources(req, free_draft_resources=draft_kv_cache is not None)
                         return None
-                    # token_num already includes the current generation input.
-                    new_capacity = kv_cache.capacity + _kv_draft
-                    success = kv_cache.resize(new_capacity, history_length=history_hint)
-                    if not success:
-                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
-                        return None
+                    if not reserve_draft_upfront:
+                        # token_num already includes the current generation input.
+                        new_capacity = kv_cache.capacity + _kv_draft
+                        success = kv_cache.resize(new_capacity, history_length=history_hint)
+                        if not success:
+                            release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                            return None
                     if draft_kv_cache is not None:
                         if not draft_kv_cache_manager._ensure_generation_beam_width(
                             req, draft_kv_cache
                         ):
                             release_resources(req, free_draft_resources=True)
                             return None
-                        success = draft_kv_cache.resize(new_capacity)
-                        if not success:
-                            release_resources(req, free_draft_resources=True)
-                            return None
+                        if not reserve_draft_upfront:
+                            success = draft_kv_cache.resize(new_capacity)
+                            if not success:
+                                release_resources(req, free_draft_resources=True)
+                                return None
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)
