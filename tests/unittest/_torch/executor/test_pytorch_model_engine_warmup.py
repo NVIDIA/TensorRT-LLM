@@ -35,10 +35,11 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -59,11 +60,13 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("model_kind", ["default", "m3", "m3_vl", "gdn", "mamba"])
 @pytest.mark.parametrize("compile_enabled,piecewise", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("compile_only_piecewise_graphs", [False, True])
 def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch: pytest.MonkeyPatch,
     model_kind: str,
     compile_enabled: bool,
     piecewise: bool,
+    compile_only_piecewise_graphs: bool,
 ) -> None:
     """Exercise the real constructor's routing gate without loading weights or CUDA."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import (
@@ -93,7 +96,11 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     eager = torch.nn.Linear(4, 4)
     model.model = eager
     compile_config = SimpleNamespace(
-        enable_fullgraph=True, enable_inductor=False, enable_userbuffers=False, max_num_streams=1
+        enable_fullgraph=True,
+        compile_only_piecewise_graphs=compile_only_piecewise_graphs,
+        enable_inductor=False,
+        enable_userbuffers=False,
+        max_num_streams=1,
     )
     llm_args = SimpleNamespace(
         encode_only=False,
@@ -169,7 +176,11 @@ def test_pcg_fx_fallback_policy_is_model_specific(
             checkpoint_loader=Mock(),
         )
 
-    expected_prefill_only = compile_enabled and piecewise and model_kind in ("m3", "m3_vl")
+    expected_prefill_only = (
+        compile_enabled
+        and piecewise
+        and (compile_only_piecewise_graphs or model_kind in ("m3", "m3_vl"))
+    )
     assert engine._torch_compile_prefill_only is expected_prefill_only
     if not compile_enabled:
         compile_model.assert_not_called()
@@ -180,7 +191,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         )
         assert backend_factory.call_args.args[0] is False  # Inductor stays disabled.
         if expected_prefill_only:
-            assert isinstance(model.model, _PrefillCompiledModel)
+            assert isinstance(model.model, PrefillCompiledModel)
             assert model.model.eager_model is eager
             assert model.model.compiled_model is compiled
         else:
@@ -200,7 +211,7 @@ def test_prefill_compile_uses_all_rank_prefill_decision(
     expected = torch.ones((2, 4))
     eager.forward = Mock(return_value=expected)
     compiled.forward = Mock(return_value=expected)
-    router = _PrefillCompiledModel(eager, compiled)
+    router = PrefillCompiledModel(eager, compiled)
     assert router.weight is eager.weight
     assert list(router.parameters()) == list(eager.parameters())
     # Local decode-only ranks participate when another attention-DP rank
@@ -208,7 +219,7 @@ def test_prefill_compile_uses_all_rank_prefill_decision(
     metadata = SimpleNamespace(num_contexts=local_contexts)
     for eligible in (True, False):
         monkeypatch.setattr(
-            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+            decoder_runner_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
         )
         assert router(expected, attn_metadata=metadata) is expected
         selected = compiled if eligible else eager
@@ -230,7 +241,7 @@ def test_prefill_compile_preserves_partial_weight_reload(
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(tie_word_embeddings=False)
     )
-    model.model = _PrefillCompiledModel(eager, compiled)
+    model.model = PrefillCompiledModel(eager, compiled)
     mapper = HfWeightMapper()
     mapper._model = model
     loader = ModelLoader.__new__(ModelLoader)
@@ -264,7 +275,7 @@ def test_prefill_compile_preserves_partial_weight_reload(
     inputs = torch.ones(2, 4)
     for eligible in (False, True):
         monkeypatch.setattr(
-            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+            decoder_runner_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
         )
         torch.testing.assert_close(model.model(inputs), inputs @ replacement.t() + old_bias)
 
@@ -272,14 +283,16 @@ def test_prefill_compile_preserves_partial_weight_reload(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("prefill_only", [False, True])
 @pytest.mark.parametrize("eligible", [False, True])
+@pytest.mark.parametrize("bypass", [False, True])
 @pytest.mark.parametrize("raises", [False, True])
 def test_prefill_compile_scopes_whole_model_forward(
     monkeypatch: pytest.MonkeyPatch,
     prefill_only: bool,
     eligible: bool,
+    bypass: bool,
     raises: bool,
 ) -> None:
-    """Keep compile state active through model epilogues and restore it on exit."""
+    """Scope compile dispatch by phase independently of the model wrapper."""
     observed = []
 
     def forward(**kwargs: object) -> str:
@@ -291,7 +304,13 @@ def test_prefill_compile_scopes_whole_model_forward(
         observed.append(is_torch_compiling())
         return "done"
 
-    model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward)
+    eager_model = torch.nn.Identity()
+    eager_model.model_config = SimpleNamespace(extra_attrs={})
+    eager_model.forward = forward
+    compiled_model = torch.nn.Identity()
+    compiled_model.forward = forward
+    prefill_compiled_model = PrefillCompiledModel(eager_model, compiled_model)
+    model = prefill_compiled_model if prefill_only else eager_model
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
@@ -301,7 +320,10 @@ def test_prefill_compile_scopes_whole_model_forward(
         model_call_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
     )
     monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
-    with torch_compiling(True):
+    bypass_scope = (
+        prefill_compiled_model.bypass() if prefill_only and bypass else contextlib.nullcontext()
+    )
+    with torch_compiling(True), bypass_scope:
         if raises:
             with pytest.raises(RuntimeError, match="epilogue failure"):
                 DecoderRunner.model_forward(engine, is_dummy=False, attn_metadata=Mock())
@@ -366,6 +388,8 @@ def test_compiled_mxfp8_warmup_backend_selection(
             max_draft_len=0,
             spec_config=None,
         ),
+        _completed_autotuner_warmup_num_tokens=None,
+        _agree_warmup_flag=lambda flag: flag,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
         is_warmup=True,
@@ -445,6 +469,86 @@ def test_compiled_mxfp8_warmup_backend_selection(
     assert flashinfer_gemm.call_count == expected_flashinfer_calls
     assert native_gemm.call_count == (engine._forward_warmup.call_count - expected_flashinfer_calls)
     assert os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND") == backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("completed_num_tokens", "peers_skip", "expect_skip"),
+    [
+        (16, True, True),
+        # A peer whose free KV capacity gives another token shape still runs
+        # the warmup, so this rank must run it too.
+        (16, False, False),
+        (8, True, False),
+        (None, True, False),
+    ],
+)
+def test_autotuner_warmup_skips_only_completed_token_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    completed_num_tokens: int | None,
+    peers_skip: bool,
+    expect_skip: bool,
+) -> None:
+    """A repeated warmup with an already tuned token shape must not re-run tuning."""
+    engine = SimpleNamespace(
+        _config=SimpleNamespace(
+            enable_autotuner=True,
+            torch_compile_enabled=False,
+            torch_compile_prefill_only=False,
+            max_num_tokens=16,
+            max_batch_size=16,
+            max_seq_len=2,
+            original_max_draft_len=0,
+            max_total_draft_tokens=0,
+            is_spec_decode=False,
+            max_draft_len=0,
+            spec_config=None,
+        ),
+        _completed_autotuner_warmup_num_tokens=completed_num_tokens,
+        _agree_warmup_flag=Mock(side_effect=lambda flag: flag and peers_skip),
+        _warmup_timer=_WarmupTimer(rank=0),
+        cuda_graph_runner=SimpleNamespace(enabled=False),
+        model=SimpleNamespace(modules=lambda: []),
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=object(),
+        kv_cache_manager_key="kv_cache",
+        guided_decoder=None,
+        no_cuda_graph=lambda: contextlib.nullcontext(),
+        _create_warmup_request=Mock(return_value=object()),
+        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
+        _should_run_warmup_batch=Mock(return_value=True),
+        _release_megamoe_profiling_scratch=Mock(),
+        _forward_warmup=Mock(),
+    )
+    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    resources = SimpleNamespace(
+        get_resource_manager=lambda key: cache if key == "kv_cache" else None
+    )
+    tuner = Mock(profiling_cache={})
+    get_tuner = Mock(return_value=tuner)
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(decoder_runner_module.AutoTuner, "get", get_tuner)
+    monkeypatch.setattr(
+        decoder_runner_module, "autotune", lambda **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    clear_buffers = Mock()
+    monkeypatch.setattr(decoder_runner_module, "clear_memory_buffers", clear_buffers)
+
+    DecoderRunner._run_autotuner_warmup(engine, resources)
+
+    # Every rank votes with its local decision, skip or not.
+    engine._agree_warmup_flag.assert_called_once_with(completed_num_tokens == 16)
+    if expect_skip:
+        get_tuner.assert_not_called()
+        engine._create_warmup_request.assert_not_called()
+        engine._forward_warmup.assert_not_called()
+    else:
+        assert engine._forward_warmup.call_count == 2
+    # Buffers cached by earlier warmup phases are released on both paths.
+    clear_buffers.assert_called_once_with()
+    assert engine._completed_autotuner_warmup_num_tokens == 16
 
 
 @pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
@@ -1253,6 +1357,8 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
+                _completed_autotuner_warmup_num_tokens=None,
+                _agree_warmup_flag=lambda flag: flag,
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
@@ -1375,6 +1481,8 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
+                _completed_autotuner_warmup_num_tokens=None,
+                _agree_warmup_flag=lambda flag: flag,
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
@@ -1482,6 +1590,8 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
+                _completed_autotuner_warmup_num_tokens=None,
+                _agree_warmup_flag=lambda flag: flag,
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
@@ -36,7 +37,6 @@ from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     apply_fused_layernorm_affine_quant,
     get_nvfp4_input_scale,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
