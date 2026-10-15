@@ -743,6 +743,11 @@ class _ReduceAttention(nn.Module):
     def __init__(self, *args: object, reduce_output: bool, **kwargs: object) -> None:
         super().__init__()
         self.reduce_output = reduce_output
+        self.reduce_requests: list[bool] = []
+
+    def forward(self, *, hidden_states: torch.Tensor, all_reduce_params, **kwargs) -> torch.Tensor:
+        self.reduce_requests.append(all_reduce_params.enable_allreduce)
+        return hidden_states + 0.25
 
 
 class _IdentityNorm(nn.Module):
@@ -767,13 +772,20 @@ class _RecordingMoE(nn.Module):
         return hidden + 1
 
 
-@pytest.mark.parametrize("eager_fusion", [True, False])
-@pytest.mark.parametrize(
-    "tp_size,attention_dp", [(1, False), (4, False), (4, True)], ids=["tp1", "tp4", "tp4-adp"]
-)
-def test_deepseek_v4_decoder_reduces_attention_output_exactly_once(
+class _PassThroughMHC(nn.Module):
+    """mHC stand-in: one stream, identity mixing, so the decoder forward runs on CPU."""
+
+    def pre_mapping(self, residual: torch.Tensor):
+        return None, None, residual[:, 0, :]
+
+    def post_mapping(self, *, x, residual, post_layer_mix, comb_res_mix) -> torch.Tensor:
+        return residual + x.unsqueeze(1)
+
+
+def _build_v4_decoder_layer(
     monkeypatch: pytest.MonkeyPatch, tp_size: int, attention_dp: bool, eager_fusion: bool
-) -> None:
+) -> DeepseekV4DecoderLayer:
+    """Run the production decoder-layer constructor with hardware-heavy parts stubbed."""
     import tensorrt_llm._torch.models.modeling_deepseekv4 as v4
 
     monkeypatch.setenv("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0" if eager_fusion else "1")
@@ -810,7 +822,20 @@ def test_deepseek_v4_decoder_reduces_attention_output_exactly_once(
         pretrained_config=config, mapping=mapping, allreduce_strategy=None, moe_backend="TRTLLM"
     )
 
-    layer = DeepseekV4DecoderLayer(model_config, layer_idx=0, aux_stream_dict={})
+    return DeepseekV4DecoderLayer(model_config, layer_idx=0, aux_stream_dict={})
+
+
+_V4_DECODER_LAYER_CASES = pytest.mark.parametrize(
+    "tp_size,attention_dp", [(1, False), (4, False), (4, True)], ids=["tp1", "tp4", "tp4-adp"]
+)
+
+
+@pytest.mark.parametrize("eager_fusion", [True, False])
+@_V4_DECODER_LAYER_CASES
+def test_deepseek_v4_forward_moe_does_not_reduce_replicated_input(
+    monkeypatch: pytest.MonkeyPatch, tp_size: int, attention_dp: bool, eager_fusion: bool
+) -> None:
+    layer = _build_v4_decoder_layer(monkeypatch, tp_size, attention_dp, eager_fusion)
 
     # The attention output projection owns the TP reduction, so the pre-MoE
     # all-reduce is never fused in and the attention all-reduce is never skipped.
@@ -829,6 +854,31 @@ def test_deepseek_v4_decoder_reduces_attention_output_exactly_once(
     torch.testing.assert_close(moe_input, hidden * 2, rtol=0, atol=0)
     assert final_reduce == (tp_size > 1)
     assert all(instance.calls == 0 for instance in _RecordingAllReduce.instances)
+
+
+@pytest.mark.parametrize("eager_fusion", [True, False])
+@_V4_DECODER_LAYER_CASES
+def test_deepseek_v4_decoder_forward_requests_attention_reduction(
+    monkeypatch: pytest.MonkeyPatch, tp_size: int, attention_dp: bool, eager_fusion: bool
+) -> None:
+    from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
+
+    layer = _build_v4_decoder_layer(monkeypatch, tp_size, attention_dp, eager_fusion)
+    layer.hc_attn = _PassThroughMHC()
+    layer.hc_ffn = _PassThroughMHC()
+
+    residual = torch.arange(24, dtype=torch.bfloat16).reshape(3, 1, 8) / 16
+    metadata = SimpleNamespace(all_rank_num_tokens=[3] * tp_size)
+    state = layer(position_ids=None, hc_state=residual, attn_metadata=metadata)
+
+    # Under TP the attention output is reduced exactly once, inside the attention
+    # module; the MoE input is then consumed without a second reduction.
+    requires_attention_reduction = tp_size > 1 and not attention_dp
+    assert layer.self_attn.reduce_requests == [requires_attention_reduction]
+    ((_, final_reduce),) = layer.mlp.calls
+    assert final_reduce == (tp_size > 1)
+    assert all(instance.calls == 0 for instance in _RecordingAllReduce.instances)
+    assert isinstance(state, HCState) and not state.is_deferred
 
 
 def test_deepseek_v4_moe_allreduce_is_mnnvl_eligible(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -878,6 +928,32 @@ def test_deepseek_v4_moe_allreduce_is_mnnvl_eligible(monkeypatch: pytest.MonkeyP
     assert moe.allreduce is _RecordingAllReduce.instances[-1]
     assert moe.allreduce.kwargs["dtype"] is torch.bfloat16
     assert moe.allreduce.kwargs["strategy"] is AllReduceStrategy.AUTO
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, None], ids=["with-dtype", "no-dtype"])
+def test_auto_allreduce_selects_mnnvl_only_with_a_dtype(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype | None
+) -> None:
+    import tensorrt_llm._mnnvl_utils as mnnvl_utils
+    from tensorrt_llm._torch.distributed import ops
+
+    # Make every hardware precondition of MNNVL hold, and keep workspace setup off-device.
+    monkeypatch.setattr(ops.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(mnnvl_utils.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
+    monkeypatch.delenv("TLLM_TEST_MNNVL", raising=False)
+    monkeypatch.setattr(ops, "get_allreduce_workspace", lambda mapping: None)
+    monkeypatch.setattr(ops, "get_or_scale_allreduce_mnnvl_workspace", lambda *args, **kw: None)
+
+    mapping = Mapping(world_size=8, tp_size=8, rank=0, gpus_per_node=4)
+    assert mapping.is_multi_node()
+    allreduce = ops.AllReduce(mapping=mapping, strategy=AllReduceStrategy.AUTO, dtype=dtype)
+
+    # DeepseekV4MoE used to build its AllReduce without a dtype, which can never
+    # select MNNVL and leaves the multi-node MoE reduction on NCCL.
+    if dtype is None:
+        assert allreduce.mnnvl_allreduce is None
+    else:
+        assert isinstance(allreduce.mnnvl_allreduce, ops.MNNVLAllReduce)
 
 
 def test_deepseek_v4_routed_moe_quant_config_ignores_fp8_header(tmp_path):
