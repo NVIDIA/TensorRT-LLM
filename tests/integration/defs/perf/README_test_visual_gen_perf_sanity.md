@@ -33,79 +33,33 @@ shared perf regression pipeline. It is responsible for:
 | `REGRESSION_METRICS` | `d_median_generation` |
 
 Latency and generation metrics are read from the VisualGen benchmark JSON in
-seconds. Both gated timings are client-side: video uses `gen_latency`, while
-synchronous image and image-edit routes use `e2e_latency` because they cannot
-observe a separate generation-complete boundary. Server timings remain
-diagnostic outputs of a detailed benchmark, rather than the regression metric.
+seconds. Generation uses client-side timing; synchronous image routes have no
+separate generation-complete observation. Server timings are diagnostic only.
 
-New uploaded results carry `s_generation_timing_source` as measurement-source
-metadata, not as a match key or a versioned metric name:
+`s_generation_timing_source` records the measurement source without changing
+metric names or match keys:
 
-| Benchmark backend | Generation timing source |
-|-------------------|--------------------------|
-| `openai-videos` | `client_gen_latency` |
-| `openai-images`, `openai-image-edits` | `client_e2e_latency` |
-
-The CI history policy accepts only records with the source expected for their
-backend. Missing, unknown, and mismatched sources/backends are excluded. The
-producer records the source corresponding to metric extraction and rejects
-result/config backend mismatches. CI does not infer compatibility from
-dates or maintain a commit allowlist. Reassess compatibility if a measurement
-window changes; a source name alone does not establish unchanged semantics.
+| Backend | Generation metric path | Timing source |
+|---------|------------------------|---------------|
+| `openai-videos` | `gen_latency` | `client_gen_latency` |
+| `openai-images`, `openai-image-edits` | `e2e_latency` | `client_e2e_latency` |
 
 `get_generation_metric_path` in `tests/test_common/visual_gen_perf_history.py`
-is the single definition of the generation measurement path. Metric extraction
-reads that path, and the uploaded source is derived as `client_<path>`; history
-selection derives its expected source from the same helper. To switch a backend
-between `gen_latency` and `e2e_latency`, change only its entry in this mapping.
-The new results and accepted history then switch together, excluding the prior
-window. Unknown backends fail explicitly rather than falling back to image timing.
+defines the shared backend-to-path mapping for extraction, source metadata, and
+history selection. Change this mapping to switch measurement paths; reassess
+compatibility explicitly if timing semantics change under the same path.
 
-The policy applies before selecting the latest main result, extracting threshold
-overrides, and computing the fallback baseline. It drops inherited `d_baseline_*`
-values, including those stored on client results, because CI may have computed
-them from mixed old/new history. Threshold overrides are preserved. Baselines
-are recomputed with the existing daily/rolling-percentile algorithm from
-compatible history and the new measurement. The lookup does not mutate DB
-records, and metric names remain unchanged. With no compatible history, the
-existing pipeline bootstraps from the current measurement; a passing first run
-alone does not verify that subsequent tests use compatible history. Default
-thresholds remain unchanged: 10% pre-merge and 5% post-merge.
+CI excludes missing or incompatible sources before latest-main and baseline
+selection. It ignores inherited `d_baseline_*` values and recomputes from
+compatible history plus the current measurement, preserving threshold overrides
+and stored records. Defaults remain 10% pre-merge and 5% post-merge; the shared
+baseline algorithm is described in `README_perf_regression_system.md`.
 
-### Historical metadata backfill and rollout
-
-To preserve the existing client-window baseline, backfill verified historical
-client results before enabling this gate in production. This is a separate,
-reviewed database migration, not a task performed by CI:
-
-1. Export candidate VisualGen documents with their index, document ID, and
-   original source. Verify the actual producer mapping at each commit (including
-   release/backport branches); do not use the merge date as a timing cutoff.
-2. Review a dry-run list of exact document IDs and proposed metadata updates.
-   Only verified client-window records without timing-source metadata are eligible.
-   Leave server-window, unknown-source, and already-tagged records untouched.
-3. Add only `s_generation_timing_source` with the verified backend-specific value,
-   conditionally on the field still being absent and the document still matching
-   the reviewed source. Preserve all metrics, baseline fields, timestamps, and result flags;
-   do not re-upload documents through the normal result-upload path.
-4. Read back the changed records and verify the compatible per-case history
-   counts before enabling the gate. Retain the export and migration audit for
-   rollback of only the added metadata.
-
-Without this migration, untagged historical results remain stored and available
-for reference, but CI will bootstrap new baselines even for video cases. Flux
-also needs new client-window samples if no compatible history exists.
-
-### Measurement-window fix verification
-
-To verify a cross-window false-regression fix, run the affected case with its
-waiver removed and inspect the uploaded timing source and regression log. A
-successful post-merge run must not use the old server-window baseline. Follow it
-with another same-config run that demonstrably reads the first client-window
-result as compatible history; a self-baselined first run alone is insufficient.
-Attach the merged fix and run evidence when resolving the issue through the
-team's bug workflow. Long-term baseline stability monitoring is separate from
-verifying this measurement-window fix; no fixed waiting period is required.
+Existing client results need source-verified timing metadata backfill before
+reuse; dates alone do not establish compatibility. Without compatible history,
+the baseline starts from the current measurement, so a first passing run alone
+does not establish historical regression coverage. Backfill is a separate,
+reviewed operation that must preserve recorded measurements.
 
 ## Match Keys
 

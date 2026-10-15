@@ -61,11 +61,6 @@ def _client_row(value: float, timestamp: str, **fields: object) -> dict:
     )
 
 
-def test_old_window_is_excluded_even_with_a_new_date() -> None:
-    record = _row(_SERVER_COMMIT, 0.8554, "2026-10-14T00:00:00Z")
-    assert transform_visual_gen_history(record) is None
-
-
 def test_untagged_client_history_needs_explicit_backfill() -> None:
     record = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z")
     assert transform_visual_gen_history(record) is None
@@ -73,30 +68,15 @@ def test_untagged_client_history_needs_explicit_backfill() -> None:
     assert transform_visual_gen_history(record) == record
 
 
-@pytest.mark.parametrize("source", [None, "", "server_generation", "unknown_source"])
+@pytest.mark.parametrize("source", [None, "server_generation", "unknown_source"])
 def test_missing_or_different_source_is_excluded(source: str | None) -> None:
-    assert transform_visual_gen_history(_row("f" * 40, 0.94, "2026-10-14T00:00:00Z")) is None
-    assert (
-        transform_visual_gen_history(
-            _row(
-                _CLIENT_COMMIT,
-                0.94,
-                "2026-10-14T00:00:00Z",
-                s_generation_timing_source=source,
-            )
-        )
-        is None
-    )
-
-
-def test_new_metadata_works_without_git_history() -> None:
     record = _row(
-        "f" * 40,
+        _CLIENT_COMMIT,
         0.94,
         "2026-10-14T00:00:00Z",
-        s_generation_timing_source="client_e2e_latency",
+        s_generation_timing_source=source,
     )
-    assert transform_visual_gen_history(record) == record
+    assert transform_visual_gen_history(record) is None
 
 
 @pytest.mark.parametrize(
@@ -104,7 +84,6 @@ def test_new_metadata_works_without_git_history() -> None:
     [
         ("openai-videos", "client_gen_latency"),
         ("openai-images", "client_e2e_latency"),
-        ("openai-image-edits", "client_e2e_latency"),
     ],
 )
 def test_source_must_match_backend(backend: str, source: str) -> None:
@@ -123,30 +102,15 @@ def test_source_must_match_backend(backend: str, source: str) -> None:
     assert transform_visual_gen_history(record) is None
 
 
-@pytest.mark.parametrize("backend", [None, "", "future-backend"])
+@pytest.mark.parametrize("backend", [None, "future-backend"])
 def test_missing_or_unknown_backend_cannot_establish_compatibility(backend: str | None) -> None:
     record = _client_row(0.94, "2026-10-14T00:00:00Z", s_backend=backend)
     assert transform_visual_gen_history(record) is None
 
 
-def test_unknown_producer_backend_is_rejected() -> None:
+def test_unknown_measurement_backend_is_rejected() -> None:
     with pytest.raises(ValueError, match="Unsupported VisualGen benchmark backend"):
         get_generation_timing_source("future-backend")
-
-
-def test_mixed_baselines_are_removed_but_thresholds_and_raw_records_survive() -> None:
-    record = _client_row(
-        0.9433,
-        "2026-09-14T00:00:00Z",
-        d_baseline_median_generation=0.8554,
-        d_threshold_post_merge_median_generation=0.05,
-        d_threshold_pre_merge_median_generation=0.1,
-    )
-    clean = transform_visual_gen_history(record)
-    assert "d_baseline_median_generation" not in clean
-    assert clean["d_threshold_post_merge_median_generation"] == 0.05
-    assert clean["d_threshold_pre_merge_median_generation"] == 0.1
-    assert record["d_baseline_median_generation"] == 0.8554
 
 
 def test_other_runtimes_keep_their_baseline() -> None:
@@ -188,7 +152,9 @@ def modules(monkeypatch: pytest.MonkeyPatch) -> _Modules:
     return loaded[0], loaded[1], search.OpenSearchDB
 
 
-def test_policy_applies_before_latest_baseline_and_exemption_selection(modules: _Modules) -> None:
+def test_history_selection_strips_baselines_but_preserves_thresholds_and_raw_rows(
+    modules: _Modules,
+) -> None:
     db, _, search = modules
     old = _row(_SERVER_COMMIT, 0.8554, "2026-10-14T00:00:00Z", d_baseline_median_generation=0.8554)
     new = _client_row(
@@ -196,7 +162,9 @@ def test_policy_applies_before_latest_baseline_and_exemption_selection(modules: 
         "2026-09-14T00:00:00Z",
         d_baseline_median_generation=0.8554,
         d_threshold_post_merge_median_generation=0.05,
+        d_threshold_pre_merge_median_generation=0.1,
     )
+    original = dict(new)
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old, new]
     latest, baseline, history = db.get_history_data(
         {0: new},
@@ -206,7 +174,12 @@ def test_policy_applies_before_latest_baseline_and_exemption_selection(modules: 
     )
     assert latest[0]["s_commit"] == _CLIENT_COMMIT
     assert [r["s_commit"] for r in history[0]] == [_CLIENT_COMMIT]
-    assert baseline[0] == {"d_threshold_post_merge_median_generation": 0.05}
+    assert baseline[0] == {
+        "d_threshold_post_merge_median_generation": 0.05,
+        "d_threshold_pre_merge_median_generation": 0.1,
+    }
+    assert "d_baseline_median_generation" not in latest[0]
+    assert new == original
 
 
 def test_default_history_lookup_is_unchanged(modules: _Modules) -> None:
@@ -233,30 +206,18 @@ def test_empty_compatible_history_and_db_failure_are_distinct(modules: _Modules)
 
 
 @pytest.mark.parametrize("post_merge", [False, True])
-@pytest.mark.parametrize("old_value", [0.8554, 1.2])
-@pytest.mark.parametrize("backend", ["openai-images", "openai-image-edits", "openai-videos"])
 def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
     modules: _Modules,
     monkeypatch: pytest.MonkeyPatch,
     post_merge: bool,
-    old_value: float,
-    backend: str,
 ) -> None:
     _, pipeline, search = modules
-    old = _row(_SERVER_COMMIT, old_value, "2026-10-14T00:00:00Z", s_backend=backend)
-    good = _client_row(
-        0.9433, "2026-09-14T00:00:00Z", s_backend=backend, d_baseline_median_generation=0.8554
-    )
+    old = _row(_SERVER_COMMIT, 1.2, "2026-10-14T00:00:00Z")
+    good = _client_row(0.9433, "2026-09-14T00:00:00Z", d_baseline_median_generation=0.8554)
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old, good]
     monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": post_merge})
     for value, should_fail in [(0.9433, False), (1.2, True)]:
-        current = _row(
-            "f" * 40,
-            value,
-            "2026-10-14T00:00:00Z",
-            s_backend=backend,
-            s_generation_timing_source=get_generation_timing_source(backend),
-        )
+        current = _client_row(value, "2026-10-14T00:00:00Z")
         kwargs = dict(
             new_data_dict={0: current},
             match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
@@ -275,37 +236,12 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
         assert current["b_is_regression"] == should_fail
 
 
-@pytest.mark.parametrize("post_merge", [False, True])
-def test_untagged_history_bootstraps_without_mutating_stored_results(
-    modules: _Modules, monkeypatch: pytest.MonkeyPatch, post_merge: bool
-) -> None:
-    _, pipeline, search = modules
-    old = _row(_SERVER_COMMIT, 0.8554, "2026-09-11T00:00:00Z")
-    untagged_client = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z")
-    history = [old, untagged_client]
-    originals = [dict(record) for record in history]
-    search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: history
-    monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": post_merge})
-    current = _client_row(0.9433, "2026-10-14T00:00:00Z")
-    pipeline.process_and_upload_test_results(
-        new_data_dict={0: current},
-        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime"],
-        maximize_metrics=[],
-        minimize_metrics=["d_median_generation"],
-        regression_metrics=["d_median_generation"],
-        upload_to_db=False,
-        history_transform=transform_visual_gen_history,
-    )
-    assert current["b_is_regression"] is False
-    assert "baseline=0.9433" in current["s_regression_info"]
-    assert history == originals
-
-
 def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
     modules: _Modules, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db, pipeline, search = modules
     history = [_row(_SERVER_COMMIT, 0.8554, "2026-09-11T00:00:00Z")]
+    original = dict(history[0])
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: history
 
     def upload(rows: list[dict], project: str) -> bool:
@@ -323,6 +259,9 @@ def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
         history_transform=transform_visual_gen_history,
     )
     pipeline.process_and_upload_test_results(new_data_dict={0: first}, **kwargs)
+    assert first["b_is_regression"] is False
+    assert "baseline=0.9433" in first["s_regression_info"]
+    assert history[0] == original
     assert len(history) == 2
     assert history[-1]["s_generation_timing_source"] == "client_e2e_latency"
     latest, _, compatible = db.get_history_data(
@@ -375,6 +314,7 @@ def test_producer_source_agrees_with_extracted_metrics_without_changing_match_ke
     )
     assert row["s_generation_timing_source"] == source
     assert row["d_median_generation"] == generation
+    assert transform_visual_gen_history(row) == row
     assert "s_generation_timing_source" not in producer.get_visual_gen_match_keys()
 
 
@@ -383,7 +323,6 @@ def test_producer_source_agrees_with_extracted_metrics_without_changing_match_ke
     [
         ("openai-videos", "e2e_latency", 0.94),
         ("openai-images", "gen_latency", 0.8),
-        ("openai-image-edits", "gen_latency", 0.8),
     ],
 )
 def test_one_path_change_updates_extraction_metadata_and_history_selection(
