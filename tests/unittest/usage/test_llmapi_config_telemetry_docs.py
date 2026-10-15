@@ -460,6 +460,8 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     assert "Categorical domain" in text
     assert "Converter" not in text
     assert "`backend`" in text  # a known captured key renders
+    assert text.count("## VisualGen telemetry") == 1
+    assert "source:tensorrt_llm/usage/schemas/README.md#visualgen-events" in text
 
 
 def test_build_capture_manifest_fails_on_divergent_kind_across_union_arms():

@@ -36,7 +36,7 @@ def test_completion_and_timeout_metrics_are_counted_once(monkeypatch):
             _iter_stats=tracker,
             response_event=asyncio.Event(),
         )
-        tracker.record_telemetry_enqueue()
+        tracker.record_telemetry_enqueue(1)
         tracker.record_request_started(1, 0)
         response = executor.DiffusionResponse(
             request_id=1,
@@ -45,7 +45,7 @@ def test_completion_and_timeout_metrics_are_counted_once(monkeypatch):
         )
         await executor.DiffusionRemoteClient._store_response(client, response)
         await executor.DiffusionRemoteClient._store_response(client, response)
-        tracker.record_telemetry_enqueue()
+        tracker.record_telemetry_enqueue(2)
         tracker.record_request_started(2, 0)
         await executor.DiffusionRemoteClient.abandon_request_id(client, 2)
         await executor.DiffusionRemoteClient.abandon_request_id(client, 2)
@@ -59,6 +59,66 @@ def test_completion_and_timeout_metrics_are_counted_once(monkeypatch):
     assert metrics.peak_queued == 1
     assert metrics.peak_active == 1
     assert sum(metrics.latencies["generation"]) == 1
+
+
+@pytest.mark.parametrize("error_msg", ["", "failure", None])
+def test_completion_error_detection_does_not_depend_on_message(monkeypatch, error_msg):
+    from tensorrt_llm._torch.visual_gen import executor
+    from tensorrt_llm.usage.visual_gen import VisualGenMetrics
+
+    metrics = VisualGenMetrics()
+    monkeypatch.setattr(
+        executor, "_record_visual_gen", lambda action, *args: getattr(metrics, action)(*args)
+    )
+    tracker = executor._IterationStatsTracker()
+    tracker.record_telemetry_enqueue(1)
+    tracker.record_request_started(1, 0)
+    response = executor.DiffusionResponse(request_id=1, error_msg=error_msg, generation=2.0)
+    tracker.record_request_completed(1, 0, response)
+    tracker.record_request_completed(1, 0, response)
+    failed = error_msg is not None
+    assert metrics.counters.get("errors", {}) == ({"unclassified": 1} if failed else {})
+    assert sum(metrics.latencies["generation"]) == (0 if failed else 1)
+
+
+def test_worker_abort_counts_only_outstanding_requests_once(monkeypatch):
+    from tensorrt_llm._torch.visual_gen import executor
+    from tensorrt_llm.usage.visual_gen import VisualGenMetrics
+
+    metrics = VisualGenMetrics()
+    monkeypatch.setattr(
+        executor, "_record_visual_gen", lambda action, *args: getattr(metrics, action)(*args)
+    )
+    tracker = executor._IterationStatsTracker()
+    for request_id in range(4):
+        tracker.record_telemetry_enqueue(request_id)
+    for request_id in range(3):
+        tracker.record_request_started(request_id, 1)
+    tracker.record_request_completed(0, 1, executor.DiffusionResponse(request_id=0))
+    tracker.record_telemetry_timeout(1)
+    client = SimpleNamespace(
+        _worker_failure=None,
+        _shutdown_started=False,
+        _iter_stats=tracker,
+        _request_to_send=None,
+        shutdown_event=threading.Event(),
+        response_event=threading.Event(),
+        worker_processes=[],
+        _discard_unsent_request=lambda request: None,
+    )
+    executor.DiffusionRemoteClient._abort_worker_group(client, "private worker detail")
+    executor.DiffusionRemoteClient._abort_worker_group(client, "private worker detail")
+    for _ in range(2):
+        responses = asyncio.run(executor.DiffusionRemoteClient.await_responses(client, [2, 3]))
+        assert all(response.error_msg is not None for response in responses)
+    tracker.record_request_completed(2, 1, executor.DiffusionResponse(request_id=2))
+    assert metrics.counters["errors"] == {"timeout": 1, "unclassified": 2}
+    assert not tracker._telemetry_pending
+    assert "private" not in str(metrics.snapshot())
+    # An enqueue racing with abort still receives exactly one failure count.
+    tracker.record_telemetry_enqueue(4)
+    tracker.record_worker_failure()
+    assert metrics.counters["errors"]["unclassified"] == 3
 
 
 def test_worker_collects_resolved_shapes_without_request_content(monkeypatch):

@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-310 captured fields.
+322 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -71,6 +71,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cp_config.use_nccl_for_alltoall` | `bool\|none` | `value` |  |
 | `cuda_graph_config.batch_sizes` | `list[int]\|none` | `value` |  |
 | `cuda_graph_config.enable_padding` | `bool` | `value` |  |
+| `cuda_graph_config.extra_model_inputs.shape` | `list[tuple[int\|literal]]` | `categorical` | `num_tokens`, `batch_size` |
 | `cuda_graph_config.max_batch_size` | `int` | `value` |  |
 | `cuda_graph_config.max_num_token` | `int` | `value` |  |
 | `cuda_graph_config.max_seq_len` | `int` | `value` |  |
@@ -96,6 +97,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_iter_req_stats` | `bool` | `value` |  |
 | `enable_layerwise_nvtx_marker` | `bool` | `value` |  |
 | `enable_lm_head_tp_in_adp` | `bool` | `value` |  |
+| `enable_locality_domains` | `bool` | `value` |  |
 | `enable_lora` | `bool` | `value` |  |
 | `enable_low_latency_host_dispatch` | `bool` | `value` |  |
 | `enable_min_latency` | `bool` | `value` |  |
@@ -107,6 +109,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `encode_only` | `bool` | `value` |  |
 | `encoder_cuda_graph_config.batch_sizes` | `list[int]\|none` | `value` |  |
 | `encoder_cuda_graph_config.enable_padding` | `bool` | `value` |  |
+| `encoder_cuda_graph_config.extra_model_inputs.shape` | `list[tuple[int\|literal]]` | `categorical` | `num_tokens`, `batch_size` |
 | `encoder_cuda_graph_config.max_batch_size` | `int` | `value` |  |
 | `encoder_cuda_graph_config.max_num_token` | `int` | `value` |  |
 | `encoder_cuda_graph_config.max_seq_len` | `int` | `value` |  |
@@ -122,13 +125,16 @@ unset or when the safety sanitizer rejects the runtime value.
 | `gms_config.mode` | `literal` | `categorical` | `auto`, `rw`, `ro` |
 | `gpus_per_node` | `int\|none` | `value` |  |
 | `guided_decoding_backend` | `literal\|none` | `categorical` | `xgrammar`, `llguidance` |
+| `iter_perf_stats_interval` | `int` | `value` |  |
 | `iter_stats_max_iterations` | `int\|none` | `value` |  |
 | `kv_cache_compression_config.algorithm` | `literal` | `categorical` | `quantization_for_cold_page`, `triattention` |
 | `kv_cache_compression_config.beta` | `int` | `value` |  |
 | `kv_cache_compression_config.budget` | `int` | `value` |  |
 | `kv_cache_compression_config.eviction_mode` | `literal` | `categorical` | `union`, `per_head`, `per_layer_perhead` |
 | `kv_cache_compression_config.normalize_scores` | `bool` | `value` |  |
+| `kv_cache_compression_config.nvfp4_residual_dim` | `literal` | `categorical` | `0`, `64` |
 | `kv_cache_compression_config.quant` | `literal` | `categorical` | `nvfp4` |
+| `kv_cache_compression_config.skip_rope_quantization` | `bool` | `value` |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `int` | `value` |  |
 | `kv_cache_config.avg_seq_len` | `int\|none` | `value` |  |
 | `kv_cache_config.block_reuse_config.max_num_turns` | `int` | `value` |  |
@@ -169,7 +175,9 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.tokens_per_block` | `int` | `value` |  |
 | `kv_cache_config.use_kv_cache_manager_v2` | `bool\|literal` | `categorical` | `auto` |
 | `kv_cache_config.use_uvm` | `bool` | `value` |  |
-| `kv_connector_config.connector` | `allowlist\|none` | `categorical` | `lmcache`, `lmcache-mp`, `kvbm` |
+| `kv_connector_config.connector` | `allowlist\|none` | `categorical` | `lmcache`, `lmcache-mp`, `kvbm`, `mooncake-store` |
+| `kv_connector_config.mooncake_store.role` | `literal` | `categorical` | `both`, `producer`, `consumer`, `capacity` |
+| `kv_connector_config.mooncake_store.segment_size` | `int` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_layer_indices` | `list[int]\|none` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_mode` | `literal` | `categorical` | `NONE`, `MARK`, `COLLECT` |
 | `load_format` | `allowlist\|enum[LoadFormat]` | `categorical` | `auto`, `dummy`, `vision_only`, `gms`, `AUTO`, `DUMMY`, `VISION_ONLY`, `GMS` |
@@ -188,6 +196,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_stats_len` | `int` | `value` |  |
 | `mla_skip_correction_threshold` | `float` | `value` |  |
 | `mm_encoder_only` | `bool` | `value` |  |
+| `modeling_v2` | `literal` | `categorical` | `off`, `auto`, `require` |
 | `moe_cluster_parallel_size` | `int\|none` | `value` |  |
 | `moe_config.backend` | `literal` | `categorical` | `AUTO`, `CUTLASS`, `CUTEDSL`, `CUTEDSL_FC12`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `moe_config.disable_finalize_fusion` | `bool` | `value` |  |
@@ -216,6 +225,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `peft_cache_config.num_host_module_layer` | `int` | `value` |  |
 | `peft_cache_config.num_put_workers` | `int` | `value` |  |
 | `peft_cache_config.optimal_adapter_size` | `int` | `value` |  |
+| `per_request_spec_decode_stats` | `bool` | `value` |  |
 | `perf_metrics_max_requests` | `int` | `value` |  |
 | `pipeline_parallel_size` | `int` | `value` |  |
 | `pp_partition` | `list[int]\|none` | `value` |  |
@@ -248,7 +258,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.use_python_scheduler` | `bool` | `value` |  |
 | `scheduler_config.waiting_queue_policy` | `enum[WaitingQueuePolicy]` | `categorical` | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `bool` | `value` |  |
-| `sparse_attention_config.algorithm` | `literal` | `categorical` | `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.algorithm` | `literal` | `categorical` | `csa2`, `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `list[int]` | `value` |  |
 | `sparse_attention_config.enable_heuristic_topk` | `bool` | `value` |  |
 | `sparse_attention_config.enable_kv_cache_offload` | `bool` | `value` |  |
@@ -285,6 +295,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.topr` | `float\|int\|none` | `value` |  |
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `bool` | `value` |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `bool` | `value` |  |
+| `sparse_attention_config.use_fp8_staging` | `bool\|none` | `value` |  |
 | `sparse_attention_config.use_gvr_emission` | `bool` | `value` |  |
 | `sparse_attention_config.use_self_sampling_topk` | `bool` | `value` |  |
 | `sparse_attention_config.uses_spcompress` | `bool` | `value` |  |
@@ -296,6 +307,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM`, `FA4`, `AUTO`, `CUTEDSL` |
 | `speculative_config.begin_thinking_phase_token` | `int` | `value` |  |
 | `speculative_config.block_size` | `int\|none` | `value` |  |
+| `speculative_config.context_recompute_tail` | `int\|none` | `value` |  |
 | `speculative_config.decoding_type` | `literal` | `categorical` | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `int\|none` | `value` |  |
 | `speculative_config.eagle3_layers_to_capture` | `none\|set[int]` | `value` |  |
@@ -331,7 +343,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `int` | `value` |  |
 | `stream_interval` | `int` | `value` |  |
 | `telemetry_config.disabled` | `bool` | `value` |  |
-| `telemetry_config.usage_context` | `enum[UsageContext]` | `categorical` | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
+| `telemetry_config.usage_context` | `enum[UsageContext]` | `categorical` | `unknown`, `llm_class`, `visual_gen_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `int` | `value` |  |
 | `tokenizer_mode` | `literal` | `categorical` | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `list[int]\|none` | `value` |  |
@@ -357,6 +369,6 @@ bucketed request shapes, approximate latency percentiles, queue peaks, and
 reliability counters. No individual request record, prompt, media, output, private
 model path, arbitrary extra parameter, or exception message is sent.
 
-See the [VisualGen field inventory](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/usage/schemas/README.md#visualgen-events)
+See the [VisualGen field inventory](source:tensorrt_llm/usage/schemas/README.md#visualgen-events)
 for wire fields, buckets, and collection limits. Use `TelemetryConfig(disabled=True)`
 with `VisualGenArgs`, or the existing environment/file and CLI opt-outs.

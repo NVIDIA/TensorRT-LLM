@@ -271,6 +271,8 @@ class _IterationStatsTracker:
     def __init__(self, maxlen: int = _DEFAULT_ITER_STATS_MAX):
         self._iter = 0
         self._telemetry_queued = 0
+        self._telemetry_pending: Set[int] = set()
+        self._telemetry_worker_failed = False
         self._buffer: deque = deque(maxlen=maxlen)
         self._lock = threading.Lock()
         # Set of request ids that have been pushed onto the worker queue but
@@ -311,11 +313,30 @@ class _IterationStatsTracker:
             "currentRequestStepIdx": self._current_request_step_idx,
         }
 
-    def record_telemetry_enqueue(self) -> None:
+    def record_telemetry_enqueue(self, request_id: int) -> None:
         """Observe accepted work before the dispatcher can remove it from the queue."""
         with self._lock:
+            if self._telemetry_worker_failed:
+                # An enqueue already in progress can race with worker abort.
+                _record_visual_gen("error", "unclassified")
+                return
+            self._telemetry_pending.add(request_id)
             self._telemetry_queued += 1
             _record_visual_gen("queue", self._telemetry_queued, len(self._active_request_ids))
+
+    def record_telemetry_timeout(self, request_id: int) -> None:
+        """Count an abandoned request once, excluding later worker failures."""
+        with self._lock:
+            self._telemetry_pending.discard(request_id)
+            if not self._telemetry_worker_failed:
+                _record_visual_gen("error", "timeout")
+
+    def record_worker_failure(self) -> None:
+        """Count outstanding requests once when the worker group fails."""
+        with self._lock:
+            self._telemetry_worker_failed = True
+            _record_visual_gen("error", "unclassified", len(self._telemetry_pending))
+            self._telemetry_pending.clear()
 
     def record_enqueue(self, num_queued_requests: int) -> None:
         """Append a snapshot reflecting an enqueue event."""
@@ -351,7 +372,7 @@ class _IterationStatsTracker:
         """
         with self._lock:
             if request_id in self._active_request_ids:
-                if response is not None:
+                if response is not None and request_id in self._telemetry_pending:
                     _record_visual_gen(
                         "complete",
                         response.telemetry_shape,
@@ -362,8 +383,11 @@ class _IterationStatsTracker:
                                 for phase in ("pre_denoise", "denoise", "post_denoise")
                             },
                         },
-                        (response.error_type or "unclassified") if response.error_msg else None,
+                        (response.error_type or "unclassified")
+                        if response.error_msg is not None
+                        else None,
                     )
+                self._telemetry_pending.discard(request_id)
                 self._active_request_ids.discard(request_id)
                 # Lazy removal from the ordering deque -- we filter stale
                 # entries when picking a fallback "current" id below.
@@ -1218,7 +1242,7 @@ class DiffusionRemoteClient:
         req_ids = []
         for req in requests:
             _record_visual_gen("request", self.telemetry_metadata.get("modality", "unknown"))
-            self._iter_stats.record_telemetry_enqueue()
+            self._iter_stats.record_telemetry_enqueue(req.request_id)
             self.pending_requests.put(req)
             req_ids.append(req.request_id)
         # Record one snapshot per enqueue so a /metrics consumer sees the
@@ -1464,7 +1488,7 @@ class DiffusionRemoteClient:
         """
         async with self.lock:
             if request_id not in self._abandoned_request_ids:
-                _record_visual_gen("error", "timeout")
+                self._iter_stats.record_telemetry_timeout(request_id)
             self.completed_responses.pop(request_id, None)
             self._abandoned_request_ids.add(request_id)
 
@@ -1552,6 +1576,7 @@ class DiffusionRemoteClient:
             return
 
         self._worker_failure = worker_failure
+        self._iter_stats.record_worker_failure()
         request_to_discard = self._request_to_send
         self._request_to_send = None
         logger.error(self._worker_failure)

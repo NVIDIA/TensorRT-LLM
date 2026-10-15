@@ -85,9 +85,11 @@ class VisualGenMetrics:
         self.peak_active = 0
         self.failed_component = "none"
 
-    def _count(self, group: str, key: str) -> None:
+    def _count(self, group: str, key: str, count: int = 1) -> None:
+        if count <= 0:
+            return
         counts = self.counters.setdefault(group, {})
-        counts[key] = min(counts.get(key, 0) + 1, UINT_MAX)
+        counts[key] = min(counts.get(key, 0) + count, UINT_MAX)
 
     def endpoint(self, path: str) -> None:
         if path == "/v1/videos/sync":
@@ -99,9 +101,11 @@ class VisualGenMetrics:
         self.peak_queued = min(max(self.peak_queued, queued), UINT_MAX)
         self.peak_active = min(max(self.peak_active, active), UINT_MAX)
 
-    def error(self, category: str) -> None:
+    def error(self, category: str, count: int = 1) -> None:
         self._count(
-            "errors", category if category in ("client", "capacity", "timeout") else "unclassified"
+            "errors",
+            category if category in ("client", "capacity", "timeout") else "unclassified",
+            count,
         )
 
     def request(self, modality: str) -> None:

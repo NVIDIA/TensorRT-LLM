@@ -249,7 +249,7 @@ def visual_gen_command(
     )
     visual_gen_args = visual_gen_args.model_copy(update={"telemetry_config": telemetry_config})
 
-    n_workers = visual_gen_args.parallel_config.n_workers if visual_gen_args is not None else 1
+    n_workers = visual_gen_args.parallel_config.n_workers
     parallel_config = extra_args.get("parallel_config", {})
     if parallel_config:
         logger.info(f"World size: {n_workers}")

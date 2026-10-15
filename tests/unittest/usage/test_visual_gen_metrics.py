@@ -82,6 +82,8 @@ def test_request_histograms_and_percentiles_retain_no_content():
 def test_invalid_values_and_saturation_stay_bounded():
     metrics = VisualGenMetrics()
     metrics.request("private-modality")
+    metrics.error("unclassified", UINT_MAX - 1)
+    metrics.error("unclassified", 3)
     metrics.counters["requestsByModality"]["unknown"] = UINT_MAX
     metrics.request("private-modality")
     metrics.complete(
@@ -91,6 +93,7 @@ def test_invalid_values_and_saturation_stay_bounded():
     )
     summary = json.loads(metrics.snapshot()["visualGenMetricsJson"])
     assert summary["requestsByModality"] == {"unknown": UINT_MAX}
+    assert summary["errors"] == {"unclassified": UINT_MAX}
     assert "resolution" not in summary
     assert summary["latencySec"] == {}
     assert len(metrics.snapshot()["visualGenMetricsJson"]) < 8192

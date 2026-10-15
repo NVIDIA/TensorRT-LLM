@@ -226,6 +226,36 @@ class TestTelemetryGroup:
 
         apply_config.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            (["--set", "dtype=auto"], "--set configures LlmArgs"),
+            (["--grpc"], "--grpc is not supported"),
+            (["--report_addr", "unused.json"], "--report_addr is only supported"),
+        ],
+    )
+    @pytest.mark.parametrize("explicit_enable", [False, True])
+    def test_visual_gen_serve_yaml_opt_out_precedes_option_validation(
+        self, tmp_path, captured_exit_payloads, options, message, explicit_enable
+    ):
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        config_path = tmp_path / "visual_gen.yaml"
+        config_path.write_text("telemetry_config:\n  disabled: true\n", encoding="utf-8")
+        result = CliRunner().invoke(
+            serve_main,
+            ["test-model", "--visual_gen_args", str(config_path), *options]
+            + (["--telemetry"] if explicit_enable else []),
+        )
+        assert result.exit_code == 2
+        assert message in result.output
+        if explicit_enable:
+            assert _captured_terminal_parameters(captured_exit_payloads)["exitCode"] == 2
+        else:
+            assert captured_exit_payloads == []
+
     def test_visual_gen_bench_yaml_opt_out_precedes_prompt_validation(
         self,
         tmp_path,
