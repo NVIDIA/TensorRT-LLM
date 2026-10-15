@@ -194,6 +194,8 @@ def test_tasks_run_in_parallel_and_the_final_task_waits_for_finish(tmp_path, tmp
 
     layout = Layout(tmp_path / "ws")
     assert json.loads(layout.state_path.read_text())["outcome"] == "succeeded"
+    # No e2e_accuracy and no perf task in this graph: every task defaults to feature.
+    assert set(json.loads(layout.priorities_path.read_text()).values()) == {"feature"}
     # A finished run does not run again, whatever the checkout holds now.
     (tmp_git_repo / "later.txt").write_text("x")
     assert workflow.run() == RunOutcome.SUCCEEDED

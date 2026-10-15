@@ -75,6 +75,12 @@ committed work, notes and detached jobs, and the planner is told.
 A node's `type` is its primary tag; `tags: [...]` adds more. Each tag adds a
 block to the worker's system prompt (`prompts/tags.py`).
 
+A node's optional `priority` (`accuracy` > `feature` > `perf`) is its claim on
+shared GPUs; the orchestrator publishes it in `gpu_priorities.json` for a GPU
+pool to serve. Left out, `perf`-tagged tasks are `perf`, an `e2e_accuracy`
+task with no `perf` task upstream and everything upstream of it are
+`accuracy`, and the rest are `feature`. Changing it never re-runs a task.
+
 ## Plan rules
 
 The planner's plan is checked before it runs (`plan.py`):
@@ -98,6 +104,7 @@ The planner's plan is checked before it runs (`plan.py`):
 | `nodes/<id>/` | a task's notes and `jobs.json` (detached jobs) |
 | `worktrees/<id>/` | a running task's git worktree |
 | `test_commands.md` | Slurm commands the workers verified (Slurm runs only) |
+| `gpu_priorities.json` | each task's GPU priority class, rewritten whenever the plan changes |
 | `.state.json`, `.running_plan.md` | task states and the plan being run, for resume |
 
 ## Requirements on the checkout

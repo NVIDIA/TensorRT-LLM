@@ -90,6 +90,11 @@ class Layout:
         return self.workspace / ".state.json"
 
     @property
+    def priorities_path(self) -> Path:
+        """``{task id: priority class}`` of the running plan, for the GPU pool."""
+        return self.workspace / "gpu_priorities.json"
+
+    @property
     def results_dir(self) -> Path:
         return self.workspace / "task_results"
 

@@ -29,6 +29,7 @@ from agent_flow.orchestration import (
 )
 
 __all__ = [
+    "PRIORITIES",
     "TAGS",
     "PlanError",
     "PlanSpec",
@@ -45,6 +46,11 @@ TAGS: tuple[str, ...] = (
     "e2e_accuracy",
     "perf",
 )
+
+# GPU priority classes, most urgent first: the path to the first whole-model
+# accuracy result, then feature work, then performance work. The shared GPU
+# pool serves a waiting task of an earlier class first.
+PRIORITIES: tuple[str, ...] = ("accuracy", "feature", "perf")
 
 # Task ids become git branch names (``node/<id>``) and file names, so keep them
 # to a character set that is safe in both.
@@ -76,11 +82,14 @@ class PlanSpec:
         graph: The execution graph the scheduler runs.
         tags: Each task's tags, primary tag first.
         text: The plan.md text this spec was parsed from.
+        priorities: Each task's GPU priority class (one of :data:`PRIORITIES`).
+            Not part of a task's definition: changing it never re-runs a task.
     """
 
     graph: ExecutionGraph
     tags: Mapping[str, tuple[str, ...]]
     text: str
+    priorities: Mapping[str, str]
 
     def sink_id(self) -> str:
         """The id of the plan's single final task."""
@@ -128,12 +137,46 @@ def _sinks(graph: ExecutionGraph) -> list[str]:
     return [node.id for node in graph.nodes if node.id not in depended_on]
 
 
-def _raw_tags(block: str) -> dict[str, object]:
+def _raw_field(block: str, key: str) -> dict[str, object]:
     data = yaml.safe_load(block)
     return {
-        raw["id"]: raw.get("tags")
+        raw["id"]: raw.get(key)
         for raw in data["nodes"] or []
         if isinstance(raw, dict) and isinstance(raw.get("id"), str)
+    }
+
+
+def _ancestors(graph: ExecutionGraph, node_id: str) -> set[str]:
+    seen: set[str] = set()
+    stack = list(graph.by_id[node_id].depends_on)
+    while stack:
+        dep = stack.pop()
+        if dep not in seen:
+            seen.add(dep)
+            stack.extend(graph.by_id[dep].depends_on)
+    return seen
+
+
+def default_priorities(
+    graph: ExecutionGraph, tags: Mapping[str, tuple[str, ...]]
+) -> dict[str, str]:
+    """The priority class of each task when the plan does not set one.
+
+    ``perf``-tagged tasks are ``perf``. An ``e2e_accuracy`` task with no
+    ``perf`` task upstream is on the path to the first accuracy result, so it
+    and everything upstream of it are ``accuracy``. The rest are ``feature``.
+    """
+    perf = {tid for tid, t in tags.items() if "perf" in t}
+    accuracy: set[str] = set()
+    for node in graph.nodes:
+        if "e2e_accuracy" not in tags[node.id] or node.id in perf:
+            continue
+        upstream = _ancestors(graph, node.id)
+        if not upstream & perf:
+            accuracy |= {node.id} | upstream
+    return {
+        node.id: "perf" if node.id in perf else "accuracy" if node.id in accuracy else "feature"
+        for node in graph.nodes
     }
 
 
@@ -205,7 +248,8 @@ def parse_plan(
     if not graph.nodes:
         raise PlanError(["the execution graph has no tasks"])
 
-    raw_tags = _raw_tags(block)
+    raw_tags = _raw_field(block, "tags")
+    raw_priorities = _raw_field(block, "priority")
     tags: dict[str, tuple[str, ...]] = {}
     for node in graph.nodes:
         if node.children:
@@ -245,7 +289,18 @@ def parse_plan(
     elif "merge" not in tags[shared[0]]:
         problems.append(f"the final task {shared[0]!r} must be tagged `merge`")
 
-    spec = PlanSpec(graph=graph, tags=tags, text=text)
+    priorities = default_priorities(graph, tags)
+    for node_id, value in raw_priorities.items():
+        if value is None or node_id not in priorities:
+            continue
+        if value not in PRIORITIES:
+            problems.append(
+                f"task {node_id!r}: `priority` must be one of {', '.join(PRIORITIES)}, "
+                f"got {value!r}"
+            )
+        else:
+            priorities[node_id] = value
+    spec = PlanSpec(graph=graph, tags=tags, text=text, priorities=priorities)
     if previous is not None and states is not None:
         for node_id, state in states.items():
             frozen = state in (NodeState.DONE, NodeState.RUNNING)

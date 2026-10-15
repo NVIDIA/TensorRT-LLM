@@ -197,3 +197,37 @@ def test_a_revision_may_rewrite_unfinished_tasks_and_add_new_ones():
 """
     spec = parse_plan(_plan(revised, ["a", "op2", "b", "land"]), previous=previous, states=states)
     assert spec.graph.by_id["b"].depends_on == ("op2",)
+
+
+def test_priorities_default_by_role_and_can_be_set():
+    spec = parse_plan(PLAN_EXAMPLE)
+    assert spec.priorities["op-gated-delta"] == "accuracy"
+    assert spec.priorities["feat-fp8-kv"] == "feature"
+    assert spec.priorities["perf-moe-gemm"] == "perf"
+    # Defaults: gsm8k-final follows perf work, so only the first gate's path is accuracy.
+    bare = PLAN_EXAMPLE.replace("    priority: accuracy\n", "").replace(
+        "    priority: feature\n", ""
+    )
+    defaults = parse_plan(bare).priorities
+    assert defaults["op-gated-delta"] == "accuracy" and defaults["gsm8k"] == "accuracy"
+    assert defaults["feat-fp8-kv"] == "feature" and defaults["gsm8k-final"] == "feature"
+    assert defaults["perf-moe-gemm"] == "perf"
+
+
+def test_an_unknown_priority_is_rejected():
+    text = _plan(
+        _VALID_NODES.replace("type: new_op", "type: new_op\n    priority: urgent"),
+        ["a", "b", "land"],
+    )
+    assert _problems(text) == [
+        "task 'a': `priority` must be one of accuracy, feature, perf, got 'urgent'"
+    ]
+
+
+def test_changing_a_running_task_priority_is_allowed():
+    previous = parse_plan(_plan(_VALID_NODES, ["a", "b", "land"]))
+    states = {"a": NodeState.RUNNING, "b": NodeState.DONE, "land": NodeState.PENDING}
+    text = _plan(
+        _VALID_NODES.replace("type: new_op", "type: new_op\n    priority: perf"), ["a", "b", "land"]
+    )
+    assert parse_plan(text, previous=previous, states=states).priorities["a"] == "perf"

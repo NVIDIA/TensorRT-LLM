@@ -214,6 +214,7 @@ class ModelingV2OnboardWorkflow:
             layout.state_path,
             layout.plan_path,
             layout.running_plan_path,
+            layout.priorities_path,
             layout.test_commands_path,
         ):
             path.unlink(missing_ok=True)
@@ -256,6 +257,10 @@ class ModelingV2OnboardWorkflow:
     def _adopt(self, plan: PlanSpec) -> None:
         self._plan = plan
         self.layout.running_plan_path.write_text(plan.text, encoding="utf-8")
+        priorities = self.layout.priorities_path
+        tmp = priorities.with_suffix(".tmp")
+        tmp.write_text(json.dumps(dict(plan.priorities), indent=1), encoding="utf-8")
+        tmp.replace(priorities)
 
     def _startable(self, node: Node) -> bool:
         tasks = self._state.tasks
@@ -605,7 +610,7 @@ class ModelingV2OnboardWorkflow:
             resumed = self._state.phase == "run"
             if resumed:
                 text = self.layout.running_plan_path.read_text(encoding="utf-8")
-                self._plan = parse_plan(text)
+                self._adopt(parse_plan(text))
             else:
                 await self._initial_plan()
             print_rule(f"[bold cyan]Run (up to {self.max_parallel} workers)[/bold cyan]", self._log)

@@ -80,24 +80,31 @@ Merge the verified result into the checkout and confirm it is clean.
 nodes:
   - id: op-fused-qk-norm
     type: new_op
+    priority: accuracy
   - id: op-gated-delta
     type: new_op
+    priority: accuracy
   - id: target-core
     type: target
+    priority: accuracy
   - id: attn-accuracy
     type: module_accuracy
     depends_on: [target-core]
+    priority: accuracy
   - id: join-core
     type: merge
     kind: merge
     tags: [target]
     depends_on: [op-fused-qk-norm, op-gated-delta, attn-accuracy]
+    priority: accuracy
   - id: gsm8k
     type: e2e_accuracy
     depends_on: [join-core]
+    priority: accuracy
   - id: feat-fp8-kv
     type: target
     depends_on: [join-core]
+    priority: feature
   - id: perf-fuse-add-norm
     type: perf
     depends_on: [join-core]
@@ -189,6 +196,11 @@ block with a flat `nodes:` list. Each node is a task:
 - `id` — stable and unique; letters, digits, `_`, `.`, `-`. Matches the
   task's `### <id>` heading.
 - `type` — the primary tag; `tags` — optional list of extra tags.
+- `priority` — the task's claim on shared GPUs, one of `accuracy`, `feature`,
+  `perf` (see Keep every worker busy). Optional: left out, a `perf`-tagged
+  task is `perf`, the path to the first whole-model accuracy result is
+  `accuracy`, and the rest is `feature`. Change it whenever the situation
+  does; it never re-runs a task.
 - `depends_on` — the tasks that must finish first. **A task starts from the
   merged code of the tasks it depends on**; this is the only way code reaches
   a task. Depend on a task only when you need its code or its result.
@@ -238,6 +250,13 @@ than {max_parallel}, add work that can start now.
 - **Give parallel tasks disjoint edits.** Two tasks rewriting the same part
   of `modeling.py` leave a conflict for their merge task. Give each its own
   entry file and its own call site, and say so in the task sections.
+- **GPUs go to the most urgent work first.** Workers share a pool of GPUs,
+  which serves waiting tasks by `priority`: `accuracy` (everything on the
+  way to the first whole-model accuracy result: missing entries, module
+  checks, assembling the target, the first gate) before `feature` (further
+  capabilities and their checks) before `perf`, and keeps a few GPUs that
+  `perf` work may not take. Set each task's `priority` by what it unblocks,
+  not by its tag: a `new_op` the first target needs is `accuracy`.
 - **Everything still reaches the final task.** Feature and performance
   branches join the main line through `merge` tasks, and an `e2e_accuracy`
   task on the joined code runs after the last of them, before the final task.
