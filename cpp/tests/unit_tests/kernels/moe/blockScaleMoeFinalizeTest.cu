@@ -73,7 +73,8 @@ CapturedKernelLaunch captureFinalizeNode(moe::dev::finalize::Data const& data, c
     // runtime parameter structure cannot represent.
     CUDA_KERNEL_NODE_PARAMS params{};
     CUresult const result = cuGraphKernelNodeGetParams(node, &params);
-    TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Could not read finalize kernel node parameters: {}", result);
+    TLLM_CHECK_WITH_INFO(
+        result == CUDA_SUCCESS, "Could not read finalize kernel node parameters: {}", static_cast<int>(result));
     TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
     return {
         {params.gridDimX, params.gridDimY, params.gridDimZ}, {params.blockDimX, params.blockDimY, params.blockDimZ}};
