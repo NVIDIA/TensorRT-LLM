@@ -1056,21 +1056,32 @@ class PyTorchModelEngine(ModelEngine):
         assert isinstance(self._runner, ScheduledModelRunner)
         from ..jit_prefetch import prefetch_enabled
         record_decode = prefetch_enabled()
+        record_msa = record_decode and self._uses_minimax_m3_sparse()
         if record_decode:
-            # The Mamba decode provider plans from the launches warmup makes.
+            # The Mamba and MSA decode providers plan from the launches
+            # warmup makes.
             from ..modules.mamba import jit_prefetch_decode
             jit_prefetch_decode.start_recording(self.model)
+        if record_msa:
+            from ..attention.backends.sparse.minimax_m3 import jit_prefetch_msa
+            jit_prefetch_msa.start_recording()
         try:
             self._runner.warmup(resource_manager)
         finally:
             if record_decode:
                 jit_prefetch_decode.stop_recording()
+            if record_msa:
+                jit_prefetch_msa.stop_recording()
         try:
             self._init_jit_prefetch()
         except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
             logger.warning(
                 f"[JIT prefetch] setup failed, serving without prefetch: "
                 f"{type(e).__name__}: {e}")
+
+    def _uses_minimax_m3_sparse(self) -> bool:
+        sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
+        return getattr(sparse_cfg, "algorithm", None) == "minimax_m3"
 
     def _init_jit_prefetch(self) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
@@ -1155,13 +1166,17 @@ class PyTorchModelEngine(ModelEngine):
                 GlmKpoolProvider
             prefetcher.register("glm_kpool",
                                 GlmKpoolProvider(self.max_num_tokens))
-        sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
-        if getattr(sparse_cfg, "algorithm", None) == "minimax_m3":
+        if self._uses_minimax_m3_sparse():
             from ..attention.backends.sparse.minimax_m3.jit_prefetch import \
                 MiniMaxM3TritonProvider
+            from ..attention.backends.sparse.minimax_m3.jit_prefetch_msa import \
+                MiniMaxM3MsaDecodeProvider
             m3_provider = MiniMaxM3TritonProvider(self.model, self.max_seq_len)
             if m3_provider:
                 prefetcher.register("minimax_m3_triton", m3_provider)
+            msa_provider = MiniMaxM3MsaDecodeProvider(self.batch_size)
+            if msa_provider:
+                prefetcher.register("minimax_m3_msa", msa_provider)
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
