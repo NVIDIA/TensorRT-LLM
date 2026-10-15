@@ -23,7 +23,7 @@ import pytest
 import torch
 from packaging.version import Version
 
-from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
+from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard, nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_two_sided as two_sided_module
@@ -68,6 +68,31 @@ def _strategy_unavailable(*args, **kwargs):
 def _mock_nccl_ep_v02(monkeypatch: pytest.MonkeyPatch) -> None:
     """Model the v0.2 runtime contract required by these factory tests."""
     monkeypatch.setattr(communication_factory, "nccl_ep_supports_version", lambda _: True)
+    monkeypatch.setattr(communication_factory, "nccl_ep_supports_group_timeout", lambda: True)
+
+
+def test_create_strategy_rejects_invalid_comm_timeout_before_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selection treats constructor errors as "unavailable", so validation must come first."""
+    guard = moe_comm_timeout_guard.MoECommTimeoutGuard(
+        environ={moe_comm_timeout_guard.SERVING_TIMEOUT_ENV: "soon"}
+    )
+    monkeypatch.setattr(moe_comm_timeout_guard, "_DEFAULT_GUARD", guard)
+    one_sided = Mock(side_effect=AssertionError("backend construction reached"))
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
+
+    with pytest.raises(ValueError, match=moe_comm_timeout_guard.SERVING_TIMEOUT_ENV):
+        communication_factory.CommunicationFactory.create_strategy(
+            _make_model_config(),
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            hidden_size=4096,
+        )
+
+    one_sided.assert_not_called()
 
 
 @pytest.mark.parametrize("use_flashinfer", [False, True])
@@ -230,6 +255,33 @@ def test_nccl_ep_invalid_version_is_unavailable(monkeypatch: pytest.MonkeyPatch)
         )
         == "NcclEP v0.1 does not support quantized MoE communication."
     )
+
+
+@pytest.mark.parametrize(("has_setter", "supported"), [(False, False), (True, True)])
+def test_nccl_ep_group_timeout_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    has_setter: bool,
+    supported: bool,
+):
+    methods = {"set_timeout_ns": lambda self, timeout_ns: None} if has_setter else {}
+    fake_ep = SimpleNamespace(Group=type("Group", (), methods))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+
+    assert nccl_ep_utils.nccl_ep_supports_group_timeout() is supported
+
+
+def test_nccl_ep_without_runtime_group_timeout_is_unavailable(monkeypatch: pytest.MonkeyPatch):
+    """A wheel without the carried nccl-extensions patch cannot follow warmup timeouts."""
+    _mock_nccl_ep_v02(monkeypatch)
+    monkeypatch.setattr(communication_factory, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(communication_factory, "nccl_ep_supports_group_timeout", lambda: False)
+
+    reason = communication_factory.CommunicationFactory._get_nccl_ep_unavailable_reason(
+        torch.bfloat16, None, 32, 4096, 1024, 1024, 8
+    )
+
+    assert reason is not None and "set_timeout_ns" in reason
 
 
 class _FakeNcclEP:

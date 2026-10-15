@@ -218,7 +218,7 @@ widening a tolerance, and each is written up in its own entry:
   by the op, not certified here).
 
 Both targets are gated by the accuracy suite's modeling_v2 files,
-`tests/integration/defs/accuracy/test_modeling_v2_{gpt_oss,deepseek_v3}.py`,
+`tests/integration/defs/accuracy/modeling_v2/test_{gpt_oss,deepseek_v3}.py`,
 with `modeling_v2="require"` in force, which is what rules out the built-in
 implementation having been measured instead. gpt-oss-120b / sm_103 / tp1 runs
 gsm8k; deepseek-r1-0528-nvfp4 / sm_103 / dep4 runs gsm8k for the identity

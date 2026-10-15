@@ -370,8 +370,7 @@
 /examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /scripts/visualgen_eval @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_torch/visual_gen/attention_backend @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
+/tensorrt_llm/_torch/visual_gen/attention @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 /cpp/tensorrt_llm/thop/*lysses* @NVIDIA/trt-llm-torch-visual-gen-devs
 /cpp/tensorrt_llm/kernels/ulysses* @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/media @NVIDIA/trt-llm-torch-visual-gen-devs
@@ -392,8 +391,7 @@
 # experiment with named owners, not a standing domain.
 /tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 /tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-/tests/integration/defs/accuracy/test_modeling_v2_deepseek_v3.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-/tests/integration/defs/accuracy/test_modeling_v2_gpt_oss.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/integration/defs/accuracy/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 # The two catalog categories whose contracts state kernel behaviour the
 # attention and MoE owners are the authority on; co-owned rather than reassigned.
 /tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq

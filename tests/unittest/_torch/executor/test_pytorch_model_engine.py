@@ -29,7 +29,8 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
-    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch)
+    PrefillCompiledModel, _get_context_prompt_lookahead_token,
+    _make_single_token_context_graph_batch, _zero_fill_row_spans)
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
@@ -275,6 +276,18 @@ def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
         request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
 
 
+def test_zero_fill_row_spans_merges_unsorted_and_adjacent_spans() -> None:
+    buffer = torch.arange(1, 13, dtype=torch.int32)
+    _zero_fill_row_spans(buffer, [(9, 11), (2, 4), (4, 5), (7, 8)])
+    assert buffer.tolist() == [1, 2, 0, 0, 0, 6, 7, 0, 9, 0, 0, 12]
+
+
+def test_zero_fill_row_spans_without_spans_is_noop() -> None:
+    buffer = torch.arange(4, dtype=torch.int32)
+    _zero_fill_row_spans(buffer, [])
+    assert buffer.tolist() == [0, 1, 2, 3]
+
+
 def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=req_id,
@@ -315,6 +328,7 @@ def _make_forward_only_engine(
     decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     decoder._config = SimpleNamespace(
+        compile_only_piecewise_graphs=False,
         disable_overlap_scheduler=True,
         is_spec_decode=False,
         max_beam_width=1,
@@ -394,6 +408,52 @@ def _make_forward_only_engine(
 
     resource_manager.get_resource_manager.side_effect = get_resource_manager
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "ordinary_capture,eligible",
+    [(False, True), (False, False), (True, True), (True, False)],
+)
+def test_decoder_forward_routes_compile_bypass(enabled: bool,
+                                               ordinary_capture: bool,
+                                               eligible: bool) -> None:
+    """Exercise both the regular forward and ordinary-graph capture callbacks."""
+    key = KeyType(batch_size=1, draft_len=0,
+                  is_first_draft=False) if ordinary_capture else None
+    engine, graph_runner, resources, _, outputs = _make_forward_only_engine(key)
+    eager = torch.nn.Identity()
+    compiled = torch.nn.Identity()
+    eager.forward = Mock(return_value=outputs)
+    compiled.forward = Mock(return_value=outputs)
+    wrapper = PrefillCompiledModel(eager, compiled)
+    engine._runner._config.compile_only_piecewise_graphs = enabled
+    engine._runner.model.model = wrapper
+    engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
+    graph_runner.needs_capture.return_value = ordinary_capture
+    graph_runner.is_warmup_only = ordinary_capture
+    graph_runner.capture.side_effect = lambda key, forward, inputs, **kwargs: forward(
+        inputs)
+    batch = ScheduledRequests()
+    batch.generation_requests = [_make_request_stub(1)]
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+            return_value=Mock()
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
+            return_value=eligible,
+    ):
+        result = engine.forward(batch, resources)
+
+    assert result["logits"] is outputs["logits"]
+    expected_compiled = eligible and not (enabled and ordinary_capture)
+    selected = compiled.forward if expected_compiled else eager.forward
+    other = eager.forward if expected_compiled else compiled.forward
+    selected.assert_called_once_with()
+    other.assert_not_called()
+    assert not wrapper._bypass_active
 
 
 def create_model_engine_and_kvcache(
@@ -1731,6 +1791,47 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # The promoted row has no previous overlap tensor, so the batch cannot
         # seed the steady-state generation cache.
         self.assertIsNone(model_engine._runner._steady_gen_cache)
+        kv_cache_manager.shutdown()
+
+    def test_padding_request_input_id_rows_are_zeroed(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        generation = _create_request_with_tokens([50, 51, 52, 53, 54], 1)
+        generation.py_seq_slot = 0
+        generation.py_batch_idx = 0
+        padding = _create_request_with_tokens([60, 61, 62], 2)
+        padding.is_cuda_graph_dummy = True
+        padding.py_seq_slot = 1
+
+        graph_batch = ScheduledRequests()
+        graph_batch.generation_requests = [generation, padding]
+        new_tokens = torch.zeros((1, 4, 1), dtype=torch.int32, device="cuda")
+        new_tokens[0, 0, 0] = 777
+        overlap_state = SimpleNamespace(new_tokens=new_tokens)
+        model_engine._runner._can_use_steady_gen_fast_prepare = Mock(
+            return_value=False)
+        # The padding row is written by neither input-id copy, so poison the
+        # buffer with an out-of-vocabulary id to catch a stale read.
+        model_engine._runner.input_ids_cuda.fill_(1 << 30)
+
+        inputs, _, _ = model_engine._runner._prepare_tp_inputs(
+            scheduled_requests=graph_batch,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            new_tensors_device=overlap_state,
+            resource_manager=resource_manager,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
+        )
+
+        self.assertEqual(inputs["input_ids"][:2].cpu().tolist(), [777, 0])
         kv_cache_manager.shutdown()
 
     def test_promoted_context_precedes_speculative_overlap_generation(

@@ -9,11 +9,32 @@ import torch
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.mapping import Mapping
 
+from .moe_comm_timeout_guard import register_moe_comm_timeout_proxy
+
 try:
+    from tensorrt_llm import deep_ep
     from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
 except ImportError:
     deep_ep_installed = False
+
+
+class _DeepEPTimeoutProxy:
+    """Applies MoE communication timeouts to DeepEP's normal kernels.
+
+    DeepEP keeps the kernel timeout and its CPU-side wait timeout
+    process-wide, so one proxy serves every buffer. Low-latency kernels do not
+    use them.
+    """
+
+    name = "DeepEP"
+
+    def set_timeout_seconds(self, seconds: Optional[int]) -> None:
+        # DeepEP restores its compile-time defaults for 0.
+        deep_ep.set_timeout_seconds(0 if seconds is None else seconds)
+
+
+_TIMEOUT_PROXY = _DeepEPTimeoutProxy()
 
 
 class VariableLengthBuffer:
@@ -21,6 +42,7 @@ class VariableLengthBuffer:
     """
 
     def __init__(self, mapping: Mapping):
+        register_moe_comm_timeout_proxy(_TIMEOUT_PROXY)
         self.comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
         self.buffer = None
 
