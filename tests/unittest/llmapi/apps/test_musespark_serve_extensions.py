@@ -17,11 +17,13 @@
 Covers the request-schema acceptance of the extended reasoning-effort scale
 (up to `xhigh`), the routing of a request-level `reasoning_effort`
 into the chat-template kwargs for musespark_open_omni deployments, whose chat
-template reads the effort from its kwargs only, and the Responses-API
+template reads the effort from its kwargs only, the Responses-API
 reasoning routing, which must not inject template-only kwargs the active
-template never reads. No GPU or checkpoint required.
+template never reads, and the structured-output placement under the
+`musespark` reasoning parser. No GPU or checkpoint required.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +33,17 @@ from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwarg
 from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    ResponseFormat,
+    ResponsesRequest,
+    _response_format_to_guided_decoding_params,
+)
 from tensorrt_llm.serve.responses_utils import reasoning_chat_template_kwargs
-from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
+from tensorrt_llm.serve.serving_extensions import (
+    apply_model_chat_extensions,
+    structured_output_format_for,
+)
 
 # The L0 CPU stage invokes registered files with `-m cpu_only`; without this
 # marker every test is deselected and pytest exits with code 5.
@@ -357,3 +367,59 @@ class TestHarmonyTransformCoversExtendedScale:
 
         assert maybe_transform_reasoning_effort("minimal") == ReasoningEffort.LOW
         assert maybe_transform_reasoning_effort("xhigh") == ReasoningEffort.HIGH
+
+
+# The markers of the forced reasoning message, restated rather than read from
+# MuseSparkReasoningParser for the same reason as EFFORT_CONTRACT.
+REASONING_BEGIN = " to=self<|message|>"
+REASONING_END = "<|eom|><|start|>assistant to=user<|message|>"
+CITY_SCHEMA = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}, "country": {"type": "string"}},
+    "required": ["city", "country"],
+}
+
+
+class TestStructuredOutputPlacement:
+    """Response formats take the generic reasoning-parser placement.
+
+    No hook is keyed by the `musespark` parser, so the constraint follows a
+    forced private reasoning message and applies to the answer message, at
+    every reasoning effort.
+    """
+
+    def test_no_parser_keyed_hook(self) -> None:
+        assert structured_output_format_for("musespark") is None
+
+    @pytest.mark.parametrize("chat_template_kwargs", [None, {"reasoning_effort": "low"}])
+    @pytest.mark.parametrize(
+        ("response_format", "expected_schema"),
+        [
+            (ResponseFormat(type="json_object"), {"type": "object"}),
+            (
+                ResponseFormat(
+                    type="json_schema", json_schema={"name": "city", "schema": CITY_SCHEMA}
+                ),
+                CITY_SCHEMA,
+            ),
+        ],
+        ids=["json_object", "json_schema"],
+    )
+    def test_reasoning_precedes_the_constrained_answer(
+        self, response_format, expected_schema, chat_template_kwargs
+    ) -> None:
+        params = _response_format_to_guided_decoding_params(
+            response_format,
+            reasoning_parser="musespark",
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        # Key-wise: the structural-tag model adds defaulted fields on dump.
+        fmt = json.loads(params.structural_tag)["format"]
+        assert fmt["type"] == "sequence"
+        reasoning, answer = fmt["elements"]
+        assert reasoning["type"] == "tag"
+        assert reasoning["begin"] == REASONING_BEGIN
+        assert reasoning["content"]["type"] == "any_text"
+        assert reasoning["end"] == REASONING_END
+        assert answer["type"] == "json_schema"
+        assert answer["json_schema"] == expected_schema
