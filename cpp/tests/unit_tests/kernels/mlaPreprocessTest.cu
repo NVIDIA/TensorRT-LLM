@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -230,7 +230,6 @@ protected:
         using tensorrt_llm::runtime::BufferManager;
         using tensorrt_llm::runtime::CudaStream;
         using tensorrt_llm::runtime::ITensor;
-        using tensorrt_llm::runtime::bufferCast;
 
         auto dtype = tensorrt_llm::DataType::kHALF;
         if constexpr (std::is_same_v<DataType, float>)
@@ -261,8 +260,8 @@ protected:
                 = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
             this->d_kv_scale_quant_orig = tensorrt_llm::runtime::BufferManager::gpuSync(
                 ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
-            auto* kv_scale_orig_quant_ptr = bufferCast<float>(*(this->h_kv_scale_orig_quant));
-            auto* kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
+            auto* kv_scale_orig_quant_ptr = this->h_kv_scale_orig_quant->template getBufferPtr<float>();
+            auto* kv_scale_quant_orig_ptr = this->h_kv_scale_quant_orig->template getBufferPtr<float>();
             float kv_scale_orig_quant = 2.0f;
             kv_scale_orig_quant_ptr[0] = kv_scale_orig_quant;
             kv_scale_quant_orig_ptr[0] = 1.0 / kv_scale_orig_quant;
@@ -285,8 +284,8 @@ protected:
             ITensor::makeShape({this->mNumRequests + 1}), tensorrt_llm::DataType::kINT64);
         {
             // set random sequence length
-            auto* cu_seq_lens_temp_ptr = bufferCast<int64_t>(*(this->h_cu_seq_lens));
-            auto* cu_ctx_cached_kv_lens_temp_ptr = bufferCast<int64_t>(*(this->h_cu_ctx_cached_kv_lens));
+            auto* cu_seq_lens_temp_ptr = this->h_cu_seq_lens->template getBufferPtr<int64_t>();
+            auto* cu_ctx_cached_kv_lens_temp_ptr = this->h_cu_ctx_cached_kv_lens->template getBufferPtr<int64_t>();
             cu_seq_lens_temp_ptr[0] = 0;
             cu_ctx_cached_kv_lens_temp_ptr[0] = 0;
             for (int i = 1; i <= this->mNumRequests; i++)
@@ -353,12 +352,12 @@ protected:
         this->d_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
             ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), tensorrt_llm::DataType::kINT32);
         {
-            auto* kv_cache_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor));
-            auto* kv_cache_ref_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor_ref));
-            auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
-            auto* compressed_kv_cache_ref_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor_ref));
-            auto* offset_ptr = bufferCast<int32_t>(*(this->h_offset_tensor));
-            auto* compressed_offset_ptr = bufferCast<int32_t>(*(this->h_compressed_offset_tensor));
+            auto* kv_cache_ptr = this->h_kv_cache_tensor->template getBufferPtr<DataType>();
+            auto* kv_cache_ref_ptr = this->h_kv_cache_tensor_ref->template getBufferPtr<DataType>();
+            auto* compressed_kv_cache_ptr = this->h_compressed_kv_cache_tensor->template getBufferPtr<TCache>();
+            auto* compressed_kv_cache_ref_ptr = this->h_compressed_kv_cache_tensor_ref->template getBufferPtr<TCache>();
+            auto* offset_ptr = this->h_offset_tensor->template getBufferPtr<int32_t>();
+            auto* compressed_offset_ptr = this->h_compressed_offset_tensor->template getBufferPtr<int32_t>();
             fillArrayDataWithMod(compressed_kv_cache_ptr, this->h_compressed_kv_cache_tensor->getSize());
             fillArrayDataWithMod(compressed_kv_cache_ref_ptr, this->h_compressed_kv_cache_tensor_ref->getSize());
             memsetZeroHost<DataType>(kv_cache_ptr, this->h_kv_cache_tensor->getSize());
@@ -392,15 +391,15 @@ protected:
         this->d_k_pe_output = tensorrt_llm::runtime::BufferManager::gpuSync(
             ITensor::makeShape({this->mTotalCachedTokens, this->mRopeSize}), dtype);
         {
-            auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output));
-            auto* compressed_kv_output_ref_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output_ref));
+            auto* compressed_kv_output_ptr = this->h_compressed_kv_output->template getBufferPtr<DataType>();
+            auto* compressed_kv_output_ref_ptr = this->h_compressed_kv_output_ref->template getBufferPtr<DataType>();
             memsetZeroHost<DataType>(compressed_kv_output_ptr, this->h_compressed_kv_output->getSize());
             memsetZeroHost<DataType>(compressed_kv_output_ref_ptr, this->h_compressed_kv_output_ref->getSize());
             cudaMemcpy(this->d_compressed_kv_output->data(), this->h_compressed_kv_output->data(),
                 this->h_compressed_kv_output->getSizeInBytes(), cudaMemcpyHostToDevice);
 
-            auto* k_pe_output_ptr = bufferCast<DataType>(*(this->h_k_pe_output));
-            auto* k_pe_output_ref_ptr = bufferCast<DataType>(*(this->h_k_pe_output_ref));
+            auto* k_pe_output_ptr = this->h_k_pe_output->template getBufferPtr<DataType>();
+            auto* k_pe_output_ref_ptr = this->h_k_pe_output_ref->template getBufferPtr<DataType>();
             memsetZeroHost<DataType>(k_pe_output_ptr, this->h_k_pe_output->getSize());
             memsetZeroHost<DataType>(k_pe_output_ref_ptr, this->h_k_pe_output_ref->getSize());
             cudaMemcpy(this->d_k_pe_output->data(), this->h_k_pe_output->data(), this->h_k_pe_output->getSizeInBytes(),
@@ -411,16 +410,15 @@ protected:
 
     void PerformLoadPagedKV()
     {
-        using tensorrt_llm::runtime::bufferCast;
-        auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->d_compressed_kv_output));
-        auto* k_pe_output_ptr = bufferCast<DataType>(*(this->d_k_pe_output));
-        auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->d_compressed_kv_cache_tensor));
-        auto* offset_ptr = bufferCast<int32_t>(*(this->d_compressed_offset_tensor));
-        auto* cu_ctx_cached_kv_lens_ptr = bufferCast<int64_t>(*(this->d_cu_ctx_cached_kv_lens));
+        auto* compressed_kv_output_ptr = this->d_compressed_kv_output->template getBufferPtr<DataType>();
+        auto* k_pe_output_ptr = this->d_k_pe_output->template getBufferPtr<DataType>();
+        auto* compressed_kv_cache_ptr = this->d_compressed_kv_cache_tensor->template getBufferPtr<TCache>();
+        auto* offset_ptr = this->d_compressed_offset_tensor->template getBufferPtr<int32_t>();
+        auto* cu_ctx_cached_kv_lens_ptr = this->d_cu_ctx_cached_kv_lens->template getBufferPtr<int64_t>();
         float* kv_scale_quant_orig_ptr = nullptr;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
-            kv_scale_quant_orig_ptr = bufferCast<float>(*(this->d_kv_scale_quant_orig));
+            kv_scale_quant_orig_ptr = this->d_kv_scale_quant_orig->template getBufferPtr<float>();
         }
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mNumRequests, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(TCache) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
@@ -437,16 +435,15 @@ protected:
 
     void PerformLoadPagedKVRef()
     {
-        using tensorrt_llm::runtime::bufferCast;
-        auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output_ref));
-        auto* k_pe_output_ptr = bufferCast<DataType>(*(this->h_k_pe_output_ref));
-        auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
-        auto* offset_ptr = bufferCast<int32_t>(*(this->h_compressed_offset_tensor));
-        auto* cu_ctx_cached_kv_lens_ptr = bufferCast<int64_t>(*(this->h_cu_ctx_cached_kv_lens));
+        auto* compressed_kv_output_ptr = this->h_compressed_kv_output_ref->template getBufferPtr<DataType>();
+        auto* k_pe_output_ptr = this->h_k_pe_output_ref->template getBufferPtr<DataType>();
+        auto* compressed_kv_cache_ptr = this->h_compressed_kv_cache_tensor->template getBufferPtr<TCache>();
+        auto* offset_ptr = this->h_compressed_offset_tensor->template getBufferPtr<int32_t>();
+        auto* cu_ctx_cached_kv_lens_ptr = this->h_cu_ctx_cached_kv_lens->template getBufferPtr<int64_t>();
         float* kv_scale_quant_orig_ptr = nullptr;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
-            kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
+            kv_scale_quant_orig_ptr = this->h_kv_scale_quant_orig->template getBufferPtr<float>();
         }
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mNumRequests, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(TCache) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
@@ -480,7 +477,6 @@ TYPED_TEST_SUITE(MlaPreprocessTest, MLATypes);
 
 TYPED_TEST(MlaPreprocessTest, MLAPreprocessDefault)
 {
-    using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
     using TCache = typename TestFixture::TCache;
     this->mNumRequests = 8;
@@ -494,10 +490,10 @@ TYPED_TEST(MlaPreprocessTest, MLAPreprocessDefault)
         this->PerformLoadPagedKV();
         sync_check_cuda_error(this->mStream->get());
         this->PerformLoadPagedKVRef();
-        auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output));
-        auto* k_pe_output_ptr = bufferCast<DataType>(*(this->h_k_pe_output));
-        auto* compressed_kv_output_ref_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output_ref));
-        auto* k_pe_output_ref_ptr = bufferCast<DataType>(*(this->h_k_pe_output_ref));
+        auto* compressed_kv_output_ptr = this->h_compressed_kv_output->template getBufferPtr<DataType>();
+        auto* k_pe_output_ptr = this->h_k_pe_output->template getBufferPtr<DataType>();
+        auto* compressed_kv_output_ref_ptr = this->h_compressed_kv_output_ref->template getBufferPtr<DataType>();
+        auto* k_pe_output_ref_ptr = this->h_k_pe_output_ref->template getBufferPtr<DataType>();
         allEqual = this->CheckEqual(
             compressed_kv_output_ref_ptr, compressed_kv_output_ptr, this->h_compressed_kv_output->getSize());
         EXPECT_TRUE(allEqual);

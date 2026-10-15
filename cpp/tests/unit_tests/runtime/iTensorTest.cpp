@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -655,40 +655,28 @@ TEST(ITensorTest, TensorDimsSliceAt)
     }
 }
 
-TEST(BufferRangeTest, ConstType)
+TEST(ITensorTest, getBufferRangeConstType)
 {
     auto shape = ITensor::makeShape({5, 5, 5, 5, 5});
     auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
     ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
     ITensor::SharedConstPtr tensorConst = tensor;
 
-    //// 1 ////////////////////////////////////
-    BufferRange<float const> tensor_RangeConst_WONT_ASSIGN(*tensor);
-    // tensorRange_WONT_ASSIGN[0] = 3.14159;
+    auto range = tensor->getBufferRange<float>();
+    auto constElementRange = tensor->getBufferRange<float const>();
+    auto constRange = tensorConst->getBufferRange<float>();
+    static_assert(std::is_same_v<decltype(range), std::span<float>>);
+    static_assert(std::is_same_v<decltype(constElementRange), std::span<float const>>);
+    static_assert(std::is_same_v<decltype(constRange), std::span<float const>>);
 
-    //// 2 ////////////////////////////////////
-    BufferRange<float> tensorRange(*tensor);
-    tensorRange[0] = 3.14159;
-
-    //// 3 ////////////////////////////////////
-    // BufferRange<float> TensorConst_Range_WONT_COMPILE(*tensorConst);
-
-    //// 4 ////////////////////////////////////
-    BufferRange<float const> tensorConst_RangeConst_WONT_ASSIGN(*tensorConst);
-    // theConstOnerange_WONT_ASSIGN[0] = 1.1;
-
-    BufferRange<float const> tensor_RangeConst(*tensor);
-    BufferRange<float const> tensorConst_RangeConst(*tensorConst);
-
-    float acc = 3.14159;
-    for (auto& v : tensorRange)
+    EXPECT_EQ(range.size(), ITensor::volume(shape));
+    EXPECT_EQ(range.data(), constElementRange.data());
+    EXPECT_EQ(range.data(), constRange.data());
+    for (std::size_t i = 0; i < range.size(); ++i)
     {
-        v = acc * acc + 1.0;
-    }
-    for (SizeType32 i = 0; i < tensorRange.size(); i++)
-    {
-        EXPECT_EQ(tensorRange[i], tensor_RangeConst[i]);
-        EXPECT_EQ(tensorRange[i], tensorConst_RangeConst[i]);
+        range[i] = static_cast<float>(i);
+        EXPECT_EQ(range[i], constElementRange[i]);
+        EXPECT_EQ(range[i], constRange[i]);
     }
 }
 
