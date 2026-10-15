@@ -2789,6 +2789,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
+    spec_dec_variant: PositiveInt = Field(
+        default=3,
+        init=False,
+        description=
+        "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do "
+        "not set manually.")
 
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
