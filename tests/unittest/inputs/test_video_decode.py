@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,10 +20,11 @@ from transformers.video_utils import make_batched_videos
 pytest.importorskip("cv2")
 import cv2  # noqa: E402
 
+from tensorrt_llm.inputs import media_io  # noqa: E402
 from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 from tensorrt_llm.inputs.multimodal import default_hasher  # noqa: E402
 from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
-from tensorrt_llm.inputs.utils import async_load_video, load_video  # noqa: E402
+from tensorrt_llm.inputs.utils import async_load_video, load_base64_video, load_video  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -94,6 +96,7 @@ def test_offline_loaders_match_serve_video_hash(
 
     path = Path(sample_video_path)
     encoded = path.read_bytes()
+    monkeypatch.setattr(media_io, "_MAX_RESPONSE_BYTES", len(encoded))
     if input_kind == "file_uri":
         source = path.as_uri()
     elif input_kind == "data_uri":
@@ -130,7 +133,7 @@ def test_offline_local_video_read_errors_are_value_errors(
     source = path.as_uri() if file_uri else str(path)
     failure = read_error("cannot read video")
 
-    with patch.object(Path, "read_bytes", side_effect=failure):
+    with patch.object(Path, "open", side_effect=failure):
         with pytest.raises(ValueError) as error:
             if use_async:
                 asyncio.run(async_load_video(source))
@@ -138,3 +141,83 @@ def test_offline_local_video_read_errors_are_value_errors(
                 load_video(source)
 
     assert error.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("file_uri", [False, True], ids=["path", "file_uri"])
+@pytest.mark.parametrize("loader", ["serve", "sync", "async"])
+def test_oversized_local_video_is_rejected_before_read(
+    sample_video_path: str,
+    file_uri: bool,
+    loader: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = Path(sample_video_path)
+    source = path.as_uri() if file_uri else str(path)
+    monkeypatch.setattr(media_io, "_MAX_RESPONSE_BYTES", path.stat().st_size - 1)
+
+    with patch.object(Path, "open", side_effect=AssertionError("Oversized file was opened")):
+        with pytest.raises(ValueError, match="maximum allowed size"):
+            if loader == "serve":
+                asyncio.run(VideoMediaIO().async_load(source))
+            elif loader == "async":
+                asyncio.run(async_load_video(source))
+            else:
+                load_video(source)
+
+
+def test_local_media_read_is_bounded_if_file_grows(tmp_path: Path) -> None:
+    path = tmp_path / "growing.mp4"
+    path.write_bytes(b"x")
+    source = BytesIO(b"x" * 100)
+    with (
+        patch.object(Path, "open", return_value=source),
+        patch.object(source, "read", wraps=source.read) as read,
+    ):
+        with pytest.raises(ValueError, match="maximum allowed size"):
+            media_io._safe_read_local_file(str(path), max_bytes=4)
+        requested_sizes = [call.args[0] for call in read.call_args_list]
+        assert requested_sizes and all(size >= 0 for size in requested_sizes)
+        assert sum(requested_sizes) <= 5
+    assert source.closed
+
+
+def test_oversized_video_bytes_are_rejected_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(media_io, "_MAX_RESPONSE_BYTES", 4)
+    with patch.object(media_io, "blake3", side_effect=AssertionError("Oversized video was hashed")):
+        with pytest.raises(ValueError, match="maximum allowed size"):
+            VideoMediaIO().load_bytes(b"video")
+
+
+@pytest.mark.parametrize("loader", ["serve", "sync", "async", "base64_helper"])
+@pytest.mark.parametrize("extra_bytes", [1, 4])
+def test_oversized_base64_video_is_rejected(
+    loader: str,
+    extra_bytes: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(media_io, "_MAX_RESPONSE_BYTES", 4)
+    encoded = base64.b64encode(b"x" * (4 + extra_bytes)).decode("ascii")
+    source = "data:video/mp4;base64," + encoded
+    decoder = media_io.base64.b64decode
+    with (
+        patch.object(media_io.base64, "b64decode", wraps=decoder) as decode,
+        patch.object(media_io, "blake3", side_effect=AssertionError("Oversized video was hashed")),
+    ):
+        with pytest.raises(ValueError, match="maximum allowed size"):
+            if loader == "serve":
+                asyncio.run(VideoMediaIO().async_load(source))
+            elif loader == "async":
+                asyncio.run(async_load_video(source))
+            elif loader == "base64_helper":
+                load_base64_video(source)
+            else:
+                load_video(source)
+        if extra_bytes == 4:
+            decode.assert_not_called()
+
+
+def test_base64_video_helper_accepts_input_at_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(media_io, "_MAX_RESPONSE_BYTES", 4)
+    assert load_base64_video("data:video/mp4;base64,eHh4eA==") == b"xxxx"

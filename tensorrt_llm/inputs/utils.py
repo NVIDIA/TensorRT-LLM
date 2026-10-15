@@ -24,6 +24,7 @@ from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
 from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
+                                          _decode_base64_with_limit,
                                           _get_aiohttp_session,
                                           _load_and_convert_image,
                                           _normalize_file_uri,
@@ -133,8 +134,7 @@ def load_base64_video(video: str) -> BytesIO:
         msg = "Only base64 data URLs are supported for now."
         raise NotImplementedError(msg)
 
-    content = base64.b64decode(data)
-    return content
+    return _decode_base64_with_limit(data)
 
 
 def load_video(video: str,
@@ -145,8 +145,9 @@ def load_video(video: str,
                extract_audio: bool = False) -> VideoData:
     """Load video frames with the shared source-byte cache identity.
 
-    Local files are read fully into memory during decoding. Local-file I/O
-    failures raise ValueError, with the original OSError as their cause.
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
     """
     # Decode through `VideoMediaIO`, the loader `trtllm-serve` uses, so the
     # same video gets the same source-byte anchor (`raw_bytes_hash`) and
@@ -179,8 +180,9 @@ async def async_load_video(video: str,
                            extract_audio: bool = False) -> VideoData:
     """Load video frames without blocking the event loop.
 
-    Local files are read fully into memory during decoding. Local-file I/O
-    failures raise ValueError, with the original OSError as their cause.
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
     """
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
