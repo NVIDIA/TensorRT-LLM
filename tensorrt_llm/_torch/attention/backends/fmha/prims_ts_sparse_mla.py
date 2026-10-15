@@ -429,6 +429,18 @@ class PrimsTSSparseMlaFmha(Fmha):
         self._sinks_cache = (sinks.data_ptr(), prepared)
         return prepared
 
+    @staticmethod
+    def _softmax_scale(attn: "TrtllmAttention") -> float:
+        """TRT-LLM's MLA softmax scale, ``1 / (q_scaling * sqrt(qk_nope + qk_rope))``.
+
+        The scale follows the un-absorbed QK head width (attentionOp.cpp and the
+        DeepSeek-V4 fallback), not the 512-wide absorbed latent the kernel
+        contracts over. DeepSeek-V4 checkpoints have 448 + 64 = 512, so the two
+        only differ for configs such as the 128 + 64 unit-test scenario.
+        """
+        qk_head_dim = int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim)
+        return 1.0 / (float(attn.q_scaling) * math.sqrt(float(qk_head_dim)))
+
     def _kv_dequant(self) -> float:
         if self._kv_dequant_scale is None:
             if torch.cuda.is_current_stream_capturing():
@@ -549,7 +561,7 @@ class PrimsTSSparseMlaFmha(Fmha):
         output = forward_args.output
         groups = int(output.shape[0]) if fused else None
 
-        softmax_scale = 1.0 / (float(attn.q_scaling) * math.sqrt(float(_LATENT_DIM)))
+        softmax_scale = self._softmax_scale(attn)
         if is_fp8:
             # The MLA preprocessing quantizes Q with the KV-cache scale, so both
             # descales equal the layer's kv_scale_quant_orig (see
