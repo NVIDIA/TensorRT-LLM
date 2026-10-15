@@ -225,6 +225,33 @@ def test_qsa_mtp_reuse_topk_appends_groups_completed_since_capture() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_mtp_reuse_topk_displace_oldest_shifts_a_full_row() -> None:
+    """With `displace_oldest` a full row gives up its first ids and the rest move to the
+    front, so an ascending row stays ascending and keeps its newest groups."""
+    shared = torch.tensor(
+        [[1, 2, 4, 6, 7, 9, 11, 12], [1, 2, 4, 6, 7, 9, -1, -1], [3, 5, 6, 8, 9, 10, 11, -1]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    out = torch.full((3, 8), -99, device="cuda", dtype=torch.int32)
+
+    triton_qsa_mtp_reuse_topk(
+        shared_indices=shared,
+        shared_visible_blocks=torch.tensor([13, 10, 12], device="cuda", dtype=torch.int32),
+        request_indices=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+        visible_blocks=torch.tensor([15, 11, 14], device="cuda", dtype=torch.int32),
+        output=out,
+        displace_oldest=True,
+    )
+
+    assert out.tolist() == [
+        [4, 6, 7, 9, 11, 12, 13, 14],  # full, 2 new: the 2 oldest go
+        [1, 2, 4, 6, 7, 9, 10, -1],  # room: appended
+        [5, 6, 8, 9, 10, 11, 12, 13],  # 7 ids, 2 new: the oldest goes
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_qsa_mtp_reuse_topk_is_verbatim_without_new_groups() -> None:
     """A draft step that completes no group reuses the captured row unchanged."""
     shared = torch.tensor([[5, 2, 9, -1]], device="cuda", dtype=torch.int32)

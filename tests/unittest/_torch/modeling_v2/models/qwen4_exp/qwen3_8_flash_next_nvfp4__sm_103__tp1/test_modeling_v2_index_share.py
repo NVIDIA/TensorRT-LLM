@@ -138,18 +138,23 @@ def _reuse_case(fresh: int):
 
 
 def test_reuse_of_a_sorted_capture_stays_sorted():
-    """A sorted capture plus the groups completed since is still ascending:
-    appended ids are newer than every captured one, and a full row loses its
-    largest ids to them."""
+    """A sorted capture plus the groups completed since is still ascending: appended ids
+    are newer than every captured one, and a full row gives up its oldest ids to them, so
+    the newest captured groups -- the ones next to the new ones -- are kept."""
     for fresh in (0, 1, 2):
         args, captured_visible = _reuse_case(fresh)
 
         out = reuse(**args)
 
         assert torch.equal(out, reuse.reference(**args))
-        for row, vis in zip(out.cpu().tolist(), captured_visible.tolist()):
+        for row, shared_row, vis in zip(
+            out.cpu().tolist(), args["shared_indices"].cpu().tolist(), captured_visible.tolist()
+        ):
             ids = [i for i in row if i >= 0]
             assert row == ids + [-1] * (K - len(ids)), "padding must stay last"
             assert ids == sorted(ids) and len(set(ids)) == len(ids)
             assert len(ids) == min(vis + fresh, K)
             assert all(i < vis + fresh for i in ids)
+            captured = [i for i in shared_row if i >= 0]
+            kept = captured[max(0, len(captured) + fresh - K) :]
+            assert ids == kept + list(range(vis, vis + fresh))

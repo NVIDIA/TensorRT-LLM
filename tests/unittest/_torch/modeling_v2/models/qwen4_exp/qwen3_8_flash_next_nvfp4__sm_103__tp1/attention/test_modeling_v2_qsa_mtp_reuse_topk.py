@@ -254,8 +254,8 @@ def test_boundary_rows_take_the_documented_branch() -> None:
     assert bool((out[2, 101:] == -1).all()), "short row: appended right after the prefix"
     assert torch.equal(out[3, :511], shared[3, :511]) and out[3, 511] == 511, "fills slot 511"
     for row, group in ((4, 512), (5, 2047)):
-        assert torch.equal(out[row, :511], shared[row, :511]) and out[row, 511] == group, (
-            "full row: the new group displaces slot 511"
+        assert torch.equal(out[row, :511], shared[row, 1:]) and out[row, 511] == group, (
+            "full row: the new group displaces the oldest id and the rest shift to the front"
         )
     assert torch.equal(out[6], shared[6]) and torch.equal(out[7], shared[7])
 
@@ -265,10 +265,10 @@ def test_worked_example_small_geometry() -> None:
     shared = torch.tensor(
         [
             [5, 2, 7, 0, -1, -1, -1, -1],  # 4 of 8 groups, 2 more completed
-            [3, 1, 6, 4, 0, 2, 7, 5],  # full, 1 more: displaces slot 7
+            [3, 1, 6, 4, 0, 2, 7, 5],  # full, 1 more: displaces its first id
             [-1] * 8,  # nothing captured yet
             [1, 0, 2, -1, -1, -1, -1, -1],  # nothing new: a copy
-            [4, 1, 0, 3, 2, 6, 5, -1],  # 7 ids + 2 new: displaces slot 6 too
+            [4, 1, 0, 3, 2, 6, 5, -1],  # 7 ids + 2 new: displaces its first id too
         ],
         dtype=torch.int32,
         device=DEV,
@@ -286,9 +286,9 @@ def test_worked_example_small_geometry() -> None:
     out = op(**kwargs)
     _compare(out, op.reference(**kwargs))
     assert out.cpu().tolist() == [
-        [3, 1, 6, 4, 0, 2, 7, 8],
+        [1, 6, 4, 0, 2, 7, 5, 8],
         [5, 2, 7, 0, 8, 9, -1, -1],
-        [4, 1, 0, 3, 2, 6, 7, 8],
+        [1, 0, 3, 2, 6, 5, 7, 8],
         [0, -1, -1, -1, -1, -1, -1, -1],
         [1, 0, 2, -1, -1, -1, -1, -1],
     ]
@@ -412,6 +412,7 @@ def test_discriminates_plausible_wrong_variants() -> None:
 
     never_displace = shared.clone()  # appends only where there is room
     always_last = shared.clone()  # always writes the last `fresh` slots
+    displace_last = shared.clone()  # a full row gives up its newest ids, not its oldest
     for r in range(out.shape[0]):
         fresh = int((current[r] - captured[r]).clamp(0, K))
         filled = int((shared[r] >= 0).sum())
@@ -419,5 +420,6 @@ def test_discriminates_plausible_wrong_variants() -> None:
             if filled + j < K:
                 never_displace[r, filled + j] = captured[r] + j
             always_last[r, K - fresh + j] = captured[r] + j
-    for wrong in (never_displace, always_last, shared):
+            displace_last[r, min(filled, K - fresh) + j] = captured[r] + j
+    for wrong in (never_displace, always_last, displace_last, shared):
         assert not torch.equal(out, wrong.to(torch.int32))

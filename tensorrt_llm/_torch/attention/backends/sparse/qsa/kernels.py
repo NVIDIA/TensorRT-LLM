@@ -2178,6 +2178,7 @@ def _qsa_mtp_reuse_topk_kernel(
     visible_ptr,
     out_ptr,
     BLOCK_TOPK: tl.constexpr,
+    DISPLACE_OLDEST: tl.constexpr,
 ):
     """Rebuild a query row's selection from its request's captured row.
 
@@ -2185,6 +2186,10 @@ def _qsa_mtp_reuse_topk_kernel(
     groups that completed afterwards are written on top of it. They are always
     larger than every captured ID, because the capture's Top-K searched only
     ``[0, captured_visible)``, so the row never gains a duplicate.
+
+    A full row has no room for them: they take the slots of the row's last IDs,
+    or with ``DISPLACE_OLDEST`` the survivors shift to the front and they take
+    the slots after them, which for an ascending row displaces its smallest IDs.
     """
     row = tl.program_id(0)
     request = tl.load(request_ptr + row).to(tl.int32)
@@ -2197,8 +2202,16 @@ def _qsa_mtp_reuse_topk_kernel(
     # Valid captured IDs form a prefix; the rest is -1 padding.
     filled = tl.sum((values >= 0).to(tl.int32))
     fresh = tl.minimum(tl.maximum(current - captured, 0), BLOCK_TOPK)
-    # Append after the prefix when there is room, otherwise displace its tail.
+    # Append after the prefix when there is room, otherwise displace its tail, or its head
+    # (the survivors shifted to the front) with DISPLACE_OLDEST.
     start = tl.minimum(filled, BLOCK_TOPK - fresh)
+    if DISPLACE_OLDEST:
+        source = slots + (filled - start)
+        values = tl.load(
+            shared_ptr + request.to(tl.int64) * BLOCK_TOPK + source,
+            mask=source < BLOCK_TOPK,
+            other=-1,
+        )
     offset = slots - start
     is_fresh = (offset >= 0) & (offset < fresh)
     values = tl.where(is_fresh, (captured + offset).to(values.dtype), values)
@@ -2212,8 +2225,13 @@ def triton_qsa_mtp_reuse_topk(
     request_indices: torch.Tensor,
     visible_blocks: torch.Tensor,
     output: torch.Tensor,
+    displace_oldest: bool = False,
 ) -> torch.Tensor:
-    """Expand captured per-request selections back to per-query-row selections."""
+    """Expand captured per-request selections back to per-query-row selections.
+
+    ``displace_oldest`` is for captured rows in ascending order: a full row gives up
+    its first IDs, rather than its last, to the groups completed since the capture.
+    """
     rows, block_topk = output.shape
     if shared_indices.shape[1] != block_topk:
         raise ValueError(
@@ -2239,6 +2257,7 @@ def triton_qsa_mtp_reuse_topk(
         visible_blocks,
         output,
         BLOCK_TOPK=block_topk,
+        DISPLACE_OLDEST=displace_oldest,
         num_warps=4,
     )
     return output

@@ -4822,9 +4822,10 @@ class MTPLayer:
     the loop's first, runs it and captures per request the selection of the row the loop
     continues from, into the metadata's shared buffers; every draft decode step after it
     skips the index branch and rebuilds its selection from that capture with
-    `qsa_mtp_reuse_topk`, which appends the groups completed since. The expansion adds
-    the incomplete tail, so the tokens drafted since the capture stay visible. Every
-    selection is sorted first (padding last), so the reuse keeps the order.
+    `qsa_mtp_reuse_topk`, which appends the groups completed since; a full row gives up
+    its oldest ids to them. The expansion adds the incomplete tail, so the tokens drafted
+    since the capture stay visible. Every selection is sorted first (padding last), so
+    the reuse keeps the order.
 
     Not an `nn.Module`: the weights live in the core's `ParameterDict`, and a second
     registration would break the weight load's both-directions coverage assert."""

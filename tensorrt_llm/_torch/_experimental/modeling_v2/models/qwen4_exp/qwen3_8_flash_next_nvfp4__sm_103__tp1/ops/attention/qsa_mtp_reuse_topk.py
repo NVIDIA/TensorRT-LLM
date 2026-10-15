@@ -69,14 +69,17 @@ class QsaMtpReuseTopk(OpWrapper):
       3. `filled` = the count of non-negative ids in the captured row; the
          fresh ids go, ascending, into slots `start .. start + fresh - 1` with
          `start = min(filled, K - fresh)` -- right after the prefix when there
-         is room, otherwise over the row's last `fresh` slots, displacing
-         `filled + fresh - K` captured ids;
-      4. every other slot is the captured row verbatim, `-1` padding included.
+         is room, otherwise after the captured row's newest `K - fresh` ids:
+         the oldest `filled + fresh - K` ids are displaced and the survivors
+         shift to the front;
+      4. every other slot is the captured row's survivors in their order, `-1`
+         padding included.
 
     Every slot of `output[:rows]` is written and nothing else; returns `output`.
     The inputs are read-only. Nothing is sorted, compacted or de-duplicated and
-    the ranking is not recomputed: a displaced id is whichever the producer
-    placed last, not the lowest-scored one.
+    the ranking is not recomputed: the captured row is taken as ascending (the
+    target sorts it), so the displaced ids are the oldest groups, not the
+    lowest-scored ones, and the result is ascending again.
 
     Fusion boundary: the copy-and-append only. Capturing each request's row
     into the shared buffers, the per-row request map and visible counts, and
@@ -93,7 +96,7 @@ class QsaMtpReuseTopk(OpWrapper):
             spec=_spec(("explicit", (402,)), drafted=(1,), shared_rows=8),
         ),
         Cell(
-            why="1 request, full row: group 512 displaces slot 511",
+            why="1 request, full row: group 512 displaces the oldest id, slot 0",
             spec=_spec(("explicit", (2050,)), drafted=(1,), shared_rows=8),
         ),
         Cell(
@@ -247,6 +250,7 @@ class QsaMtpReuseTopk(OpWrapper):
             request_indices=request_indices,
             visible_blocks=visible_blocks,
             output=output,
+            displace_oldest=True,
         )
 
     def reference(
@@ -273,6 +277,13 @@ class QsaMtpReuseTopk(OpWrapper):
         fresh = (current - captured).clamp(min=0, max=block_topk)
         start = torch.minimum(filled, block_topk - fresh)
         slot = torch.arange(block_topk, device=device)[None, :]
+        # The oldest `filled - start` ids go; the survivors move to the front.
+        source = slot + (filled - start)[:, None]
+        rebuilt = torch.where(
+            source < block_topk,
+            rebuilt.gather(1, source.clamp(max=block_topk - 1)),
+            torch.full_like(rebuilt, -1),
+        )
         rank = slot - start[:, None]
         appended = (rank >= 0) & (rank < fresh[:, None])
         rebuilt[appended] = (captured[:, None] + rank)[appended]
