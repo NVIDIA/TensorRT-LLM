@@ -7599,8 +7599,8 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
-    def _update_adp_dummy_role(
-            self, candidates: list[RequestQueueItem]) -> None:
+    def _update_adp_dummy_role(self,
+                               candidates: list[RequestQueueItem]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
         has_ctx = False
