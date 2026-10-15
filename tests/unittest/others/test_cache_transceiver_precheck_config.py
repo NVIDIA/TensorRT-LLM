@@ -748,7 +748,7 @@ def test_gate_library_content(tmp_path):
         pcfg.gate_library_content("/nowhere/draft.sh", str(tmp_path / "empty"))
 
 
-@pytest.mark.parametrize("driver_status", (None, "RUNNING", "FAIL"))
+@pytest.mark.parametrize("driver_status", (None, "PASS", "RUNNING", "FAIL"))
 @pytest.mark.parametrize(
     ("exit_code", "expected_verdict"),
     ((124, "EXTERNAL_TIMEOUT"), (137, "EXTERNAL_KILL")),
@@ -758,8 +758,8 @@ def test_gate_records_external_timeout_verdict(
 ):
     """A killed step gets the gate's verdict unless the driver already wrote a FAIL verdict.
 
-    A RUNNING status left by a dead driver is replaced, and the junit excerpt still shows the
-    driver's error marker after it scrolled out of the log tail.
+    A stale PASS or a RUNNING status left by a dead driver is replaced, and the junit excerpt
+    still shows the driver's error markers after they scrolled out of the log tail.
     """
     gate = os.path.join(
         os.path.dirname(_PRECHECK_DIR),
@@ -782,6 +782,7 @@ timeout() {{
         echo "{driver_status} $name" > "$precheckDir/status/$name.status"
     fi
     echo "[precheck $name r0] UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists"
+    echo "[precheck $name] STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error"
     seq 100  # later output pushes the marker out of the log tail
     printf '\\0'  # an aborted MPI job can leave a NUL byte in the log
     return {exit_code}
@@ -826,6 +827,7 @@ run_cache_transceiver_precheck
     assert ("FAIL gen_0" if driver_status == "FAIL" else expected_verdict) in junit
     assert "NO_STATUS" not in junit
     assert "UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists" in junit
+    assert "STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error" in junit
 
 
 def test_gate_scopes_precheck_launch_environment(tmp_path):

@@ -1919,7 +1919,8 @@ def _hard_abort_unhandled(runner, exc):
             flush=True,
         )
         if runner.is_leader:
-            runner.recorder.record("-", 0, "UNHANDLED_ERROR", detail)
+            with contextlib.suppress(Exception):  # peers must still get the abort flag
+                runner.recorder.record("-", 0, "UNHANDLED_ERROR", detail)
             raise_abort_flag(runner.work_dir, f"{name} UNHANDLED_ERROR: {detail}")
         else:
             # If the leader hit the same error, give it time to write its verdict

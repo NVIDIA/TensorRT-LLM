@@ -1223,13 +1223,14 @@ def test_hard_abort_unhandled_records_the_error_then_aborts(tmp_path, monkeypatc
     err = capfd.readouterr().err
     assert f"] UNHANDLED_ERROR: {detail}" in err  # the gate greps this line
     assert "in publish_addr" in err  # the traceback names the raising frame
+    if is_leader:  # peers fail fast, even when the verdict could not be recorded
+        assert rp.abort_flag_reason(work) == f"ctx_2 UNHANDLED_ERROR: {detail}"
     if scenario == "leader":
         text, doc = _read_status(tmp_path, "ctx_2")
         assert text.startswith(
             f"FAIL ctx_2: 1 case(s) failed; first: peer=- req_len=0 UNHANDLED_ERROR: {detail}"
         )
         assert doc["overall"] == "FAIL"
-        assert rp.abort_flag_reason(work) == f"ctx_2 UNHANDLED_ERROR: {detail}"  # peers fail fast
     if scenario == "non_leader":
         # Neither a verdict nor the abort flag: only the leader writes.
         assert os.listdir(work) == []
