@@ -28,6 +28,8 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.speculative import SpecMetadata
 
 from . import weights as _weights
+from .ops.embedding.fused_embedding import fused_embedding
+from .ops.gemm.dense_mlp_small_m import INTER_PER_RANK, dense_mlp_small_m
 
 # The deployment this target is written for; route() selects it on the same
 # facts, and the constructor states them again for a direct construction.
@@ -76,6 +78,11 @@ class DecodeTarget:
     - Layers 3-77 (MoE): both all-reduces carry the residual add and the
       following norm; the experts finalize before theirs (16 ranks span nodes).
     - The last all-reduce applies the model's final norm (``next_layer_layernorm``).
+
+    The embedding table is whole on every rank, so the lookup is one local
+    kernel. The dense MLP runs as two weight-streaming kernels on this rank's
+    768 intermediate columns for up to 8 rows (every c1 step: one request and
+    its 7 drafts); a larger batch takes the generic gated MLP.
     """
 
     def __init__(self, core: "Glm52Nvfp4Sm107Tp16Core") -> None:
@@ -110,13 +117,16 @@ class DecodeTarget:
     ) -> torch.Tensor:
         core = self.core
         if inputs_embeds is None:
-            inputs_embeds = core.embed_tokens(input_ids)
+            inputs_embeds = fused_embedding(input_ids, core.embed_tokens.weight)
         residual = inputs_embeds
         hidden_states = core.layers[0].input_layernorm(inputs_embeds)
+        small_m = torch.ops.trtllm.glm_dense_mlp_small_m_supported(
+            hidden_states.shape[0], core.config.hidden_size, INTER_PER_RANK
+        )
         for layer in core.layers[: core.num_hidden_layers]:
             if isinstance(layer.mlp, GatedMLP):
                 hidden_states, residual = self._dense_layer(
-                    layer, position_ids, hidden_states, residual, attn_metadata
+                    layer, position_ids, hidden_states, residual, attn_metadata, small_m
                 )
             else:
                 hidden_states, residual = self._moe_layer(
@@ -125,7 +135,7 @@ class DecodeTarget:
         return hidden_states
 
     @staticmethod
-    def _dense_layer(layer, position_ids, hidden_states, residual, attn_metadata):
+    def _dense_layer(layer, position_ids, hidden_states, residual, attn_metadata, small_m):
         hidden_states = layer.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -133,9 +143,15 @@ class DecodeTarget:
             all_reduce_params=AllReduceParams(enable_allreduce=True),
         )
         hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
-        hidden_states = layer.mlp(
-            hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
-        )
+        if small_m:
+            # The rank partial; the all-reduce below sums it over the 16 ranks.
+            hidden_states = dense_mlp_small_m(
+                hidden_states, layer.mlp.gate_up_proj.weight, layer.mlp.down_proj.weight
+            )
+        else:
+            hidden_states = layer.mlp(
+                hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+            )
         return layer.allreduce(
             hidden_states,
             all_reduce_params=AllReduceParams(
