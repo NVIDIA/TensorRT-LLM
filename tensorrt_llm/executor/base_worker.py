@@ -32,7 +32,7 @@ from .._torch.peft.lora.manager import LoraManager
 from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
+from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
@@ -41,15 +41,14 @@ from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
-from .executor import GenerationExecutor, IterationResultQueue
-from .ipc import FusedIpcQueue, IpcQueue
+from .executor import GenerationExecutor
+from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
-from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    bucket_responses_by_frontend,
+from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
@@ -113,9 +112,6 @@ class BaseWorker(GenerationExecutor):
         self.postproc_config = postproc_config
 
         # inputs
-        self._engine = engine
-        self._batched_logits_processor = batched_logits_processor
-        self._postproc_worker_config = postproc_worker_config
         self._is_llm_executor = is_llm_executor
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
@@ -146,32 +142,22 @@ class BaseWorker(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
-    def _get_comm_ranks_device_id(self):
+    def _configure_device(self):
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = global_mpi_rank()
-        comm_ranks = mpi_comm().allgather(global_rank)
-        device_ids = mpi_comm().allgather(device_id)
-
         configure_cpu_affinity(device_id)
-
-        return comm_ranks, device_ids
 
     def setup_engine(self):
         """
         Setup the engine for the worker.
         """
 
-        if isinstance(self._engine, list):
-            self._engine = self._engine[self.rank]
-
         def _create_py_executor():
             args = {}
             assert hasattr(
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
-            _ = self._get_comm_ranks_device_id()
+            self._configure_device()
             if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
@@ -187,19 +173,17 @@ class BaseWorker(GenerationExecutor):
 
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
-            self.checkpoint_loader = None
-            if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.model_loader import \
-                    _construct_checkpoint_loader
-                partial_model_loading = self.llm_args.is_partial_model_loading
-                self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.checkpoint_loader,
-                    self.llm_args.checkpoint_format,
-                    mx_config=self.llm_args.mx_config,
-                    checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
-                    load_format=self.llm_args.load_format,
-                    partial_model_loading=partial_model_loading,
-                )
+            from tensorrt_llm._torch.pyexecutor.model_loader import \
+                _construct_checkpoint_loader
+            partial_model_loading = self.llm_args.is_partial_model_loading
+            self.checkpoint_loader = _construct_checkpoint_loader(
+                self.llm_args.checkpoint_loader,
+                self.llm_args.checkpoint_format,
+                mx_config=self.llm_args.mx_config,
+                checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
+                load_format=self.llm_args.load_format,
+                partial_model_loading=partial_model_loading,
+            )
 
             self.max_seq_len = self.llm_args.max_seq_len
             # creare_py_executor may change some fields of llm_args
@@ -216,7 +200,7 @@ class BaseWorker(GenerationExecutor):
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
 
-        if self._backend == "pytorch" and self._lora_config is not None:
+        if self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
@@ -307,14 +291,6 @@ class BaseWorker(GenerationExecutor):
         assert self.postproc_queues is None
         self.frontend_result_queues = queues
 
-    def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
-                                    queue: Union[Queue, FusedIpcQueue,
-                                                 IntraProcessQueue]):
-        assert not it_result_queue.is_initialized, "Iteration result queue should not already be initialized."
-        it_result_queue.is_initialized = True
-        it_result_queue.queue = queue
-        it_result_queue.aqueue = None
-
     def return_queue(self, client_id: int):
         """Return the queue used to deliver responses for ``client_id``.
 
@@ -337,9 +313,6 @@ class BaseWorker(GenerationExecutor):
                 return
             self.engine.cancel_request(request_id)
 
-    def _engine_response_callback(self, response: tllm.Response):
-        return response
-
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
 
@@ -353,16 +326,13 @@ class BaseWorker(GenerationExecutor):
         raise NotImplementedError(
             "start method is not implemented in BaseWorker")
 
-    def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
-        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+    def _load_lora_adapter(self, lora_request: LoRARequest) -> None:
+        """Ensure the adapter is loaded into the local cache."""
         adapter_id = str(lora_request.adapter_id)
-        newly_loaded_uids = self._lora_manager.load_from_ckpt(
-            [lora_request.path],
-            model_config=self._runtime_model_config if
-            self._runtime_model_config is not None else self._lora_model_config,
-            uids=[adapter_id],
-            ckpt_source=lora_request.ckpt_source)
-        return adapter_id in newly_loaded_uids
+        self._lora_manager.load_from_ckpt([lora_request.path],
+                                          model_config=self._lora_model_config,
+                                          uids=[adapter_id],
+                                          ckpt_source=lora_request.ckpt_source)
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
@@ -378,28 +348,14 @@ class BaseWorker(GenerationExecutor):
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             try:
-                if self._is_pytorch_backend:
-                    # PyTorch backend: don't embed weights in the request.
-                    # Each rank loads independently from disk via py_lora_path
-                    # in PeftCacheManager.add_request_peft().
-                    # Pre-load on rank 0 to warm the LoRA manager cache so that
-                    # add_request_peft finds the adapter already loaded.
-                    self._load_lora_adapter(request.lora_request)
-                    uid = str(request.lora_request.adapter_id)
-                    lora_config = tllm.LoraConfig(
-                        task_id=request.lora_request.adapter_id,
-                        weights=None,
-                        config=self._lora_manager.cpp_lora_config[uid])
-                else:
-                    adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                        request.lora_request.adapter_id)
-                    self._load_lora_adapter(request.lora_request)
-                    uid = str(request.lora_request.adapter_id)
-                    lora_config = tllm.LoraConfig(
-                        task_id=request.lora_request.adapter_id,
-                        weights=self._lora_manager.cpp_lora_weights[uid]
-                        if not adapter_in_cache else None,
-                        config=self._lora_manager.cpp_lora_config[uid])
+                # Each rank loads independently from disk via py_lora_path in
+                # PeftCacheManager.add_request_peft(). Warm rank 0's cache here.
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=None,
+                    config=self._lora_manager.cpp_lora_config[uid])
                 py_lora_path = request.lora_request.lora_path
             except Exception as e:
                 raise RequestError(f"Failed to load LoRA adapter: {e}") from e
@@ -518,8 +474,7 @@ class BaseWorker(GenerationExecutor):
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
                 request.sampling_params.end_id,
-                output_config=request.sampling_params._get_output_config(
-                    is_pytorch_backend=self._is_pytorch_backend),
+                output_config=request.sampling_params._get_output_config(),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
                 return_all_generated_tokens=False,
                 guided_decoding_params=request.sampling_params.
@@ -1370,11 +1325,8 @@ class AwaitResponseHelper:
 
     def process_responses(
             self, responses: List[tllm.Response]) -> List[tllm.Response]:
-        """Apply engine callbacks and append deferred submission errors."""
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
+        """Append deferred submission errors to the engine responses."""
+        responses = list(responses)
 
         # Drain with get_nowait(): this may run concurrently from the
         # ManagedThread and RPC fetch_responses(), and empty()+get() can
@@ -1534,8 +1486,7 @@ class AwaitResponseHelper:
             queue = self.worker.return_queue(response.client_id)
 
             if not response.has_error():
-                response = _maybe_wrap_response(self.worker, response,
-                                                self.worker._is_pytorch_backend)
+                response = _maybe_wrap_response(self.worker, response)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -1579,8 +1530,7 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
             else:
-                response = _maybe_wrap_response(self.worker, response,
-                                                self.worker._is_pytorch_backend)
+                response = _maybe_wrap_response(self.worker, response)
 
             _send_rsp(self.worker,
                       response,
@@ -1623,9 +1573,7 @@ def _compute_pytorch_prompt_logprobs(
     if generation_result._streaming:
         cached = getattr(generation_result, '_cached_prompt_logprobs', None)
         if cached is not None:
-            return LogProbsResult(
-                prompt=cached, generation=None
-            )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
+            return LogProbsResult(prompt=cached)
     context_logits = response.result.context_logits
     assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     result = response.result.get_result()
@@ -1639,10 +1587,7 @@ def _compute_pytorch_prompt_logprobs(
 
     logprobs_result = compute_logprobs(
         logprob_params.prompt_logprobs,
-        None,
         context_logits,
-        None,
-        None,
         prompt_token_ids,
         simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
     )
@@ -1652,58 +1597,28 @@ def _compute_pytorch_prompt_logprobs(
     return logprobs_result
 
 
-def _get_logprobs(worker,
-                  response: Union[tllm.Response, LlmResponse],
-                  is_pytorch_backend=False) -> Optional[LogProbsResult]:
-    """Compute logprobs from response logits when needed.
-
-    Logprobs provenance varies by backend:
-    - PyTorch: Generation logprobs computed in sampler, only prompt logprobs computed here
-    - TRT: Both prompt and generation logprobs computed here from logits
-    """
-
-    logprobs_result = None
+def _get_logprobs(worker, response: LlmResponse) -> Optional[LogProbsResult]:
+    """Compute prompt logprobs; the sampler supplies generation logprobs."""
     generation_result = worker._results.get(response.client_id, None)
 
     if not generation_result:
         return None
 
     logprob_params = getattr(generation_result, "_logprob_params", None)
-    if logprob_params:
-        if is_pytorch_backend:
-            if logprob_params.prompt_logprobs is None:
-                # PyTorch: generation logprobs computed in sampler, no post-processing needed
-                return None
-            else:
-                logprobs_result = _compute_pytorch_prompt_logprobs(
-                    generation_result, response)
-
-                if logprob_params.drop_context_logits:
-                    response.clear_context_logits()
-
-                return logprobs_result
-
-        # TRT backend: compute both prompt and generation logprobs from logits
-        logprobs_result = compute_logprobs(
-            logprob_params.prompt_logprobs,
-            logprob_params.logprobs,
-            response.result.context_logits,
-            response.result.generation_logits,
-            response.result.output_token_ids[0],
-            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
-            simple_logprobs=logprob_params.logprobs_simple_format,
-        )
-
+    if logprob_params and logprob_params.prompt_logprobs is not None:
+        logprobs_result = _compute_pytorch_prompt_logprobs(
+            generation_result, response)
         if logprob_params.drop_context_logits:
             response.clear_context_logits()
+        return logprobs_result
 
-        if logprob_params.drop_generation_logits:
-            response.clear_generation_logits()
+    if logprob_params:
+        return None
 
     if response.result.is_final:
         generation_result.clear_logprob_params()
 
-    return logprobs_result
+    return None
 
 
 def _send_rsp_to_postproc(
@@ -1788,11 +1703,9 @@ def _send_rsp(
 
 
 def _maybe_wrap_response(
-        worker,
-        response: tllm.Response,
-        is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
+        worker, response: LlmResponse) -> Union[LlmResponse, ResponseWrapper]:
 
-    logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    logprobs_result = _get_logprobs(worker, response)
     req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)

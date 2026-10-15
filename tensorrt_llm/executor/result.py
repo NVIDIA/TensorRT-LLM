@@ -18,11 +18,6 @@ import torch.nn.functional as F
 
 from tensorrt_llm.llmapi import tracing
 
-try:
-    pass
-except ModuleNotFoundError:
-    pass
-
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
@@ -68,9 +63,8 @@ SimpleTokenLogprobs: TypeAlias = list[float]
 
 
 class LogProbsResult(NamedTuple):
-    """Optional log probability outputs computed post runtime."""
+    """Optional prompt log probabilities computed post runtime."""
     prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
-    generation: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
 class _SpecDecCounters(NamedTuple):
@@ -95,11 +89,6 @@ class ResponseWrapper:
         self._response = response
         self.logprobs = logprobs
         self.request_perf_metrics = request_perf_metrics
-
-    @property
-    def _is_llm_response(self):
-        response = object.__getattribute__(self, '_response')
-        return isinstance(response, tllm.Response)
 
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
@@ -410,14 +399,9 @@ class GenerationResultBase:
             output.cumulative_logprob = cum_log_probs[src_idx]
 
         # prompt logprobs handling
-        if logprobs_result and logprobs_result.prompt is not None:  # both backends
+        if logprobs_result and logprobs_result.prompt is not None:
             output.prompt_logprobs = logprobs_result.prompt
-        # generation logprobs handling (provenance varies by backend)
-        if logprobs_result and logprobs_result.generation is not None:  # TRT backend
-            # update logprobs from ResponseWrapper (TRT top logprobs WAR)
-            output.logprobs += logprobs_result.generation
-        elif (log_probs :=
-              response_tensors.log_probs) is not None:  # PyTorch backend
+        if (log_probs := response_tensors.log_probs) is not None:
             # handle logprobs directly from response tensors given by sampler
             if decoder_output_prefix and self.sampling_params.use_beam_search:
                 output.logprobs = [
@@ -1161,9 +1145,6 @@ class GenerationResult(GenerationResultBase):
         if hasattr(self, "_logprob_params"):
             del self._logprob_params
 
-    def _handle_ray_response(self, response: Any):
-        return response
-
     def _result_step(self, timeout: Optional[float] = None):
         # Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor
         # worker dies silently without pushing a terminal response, instead of blocking potentially
@@ -1345,23 +1326,14 @@ class IterationResult:
 
 def compute_logprobs(
     k_prompt_logprobs: int,
-    k_logprobs: int,
     context_logits: Optional[torch.Tensor],
-    generation_logits: Optional[torch.Tensor],
-    output_token_ids: Optional[list[int]],
     prompt_token_ids: Optional[list[int]] = None,
     simple_prompt_logprobs: bool = False,
-    simple_logprobs: bool = False,
 ) -> LogProbsResult:
-    """Compute top-K logprobs from logits when engine doesn't provide them directly.
+    """Compute prompt logprobs from context logits.
 
-    Used for post-processing logits into logprobs.
-    - Prompt logprobs (from context_logits): always used.
-    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
-    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
-
-    When `simple_prompt_logprobs` / `simple_logprobs` is True and the corresponding
-    `k_*` is 0, the result is a flat ``SimpleTokenLogprobs`` (``list[float]``,
+    When `simple_prompt_logprobs` is True and `k_prompt_logprobs` is 0,
+    the result is a flat ``SimpleTokenLogprobs`` (``list[float]``,
     one logprob per token) instead of ``TokenLogprobs``. This avoids the
     per-token dict allocation overhead when only the sampled-token logprob is
     needed.
@@ -1369,7 +1341,6 @@ def compute_logprobs(
     Returns:
         LogProbsResult, a NamedTuple containing:
             - prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for prompt tokens.
-            - generation: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for generated tokens.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,
@@ -1434,12 +1405,7 @@ def compute_logprobs(
         context_logits, k_prompt_logprobs, prompt_token_ids,
         simple_prompt_logprobs
     ) if k_prompt_logprobs is not None and context_logits is not None else None
-    generation_logprobs = _topk_logprobs(
-        generation_logits, k_logprobs, output_token_ids, simple_logprobs
-    ) if k_logprobs is not None and generation_logits is not None else None
-
-    return LogProbsResult(prompt=prompt_logprobs,
-                          generation=generation_logprobs)
+    return LogProbsResult(prompt=prompt_logprobs)
 
 
 def _build_perf_metrics_dict(

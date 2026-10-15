@@ -12,6 +12,8 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### API Changes
 
+- <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, the `insertRequestInOrder(std::deque<RequestWithId>&, RequestWithId&&)` overload, and the unused `orchestratorUtils.h` message types have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available.
+
 ### Fixed Issues
 
 ### Known Issues

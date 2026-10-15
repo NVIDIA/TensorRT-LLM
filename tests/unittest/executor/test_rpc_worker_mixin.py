@@ -26,7 +26,7 @@ pytestmark = pytest.mark.cpu_only
 class _WorkerBaseStub:
     def await_responses(self, timeout):
         self.await_responses_timeout = timeout
-        return ["forward", "consume", None]
+        return ["first-response", "second-response"]
 
 
 class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
@@ -38,27 +38,20 @@ class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
         self._await_response_helper = AwaitResponseHelper(self)
         self._await_response_helper.responses_handler = self._responses_handler
         self.handler_responses = None
-        self.callback_responses = []
 
     def _responses_handler(self, responses):
         self.handler_responses = responses
         if responses:
             self._response_queue.put(responses)
 
-    def _engine_response_callback(self, response):
-        self.callback_responses.append(response)
-        if response in ("consume", None):
-            return None
-        return f"processed-{response}"
 
-
-def test_fetch_responses_processes_and_filters_engine_responses():
+def test_fetch_responses_dispatches_engine_responses_and_submission_errors():
     worker = _RpcWorkerStub()
     worker._await_response_helper.temp_error_responses.put("temporary-error")
 
     responses = worker.fetch_responses(timeout=0.25)
 
     assert worker.await_responses_timeout == 0.25
-    assert worker.callback_responses == ["forward", "consume", None]
-    assert worker.handler_responses == ["processed-forward", "temporary-error"]
-    assert responses == ["processed-forward", "temporary-error"]
+    expected = ["first-response", "second-response", "temporary-error"]
+    assert worker.handler_responses == expected
+    assert responses == expected
