@@ -69,7 +69,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
 
     @property
     def supported_media_modalities(self) -> frozenset[str]:
-        """Media capabilities cached from the loaded model and mapper."""
+        """Cached media modalities."""
         return self._media_capabilities.modalities
 
     def active_request_count(self) -> int:

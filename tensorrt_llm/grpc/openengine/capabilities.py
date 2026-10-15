@@ -1,11 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What this engine can actually do, defined once for Generate and Control.
-
-Control advertises from this table and Generate enforces it, so a client can
-never discover a capability that Generate then rejects.
-"""
+"""Shared capability resolution for OpenEngine Control and Generate."""
 
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -29,7 +25,7 @@ GUIDE_SUPPORT_BY_BACKEND: dict[str, frozenset[str]] = {
 
 @dataclass(frozen=True)
 class MediaCapabilities:
-    """Immutable media capability snapshot shared by Control and Generate."""
+    """Media support shared by Control and Generate."""
 
     placeholder_templates: Mapping[str, str]
 
@@ -40,7 +36,7 @@ class MediaCapabilities:
 
     @property
     def modalities(self) -> frozenset[str]:
-        """Modalities the loaded model and request mapper both support."""
+        """Modalities supported by both the model and request mapper."""
         return frozenset(self.placeholder_templates)
 
     def placeholder(self, modality: str, item_number: int) -> str:
@@ -73,8 +69,7 @@ def _loaded_model_type(llm: Any) -> str:
     if config is None:
         return ""
 
-    # Composite Hugging Face configs can delegate the instance attribute to
-    # their text config. The class attribute retains the top-level registry key.
+    # The class attribute preserves the top-level type for composite configs.
     model_type = getattr(type(config), "model_type", None) or getattr(config, "model_type", "")
     return model_type if isinstance(model_type, str) else ""
 
@@ -82,14 +77,9 @@ def _loaded_model_type(llm: Any) -> str:
 def resolve_media_capabilities(
     llm: Any, implemented_modalities: Collection[str]
 ) -> MediaCapabilities:
-    """Resolve media support implemented by both the mapper and loaded model.
+    """Intersect model support with implemented request handlers.
 
-    A registry entry alone describes what this TensorRT-LLM build knows about;
-    it does not prove that the loaded engine instantiated a multimodal input
-    processor. Requiring both prevents a text-only model from advertising
-    media merely because another image model is registered in the process. The
-    request mapper supplies ``implemented_modalities`` from its handler table,
-    so discovery cannot advertise a modality without a request implementation.
+    A live multimodal processor prevents registry-only false positives.
     """
     input_processor = getattr(llm, "input_processor", None)
     if not isinstance(input_processor, BaseMultimodalInputProcessor):
@@ -103,9 +93,7 @@ def resolve_media_capabilities(
         for modality in implemented_modalities
         if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality)
     }
-    # Validate templates once at startup. A malformed registry entry is a
-    # server configuration failure, not a client request error discovered only
-    # after Control has advertised the modality.
+    # Fail startup before Control advertises a malformed template.
     for modality, template in placeholders.items():
         try:
             template.format(1)
