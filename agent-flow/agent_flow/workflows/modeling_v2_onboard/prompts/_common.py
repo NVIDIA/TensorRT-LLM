@@ -167,8 +167,11 @@ the code **you are testing** mounted at its own absolute path:
   it) and the run's workspace, each at the same path inside the container;
 - `cd` into your worktree inside the container before running anything.
 
-A fresh worktree has no native build artifacts. Each fresh container session
-bootstraps the checkout it runs from:
+A fresh worktree has no native build artifacts. When `implements_tips` or
+`test_commands.md` give a way to reuse an existing build (for example linking
+a built checkout's compiled artifacts into your worktree), use it: it takes
+seconds, and is valid as long as your task changes no C++ or CUDA source.
+Otherwise each fresh container session bootstraps the checkout it runs from:
 
 ```bash
 cd <your worktree>
