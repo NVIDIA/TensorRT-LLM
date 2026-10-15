@@ -2,27 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Store keys for blob objects.
 
-A private, versioned encoding of the lender's opaque object names, not a stable public format. An
-incompatible change bumps ``KEY_FORMAT_VERSION`` so objects written under the old one miss instead
-of being misread.
+A private encoding of the lender's opaque object names, not a stable public format. The key
+carries ``FORMAT_VERSION``, which covers the key spelling and the payload layout alike: after an
+incompatible change, objects written under the old version are never looked up, so they miss
+instead of being misread.
 """
 
 from __future__ import annotations
 
-KEY_FORMAT_VERSION = 1
+import re
 
+FORMAT_VERSION = 1
+
+_PREFIX = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _SEPARATOR = "/"
 
 
 def encode_key(prefix: str, name: bytes) -> str:
-    """``"<prefix>/v<version>/<hex of name>"``.
+    """``"<prefix>/v<FORMAT_VERSION>/<hex of name>"``.
 
     Args:
-        prefix: The deployment's namespace; non-empty, without ``/`` or whitespace.
+        prefix: The store partition the objects live in, for example a deployment name; matches
+            ``[A-Za-z0-9_-]{1,64}``.
         name: The lender's opaque object name; encoded whole, never parsed.
     """
-    if not prefix or _SEPARATOR in prefix or any(c.isspace() for c in prefix):
-        raise ValueError(f"bad key prefix {prefix!r}: non-empty, no '/' and no whitespace")
+    if not _PREFIX.fullmatch(prefix):
+        raise ValueError(f"bad key prefix {prefix!r}: expected [A-Za-z0-9_-]{{1,64}}")
     if not name:
         raise ValueError("an object name is non-empty")
-    return f"{prefix}{_SEPARATOR}v{KEY_FORMAT_VERSION}{_SEPARATOR}{name.hex()}"
+    return f"{prefix}{_SEPARATOR}v{FORMAT_VERSION}{_SEPARATOR}{name.hex()}"

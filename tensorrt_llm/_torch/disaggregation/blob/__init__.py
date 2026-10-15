@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The blob backend: KV rows shared through a byte store.
 
-Only the private driver boundary lives here so far. Nothing in this package imports the public
-backend contract or an optional store SDK at import time.
+So far this package holds the private driver boundary (``store.py``) and the key encoding
+(``keys.py``). Nothing here imports the public backend contract or an optional store SDK at
+import time.
 """

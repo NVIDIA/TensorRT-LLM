@@ -2,31 +2,41 @@
 # SPDX-License-Identifier: Apache-2.0
 """An in-process store and a driver over it, for tests.
 
-``MemoryStore`` is a dictionary of complete objects that two endpoints in one process can share.
-``MemoryDriver`` really copies bytes between registered host memory and that store. In automatic
-mode an operation completes inside ``put``/``get``, like a blocking SDK. In controlled mode the test
-releases three things separately per operation: the transfer, the logical results and the end of
-access, so it can stage partial arrival, a result before or after access end, a late write after a
-fault, and registration failures. No threads are started here. Transfers copy and call the store
-outside the driver's lock, so queries never wait on the store; the lock is held around state
-changes and around a late write's short copy, which keeps ``end_access`` out until it lands.
+``MemoryStore`` is a dictionary of complete objects that endpoints in one process can share. It
+can be given a capacity, and a test can mark a key as held by an unfinished write. ``MemoryDriver``
+really copies bytes between registered host memory and that store, keeping a trailer beside each
+object that it verifies on every get, the way a real store checks sizes and checksums natively.
+
+In automatic mode an operation completes inside ``put``/``get``, like a blocking SDK. In controlled
+mode the test releases three things separately per operation: the transfer, the logical results
+and the end of access, so it can stage partial arrival, a result before or after access end, a late
+write after a fault, an operation whose end can never be proven, and registration failures.
+
+Transfers copy and call the store outside the driver's lock, so queries never wait on the store
+and one blocked operation never delays another. Each submission check is its own method, so a
+test can subclass the driver and disable exactly one rule.
 """
 
 from __future__ import annotations
 
 import ctypes
+import enum
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from tensorrt_llm._torch.disaggregation.blob.format import TRAILER_BYTES
+from object_trailer import Checksum, check_trailer, encode_trailer
+
 from tensorrt_llm._torch.disaggregation.blob.store import (
     CANCELLED,
+    DECLINED,
     MISS,
+    NOT_READY,
     PENDING,
     READY,
     DriverCapabilities,
+    DriverRejected,
     OpHandle,
     ProbeStatus,
     RegionHandle,
@@ -40,6 +50,35 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     faulted,
 )
 
+DEFAULT_CAPABILITIES = DriverCapabilities(
+    get=True, put=True, cancel=True, probe=True, max_rows_per_op=None
+)
+MAX_PROBES_IN_FLIGHT = 4
+
+Kind = Literal["put", "get"]
+
+
+class ObjectNotReady(StoreError):
+    """The key is held by a write that has not finished."""
+
+
+class Commit(enum.Enum):
+    """How the store answered a commit."""
+
+    STORED = "stored"
+    SAME = "same"  # an identical object was already there
+    DIFFERENT = "different"  # a different object holds the key; it was kept
+    DECLINED = "declined"  # no room
+    NOT_READY = "not_ready"  # another write holds the key
+
+
+@dataclass(frozen=True)
+class StoredObject:
+    """One committed object: its payload and the trailer the driver keeps beside it."""
+
+    payload: bytes
+    trailer: bytes
+
 
 class MemoryStore:
     """Objects by key. Each object is a private copy, committed whole or not at all.
@@ -48,42 +87,77 @@ class MemoryStore:
     raise ``StoreError``, which the driver turns into a row fault.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, capacity: int | None = None) -> None:
         self._lock = threading.Lock()
-        self._objects: dict[str, bytes] = {}
+        self._objects: dict[str, StoredObject] = {}
+        self._writing: set[str] = set()
+        self.capacity = capacity
 
-    def commit(self, key: str, data: bytes) -> bool:
-        """Store ``data`` under ``key``. False when a different object already holds the key;
-        the existing object is kept. Storing identical bytes again is a no-op success."""
-        copy = bytes(data)
+    def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
+        new = StoredObject(bytes(payload), bytes(trailer))
         with self._lock:
+            if key in self._writing:
+                return Commit.NOT_READY
             existing = self._objects.get(key)
-            if existing is None:
-                self._objects[key] = copy
-                return True
-            return existing == copy
+            if existing is not None:
+                return Commit.SAME if existing == new else Commit.DIFFERENT
+            if self.capacity is not None and len(self._objects) >= self.capacity:
+                return Commit.DECLINED
+            self._objects[key] = new
+            return Commit.STORED
 
-    def get(self, key: str) -> bytes | None:
+    def get(self, key: str) -> StoredObject | None:
         with self._lock:
+            if key in self._writing:
+                raise ObjectNotReady(key)
             return self._objects.get(key)
 
+    def presence(self, key: str) -> ProbeStatus:
+        with self._lock:
+            if key in self._writing:
+                return ProbeStatus.NOT_READY
+            return ProbeStatus.HIT if key in self._objects else ProbeStatus.MISS
+
     def contains(self, key: str) -> bool:
-        return self.get(key) is not None
+        return self.presence(key) is ProbeStatus.HIT
 
-    def committed_object(self, key: str) -> bytes:
-        """The whole object under ``key``; ``KeyError`` when nothing is committed there."""
-        data = self.get(key)
-        if data is None:
+    def committed_object(self, key: str) -> StoredObject:
+        """The object under ``key``; ``KeyError`` when nothing is committed there."""
+        stored = self.get(key)
+        if stored is None:
             raise KeyError(f"no committed object under {key!r}")
-        return data
+        return stored
 
-    def committed_payload(self, key: str, trailer_nbytes: int = TRAILER_BYTES) -> bytes:
-        """The payload of the object under ``key``, without its trailer."""
-        return self.committed_object(key)[:-trailer_nbytes]
+    def committed_payload(self, key: str) -> bytes:
+        return self.committed_object(key).payload
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._objects)
+
+    # Test controls.
+
+    def begin_write(self, key: str) -> None:
+        """Hold ``key`` as another writer's unfinished object until ``end_write``."""
+        with self._lock:
+            self._writing.add(key)
+
+    def end_write(self, key: str) -> None:
+        with self._lock:
+            self._writing.discard(key)
+
+    def corrupt(self, key: str, index: int) -> None:
+        """Flip one payload byte of the committed object, as a damaged store would."""
+        with self._lock:
+            stored = self._objects[key]
+            payload = bytearray(stored.payload)
+            payload[index] ^= 0xFF
+            self._objects[key] = StoredObject(bytes(payload), stored.trailer)
+
+    def overwrite(self, key: str, payload: bytes, trailer: bytes) -> None:
+        """Replace whatever holds ``key``. Only a deliberately broken driver calls this."""
+        with self._lock:
+            self._objects[key] = StoredObject(bytes(payload), bytes(trailer))
 
 
 @dataclass(eq=False)
@@ -106,9 +180,16 @@ class _Row:
 class MemoryOp:
     """One put or get. Tests hold it to drive the controlled mode."""
 
-    kind: Literal["put", "get"]
+    kind: Kind
     rows: list[_Row]
     access_ended: bool = False
+    unprovable: bool = False
+
+
+@dataclass(eq=False)
+class _Probe:
+    worker: threading.Thread
+    finished: threading.Event
 
 
 class MemoryDriver:
@@ -119,7 +200,7 @@ class MemoryDriver:
         store: MemoryStore,
         *,
         controlled: bool = False,
-        capabilities: DriverCapabilities = DriverCapabilities(cancel=True, probe=True),
+        capabilities: DriverCapabilities = DEFAULT_CAPABILITIES,
     ) -> None:
         self.store = store
         self.controlled = controlled
@@ -127,7 +208,9 @@ class MemoryDriver:
         self._lock = threading.Condition(threading.RLock())
         self._registrations: list[_Registration] = []
         self._ops: list[MemoryOp] = []
+        self._probes: list[_Probe] = []
         self._draining = False
+        self._closed = False
         self._cancel_effective = True
         self._probe_unknown = False
         self._register_failure: tuple[str, bool] | None = None
@@ -140,13 +223,17 @@ class MemoryDriver:
         return self._capabilities
 
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> _Registration:
-        span = Span(address, nbytes)
+        try:
+            span = Span(address, nbytes)
+        except ValueError as error:
+            raise DriverRejected(str(error)) from None
         if layout.nbytes > nbytes:
-            raise ValueError(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
+            raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
         with self._lock:
+            self._require_accepting()
             for other in self._registrations:
                 if other.live and other.span.overlaps(span):
-                    raise ValueError(f"region {span} overlaps a live registration {other.span}")
+                    raise DriverRejected(f"region {span} overlaps a live registration {other.span}")
             registration = _Registration(span, layout)
             if self._register_failure is not None:
                 reason, escaped = self._register_failure
@@ -162,6 +249,9 @@ class MemoryDriver:
     def unregister(self, handle: RegionHandle) -> None:
         with self._lock:
             registration = self._registration(handle)
+            if not registration.live:
+                return
+            self._check_region_idle(registration)
             reason = self._unregister_failures.pop(id(registration), None)
             if reason is not None:
                 raise StoreError(reason)
@@ -181,33 +271,72 @@ class MemoryDriver:
         with self._lock:
             return self._op(op).access_ended
 
+    def access_unprovable(self, op: OpHandle) -> bool:
+        with self._lock:
+            return self._op(op).unprovable
+
     def cancel(self, op: OpHandle) -> None:
         with self._lock:
             if self._cancel_effective:
                 self._cancel_unstarted(self._op(op))
 
     def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
-        if self._probe_unknown:
-            return tuple(ProbeStatus.UNKNOWN for _ in keys)
-        return tuple(
-            ProbeStatus.HIT if self.store.contains(key) else ProbeStatus.MISS for key in keys
-        )
+        answers: dict[str, ProbeStatus] = {}
+        errors: list[Exception] = []
+        finished = threading.Event()
+
+        def ask() -> None:
+            try:
+                for key in keys:
+                    answers[key] = self.store.presence(key)
+            except Exception as error:  # reported from the caller's thread below
+                errors.append(error)
+            finally:
+                finished.set()
+                with self._lock:
+                    self._lock.notify_all()
+
+        # The store may block; the budget bounds this call, not the store. Registration and
+        # start happen under the lock, so close and drain see every worker.
+        with self._lock:
+            self._require_not_closed()
+            self._probes = [probe for probe in self._probes if not probe.finished.is_set()]
+            if self._draining or self._probe_unknown or len(self._probes) >= MAX_PROBES_IN_FLIGHT:
+                return tuple(ProbeStatus.UNKNOWN for _ in keys)
+            worker = threading.Thread(target=ask, name="memory-driver-probe", daemon=True)
+            self._probes.append(_Probe(worker, finished))
+            worker.start()
+        if finished.wait(budget_s):
+            worker.join()  # it is exiting; leave no thread behind a call that got its answer
+        if errors:
+            raise errors[0]
+        return tuple(answers.get(key, ProbeStatus.UNKNOWN) for key in keys)
 
     def drain(self, budget_s: float) -> bool:
         with self._lock:
-            self._draining = True
+            self._require_not_closed()
+            self._start_draining()
             for op in self._ops:
                 self._cancel_unstarted(op)
-            return self._lock.wait_for(
-                lambda: all(op.access_ended for op in self._ops), timeout=budget_s
-            )
+            self._lock.wait_for(self._drain_can_return, timeout=budget_s)
+            return self._quiet()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._check_closable()
+            self._closed = True
+            probes, self._probes = self._probes, []
+        for probe in probes:  # all finished; join only lets the threads exit
+            probe.worker.join()
 
     # Controlled mode: the test releases each stage.
 
     def transfer(self, op: MemoryOp, rows: Iterable[int] | None = None) -> None:
         """Move the bytes of ``rows`` (all by default) and stage their results.
 
-        The copies and store calls run outside the driver's lock; a ``StoreError`` from the store
+        The copies and store calls run outside the driver's lock; any raise from the store
         becomes that row's fault instead of escaping.
         """
         with self._lock:
@@ -241,7 +370,8 @@ class MemoryDriver:
         self.publish_results(op, indexes)
 
     def fail(self, op: MemoryOp, reason: str, rows: Iterable[int] | None = None) -> None:
-        """Conclude ``rows`` as FAULT without moving bytes; access stays open."""
+        """Conclude ``rows`` as FAULT without moving bytes, as a store that reported an error
+        would; access stays open because the store may still be writing."""
         with self._lock:
             self._require_open(op)
             for index in self._indexes(op, rows):
@@ -252,8 +382,8 @@ class MemoryDriver:
 
     def write_late(self, op: MemoryOp, index: int, data: bytes) -> None:
         """Write into a faulted get row's payload after its result, as a transfer that kept going
-        would. Refused once access has ended, and for rows that are READY, MISS, CANCELLED or
-        still pending: those must stay as reported."""
+        would. Refused once access has ended, and for rows that are not FAULT: those must stay
+        as reported."""
         with self._lock:
             self._require_open(op)
             if op.kind != "get":
@@ -274,6 +404,14 @@ class MemoryDriver:
             if any(row.started and not row.transferred for row in op.rows):
                 raise RuntimeError("a transfer is still in progress")
             op.access_ended = True
+            self._lock.notify_all()
+
+    def mark_unprovable(self, op: MemoryOp) -> None:
+        """Declare that the driver will never learn when this operation's access ends, as after a
+        store failure that issued nothing to wait on. Access stays open."""
+        with self._lock:
+            self._require_open(op)
+            op.unprovable = True
             self._lock.notify_all()
 
     def set_cancel_effective(self, effective: bool) -> None:
@@ -298,71 +436,192 @@ class MemoryDriver:
         with self._lock:
             return [op for op in self._ops if not op.access_ended]
 
-    # Internals.
+    def probes_in_flight(self) -> int:
+        with self._lock:
+            return sum(1 for probe in self._probes if not probe.finished.is_set())
 
-    def _submit(self, kind: Literal["put", "get"], rows: Sequence[RowIO]) -> MemoryOp:
+    def join_probes(self, timeout: float) -> None:
+        """Wait for every probe worker to exit, for tests that opened a gate they had closed."""
+        with self._lock:
+            probes = list(self._probes)
+        for probe in probes:
+            probe.worker.join(timeout)
+
+    # Submission checks, one rule each.
+
+    def _check_direction(self, kind: Kind) -> None:
+        if not getattr(self._capabilities, kind):
+            raise DriverRejected(f"{kind} is not declared by this driver")
+
+    def _check_not_draining(self) -> None:
+        if self._draining:
+            raise DriverRejected("the driver is draining")
+
+    def _check_row_limit(self, rows: Sequence[RowIO]) -> None:
         if not rows:
-            raise ValueError("an operation needs at least one row")
+            raise DriverRejected("an operation needs at least one row")
         limit = self._capabilities.max_rows_per_op
         if limit is not None and len(rows) > limit:
-            raise ValueError(f"{len(rows)} rows exceed the limit of {limit} per operation")
+            raise DriverRejected(f"{len(rows)} rows exceed the limit of {limit} per operation")
+
+    def _check_unique_keys(self, rows: Sequence[RowIO]) -> None:
+        keys = [io.key for io in rows]
+        if len(set(keys)) != len(keys):
+            raise DriverRejected("a key appears more than once in the operation")
+
+    def _check_registered(self, rows: Sequence[RowIO]) -> None:
+        for io in rows:
+            if not self._registered(io.payload):
+                raise DriverRejected(f"{io.payload} is outside every live registration")
+
+    def _check_region_idle(self, registration: _Registration) -> None:
+        busy = sum(
+            1
+            for op in self._ops
+            if not op.access_ended
+            and any(row.io.payload.within(registration.span) for row in op.rows)
+        )
+        if busy:
+            raise DriverRejected(f"{busy} operation(s) may still access the region")
+
+    def _check_closable(self) -> None:
+        if not self._draining or not self._quiet():
+            raise DriverRejected("close needs a drain that returned True")
+        if any(r.live for r in self._registrations):
+            raise DriverRejected("close needs every registration unregistered")
+
+    def _start_draining(self) -> None:
+        self._draining = True
+
+    def _drain_can_return(self) -> bool:
+        return self._quiet() or any(op.unprovable and not op.access_ended for op in self._ops)
+
+    def _quiet(self) -> bool:
+        """Nothing can still touch memory and no background work is running."""
+        return all(op.access_ended for op in self._ops) and all(
+            probe.finished.is_set() for probe in self._probes
+        )
+
+    # Internals.
+
+    def _submit(self, kind: Kind, rows: Sequence[RowIO]) -> MemoryOp:
         with self._lock:
-            if self._draining:
-                raise ValueError("the driver is draining")
-            for io in rows:
-                for span in (io.payload, io.trailer):
-                    if not self._registered(span):
-                        raise ValueError(f"{span} is outside every live registration")
+            self._require_accepting()
+            self._check_direction(kind)
+            self._check_not_draining()
+            self._check_row_limit(rows)
+            self._check_unique_keys(rows)
+            self._check_registered(rows)
             op = MemoryOp(kind, [_Row(io) for io in rows])
             self._ops.append(op)
         if not self.controlled:
-            # Like a blocking SDK: the call returns once every row is decided and access is over.
-            self.transfer(op)
-            self.publish_results(op)
-            self.end_access(op)
+            self._before_execute(op)
+            self._execute(op)
         return op
 
-    def _move(self, kind: str, io: RowIO) -> RowResult:
+    def _before_execute(self, op: MemoryOp) -> None:
+        """Between recording an operation and executing it; a test races a drain here."""
+
+    def _execute(self, op: MemoryOp) -> None:
+        """Automatic mode: like a blocking SDK, the call returns once every row is decided and
+        access is over. Rows a concurrent drain cancelled in between stay as they are."""
+        with self._lock:
+            taken = [row for row in op.rows if not row.started and not row.published.concluded]
+            for row in taken:
+                row.started = True
+        for row in taken:
+            result = self._move(op.kind, row.io)
+            with self._lock:
+                row.published = result
+                row.transferred = True
+        with self._lock:
+            if not op.access_ended:
+                op.access_ended = True
+                self._lock.notify_all()
+
+    def _move(self, kind: Kind, io: RowIO) -> RowResult:
+        # The operation is recorded by now: nothing may escape as an exception any more.
         try:
             return self._put_row(io) if kind == "put" else self._get_row(io)
         except StoreError as error:
             return faulted(str(error))
+        except Exception as error:
+            return faulted(f"{type(error).__name__}: {error}")
 
     def _put_row(self, io: RowIO) -> RowResult:
-        data = ctypes.string_at(io.payload.address, io.payload.nbytes)
-        data += ctypes.string_at(io.trailer.address, io.trailer.nbytes)
-        if self.store.commit(io.key, data):
+        payload = ctypes.string_at(io.payload.address, io.payload.nbytes)
+        trailer = self._trailer_for(io, payload)
+        outcome = self.store.commit(io.key, payload, trailer)
+        if outcome in (Commit.STORED, Commit.SAME):
             return READY
+        if outcome is Commit.DECLINED:
+            return DECLINED
+        if outcome is Commit.NOT_READY:
+            return NOT_READY
+        # A diagnostic this store can afford; the contract asks no driver to compare bytes.
         return faulted("key exists with different content")
 
     def _get_row(self, io: RowIO) -> RowResult:
-        data = self.store.get(io.key)
-        if data is None:
+        try:
+            stored = self.store.get(io.key)
+        except ObjectNotReady:
+            return NOT_READY
+        if stored is None:
             return MISS
-        expected = io.payload.nbytes + io.trailer.nbytes
-        if len(data) != expected:
-            return faulted(f"object is {len(data)} bytes, expected {expected}")
-        ctypes.memmove(io.payload.address, data, io.payload.nbytes)
-        ctypes.memmove(io.trailer.address, data[io.payload.nbytes :], io.trailer.nbytes)
+        if len(stored.payload) != io.payload.nbytes:
+            return faulted(f"object is {len(stored.payload)} bytes, expected {io.payload.nbytes}")
+        problem = self._verify(io, stored)
+        if problem is not None:
+            return faulted(problem)
+        ctypes.memmove(io.payload.address, stored.payload, len(stored.payload))
         return READY
+
+    def _trailer_for(self, io: RowIO, payload: bytes) -> bytes:
+        return encode_trailer(
+            io.key.encode(), io.payload.nbytes, checksum=Checksum.CRC32, payload=payload
+        )
+
+    def _verify(self, io: RowIO, stored: StoredObject) -> str | None:
+        """Why the stored object may not be delivered as ``io``, or ``None``."""
+        return check_trailer(stored.trailer, io.key.encode(), io.payload.nbytes, stored.payload)
 
     def _cancel_unstarted(self, op: MemoryOp) -> None:
         for row in op.rows:
             if not row.started and not row.published.concluded:
                 row.published = CANCELLED
+        self._settle_untouched(op)
+
+    def _settle_untouched(self, op: MemoryOp) -> None:
+        """An operation whose rows were all cancelled before any started never touched memory,
+        which is access-end evidence in itself."""
+        if not op.access_ended and all(
+            row.published.status is RowStatus.CANCELLED and not row.started for row in op.rows
+        ):
+            op.access_ended = True
+            self._lock.notify_all()
 
     def _registered(self, span: Span) -> bool:
         return any(r.live and span.within(r.span) for r in self._registrations)
 
     def _registration(self, handle: RegionHandle) -> _Registration:
+        self._require_not_closed()
         if not isinstance(handle, _Registration) or handle not in self._registrations:
             raise ValueError("handle does not belong to this driver")
         return handle
 
     def _op(self, op: OpHandle) -> MemoryOp:
+        self._require_not_closed()
         if not isinstance(op, MemoryOp) or op not in self._ops:
             raise ValueError("operation does not belong to this driver")
         return op
+
+    def _require_accepting(self) -> None:
+        if self._closed:
+            raise DriverRejected("the driver is closed")
+
+    def _require_not_closed(self) -> None:
+        if self._closed:
+            raise RuntimeError("the driver is closed")
 
     def _require_open(self, op: MemoryOp) -> None:
         if self._op(op).access_ended:

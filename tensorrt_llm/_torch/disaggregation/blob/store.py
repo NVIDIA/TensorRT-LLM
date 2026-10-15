@@ -21,13 +21,22 @@ class StoreError(Exception):
     """A store-side failure the driver could not express as a row result."""
 
 
+class DriverRejected(StoreError):
+    """Raised by a driver on purpose, before it touched the store or the caller's memory.
+
+    The only exception that certifies nothing escaped: the caller may forget the call. Any other
+    raise from ``register``, ``put`` or ``get`` may have escaped, and the caller keeps the memory
+    protected until the driver proves otherwise, at the latest through a ``drain`` returning True.
+    """
+
+
 class RegistrationError(StoreError):
-    """Registering a region failed.
+    """Registering a region failed after the store was asked.
 
     Args:
         reason: What went wrong.
         handle: The handle to ``unregister`` later when the store may have registered the region
-            anyway, or ``None`` when nothing escaped.
+            anyway, or ``None`` when the store certainly did not.
     """
 
     def __init__(self, reason: str, handle: RegionHandle | None = None) -> None:
@@ -36,23 +45,37 @@ class RegistrationError(StoreError):
 
 
 class RowStatus(enum.Enum):
-    """The logical state of one row within an operation."""
+    """The logical state of one row within an operation.
+
+    READY and FAULT are the only two that carry a verdict; MISS, NOT_READY and DECLINED say that
+    nothing moved and nothing went wrong, so the backend reports the row as not delivered without
+    a fault and they never count toward isolation.
+    """
 
     PENDING = "pending"
     """Not concluded yet."""
 
     READY = "ready"
-    """For a get: the bytes landed whole and the driver will not write the row again. For a put:
-    the object is readable whole under its key."""
+    """For a get: the payload landed whole and intact, and the driver will not write the row again.
+    For a put: a complete object is readable under the key by any reader now, whoever wrote it. A
+    store's "already exists" counts only once that object is committed."""
 
     MISS = "miss"
-    """For a get: the store holds no object under the key. Not a failure."""
+    """For a get: the store holds no object under the key."""
+
+    NOT_READY = "not_ready"
+    """The key is held by a write that has not finished: a get delivered nothing, a put published
+    nothing of its own. ``probe`` gives the same answer for such a key."""
+
+    DECLINED = "declined"
+    """For a put: the store would not take the row, for space or policy. Nothing was published;
+    the other rows of the operation go on."""
 
     CANCELLED = "cancelled"
     """Never started, because of a cancel or a drain; the row's memory was not touched."""
 
     FAULT = "fault"
-    """Anything else: timeout, size or format mismatch, transport or store error."""
+    """Anything else: timeout, size or integrity mismatch, transport or store error."""
 
 
 @dataclass(frozen=True)
@@ -74,6 +97,8 @@ class RowResult:
 PENDING = RowResult(RowStatus.PENDING)
 READY = RowResult(RowStatus.READY)
 MISS = RowResult(RowStatus.MISS)
+NOT_READY = RowResult(RowStatus.NOT_READY)
+DECLINED = RowResult(RowStatus.DECLINED)
 CANCELLED = RowResult(RowStatus.CANCELLED)
 
 
@@ -133,23 +158,21 @@ class RegionLayout:
 
 @dataclass(frozen=True)
 class RowIO:
-    """One row to move: its store key, where its payload sits and where its trailer sits.
+    """One row to move: its store key and where its payload sits.
 
-    The payload is the KV bytes of one staging slot; the trailer is the format's fixed tail, in a
-    buffer of the backend's own. The two spans never overlap. ``position`` is ``(group, row)``
-    within the submission, kept so the backend can map results back; drivers treat it as opaque.
+    The payload is the KV bytes of one staging slot in a registered region; the object a driver
+    stores is that payload, in whatever format and with whatever integrity data the driver keeps.
+    ``position`` is ``(group, row)`` within the submission, kept so the backend can map results
+    back; drivers treat it as opaque.
     """
 
     key: str
     payload: Span
-    trailer: Span
     position: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if not self.key:
             raise ValueError("a row needs a store key")
-        if self.payload.overlaps(self.trailer):
-            raise ValueError(f"payload and trailer overlap for key {self.key}")
 
 
 class RegionHandle(Protocol):
@@ -165,63 +188,92 @@ class ProbeStatus(enum.Enum):
 
     HIT = "hit"
     MISS = "miss"
+    NOT_READY = "not_ready"
     UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
 class DriverCapabilities:
-    """What a driver implements beyond the required methods.
+    """What a driver implements. Fixed for the driver's life; every field is declared.
 
     Args:
+        get: ``get`` is implemented.
+        put: ``put`` is implemented.
         cancel: ``cancel`` does something; without it the backend only suppresses unstarted work.
         probe: ``probe`` answers; without it the backend fetches blindly.
         max_rows_per_op: Rows one ``put``/``get`` accepts, or ``None`` for no limit.
     """
 
-    cancel: bool = False
-    probe: bool = False
-    max_rows_per_op: int | None = None
+    get: bool
+    put: bool
+    cancel: bool
+    probe: bool
+    max_rows_per_op: int | None
+
+    def __post_init__(self) -> None:
+        if not (self.get or self.put):
+            raise ValueError("a driver implements at least one of get and put")
+        if self.max_rows_per_op is not None and self.max_rows_per_op <= 0:
+            raise ValueError("max_rows_per_op is positive or None")
 
 
 @runtime_checkable
 class StoreDriver(Protocol):
     """What the backend asks of a store.
 
-    Threads: ``register``, ``unregister``, ``put``, ``get``, ``cancel`` and ``drain`` are called one
-    at a time from the backend's own threads; ``poll`` and ``access_ended`` may be called from any
-    thread, concurrently with the rest. A driver over a blocking SDK blocks inside ``put``/``get``;
-    the backend keeps those calls off the submission thread.
+    Threads: ``register``, ``unregister``, ``drain`` and ``close`` are called one at a time.
+    ``put``, ``get``, ``cancel`` and ``probe`` may run concurrently with each other and with those,
+    from the backend's own threads; a blocked ``put``/``get`` must not delay another. ``poll``,
+    ``access_ended`` and ``access_unprovable`` may be called from any thread. Locks inside a driver
+    guard its state only and are never held while waiting on the store.
 
-    Side effects: ``register``, ``put`` and ``get`` raise ``ValueError`` only before anything
-    escaped, so the caller may forget the call. Once ``put``/``get`` has returned, every later
-    problem is a row result, and the operation holds the rows' memory until ``access_ended`` is
-    true. A failure return is not access-end evidence.
+    Side effects: :class:`DriverRejected` is the only raise that certifies nothing escaped, and
+    ``put``/``get`` raise it only before recording the operation. Once recorded, the call returns
+    the handle and every later failure, of any kind, is a row result; the operation holds the
+    rows' memory until ``access_ended`` is true. Neither a failure result nor a successful
+    ``unregister`` is access-end evidence.
+
+    Integrity: a READY get row is the whole object, intact, under the right key; a READY put row
+    is a complete object any reader can get. How a driver assures this is its own: a store's
+    native size checks, hidden unfinished objects and checksums, or data the driver keeps beside
+    the object. A failed, declined or cancelled put never damages an existing complete object.
+
+    Queries (``poll``, ``access_ended``, ``access_unprovable``, ``cancel``) read recorded state:
+    they never block, never ask the store and never raise for a handle this driver issued. A handle
+    from elsewhere, or any call after ``close``, is a programming error and raises.
     """
 
     @property
-    def capabilities(self) -> DriverCapabilities: ...
+    def capabilities(self) -> DriverCapabilities:
+        """The same value on every call."""
+        ...
 
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> RegionHandle:
         """Register one host region the driver may read and write.
 
         Raises:
-            ValueError: Bad geometry or overlap with a live registration; nothing escaped.
+            DriverRejected: Bad geometry or overlap with a live registration; nothing escaped.
             RegistrationError: The store refused; ``handle`` is set when the store may have
                 registered the region anyway.
         """
         ...
 
     def unregister(self, handle: RegionHandle) -> None:
-        """Revoke a registration. Idempotent once it succeeded; a raise leaves the registration
-        live and the call retryable."""
+        """Revoke a registration.
+
+        Called only once every operation touching the region has ``access_ended``; otherwise
+        raises :class:`DriverRejected` and the registration stays live. Idempotent once it
+        succeeded; any other raise leaves the registration live and the call retryable.
+        """
         ...
 
     def put(self, rows: Sequence[RowIO]) -> OpHandle:
         """Publish ``rows``; may return before any byte moved.
 
         Raises:
-            ValueError: A span lies outside a live registration, or ``rows`` exceed the driver's
-                capabilities; nothing escaped.
+            DriverRejected: ``put`` is not declared, the driver is draining or closed, a key
+                appears twice in ``rows``, ``rows`` exceed ``max_rows_per_op``, or a payload lies
+                outside a live registration; nothing escaped.
         """
         ...
 
@@ -230,12 +282,26 @@ class StoreDriver(Protocol):
         ...
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
-        """One result per row, in submission order; non-blocking. A concluded row never changes."""
+        """One result per row, in submission order. A concluded row never changes."""
         ...
 
     def access_ended(self, op: OpHandle) -> bool:
         """True once the operation can no longer touch any of its rows' memory, with evidence.
-        Never turns false again. Independent of ``poll``."""
+
+        Never turns false again. Independent of ``poll``. Without evidence the answer is False:
+        a timeout, an error or a guess never turns it true.
+        """
+        ...
+
+    def access_unprovable(self, op: OpHandle) -> bool:
+        """True once the driver's own mechanisms can never prove this operation's access ended,
+        for example when the store failed before issuing anything the driver could wait on.
+
+        Never turns false again. Not permission to reuse memory: the rows stay protected until
+        evidence arrives from elsewhere, for example the store's own teardown; the backend counts
+        such operations instead of waiting for them. A driver that cannot tell always answers
+        False.
+        """
         ...
 
     def cancel(self, op: OpHandle) -> None:
@@ -244,13 +310,30 @@ class StoreDriver(Protocol):
         ...
 
     def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
-        """Advisory presence of ``keys``, within ``budget_s`` seconds; UNKNOWN when the budget runs
-        out. Called only when ``capabilities.probe`` is set. Raises on a store error rather than
-        answering MISS."""
+        """Advisory presence of ``keys``, answered within ``budget_s`` seconds.
+
+        Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within the
+        budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
+        once. A key held by an unfinished write is NOT_READY, as a get would report. Called only
+        when ``capabilities.probe`` is set. Raises on a store error rather than answering MISS.
+        """
         ...
 
     def drain(self, budget_s: float) -> bool:
         """Stop starting work and wait up to ``budget_s`` seconds for every operation to end its
-        access. True when none can still touch memory; False means keep everything registered and
-        try again. Never forces an end."""
+        access and for the driver's own background work, such as outstanding probes, to finish.
+
+        One-way: after the first call the driver rejects new ``put``/``get`` for good, whatever
+        the result. Returns False at once when an operation that cannot prove its end remains.
+        True when nothing can still touch memory and nothing is left running; False means keep
+        everything registered and try again. Never forces an end.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release the store client and every resource the driver holds.
+
+        Allowed only after ``drain`` returned True and every registration is unregistered;
+        otherwise raises :class:`DriverRejected` and changes nothing. Idempotent.
+        """
         ...
