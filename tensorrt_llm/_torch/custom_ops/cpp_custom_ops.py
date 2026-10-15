@@ -349,6 +349,11 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::glm_lowm_bf16_moe")
+    def _(x, router_logits, e_score_correction_bias, w3_w1, w2, top_k,
+          routed_scaling_factor):
+        return x.new_empty((x.shape[0], w2.shape[1]))
+
     @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_mxfp8_quant")
     def _(scores, bias, hidden_states, routed_scaling_factor):
         num_tokens = scores.shape[0]
