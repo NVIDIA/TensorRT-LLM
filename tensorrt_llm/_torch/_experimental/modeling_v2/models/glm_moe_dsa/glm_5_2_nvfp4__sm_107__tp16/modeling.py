@@ -49,12 +49,16 @@ from tensorrt_llm._torch.utils import EventType
 from . import weights as _weights
 from .ops.attention.mla_kv_half_append import mla_kv_half_append
 from .ops.attention.sparse_mla_flash_decode import sparse_mla_flash_decode
+from .ops.comm._mnnvl_workspace import hop_supported, hop_workspace, publish_target
+from .ops.comm.mnnvl_hop import mnnvl_hop
+from .ops.comm.mnnvl_moe_finalize_hop import mnnvl_moe_finalize_hop
 from .ops.embedding.fused_embedding import fused_embedding
 from .ops.gemm.dense_mlp_small_m import INTER_PER_RANK, dense_mlp_small_m
 from .ops.gemm.fused_a_gemm import MAX_TOKENS as FUSED_A_MAX_TOKENS
 from .ops.gemm.fused_a_gemm import OUT_FEATURES as FUSED_A_OUT_FEATURES
 from .ops.gemm.fused_a_gemm import fused_a_gemm
 from .ops.gemm.low_m_gemm import low_m_gemm
+from .ops.gemm.o_proj_publish import o_proj_publish
 from .ops.gemm.q_b_fp8_rope import q_b_fp8_rope
 from .ops.moe.routed_experts import (
     FUSED_ROUTER_MAX_TOKENS,
@@ -100,43 +104,40 @@ class DecodeTarget:
     Routed to only when the batch has no context rows, which the core decides
     per step; nothing in this class reads the phase back.
 
-    The step is written out layer by layer for this deployment's configuration,
-    which ``__init__`` checks once:
+    A step of up to 8 rows (one request and its 7 draft tokens at c1) runs on
+    the target's kernels, layer by layer:
 
-    - Layers 0-2 (dense, unquantized): the attention all-reduces its own output,
-      the residual add and ``post_attention_layernorm`` follow, and the MLP's
-      all-reduce carries the residual add and the next layer's input norm.
-    - Layers 3-77 (MoE): both all-reduces carry the residual add and the
-      following norm; the experts finalize before theirs (16 ranks span nodes).
-    - The last all-reduce applies the model's final norm (``next_layer_layernorm``).
+    - The embedding is one lookup in the whole BF16 table every rank holds.
+    - Attention: q_a, the compressed KV and its rope part come from one GEMM over
+      the stored kv_a_proj_with_mqa weight. q_b, with k_b absorbed and the q_a
+      norm folded, writes the RoPE'd FP8 query in its epilogue, while on the aux
+      stream one kernel normalizes, ropes and appends the KV half to the FP8
+      cache. The built-in DSA indexer selects 2048 rows, the flash decode attends
+      over them at 4 heads with v_b folded in, and o_proj's epilogue publishes
+      this rank's shard into the all-reduce workspace.
+    - Every all-reduce is a one-shot MNNVL hop that adds the residual and applies
+      the following RMSNorm: post_attention_layernorm after attention, and after
+      the MLP or MoE the next layer's input_layernorm (the model's final norm
+      after the last layer).
+    - The dense layers 0-2 run this rank's 768 intermediate columns as two
+      weight-streaming kernels.
+    - The MoE layers run the shared expert as two split-K GEMMs around SwiGLU on
+      the aux stream, and the routed experts as one trtllm-gen call that runs the
+      router GEMV in its routing kernel, joins the NVFP4 input (quantized on its
+      own stream) right before FC1, runs FC2 on the K = 128 kernel and leaves the
+      finalize step to the post-MoE hop.
 
-    Attention is MLA with the DSA indexer on the generation rows. For up to 8
-    rows: q_a, the compressed KV and its rope part come from one GEMM over the
-    stored kv_a_proj_with_mqa weight; q_b with k_b absorbed and the q_a norm
-    folded writes the RoPE'd FP8 query in its epilogue, while on the aux stream
-    one kernel normalizes, ropes and appends the KV half to the FP8 cache; the
-    built-in indexer selects the 2048 rows; and the flash decode attends over
-    them at 4 heads with v_b folded in, ahead of o_proj. A larger batch takes the
-    built-in modules' path.
-
-    The MoE block over up to 8 rows runs its shared expert as two split-K
-    GEMMs around SwiGLU on the aux stream, and its routed experts in one
-    trtllm-gen call on the main stream: the routing kernel runs the router GEMV
-    itself, the NVFP4 input quantizes on its own stream and joins right before
-    FC1, and FC2 runs on the K = 128 kernel. A larger batch takes the built-in
-    MoE module.
-
-    The embedding table is whole on every rank, so the lookup is one local
-    kernel. The dense MLP runs as two weight-streaming kernels on this rank's
-    768 intermediate columns for up to 8 rows (every c1 step: one request and
-    its 7 drafts); a larger batch takes the generic gated MLP.
+    A larger batch runs the built-in modules in the same order.
     """
 
     def __init__(self, core: "Glm52Nvfp4Sm107Tp16Core") -> None:
         self.core = core
         config = core.model_config.pretrained_config
+        self.mapping = core.model_config.mapping
         self.hidden_size = config.hidden_size
-        for layer in core.layers[: core.num_hidden_layers]:
+        self.index_topk = config.index_topk
+        layers = core.layers[: core.num_hidden_layers]
+        for layer in layers:
             mla = layer.self_attn
             assert layer.allreduce is not None and layer.next_layer_layernorm is not None
             assert not mla.apply_rotary_emb and not mla.mapping.has_cp_helix()
@@ -146,6 +147,15 @@ class DecodeTarget:
             ) and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16, (
                 f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
             )
+            assert (
+                getattr(mla.mqa, "has_fp8_kv_cache", False)
+                and mla.kv_cache_dtype != "fp8_ds_mla"
+                and mla.k_b_proj_trans.dtype == torch.bfloat16
+                and mla.v_b_proj.dtype == torch.bfloat16
+                and mla.v_b_proj.is_contiguous()
+                and mla.q_b_proj.weight.dtype == torch.bfloat16
+                and mla.o_proj.weight.dtype == torch.bfloat16
+            ), f"layer {layer.layer_idx}: unexpected MLA weights or KV cache layout"
             assert layer.input_layernorm.nvfp4_scale is None, "kv_a_proj is not NVFP4"
             if isinstance(layer.mlp, GatedMLP):
                 assert (
@@ -179,29 +189,28 @@ class DecodeTarget:
                     and not backend.bias
                     and backend.w3_w1_weight.shape[-1] * 2 == config.hidden_size
                 ), f"layer {layer.layer_idx}: routed experts are not unpadded TRTLLM-Gen NVFP4"
-        self.index_topk = config.index_topk
+
         # q_b with k_b absorbed and the q_a norm weight folded, per layer: for head h, rows
         # [h * 576, h * 576 + 512) are k_b_trans[h] @ W_q_b[h, :qk_nope] and the next 64 rows
         # W_q_b[h, qk_nope:], every column times gamma_q_a; FP64, rounded to BF16 once.
         self._q_b_absorbed = {}
-        for layer in core.layers[: core.num_hidden_layers]:
+        # What fused-A prefetches into L2 while it waits for its input: the weights of the
+        # attention GEMMs that follow it.
+        self._l2_after_fused_a = {}
+        for layer in layers:
             mla = layer.self_attn
-            assert (
-                getattr(mla.mqa, "has_fp8_kv_cache", False)
-                and mla.kv_cache_dtype != "fp8_ds_mla"
-                and mla.k_b_proj_trans.dtype == torch.bfloat16
-                and mla.v_b_proj.dtype == torch.bfloat16
-                and mla.v_b_proj.is_contiguous()
-                and mla.q_b_proj.weight.dtype == torch.bfloat16
-            ), f"layer {layer.layer_idx}: unexpected MLA weights or KV cache layout"
             qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
             w = mla.q_b_proj.weight.view(mla.num_heads_tp, qk_head_dim, mla.q_lora_rank).double()
             nope = torch.bmm(mla.k_b_proj_trans.double(), w[:, : mla.qk_nope_head_dim])
             absorbed = torch.cat([nope, w[:, mla.qk_nope_head_dim :]], 1)
             absorbed = absorbed * mla.q_a_layernorm.weight.double()
-            self._q_b_absorbed[layer.layer_idx] = (
-                absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
-            )
+            q_b = absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
+            self._q_b_absorbed[layer.layer_idx] = q_b
+            prefetch = [q_b, mla.v_b_proj, mla.o_proj.weight]
+            if mla.mqa.indexer is not None:
+                prefetch.insert(1, mla.mqa.indexer.wq_b.weight)
+            self._l2_after_fused_a[layer.layer_idx] = [t for t in prefetch if t.is_contiguous()]
+
         device = core.embed_tokens.weight.device
         # The attention scales the KV-half kernel writes and the flash decode reads.
         self._bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
@@ -209,11 +218,7 @@ class DecodeTarget:
         self._unit_scale = torch.ones(1, dtype=torch.float32, device=device)
         self._kv_pool = None
 
-        moe_layers = [
-            layer
-            for layer in core.layers[: core.num_hidden_layers]
-            if not isinstance(layer.mlp, GatedMLP)
-        ]
+        moe_layers = [layer for layer in layers if not isinstance(layer.mlp, GatedMLP)]
         # One exchange workspace per router call site: its launches must run in stream order.
         self._router_workspace = {
             layer.layer_idx: make_fused_router_workspace(device) for layer in moe_layers
@@ -226,6 +231,24 @@ class DecodeTarget:
         self._quant_stream = torch.cuda.Stream()
         self._quant_fork = torch.cuda.Event()
         self._quant_ready = torch.cuda.Event()
+        self._fast_rows = {}
+
+    def _fast(self, rows: int) -> bool:
+        """Whether every kernel of the step serves this many rows (decided once per shape)."""
+        fast = self._fast_rows.get(rows)
+        if fast is None:
+            fast = (
+                rows <= FUSED_A_MAX_TOKENS
+                and rows <= FUSED_ROUTER_MAX_TOKENS
+                and bool(
+                    torch.ops.trtllm.glm_dense_mlp_small_m_supported(
+                        rows, self.hidden_size, INTER_PER_RANK
+                    )
+                )
+                and hop_supported(rows, self.hidden_size, self.mapping.tp_size)
+            )
+            self._fast_rows[rows] = fast
+        return fast
 
     def forward(
         self,
@@ -237,106 +260,34 @@ class DecodeTarget:
         **kwargs,
     ) -> torch.Tensor:
         core = self.core
+        layers = core.layers[: core.num_hidden_layers]
         if inputs_embeds is None:
             inputs_embeds = fused_embedding(input_ids, core.embed_tokens.weight)
         residual = inputs_embeds
-        hidden_states = core.layers[0].input_layernorm(inputs_embeds)
-        rows = hidden_states.shape[0]
-        small_m = torch.ops.trtllm.glm_dense_mlp_small_m_supported(
-            rows, self.hidden_size, INTER_PER_RANK
-        )
-        fused_a = rows <= FUSED_A_MAX_TOKENS
-        for layer in core.layers[: core.num_hidden_layers]:
+        hidden_states = layers[0].input_layernorm(inputs_embeds)
+        if not self._fast(hidden_states.shape[0]):
+            for layer in layers:
+                hidden_states, residual = self._builtin_layer(
+                    layer, position_ids, hidden_states, residual, attn_metadata
+                )
+            return hidden_states
+        for layer in layers:
+            attn_out = self._attention(layer, position_ids, hidden_states, attn_metadata)
+            hidden_states, residual = self._post_attention_hop(layer, attn_out, residual)
             if isinstance(layer.mlp, GatedMLP):
-                hidden_states, residual = self._dense_layer(
-                    layer, position_ids, hidden_states, residual, attn_metadata, fused_a, small_m
+                mlp = layer.mlp
+                # This rank's partial sum; the hop adds the 16 ranks'.
+                partial = dense_mlp_small_m(
+                    hidden_states, mlp.gate_up_proj.weight, mlp.down_proj.weight
                 )
+                hidden_states, residual = self._hop(layer.next_layer_layernorm, partial, residual)
             else:
-                hidden_states, residual = self._moe_layer(
-                    layer, position_ids, hidden_states, residual, attn_metadata, fused_a
-                )
+                hidden_states, residual = self._moe(layer, hidden_states, residual)
         return hidden_states
 
-    def _experts(self, layer, hidden_states: torch.Tensor) -> torch.Tensor:
-        """The MoE block's output for up to 8 rows: shared expert plus routed experts."""
-        mlp = layer.mlp
-        backend = getattr(mlp.experts, "backend", mlp.experts)
-        rows = hidden_states.shape[0]
-
-        self._quant_fork.record()
-        with torch.cuda.stream(self._quant_stream):
-            self._quant_stream.wait_event(self._quant_fork)
-            x_fp4, x_sf = fp4_quantize(
-                hidden_states, backend.fc31_input_scale, backend.scaling_vector_size, False, False
-            )
-            self._quant_ready.record()
-        routing = extract_routing_params(backend.routing_method)
-
-        def routed() -> torch.Tensor:
-            return routed_experts(
-                self._router_logits[:rows],
-                routing.routing_bias,
-                x_fp4,
-                x_sf.flatten().view(torch.float8_e4m3fn),
-                backend.w3_w1_weight,
-                backend.w3_w1_weight_scale.view(torch.float8_e4m3fn),
-                None,
-                backend.act_alpha,
-                backend.act_beta,
-                backend.act_clamp,
-                backend.w2_weight,
-                backend.w2_weight_scale.view(torch.float8_e4m3fn),
-                None,
-                get_data_or_none(backend, "fc31_scale_c"),
-                get_data_or_none(backend, "fc31_alpha"),
-                get_data_or_none(backend, "fc2_alpha"),
-                backend.num_slots,
-                routing.top_k,
-                routing.n_group,
-                routing.topk_group,
-                backend.w3_w1_weight.shape[-2] // 2,
-                backend.slot_start,
-                backend.expert_size_per_partition,
-                routing.routed_scaling_factor,
-                backend.routing_method.routing_method_type,
-                True,
-                to_trtllm_gen_act_type(backend.activation_type),
-                None,
-                None,
-                None,
-                backend.max_num_tokens,
-                False,
-                self._quant_ready.cuda_event,
-                hidden_states,
-                mlp.gate.weight,
-                self._router_workspace[layer.layer_idx],
-                True,
-            )[0]
-
-        def shared() -> torch.Tensor:
-            expert = mlp.shared_experts
-            gate_up = expert.gate_up_proj.weight
-            h = low_m_gemm(hidden_states, gate_up, hidden_states.new_empty(rows, gate_up.shape[0]))
-            h = swiglu(h)
-            return low_m_gemm(
-                h, expert.down_proj.weight, hidden_states.new_empty(rows, hidden_states.shape[1])
-            )
-
-        routed_output, shared_output = maybe_execute_in_parallel(
-            routed,
-            shared,
-            mlp.event_dict[EventType.Main],
-            mlp.event_dict[EventType.MoeShared],
-            mlp.aux_stream,
-        )
-        return shared_output.add_(routed_output)
-
-    def _attention(self, layer, position_ids, hidden_states, attn_metadata, all_reduce_params, fused):
-        """MLA with the DSA indexer over generation rows, through o_proj."""
-        if not fused:
-            return self._attention_builtin(
-                layer, position_ids, hidden_states, attn_metadata, all_reduce_params
-            )
+    def _attention(self, layer, position_ids, hidden_states, attn_metadata) -> torch.Tensor:
+        """MLA with the DSA indexer over the generation rows: the attention output ahead of
+        o_proj, [rows, heads * v_head_dim]."""
         mla = layer.self_attn
         mqa = mla.mqa
         manager = attn_metadata.kv_cache_manager
@@ -349,9 +300,15 @@ class DecodeTarget:
         if self._kv_pool is None:
             self._kv_pool = manager.get_unique_primary_pool()
 
-        kv_a = fused_a_gemm(hidden_states, mla.kv_a_proj_with_mqa.weight, [])[:num_tokens]
+        kv_a = fused_a_gemm(
+            hidden_states,
+            mla.kv_a_proj_with_mqa.weight,
+            self._l2_after_fused_a[layer.layer_idx],
+        )[:num_tokens]
         q_a = kv_a[:, : mla.q_lora_rank]
-        quant_q = hidden_states.new_empty((num_tokens, mla.num_heads_tp * head_dim), dtype=torch.uint8)
+        quant_q = hidden_states.new_empty(
+            (num_tokens, mla.num_heads_tp * head_dim), dtype=torch.uint8
+        )
 
         def q_half():
             q_b_fp8_rope(
@@ -401,7 +358,9 @@ class DecodeTarget:
                     qr, hidden_states[:num_tokens], position_ids[..., :num_tokens]
                 )
             ]
-            indexer._update_k_cache(indexer_intermediates[1], indexer_intermediates[2], attn_metadata)
+            indexer._update_k_cache(
+                indexer_intermediates[1], indexer_intermediates[2], attn_metadata
+            )
         indices, _ = mqa.sparse_attn_predict(
             hidden_states[:num_tokens],
             None,
@@ -430,7 +389,167 @@ class DecodeTarget:
         )
         if indexer is not None:
             indexer.maybe_join_prev_topk_copy()
-        return mla.o_proj(output, all_reduce_params=all_reduce_params, layer_idx=mla.layer_idx)
+        return output
+
+    def _post_attention_hop(self, layer, attn_out: torch.Tensor, residual: torch.Tensor):
+        """o_proj published into the all-reduce workspace, then the hop with the residual add
+        and post_attention_layernorm: (normed, residual)."""
+        rows = attn_out.shape[0]
+        lamport, flags = publish_target(self.mapping, rows, self.hidden_size)
+        comm_buffer, buffer_flags = hop_workspace(self.mapping, rows, self.hidden_size)
+        shard = attn_out.new_empty((rows, self.hidden_size))
+        o_proj_publish(
+            attn_out,
+            layer.self_attn.o_proj.weight,
+            shard,
+            lamport,
+            flags,
+            self.mapping.tp_size,
+            self.mapping.tp_rank,
+        )
+        norm = layer.post_attention_layernorm
+        return mnnvl_hop(
+            shard, residual, norm.weight, norm.variance_epsilon, comm_buffer, buffer_flags, True
+        )
+
+    def _hop(self, norm, partial: torch.Tensor, residual: torch.Tensor):
+        """The hop of a rank-partial sum with the residual add and `norm`: (normed, residual)."""
+        comm_buffer, buffer_flags = hop_workspace(self.mapping, partial.shape[0], self.hidden_size)
+        return mnnvl_hop(
+            partial, residual, norm.weight, norm.variance_epsilon, comm_buffer, buffer_flags, False
+        )
+
+    def _moe(self, layer, hidden_states: torch.Tensor, residual: torch.Tensor):
+        """The MoE block and the post-MoE hop that finalizes it: (normed, residual)."""
+        mlp = layer.mlp
+        backend = getattr(mlp.experts, "backend", mlp.experts)
+        rows = hidden_states.shape[0]
+
+        self._quant_fork.record()
+        with torch.cuda.stream(self._quant_stream):
+            self._quant_stream.wait_event(self._quant_fork)
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states, backend.fc31_input_scale, backend.scaling_vector_size, False, False
+            )
+            self._quant_ready.record()
+        routing = extract_routing_params(backend.routing_method)
+
+        def routed():
+            # Unfinalized: [FC2 rows, expert weights, expanded index -> FC2 row].
+            return routed_experts(
+                self._router_logits[:rows],
+                routing.routing_bias,
+                x_fp4,
+                x_sf.flatten().view(torch.float8_e4m3fn),
+                backend.w3_w1_weight,
+                backend.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                None,
+                backend.act_alpha,
+                backend.act_beta,
+                backend.act_clamp,
+                backend.w2_weight,
+                backend.w2_weight_scale.view(torch.float8_e4m3fn),
+                None,
+                get_data_or_none(backend, "fc31_scale_c"),
+                get_data_or_none(backend, "fc31_alpha"),
+                get_data_or_none(backend, "fc2_alpha"),
+                backend.num_slots,
+                routing.top_k,
+                routing.n_group,
+                routing.topk_group,
+                backend.w3_w1_weight.shape[-2] // 2,
+                backend.slot_start,
+                backend.expert_size_per_partition,
+                routing.routed_scaling_factor,
+                backend.routing_method.routing_method_type,
+                False,
+                to_trtllm_gen_act_type(backend.activation_type),
+                None,
+                None,
+                None,
+                backend.max_num_tokens,
+                False,
+                self._quant_ready.cuda_event,
+                hidden_states,
+                mlp.gate.weight,
+                self._router_workspace[layer.layer_idx],
+                True,
+            )
+
+        def shared() -> torch.Tensor:
+            expert = mlp.shared_experts
+            gate_up = expert.gate_up_proj.weight
+            h = low_m_gemm(hidden_states, gate_up, hidden_states.new_empty(rows, gate_up.shape[0]))
+            h = swiglu(h)
+            return low_m_gemm(
+                h, expert.down_proj.weight, hidden_states.new_empty(rows, self.hidden_size)
+            )
+
+        (fc2_output, expert_weights, permuted_rows), shared_output = maybe_execute_in_parallel(
+            routed,
+            shared,
+            mlp.event_dict[EventType.Main],
+            mlp.event_dict[EventType.MoeShared],
+            mlp.aux_stream,
+        )
+        norm = layer.next_layer_layernorm
+        comm_buffer, buffer_flags = hop_workspace(self.mapping, rows, self.hidden_size)
+        return mnnvl_moe_finalize_hop(
+            fc2_output,
+            expert_weights,
+            permuted_rows,
+            shared_output,
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            comm_buffer,
+            buffer_flags,
+        )
+
+    @staticmethod
+    def _builtin_layer(layer, position_ids, hidden_states, residual, attn_metadata):
+        """One decoder layer on the built-in modules, for a batch the kernels do not serve."""
+        dense = isinstance(layer.mlp, GatedMLP)
+        hidden_states = DecodeTarget._attention_builtin(
+            layer,
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            AllReduceParams(enable_allreduce=dense),
+        )
+        if dense:
+            hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+            hidden_states = layer.mlp(
+                hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+            )
+        else:
+            hidden_states, residual = layer.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=layer.post_attention_layernorm.weight,
+                    eps=layer.post_attention_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+            hidden_states = layer.mlp(
+                hidden_states,
+                None,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=False),
+                do_finalize=True,
+            )
+        return layer.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=layer.next_layer_layernorm.weight,
+                eps=layer.next_layer_layernorm.variance_epsilon,
+                trigger_completion_at_end=dense,
+            ),
+        )
 
     @staticmethod
     def _attention_builtin(layer, position_ids, hidden_states, attn_metadata, all_reduce_params):
@@ -473,77 +592,6 @@ class DecodeTarget:
         if indexer is not None:
             indexer.maybe_join_prev_topk_copy()
         return mla.o_proj(output, all_reduce_params=all_reduce_params, layer_idx=mla.layer_idx)
-
-    def _dense_layer(
-        self, layer, position_ids, hidden_states, residual, attn_metadata, fused_a, small_m
-    ):
-        hidden_states = self._attention(
-            layer,
-            position_ids,
-            hidden_states,
-            attn_metadata,
-            AllReduceParams(enable_allreduce=True),
-            fused_a,
-        )
-        hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
-        if small_m:
-            # The rank partial; the all-reduce below sums it over the 16 ranks.
-            hidden_states = dense_mlp_small_m(
-                hidden_states, layer.mlp.gate_up_proj.weight, layer.mlp.down_proj.weight
-            )
-        else:
-            hidden_states = layer.mlp(
-                hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
-            )
-        return layer.allreduce(
-            hidden_states,
-            all_reduce_params=AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                residual=residual,
-                norm_weight=layer.next_layer_layernorm.weight,
-                eps=layer.next_layer_layernorm.variance_epsilon,
-            ),
-        )
-
-    def _moe_layer(self, layer, position_ids, hidden_states, residual, attn_metadata, fused_a):
-        hidden_states = self._attention(
-            layer,
-            position_ids,
-            hidden_states,
-            attn_metadata,
-            AllReduceParams(enable_allreduce=False),
-            fused_a,
-        )
-        hidden_states, residual = layer.allreduce(
-            hidden_states,
-            all_reduce_params=AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                residual=residual,
-                norm_weight=layer.post_attention_layernorm.weight,
-                eps=layer.post_attention_layernorm.variance_epsilon,
-                trigger_completion_at_end=False,
-            ),
-        )
-        if hidden_states.shape[0] <= FUSED_ROUTER_MAX_TOKENS:
-            hidden_states = self._experts(layer, hidden_states)
-        else:
-            hidden_states = layer.mlp(
-                hidden_states,
-                None,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                final_all_reduce_params=AllReduceParams(enable_allreduce=False),
-                do_finalize=True,
-            )
-        return layer.allreduce(
-            hidden_states,
-            all_reduce_params=AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                residual=residual,
-                norm_weight=layer.next_layer_layernorm.weight,
-                eps=layer.next_layer_layernorm.variance_epsilon,
-                trigger_completion_at_end=False,
-            ),
-        )
 
 
 class Glm52Nvfp4Sm107Tp16Core(DeepseekV3Model):
