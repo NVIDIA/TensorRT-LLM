@@ -225,6 +225,24 @@ def test_multi_reference_variant_warms_and_records_each_reference_shape() -> Non
     assert pipeline.request_warmup_cache_key(req) in warmed
 
 
+def test_reference_variant_smaller_than_alignment_is_skipped() -> None:
+    """A reference side below vae_scale_factor * 2 would warm an empty tensor."""
+    pipeline = _make_warmup_stub()
+
+    # The stub aligns each side to a multiple of 16.
+    assert not pipeline.validate_reference_variant(ReferenceWarmupVariant(images=[(1, 1)]))
+    assert not pipeline.validate_reference_variant(
+        ReferenceWarmupVariant(images=[(1024, 1024), (15, 100)])
+    )
+    assert pipeline.validate_reference_variant(ReferenceWarmupVariant(images=[(16, 16)]))
+
+    configured = _make_warmup_stub(
+        reference_variants_for_warmup=[ReferenceWarmupVariant(images=[(1, 1)])]
+    )
+    assert configured.resolve_warmup_reference_variants(1024, 1024, 1) == []
+    assert configured.warmup_cache_keys([(1024, 1024, 1)]) == {(1024, 1024)}
+
+
 def test_empty_reference_variants_disables_reference_warmup() -> None:
     pipeline = _make_warmup_stub(reference_variants_for_warmup=[])
 

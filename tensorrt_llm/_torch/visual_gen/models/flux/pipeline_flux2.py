@@ -263,6 +263,20 @@ class Flux2Pipeline(BasePipeline):
             )
         return tuple(shapes)
 
+    def validate_reference_variant(self, variant: ReferenceWarmupVariant) -> bool:
+        if not super().validate_reference_variant(variant):
+            return False
+        # Each side is floored to a multiple of vae_scale_factor * 2; a reference
+        # smaller than that would warm an empty tensor and fail startup.
+        if any(0 in shape for shape in self._processed_reference_shapes(variant.images)):
+            logger.warning(
+                f"Skipping reference warmup variant: FLUX.2 aligns each reference "
+                f"side down to a multiple of {self.vae_scale_factor * 2}, so "
+                f"{variant.images} would produce an empty reference."
+            )
+            return False
+        return True
+
     def reference_warmup_cache_key(
         self,
         height: int,

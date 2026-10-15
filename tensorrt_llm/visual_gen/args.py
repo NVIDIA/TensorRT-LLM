@@ -20,6 +20,7 @@ cross-cutting sub-configs it composes. All fields carry
 subject to breaking changes.
 """
 
+import math
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -648,8 +649,8 @@ class ReferenceVideoSpec(StrictBaseModel):
             raise ValueError(
                 f"video num_frames must be in (0, {_MAX_REFERENCE_FRAMES}], got {self.num_frames}."
             )
-        if self.fps is not None and self.fps <= 0:
-            raise ValueError(f"video fps must be positive, got {self.fps}.")
+        if self.fps is not None and not (math.isfinite(self.fps) and self.fps > 0):
+            raise ValueError(f"video fps must be finite and positive, got {self.fps}.")
         if self.audio_seconds is not None and not (
             0 < self.audio_seconds <= _MAX_REFERENCE_AUDIO_SECONDS
         ):

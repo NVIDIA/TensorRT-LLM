@@ -57,8 +57,9 @@ class TestCompilationConfig:
         """Non-positive or absurd reference sizes are rejected at config time."""
         with pytest.raises(ValidationError):
             ReferenceVideoSpec(size=(0, 64), num_frames=8)
-        with pytest.raises(ValidationError):
-            ReferenceVideoSpec(size=(64, 64), num_frames=8, fps=0)
+        for fps in (0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValidationError):
+                ReferenceVideoSpec(size=(64, 64), num_frames=8, fps=fps)
         with pytest.raises(ValidationError):
             ReferenceVideoSpec(size=(64, 64), num_frames=10**9)
         with pytest.raises(ValidationError):
