@@ -607,6 +607,28 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
         CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner
 
     runner = CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner()
+    # The batch metadata stays out of the cache key: a different number of
+    # sequences with the same M reuses the tuned tactic.
+    other_batch_inputs = [
+        a_fp8,
+        b_fp8,
+        a_sf,
+        b_sf,
+        cos_sin_cache,
+        torch.tensor([0, m], dtype=torch.int32, device="cuda"),
+        torch.tensor([m], dtype=torch.int32, device="cuda"),
+        position_ids,
+        quant_scale_qkv,
+    ]
+    for inputs in (other_batch_inputs, [
+            a_fp8, b_fp8, a_sf, b_sf, cos_sin_cache, cu_q_seqlens,
+            kv_cache_lengths, position_ids, quant_scale_qkv
+    ]):
+        is_cache_hit, *_ = tuner.profiling_cache.search_cache(
+            custom_op, [runner], tuple(tuner._get_input_sizes(inputs)),
+            runner.tuning_config)
+        assert is_cache_hit
+
     profile_inputs = [
         a_fp8.new_empty((8192, k)),
         b_fp8,

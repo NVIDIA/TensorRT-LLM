@@ -14758,7 +14758,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS = (32, 128, 192, 256)
         _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET = 16384
+        _DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX = 5
+        _DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX = 6
         _DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX = 7
+        # Positions come from position_ids, so the batch metadata is only
+        # staged into shared memory and does not steer tactic choice. Tune
+        # with one sequence and keep the batch size out of the cache key.
+        _DSV4_QB_FUSION_TUNING_BATCH_SIZE = 1
 
         def _gen_dsv4_qb_fusion_tuning_buckets(
                 max_num_tokens: int) -> Tuple[int, ...]:
@@ -14778,10 +14784,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def _prepare_dsv4_qb_fusion_tuning_inputs(
                 inputs: List[torch.Tensor]) -> List[torch.Tensor]:
             # Resized integer tensors are otherwise filled with arbitrary
-            # values. Keep every tuning row inside the RoPE cache.
+            # values. Keep every tuning row inside the RoPE cache, and give
+            # the single tuning sequence all M rows.
             position_ids = inputs[_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX]
             inputs[_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX] = torch.zeros_like(
                 position_ids)
+            num_tokens = inputs[0].shape[0]
+            cu_q_seqlens = inputs[_DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX]
+            inputs[_DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX] = torch.tensor(
+                [0, num_tokens],
+                dtype=cu_q_seqlens.dtype,
+                device=cu_q_seqlens.device)
+            kv_cache_lengths = inputs[
+                _DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX]
+            inputs[_DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX] = torch.full(
+                (_DSV4_QB_FUSION_TUNING_BATCH_SIZE, ),
+                num_tokens,
+                dtype=kv_cache_lengths.dtype,
+                device=kv_cache_lengths.device)
             return inputs
 
         class CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner(TunableRunner):
@@ -14796,7 +14816,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ), ),
                 constraint_specs=(
                     ConstraintSpec(2, 0, mxfp8_scale_infer_shape),
-                    ConstraintSpec(7, 0, infer_output_m_shape),
+                    ConstraintSpec(
+                        _DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX, 0,
+                        lambda _: _DSV4_QB_FUSION_TUNING_BATCH_SIZE + 1),
+                    ConstraintSpec(_DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX,
+                                   0,
+                                   lambda _: _DSV4_QB_FUSION_TUNING_BATCH_SIZE),
+                    ConstraintSpec(_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX, 0,
+                                   infer_output_m_shape),
                 ),
                 inputs_pre_hook=_prepare_dsv4_qb_fusion_tuning_inputs,
                 # Do not let the generic tuner append the actual warmup M:
