@@ -318,7 +318,7 @@ class TestWanAsyncUlysses:
 
 
 def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output() -> None:
-    from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+    from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 
     class _CaptureAsyncAttention(torch.nn.Module):
         def forward_async(

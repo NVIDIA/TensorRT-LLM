@@ -42,10 +42,12 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.visual_gen.attention_backend import RingAttention, UlyssesAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends import RingAttention, UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 
 _flash_attn4_available = _fa4_fwd is not None
 

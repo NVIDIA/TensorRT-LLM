@@ -11,6 +11,7 @@ each case maps to a real workload. The orthogonal dimensions are bounded:
 
 * default cross on every cacheable config: phase {ctx, gen, mix} x
   precision {bf16, fp8-KV} x KV-manager {v1, v2}, at page_size=32, layout=HND.
+  T5/BART encoder-decoder cross-attention uses V2 only.
 * the non-default dimension values (page_size=64, layout=NHD, dtype=fp16) are
   exercised on a small representative set (GQA / MHA / MQA) to avoid a full
   cross blow-up -- page/manager/layout are mostly head-config-independent. For
@@ -168,6 +169,8 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
         for layout in kv_layouts:
             for page in page_sizes:
                 for v2 in (False, True):
+                    if cfg.is_cross and cfg.id != "mllama_gqa_cross" and not v2:
+                        continue
                     tag = f"{_prec_tag(dtype, kvd)}-{layout}-p{page}-{'v2' if v2 else 'v1'}"
                     base = dict(
                         page_size=page,
