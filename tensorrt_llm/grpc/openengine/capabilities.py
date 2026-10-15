@@ -7,16 +7,14 @@ Control advertises from this table and Generate enforces it, so a client can
 never discover a capability that Generate then rejects.
 """
 
-from typing import Any
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Collection, Mapping
 
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
 )
-
-# OpenEngine support is intentionally narrower than the LLM API today. Add a
-# modality here only once request mapping and conformance coverage exist for it.
-_OPENENGINE_MEDIA_MODALITIES = ("image",)
 
 # Guides each grammar backend can build, keyed by the `GuidedDecoding` oneof
 # field name. Control advertises from this table and Generate enforces it, so
@@ -27,6 +25,27 @@ GUIDE_SUPPORT_BY_BACKEND: dict[str, frozenset[str]] = {
     ),
     "llguidance": frozenset({"json_schema", "regex", "ebnf_grammar", "json_object"}),
 }
+
+
+@dataclass(frozen=True)
+class MediaCapabilities:
+    """Immutable media capability snapshot shared by Control and Generate."""
+
+    placeholder_templates: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "placeholder_templates", MappingProxyType(dict(self.placeholder_templates))
+        )
+
+    @property
+    def modalities(self) -> frozenset[str]:
+        """Modalities the loaded model and request mapper both support."""
+        return frozenset(self.placeholder_templates)
+
+    def placeholder(self, modality: str, item_number: int) -> str:
+        """Format the model placeholder for a one-based media item."""
+        return self.placeholder_templates[modality].format(item_number)
 
 
 def supported_guides(backend: str | None) -> frozenset[str]:
@@ -60,36 +79,47 @@ def _loaded_model_type(llm: Any) -> str:
     return model_type if isinstance(model_type, str) else ""
 
 
-def supported_media_modalities(llm: Any) -> frozenset[str]:
-    """OpenEngine media modalities supported by the loaded model.
+def resolve_media_capabilities(
+    llm: Any, implemented_modalities: Collection[str]
+) -> MediaCapabilities:
+    """Resolve media support implemented by both the mapper and loaded model.
 
     A registry entry alone describes what this TensorRT-LLM build knows about;
     it does not prove that the loaded engine instantiated a multimodal input
     processor. Requiring both prevents a text-only model from advertising
-    media merely because another image model is registered in the process.
+    media merely because another image model is registered in the process. The
+    request mapper supplies ``implemented_modalities`` from its handler table,
+    so discovery cannot advertise a modality without a request implementation.
     """
     input_processor = getattr(llm, "input_processor", None)
     if not isinstance(input_processor, BaseMultimodalInputProcessor):
-        return frozenset()
+        return MediaCapabilities({})
     model_type = _loaded_model_type(llm)
     if not model_type:
-        return frozenset()
-    return frozenset(
-        modality
-        for modality in _OPENENGINE_MEDIA_MODALITIES
+        return MediaCapabilities({})
+
+    placeholders = {
+        modality: MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(model_type, modality)
+        for modality in implemented_modalities
         if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality)
-    )
-
-
-def media_placeholder(llm: Any, modality: str, item_number: int) -> str:
-    """Return the model-specific placeholder for a one-based media item."""
-    model_type = _loaded_model_type(llm)
-    return MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(model_type, modality).format(item_number)
+    }
+    # Validate templates once at startup. A malformed registry entry is a
+    # server configuration failure, not a client request error discovered only
+    # after Control has advertised the modality.
+    for modality, template in placeholders.items():
+        try:
+            template.format(1)
+        except (IndexError, KeyError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid multimodal placeholder for model type '{model_type}' "
+                f"and modality '{modality}': {error}"
+            ) from error
+    return MediaCapabilities(placeholders)
 
 
 __all__ = [
     "GUIDE_SUPPORT_BY_BACKEND",
-    "media_placeholder",
+    "MediaCapabilities",
+    "resolve_media_capabilities",
     "supported_guides",
-    "supported_media_modalities",
 ]

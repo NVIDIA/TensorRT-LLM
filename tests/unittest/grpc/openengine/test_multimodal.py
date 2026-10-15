@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 
 grpc = pytest.importorskip(
@@ -17,9 +18,9 @@ from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.request_mapping as request_mapping  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
-from tensorrt_llm.grpc.openengine.capabilities import supported_media_modalities  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
+from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
 from tensorrt_llm.inputs.registry import (  # noqa: E402
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
@@ -160,14 +161,73 @@ def image_llm(monkeypatch):
 def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
     llm, seen_model_types = image_llm
 
-    assert supported_media_modalities(llm) == {"image"}
+    assert request_mapping.media_capabilities_for_model(llm).modalities == {"image"}
     assert seen_model_types == [_ImageConfig.model_type]
     assert (
-        supported_media_modalities(
+        request_mapping.media_capabilities_for_model(
             SimpleNamespace(_hf_model_config=llm._hf_model_config, input_processor=object())
-        )
+        ).modalities
         == set()
     )
+
+
+def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, monkeypatch):
+    llm, _ = image_llm
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: "<image_{missing}>",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid multimodal placeholder"):
+        request_mapping.media_capabilities_for_model(llm)
+
+
+@pytest.mark.asyncio
+async def test_handler_table_drives_capability_and_mapping(image_llm, monkeypatch):
+    llm, _ = image_llm
+
+    def video_loader_factory(_llm):
+        async def load(item, index):
+            return f"video-{index}:{bytes(item.raw_bytes).decode()}"
+
+        return load
+
+    monkeypatch.setitem(
+        request_mapping._MEDIA_HANDLERS,
+        generation_pb2.MODALITY_VIDEO,
+        request_mapping._MediaHandler("video", video_loader_factory, lambda decoded: len(decoded)),
+    )
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "is_valid",
+        lambda model_type, modality: model_type == _ImageConfig.model_type
+        and modality in {"image", "video"},
+    )
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: f"<{modality}_{{}}>",
+    )
+
+    capabilities = request_mapping.media_capabilities_for_model(llm)
+    assert capabilities.modalities == {"image", "video"}
+
+    request = generation_pb2.GenerateRequest(
+        prompt="video",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                raw_bytes=b"clip",
+            )
+        ],
+    )
+    mapped = await request_mapping._input_from_request(request, llm, capabilities)
+
+    assert mapped["multi_modal_data"] == {"video": ["video-0:clip"]}
+    assert mapped["mm_item_order"] == [
+        {"modality": "video", "index": 0, "placeholder": "<video_1>"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -338,7 +398,9 @@ async def test_image_count_is_bounded_before_decoding(image_llm, monkeypatch):
         prompt="too many images",
         media=[
             generation_pb2.MediaItem(
-                modality=generation_pb2.MODALITY_IMAGE,
+                # Unsupported on purpose: the count guard must win before the
+                # per-item modality loop.
+                modality=generation_pb2.MODALITY_VIDEO,
                 raw_bytes=b"image",
             )
             for _ in range(request_mapping._MAX_MEDIA_ITEMS + 1)
@@ -346,6 +408,35 @@ async def test_image_count_is_bounded_before_decoding(image_llm, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="at most 64 media items"):
+        await request_mapping._input_from_request(request, llm)
+
+
+@pytest.mark.asyncio
+async def test_total_decoded_image_bytes_are_bounded(image_llm, monkeypatch):
+    llm, _ = image_llm
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.zeros((2, 2, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(request_mapping, "_MAX_TOTAL_DECODED_MEDIA_BYTES", 20)
+    request = generation_pb2.GenerateRequest(
+        prompt="images",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+            for _ in range(2)
+        ],
+    )
+
+    with pytest.raises(ValueError, match="decoded media exceeds"):
         await request_mapping._input_from_request(request, llm)
 
 
@@ -458,6 +549,43 @@ async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
         async for _ in servicer.Generate(file_request, malformed_context):
             pass
     assert malformed_context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.asyncio
+async def test_generate_maps_transient_media_fetch_to_unavailable(image_llm, monkeypatch):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load(self, source):
+            raise MediaFetchError("connection timed out")
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    context = FakeServicerContext()
+    request = generation_pb2.GenerateRequest(
+        request_id="remote-image",
+        model="image-model",
+        prompt="image",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                url="https://example.com/image.png",
+            )
+        ],
+    )
+
+    with pytest.raises(AbortError):
+        async for _ in servicer.Generate(request, context):
+            pass
+    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
 
 
 @pytest.mark.asyncio
