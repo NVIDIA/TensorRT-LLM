@@ -54,6 +54,7 @@ MODELING_V2_ROUTERS = {
     # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
     # config loader's composite branch writes the same name back.
     "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
+    "GlmMoeDsaForCausalLM": "models.glm_moe_dsa.routing",
 }
 
 
