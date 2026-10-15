@@ -330,7 +330,7 @@ class KVCacheLayerSpec:
             expected_scale_roles = {Role.KEY_BLOCK_SCALE}
             if Role.VALUE in self.buffer_roles:
                 expected_scale_roles.add(Role.VALUE_BLOCK_SCALE)
-            if not expected_scale_roles.issubset(self.buffer_roles):
+            if scale_roles.intersection(self.buffer_roles) != expected_scale_roles:
                 raise ValueError(
                     f"NVFP4 layer {self.global_layer_id} must contain matching block-scale roles"
                 )
@@ -3209,6 +3209,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
         if self.layer_specs is not None:
+            scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
             layer_configs = [
                 AttentionLayerConfig(
                     layer_id=LayerId(local_layer_id),
@@ -3216,8 +3217,14 @@ class KVCacheManagerV2(BaseResourceManager):
                         BufferConfig(
                             role=role,
                             size=layer.bytes_per_token(role) * tokens_per_block,
+                            # Keep NVFP4 data (1), its scales (2), and other data (0)
+                            # separate while preserving matching K/V page order.
+                            coalescing_group=(
+                                1 + int(role in scale_roles) if layer.dtype == DataType.NVFP4 else 0
+                            ),
                         )
-                        for role in layer.buffer_roles
+                        for role in (Role.KEY, Role.VALUE, *scale_roles)
+                        if role in layer.buffer_roles
                     ],
                     sliding_window_size=self.max_attention_window_vec[local_layer_id],
                     num_sink_tokens=layer.num_sink_tokens,

@@ -746,6 +746,73 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
         manager.shutdown()
 
 
+def test_nvfp4_scale_indices_with_mixed_bf16_storage() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    nvfp4 = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.NVFP4,
+        num_kv_heads=4,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+    )
+    bf16 = replace(
+        nvfp4,
+        global_layer_id=1,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.NVFP4,
+        layer_specs=[nvfp4, bf16],
+    )
+    try:
+        assert manager.num_pools == 1
+        (group,) = manager.impl.pool_group_descs
+        assert len(group.pools) == 3
+        assert group.num_slots > 1
+        slots = [1, int(group.num_slots) - 1]
+        for offset, (data_role, scale_role) in enumerate(
+            ((Role.KEY, Role.KEY_BLOCK_SCALE), (Role.VALUE, Role.VALUE_BLOCK_SCALE))
+        ):
+            data_converter = manager.impl.get_page_index_converter(0, data_role)
+            scale_converter = manager.impl.get_page_index_converter(0, scale_role)
+            pages = data_converter(slots, PageIndexMode.PER_LAYER)
+            assert pages == [2 * slot + offset for slot in slots]
+            assert scale_converter(slots, PageIndexMode.PER_LAYER) == pages
+
+            scale_base = manager.impl.get_mem_pool_base_address(
+                0, scale_role, PageIndexMode.PER_LAYER
+            )
+            scale_pool = next(pool for pool in group.pools if pool.base_address == scale_base)
+            page_bytes = manager.impl.get_page_stride(0, scale_role)
+            # Attention reuses data indices for scales, including at the final slot.
+            for slot, page in zip(slots, pages):
+                address = scale_base + page * page_bytes
+                assert address == scale_base + slot * scale_pool.slot_bytes + offset * page_bytes
+                assert address + page_bytes <= scale_base + group.num_slots * scale_pool.slot_bytes
+    finally:
+        manager.shutdown()
+
+
 def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.pp_layers = [3, 4, 5]
