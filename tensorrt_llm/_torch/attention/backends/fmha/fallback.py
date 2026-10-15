@@ -750,12 +750,16 @@ class FallbackFmha(PhasedFmha):
         ops. Direct callers supply the flat attention arguments and workspace.
         """
         arguments = locals().copy()
-        del host_request_types, update_kv_cache
+        del host_request_types
 
         if workspace is None:
             raise RuntimeError("FallbackFmha.attention requires workspace.")
         if output is None:
             raise RuntimeError("FallbackFmha.attention requires output.")
+        if not update_kv_cache and not is_cross:
+            raise RuntimeError(
+                "KV cache update cannot be disabled now (except for cross attention)."
+            )
 
         num_tokens = q.size(0)
         if attention_input_type is None:

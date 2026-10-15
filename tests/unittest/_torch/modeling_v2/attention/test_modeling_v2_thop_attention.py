@@ -2400,8 +2400,10 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        the decoy changes the output, while the page holding only this call's
        own new tokens is invisible (the append lands wherever the offsets
        point and is read straight back from there).
-    3. use_paged_context_fmha=False on a context call with a cached prefix is
-       silently wrong — no exception, an answer far off the reference.
+    3. The packed path sees only the new tokens, so omitting the cached
+       prefix gives an answer far off the reference. Its KV lengths must
+       match the supplied packed rows; including the prefix would read
+       beyond the QKV buffer.
     4. context_lengths on a context row must be this call's new-token count;
        0 is far off. A larger value is not probed: the context FMHA then
        writes past the output buffer, which holds this call's new tokens
@@ -2475,7 +2477,7 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
     env.check_cache(0)
     env.check_unwritten_pool_zero()
 
-    # (3) the flag itself, and (4) the context length
+    # (3) packed attention without the prefix, and (4) the context length
     penv, pq = prepared()
     assert _bitwise_equal(pq, qkv), "the prepared state is not reproducible"
     _assert_far_outside(
@@ -2486,11 +2488,12 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
             [0],
             MASK_CAUSAL,
             record=False,
+            seq_lens_override=[new],
             ctx_lens_override=[new],
             use_paged_context_fmha=False,
         ),
         base,
-        "cached-prefix context at use_paged_context_fmha=False",
+        "packed context without the cached prefix",
     )
     cenv, cq = prepared()
     _assert_far_outside(
