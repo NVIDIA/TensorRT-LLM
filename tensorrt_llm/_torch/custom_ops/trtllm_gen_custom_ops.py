@@ -500,6 +500,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
         tactic: List[int] = [-1, -1],
         output: Optional[torch.Tensor] = None,
         hidden_states_ready_event: Optional[int] = None,
+        router_hidden_states: Optional[torch.Tensor] = None,
+        router_weight: Optional[torch.Tensor] = None,
+        router_workspace: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -518,7 +521,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
             self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
-            hidden_states_ready_event)
+            hidden_states_ready_event, router_hidden_states, router_weight,
+            router_workspace)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -682,11 +686,24 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                output: Optional[torch.Tensor] = None,
                                tune_max_num_tokens: int = 8192,
                                use_dp: bool = False,
-                               hidden_states_ready_event: Optional[int] = None
+                               hidden_states_ready_event: Optional[int] = None,
+                               router_hidden_states: Optional[
+                                   torch.Tensor] = None,
+                               router_weight: Optional[torch.Tensor] = None,
+                               router_workspace: Optional[torch.Tensor] = None
                                ) -> List[torch.Tensor]:
     """hidden_states_ready_event: raw cudaEvent_t (torch.cuda.Event.cuda_event)
     recorded on another stream once hidden_states and hidden_states_scale are
-    written; the op waits on it right before FC1, after launching routing."""
+    written; the op waits on it right before FC1, after launching routing.
+
+    router_hidden_states, router_weight, router_workspace: the router GEMV runs
+    in the routing kernel (DeepSeekV3 routing without groups, 256 experts,
+    top-8, hidden 6144, 1-8 tokens): the logits of
+    dsv3_router_gemm_op(router_hidden_states, router_weight.t()) are computed
+    there and routing_logits only gives their shape (it is not read or
+    written). router_workspace: int32 [FUSED_ROUTER_WORKSPACE_WORDS], see
+    make_fused_router_workspace; the kernel uses and restores it. Profiling
+    runs of the autotuner route from routing_logits as usual."""
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -763,7 +780,10 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         input_tensors,
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
         output=output,
-        hidden_states_ready_event=hidden_states_ready_event)
+        hidden_states_ready_event=hidden_states_ready_event,
+        router_hidden_states=router_hidden_states,
+        router_weight=router_weight,
+        router_workspace=router_workspace)
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -771,6 +791,24 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     if output is not None and do_finalize:
         return [torch.empty(0, device=output.device, dtype=output.dtype)]
     return result
+
+
+# routingCustom::FusedRouterWorkspaceWords: two exchange buffers of
+# [8 tokens][256 experts][4 slices] fp32, then the epoch word, padded to 16 B.
+FUSED_ROUTER_WORKSPACE_WORDS = 2 * 8 * 256 * 4 + 4
+
+
+def make_fused_router_workspace(device: torch.device) -> torch.Tensor:
+    """Workspace of fp4_block_scale_moe_runner's fused router GEMV + routing
+    kernel (router_workspace): both exchange buffers idle (-0.0, bits
+    0x80000000) and epoch 0. Between launches the buffer the next launch uses
+    is idle; nothing else may write the workspace. Launches that share a
+    workspace must run in stream order."""
+    workspace = torch.zeros(FUSED_ROUTER_WORKSPACE_WORDS,
+                            dtype=torch.int32,
+                            device=device)
+    workspace[:FUSED_ROUTER_WORKSPACE_WORDS - 4].fill_(-2**31)
+    return workspace
 
 
 def fp4_block_scale_fake_output_without_finalize(
@@ -832,7 +870,10 @@ def _(routing_logits,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
       use_dp: bool = False,
-      hidden_states_ready_event: Optional[int] = None) -> List[torch.Tensor]:
+      hidden_states_ready_event: Optional[int] = None,
+      router_hidden_states: Optional[torch.Tensor] = None,
+      router_weight: Optional[torch.Tensor] = None,
+      router_workspace: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

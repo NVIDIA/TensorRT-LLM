@@ -193,6 +193,17 @@ public:
         batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16,
         batchedGemm::trtllm::gen::Dtype dtypeRoutingBias = batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
+    // run() for DeepSeekV3 routing without groups or fused shared experts, with the router GEMV in the same kernel:
+    // the routing logits are computed from routerHiddenStates [numTokens, hiddenDim] and routerWeight [numExperts,
+    // hiddenDim] (bf16) as dsv3_router_gemm_op computes them (see routingCustom::runFusedRouter, which checks that the
+    // shape is covered).
+    void runFusedRouter(void const* routerHiddenStates, void const* routerWeight, int32_t hiddenDim,
+        int32_t* routerWorkspace, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
+        int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor, int32_t* permutedIdxSize,
+        int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
+        void* expertWeights, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
+        cudaStream_t stream, batchedGemm::trtllm::gen::Dtype dtypeRoutingBias);
+
 private:
     int32_t mTileTokensDim;
 };

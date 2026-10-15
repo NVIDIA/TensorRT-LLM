@@ -384,6 +384,21 @@ void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 void launchSmallTokenBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 
+// Workspace of runFusedRouter, in 32-bit words: two exchange buffers of [8 tokens][256 experts][4 slices] fp32 whose
+// idle value is -0.0 (bits 0x80000000), then the epoch (0 before the first launch), padded to 16 bytes.
+static constexpr int32_t FusedRouterWorkspaceWords = 2 * 8 * 256 * 4 + 4;
+
+// Whether runFusedRouter covers this routing configuration and hidden size: 1-8 tokens and at most mTileTokensDim,
+// 256 experts, top-8, unit local-expert stride, SigmoidBias + ScaledSumNormalize, bf16 expert weights.
+bool supportsFusedRouter(Data const& data, int32_t hiddenDim);
+
+// The router GEMV of dsv3_router_gemm_op (bf16 hiddenStates [mNumTokens, hiddenDim] x routerWeight [mNumExperts,
+// hiddenDim], the same fp32 logits, which are not stored) and the routing of routingIndicesSmallTokenKernel in one
+// kernel, with the same routing outputs; mPtrScores is not read. workspace: FusedRouterWorkspaceWords words, owned by
+// the caller and initialized once; launches that share a workspace must run in stream order.
+void runFusedRouter(Data const& data, void const* hiddenStates, void const* routerWeight, int32_t hiddenDim,
+    int32_t* workspace, void* stream);
+
 } // namespace routingCustom
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

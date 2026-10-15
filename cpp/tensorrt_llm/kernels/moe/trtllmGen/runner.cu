@@ -411,6 +411,44 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
             serializeMoeRoutingMethodType(routingMethodType).c_str(), (int) routingMethodType);
     }
 }
+
+void Runner::runFusedRouter(void const* routerHiddenStates, void const* routerWeight, int32_t hiddenDim,
+    int32_t* routerWorkspace, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
+    int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor, int32_t* permutedIdxSize,
+    int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
+    void* expertWeights, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
+    cudaStream_t stream, btg::Dtype dtypeRoutingBias)
+{
+    // The routing configuration of run()'s DeepSeekV3 branch without groups.
+    moe::dev::routing::routingCustom::Data routingData;
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = btg::Dtype::Fp32;
+    routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+    routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
+    routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+    routingData.mPtrRoutingBias = routingBias;
+    routingData.mDtypeBias = dtypeRoutingBias;
+    routingData.mRouteScale = routedScalingFactor;
+    routingData.mPtrPermutedIdxSize = permutedIdxSize;
+    routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+    routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+    routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+    routingData.mPtrTopKWeights = expertWeights;
+    routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+    routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+    routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mNumTokens = numTokens;
+    routingData.mNumExperts = numExperts;
+    routingData.mTopK = topK;
+    routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mLocalExpertsStartIdx = localExpertOffset;
+    routingData.mLocalExpertsStrideLog2 = 0;
+    routingData.mNumLocalExperts = localNumExperts;
+
+    moe::dev::routing::routingCustom::runFusedRouter(
+        routingData, routerHiddenStates, routerWeight, hiddenDim, routerWorkspace, stream);
+}
 } // namespace Routing
 
 namespace PermuteGemm1
