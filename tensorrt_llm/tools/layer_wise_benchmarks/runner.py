@@ -443,25 +443,26 @@ class Runner:
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
             ),
         )
-        # Serving applies these in py_executor_creator; the harness builds llm_args
-        # by hand, so without this every model default is off here only.
-        llm_args = ModelLoader.load_config_and_apply_defaults(
-            pretrained_model_name_or_path, llm_args, checkpoint_loader
-        )
-        model_loader = ModelLoader(
-            llm_args=llm_args,
-            mapping=mapping,
-            spec_config=spec_config,
-            sparse_attention_config=None,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-        )
-
         with (
             self.scaled_from_ctx(scaled_from, mapping),
             self.vision_config_ctx(vision_config),
             self.skip_unused_layers_ctx(layer_indices),
         ):
+            # Serving applies these in py_executor_creator; the harness builds
+            # llm_args by hand, so without this every model default is off here
+            # only. Resolved inside the config contexts so the defaults come from
+            # the same config (text-only, scaled) that the model loads with.
+            llm_args = ModelLoader.load_config_and_apply_defaults(
+                pretrained_model_name_or_path, llm_args, checkpoint_loader
+            )
+            model_loader = ModelLoader(
+                llm_args=llm_args,
+                mapping=mapping,
+                spec_config=spec_config,
+                sparse_attention_config=None,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+            )
             model, _ = model_loader.load(
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
