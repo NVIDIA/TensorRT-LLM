@@ -53,6 +53,14 @@ result/config backend mismatches. CI does not infer compatibility from
 dates or maintain a commit allowlist. Reassess compatibility if a measurement
 window changes; a source name alone does not establish unchanged semantics.
 
+`get_generation_metric_path` in `tests/test_common/visual_gen_perf_history.py`
+is the single definition of the generation measurement path. Metric extraction
+reads that path, and the uploaded source is derived as `client_<path>`; history
+selection derives its expected source from the same helper. To switch a backend
+between `gen_latency` and `e2e_latency`, change only its entry in this mapping.
+The new results and accepted history then switch together, excluding the prior
+window. Unknown backends fail explicitly rather than falling back to image timing.
+
 The policy applies before selecting the latest main result, extracting threshold
 overrides, and computing the fallback baseline. It drops inherited `d_baseline_*`
 values, including those stored on client results, because CI may have computed

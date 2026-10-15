@@ -19,7 +19,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from test_common.visual_gen_perf_history import get_generation_timing_source
+from test_common.visual_gen_perf_history import (
+    get_generation_metric_path,
+    get_generation_timing_source,
+)
 
 from tensorrt_llm.commands.utils import get_visual_gen_num_gpus as resolve_visual_gen_num_gpus
 
@@ -76,7 +79,7 @@ def result_metric_paths(backend: str) -> dict[str, str]:
     reports that separately as ``gen_latency``, and the image route, being a
     single leg, cannot tell it apart from the whole request.
     """
-    generation = "gen_latency" if backend == "openai-videos" else "e2e_latency"
+    generation = get_generation_metric_path(backend)
     return {
         "d_request_throughput": "request_throughput",
         "d_mean_latency": "e2e_latency.mean",
