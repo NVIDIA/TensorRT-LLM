@@ -75,6 +75,10 @@ class LocalityDomainConcurrentTunableRunner(TunableRunner):
     ) -> list[Any]:
         return self._op_runner.get_valid_tactics(inputs, profile, **kwargs)
 
+    def tactic_search_cache_key(self) -> tuple[Any, ...] | None:
+        """Use the wrapped runner's candidate-search discriminator."""
+        return self._op_runner.tactic_search_cache_key()
+
     def should_profile_tactic_in_subprocess(
         self,
         custom_op: str,
