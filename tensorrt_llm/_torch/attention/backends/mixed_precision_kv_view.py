@@ -54,27 +54,17 @@ class MixedPrecisionKVView:
             raise NotImplementedError(
                 "Mixed-precision paged-cache staging requires eager execution"
             )
-        if metadata.is_cross or manager.kv_factor != 2 or manager.max_beam_width != 1:
+        if metadata.is_cross or manager.kv_factor != 2:
             raise NotImplementedError("Mixed-precision staging requires single-beam dense self K/V")
-        if manager.max_draft_len or metadata.kv_cache_params.use_full_generation_page_table:
-            raise NotImplementedError(
-                "Mixed-precision staging does not yet support speculative or context-parallel steps"
-            )
-        if manager.dtype != DataType.NVFP4:
-            raise NotImplementedError("Mixed-precision staging currently requires NVFP4 history")
-        if dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("Mixed-precision staging requires FP16 or BF16 computation")
-        window = manager.get_high_precision_window(
-            layer_idx, metadata.request_ids, metadata.kv_layout
-        )
-        return cls(metadata, layer_idx, dtype, window, history_dequant_scale, max_page_size)
+        if dtype != manager.compute_dtype:
+            raise ValueError("Attention input dtype differs from its reserved mixed-precision view")
+        return cls(metadata, layer_idx, dtype, history_dequant_scale, max_page_size)
 
     def __init__(
         self,
         metadata: "AttentionMetadata",
         layer_idx: int,
         dtype: torch.dtype,
-        window: tuple[torch.Tensor, list[list[int]]],
         history_dequant_scale: torch.Tensor | None,
         max_page_size: int | None,
     ) -> None:
@@ -87,7 +77,9 @@ class MixedPrecisionKVView:
         if self.block_size % self.stage_block_size:
             raise ValueError("Staging pages must divide the owning cache's block size")
         self.history = self.manager.get_buffers(layer_idx, kv_layout=self.layout)
-        self.high, self.high_ids = window
+        self.high, self.high_ids = self.manager.get_high_precision_window(
+            layer_idx, self.request_ids, self.layout
+        )
         self.history_ids = self.manager.get_batch_cache_indices(self.request_ids, layer_idx)
         self.scales, self.scale_ids = self.manager.get_history_block_scales(
             layer_idx, self.request_ids, self.layout

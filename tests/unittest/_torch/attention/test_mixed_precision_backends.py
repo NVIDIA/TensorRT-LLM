@@ -37,7 +37,7 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
     request_ids = list(range(batch))
     high_torch_dtype = binding_to_torch_dtype(high_dtype)
     manager = MixedPrecisionKVCacheManager(
-        KvCacheConfig(max_tokens=65536, enable_block_reuse=True, pool_ratio=[0.75, 0.25]),
+        KvCacheConfig(max_tokens=65536, enable_block_reuse=True),
         CacheType.SELF,
         num_layers=1,
         num_kv_heads=heads,
@@ -46,8 +46,10 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
         max_seq_len=1024,
         max_batch_size=batch,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        dtype=DataType.NVFP4,
-        high_dtype=high_dtype,
+        dtype=high_dtype,
+        low_dtype=DataType.NVFP4,
+        compute_dtype=compute_dtype,
+        high_low_pool_ratio=1 / 3,
         first_n=128,
         last_n=128,
     )

@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     MixedPrecisionKVCacheManager,
     Role,
 )
+from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -33,7 +34,6 @@ def manager(request):
             max_tokens=65536,
             host_cache_size=0,
             enable_block_reuse=True,
-            pool_ratio=[0.75, 0.25],
             block_reuse_config={"policy": policy},
         ),
         CacheType.SELF,
@@ -44,8 +44,10 @@ def manager(request):
         max_seq_len=1024,
         max_batch_size=2,
         mapping=Mapping(),
-        dtype=history_dtype,
-        high_dtype=high_dtype,
+        dtype=high_dtype,
+        low_dtype=history_dtype,
+        compute_dtype=torch.bfloat16,
+        high_low_pool_ratio=1 / 3,
         first_n=128,
         last_n=128,
     )
@@ -66,7 +68,7 @@ def test_extra_pool_uses_existing_dtype_layout(manager):
     """Allocation coverage, not a claim that every dtype has an Attention reader."""
     high = manager.kv_cache_manager_py_config.layers[1]
     for buffer in high.buffers:
-        expected = manager.get_layer_bytes_per_token(0, buffer.role, dtype=manager.high_dtype) * 128
+        expected = get_size_in_bytes(2 * 64 * 128, manager.high_dtype)
         assert buffer.size == expected
         assert manager.impl.get_page_stride(high.layer_id, buffer.role) >= expected
     has_scales = any(buffer.role == Role.KEY_BLOCK_SCALE for buffer in high.buffers)
@@ -83,8 +85,10 @@ def test_recurrent_state_layout_is_unchanged(manager):
         ],
     )
     config = manager.kv_cache_manager_py_config
-    with patch.object(manager, "high_layers", {}):
-        configured = manager._build_cache_config(replace(config, layers=[config.layers[0], state]))
+    with patch.object(manager, "high_layers", {}), patch.object(manager, "high_low_pool_ratio", 1):
+        configured = manager._build_cache_config(
+            replace(config, layers=[config.layers[0], state], initial_pool_ratio=[0.5, 0.5])
+        )
         retained = configured.layers[1]
         assert isinstance(retained, kv.SsmLayerConfig)
         assert retained.layer_id == state.layer_id
@@ -93,6 +97,29 @@ def test_recurrent_state_layout_is_unchanged(manager):
         ]
         assert manager.high_layers == {0: 2}
         assert len(configured.layers) == 3
+        # Original KV:SSM=1:1, then high:low=1:1 within KV, never three equal shares.
+        assert configured.initial_pool_ratio == pytest.approx([0.25, 0.5, 0.25])
+
+
+@pytest.mark.parametrize("manager", ["per_request"], indirect=True)
+def test_pool_ratio_splits_native_groups_not_individual_layers(manager):
+    config = manager.kv_cache_manager_py_config
+    key = kv.BufferConfig(role=Role.KEY, size=1024)
+    layers = [kv.AttentionLayerConfig(layer_id=i, buffers=[key]) for i in range(2)]
+    layers.append(kv.AttentionLayerConfig(layer_id=2, buffers=[key], sliding_window_size=513))
+    high = [
+        kv.AttentionLayerConfig(
+            layer_id=i, buffers=[key], sliding_window_size=129, num_sink_tokens=128
+        )
+        for i in (3, 4)
+    ]
+    original = replace(config, layers=layers, initial_pool_ratio=[0.6, 0.4])
+    with (
+        patch.object(manager, "high_layers", {0: 3, 1: 4}),
+        patch.object(manager, "high_low_pool_ratio", 2),
+    ):
+        ratio = manager._split_mixed_precision_pool_ratio(original, [*layers, *high])
+    assert ratio == pytest.approx([0.2, 0.4, 0.4])
 
 
 @pytest.mark.parametrize("manager", ["all_reusable", "per_request"], indirect=True)

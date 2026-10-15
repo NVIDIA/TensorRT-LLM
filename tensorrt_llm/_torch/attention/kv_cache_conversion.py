@@ -18,8 +18,6 @@ def quantize_nvfp4_kv(
     the existing quantizer takes its reciprocal. Scales are linear, not GEMM
     swizzled. Each K/V head is a separate row.
     """
-    if values.dtype not in _VALUE_DTYPES or values.shape[-1] % NVFP4_SF_VEC_SIZE:
-        raise ValueError("NVFP4 KV conversion requires FP16/BF16/FP8 rows aligned to 16 values")
     packed, scales = torch.ops.trtllm.fp4_quantize(
         values.contiguous(), dequant_scale.reciprocal(), NVFP4_SF_VEC_SIZE, False, False
     )
@@ -70,8 +68,6 @@ def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.
     The high pool stores unscaled FP8 values. Its scale is independent of the
     NVFP4 history scale, and values never pass through the NVFP4 representation.
     """
-    if dtype not in _VALUE_DTYPES:
-        raise ValueError("High-precision KV supports FP16, BF16 and FP8")
     if dtype == torch.float8_e4m3fn and values.dtype != dtype:
         unit_scale = torch.ones(1, dtype=torch.float32, device=values.device)
         values, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
