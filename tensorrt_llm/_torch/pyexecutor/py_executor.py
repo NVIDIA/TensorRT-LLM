@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Literal,
-                    Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
+                    Literal, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -127,6 +127,8 @@ from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+    from tensorrt_llm.bindings import MpiProgressThread
+
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
 
 _UNBOUNDED_STATS_MAX_LEN = -1
@@ -195,6 +197,30 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
 # max_input_len truncation.
 _UNBOUNDED_PAUSE_MAX_INPUT_LEN = 0x7fffffff
+
+# Period of the native MPI progress thread that pipeline-parallel ranks run;
+# a value <= 0 disables the thread, and a value above the maximum is malformed.
+PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME = "TLLM_PP_MPI_PROGRESS_INTERVAL_US"
+DEFAULT_PP_MPI_PROGRESS_INTERVAL_US = 5000
+MAX_PP_MPI_PROGRESS_INTERVAL_US = 1_000_000
+
+
+def _resolve_pp_mpi_progress_interval_us() -> int:
+    raw = os.environ.get(PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME)
+    if raw is None:
+        return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
+    try:
+        interval_us = int(raw)
+    except ValueError:
+        interval_us = None
+    if interval_us is None or interval_us > MAX_PP_MPI_PROGRESS_INTERVAL_US:
+        logger.error(
+            f"Ignoring malformed {PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}="
+            f"{raw!r} (expected an integer up to "
+            f"{MAX_PP_MPI_PROGRESS_INTERVAL_US}); using "
+            f"{DEFAULT_PP_MPI_PROGRESS_INTERVAL_US} us.")
+        return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
+    return interval_us
 
 
 class _SleepWakeupTag(IntEnum):
@@ -1106,6 +1132,10 @@ class PyExecutor:
         self._pp_mpi_progress: Optional[MpiProgressPump] = None
         self._pp_mpi_progress_stop = threading.Event()
         self._pp_mpi_progress_quiesced = threading.Event()
+        self._mpi_progress_thread: Optional["MpiProgressThread"] = None
+        # The callable registered with atexit for that thread, kept so that
+        # shutdown can unregister it.
+        self._mpi_progress_thread_exit_hook: Optional[Callable[[], None]] = None
         # Secondary MPI communicator and listener thread for multi-rank
         # sleep/wakeup control messages.  Both are None until start_worker()
         # calls Dup() (a collective) on the main thread.
@@ -1622,6 +1652,8 @@ class PyExecutor:
                             name="sleep_wakeup_listener_thread",
                         )
                         self._sleep_wakeup_listener_thread.start()
+                if self.dist.pp_size > 1 and not self._disable_mpi:
+                    self._start_mpi_progress_thread()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -1860,6 +1892,62 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
+    def _start_mpi_progress_thread(self) -> None:
+        """Start a native thread that keeps this rank's MPI sends moving.
+
+        Pipeline-parallel ranks post their schedule and sample-state messages
+        with isend and continue. A message large enough for the rendezvous
+        protocol completes only when this process enters MPI again; if the
+        executor thread meanwhile blocks in a native call that holds the GIL
+        (e.g. a lazy CUDA kernel load that waits for an in-flight NCCL
+        kernel), no thread of this process enters MPI, the next rank never
+        receives the message, and the pipeline deadlocks. The thread issues a
+        non-matching MPI_Iprobe every interval without taking the GIL.
+
+        Leaves ``_mpi_progress_thread`` None when the thread is disabled or
+        unavailable.
+        """
+        interval_us = _resolve_pp_mpi_progress_interval_us()
+        if interval_us <= 0:
+            logger.error(
+                f"{PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}={interval_us}: the "
+                f"pipeline-parallel MPI progress thread is disabled.")
+            return
+        from mpi4py import MPI
+
+        from tensorrt_llm.bindings import MpiProgressThread
+
+        if MPI.Query_thread() < MPI.THREAD_MULTIPLE:
+            logger.error(
+                "MPI does not provide MPI_THREAD_MULTIPLE; the "
+                "pipeline-parallel MPI progress thread stays off. A rank that "
+                "blocks in a GIL-holding native call while one of its sends "
+                "is in flight can then deadlock the pipeline.")
+            return
+        thread = MpiProgressThread(mpi_comm().py2f(), interval_us,
+                                   int(PPCommTag.MPI_PROGRESS_PROBE))
+        # Must stop before MPI_Finalize. mpi4py finalizes MPI from a
+        # Py_AtExit hook, which runs after all atexit handlers. Keep the
+        # registered callable: each `thread.stop` access creates a new bound
+        # method, which atexit.unregister would not match.
+        self._mpi_progress_thread = thread
+        self._mpi_progress_thread_exit_hook = thread.stop
+        atexit.register(self._mpi_progress_thread_exit_hook)
+        logger.info(f"Started the pipeline-parallel MPI progress thread "
+                    f"(interval {interval_us} us).")
+
+    def _stop_mpi_progress_thread(self) -> None:
+        """Stop the native MPI progress thread if it runs.
+
+        stop() waits only for a probe already in flight to return, and
+        MPI_Iprobe is non-blocking.
+        """
+        if self._mpi_progress_thread is not None:
+            self._mpi_progress_thread.stop()
+            atexit.unregister(self._mpi_progress_thread_exit_hook)
+            self._mpi_progress_thread = None
+            self._mpi_progress_thread_exit_hook = None
+
     def shutdown(self):
         """
         Signals the server to shutdown.
@@ -1883,9 +1971,11 @@ class PyExecutor:
             # Since the whole process will shutdown after this `shutdown` call,
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
-            # Stop the relay thread from probing while the hang detector
-            # aborts MPI. A probe already in flight is not interrupted.
+            # Stop the relay thread and the native progress thread from
+            # probing while the hang detector aborts MPI. A relay-thread probe
+            # already in flight is not interrupted.
             self._pp_mpi_progress_stop.set()
+            self._stop_mpi_progress_thread()
             return
         self.worker_thread.join()
         if self.kv_connector_manager is not None:
@@ -1899,6 +1989,7 @@ class PyExecutor:
             # pump tick, so acknowledge the quiesce here; otherwise the exit
             # hook would wait out its full timeout.
             self._pp_mpi_progress_quiesced.set()
+            self._stop_mpi_progress_thread()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
@@ -3122,7 +3213,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
-                if not can_queue:
+                    self._finalize_adp_dummy_allocation(False)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -3982,6 +4073,21 @@ class PyExecutor:
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         if cross_kv_cache_manager is not None:
             cross_kv_cache_manager.update_context_resources(scheduled_batch)
+
+    def _terminate_attention_dp_dummy_requests(self) -> None:
+        """Terminate every local attention-DP dummy without assuming its position.
+
+        Requests activated after the dummy was appended can follow it in
+        ``active_requests``; a dummy left behind keeps its KV cache and blocks
+        the next iteration from padding again.
+        """
+        for request in list(self.active_requests):
+            if not request.is_attention_dp_dummy:
+                continue
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -8391,14 +8497,8 @@ class PyExecutor:
             strip_mm_data_for_generation(mm_data)
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
-        # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        # handle potential attention dp dummy requests
+        self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
@@ -8535,8 +8635,7 @@ class PyExecutor:
                 continue
             request.py_num_draft_tokens_verified = 0
             py_num_accepted = request.py_num_accepted_draft_tokens
-            # Mirror C++ LlmRequest::updateNumTokensPerIteration, which
-            # clamps the drafted count to getMaxDraftPathLen(): with
+            # Clamp the drafted count to max_draft_len: with
             # tree-based drafting the request carries up to
             # max_total_draft_tokens draft tokens, but at most
             # max_draft_len (the max path length) of them can be accepted
@@ -9158,10 +9257,8 @@ class PyExecutor:
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
                     if request.py_total_draft_tokens > 0:
-                        # Backfills RequestPerfMetrics.speculative_decoding on
-                        # the client side; the C++ section is only populated
-                        # by updateNumTokensPerIteration, which the PyTorch
-                        # flow never calls.
+                        # Backfill RequestPerfMetrics.speculative_decoding on
+                        # the client side from the Python-owned counters.
                         response.result.spec_dec_totals = (
                             request.py_total_accepted_draft_tokens,
                             request.py_total_draft_tokens)
