@@ -23,8 +23,11 @@ import pytest
 grpc = pytest.importorskip(  # noqa: E402
     "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
-
-from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc, server_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    kv_pb2,
+    openengine_pb2_grpc,
+    server_pb2,
+)
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
@@ -75,16 +78,57 @@ def test_openengine_server_serves_the_control_contract() -> None:
         assert server.port != 0
 
         await server.start()
+        with pytest.raises(RuntimeError, match="Failed to bind"):
+            OpenEngineServer(host="127.0.0.1", port=server.port, llm=llm, model="test-model")
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
         try:
             control = openengine_pb2_grpc.ControlStub(channel)
             info = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
             assert info.engine_name == "tensorrt_llm"
+            sources = await control.GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), timeout=5)
+            assert list(sources.sources) == []
+            with pytest.raises(grpc.aio.AioRpcError) as error:
+                async for _ in control.SubscribeKvEvents(
+                    kv_pb2.SubscribeKvEventsRequest(), timeout=5
+                ):
+                    pass
+            assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
             assert info.schema_revision == 1
             assert info.minimum_client_revision == 1
             assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
         finally:
             await channel.close()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+@pytest.mark.parametrize("publisher_enabled", [False, True])
+def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> None:
+    """Configured events must not advertise a source absent from the loaded engine."""
+    from tensorrt_llm.grpc.openengine.kv_events import KvEventsUnavailableError
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(
+            guided_decoding_backend=None,
+            kv_cache_config=SimpleNamespace(
+                kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq")
+            ),
+        ),
+        _executor=SimpleNamespace(
+            get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {}
+        ),
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer(host="127.0.0.1", port=0, llm=llm, model="test-model")
+        try:
+            if publisher_enabled:
+                await server.start()
+            else:
+                with pytest.raises(KvEventsUnavailableError, match="no streaming publisher"):
+                    await server.start()
+        finally:
             await server.stop(grace=0)
 
     asyncio.run(exercise_server())
@@ -127,6 +171,7 @@ def test_launch_server_disables_gc_only_when_requested(
     class _Llm:
         def __init__(self, **kwargs) -> None:
             del kwargs
+            self.llm_id = "test-instance"
 
         def shutdown(self) -> None:
             pass

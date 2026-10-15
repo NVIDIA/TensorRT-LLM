@@ -42,6 +42,11 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
 {
 }
 
+bool Page::isPrivate() const
+{
+    return !isCommitted() && !requiresPrefixCoverage(manager->lifeCycles()[lifeCycle]);
+}
+
 Page::~Page()
 {
     KVCM2_POISON_ON_EXCEPT(
@@ -259,8 +264,11 @@ PageHolder::~PageHolder()
                 // page with a larger recorded token count) is unreachable for reuse, so keeping it
                 // in the eviction LRU would just pin a slot until memory pressure hits.
                 auto* cp = static_cast<CommittedPage*>(page.get());
-                if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
+                if (page->scheduledForEviction()
+                    && (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp)))
+                {
                     manager->excludeFromEviction(*page);
+                }
             }
             else
             {
@@ -531,6 +539,15 @@ void SharedPageLock::acquirePageIndex()
 
 void SharedPageLock::releasePageIndex()
 {
+    if (mUser.ordinal == kBadBlockOrdinal)
+    {
+        // SSM state has one live page per beam and no attention page-index
+        // entry. updateBasePageIndex deliberately returns BAD for this ordinal.
+        auto const& lc = page()->manager->lifeCycles().getLifeCycle(mUser.lifeCycle);
+        auto const* attention = std::get_if<AttnLifeCycle>(&lc);
+        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && attention->allowsCheckpoint()));
+        return;
+    }
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
     // SSM pages use kBadBlockOrdinal, for which updateBasePageIndex returns kBadPageIndex.
@@ -717,7 +734,9 @@ void ScratchSlotLock::unlock()
 {
     TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     mSlot.readyEvent = mOwner->finishEvent();
-    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, std::move(mSlot));
+    // Slot's implicit move leaves its optional ID engaged. Transfer ownership
+    // explicitly so destruction cannot release this physical slot a second time.
+    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, detachSlot());
     TLLM_CHECK_DEBUG(!mSlot.hasValidSlot());
 }
 

@@ -492,7 +492,7 @@ class VideoMME(AccuracyTask):
 
 class CnnDailymail(AccuracyTask):
     DATASET = "cnn_dailymail"
-    DATASET_DIR = f"{llm_models_root()}/datasets/ccdv/cnn_dailymail"
+    DATASET_DIR = f"{llm_models_root()}/datasets/cnn_dailymail"
     ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002

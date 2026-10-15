@@ -70,6 +70,11 @@ def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
 
 
+def drop_optional_pages(kv_cache: Any, end: int, groups: list[int] | None = None) -> None:
+    """Test-only eviction injection, preserving other groups and live readers."""
+    _cpp().drop_optional_pages(kv_cache, end, groups)
+
+
 def make_test_block(
     manager: Any,
     tokens: Any,

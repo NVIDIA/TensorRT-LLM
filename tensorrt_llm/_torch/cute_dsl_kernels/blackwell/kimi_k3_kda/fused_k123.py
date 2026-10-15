@@ -1298,6 +1298,10 @@ def fused_kernel123(
                     for vi in cutlass.range_constexpr(VEC):
                         rPrefix[vi] = sPartialLast[warp_row_group - 1, col_base + vi]
 
+                # The next chunk's partial sums overwrite sPartialLast, so every
+                # K1 warp must have read its prefix and the chunk total first.
+                k1_internal_barrier()
+
                 # ---- Pass 2a: ONLY cumsum + write csGcum (critical path, minimal work) ----
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = rPrefix[vi]

@@ -168,6 +168,33 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 
+[LiLiCorr](https://arxiv.org/abs/2608.20530) checkpoints use the same
+`DFlashDecodingConfig`. The draft checkpoint selects LiLiCorr through
+`architectures: ["LiLiCorrDraftModel"]`, `dflash_config.projector_type: "lilicorr"`,
+or `dflash_config.lilicorr_enabled: true`.
+Its candidate scorer correlates the per-position top-k proposals before target
+verification. Load the matching target separately through `LLM(model=...)` and
+set `speculative_model` to the drafter. Both models must share the token vocabulary
+and embedding width; the captured target layers must match the drafter's training.
+The drafter currently uses the generic GQA DFlash backbone; MLA and Laguna-specific
+draft layers require separate adapters.
+
+Set `max_draft_len` to at most `block_size - 1`; for an eight-position checkpoint,
+use up to seven draft tokens. Projection quantization follows the checkpoint's
+global or per-module metadata, including excluded modules. The loader accepts
+dense, FP8, NVFP4 and W4A16 NVFP4 projections. Backbone QKV projections must remain
+unquantized; checkpoints with quantized backbone QKV are rejected during loading.
+It preserves a checkpoint-owned output head when `has_own_lm_head` is set. Grouped
+convolutions are loaded when declared by the checkpoint. Draft attention is
+non-causal, including symmetric windows on sliding-attention layers; causal
+LiLiCorr checkpoints are rejected. The draft attention backend retains the
+hardware restrictions listed above.
+
+LiLiCorr builds proposal rows along a greedy candidate path. With stochastic draft
+sampling, a sampled token can differ from the predecessor used to score the next
+row. Rejection sampling uses the actual proposal distributions, preserving the
+target distribution, but acceptance can decrease.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.

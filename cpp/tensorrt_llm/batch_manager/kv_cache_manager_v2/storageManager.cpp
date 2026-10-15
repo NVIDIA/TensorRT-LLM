@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/batchedPageCopy.h"
+#include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -397,12 +398,14 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     TypedVec<LifeCycleId, PoolGroupIndex> coldGrouping(numLifeCycles());
     TypedVec<PoolGroupIndex, SlotDesc> coldSlotDescList;
-    std::map<size_t, PoolGroupIndex> coldGroupByPageBytes;
+    std::map<std::pair<AttentionReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
+        auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[lifeCycle]);
+        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
         auto [it, inserted] = coldGroupByPageBytes.emplace(
-            coldPageBytes, PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
+            std::make_pair(policy, coldPageBytes), PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;
         if (inserted)
         {
@@ -744,7 +747,14 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 {
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
-    return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
+    if (s == PageStatus::DROPPABLE && page.isCommitted())
+    {
+        // A migration batch can outlive checkpoint invalidation. Do not put
+        // detached bundle members back in an LRU that would retain their slots.
+        auto const& committed = static_cast<CommittedPage const&>(page);
+        return committed.block && !committed.block->isOrphan() && committed.block->holdsPage(committed);
+    }
+    return s == PageStatus::HELD && lvl < numCacheLevels() - 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,10 +1089,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& page : pages)
             {
-                if (!isLast || page->status() != PageStatus::HELD)
-                {
-                    lvl.controller.scheduleForEviction(*page);
-                }
+                scheduleForEviction(*page);
             }
         }
     }
@@ -1943,7 +1950,16 @@ TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
 TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const
 {
-    auto const numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    // A soft preference, not a feasibility floor: keep one optional endpoint
+    // per typical request in addition to its private working pages.
+    for (auto const& [lc, attention] : mLifeCycles.attentionLifeCycles())
+    {
+        if (attention->allowsCheckpoint())
+        {
+            numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
+        }
+    }
     return normalizeToRatio(slotsToBytes(numSlots, granularity));
 }
 

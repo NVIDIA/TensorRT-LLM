@@ -35,8 +35,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from utils.llm_data import get_checkpoint
 
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
@@ -64,7 +64,7 @@ def _cleanup_mpi_env():
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)

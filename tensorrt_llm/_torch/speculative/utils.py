@@ -460,6 +460,11 @@ def _build_spec_metadata(spec_config,
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
+        if not target_layer_ids:
+            raise ValueError(
+                "Embedded DSpark requires nonempty target_layer_ids before "
+                "creating capture metadata. Resolve dspark_target_layer_ids "
+                "from the checkpoint's text_config for multimodal models.")
         return DSparkSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
