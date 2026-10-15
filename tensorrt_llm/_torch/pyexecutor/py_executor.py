@@ -3223,7 +3223,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
-                if not can_queue:
+                    self._finalize_adp_dummy_allocation(False)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -4083,6 +4083,21 @@ class PyExecutor:
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         if cross_kv_cache_manager is not None:
             cross_kv_cache_manager.update_context_resources(scheduled_batch)
+
+    def _terminate_attention_dp_dummy_requests(self) -> None:
+        """Terminate every local attention-DP dummy without assuming its position.
+
+        Requests activated after the dummy was appended can follow it in
+        ``active_requests``; a dummy left behind keeps its KV cache and blocks
+        the next iteration from padding again.
+        """
+        for request in list(self.active_requests):
+            if not request.is_attention_dp_dummy:
+                continue
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -8517,14 +8532,8 @@ class PyExecutor:
             strip_mm_data_for_generation(mm_data)
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
-        # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        # handle potential attention dp dummy requests
+        self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests

@@ -989,6 +989,37 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
 
 
 @pytest.mark.cpu_only
+def test_sparse_prefill_bounds_pool_scoring_by_largest_visible_length():
+    """forward_prefill bounds pool scoring by the largest cached + new length.
+
+    Request 0 continues a cached prefix with a shorter chunk than request 1, so a
+    bound that ignored cached tokens would hide visible pools from top-k.
+    """
+    cu_seqlens, cached_lens = [0, 10, 70], [100, 0]
+    tokens, heads, head_dim = cu_seqlens[-1], 2, 4
+    select = Mock(return_value=torch.zeros(tokens, 8))
+    attention = SimpleNamespace(
+        indexer=SimpleNamespace(index_kpool=4, index_kpool_compress_ape=None),
+        attn_backend=Mock(),
+        _project_attention_and_indexer=Mock(
+            return_value=(torch.zeros(tokens, 3), None, None, None)
+        ),
+        q_b_proj=lambda x: torch.zeros(x.shape[0], heads * head_dim),
+        num_heads=heads,
+        qk_head_dim=head_dim,
+        _select_and_attend_paged=select,
+    )
+    Glm5NextSparseAttention.forward_prefill(
+        attention, torch.zeros(tokens, 8), cu_seqlens, cached_lens, SimpleNamespace()
+    )
+    select.assert_called_once()
+    visible = select.call_args.args[3]
+    max_visible = select.call_args.kwargs["max_visible"]
+    assert isinstance(max_visible, int)
+    assert max_visible == int(visible.max()) == 110
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tokens_per_request", [1, 4], ids=["decode", "verify"])
 @pytest.mark.parametrize("attention_dp", [False, True], ids=["tp", "attention-dp"])
 @pytest.mark.parametrize("layer_kind", ["decoder", "mtp"])
