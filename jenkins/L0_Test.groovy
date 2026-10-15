@@ -1133,24 +1133,15 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     imageForSlurm = LLM_DOCKER_IMAGE
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
-                def clusterExcludes = SlurmConfig.getSlurmPlacementExcludes(
+                def submitPartition = SlurmConfig.withSlurmPlacementArgs(
                     pipeline, remote, partition,
                     placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 )
-                def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
-                if (slurmExcludeArg) {
-                    if (slurmCommandWithExclusion != slurmCommand) {
-                        echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
-                    } else {
-                        echo "[INFRA-RETRY] ${stageName}: could not inject ${slurmExcludeArg} into generated SLURM agent command; submitting without node exclusion"
-                    }
-                }
+                def slurmCommand = SlurmConfig.generateCommand(cluster, submitPartition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
 
-                def slurmSubmitCommand = slurmCommandWithExclusion
+                def slurmSubmitCommand = slurmCommand
                 if (enrootConfigDir) {
-                    slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
+                    slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommand}"
                 }
 
                 def slurmSubmitOutput = Utils.exec(
@@ -2181,15 +2172,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
-                def clusterExcludes = SlurmConfig.getSlurmPlacementExcludes(
+                def submitPartition = SlurmConfig.withSlurmPlacementArgs(
                     pipeline, remote, partition,
                     placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 )
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
-                def slurmExcludeDirective = slurmExcludeArg ? "#SBATCH ${slurmExcludeArg}" : ""
-                if (slurmExcludeArg) {
-                    echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
-                }
 
                 def envExportStatements = envVarsToExport.collect { varName, varValue ->
                     def escapedValue = varValue?.toString() ?: ''
@@ -2205,8 +2191,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
-                    #SBATCH ${partition.additionalArgs}
-                    ${slurmExcludeDirective}
+                    #SBATCH ${submitPartition.additionalArgs}
                     ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
 
