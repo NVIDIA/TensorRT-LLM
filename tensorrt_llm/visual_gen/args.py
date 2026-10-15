@@ -103,6 +103,26 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
+    vc_attention: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals "
+            "around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated "
+            "with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts."
+        ),
+    )
+    vc_repair_budget: float = Field(
+        0.0,
+        ge=0.0,
+        lt=1.0,
+        status="prototype",
+        description=(
+            "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
+            "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
+            "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -158,6 +178,30 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (1, 4, 1)),
             },
         }
+        # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
+        PRIMSTS_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
+        # VC-Attention stores V as E4M3 residuals around tile means with one scale per channel.
+        # VC-Attention-QK16 keeps Q/K in BF16, VC-Attention-QK8 quantizes the Hadamard-rotated
+        # Q/K to E4M3 with one scale per 128 tokens.
+        VC_ATTENTION_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 1)),
+                ("fp8", "fp8", (128, 128, 1)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 1)),
+                ("fp8", "fp8", (128, 128, 1)),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -186,13 +230,34 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            sm_version = get_sm_version()
+            if q_config.vc_attention:
+                recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
+                family = "VC-Attention"
+            else:
+                recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(
+                    sm_version, set()
+                )
+                family = "SAGE and PrimTS"
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
+                    f"for backend='TRTLLM'. Supported {family} recipes on this device: "
                     f"{sorted(recipes)}."
                 )
+            if q_config.smooth_k and (q_config.q_block_size == 0 or q_config.vc_attention):
+                raise ValueError(
+                    "smooth_k is a SageAttention option and does not apply to the recipe "
+                    f"{recipe!r}."
+                )
+            if q_config.vc_repair_budget and not q_config.vc_attention:
+                raise ValueError(
+                    "vc_repair_budget is a VC-Attention option and requires vc_attention=True."
+                )
+        elif q_config.vc_attention or q_config.vc_repair_budget:
+            raise ValueError(
+                f"vc_attention is a TRTLLM backend option, got backend='{self.backend}'."
+            )
         elif q_config.smooth_k:
             raise ValueError(
                 f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
