@@ -17,7 +17,7 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -1426,6 +1426,18 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
+            return False
+
+        # The userbuffers bootstrap exchanges CUDA memory handles over raw
+        # MPI_COMM_WORLD collectives (userbuffers-host.cpp). Under non-MPI
+        # orchestrators (Ray sets TLLM_DISABLE_MPI) every worker holds a
+        # 1-rank MPI world, so importer ranks would receive uninitialized
+        # bytes instead of peer handles and crash in
+        # cuMemImportFromShareableHandle with 'operation not supported'.
+        if mpi_disabled():
+            logger.info(
+                "Disabling userbuffers: its bootstrap requires MPI, which is "
+                "disabled under this orchestrator.")
             return False
 
         # Disable UB for unsupported platforms

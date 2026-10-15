@@ -23,6 +23,8 @@ under tracing, and prescale_workspace must request a size that covers every
 call forward() can serve so the traced path stays a pure lookup.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -40,7 +42,10 @@ def tp4_mapping():
 
 def _seed_workspace(mapping, buffer_size_bytes):
     MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping] = {
+        # The lookup revalidates the multicast mapping before reusing a workspace.
+        "handle": SimpleNamespace(is_mapped=lambda: True),
         "buffer_size_bytes": buffer_size_bytes,
+        "captured": False,
     }
 
 
