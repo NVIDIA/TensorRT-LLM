@@ -112,3 +112,23 @@ TEST(LoggerFormatTest, PreservesRuntimeMessageText)
         });
     t.join();
 }
+
+TEST(LoggerFormatTest, DisabledLevelSkipsArgumentEvaluation)
+{
+    std::thread t(
+        []
+        {
+            Logger::getLogger()->setLevel(Logger::WARNING);
+            int evaluations = 0;
+            auto const count = [&evaluations] { return ++evaluations; };
+
+            TLLM_LOG_DEBUG("evaluated {}", count());
+            EXPECT_EQ(evaluations, 0);
+
+            testing::internal::CaptureStderr();
+            TLLM_LOG_WARNING("evaluated {}", count());
+            EXPECT_EQ(evaluations, 1);
+            EXPECT_NE(testing::internal::GetCapturedStderr().find("evaluated 1"), std::string::npos);
+        });
+    t.join();
+}
