@@ -85,7 +85,12 @@ def test_recurrent_state_layout_is_unchanged(manager):
     config = manager.kv_cache_manager_py_config
     with patch.object(manager, "high_layers", {}):
         configured = manager._build_cache_config(replace(config, layers=[config.layers[0], state]))
-        assert configured.layers[1] is state
+        retained = configured.layers[1]
+        assert isinstance(retained, kv.SsmLayerConfig)
+        assert retained.layer_id == state.layer_id
+        assert [(buffer.role, buffer.size) for buffer in retained.buffers] == [
+            (buffer.role, buffer.size) for buffer in state.buffers
+        ]
         assert manager.high_layers == {0: 2}
         assert len(configured.layers) == 3
 
