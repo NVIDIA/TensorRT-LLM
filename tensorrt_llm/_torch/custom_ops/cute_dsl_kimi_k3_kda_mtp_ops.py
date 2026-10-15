@@ -805,7 +805,10 @@ def kda_mtp_decode_impl(
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
     if not quantize_output:
-        output_scale = num_accepted_tokens
+        # The kernel never reads output_scale without QUANTIZE_OUTPUT. Use the
+        # persistent 1-element control tensor as the placeholder: its static
+        # layout keeps the compile key independent of the request count N.
+        output_scale = _precompute_control_tensor(x_q.device, True)
         scale_leading_dim = 1
     _require_stride_layout(
         x_q=x_q,
@@ -891,7 +894,6 @@ def kda_mtp_decode_impl(
     )
     stage_timing_arg = out
     beta_cache_assumed_align = _beta_cache_assumed_align(beta_cache)
-    output_scale_assumed_align = 16 if quantize_output else 4
     # Two CTAs per (head, request) while they fit in one wave (see SPLIT_MAX_TILES).
     split_v = 2 if HV * N <= SPLIT_MAX_TILES else 1
     bf16_math = _bf16_math_enabled()
@@ -924,7 +926,7 @@ def kda_mtp_decode_impl(
         _layout_key(onorm_g_arg, dynamic_layout=True, assumed_align=16),
         _layout_key(onorm_weight_arg),
         _layout_key(out, dynamic_layout=True, assumed_align=16),
-        _layout_key(output_scale, assumed_align=output_scale_assumed_align),
+        _layout_key(output_scale, assumed_align=16),
         _layout_key(k_cache),
         _layout_key(g_cache),
         _layout_key(v_cache),
@@ -973,7 +975,7 @@ def kda_mtp_decode_impl(
             _dlpack_arg(onorm_g_arg, assumed_align=16),
             _from_dlpack_arg(onorm_weight_arg),
             _dlpack_arg(out, assumed_align=16),
-            _from_dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
+            _from_dlpack_arg(output_scale, assumed_align=16),
             _from_dlpack_arg(h0_arg),
             _from_dlpack_arg(k_cache),
             _from_dlpack_arg(g_cache),
@@ -1014,11 +1016,10 @@ def kda_mtp_decode_impl(
 
     # Runtime alignment policy:
     # - 16 B: model inputs/outputs, parameters, recurrent/conv/kg/v pools,
-    #   output-norm tensors, and the persistent control scalar.
+    #   output-norm tensors, the persistent control scalar, and output_scale
+    #   (separately allocated, or the control scalar as a placeholder).
     # - beta_cache: derived from its actual per-layer physical span and dtype.
     # - 4 B: int32 scheduler metadata, which may be an element-offset view.
-    # - output_scale: 16 B when separately allocated, otherwise it aliases
-    #   int32 num_accepted_tokens and inherits its 4-byte guarantee.
     _compiled_cache[key](
         _dlpack_arg(h0_arg, assumed_align=16),
         _dlpack_arg(x_q_arg, assumed_align=16),
@@ -1037,7 +1038,7 @@ def kda_mtp_decode_impl(
         _dlpack_arg(onorm_g_arg, assumed_align=16),
         _dlpack_arg(onorm_weight_arg, assumed_align=16),
         _dlpack_arg(out, assumed_align=16),
-        _dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
+        _dlpack_arg(output_scale, assumed_align=16),
         _dlpack_arg(h0_arg, assumed_align=16),
         _dlpack_arg(k_cache, assumed_align=16),
         _dlpack_arg(g_cache, assumed_align=16),
