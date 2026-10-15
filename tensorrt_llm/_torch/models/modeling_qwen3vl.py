@@ -1267,22 +1267,13 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
 
     def build(self, key: EncoderGraphKey) -> AttentionMetadata:
         vision = self._vision
-        assert vision.attn_metadata is not None
-        if (
-            key.num_contexts > vision.attn_metadata.max_num_requests
-            or key.total_tokens > vision.attn_metadata.max_num_tokens
-        ):
-            raise ValueError(
-                f"Qwen3-VL encoder CUDA graph needs {key.total_tokens} tokens and "
-                f"{key.num_contexts} contexts, which exceeds the encoder attention metadata "
-                f"capacity (max_num_tokens={vision.attn_metadata.max_num_tokens}, "
-                f"max_num_requests={vision.attn_metadata.max_num_requests}). With "
-                "enable_padding=True, every bucket reserves one extra token and one padding "
-                "context. Raise encoder_max_num_tokens or use a smaller bucket."
-            )
-        metadata = vision.attn_metadata.create_cuda_graph_metadata(
-            key.num_contexts, encode_only=True
+        metadata = vision.metadata_cls(
+            max_num_requests=key.num_contexts,
+            max_num_tokens=key.total_tokens,
+            kv_cache_manager=None,
         )
+        metadata.is_cuda_graph = True
+        metadata.seq_lens = torch.ones(key.num_contexts, dtype=torch.int32)
         bind_seq_lens = getattr(metadata, "bind_encoder_cuda_graph_seq_lens", None)
         if callable(bind_seq_lens):
             bind_seq_lens(metadata.seq_lens, key.num_contexts)
@@ -1341,10 +1332,6 @@ class Qwen3VisionModelBase(nn.Module):
 
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
-
-    def enable_cuda_graph(self) -> None:
-        """Capture the vision tower's opt-in encoder CUDA graphs."""
-        self.visual.enable_blocks_cuda_graph()
 
     def load_weights(
         self,

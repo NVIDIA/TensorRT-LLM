@@ -653,11 +653,13 @@ def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 @pytest.mark.parametrize("deepstack_visual_indexes", [[0], [1, 0]])
 @pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
+@pytest.mark.parametrize("num_tokens", [192, 256])
 def test_qwen3_vision_cuda_graph_replay_matches_eager(
     monkeypatch: pytest.MonkeyPatch,
     attn_backend: str,
     deepstack_visual_indexes: list[int],
     automatic: bool,
+    num_tokens: int,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
         setup_mm_encoder_attn_metadata,
@@ -688,13 +690,9 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
             else:
                 param.normal_(std=0.02)
     vision = encoder.visual
-    if automatic:
-        setup_mm_encoder_attn_metadata(encoder, object(), 256, None)
-    else:
-        vision.setup_attn_metadata(max_num_tokens=1024)
-    # 192 real tokens replay the (256, 1) bucket with a 65-token padding context.
-    grid_thw = torch.tensor([[1, 12, 16]])
-    pixel_values = torch.randn(192, 3 * 2 * 16 * 16, device="cuda")
+    setup_mm_encoder_attn_metadata(encoder, object(), 256, {"attention": 1})
+    grid_thw = torch.tensor([[1, num_tokens // 16, 16]])
+    pixel_values = torch.randn(num_tokens, 3 * 2 * 16 * 16, device="cuda")
     eager = encoder.encode_batched(pixel_values, grid_thw)
 
     if automatic:
@@ -711,7 +709,11 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     torch.testing.assert_close(graph, eager, rtol=5e-2, atol=5e-2)
     captured = vision._blocks_graph_runner._captured[(257, 2)]
     # Replay must refresh the device lengths read by attention, not only the host copy.
-    assert captured.metadata.seq_lens_cuda.tolist() == [192, 65]
+    assert captured.metadata.seq_lens_cuda.tolist() == [num_tokens, 257 - num_tokens]
+    assert vision.attn_metadata.max_num_tokens == 256
+    assert vision.attn_metadata.max_num_requests == 1
+    assert captured.metadata.max_num_tokens == 257
+    assert captured.metadata.max_num_requests == 2
 
 
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:

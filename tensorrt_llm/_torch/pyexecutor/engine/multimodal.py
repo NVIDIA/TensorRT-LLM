@@ -228,25 +228,13 @@ def setup_mm_encoder_attn_metadata(
         if attention_metadata_capacity is not None:
             setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
         graph_config = module._encoder_cuda_graph_config
-        if graph_config is not None and graph_config.buckets is None:
-            # The default packed adapter isolates padding in one extra context/token.
-            # Reserve this small margin for automatic configs before any graph is captured.
-            reserve = int(graph_config.enable_padding)
-            graph_tokens = graph_config.max_num_tokens or encoder_max_num_tokens
-            max_batch_size = graph_config.max_batch_size
-            assert max_batch_size is not None
-            metadata_tokens = max(encoder_max_num_tokens, graph_tokens) + reserve
-            encoder_max_seq_len = max(max_seq_len, graph_tokens)
-            capacities = (
-                attention_metadata_capacity
-                if attention_metadata_capacity is not None
-                else module.get_encoder_attention_metadata_capacity(metadata_tokens)
+        if graph_config is not None:
+            graph_tokens = (
+                max(tokens for tokens, _ in graph_config.buckets)
+                if graph_config.buckets is not None
+                else graph_config.max_num_tokens or encoder_max_num_tokens
             )
-            setup_kwargs["max_num_tokens"] = metadata_tokens
-            setup_kwargs["attention_metadata_capacity"] = {
-                name: max(capacity, max_batch_size + reserve)
-                for name, capacity in capacities.items()
-            }
+            encoder_max_seq_len = max(max_seq_len, graph_tokens)
         module.setup_attn_metadata(**setup_kwargs)
         module.set_attn_max_seq_len(encoder_max_seq_len)
 

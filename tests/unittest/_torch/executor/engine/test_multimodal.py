@@ -202,12 +202,19 @@ def test_automatic_encoder_graphs_need_a_token_budget_before_capture() -> None:
 
 
 @pytest.mark.parametrize("enable_padding", [False, True])
-def test_automatic_encoder_graph_metadata_reserves_padding_capacity(enable_padding) -> None:
+@pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
+def test_encoder_graphs_preserve_eager_metadata_capacity(enable_padding, automatic) -> None:
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         def __init__(self) -> None:
             super().__init__()
-            self._encoder_cuda_graph_config = MultimodalEncoderCudaGraphConfig(
-                max_batch_size=8, max_num_tokens=64, enable_padding=enable_padding
+            self._encoder_cuda_graph_config = (
+                MultimodalEncoderCudaGraphConfig(
+                    max_batch_size=8, max_num_tokens=64, enable_padding=enable_padding
+                )
+                if automatic
+                else MultimodalEncoderCudaGraphConfig(
+                    buckets=[(64, 8)], enable_padding=enable_padding
+                )
             )
             self.setup_attn_metadata = Mock()
             self.set_attn_max_seq_len = Mock()
@@ -216,10 +223,9 @@ def test_automatic_encoder_graph_metadata_reserves_padding_capacity(enable_paddi
     model.encoder = Encoder()
     capacities = {"attention": 4}
     setup_mm_encoder_attn_metadata(model, object(), 32, capacities)
-    reserve = int(enable_padding)
     model.encoder.setup_attn_metadata.assert_called_once_with(
-        max_num_tokens=64 + reserve,
-        attention_metadata_capacity={"attention": 8 + reserve},
+        max_num_tokens=32,
+        attention_metadata_capacity={"attention": 4},
     )
     model.encoder.set_attn_max_seq_len.assert_called_once_with(64)
     assert capacities == {"attention": 4}
