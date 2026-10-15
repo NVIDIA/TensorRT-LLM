@@ -99,6 +99,7 @@ add_th_common_family(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   glmDenseMlpSmallMOp.cpp
+  glmFusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
