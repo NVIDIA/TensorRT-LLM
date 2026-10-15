@@ -382,14 +382,14 @@ class BlockHashMixin:
         # (kimi_k3) and reasoning modes read off the prompt are lost. Ids whose serving
         # semantics cannot be preserved that way are not forwarded; the worker renders them.
         context = PreparedContext.model_validate(rendered.context)
-        reason = rendered.untrusted_reason
-        if not context.is_trivial():
+        reason = None
+        if getattr(request.tool_choice, "function", None) is not None:
+            # A named function makes the worker append a forced tool-call prefix to the prompt
+            # it renders, and the worker rejects such a request together with prompt_token_ids.
+            reason = "a named tool_choice is rendered by the worker"
+        elif not context.is_trivial():
             reason = "serving decisions derived from the rendered prompt cannot be forwarded"
-        if (
-            rendered.tokens_trusted
-            and context.is_trivial()
-            and self._may_write_back_token_ids(request.model)
-        ):
+        if reason is None and self._may_write_back_token_ids(request.model):
             request.prompt_token_ids = rendered.token_ids
         else:
             self._render_fallbacks = getattr(self, "_render_fallbacks", 0) + 1

@@ -97,7 +97,6 @@ class TestStandaloneApp:
         expected = render_chat(chat_request(), resources(tokenizer)).token_ids
         assert prepared.token_ids == expected
         assert prepared.kind == "chat"
-        assert prepared.tokens_trusted is True
         assert "fingerprint" not in response.json()
         assert prepared.request == CHAT_BODY
         # Top-level token_ids, so a client that reads only that field works.
@@ -173,7 +172,7 @@ class TestStandaloneApp:
         assert response.status_code == 400
         assert "Multimodal" in response.json()["message"]
 
-    def test_a_named_tool_choice_comes_back_untrusted(self, client) -> None:
+    def test_a_named_tool_choice_stays_in_the_echoed_request(self, client) -> None:
         body = {
             **CHAT_BODY,
             "tools": [WEATHER_TOOL],
@@ -182,8 +181,8 @@ class TestStandaloneApp:
 
         prepared = client.post("/v1/chat/completions/render", json=body).json()
 
-        assert prepared["tokens_trusted"] is False
-        assert prepared["untrusted_reason"] == "named_tool_choice"
+        # The consumer sees the forced tool in `request`: the worker renders that itself.
+        assert prepared["request"]["tool_choice"] == body["tool_choice"]
         assert prepared["token_ids"]
 
     def test_the_server_template_shapes_the_ids(self, tokenizer) -> None:
@@ -226,14 +225,14 @@ class TestRenderedRequestFields:
         assert rendered["model"] == "m"
         assert rendered["cache_salt"] == "salt"
         # Execution-only and context fields are not part of the response.
-        assert not {"stream", "stream_options", "priority", "render_context"} & set(rendered)
+        omitted = {"stream", "stream_options", "priority", "render_context", "tokens_trusted"}
+        assert not omitted & set(rendered)
 
     def test_without_a_reasoning_parser_there_is_no_reasoning_state(self, client) -> None:
         rendered = client.post("/v1/chat/completions/render", json=CHAT_BODY).json()
 
         assert rendered["reasoning_ended"] is None
         assert rendered["reasoning_parser_kwargs"] is None
-        assert rendered["tokens_trusted"] is True
 
     @pytest.mark.parametrize(
         ("marker", "ended"), [(OPEN, False), (CLOSED, True)], ids=["open", "closed"]
@@ -250,17 +249,6 @@ class TestRenderedRequestFields:
             "chat_template_kwargs": {"enable_thinking": False}
         }
 
-    def test_ids_that_carry_a_reasoning_decision_are_not_trusted(self) -> None:
-        # A request holding only these ids could not tell the worker the reasoning mode.
-        rendered = (
-            TestClient(self._app(self.OPEN))
-            .post("/v1/chat/completions/render", json=CHAT_BODY)
-            .json()
-        )
-
-        assert rendered["tokens_trusted"] is False
-        assert "cannot be forwarded" in rendered["untrusted_reason"]
-
     def test_a_prompt_that_says_nothing_leaves_reasoning_ended_unset(self, tokenizer) -> None:
         app = build_render_app(resources(tokenizer, reasoning_parser="poolside_v1"))
 
@@ -268,7 +256,6 @@ class TestRenderedRequestFields:
 
         assert rendered["reasoning_ended"] is None
         assert rendered["reasoning_parser_kwargs"] == {"chat_template_kwargs": {}}
-        assert rendered["tokens_trusted"] is True
 
     def test_each_completion_prompt_gets_its_own_request_id(self, client) -> None:
         body = {"model": "m", "prompt": ["hello", "world"]}

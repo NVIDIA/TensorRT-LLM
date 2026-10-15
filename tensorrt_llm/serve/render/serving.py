@@ -21,15 +21,13 @@ renderer process.
 Supported integration. The render routes are *routing-only rendering* for a consumer
 such as the Dynamo EPP: it reads ``token_ids`` to compute KV-cache block hashes, forwards
 the original request unchanged, and leaves the worker to render it. Such a consumer does
-not use ``schema_version`` or ``tokens_trusted``, so a router built on the ids alone must
-itself decide what to do when ``tokens_trusted`` is false (a named ``tool_choice``: the ids
-are a good estimate but not the executed prompt) or when the renderer's
-``render_fingerprint`` differs from a worker's (both on ``GET /server_info``, compared once
-when the worker is admitted): the ids are then an estimate and routing quality, not
-correctness, is what is at stake. A consumer that
+not use ``schema_version``. When the renderer's ``render_fingerprint`` differs from a
+worker's (both on ``GET /server_info``, compared once when the worker is admitted), the ids
+are an estimate and routing quality, not correctness, is what is at stake. A consumer that
 wants the worker to execute the ids without rendering uses the worker's existing token-in
 routes (``/v1/completions`` with token ids as the prompt, ``/v1/chat/completions`` with
-``prompt_token_ids``); there is no separate execution endpoint here.
+``prompt_token_ids``); there is no separate execution endpoint here. A named ``tool_choice``
+is the exception, as the ``request`` it echoes shows: the worker renders that request itself.
 """
 
 from __future__ import annotations
@@ -154,20 +152,10 @@ class ServingRender:
                 raise
             raise RenderRequestError(400, str(error)) from error
         context = PreparedContext.model_validate(rendered.context)
-        tokens_trusted, untrusted_reason = rendered.tokens_trusted, rendered.untrusted_reason
-        if not context.is_trivial():
-            # Same rule as the router: a request that carries only ids cannot make the
-            # decisions the worker reads off the rendered text.
-            tokens_trusted = False
-            untrusted_reason = untrusted_reason or (
-                "serving decisions derived from the rendered prompt cannot be forwarded"
-            )
         return RenderedRequest(
             kind="chat",
             request_id=f"chatcmpl-{uuid.uuid4().hex}",
             token_ids=rendered.token_ids,
-            tokens_trusted=tokens_trusted,
-            untrusted_reason=untrusted_reason,
             request=original,
             **_request_fields(request),
             **_reasoning_fields(request, resources, context),
