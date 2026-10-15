@@ -1143,12 +1143,20 @@ class PyTorchModelEngine(ModelEngine):
                 DsaDecodeMetadataProvider
             prefetcher.register("dsa_decode_metadata",
                                 DsaDecodeMetadataProvider(self.batch_size))
-        from ..attention.backends.sparse.glm_kpool import kernels as kpool_kernels
+        from ..attention.backends.sparse.glm_kpool import \
+            kernels as kpool_kernels
         if kpool_kernels.KPOOL_LAUNCH_TEMPLATE:
             from ..attention.backends.sparse.glm_kpool.jit_prefetch import \
                 GlmKpoolProvider
             prefetcher.register("glm_kpool",
                                 GlmKpoolProvider(self.max_num_tokens))
+        sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
+        if getattr(sparse_cfg, "algorithm", None) == "minimax_m3":
+            from ..attention.backends.sparse.minimax_m3.jit_prefetch import \
+                MiniMaxM3TritonProvider
+            m3_provider = MiniMaxM3TritonProvider(self.model, self.max_seq_len)
+            if m3_provider:
+                prefetcher.register("minimax_m3_triton", m3_provider)
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
