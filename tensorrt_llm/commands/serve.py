@@ -1452,15 +1452,19 @@ def serve(
             disagg_cluster_config = DisaggClusterConfig(
                 cluster_uri=disagg_cluster_uri)
 
-        if metadata_server_cfg is not None or disagg_cluster_config is not None:
-            assert (
-                server_role is not None
-            ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
+        # Resolve the role whenever it is given: standalone disaggregated
+        # workers pass --server_role without a metadata server or cluster
+        # config, and OpenAIServer expects a ServerRole, not the CLI string.
+        if server_role is not None:
             try:
                 server_role = ServerRole[server_role.upper()]
             except KeyError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+        if metadata_server_cfg is not None or disagg_cluster_config is not None:
+            assert (
+                server_role is not None
+            ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
         # Parse media_io_kwargs from JSON string to dict if provided
         parsed_media_io_kwargs = None
         if media_io_kwargs is not None:
