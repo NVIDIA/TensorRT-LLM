@@ -48,6 +48,8 @@ def manager(monkeypatch) -> MiniMaxM3KVCacheManagerV2:
         self.is_disagg = False
         self.dtype = DataType.BF16
         self.layer_offsets = {3: 0}
+        # _prepare_page_table_tensor's result for the two-pool host table the copy tests build.
+        self.num_attention_op_pools = 2
 
     def no_index_k_buffer(self, layer_idx, **kwargs):
         del self, layer_idx, kwargs
@@ -56,9 +58,13 @@ def manager(monkeypatch) -> MiniMaxM3KVCacheManagerV2:
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", no_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
-    return MiniMaxM3KVCacheManagerV2(
-        num_layers=4, sparse_attention_config=MiniMaxM3SparseAttentionConfig()
-    )
+    # The constructor resolves every layer's K/V view, which needs a real pool. Stub it there
+    # only: the pool-view tests below call get_buffers against their own geometry.
+    with monkeypatch.context() as construction:
+        construction.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
+        return MiniMaxM3KVCacheManagerV2(
+            num_layers=4, sparse_attention_config=MiniMaxM3SparseAttentionConfig()
+        )
 
 
 # ---------------------------------------------------------------------------
