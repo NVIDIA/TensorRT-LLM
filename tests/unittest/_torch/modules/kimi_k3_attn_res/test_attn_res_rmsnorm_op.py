@@ -453,10 +453,12 @@ def test_model_helper_rejects_fused_add_above_token_ceiling() -> None:
         (32, 3),  # production max_batch_size, top of the measured window
     ],
 )
+@pytest.mark.parametrize("default_ceiling", [False, True], ids=["env_ceiling", "default_ceiling"])
 @torch.no_grad()
 def test_model_helper_dispatches_fused_attn_res_rmsnorm(
     num_tokens: int,
     num_snapshots: int,
+    default_ceiling: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (
@@ -507,15 +509,21 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
         "_apply_attn_res",
         unexpected_fallback,
     )
-    # The ceiling is configurable through KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS;
-    # keep every parametrized token count inside it for the dispatch
-    # assertion, so this test covers the multi-token fused kernel whatever the
-    # environment sets.
-    monkeypatch.setattr(
-        modeling_kimi_linear,
-        "_FUSED_ATTN_RES_MAX_TOKENS",
-        max(num_tokens, modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS),
-    )
+    if default_ceiling:
+        # The ceiling the default per_token topology resolves to without
+        # KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS must already cover these steps.
+        monkeypatch.delenv(
+            modeling_kimi_linear.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False
+        )
+        monkeypatch.setattr(modeling_kimi_linear, "_ATTN_RES_TOPOLOGY", "per_token")
+        ceiling = modeling_kimi_linear._read_fused_attn_res_max_tokens()
+    else:
+        # The ceiling is configurable through KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS;
+        # keep every parametrized token count inside it for the dispatch
+        # assertion, so this case covers the multi-token fused kernel whatever
+        # the environment sets.
+        ceiling = max(num_tokens, modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS)
+    monkeypatch.setattr(modeling_kimi_linear, "_FUSED_ATTN_RES_MAX_TOKENS", ceiling)
     actual = _apply_attn_res_and_rmsnorm(
         prefix_sum,
         block_kernel_layout,
