@@ -352,6 +352,15 @@ def test_item_encode_runs_inside_nccl_window_tensor_scope(
 
     monkeypatch.setattr(model, "forward_multimodal_encoder_items", scoped_forward)
     request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+    state = request.py_mm_encoder_state
+    record = state.record
+    record_in_scope = []
+
+    def scoped_record(item_idx: int, output: torch.Tensor) -> None:
+        record_in_scope.append(bool(in_scope))
+        record(item_idx, output)
+
+    monkeypatch.setattr(state, "record", scoped_record)
     mm_item_scheduler.forward_items([request], {1: [0, 1]})
 
     # Window tensors from the encoder are released at the scope boundary, so
@@ -359,6 +368,7 @@ def test_item_encode_runs_inside_nccl_window_tensor_scope(
     assert len(scope_inputs) == 1
     assert forward_in_scope == [True]
     assert put_in_scope == [True, True]
+    assert record_in_scope == [True, True]
     assert is_multimodal_encoder_ready(request)
 
     # A full cache hit runs no encoder and opens no scope.
