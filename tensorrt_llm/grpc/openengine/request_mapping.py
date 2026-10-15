@@ -3,22 +3,31 @@
 
 """Translate an OpenEngine GenerateRequest into TensorRT-LLM request inputs."""
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlparse
 
 import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.media_io import ImageMediaIO
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from .bindings import generation_pb2
-from .capabilities import supported_guides
+from .capabilities import media_placeholder, supported_guides, supported_media_modalities
 from .errors import UnsupportedFeatureError
 
 # Cap on the number of stop conditions. Each one costs a KMP automaton per
 # output index and a scan of every generated token, so an unbounded list lets a
 # single request tax the event loop for the whole stream.
 _MAX_STOP_CONDITIONS = 64
+# Media decoding can retain both encoded and decoded image buffers. Keep one
+# request from scheduling an unbounded number of fetch/decode tasks or holding
+# an unbounded amount of image data while preserving practical multi-image use.
+_MAX_MEDIA_ITEMS = 64
+_MAX_CONCURRENT_MEDIA_LOADS = 8
 _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
 _DETOKENIZE_EXTRA_KEY = "detokenize"
 
@@ -244,13 +253,118 @@ def _metadata_from_context(
     return headers or None, target_dp_rank, affinity_headers
 
 
-def _input_from_request(request: generation_pb2.GenerateRequest) -> str | dict[str, list[int]]:
+def _base_input_from_request(
+    request: generation_pb2.GenerateRequest,
+) -> str | dict[str, list[int]]:
     input_kind = request.WhichOneof("input")
     if input_kind == "prompt":
         return request.prompt
     if input_kind == "token_ids":
         return {"prompt_token_ids": request.token_ids.ids[:]}
     raise ValueError("exactly one of prompt or token_ids must be set")
+
+
+def _image_io_for_model(llm: Any) -> ImageMediaIO:
+    """Create image I/O using the loaded model's preferred decode format."""
+    input_processor = getattr(llm, "input_processor", None)
+    defaults = None
+    if isinstance(input_processor, BaseMultimodalInputProcessor):
+        preferences = input_processor.get_preferred_media_io_kwargs() or {}
+        defaults = preferences.get("image")
+    return ImageMediaIO.create(defaults, None)
+
+
+async def _load_image_item(
+    item: generation_pb2.MediaItem, image_io: ImageMediaIO, index: int
+) -> Any:
+    """Resolve and decode one OpenEngine image item."""
+    source = item.WhichOneof("source")
+    if source is None:
+        raise ValueError(f"media[{index}] must set exactly one source")
+    if source == "url":
+        if urlparse(item.url).scheme.lower() not in ("http", "https"):
+            raise ValueError(f"media[{index}].url must use http or https")
+        value = item.url
+    elif source == "data_uri":
+        if urlparse(item.data_uri).scheme.lower() != "data":
+            raise ValueError(f"media[{index}].data_uri must use the data scheme")
+        value = item.data_uri
+    elif source == "raw_bytes":
+        if item.mime_type and not item.mime_type.lower().startswith("image/"):
+            raise ValueError(f"media[{index}].mime_type must be an image type for raw image bytes")
+        try:
+            return await image_io.async_load_bytes(bytes(item.raw_bytes))
+        except Exception as error:
+            raise ValueError(f"media[{index}].raw_bytes could not be decoded: {error}") from error
+    else:
+        raise ValueError(f"media[{index}] has an unknown source '{source}'")
+
+    try:
+        return await image_io.async_load(value)
+    except Exception as error:
+        raise ValueError(f"media[{index}].{source} could not be loaded: {error}") from error
+
+
+async def _input_from_request(
+    request: generation_pb2.GenerateRequest, llm: Any
+) -> str | dict[str, Any]:
+    """Build LLM API inputs, resolving image media off the event loop."""
+    inputs = _base_input_from_request(request)
+    if not request.media:
+        return inputs
+
+    supported = supported_media_modalities(llm)
+    for index, item in enumerate(request.media):
+        if item.modality == generation_pb2.MODALITY_UNSPECIFIED:
+            raise ValueError(f"media[{index}].modality must be set")
+        if item.modality != generation_pb2.MODALITY_IMAGE:
+            modality = generation_pb2.Modality.Name(item.modality).removeprefix("MODALITY_").lower()
+            supported_text = ", ".join(sorted(supported)) or "none"
+            raise UnsupportedFeatureError(
+                f"multimodal modality '{modality}' is not supported by the loaded model; "
+                f"supported modalities: {supported_text}"
+            )
+    if "image" not in supported:
+        raise UnsupportedFeatureError("image input is not supported by the loaded model")
+    if len(request.media) > _MAX_MEDIA_ITEMS:
+        raise ValueError(
+            f"at most {_MAX_MEDIA_ITEMS} media items are supported per request, "
+            f"got {len(request.media)}"
+        )
+
+    image_io = _image_io_for_model(llm)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEDIA_LOADS)
+
+    async def load_bounded(item: generation_pb2.MediaItem, index: int) -> Any:
+        async with semaphore:
+            return await _load_image_item(item, image_io, index)
+
+    tasks = [
+        asyncio.create_task(load_bounded(item, index)) for index, item in enumerate(request.media)
+    ]
+    try:
+        images = await asyncio.gather(*tasks)
+    except (Exception, asyncio.CancelledError):
+        # `gather` propagates the first failure without cancelling siblings.
+        # Explicitly stop any in-flight URL fetches/decodes before returning
+        # the request error so their memory and connections do not linger.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    mapped: dict[str, Any] = {"prompt": inputs} if isinstance(inputs, str) else dict(inputs)
+    mapped["multi_modal_data"] = {"image": images}
+    if any(item.uuid for item in request.media):
+        mapped["multi_modal_uuids"] = {"image": [item.uuid or None for item in request.media]}
+    mapped["mm_item_order"] = [
+        {
+            "modality": "image",
+            "index": index,
+            "placeholder": media_placeholder(llm, "image", index + 1),
+        }
+        for index in range(len(request.media))
+    ]
+    return mapped
 
 
 __all__ = [

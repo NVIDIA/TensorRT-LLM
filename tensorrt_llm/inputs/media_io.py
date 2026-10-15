@@ -1002,6 +1002,10 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
+    async def async_load_bytes(self, data: bytes) -> _MediaT:
+        """Decode in-memory media without blocking the event loop."""
+        return await self._run_in_executor(self.load_bytes, data)
+
     @staticmethod
     async def _run_in_executor(fn, *args, **kwargs):
         """Run a blocking decode callable on the configured executor."""
