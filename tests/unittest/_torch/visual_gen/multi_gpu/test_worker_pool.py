@@ -229,6 +229,21 @@ def test_lifetime_value_is_validated(monkeypatch):
         pool_mod.lifetime()
 
 
+def test_rank_dead_while_idle_retires_pool(tmp_path):
+    p = str(tmp_path / "pid")
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
+    first = _read_pids(p, 2)
+    os.kill(first[1], signal.SIGKILL)
+    deadline = time.monotonic() + _TIMEOUT
+    while (
+        not _pid_gone(first[1]) and next(iter(pool_mod._POOLS.values()))._ranks[1].proc.is_alive()
+    ):
+        assert time.monotonic() < deadline
+        time.sleep(0.1)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
+    assert set(_read_pids(p, 2)).isdisjoint(first)
+
+
 def test_env_change_retires_pool(tmp_path, monkeypatch):
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)

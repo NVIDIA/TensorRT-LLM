@@ -591,6 +591,10 @@ def _acquire(
 ) -> _Pool:
     key = (world_size, backend, preload)
     pool = _POOLS.pop(key, None)
+    if pool is not None and not all(r.proc.is_alive() for r in pool._ranks):
+        # Died while parked (OOM killer, NCCL watchdog): not this test's failure.
+        _retire(pool, "rank died while idle")
+        pool = None
     if pool is not None and pool.snapshot != _spawn_snapshot():
         _retire(pool, "env/sys.path changed since spawn")
         pool = None
