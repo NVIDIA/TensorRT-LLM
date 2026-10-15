@@ -630,7 +630,14 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
     position_ids: Optional[torch.Tensor],
     attn_metadata: AttentionMetadata,
 ) -> bool:
-    """Whether q_b can use the SM107 GEMM, norm, and RoPE fusion."""
+    """Whether q_b can use the SM107 GEMM, norm, and RoPE fusion.
+
+    Decode-only by design: the gate reads the Q lengths from
+    ``attn_metadata.cu_q_seqlens``, which DeepSeek V4 metadata does not set, or,
+    for pure generation batches, from ``cu_seq_lens_cuda``. Context and mixed
+    batches therefore take the unfused path, and the context-side handling below
+    and in the thop op is not exercised yet.
+    """
     if os.environ.get("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", "0") == "1":
         return False
     num_contexts = attn_metadata.num_contexts
@@ -694,8 +701,10 @@ def _dsv4_q_b_gemm_cu_q_seqlens(
 ) -> Optional[torch.Tensor]:
     """Per-phase cumulative Q lengths for the fused q_b GEMM.
 
-    Context batches take the ragged prefix sums from the DSA metadata; pure
-    generation batches slice the uniform generation prefix sums.
+    Pure generation batches slice the uniform generation prefix sums. The
+    context branch (ragged prefix sums from the DSA metadata) is not reached
+    today, because the fusion gate rejects context batches; see
+    ``_is_dsv4_q_b_gemm_norm_rope_fusion_enabled``.
     """
     if attn_metadata.cu_q_seqlens is not None:
         return attn_metadata.cu_q_seqlens
@@ -718,8 +727,9 @@ def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
 
     Returns `(q_shape_carrier, quant_q_buffer, quant_scale_qkv)`. The FP8 buffer
     holds the complete rotated Q, so downstream consumers only read the carrier's
-    leading dimension: context keeps the compact q_lora tensor, generation gets a
-    full-width placeholder for the shared q_pe view.
+    leading dimension: generation gets a full-width placeholder for the shared
+    q_pe view. The context carrier (the compact q_lora tensor) is kept for a
+    future prefill path; the gate admits only generation batches today.
     """
     assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
     assert q.is_contiguous(), "fused q_b GEMM needs a contiguous q_lora"
@@ -1182,7 +1192,8 @@ def forward_context_sparse_attn(
     fused_q_pe = getattr(self, "_fused_q_pe", None)
     quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
     # With the q_b GEMM fusion, `q` is the compact q_lora tensor and the FP8 buffer
-    # already holds the rotated Q; the op takes no q_pe in that case.
+    # already holds the rotated Q; the op takes no q_pe in that case. Not reached
+    # today: the q_b fusion gate admits only generation batches.
     fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
         quant_q_buffer is not None
