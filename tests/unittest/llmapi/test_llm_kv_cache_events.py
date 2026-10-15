@@ -36,7 +36,7 @@ global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
                                       max_tokens=256,
-                                      use_kv_cache_manager_v2=False)
+                                      use_kv_cache_manager_v2=True)
 
 
 def create_kv_cache_manager():
@@ -48,7 +48,8 @@ def create_kv_cache_manager():
     max_batch_size = 1
     mapping = Mapping()
     return KVCacheManager(
-        kv_cache_config=global_kvcache_config,
+        kv_cache_config=global_kvcache_config.model_copy(
+            update={"use_kv_cache_manager_v2": False}),
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
         SELF,
         num_layers=num_layers,
