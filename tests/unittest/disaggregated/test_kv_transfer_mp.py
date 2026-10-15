@@ -73,7 +73,6 @@ def _instance_mapping(**kwargs) -> Mapping:
     return mapping
 
 
-
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
     # Use CPU tensors for gloo backend compatibility
