@@ -4360,8 +4360,9 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     ``extract_mamba_kv_cache_params`` forces the KDA delta-rule (ssm) pool to
     fp32 but leaves the short-convolution pool at the model dtype, so what the
     context rank serializes and the generation rank restores for the conv slot
-    is bf16 while the SA replay caches the generation rank rebuilds from it are
-    fp32. Seeding must widen the restored rows losslessly, keep the logical
+    is bf16, the same dtype as the replay conv caches the generation rank
+    rebuilds from it (k / v / beta replay caches are bf16 too, the gate cache
+    fp32). Seeding must copy the restored rows bit for bit, keep the logical
     shape, leave the restored bf16 pool itself untouched so the decode path
     reuses exactly what was transferred, and clear only the draft scratch of
     the seeded slots.
@@ -4379,16 +4380,18 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     mgr.all_conv_states = [(torch.randn(4, 6, 4) * 0.1).to(torch.bfloat16) for _ in range(2)]
     restored = [conv.clone() for conv in mgr.all_conv_states]
 
+    # Same dtypes as _allocate_pool_replay_buffers: bf16 conv / k / v / beta
+    # replay caches, fp32 gate cache.
     def dim_contiguous_conv_cache() -> torch.Tensor:
-        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+        return torch.full((2, 4, 6, 2), 7.0, dtype=torch.bfloat16).transpose(-1, -2)
 
     mgr.kda_conv_q = dim_contiguous_conv_cache()
     mgr.kda_conv_k = dim_contiguous_conv_cache()
     mgr.kda_conv_v = dim_contiguous_conv_cache()
-    mgr.kda_k_cache = torch.full((2, 4, 2, 2), 7.0)
-    mgr.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
-    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
-    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+    mgr.kda_k_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    mgr.kda_g_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.float32)
+    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0, dtype=torch.bfloat16)
 
     mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
 
@@ -4400,15 +4403,15 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
                 (mgr.kda_conv_k, 2),
                 (mgr.kda_conv_v, 4),
             ):
-                # fp32 replay cache, logical shape unchanged by the widening.
-                assert replay_buffer.dtype is torch.float32
+                # bf16 replay cache, logical shape unchanged by the seeding.
+                assert replay_buffer.dtype is torch.bfloat16
                 seeded = replay_buffer[layer_offset, slot, :, :4]
                 assert seeded.shape == (2, 4)
-                # bf16 -> fp32 is lossless, so the restored values must survive
-                # the widening bit for bit.
+                # Same dtype on both sides: the restored values are copied bit
+                # for bit.
                 torch.testing.assert_close(
                     seeded,
-                    conv_state[slot, start : start + 2, :].float(),
+                    conv_state[slot, start : start + 2, :],
                     rtol=0,
                     atol=0,
                 )
