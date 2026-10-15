@@ -1906,7 +1906,6 @@ class Glm5NextModel(DecoderModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        streams = self.expand_streams(inputs_embeds)
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         # Only the decoder stack: under one-model MTP the speculative base
@@ -1917,7 +1916,10 @@ class Glm5NextModel(DecoderModel):
         # engine's warmup / KV-cache sizing pass measures the same activation
         # peak that mixed context+generation iterations reach in production.
         if self._fused_hc_ok():
-            return self.collapse_streams(self._forward_single_phase_fused_hc(streams, runtime_ctx))
+            return self.collapse_streams(
+                self._forward_single_phase_fused_hc(inputs_embeds, runtime_ctx)
+            )
+        streams = self.expand_streams(inputs_embeds)
         for layer_idx in range(self.schedule.num_layers):
             streams = self.layers[layer_idx](
                 position_ids=position_ids,
@@ -1939,7 +1941,7 @@ class Glm5NextModel(DecoderModel):
         return cached
 
     def _forward_single_phase_fused_hc(
-        self, streams: torch.Tensor, runtime_ctx: Glm5NextRuntimeContext
+        self, embeds: torch.Tensor, runtime_ctx: Glm5NextRuntimeContext
     ) -> torch.Tensor:
         """Single-phase forward with fused hyper-connection boundaries.
 
@@ -1950,11 +1952,15 @@ class Glm5NextModel(DecoderModel):
         of 4 mappings + 2 norms. The math matches the per-layer forward; the
         first pre-mapping and last post-mapping stay unfused. Pipeline-parallel
         ranks keep the per-layer path (see :meth:`_fused_hc_ok`).
+
+        Only ``residual`` holds the streams and each sublayer output is dropped
+        once its boundary consumed it, so a long prefill keeps one copy of the
+        [tokens, hc_mult, hidden] streams alive, as the per-layer loop does.
         """
         num_layers = self.schedule.num_layers
         first = self.layers[0]
-        residual = streams
-        post, comb, x = first.hc_attn.pre_mapping(streams)
+        residual = self.expand_streams(embeds)
+        post, comb, x = first.hc_attn.pre_mapping(residual)
         x = first.input_layernorm(x)
         for layer_idx in range(num_layers):
             layer = self.layers[layer_idx]
@@ -1970,6 +1976,7 @@ class Glm5NextModel(DecoderModel):
                 norm_weight=layer.post_attention_layernorm.weight,
                 norm_eps=layer.post_attention_layernorm.variance_epsilon,
             )
+            del attn_out
             mlp_out = layer.run_mlp(x, runtime_ctx.metadata.all_rank_num_tokens)
             if layer_idx + 1 < num_layers:
                 nxt = self.layers[layer_idx + 1]
@@ -1983,6 +1990,7 @@ class Glm5NextModel(DecoderModel):
                 )
             else:
                 residual = layer.hc_ffn.post_mapping(mlp_out, residual, post, comb)
+            del mlp_out
         return residual
 
     def expand_streams(self, embeds: torch.Tensor) -> torch.Tensor:
