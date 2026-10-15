@@ -3,12 +3,11 @@
 """GPU test for the target's Gated-DeltaNet verify step in both recurrent modes.
 
 Drives the two targets' own `_gdn_verify` -- the prefill target's (generation rows
-behind a context prefix: q/k/v views, no `packed_qkv`) and the decode target's (the
-conv rows as `packed_qkv`) -- over consecutive verify steps of this checkpoint's GDN
-geometry, with the cache manager's bookkeeping run in between as `update_mamba_states`
-runs it: the conv window promotion in both modes, then either the legacy per-step state
-promotion, or the cached replay's all-layer commit (partitioned batches only) and
-`_advance_replay_state`.
+behind a context prefix) and the decode target's -- over consecutive verify steps of
+this checkpoint's GDN geometry, with the cache manager's bookkeeping run in between as
+`update_mamba_states` runs it: the conv window promotion in both modes, then either the
+legacy per-step state promotion, or the cached replay's all-layer commit (partitioned
+batches only) and `_advance_replay_state`.
 
 Three things are checked at every step, with a random partial acceptance:
 

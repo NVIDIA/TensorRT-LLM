@@ -1944,9 +1944,7 @@ def _sort_selection(topk_indices: torch.Tensor) -> None:
     topk_indices.copy_(torch.where(ordered == _SELECTION_PAD_KEY, -1, ordered))
 
 
-def _replay_verify(
-    core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, packed_qkv
-) -> torch.Tensor:
+def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay) -> torch.Tensor:
     """One GDN layer's verify recurrence under the cached replay: `n` generation sequences
     of `p` rows over the conv output `mq_out` (`[n * p, conv_dim]`, token-major) and the
     raw `a`/`b` projections, with the fp32 gating parameters fused into the kernel.
@@ -1954,8 +1952,8 @@ def _replay_verify(
     `replay` is `(work_items, n_writes, partitioned)`; the work items are given exactly
     when the manager runs its all-layer commit after the step (without that commit every
     history wrap goes uncommitted, with it a wrap committed here is committed twice).
-    `packed_qkv` is `mq_out` when it is the contiguous conv rows themselves, else None
-    and q/k/v go in as views the kernel copies. The conv before it does not signal
+    `mq_out` is the conv's fresh, contiguous output, so the kernel reads q/k/v from it
+    directly (`packed_qkv`) and never from the views. The conv before it does not signal
     dependents, so the kernel launches without PDL."""
     work_items, n_writes, partitioned = replay
     state = core._bound.replay
@@ -1989,7 +1987,7 @@ def _replay_verify(
         use_l2_streaming_inputs=None,
         use_l2_shared_inputs=None,
         main_num_stages=None,
-        packed_qkv=packed_qkv,
+        packed_qkv=mq_out,
         use_all_layer_commit=partitioned,
         output=None,
     )
@@ -2462,11 +2460,7 @@ class PrefillTarget:
         # Back to token-major (a view).
         mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
         if replay is not None:
-            # Behind a context prefix: q/k/v go in as views over the conv rows and the
-            # kernel copies them (the entry's mixed-batch form, no `packed_qkv`).
-            return _replay_verify(
-                core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, None
-            )
+            return _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
         q, k, v = pack_gdn_decode_qkv(
             mq_out, core.num_k_heads, core.head_k_dim, core.num_v_heads, core.head_v_dim
         )
@@ -3798,10 +3792,7 @@ class DecodeTarget:
         # Back to token-major (a view).
         mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
         if replay is not None:
-            # The conv rows themselves, contiguous: the q/k/v views are never read.
-            return _replay_verify(
-                core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, mq_out
-            )
+            return _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
         q, k, v = pack_gdn_decode_qkv(
             mq_out, core.num_k_heads, core.head_k_dim, core.num_v_heads, core.head_v_dim
         )
