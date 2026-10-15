@@ -27,8 +27,8 @@ from pydantic import ValidationError
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.serve import serving_extensions
 from tensorrt_llm.serve.render import (
-    GENERATE_REQUEST_SCHEMA_VERSION,
-    GenerateRequest,
+    RENDERED_REQUEST_SCHEMA_VERSION,
+    RenderedRequest,
     RenderResources,
     UnsupportedRenderError,
     compute_fingerprint,
@@ -739,22 +739,22 @@ class TestResourcesFromServer:
         assert res.input_processor is None
 
 
-class TestGenerateRequest:
+class TestRenderedRequest:
     def test_round_trips_and_carries_the_schema_version(self) -> None:
-        body = GenerateRequest(token_ids=[1, 2, 3], request={"model": "m"})
-        again = GenerateRequest.model_validate_json(body.model_dump_json())
+        body = RenderedRequest(token_ids=[1, 2, 3], request={"model": "m"})
+        again = RenderedRequest.model_validate_json(body.model_dump_json())
 
         assert again == body
-        assert again.schema_version == GENERATE_REQUEST_SCHEMA_VERSION
+        assert again.schema_version == RENDERED_REQUEST_SCHEMA_VERSION
         assert again.tokens_trusted is True
 
     def test_unknown_fields_are_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            GenerateRequest(token_ids=[1], surprise=True)
+            RenderedRequest(token_ids=[1], surprise=True)
 
     def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
         with pytest.raises(ValidationError):
-            GenerateRequest(fingerprint={"digest": "abc"}, token_ids=[1])
+            RenderedRequest(fingerprint={"digest": "abc"}, token_ids=[1])
 
 
 class TestLegacySwitch:

@@ -32,18 +32,18 @@ from .chat import (
 )
 from .fingerprint import compute_fingerprint, fingerprint_summary, fingerprints_match
 from .prompt_types import (
-    GENERATE_REQUEST_SCHEMA_VERSION,
-    GenerateRequest,
+    RENDERED_REQUEST_SCHEMA_VERSION,
     PreparedContext,
     RenderedPrompt,
+    RenderedRequest,
     UnsupportedRenderError,
 )
 from .resources import RenderResources, harmony_enabled_for
 from .serving import RenderRequestError, ServingRender
 
 __all__ = [
-    "GENERATE_REQUEST_SCHEMA_VERSION",
-    "GenerateRequest",
+    "RENDERED_REQUEST_SCHEMA_VERSION",
+    "RenderedRequest",
     "PreparedChat",
     "PreparedContext",
     "RenderRequestError",

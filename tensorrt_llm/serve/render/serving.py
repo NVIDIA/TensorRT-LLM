@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The render endpoints' logic: request body in, prepared ``GenerateRequest`` out.
+"""The render endpoints' logic: request body in, prepared ``RenderedRequest`` out.
 
 One :class:`ServingRender` backs both ways of exposing rendering over HTTP: the
 routes mounted on a normal ``trtllm-serve`` worker and the standalone CPU-only
@@ -40,7 +40,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 from .chat import arender_chat, tokenize_rendered
-from .prompt_types import GenerateRequest, UnsupportedRenderError
+from .prompt_types import RenderedRequest, UnsupportedRenderError
 from .resources import RenderResources
 
 # Top-level request fields that a Dynamo gateway adds for its own routing and
@@ -92,7 +92,7 @@ class ServingRender:
             self._fingerprint = self._resources_factory().fingerprint()
         return self._fingerprint
 
-    async def render_chat(self, body: Dict[str, Any]) -> GenerateRequest:
+    async def render_chat(self, body: Dict[str, Any]) -> RenderedRequest:
         """Render a chat-completions body into a prepared request."""
         from pydantic import ValidationError
 
@@ -125,7 +125,7 @@ class ServingRender:
             if not resources.use_harmony:
                 raise
             raise RenderRequestError(400, str(error)) from error
-        return GenerateRequest(
+        return RenderedRequest(
             kind="chat",
             token_ids=rendered.token_ids,
             tokens_trusted=rendered.tokens_trusted,
@@ -133,7 +133,7 @@ class ServingRender:
             request=original,
         )
 
-    async def render_completion(self, body: Dict[str, Any]) -> List[GenerateRequest]:
+    async def render_completion(self, body: Dict[str, Any]) -> List[RenderedRequest]:
         """Render a completions body into one prepared request per prompt."""
         from pydantic import ValidationError
 
@@ -145,7 +145,7 @@ class ServingRender:
         except ValidationError as error:
             raise RenderRequestError(400, str(error)) from error
         resources = self._resources_factory()
-        results: List[GenerateRequest] = []
+        results: List[RenderedRequest] = []
         for prompt in _normalize_completion_prompts(request.prompt):
             if isinstance(prompt, str):
                 try:
@@ -161,7 +161,7 @@ class ServingRender:
             else:
                 token_ids = list(prompt)
             results.append(
-                GenerateRequest(
+                RenderedRequest(
                     kind="completion",
                     token_ids=token_ids,
                     request={**body, "prompt": token_ids},
