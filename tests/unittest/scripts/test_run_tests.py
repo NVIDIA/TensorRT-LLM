@@ -118,5 +118,42 @@ class RenderTestListTest(unittest.TestCase):
         self.assertEqual(isolate, [ATTENTION_DIR])
 
 
+class RunIsolatedTestsSummaryTest(unittest.TestCase):
+    def _run(self, write_rerun_0):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        output_dir = Path(tmp.name)
+        isolate_list = output_dir / "isolate.txt"
+        isolate_list.write_text("unittest/a.py\nunittest/b.py\n")
+
+        def fake_check_and_rerun(result_xml, base_cmd, working_dir, out_dir, rerun_tag, *args):
+            if write_rerun_0:
+                rerun_dir = Path(out_dir, "rerun", rerun_tag)
+                rerun_dir.mkdir(parents=True, exist_ok=True)
+                (rerun_dir / "rerun_0.txt").write_text("unittest/b.py\n")
+            return False, []
+
+        # The first isolated test passes, the second fails after > 10 min.
+        pytest_results = iter([(0, 30.0, []), (1, 700.0, [])])
+        with (
+            mock.patch.object(
+                run_tests, "run_pytest", side_effect=lambda *a, **k: next(pytest_results)
+            ),
+            mock.patch.object(run_tests, "check_and_rerun", side_effect=fake_check_and_rerun),
+            mock.patch.object(run_tests, "print_phase_summary") as summary,
+        ):
+            run_tests.run_isolated_tests(
+                "pytest", str(isolate_list), str(output_dir), str(output_dir), "stage", [], 10
+            )
+        _, passed, failed, _ = summary.call_args.args
+        return passed, failed
+
+    def test_failure_not_eligible_for_rerun_is_counted_as_failed(self) -> None:
+        self.assertEqual(self._run(write_rerun_0=True), (1, 1))
+
+    def test_failure_fixed_by_rerun_is_counted_as_passed(self) -> None:
+        self.assertEqual(self._run(write_rerun_0=False), (2, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
