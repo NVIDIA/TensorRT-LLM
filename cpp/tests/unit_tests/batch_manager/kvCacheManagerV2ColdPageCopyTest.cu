@@ -205,14 +205,15 @@ TEST(KvCacheManagerV2BatchedPageCopierTest, PreferredCopyEngineLaunchRoundTrips)
         std::memset(hostBackBytes, 0, total);
         ASSERT_EQ(cudaMemsetAsync(device.get(), 0xEE, total, stream), cudaSuccess);
 
-        // Onboard with a permutation: device page (5 i + 3) mod n receives host page i. Offload with the identity, so
-        // hostBack page (5 i + 3) mod n must equal host page i. 5 is coprime to 1, 12 and 140.
+        // Onboard with a permutation: device page (11 i + 3) mod n receives host page i. Offload with the identity, so
+        // hostBack page (11 i + 3) mod n must equal host page i. 11 is coprime to 12 and 140 (140 = 2^2 x 5 x 7), so
+        // the map is a bijection for every shape here.
         std::vector<PageIndexPair> onboardPairs;
         std::vector<PageIndexPair> offloadPairs;
         std::vector<size_t> destinationOf(shape.numPages);
         for (size_t i = 0; i < shape.numPages; ++i)
         {
-            destinationOf[i] = (5 * i + 3) % shape.numPages;
+            destinationOf[i] = (11 * i + 3) % shape.numPages;
             onboardPairs.push_back(PageIndexPair{static_cast<int32_t>(destinationOf[i]), static_cast<int32_t>(i)});
             offloadPairs.push_back(PageIndexPair{static_cast<int32_t>(i), static_cast<int32_t>(i)});
         }
