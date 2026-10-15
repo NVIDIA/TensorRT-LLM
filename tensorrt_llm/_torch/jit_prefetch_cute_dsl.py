@@ -48,6 +48,7 @@ executor's device and answered by a shim (``device_props`` /
 # string annotations against module globals, where ``cutlass`` is not bound.
 import hashlib
 import inspect
+import itertools
 import json
 import os
 import types
@@ -329,7 +330,61 @@ def _build_topk(s: Dict[str, Any]):
     return cached[0] if isinstance(cached, tuple) else cached
 
 
-_BUILDERS = {_K123: _build_k123, _FI_NORM: _build_fi_norm}
+# CSA2's candidate publication (attention/backends/sparse/csa2/kernel.py),
+# keyed like its ``_launch``: (block_size, padded blocks, sparse block) plus
+# each pointer argument's (element type, assumed alignment).
+_CSA2_PUBLISH = "csa2_candidate_publish"
+
+
+def csa2_publish_spec(block_size: int, padded: int, sparse_block: int, ptrs) -> str:
+    """Spec for one CandidatePublishKernel compile; ``ptrs`` is the five
+    pointer arguments' ``(element type name, assumed alignment)``."""
+    return json.dumps(
+        {
+            "kernel": _CSA2_PUBLISH,
+            "block_size": int(block_size),
+            "padded": int(padded),
+            "sparse_block": int(sparse_block),
+            "ptrs": [[str(e), int(a)] for e, a in ptrs],
+        },
+        sort_keys=True,
+    )
+
+
+def csa2_spec_from_launch_key(key: tuple) -> Optional[str]:
+    """Spec for a ``csa2.kernel._launch`` key, or None if it is not a
+    candidate publication (the only CSA2 glue kernel prefetched)."""
+    (name, *fields), signature = key
+    if name != "candidate_publish":
+        return None
+    block_size, padded, sparse_block = fields[:3]
+    ptrs = [s for s in signature if s is not None]
+    return csa2_publish_spec(block_size, padded, sparse_block, ptrs)
+
+
+def _build_csa2_publish(s: Dict[str, Any]):
+    """Return (kernel, fake args, options) for one candidate publication,
+    with the argument kinds ``csa2.kernel.publish_candidates_`` passes."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .attention.backends.sparse.csa2 import kernel as csa2
+
+    ns = csa2._glue_kernels()
+    fn = ns.CandidatePublishKernel(s["block_size"], s["padded"], s["sparse_block"])
+    ptrs = []
+    for element, align in s["ptrs"]:
+        dtype = getattr(cutlass, element)
+        # Any address with the recorded alignment: the compile reads only the
+        # type and the assumed alignment.
+        ptrs.append(ns.make_ptr(dtype, 1 << 20, cute.AddressSpace.gmem, assumed_align=align))
+    i32, i64 = cutlass.Int32, cutlass.Int64
+    args = [*ptrs, i32(1), i32(1), i32(1), i32(1), i32(1), i64(1), i64(1), i64(1)]
+    args.append(cute.runtime.make_fake_stream())
+    return fn, args, ""
+
+
+_BUILDERS = {_K123: _build_k123, _FI_NORM: _build_fi_norm, _CSA2_PUBLISH: _build_csa2_publish}
 # Builders that return an already compiled kernel instead of (fn, args, options).
 _PRECOMPILED = {_TOPK: _build_topk}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
@@ -804,6 +859,82 @@ class TopKProvider:
                     for runner, key in keys:
                         specs.append(topk_spec(runner, key))
         return sorted(set(specs))
+
+
+class Csa2PublishProvider:
+    """Every CSA2 candidate-publication variant the model's layers can reach.
+
+    ``publish_candidates_`` runs in each candidate-source indexer (a CSA2
+    layer whose ``candidate_source`` is itself) for every scores chunk. Its
+    compile key is the layer's candidate block size and sparse block, the
+    power-of-two block capacity ``padded`` (``next_pow2(ceil(width /
+    block_size))`` for the chunk's score width), and each pointer's element
+    type and the alignment ``_ptr`` gives it: up to 4 bytes for the fp32
+    scores and int32 outputs, 8 for the int64 visible lengths, lowered when
+    the row a chunk starts at is not that aligned. Every capacity up to the
+    kernel's 4096 blocks, the widest a sequence of ``max_seq_len`` positions
+    reaches, times every alignment, is enumerated up front.
+    """
+
+    def __init__(self, model, max_seq_len: int):
+        self.geometries = set()
+        for mod in _modules_with_attention_backends(model):
+            layout = getattr(mod, "layout", None)
+            layer_of = getattr(layout, "layer", None)
+            idx = getattr(mod, "layer_idx", None)
+            if layer_of is None or idx is None or not hasattr(mod, "sparse_block"):
+                continue
+            try:
+                layer = layer_of(idx)
+            except (KeyError, IndexError, ValueError):
+                continue
+            if getattr(layer, "candidate_source", None) != idx:
+                continue
+            self.geometries.add((int(layout.candidate_block_size), int(mod.sparse_block)))
+        self.max_seq_len = max(1, int(max_seq_len))
+
+    def __bool__(self):
+        return bool(self.geometries)
+
+    def enumerate_specs(self) -> List[str]:
+        specs = []
+        for block_size, sparse_block in sorted(self.geometries):
+            blocks = min(4096, -(-self.max_seq_len // block_size))
+            padded, capacities = 1, []
+            while padded < 2 * blocks and padded <= 4096:
+                capacities.append(padded)
+                padded *= 2
+            # (scores, visible, output, sparse ids, sparse counts); without a
+            # sparse block the last two are the output again.
+            score_aligns = (4,)  # fp32 rows of an fp32 tensor
+            visible_aligns = (8,)  # int64 visible lengths
+            out_aligns = (4,)  # int32 rows
+            for padded in capacities:
+                for s_a, v_a, o_a in itertools.product(score_aligns, visible_aligns, out_aligns):
+                    ids_a = o_a if not sparse_block else 4
+                    ptrs = [("Float32", s_a), ("Int64", v_a), ("Int32", o_a),
+                            ("Int32", ids_a), ("Int32", ids_a)]  # fmt: skip
+                    specs.append(csa2_publish_spec(block_size, padded, sparse_block, ptrs))
+        return specs
+
+
+def install_csa2_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
+    """Route CSA2's glue-kernel compiles through ``loader(spec)``; returns
+    False if CSA2 is unavailable."""
+    try:
+        from .attention.backends.sparse.csa2 import kernel as csa2
+    except ImportError:
+        return False
+
+    def _loader(key):
+        try:
+            spec = csa2_spec_from_launch_key(key)
+        except (TypeError, ValueError):
+            return None
+        return None if spec is None else loader(spec)
+
+    csa2.csa2_loader = _loader
+    return True
 
 
 def _flashinfer_norm_uses_cute_dsl() -> bool:

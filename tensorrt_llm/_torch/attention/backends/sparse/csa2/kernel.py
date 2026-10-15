@@ -1140,6 +1140,9 @@ def _glue_kernels():
 
 _COMPILED: dict[tuple, Any] = {}
 _DTYPE_MAP = None
+# Set by the JIT prefetcher (jit_prefetch_cute_dsl.install_csa2_loader):
+# ``loader(key) -> compiled function or None``, consulted before compiling.
+csa2_loader = None
 
 
 def _cute_dtype(dtype: torch.dtype):
@@ -1190,9 +1193,14 @@ def _launch(key: tuple, factory, *args) -> None:
     key = (key, signature)
     compiled = _COMPILED.get(key)
     if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Warm up CSA2 CuTe kernels before CUDA Graph capture")
-        compiled = _COMPILED[key] = ns.cute.compile(factory(), *args)
+        loader = csa2_loader
+        if loader is not None:
+            compiled = loader(key)
+        if compiled is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up CSA2 CuTe kernels before CUDA Graph capture")
+            compiled = ns.cute.compile(factory(), *args)
+        _COMPILED[key] = compiled
     compiled(*args)
 
 

@@ -812,7 +812,9 @@ class JitPrefetcher:
         fn = jcd.load(spec, self._cd_dir)
         if fn is None:
             # The compile that follows is counted by the cute.compile wrapper.
-            if threading.get_ident() == self._executor_thread:
+            if threading.get_ident() == self._executor_thread or (
+                os.environ.get("TLLM_JIT_PREFETCH_DEBUG_KEYS") == "1"
+            ):
                 self._event(f"CuTe DSL variant not prefetched: {spec}")
         else:
             self.stats.cd_loaded += 1
@@ -857,6 +859,21 @@ class JitPrefetcher:
         for spec in specs:
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
         self._event(f"CuTe DSL top-k prefetch: {len(specs)} variant(s)")
+        return True
+
+    def enable_csa2_publish(self, publish_provider) -> bool:
+        """Compile CSA2's candidate-publication variants in the CuTe DSL
+        helpers and have CSA2's glue-kernel launcher load them."""
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if not publish_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_csa2_loader(self._cute_dsl_load):
+            return False
+        specs = publish_provider.enumerate_specs()
+        for spec in specs:
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(f"CSA2 candidate publication prefetch: {len(specs)} variant(s)")
         return True
 
     def enable_flashinfer_norm(self, norm_provider) -> bool:

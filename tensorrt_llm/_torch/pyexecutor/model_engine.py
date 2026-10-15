@@ -1144,6 +1144,10 @@ class PyTorchModelEngine(ModelEngine):
                 draft = getattr(spec_cfg, "max_draft_len", 0) or 0
                 prefetcher.enable_cute_dsl_topk(topk_provider,
                                                 next_ns=sorted({1, 1 + draft}))
+            publish_provider = jcd.Csa2PublishProvider(self.model,
+                                                       self.max_seq_len)
+            if publish_provider:
+                prefetcher.enable_csa2_publish(publish_provider)
         from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
         la_provider = LinearAttnProvider(
             self.model,
