@@ -26,21 +26,26 @@ no captured CUDA graph covers):
 
 What varies from batch to batch is the number of generation requests (an int
 argument of every kernel, and the tuning bucket of the replay update) and the
-16-byte alignment of the per-request inputs, which are row slices starting
-after the context rows (``state_indices[num_prefills:]``,
-``zxbcdt[num_prefill_tokens:]``, ...).
+16-byte alignment of the per-request inputs. Those are row slices of longer
+buffers, and not all from the same row: some start after the context rows
+(``state_indices[num_prefills:]``, ``num_accepted_tokens[num_contexts:]``),
+others at row 0 (``intermediate_state_indices[:num_decodes]``), so in one
+launch some can be aligned and others not.
 
 The launchers are wrapped while warmup runs (``start_recording`` /
 ``stop_recording``): each real call is recorded once per launch class, with
 every per-request tensor (``_BATCH_ARGS``) described independently of the
-batch size. Recording stops at the end of warmup, so serving pays nothing.
-A launch class also fixes the cache pool (its size is a constexpr of the conv
-update and sets the promote kernel's strides), so the classes the final
-executor's warmup records are planned after it, in addition to those of the
-KV-cache estimation pass.
+batch size and of its alignment. Recording stops at the end of warmup, so
+serving pays nothing. A launch class also fixes the cache pool (its size is a
+constexpr of the conv update and sets the promote kernel's strides), so the
+classes the final executor's warmup records are planned after it, in addition
+to those of the KV-cache estimation pass.
+
 The provider then replays each recorded call on ``meta`` tensors under
-``shadow_launches`` for every batch size up to the engine's, with the
-per-request tensors at each alignment a row offset can give them: the
+``shadow_launches`` for every batch size up to the engine's and every
+combination of alignments of the per-request tensors whose alignment a row
+offset can change (rows that are not a multiple of 16 bytes); an argument the
+real call passed as the same tensor as another stays that tensor. The
 launcher's own code derives every Triton argument as the real call would.
 """
 
@@ -48,6 +53,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import itertools
 import threading
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -95,30 +101,35 @@ _PATCHES: List[Tuple[Any, str, Any]] = []
 _RECORDING = False
 
 
-def _spec(value: Any, batched: bool) -> tuple:
-    """A batch-size-independent description of one launcher argument."""
+def _spec(value: Any, batched: bool, same_as: Optional[str]) -> tuple:
+    """A batch-size- and alignment-independent description of one launcher
+    argument. ``same_as`` names an earlier parameter the call passed the same
+    tensor as."""
     if not isinstance(value, torch.Tensor):
         return ("value", value)
+    if same_as is not None:
+        return ("same", same_as)
     if batched and value.dim() >= 1:
+        # Whether a row offset can change the alignment: rows of a multiple
+        # of 16 bytes keep the alignment of the buffer's first row.
+        row_bytes = value.stride(0) * value.element_size()
+        aligned = (value.storage_offset() * value.element_size()) % 16 == 0
         return ("rows", tuple(value.shape[1:]), tuple(value.stride()), value.dtype,
-                value.storage_offset() % 16)  # fmt: skip
+                None if row_bytes % 16 else aligned)  # fmt: skip
     aligned = (value.storage_offset() * value.element_size()) % 16 == 0
     return ("tensor", tuple(value.shape), tuple(value.stride()), value.dtype, aligned)
 
 
-def _meta(spec: tuple, batch: int, row_offset: int) -> Any:
-    """Rebuild one argument on ``meta`` for ``batch`` requests whose rows
-    start ``row_offset`` rows into their buffer."""
+def _meta(spec: tuple, batch: int, aligned: bool) -> torch.Tensor:
+    """Rebuild one tensor argument on ``meta`` (``batch`` rows for a
+    per-request one), 16-byte aligned or not."""
     kind = spec[0]
-    if kind == "value":
-        return spec[1]
     if kind == "rows":
-        _, rest, stride, dtype, base = spec
+        _, rest, stride, dtype, _ = spec
         shape = (batch, *rest)
-        offset = (base + row_offset * stride[0]) % 16
     else:
-        _, shape, stride, dtype, aligned = spec
-        offset = 0 if aligned else 1
+        _, shape, stride, dtype, _ = spec
+    offset = 0 if aligned else 1
     span = 1 + sum((s - 1) * st for s, st in zip(shape, stride) if s > 0)
     base_t = torch.empty(offset + max(span, 1), dtype=dtype, device="meta")
     return base_t.as_strided(tuple(shape), tuple(stride), offset)
@@ -128,10 +139,15 @@ def _record(name: str, launcher: Callable, sig: inspect.Signature, args, kwargs)
     batch_names, _ = _BATCH_ARGS[name]
     bound = sig.bind_partial(*args, **kwargs)
     specs = {}
+    seen: Dict[int, str] = {}
     for param, value in bound.arguments.items():
-        if isinstance(value, torch.Tensor) and (value.is_meta or not value.is_cuda):
-            return
-        specs[param] = _spec(value, param in batch_names)
+        same_as = None
+        if isinstance(value, torch.Tensor):
+            if value.is_meta or not value.is_cuda:
+                return
+            same_as = seen.setdefault(id(value), param)
+            same_as = None if same_as == param else same_as
+        specs[param] = _spec(value, param in batch_names, same_as)
     key = tuple(sorted(specs.items(), key=lambda kv: kv[0]))
     with _LOCK:
         _RECORDS.setdefault(name, {}).setdefault(key, (launcher, sig, specs))
@@ -260,20 +276,18 @@ class MambaDecodeProvider:
         return [b for b in _INT_CLASS_BATCHES if b <= top]
 
     @staticmethod
-    def _row_offsets(specs: Dict[str, tuple]) -> List[int]:
-        """Row offsets giving every distinct alignment pattern of the
-        per-request tensors (alignment repeats with period 16 rows)."""
-        seen, offsets = set(), []
-        for r in range(16):
-            pattern = tuple(
-                (s[4] + r * s[2][0]) * s[3].itemsize % 16 == 0
-                for s in specs.values()
-                if s[0] == "rows"
-            )
-            if pattern not in seen:
-                seen.add(pattern)
-                offsets.append(r)
-        return offsets
+    def _alignments(specs: Dict[str, tuple]) -> List[Dict[str, bool]]:
+        """Every combination of alignments of the per-request tensors whose
+        alignment a row offset can change, with every other tensor at its
+        recorded alignment."""
+        fixed = {
+            p: s[4] for p, s in specs.items() if s[0] in ("rows", "tensor") and s[4] is not None
+        }
+        free = [p for p, s in specs.items() if s[0] == "rows" and s[4] is None]
+        combos = []
+        for bits in itertools.product((True, False), repeat=len(free)):
+            combos.append({**fixed, **dict(zip(free, bits))})
+        return combos
 
     def plan_all(self) -> List[KernelCall]:
         """Plan every recorded launch class this provider has not planned
@@ -293,11 +307,11 @@ class MambaDecodeProvider:
         summary = {}
         for name, (launcher, sig, specs) in records:
             every_size = _BATCH_ARGS[name][1]
-            offsets = self._row_offsets(specs)
+            alignments = self._alignments(specs)
             planned = failed = 0
             for batch in self._batches(every_size):
-                for r in offsets:
-                    rec, err = self._replay(launcher, specs, batch, r)
+                for aligned in alignments:
+                    rec, err = self._replay(launcher, specs, batch, aligned)
                     if err is not None:
                         failed += 1
                         logger.warning_once(
@@ -314,8 +328,15 @@ class MambaDecodeProvider:
         return calls
 
     @staticmethod
-    def _replay(launcher, specs: Dict[str, tuple], batch: int, row_offset: int):
-        kwargs = {p: _meta(s, batch, row_offset) for p, s in specs.items()}
+    def _replay(launcher, specs: Dict[str, tuple], batch: int, aligned: Dict[str, bool]):
+        kwargs = {}
+        for p, s in specs.items():
+            if s[0] == "value":
+                kwargs[p] = s[1]
+            elif s[0] == "same":
+                kwargs[p] = kwargs[s[1]]
+            else:
+                kwargs[p] = _meta(s, batch, aligned[p])
         try:
             with shadow_launches() as rec:
                 launcher(**kwargs)

@@ -142,6 +142,43 @@ def test_planned_keys_cover_other_batches_and_row_offsets():
             assert not missing, f"{name} nctx={nctx} ngen={ngen}: unplanned {sorted(missing)}"
 
 
+def test_per_request_inputs_aligned_independently():
+    """In one MTP state promote, ``src_state_indices`` starts at row 0 (always
+    aligned) while ``dst_state_indices`` and the accepted counts start after
+    the context rows, and the launcher passes the destination indices again
+    as its placeholder pointers. Warmup records one alignment mix; serving
+    sees the others. Every one must be planned."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager as mcm
+
+    dev = torch.device("cuda")
+    dst = torch.zeros(2, CACHE, HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    inter = torch.zeros(2, MAX_ROWS, 4, HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    slots = torch.arange(MAX_ROWS, dtype=torch.int32, device=dev)
+    accepted = torch.ones(MAX_ROWS, dtype=torch.int32, device=dev)
+
+    def promote(nctx, ngen):
+        mcm._promote_mamba_state_triton(
+            dst,
+            inter,
+            slots[:ngen],
+            accepted[nctx : nctx + ngen],
+            slots[nctx : nctx + ngen],
+            position_source_is_token_count=True,
+        )
+
+    jpd._RECORDS.clear()
+    jpd.start_recording()
+    try:
+        promote(0, 4)  # warmup: no context rows, everything aligned
+        torch.cuda.synchronize()
+    finally:
+        jpd.stop_recording()
+    planned = _keys(jpd.MambaDecodeProvider(max_batch_size=MAX_ROWS).plan_all())
+    for nctx, ngen in [(0, 1), (1, 1), (1, 3), (3, 16), (4, 5), (5, 33)]:
+        missing = _real(promote, nctx, ngen) - planned
+        assert not missing, f"nctx={nctx} ngen={ngen}: unplanned {sorted(missing)}"
+
+
 def test_a_second_warmup_on_another_pool_is_planned_too():
     """The KV-cache estimation pass and the final executor warm up on pools
     of different sizes (the conv update specializes on the pool's size). A
