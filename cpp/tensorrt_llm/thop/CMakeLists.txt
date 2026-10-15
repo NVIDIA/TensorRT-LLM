@@ -75,7 +75,8 @@ add_th_common_family(
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
-  glmMlaKvHalfAppendOp.cpp)
+  glmMlaKvHalfAppendOp.cpp
+  glmSparseMlaFlashDecodeOp.cpp)
 
 add_th_common_family(
   th_common_gemm_quant
