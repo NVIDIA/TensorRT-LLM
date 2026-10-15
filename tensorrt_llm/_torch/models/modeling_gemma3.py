@@ -37,6 +37,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
+from ..modules.gemma_attention_mask import build_gemma_attention_mask
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import inference_mode_unless_compiling
@@ -321,82 +322,18 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         """
         return "V2"
 
-    def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
-        device = image_token_mask.device
-        sequence_length = len(image_token_mask)
-
-        # Create a list of token type ids. 0 for text tokens, 1 for all image tokens (regardless of which image they belong to).
-        token_type_ids = torch.zeros(sequence_length,
-                                     dtype=torch.int32,
-                                     device=device)
-        token_type_ids[image_token_mask] = 1
-
-        # There could be image tokens from multiple images where those corresponding to the
-        # same image are contiguous. We assign a unique id to each contiguous blob of image tokens now.
-
-        # Pad with zero at the start to detect changes.
-        padded = torch.cat((torch.tensor([0], device=device), token_type_ids))
-
-        # Identify where blobs start (0->1 transitions)
-        starts = (padded[1:] > padded[:-1]).int()
-
-        # Cumulative sum of starts gives a unique id for each blob. Note that
-        # this assigns a unique id to the zeros separating the blobs.
-        blob_ids = torch.cumsum(starts, dim=0)
-
-        # Mask out zeros (positions where token_type_ids == 0).
-        token_type_ids *= blob_ids
-
-        # Create a mask where each blob is a unique id.
-        token_type_mask = token_type_ids.unsqueeze(
-            0) == token_type_ids.unsqueeze(1)
-
-        # If text token, do not change anything.
-        token_type_mask = torch.where(token_type_ids == 0, False,
-                                      token_type_mask)
-
-        return token_type_mask
-
     def get_context_mask(
         self,
         image_token_mask: torch.BoolTensor,
         effective_sliding_window: Optional[int] = None,
-    ):
-        """
-        Returns an attention mask such that text tokens attend to each other in causal fashion while image
-        tokens attend in causal fashion as well as to all other image tokens in a bidirectional manner.
-        Args:
-            image_token_mask: A boolean tensor of shape (sequence_length,) where True indicates an image token.
-            effective_sliding_window: The effective sliding window size for the attention mask. Default is None, which means no sliding window.
-            For Gemma3, this is the sliding window size from config (e.g. 512 for 1B model).
-        Returns:
-            A boolean attention mask of shape (sequence_length, sequence_length).
-        """
-        device = image_token_mask.device
-        sequence_length = len(image_token_mask)
-        if effective_sliding_window is None or effective_sliding_window >= sequence_length:
-            causal_mask = torch.arange(
-                sequence_length, device=device).unsqueeze(0) <= torch.arange(
-                    sequence_length, device=device).unsqueeze(1)
-        else:
-            attention_mask_1 = (torch.arange(sequence_length,
-                                             device=device).unsqueeze(0)
-                                <= torch.arange(sequence_length,
-                                                device=device).unsqueeze(1))
-            attention_mask_2 = (
-                torch.arange(sequence_length, device=device).unsqueeze(0)
-                > torch.arange(sequence_length, device=device).unsqueeze(1) -
-                effective_sliding_window)
-            causal_mask = attention_mask_1 & attention_mask_2
+    ) -> torch.Tensor:
+        """Build causal/window attention with bidirectional image blobs."""
+        length = len(image_token_mask)
+        return build_gemma_attention_mask(image_token_mask, [length], [0],
+                                          effective_sliding_window).view(
+                                              length, length)
 
-        # Apply a bidirectional mask for image tokens.
-        token_type_mask = self._get_token_type_mask(image_token_mask)
-        causal_mask = causal_mask.masked_fill(token_type_mask, True)
-        return causal_mask
-
-    # ASSUMPTIONS:
-    # 1) Chunked prefill is disabled to avoid chunking image tokens as they need bidirectional attention.
-    # 2) KV cache reuse is disabled to avoid partially matched image tokens (entire image must be reused to get things correct).
+    # Image blobs cannot be split by chunked prefill or partial prefix reuse.
     def get_attention_mask(
             self,
             image_token_mask: torch.BoolTensor,
@@ -436,17 +373,9 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             "and kv cache reuse must be disabled.")
 
         # Create masks for context requests.
-        context_mask_list = []
-        token_offset = 0
-        for context_len in context_lens:
-            mask_i = self.get_context_mask(
-                image_token_mask=image_token_mask[token_offset:token_offset +
-                                                  context_len],
-                effective_sliding_window=effective_sliding_window,
-            )
-            context_mask_list.append(mask_i.flatten())
-            token_offset += context_len
-        return torch.cat(context_mask_list, dim=0).contiguous()
+        return build_gemma_attention_mask(image_token_mask, context_lens,
+                                          cached_token_lens,
+                                          effective_sliding_window)
 
     @inference_mode_unless_compiling
     def forward(
