@@ -52,11 +52,26 @@ from .ops.attention.sparse_mla_flash_decode import sparse_mla_flash_decode
 from .ops.comm._mnnvl_workspace import hop_supported, hop_workspace, publish_target
 from .ops.comm.mnnvl_hop import mnnvl_hop
 from .ops.comm.mnnvl_moe_finalize_hop import mnnvl_moe_finalize_hop
+from .ops.dsa._fp8_paged_mqa_logits import num_sms
+from .ops.dsa._hist_topk import (
+    MAX_SHARD,
+    TOPK,
+    get_hist_topk_workspace,
+    hist_topk_supported,
+    shard_capacity,
+)
+from .ops.dsa.fp8_paged_mqa_logits import fp8_paged_mqa_logits
+from .ops.dsa.hist_shard_meta import hist_shard_meta
+from .ops.dsa.hist_topk import hist_topk
+from .ops.dsa.indexer_k_tail import indexer_k_tail
+from .ops.dsa.paged_mqa_logits_schedule import paged_mqa_logits_schedule
 from .ops.embedding.fused_embedding import fused_embedding
 from .ops.gemm.dense_mlp_small_m import INTER_PER_RANK, dense_mlp_small_m
+from .ops.gemm.fused_a_gemm import INDEXER_OUT_FEATURES as FUSED_A_INDEXER_OUT_FEATURES
 from .ops.gemm.fused_a_gemm import MAX_TOKENS as FUSED_A_MAX_TOKENS
 from .ops.gemm.fused_a_gemm import OUT_FEATURES as FUSED_A_OUT_FEATURES
 from .ops.gemm.fused_a_gemm import fused_a_gemm
+from .ops.gemm.indexer_q_tail import indexer_q_tail
 from .ops.gemm.low_m_gemm import low_m_gemm
 from .ops.gemm.o_proj_publish import o_proj_publish
 from .ops.gemm.q_b_fp8_rope import q_b_fp8_rope
@@ -112,9 +127,17 @@ class DecodeTarget:
       the stored kv_a_proj_with_mqa weight. q_b, with k_b absorbed and the q_a
       norm folded, writes the RoPE'd FP8 query in its epilogue, while on the aux
       stream one kernel normalizes, ropes and appends the KV half to the FP8
-      cache. The built-in DSA indexer selects 2048 rows, the flash decode attends
-      over them at 4 heads with v_b folded in, and o_proj's epilogue publishes
-      this rank's shard into the all-reduce workspace.
+      cache. The flash decode attends over the 2048 selected rows at 4 heads with
+      v_b folded in, and o_proj's epilogue publishes this rank's shard into the
+      all-reduce workspace.
+    - The DSA indexer (on the layers that run one) shares fused-A: its K and
+      weight rows are fused-A's last 160 columns. Its Q comes from wq_b (q_a norm
+      folded) with an epilogue that ropes, quantizes and scales; its K tail
+      normalizes, ropes, quantizes and writes the indexer K cache on a side
+      stream. Each rank scores its 1/16 shard of the context's keys, and the ranks
+      agree on the exact top-2048 by exchanging histograms. The layers without an
+      indexer reuse the last selection, which the flash decode maps to cache rows
+      itself and starts gathering before its wait.
     - Every all-reduce is a one-shot MNNVL hop that adds the residual and applies
       the following RMSNorm: post_attention_layernorm after attention, and after
       the MLP or MoE the next layer's input_layernorm (the model's final norm
@@ -194,9 +217,6 @@ class DecodeTarget:
         # [h * 576, h * 576 + 512) are k_b_trans[h] @ W_q_b[h, :qk_nope] and the next 64 rows
         # W_q_b[h, qk_nope:], every column times gamma_q_a; FP64, rounded to BF16 once.
         self._q_b_absorbed = {}
-        # What fused-A prefetches into L2 while it waits for its input: the weights of the
-        # attention GEMMs that follow it.
-        self._l2_after_fused_a = {}
         for layer in layers:
             mla = layer.self_attn
             qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
@@ -204,12 +224,54 @@ class DecodeTarget:
             nope = torch.bmm(mla.k_b_proj_trans.double(), w[:, : mla.qk_nope_head_dim])
             absorbed = torch.cat([nope, w[:, mla.qk_nope_head_dim :]], 1)
             absorbed = absorbed * mla.q_a_layernorm.weight.double()
-            q_b = absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
-            self._q_b_absorbed[layer.layer_idx] = q_b
-            prefetch = [q_b, mla.v_b_proj, mla.o_proj.weight]
-            if mla.mqa.indexer is not None:
-                prefetch.insert(1, mla.mqa.indexer.wq_b.weight)
+            self._q_b_absorbed[layer.layer_idx] = (
+                absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
+            )
+
+        # The indexer layers' fused-A weight: kv_a_proj_with_mqa's rows, then the indexer's wk and
+        # weights_proj rows (BF16), in one tensor whose first rows the built-in kv_a_proj and
+        # the indexer's projections then view, so nothing is stored twice. Their indexer Q
+        # comes from wq_b with the q_a norm weight folded into its columns.
+        self._fused_a_indexer_weight = {}
+        self._wq_b_folded = {}
+        for layer in layers:
+            mla = layer.self_attn
+            indexer = mla.mqa.indexer
+            if indexer is None:
+                continue
+            assert (
+                indexer.wk.weight.dtype == torch.bfloat16
+                and indexer.weights_proj.weight.dtype == torch.bfloat16
+            ), "the indexer's wk and weights_proj must be BF16 (TRTLLM_DSA_INDEXER_BF16=1)"
+            kv_a = mla.kv_a_proj_with_mqa.weight
+            wk = indexer.wk.weight
+            extended = torch.cat([kv_a, wk, indexer.weights_proj.weight]).contiguous()
+            assert extended.shape[0] == FUSED_A_INDEXER_OUT_FEATURES
+            mla.kv_a_proj_with_mqa.weight.data = extended[: kv_a.shape[0]]
+            indexer.wk.weight.data = extended[kv_a.shape[0] : kv_a.shape[0] + wk.shape[0]]
+            indexer.weights_proj.weight.data = extended[kv_a.shape[0] + wk.shape[0] :]
+            self._fused_a_indexer_weight[layer.layer_idx] = extended
+            self._wq_b_folded[layer.layer_idx] = (
+                indexer.wq_b.weight.double() * mla.q_a_layernorm.weight.double()
+            ).to(torch.bfloat16)
+        # What fused-A prefetches into L2 while it waits for its input: the weights of the
+        # attention GEMMs that follow it.
+        self._l2_after_fused_a = {}
+        for layer in layers:
+            mla = layer.self_attn
+            prefetch = [self._q_b_absorbed[layer.layer_idx], mla.v_b_proj, mla.o_proj.weight]
+            if layer.layer_idx in self._wq_b_folded:
+                prefetch.insert(1, self._wq_b_folded[layer.layer_idx])
             self._l2_after_fused_a[layer.layer_idx] = [t for t in prefetch if t.is_contiguous()]
+        # The key-sharded top-k exchanges histograms over the TP group's MNNVL workspace
+        # (created here, on every rank in the same order).
+        self._hist_workspace = (
+            get_hist_topk_workspace(self.mapping) if hist_topk_supported(self.mapping) else None
+        )
+        self._hist_buffers = None
+        self._k_tail_stream = torch.cuda.Stream()
+        self._k_tail_fork = torch.cuda.Event()
+        self._k_tail_done = torch.cuda.Event()
 
         device = core.embed_tokens.weight.device
         # The attention scales the KV-half kernel writes and the flash decode reads.
@@ -271,8 +333,9 @@ class DecodeTarget:
                     layer, position_ids, hidden_states, residual, attn_metadata
                 )
             return hidden_states
+        sharded = self._shard_indexer_keys(attn_metadata)
         for layer in layers:
-            attn_out = self._attention(layer, position_ids, hidden_states, attn_metadata)
+            attn_out = self._attention(layer, position_ids, hidden_states, attn_metadata, sharded)
             hidden_states, residual = self._post_attention_hop(layer, attn_out, residual)
             if isinstance(layer.mlp, GatedMLP):
                 mlp = layer.mlp
@@ -285,11 +348,60 @@ class DecodeTarget:
                 hidden_states, residual = self._moe(layer, hidden_states, residual)
         return hidden_states
 
-    def _attention(self, layer, position_ids, hidden_states, attn_metadata) -> torch.Tensor:
+    def _shard_indexer_keys(self, attn_metadata) -> bool:
+        """Point this rank's indexer at its 1/16 shard of the request's keys for this step:
+        the shard's length and block table, and the logits kernel's schedule over it.
+
+        Applies to one generation request whose shard fits the top-k kernel; returns whether it
+        did, and otherwise every indexer layer scores the whole context with the built-in
+        indexer."""
+        manager = attn_metadata.kv_cache_manager
+        if self._hist_workspace is None or attn_metadata.num_seqs != 1:
+            return False
+        if self._hist_buffers is None:
+            capacity = shard_capacity(manager.max_seq_len, self.mapping.tp_size)
+            if capacity > MAX_SHARD:
+                return False
+            device = self._unit_scale.device
+            tokens_per_block = manager.tokens_per_block
+            rows = FUSED_A_MAX_TOKENS
+            sms = num_sms(device.index)
+            self._hist_buffers = dict(
+                capacity=capacity,
+                shard_ctx=torch.zeros(1, dtype=torch.int32, device=device),
+                shard_block_table=torch.zeros(
+                    (1, -(-capacity // tokens_per_block)), dtype=torch.int32, device=device
+                ),
+                schedule=torch.zeros((sms + 1, 2), dtype=torch.int32, device=device),
+                logits=torch.empty(
+                    (rows, -(-capacity // 256) * 256), dtype=torch.float32, device=device
+                ),
+                topk=torch.empty((rows, TOPK), dtype=torch.int32, device=device),
+                k_fp8=torch.empty((rows, 128), dtype=torch.float8_e4m3fn, device=device),
+                k_scale=torch.empty((rows, 1), dtype=torch.float32, device=device),
+                sms=sms,
+            )
+        buffers = self._hist_buffers
+        hist_shard_meta(
+            attn_metadata.gen_indexer_kv_lens_cuda_runtime,
+            attn_metadata.indexer_k_cache_block_offsets[0],
+            buffers["shard_ctx"],
+            buffers["shard_block_table"],
+            self.mapping.tp_size,
+            self.mapping.tp_rank,
+            manager.tokens_per_block,
+        )
+        paged_mqa_logits_schedule(
+            buffers["shard_ctx"], manager.tokens_per_block, buffers["sms"], buffers["schedule"]
+        )
+        return True
+
+    def _attention(self, layer, position_ids, hidden_states, attn_metadata, sharded):
         """MLA with the DSA indexer over the generation rows: the attention output ahead of
         o_proj, [rows, heads * v_head_dim]."""
         mla = layer.self_attn
         mqa = mla.mqa
+        indexer = mqa.indexer
         manager = attn_metadata.kv_cache_manager
         num_tokens = attn_metadata.num_tokens
         seq_len_q = num_tokens // attn_metadata.num_seqs
@@ -297,20 +409,25 @@ class DecodeTarget:
         mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
         cos_sin = mqa.rotary_cos_sin
         kv_lens = attn_metadata.kv_lens_cuda_runtime
+        local_layer = mqa.get_local_layer_idx(attn_metadata)
         if self._kv_pool is None:
             self._kv_pool = manager.get_unique_primary_pool()
+        own_indexer = sharded and indexer is not None
 
-        kv_a = fused_a_gemm(
-            hidden_states,
-            mla.kv_a_proj_with_mqa.weight,
-            self._l2_after_fused_a[layer.layer_idx],
-        )[:num_tokens]
+        weight = (
+            self._fused_a_indexer_weight[layer.layer_idx]
+            if own_indexer
+            else mla.kv_a_proj_with_mqa.weight
+        )
+        kv_a = fused_a_gemm(hidden_states, weight, self._l2_after_fused_a[layer.layer_idx])
+        kv_a = kv_a[:num_tokens]
         q_a = kv_a[:, : mla.q_lora_rank]
+        latent_end = mla.q_lora_rank + head_dim
         quant_q = hidden_states.new_empty(
             (num_tokens, mla.num_heads_tp * head_dim), dtype=torch.uint8
         )
 
-        def q_half():
+        def q_b():
             q_b_fp8_rope(
                 q_a,
                 self._q_b_absorbed[layer.layer_idx],
@@ -327,7 +444,7 @@ class DecodeTarget:
 
         def kv_half():
             mla_kv_half_append(
-                kv_a[:, mla.q_lora_rank :],
+                kv_a[:, mla.q_lora_rank : latent_end],
                 mla.kv_a_layernorm.weight,
                 mla.kv_a_layernorm.variance_epsilon,
                 cos_sin,
@@ -337,7 +454,7 @@ class DecodeTarget:
                 attn_metadata.kv_cache_block_offsets,
                 manager.kv_cache_pool_pointers,
                 manager.kv_cache_pool_mapping,
-                mqa.get_local_layer_idx(attn_metadata),
+                local_layer,
                 manager.tokens_per_block,
                 attn_metadata.max_seq_len,
                 self._bmm1_scale,
@@ -345,10 +462,50 @@ class DecodeTarget:
                 mla.softmax_scale,
             )
 
-        maybe_execute_in_parallel(
-            q_half, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
+        output = hidden_states.new_empty(
+            (hidden_states.shape[0], mla.num_heads_tp * mla.v_head_dim)
         )
-        indexer = mqa.indexer
+        q_heads = quant_q.view(num_tokens, mla.num_heads_tp, head_dim)
+        if sharded:
+
+            def select_then_q_b():
+                if own_indexer:
+                    self._select_rows(
+                        indexer, kv_a, latent_end, q_a, position_ids, attn_metadata, num_tokens, mla
+                    )
+                q_b()
+
+            # The KV half on the aux stream beside the indexer and q_b.
+            maybe_execute_in_parallel(
+                select_then_q_b, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
+            )
+            page_index_scale, layer_offset = manager.get_primary_pool_page_index_params(
+                local_layer
+            )
+            sparse_mla_flash_decode(
+                q_heads,
+                self._kv_pool,
+                self._hist_buffers["topk"][:num_tokens],
+                kv_lens,
+                self._bmm1_scale,
+                self._bmm2_scale,
+                mla.v_b_proj,
+                output,
+                seq_len_q,
+                self.index_topk,
+                attn_metadata.block_table[: attn_metadata.num_seqs],
+                manager.tokens_per_block,
+                page_index_scale,
+                layer_offset,
+                # The selection of an earlier layer: its rows can load before the wait.
+                not own_indexer,
+            )
+            return output
+
+        # The built-in indexer over the whole context, then the selection as cache rows.
+        maybe_execute_in_parallel(
+            q_b, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
+        )
         indexer_intermediates = None
         if indexer is not None:
             qr = mla.q_a_layernorm(q_a)
@@ -372,11 +529,8 @@ class DecodeTarget:
                 ),
             ),
         )
-        output = hidden_states.new_empty(
-            (hidden_states.shape[0], mla.num_heads_tp * mla.v_head_dim)
-        )
         sparse_mla_flash_decode(
-            quant_q.view(num_tokens, mla.num_heads_tp, head_dim),
+            q_heads,
             self._kv_pool,
             indices,
             kv_lens,
@@ -390,6 +544,87 @@ class DecodeTarget:
         if indexer is not None:
             indexer.maybe_join_prev_topk_copy()
         return output
+
+    def _select_rows(self, indexer, kv_a, latent_end, q_a, position_ids, attn_metadata, rows, mla):
+        """The indexer of a layer that runs one, on this rank's key shard: writes the exact
+        top-2048 cache positions of every row into the shared selection buffer."""
+        buffers = self._hist_buffers
+        manager = attn_metadata.kv_cache_manager
+        rope = indexer.rotary_emb
+        cos_sin = rope.rotary_cos_sin.view(rope.max_positions, -1)
+        interleave = not rope.is_neox
+        positions = position_ids.view(-1)[:rows]
+        index_k = kv_a[:, latent_end : latent_end + indexer.head_dim]
+        index_weights = kv_a[:, latent_end + indexer.head_dim :]
+        k_cache = manager.get_indexer_k_cache_buffers(indexer.layer_idx)
+
+        # The K tail on its own stream, beside the Q tail: k_norm, RoPE, FP8 and the K cache.
+        self._k_tail_fork.record()
+        with torch.cuda.stream(self._k_tail_stream):
+            self._k_tail_stream.wait_event(self._k_tail_fork)
+            indexer_k_tail(
+                index_k,
+                positions,
+                cos_sin,
+                indexer.k_norm.weight,
+                indexer.k_norm.bias,
+                indexer.k_norm.variance_epsilon,
+                indexer.rope_dim,
+                interleave,
+                indexer.scale_fmt == "ue8m0",
+                buffers["k_fp8"][:rows],
+                buffers["k_scale"][:rows],
+                k_cache,
+                attn_metadata.slot_mapping_fp8[:rows],
+                attn_metadata.slot_mapping_scale[:rows],
+                rows,
+                True,
+                True,
+                False,
+            )
+            self._k_tail_done.record()
+
+        q_fp8 = q_a.new_empty((rows, indexer.n_heads, indexer.head_dim), dtype=torch.float8_e4m3fn)
+        q_scale = q_a.new_empty((rows, indexer.n_heads, 1), dtype=torch.float32)
+        weights = q_a.new_empty((rows, indexer.n_heads), dtype=torch.float32)
+        indexer_q_tail(
+            q_a,
+            self._wq_b_folded[indexer.layer_idx],
+            positions,
+            cos_sin,
+            index_weights,
+            q_fp8,
+            q_scale,
+            weights,
+            mla.q_a_layernorm.variance_epsilon,
+            indexer.n_heads,
+            indexer.head_dim,
+            indexer.rope_dim,
+            interleave,
+            indexer.scale_fmt == "ue8m0",
+            indexer.weight_scale_factor,
+        )
+        torch.cuda.current_stream().wait_event(self._k_tail_done)
+        logits = fp8_paged_mqa_logits(
+            q_fp8.view(1, rows, indexer.n_heads, indexer.head_dim),
+            k_cache,
+            weights,
+            buffers["shard_ctx"],
+            buffers["shard_block_table"],
+            buffers["schedule"],
+            buffers["logits"][:rows],
+            buffers["capacity"],
+            True,
+        )
+        hist_topk(
+            logits,
+            attn_metadata.gen_indexer_kv_lens_cuda_runtime,
+            buffers["topk"][:rows],
+            self._hist_workspace.comm_buffer,
+            self._hist_workspace.state,
+            rows,
+            self.mapping.tp_size,
+        )
 
     def _post_attention_hop(self, layer, attn_out: torch.Tensor, residual: torch.Tensor):
         """o_proj published into the all-reduce workspace, then the hop with the residual add
