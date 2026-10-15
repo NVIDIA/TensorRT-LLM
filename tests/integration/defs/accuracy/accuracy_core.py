@@ -443,6 +443,14 @@ class AccuracyTask:
         if prepared_evaluator is None:
             prepared_evaluator = self.create_evaluator(
                 hypothesis_testing_params.num_samples, extra_evaluator_kwargs)
+        elif getattr(prepared_evaluator, "num_samples",
+                     None) != hypothesis_testing_params.num_samples:
+            # E.g. a full-size evaluator in INTEGRATION_TEST mode would run every
+            # sample while the hypothesis test assumes one.
+            raise ValueError(
+                f"prepared_evaluator has num_samples="
+                f"{getattr(prepared_evaluator, 'num_samples', None)}, but this "
+                f"evaluation uses {hypothesis_testing_params.num_samples}")
         evaluate_kwargs = {}
         if hasattr(self, 'EVALUATE_KWARGS'):
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
