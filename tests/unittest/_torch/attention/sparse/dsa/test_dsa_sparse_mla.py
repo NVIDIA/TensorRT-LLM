@@ -102,12 +102,7 @@ def _build_sparse_topk_indices_context(
     topk: int,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
-    indices_block_size: int = 1,
 ) -> torch.Tensor:
-    if indices_block_size != 1:
-        raise NotImplementedError(
-            f"Only token-level selection is implemented, got {indices_block_size}"
-        )
     total_tokens = sum(seq_lens)
     topk_indices = torch.full((total_tokens, topk), -1, dtype=torch.int32, device=device)
     token_offset = 0
@@ -128,12 +123,7 @@ def _build_sparse_topk_indices_generation(
     topk: int,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
-    indices_block_size: int = 1,
 ) -> torch.Tensor:
-    if indices_block_size != 1:
-        raise NotImplementedError(
-            f"Only token-level selection is implemented, got {indices_block_size}"
-        )
     total_tokens = len(cached_lens) * seq_len_q
     topk_indices = torch.full((total_tokens, topk), -1, dtype=torch.int32, device=device)
     row = 0

@@ -24,8 +24,6 @@ This file tests:
 
 import builtins
 import functools
-import inspect
-import math
 import random
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -63,11 +61,9 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import (
     DSAVanillaAttention,
     DSAVanillaIndexer,
-    _TorchRotaryEmbedding,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
@@ -93,6 +89,8 @@ from tensorrt_llm.quantization.utils import fp8_utils
 __extra_import_path__ = ["..", "~/tests/unittest"]
 
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
+
+from ._indexer_reference import mqa_logits, paged_mqa_logits
 
 
 def has_deep_gemm():
@@ -134,194 +132,6 @@ def _set_torch_top_k(indexer: Indexer) -> None:
         decode_implementation=TopKImplementation.TORCH,
         compress_ratio=indexer.compress_ratio,
     )
-
-
-@pytest.mark.parametrize("is_neox", [True, False])
-@pytest.mark.parametrize(
-    "q_shape,k_shape",
-    [
-        ((3, 2, 4), (3, 1, 4)),
-        ((3, 8), (3, 4)),
-    ],
-)
-def test_vanilla_rope_is_pure_torch(is_neox, q_shape, k_shape):
-    rotary_emb = _TorchRotaryEmbedding.__new__(_TorchRotaryEmbedding)
-    torch.nn.Module.__init__(rotary_emb)
-    rotary_emb.head_dim = 4
-    rotary_emb.is_neox = is_neox
-    rotary_emb.inverse = False
-    rotary_emb.rotary_cos_sin = torch.randn(4, 2, 2)
-
-    position_ids = torch.tensor([2, 0, 3], dtype=torch.int32)
-    targets = [torch.randn(q_shape), torch.randn(k_shape)]
-    expected = [
-        RotaryEmbedding.forward(
-            rotary_emb,
-            position_ids,
-            [target.reshape(position_ids.numel(), -1)],
-        )[0].reshape_as(target)
-        for target in targets
-    ]
-
-    with patch.object(
-        RotaryEmbedding,
-        "forward",
-        side_effect=AssertionError("Vanilla RoPE delegated to the fused dispatcher"),
-    ):
-        actual = rotary_emb(position_ids, targets)
-
-    for actual_target, expected_target in zip(actual, expected):
-        torch.testing.assert_close(actual_target, expected_target)
-
-
-def test_vanilla_generation_rope_matches_torch_reference():
-    attention = DSAVanillaAttention.__new__(DSAVanillaAttention)
-    attention.num_heads = 2
-    attention.kv_lora_rank = 3
-    attention.qk_nope_head_dim = 3
-    attention.qk_rope_head_dim = 4
-    attention.q_scaling = 2.0
-    attention._append_latent_cache = Mock()
-    attention.rotary_emb = _TorchRotaryEmbedding.__new__(_TorchRotaryEmbedding)
-    torch.nn.Module.__init__(attention.rotary_emb)
-    attention.rotary_emb.head_dim = attention.qk_rope_head_dim
-    attention.rotary_emb.is_neox = False
-    attention.rotary_emb.inverse = False
-    attention.rotary_emb.rotary_cos_sin = torch.randn(8, 2, 2)
-
-    positions = torch.tensor([3, 5], dtype=torch.int32)
-    attention._token_positions = MethodType(
-        lambda _self, metadata, seq_start, seq_end, device: positions.to(device),
-        attention,
-    )
-    metadata = SimpleNamespace(
-        num_contexts=0,
-        num_seqs=2,
-        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
-        kv_lens_cuda=torch.tensor([4, 6], dtype=torch.int32),
-        request_ids=[10, 11],
-        kv_cache_manager=SimpleNamespace(),
-    )
-    q_pe = torch.randn(2, attention.num_heads, attention.qk_rope_head_dim)
-    latent_cache = torch.randn(2, attention.kv_lora_rank + attention.qk_rope_head_dim)
-    fused_q = torch.randn(
-        2,
-        attention.num_heads * (attention.kv_lora_rank + attention.qk_rope_head_dim),
-    )
-    expected_fused_q = fused_q.clone()
-    original_latent = latent_cache.clone()
-    expected_cache_latent = latent_cache.clone()
-    expected_q_pe, expected_k_pe = attention.rotary_emb(
-        positions,
-        [q_pe.reshape(2, -1), expected_cache_latent[..., attention.kv_lora_rank :]],
-    )
-    expected_fused_q.view(2, attention.num_heads, -1)[..., attention.kv_lora_rank :] = (
-        expected_q_pe.view(2, attention.num_heads, attention.qk_rope_head_dim)
-    )
-    expected_cache_latent[..., attention.kv_lora_rank :] = expected_k_pe
-
-    cu_q_seqlens = torch.full((3,), -1, dtype=torch.int32)
-    cu_kv_seqlens = torch.full((3,), -1, dtype=torch.int32)
-    scheduler = torch.ones(1, dtype=torch.uint32)
-    bmm1_scale = torch.full((2,), float("nan"))
-    bmm2_scale = torch.full((1,), float("nan"))
-    quant_q_buffer = torch.empty_like(fused_q, dtype=torch.uint8)
-    attention.mla_rope_generation(
-        fused_q,
-        q_pe,
-        latent_cache,
-        metadata,
-        cu_q_seqlens,
-        cu_kv_seqlens,
-        scheduler,
-        bmm1_scale,
-        bmm2_scale,
-        quant_q_buffer,
-    )
-
-    torch.testing.assert_close(fused_q, expected_fused_q)
-    torch.testing.assert_close(latent_cache, original_latent)
-    torch.testing.assert_close(
-        quant_q_buffer.view(torch.float8_e4m3fn),
-        expected_fused_q.to(torch.float8_e4m3fn),
-    )
-    torch.testing.assert_close(cu_q_seqlens, torch.tensor([0, 2, 4], dtype=torch.int32))
-    torch.testing.assert_close(cu_kv_seqlens, torch.tensor([0, 4, 10], dtype=torch.int32))
-    assert scheduler.item() == 0
-    expected_bmm1_scale = 1.0 / (math.sqrt(7) * attention.q_scaling)
-    torch.testing.assert_close(
-        bmm1_scale,
-        torch.tensor([expected_bmm1_scale, expected_bmm1_scale * math.log2(math.e)]),
-    )
-    assert bmm2_scale.item() == 1.0
-    append_args = attention._append_latent_cache.call_args.args
-    assert append_args[0] is metadata
-    assert append_args[1:4] == ([10, 11], [1, 1], [3, 5])
-    assert append_args[4] is not latent_cache
-    torch.testing.assert_close(append_args[4], expected_cache_latent)
-
-
-def test_vanilla_quantization_uses_fused_kernel_amax_floor():
-    values = torch.zeros(1, 128)
-
-    _, fp8_scale = DSAVanillaIndexer.quantize_fp8(values, use_ue8m0=False)
-    torch.testing.assert_close(
-        fp8_scale,
-        torch.tensor(1e-12 / DSAVanillaIndexer._FP8_MAX),
-        rtol=1e-6,
-        atol=0,
-    )
-
-    _, fp4_scale = DSAVanillaIndexer.quantize_fp4(
-        values,
-        use_ue8m0=False,
-        gran_k=32,
-    )
-    torch.testing.assert_close(
-        fp4_scale,
-        torch.full((1, 4), 1e-12 / DSAVanillaIndexer._FP4_MAX),
-        rtol=1e-6,
-        atol=0,
-    )
-
-
-def test_vanilla_q_projection_does_not_dispatch_linear_forward():
-    class IdentityRope(torch.nn.Module):
-        def forward(self, position_ids, targets):
-            del position_ids
-            return targets
-
-    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
-    torch.nn.Module.__init__(indexer)
-    indexer.q_lora_rank = 2
-    indexer.n_heads = 1
-    indexer.head_dim = 4
-    indexer.rope_dim = 2
-    indexer.use_fp4 = False
-    indexer._indexer_bf16 = False
-    indexer.weight_scale_factor = 1.0
-    indexer.wq_b = torch.nn.Linear(2, 4, bias=False)
-    indexer.k_norm = torch.nn.Identity()
-    indexer.rotary_emb = IdentityRope()
-    indexer._fused_wk_wp_weight = torch.randn(5, 3)
-
-    with patch.object(
-        indexer.wq_b,
-        "forward",
-        side_effect=AssertionError("custom Linear.forward was dispatched"),
-    ):
-        q_fp8, k_fp8, k_scale, weights, q_scale = indexer.pre_indexer_proj(
-            torch.randn(2, 2),
-            torch.randn(2, 3),
-            torch.arange(2, dtype=torch.int32),
-        )
-
-    assert q_fp8.dtype == torch.float8_e4m3fn
-    assert k_fp8.dtype == torch.float8_e4m3fn
-    assert k_scale.dtype == torch.float32
-    assert weights.shape == (2, 1)
-    assert q_scale.dtype == torch.float32
-    assert q_scale.shape == (2, 1, 1)
 
 
 def test_vanilla_indexer_q_projection_supports_fp8_qdq_weight():
@@ -488,7 +298,6 @@ def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
 ):
     attention = DSAVanillaAttention.__new__(DSAVanillaAttention)
     attention.layer_idx = 0
-    attention.use_fp8_ds_mla = use_fp8_ds_mla
 
     q = torch.empty(1, 1)
     latent_cache = torch.empty(1, 1)
@@ -502,6 +311,10 @@ def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
         ),
         num_contexts=0,
         num_seqs=1,
+        num_ctx_tokens=0,
+        num_tokens=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([4], dtype=torch.int32),
     )
     forward_args = AttentionForwardArgs(
         attention_input_type=AttentionInputType.generation_only,
@@ -513,17 +326,23 @@ def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
     expected = torch.empty(1, 1)
 
     with (
-        patch.object(attention, "_token_positions", return_value=torch.tensor([0])),
         patch.object(attention, "_apply_mla_rope") as apply_rope,
-        patch.object(attention, "_select_local_topk", return_value=topk),
-        patch.object(attention, "_local_topk_to_global", return_value=topk),
+        patch.object(attention, "_select_local_topk", return_value=topk) as select_local_topk,
+        patch.object(attention, "_local_topk_to_global", return_value=topk) as local_topk_to_global,
         patch.object(attention, "_forward_sparse", return_value=expected) as forward_sparse,
     ):
         actual = attention.forward(q, None, None, metadata, forward_args=forward_args)
 
     assert actual is expected
     assert apply_rope.call_count == expected_rope_calls
+    if expected_rope_calls:
+        # The single generation token follows three cached tokens.
+        torch.testing.assert_close(
+            apply_rope.call_args.args[3], torch.tensor([3], dtype=torch.int32)
+        )
     assert forward_sparse.call_args.kwargs["append_cache"] is expected_append
+    select_local_topk.assert_called_once_with(q, None, metadata, forward_args)
+    local_topk_to_global.assert_called_once_with(topk, metadata, 0, True)
 
 
 def test_vanilla_fp4_cache_write_preserves_packed_scale_bytes():
@@ -570,53 +389,25 @@ def test_vanilla_local_topk_uses_trtllm_pool_coordinates():
     metadata._ensure_pool_view_cached.assert_called_once_with()
 
 
-def test_vanilla_inline_scale_latent_round_trip():
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_vanilla_inline_scale_latent_round_trip(kv_layout):
     latent = torch.randn(3, 576, dtype=torch.bfloat16)
 
     packed = DSAVanillaAttention._pack_inline_scale_latent(latent, torch.bfloat16)
-    actual = DSAVanillaAttention._unpack_inline_scale_latent(packed)
+    # Logical pages are physically reordered, with padding between valid IDs
+    # and only one live token in the final two-token page.
+    kv_cache = torch.zeros(3, 1, 2, 1, packed.shape[-1], dtype=packed.dtype)
+    kv_cache[2, 0, :, 0, :] = packed[:2]
+    kv_cache[0, 0, 0, 0, :] = packed[2]
+    if kv_layout == "HND":
+        kv_cache = kv_cache.transpose(2, 3)
+    actual = DSAVanillaAttention._load_latent_cache(
+        kv_cache, [2, -1, 0], latent.shape[0], kv_layout, use_fp8_ds_mla=True
+    )
 
     assert packed.shape == (3, 328)
     torch.testing.assert_close(actual[:, 512:], latent[:, 512:].float())
     torch.testing.assert_close(actual[:, :512], latent[:, :512].float(), atol=0.05, rtol=0.05)
-
-
-def test_vanilla_paged_mqa_logits_supports_partial_last_block():
-    q = torch.ones(1, 1, 1, 1)
-    kv_cache = torch.arange(1, 9, dtype=torch.float32).view(2, 4, 1, 1)
-    weights = torch.ones(1, 1)
-
-    actual = DSAVanillaIndexer.paged_mqa_logits(
-        q,
-        kv_cache,
-        weights,
-        num_tokens=torch.tensor([6]),
-        num_kv_tokens=torch.tensor([6]),
-        block_tables=torch.tensor([[0, 1]]),
-        max_model_len=6,
-    )
-
-    torch.testing.assert_close(actual, torch.arange(1, 7, dtype=torch.float32).view(1, 6))
-
-
-def test_vanilla_quantized_paged_mqa_logits_supports_partial_last_block():
-    q = torch.ones(1, 1, 1, 1)
-    kv = torch.arange(1, 9, dtype=torch.float32).view(2, 4, 1)
-    kv_scales = torch.ones(2, 4)
-    weights = torch.ones(1, 1)
-
-    actual = DSAVanillaIndexer.paged_mqa_logits_quantized(
-        q,
-        kv,
-        kv_scales,
-        weights,
-        context_lens=torch.tensor([6]),
-        block_table=torch.tensor([[0, 1]]),
-        max_model_len=6,
-        block_kv=4,
-    )
-
-    torch.testing.assert_close(actual, torch.arange(1, 7, dtype=torch.float32).view(1, 6))
 
 
 def _make_vanilla_scoring_metadata(*, skip_context=False):
@@ -661,82 +452,6 @@ def _make_vanilla_scoring_indexer():
     return indexer
 
 
-def test_vanilla_indexer_runs_context_scoring_pipeline():
-    indexer = _make_vanilla_scoring_indexer()
-    metadata = _make_vanilla_scoring_metadata()
-
-    actual = indexer.sparse_attn_indexer(
-        metadata,
-        hidden_states=torch.empty(2, 1),
-        q_fp8=torch.ones(2, 1, 1),
-        k_fp8=torch.empty(0),
-        k_scale=torch.empty(0),
-        weights=torch.ones(2, 1),
-        is_generation=False,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        torch.tensor([[1, 0], [1, 2]], dtype=torch.int32),
-    )
-
-
-@pytest.mark.parametrize(
-    "is_generation,seq_len,kv_len,gathered_keys,expected",
-    [
-        pytest.param(
-            False,
-            5,
-            5,
-            [[3.0]],
-            [[-1, -1], [-1, -1], [-1, -1], [0, -1], [0, -1]],
-            id="context",
-        ),
-        pytest.param(
-            True,
-            4,
-            10,
-            [[1.0], [3.0]],
-            [[0, -1], [1, 0], [1, 0], [1, 0]],
-            id="generation-cached-prefix",
-        ),
-    ],
-)
-def test_vanilla_indexer_scores_compressed_coordinates(
-    is_generation,
-    seq_len,
-    kv_len,
-    gathered_keys,
-    expected,
-):
-    indexer = _make_vanilla_scoring_indexer()
-    metadata = _make_vanilla_scoring_metadata()
-    metadata.num_contexts = int(not is_generation)
-    metadata.num_generations = int(is_generation)
-    metadata.num_seqs = 1
-    metadata.num_ctx_tokens = 0 if is_generation else seq_len
-    metadata.num_tokens = seq_len
-    metadata.seq_lens = torch.tensor([seq_len], dtype=torch.int32)
-    metadata.seq_lens_cuda = metadata.seq_lens
-    metadata.kv_lens_cuda = torch.tensor([kv_len], dtype=torch.int32)
-    metadata.compress_ratios = [4]
-    gathered_keys = torch.tensor(gathered_keys)
-    indexer._gather_keys = Mock(return_value=gathered_keys)
-
-    actual = indexer.sparse_attn_indexer(
-        metadata,
-        hidden_states=torch.empty(seq_len, 1),
-        q_fp8=torch.ones(seq_len, 1, 1),
-        k_fp8=torch.empty(0),
-        k_scale=torch.empty(0),
-        weights=torch.ones(seq_len, 1),
-        is_generation=is_generation,
-    )
-
-    torch.testing.assert_close(actual, torch.tensor(expected, dtype=torch.int32))
-    indexer._gather_keys.assert_called_once_with(metadata, 0, gathered_keys.shape[0])
-
-
 def test_vanilla_indexer_uses_dense_topk_when_context_scoring_is_skipped():
     indexer = _make_vanilla_scoring_indexer()
     metadata = _make_vanilla_scoring_metadata(skip_context=True)
@@ -753,74 +468,6 @@ def test_vanilla_indexer_uses_dense_topk_when_context_scoring_is_skipped():
     )
 
     torch.testing.assert_close(actual, metadata.topk_indices_buffer[:2])
-
-
-def test_vanilla_indexer_reuses_mtp_topk_without_rescoring():
-    indexer = _make_vanilla_scoring_indexer()
-    indexer.mtp_index_share = True
-    indexer._gather_keys = Mock(side_effect=AssertionError("MTP TopK was not reused"))
-    metadata = _make_vanilla_scoring_metadata()
-    metadata.num_contexts = 0
-    metadata.num_generations = 2
-    metadata.num_ctx_tokens = 0
-    metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
-    metadata.seq_lens_cuda = metadata.seq_lens
-    metadata.kv_lens_cuda = torch.tensor([3, 3], dtype=torch.int32)
-    metadata.num_tokens = 2
-    metadata.in_mtp_draft_loop = True
-    metadata.indexer_skip_topk = True
-    metadata.shared_topk_indices = torch.tensor([[2, 0], [1, 0]], dtype=torch.int32)
-
-    actual = indexer.sparse_attn_indexer(
-        metadata,
-        hidden_states=torch.empty(2, 1),
-        q_fp8=torch.ones(2, 1, 1),
-        k_fp8=torch.empty(0),
-        k_scale=torch.empty(0),
-        weights=torch.ones(2, 1),
-        is_generation=True,
-    )
-
-    torch.testing.assert_close(actual, metadata.shared_topk_indices)
-
-
-def test_vanilla_dsa_signatures_match_trtllm_dsa():
-    # CSA2 prepared indexing and dense FP4 MLA are outside the DSA contract.
-    non_dsa_parameters = {
-        Indexer.__init__: ("projection_free",),
-        DSATrtllmAttention.mla_rope_generation: ("fuse_fp4_q_quant",),
-    }
-
-    def parameter_contract(function, excluded_parameters=()):
-        parameters = inspect.signature(function).parameters
-        for name in excluded_parameters:
-            assert parameters[name].default is False
-        return [
-            (name, parameter.kind, parameter.default)
-            for name, parameter in parameters.items()
-            if name not in excluded_parameters
-        ]
-
-    for vanilla, trtllm in (
-        (DSAVanillaAttention.__init__, DSATrtllmAttention.__init__),
-        (DSAVanillaAttention.forward, DSATrtllmAttention.forward),
-        (DSAVanillaAttention.sparse_attn_predict, DSATrtllmAttention.sparse_attn_predict),
-        (DSAVanillaAttention.sparse_kv_predict, DSATrtllmAttention.sparse_kv_predict),
-        (
-            DSAVanillaAttention.mla_rope_append_paged_kv_assign_q,
-            DSATrtllmAttention.mla_rope_append_paged_kv_assign_q,
-        ),
-        (DSAVanillaAttention.mla_rope_generation, DSATrtllmAttention.mla_rope_generation),
-        (DSAVanillaIndexer.__init__, Indexer.__init__),
-        (DSAVanillaIndexer.sparse_attn_indexer, Indexer.sparse_attn_indexer),
-        (DSAVanillaIndexer.pre_indexer_proj, Indexer.pre_indexer_proj),
-        (DSAVanillaIndexer._update_k_cache, Indexer._update_k_cache),
-        (DSAVanillaIndexer.forward_from_projected, Indexer.forward_from_projected),
-        (DSAVanillaIndexer.forward, Indexer.forward),
-    ):
-        assert parameter_contract(vanilla) == parameter_contract(
-            trtllm, non_dsa_parameters.get(trtllm, ())
-        )
 
 
 @pytest.mark.parametrize("use_self_sampling", [True, False])
@@ -1290,22 +937,6 @@ def test_indexer_post_load_weights_caches_fused_weight():
     assert not hasattr(indexer, "_weights_transformed")
 
 
-def test_vanilla_indexer_caches_matching_fused_projection_weight():
-    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
-    torch.nn.Module.__init__(indexer)
-    indexer.wk = torch.nn.Linear(3, 2, bias=False)
-    indexer.weights_proj = torch.nn.Linear(3, 4, bias=False)
-    indexer.wk.weight.data.fill_(1.0)
-    indexer.weights_proj.weight.data.fill_(2.0)
-    indexer._fused_wk_wp_weight = None
-
-    indexer.cache_derived_state()
-
-    assert indexer._fused_wk_wp_weight.shape == (6, 3)
-    assert torch.equal(indexer._fused_wk_wp_weight[:2], indexer.wk.weight.data)
-    assert torch.equal(indexer._fused_wk_wp_weight[2:], indexer.weights_proj.weight.data)
-
-
 @skip_pre_hopper
 @pytest.mark.parametrize(
     "use_cute_dsl,enable_heuristic,expected_decode",
@@ -1412,10 +1043,10 @@ def test_indexer_two_level_gvr_dispatch(
     ],
 )
 def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, expected_dtype):
-    """Production and Vanilla projection dtypes follow TRTLLM_DSA_INDEXER_BF16.
+    """wk/weights_proj dtype follows TRTLLM_DSA_INDEXER_BF16.
 
     Unset or "0" keeps the projection in fp32 (default); "1" runs it in the
-    model dtype. create_indexer builds both indexers with dtype=torch.bfloat16.
+    model dtype. create_indexer builds the Indexer with dtype=torch.bfloat16.
     """
     if flag_value is None:
         monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
@@ -1432,15 +1063,11 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
         "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
         return_value=100,
     ):
-        indexers = [
-            create_indexer(sparse_config),
-            create_indexer(sparse_config, indexer_cls=DSAVanillaIndexer),
-        ]
+        indexer = create_indexer(sparse_config)
 
-    for indexer in indexers:
-        assert indexer._indexer_bf16 is (flag_value == "1")
-        assert indexer.wk.dtype == expected_dtype
-        assert indexer.weights_proj.dtype == expected_dtype
+    assert indexer._indexer_bf16 is (flag_value == "1")
+    assert indexer.wk.dtype == expected_dtype
+    assert indexer.weights_proj.dtype == expected_dtype
 
 
 @pytest.mark.parametrize(
@@ -1495,22 +1122,6 @@ def test_metadata_spec_update_resizes_radix_workspace(
 
     assert metadata._radix_rows_per_sequence == rows_per_sequence
     metadata._create_radix_aux_buffers.assert_called_once_with(True)
-
-
-def _ceil_to_ue8m0(x: torch.Tensor):
-    """Round tensor values up to the nearest power of two (UE8M0 format)."""
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division."""
-    return (a + b - 1) // b
-
-
-def _load_cast_back_from_fp4():
-    from .test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
-
-    return cast_back_from_fp4
 
 
 def create_dsa_cache_manager(
@@ -2143,14 +1754,8 @@ def test_dsa_cache_manager_v2_remaps_indexer_after_empty_layers() -> None:
         cache_manager.shutdown()
 
 
-def create_indexer(
-    sparse_attn_config,
-    layer_idx=0,
-    indexer_cls=Indexer,
-    pretrained_config=None,
-    compress_ratio=1,
-):
-    """Create a test indexer with configurable implementation, checkpoint params, and pooling."""
+def create_indexer(sparse_attn_config, layer_idx=0, pretrained_config=None, compress_ratio=1):
+    """Create a test indexer using checkpoint-derived parameters and an explicit pooling ratio."""
     # Create RopeParams
     rope_params = RopeParams(
         dim=64,  # qk_rope_head_dim
@@ -2177,18 +1782,15 @@ def create_indexer(
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
-    rope_cls = (
+    with patch(
         "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.RotaryEmbedding"
-        if indexer_cls is Indexer
-        else "tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend._TorchRotaryEmbedding"
-    )
-    with patch(rope_cls) as mock_rope:
+    ) as mock_rope:
         # Create a mock instance with a simple forward method
         mock_rope_instance = Mock()
         mock_rope_instance.forward = Mock(side_effect=lambda pos_ids, tensors: tensors)
         mock_rope.return_value = mock_rope_instance
 
-        indexer = indexer_cls(
+        indexer = Indexer(
             quant_config=None,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
@@ -2275,7 +1877,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     )
     assert logits.dtype == torch.float32, f"Expected dtype torch.float32, got {logits.dtype}"
 
-    ref_logits = DSAVanillaIndexer.mqa_logits(
+    ref_logits = mqa_logits(
         q=q,
         kv=kv,
         weights=weights,
@@ -3198,7 +2800,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_kv_lens.cuda()
-    ref_logits = DSAVanillaIndexer.paged_mqa_logits(
+    ref_logits = paged_mqa_logits(
         q,
         kv_cache_bf16,
         weights,
@@ -3605,7 +3207,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_lens.cuda()
-    ref_logits = DSAVanillaIndexer.paged_mqa_logits(
+    ref_logits = paged_mqa_logits(
         q_simulated.float(),
         kv_cache_sim,
         weights,

@@ -22,6 +22,12 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import DSAVanillaIndexer
 from tensorrt_llm._utils import get_sm_version
 
+# Support both pytest package imports and the standalone benchmark entry point.
+if __package__:
+    from ._indexer_reference import paged_mqa_logits_quantized
+else:
+    from _indexer_reference import paged_mqa_logits_quantized
+
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason=f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
@@ -201,7 +207,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(
         data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
     )
 
-    ref_logits = DSAVanillaIndexer.paged_mqa_logits_quantized(
+    ref_logits = paged_mqa_logits_quantized(
         data["q_fp8"],
         data["kv_fp8"],
         data["kv_scales"],
@@ -314,7 +320,7 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
         data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
     )
 
-    ref_logits = DSAVanillaIndexer.paged_mqa_logits_quantized(
+    ref_logits = paged_mqa_logits_quantized(
         data["q_fp8"],
         data["kv_fp8"],
         data["kv_scales"],

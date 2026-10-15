@@ -26,6 +26,12 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import DSAVanillaIndexer
 from tensorrt_llm._utils import get_sm_version
 
+# Support both pytest package imports and the standalone benchmark entry point.
+if __package__:
+    from ._indexer_reference import paged_mqa_logits
+else:
+    from _indexer_reference import paged_mqa_logits
+
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason=f"CuTe DSL FP4 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
@@ -306,7 +312,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     # bf16 path inside torch.matmul introduces ~1e-3 relative error per
     # multiply which compounds to ~0.3 max_abs for our 128-elem dot products,
     # masking the kernel's true precision.
-    ref = DSAVanillaIndexer.paged_mqa_logits(
+    ref = paged_mqa_logits(
         q_simulated.float(),
         kv_simulated.float(),
         weights,

@@ -114,17 +114,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         if not caps.get(feat, False):
             return f"{backend} does not support feature '{feat}'"
 
-    sparse_config = getattr(case, "sparse_attention_config", None)
-    if sparse_config is not None:
-        algorithm = sparse_config.algorithm
-        if backend == "TRTLLM" and algorithm == "dsa":
-            # DSA selected-attention runs the trtllm-gen DynamicTokenSparse FMHA
-            # kernels, which only ship for Blackwell (sm_100+). On Hopper (sm90)
-            # MLA generation falls back to the dense FlashMLA kernel, which has no
-            # sparse path, so top-k selection is silently ignored.
-            if sm < 100:
-                return f"TRTLLM DSA requires sm>=100/Blackwell (have sm{sm})"
-
     # KV-cache block layout: a case may request a specific layout (NHD/HND). A
     # backend that cannot store the cache that way is skipped (e.g. TRTLLM is
     # head-major HND only). The Vanilla golden always runs in its native NHD and

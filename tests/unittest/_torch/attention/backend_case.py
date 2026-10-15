@@ -30,11 +30,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
-from tensorrt_llm._torch.attention.backends.sparse.dsa import (
-    DSABackendForwardArgs,
-    _effective_compress_ratio_divisor,
-    _select_indexer_compress_ratio,
-)
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSABackendForwardArgs
 from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -155,14 +151,6 @@ class BackendCase:
         return self.sparse_attention_config is not None
 
     @property
-    def sparse_topk(self) -> Optional[int]:
-        """Per-token selection budget (``index_topk``) from the sparse config."""
-        cfg = self.sparse_attention_config
-        if cfg is None:
-            return None
-        return cfg.index_topk
-
-    @property
     def prompt_lens(self) -> List[int]:
         """Original prompt lengths expected by fused generation kernels."""
         return [
@@ -237,12 +225,6 @@ def _rope_params_from_dict(d: dict) -> RopeParams:
         if isinstance(kwargs.get(key), list):
             kwargs[key] = tuple(kwargs[key])
     return RopeParams(**kwargs)
-
-
-def _validate_sparse_case(case: BackendCase) -> None:
-    """Reject unsupported sparse contracts (called only for sparse cases)."""
-    if case.sparse_topk is None or case.sparse_topk <= 0:
-        raise ValueError("Sparse backend cases require a positive top-k")
 
 
 def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
@@ -326,9 +308,7 @@ def _build_mla_kv_cache_manager(
 ):
     """A SELFKONLY KV cache for MLA: one latent head, head_dim kv_lora+qk_rope."""
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
-    # Sparse selected-attention tests deliberately exercise multiple pages in
-    # Vanilla too. Dense Vanilla keeps its historical single-block setup.
-    paged = case.is_sparse or BACKEND_CAPS[backend]["paged"]
+    paged = BACKEND_CAPS[backend]["paged"]
     max_total = max(case.token_nums)
     if paged:
         tokens_per_block = case.page_size
@@ -1262,7 +1242,6 @@ def _assert_sparse_indexer_matches_golden(
     golden: Dict[str, torch.Tensor],
     *,
     case: BackendCase,
-    compress_ratio: int,
     min_row_overlap: float = 0.95,
 ) -> None:
     """Compare request-local TopK sets against the Vanilla indexer golden.
@@ -1271,8 +1250,7 @@ def _assert_sparse_indexer_matches_golden(
     the torch reference uses exact division. Entries at the TopK boundary may
     therefore differ even when the scoring implementation is correct. Compare
     sets rather than score order and require every row to retain at least 95%
-    of the golden selection. Causal limits are expressed in the indexer's
-    compressed KV coordinate system.
+    of the golden selection.
     """
     if actual.keys() != golden.keys():
         raise AssertionError(
@@ -1286,22 +1264,19 @@ def _assert_sparse_indexer_matches_golden(
             seq_start, seq_end = case.num_contexts, case.num_seqs
         else:
             raise AssertionError(f"Unknown Indexer phase: {phase}")
-        visible_counts = [
-            (
-                torch.arange(
-                    case.num_cached_tokens[i],
-                    case.num_cached_tokens[i] + case.seq_lens[i],
-                    device=device,
-                    dtype=torch.int64,
-                )
-                + 1
+        # Each query may select keys up to and including its own position.
+        limits = [
+            torch.arange(
+                case.num_cached_tokens[i],
+                case.num_cached_tokens[i] + case.seq_lens[i],
+                device=device,
+                dtype=torch.int64,
             )
-            // compress_ratio
             for i in range(seq_start, seq_end)
         ]
-        if not visible_counts:
+        if not limits:
             return torch.empty(0, device=device, dtype=torch.int64)
-        return torch.cat(visible_counts) - 1
+        return torch.cat(limits)
 
     def validate_topk(
         topk: torch.Tensor,
@@ -1784,7 +1759,6 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     """
     is_mla = case.is_mla
     if case.is_sparse:
-        _validate_sparse_case(case)
         if case.is_mla:
             inputs = generate_sparse_mla_inputs(case, seed)
         else:
@@ -1797,13 +1771,6 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     else:
         inputs = generate_inputs(case, seed)
     golden_indexer_outputs = {} if case.is_sparse else None
-    indexer_compress_ratio = 1
-    if case.is_sparse:
-        compress_ratios = getattr(case.sparse_attention_config, "compress_ratios", None)
-        if compress_ratios:
-            indexer_compress_ratio = _effective_compress_ratio_divisor(
-                _select_indexer_compress_ratio(compress_ratios)
-            )
     golden = run_backend(
         case,
         "VANILLA",
@@ -1846,7 +1813,6 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
                     backend_indexer_outputs,
                     golden_indexer_outputs,
                     case=case,
-                    compress_ratio=indexer_compress_ratio,
                 )
             except AssertionError as exc:
                 failures.append(f"[{backend} indexer vs VANILLA indexer golden]\n{exc}")

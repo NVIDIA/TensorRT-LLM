@@ -24,15 +24,7 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 
 import pytest
 import torch
-from backend_case import (
-    BACKENDS_UNDER_TEST,
-    BackendCase,
-    _assert_sparse_end_to_end_matches_golden,
-    _assert_sparse_indexer_matches_golden,
-    generate_inputs,
-    run_backend,
-    run_case,
-)
+from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
 from utils.util import getSMVersion
 
@@ -96,120 +88,6 @@ _SPARSE_COMPUTE_DTYPE = "bfloat16"
 _SPARSE_KV_LAYOUT = "HND"
 _SPARSE_PAGE_SIZE = 64
 _SPARSE_USE_KVM_V2 = False
-
-
-def test_sparse_indexer_golden_validation():
-    case = BackendCase(
-        num_heads=2,
-        num_kv_heads=1,
-        head_dim=8,
-        seq_lens=[20],
-        num_cached_tokens=[0],
-        num_contexts=1,
-    )
-    golden_topk = torch.full((20, 20), -1, dtype=torch.int32)
-    for row in range(20):
-        golden_topk[row, : row + 1] = torch.arange(row + 1, dtype=torch.int32)
-    golden = {"context": golden_topk}
-
-    # Selection order and padding position are not part of the contract.
-    _assert_sparse_indexer_matches_golden(
-        {"context": golden_topk.flip(1)}, golden, case=case, compress_ratio=1
-    )
-
-    duplicate = golden_topk.clone()
-    duplicate[-1, -1] = duplicate[-1, -2]
-    with pytest.raises(AssertionError, match="repeats index"):
-        _assert_sparse_indexer_matches_golden(
-            {"context": duplicate}, golden, case=case, compress_ratio=1
-        )
-
-    bad_padding = golden_topk.clone()
-    bad_padding[0, 1] = -2
-    with pytest.raises(AssertionError, match="invalid padding"):
-        _assert_sparse_indexer_matches_golden(
-            {"context": bad_padding}, golden, case=case, compress_ratio=1
-        )
-
-    future = golden_topk.clone()
-    future[0, 0] = 1
-    with pytest.raises(AssertionError, match="future index"):
-        _assert_sparse_indexer_matches_golden(
-            {"context": future}, golden, case=case, compress_ratio=1
-        )
-
-    missing = golden_topk.clone()
-    missing[-1, -1] = -1
-    with pytest.raises(AssertionError, match="valid entries"):
-        _assert_sparse_indexer_matches_golden(
-            {"context": missing}, golden, case=case, compress_ratio=1
-        )
-
-
-@pytest.mark.parametrize(
-    "phase,seq_lens,num_cached_tokens,num_contexts,valid_counts,future_row",
-    [
-        pytest.param(
-            "context",
-            [8],
-            [0],
-            1,
-            [0, 0, 0, 1, 1, 1, 1, 2],
-            3,
-            id="context",
-        ),
-        pytest.param(
-            "generation",
-            [3],
-            [5],
-            0,
-            [1, 1, 2],
-            0,
-            id="generation-cached-prefix",
-        ),
-    ],
-)
-def test_sparse_indexer_golden_validation_uses_compressed_coordinates(
-    phase,
-    seq_lens,
-    num_cached_tokens,
-    num_contexts,
-    valid_counts,
-    future_row,
-):
-    case = BackendCase(
-        num_heads=2,
-        num_kv_heads=1,
-        head_dim=8,
-        seq_lens=seq_lens,
-        num_cached_tokens=num_cached_tokens,
-        num_contexts=num_contexts,
-    )
-    golden_topk = torch.full((len(valid_counts), 2), -1, dtype=torch.int32)
-    for row, valid_count in enumerate(valid_counts):
-        golden_topk[row, :valid_count] = torch.arange(valid_count, dtype=torch.int32)
-    golden = {phase: golden_topk}
-
-    _assert_sparse_indexer_matches_golden({phase: golden_topk}, golden, case=case, compress_ratio=4)
-
-    future = golden_topk.clone()
-    future[future_row, 0] += 1
-    with pytest.raises(AssertionError, match="future index"):
-        _assert_sparse_indexer_matches_golden({phase: future}, golden, case=case, compress_ratio=4)
-
-
-def test_sparse_end_to_end_golden_rejects_corrupted_token_row():
-    golden = torch.zeros(274, 256)
-    actual = golden.clone()
-    actual[147].fill_(1.0)
-
-    with pytest.raises(AssertionError, match="worst_row_close"):
-        _assert_sparse_end_to_end_matches_golden(
-            actual,
-            golden,
-            atol=0.1,
-            rtol=0.01,
-        )
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
