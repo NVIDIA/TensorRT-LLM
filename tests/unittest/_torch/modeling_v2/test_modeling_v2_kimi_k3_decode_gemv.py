@@ -34,7 +34,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide
     k3_ctm_gemv_wide,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_decode_gemv import k3_decode_gemv
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (  # noqa: E501
     decode_gemv,
 )
 from tensorrt_llm._torch.modules.embedding import LMHead

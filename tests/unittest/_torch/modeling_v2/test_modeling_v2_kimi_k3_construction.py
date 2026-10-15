@@ -3,11 +3,13 @@
 """The Kimi K3 targets' construction checks, host-side: each target requires its own parallel layout, and
 ``tp16_moetp16ep1`` also an explicit expert split and no speculative decoding."""
 
+import importlib
 import types
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling as shared
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     modeling as route_a,
 )
@@ -76,14 +78,50 @@ def test_tp16_moetp16ep1_decodes_without_speculation():
         route_b._check_construction(_config(16, 1, spec_config=object()))
 
 
+@pytest.mark.parametrize("moe_tp,moe_ep", [(4, 4), (16, 1)])
+def test_sm103_mxfp4_requires_its_hardware(monkeypatch, moe_tp, moe_ep):
+    target = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        f"kimi_k3_mxfp4__sm_103__tp16_moetp{moe_tp}ep{moe_ep}.modeling"
+    )
+    with pytest.raises(AssertionError, match="requires sm_103"):
+        target._check_construction(_config(moe_tp, moe_ep))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 3))
+    target._check_construction(_config(moe_tp, moe_ep))
+
+
+@pytest.mark.parametrize("sm", [103, 107])
+def test_nvfp4_checks_every_expert_layer(monkeypatch, sm):
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    target = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        f"kimi_k3_nvfp4__sm_{sm}__tp16_moetp4ep4.modeling"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (sm // 10, sm % 10))
+    config = _config(4, 4)
+    config.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=QuantAlgo.NVFP4
+    )
+    config.quant_config_dict = {
+        f"model.layers.{i}.mlp.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+        for i in range(1, 93)
+    }
+    target._check_construction(config)
+    config.quant_config_dict["model.layers.92.mlp.experts"].group_size = 32
+    with pytest.raises(ValueError, match="group-size-16 NVFP4 experts at layer 92"):
+        target._check_construction(config)
+
+
 def test_tp16_moetp16ep1_keeps_no_per_token_kda_states(monkeypatch):
     """The text model answers ``kda_draft_records`` (False, without speculation), which a captured step's latent-push
     decision reads: a pure decode step on the decode kernels pushes, as on ``tp16_moetp4ep4`` without per-token
     states."""
-    model = route_b.KimiLinearModel.__new__(route_b.KimiLinearModel)
+    model = shared.KimiLinearModel.__new__(shared.KimiLinearModel)
+    object.__setattr__(model, "model_config", types.SimpleNamespace(spec_config=None))
     assert model.kda_draft_records is False
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(route_b, "is_in_breakable_cuda_graph", lambda: False)
+    monkeypatch.setattr(shared, "is_in_breakable_cuda_graph", lambda: False)
     kda = types.SimpleNamespace(
         is_kda=True,
         linear_attn=types.SimpleNamespace(takes_k3_kernels=True, k3_buffers=object()),
@@ -93,5 +131,5 @@ def test_tp16_moetp16ep1_keeps_no_per_token_kda_states(monkeypatch):
         self_attn=types.SimpleNamespace(will_run_decode_branch=lambda metadata, step: True),
     )
     object.__setattr__(model, "layers", [kda, mla])
-    assert model._latent_push(None, route_b.DecodeStep(1, 1, 1))
-    assert not model._latent_push(None, route_b.DecodeStep(8, 1, 8))
+    assert model._latent_push(None, shared.DecodeStep(1, 1, 1))
+    assert not model._latent_push(None, shared.DecodeStep(8, 1, 8))

@@ -1970,13 +1970,11 @@ def test_modeling_v2_nvfp4_streamed_moe_matches_reference(num_tokens: int) -> No
     """Exercise the target's loader and router without allocating the full K3 model."""
     from transformers import PretrainedConfig
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp16_moetp4ep4 import (
-        modeling as target,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling as target
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
-    if torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("The NVFP4 modeling_v2 target requires SM107")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("NVFP4 MoE requires SM100, SM103 or SM107")
     torch.manual_seed(91)
     cfg = _K3Config(
         hidden_size=_TP_HIDDEN,

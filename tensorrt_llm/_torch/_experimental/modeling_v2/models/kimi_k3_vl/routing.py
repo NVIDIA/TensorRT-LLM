@@ -20,11 +20,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget
 
-# The GPU architecture the MXFP4 targets are written for. sm is part of a
-# target's identity, not a knob: a different SM is a different target. The K3
-# decode kernels (the tcgen05 GEMVs, the fused MoE) are built for GB200 only.
-_SM = (10, 0)
-
 # The MXFP4 checkpoint's config shape; see the note in the sibling gpt_oss
 # routing module for what shape-sniffing does and does not pin.
 #
@@ -145,9 +140,23 @@ def route(
     )
     quant_algo = _quant_algo(pretrained_config)
     parallel = _parallel(mapping)
-    mxfp4_on_sm100 = (
-        compute_capability == _SM and shape == _SHAPE and quant_algo == QuantAlgo.W4A16_MXFP4
+    mxfp4_on_blackwell = (
+        compute_capability in ((10, 0), (10, 3))
+        and shape == _SHAPE
+        and quant_algo == QuantAlgo.W4A16_MXFP4
     )
+
+    if (
+        compute_capability == (10, 3)
+        and shape == _SHAPE
+        and parallel == "tp16_moetp4ep4"
+        and _has_nvfp4_experts(pretrained_config)
+    ):
+        from .kimi_k3_nvfp4__sm_103__tp16_moetp4ep4.modeling import (
+            ModelingV2KimiK3Nvfp4Sm103Tp16Moetp4ep4,
+        )
+
+        return ModelingV2KimiK3Nvfp4Sm103Tp16Moetp4ep4
 
     if (
         compute_capability == (10, 7)
@@ -161,14 +170,28 @@ def route(
 
         return ModelingV2KimiK3Nvfp4Sm107Tp16Moetp4ep4
 
-    if mxfp4_on_sm100 and parallel == "tp16_moetp4ep4":
+    if mxfp4_on_blackwell and compute_capability == (10, 3) and parallel == "tp16_moetp4ep4":
+        from .kimi_k3_mxfp4__sm_103__tp16_moetp4ep4.modeling import (
+            ModelingV2KimiK3Mxfp4Sm103Tp16Moetp4ep4,
+        )
+
+        return ModelingV2KimiK3Mxfp4Sm103Tp16Moetp4ep4
+
+    if mxfp4_on_blackwell and compute_capability == (10, 3) and parallel == "tp16_moetp16ep1":
+        from .kimi_k3_mxfp4__sm_103__tp16_moetp16ep1.modeling import (
+            ModelingV2KimiK3Mxfp4Sm103Tp16Moetp16ep1,
+        )
+
+        return ModelingV2KimiK3Mxfp4Sm103Tp16Moetp16ep1
+
+    if mxfp4_on_blackwell and parallel == "tp16_moetp4ep4":
         from .kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (
             ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4,
         )
 
         return ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4
 
-    if mxfp4_on_sm100 and parallel == "tp16_moetp16ep1":
+    if mxfp4_on_blackwell and parallel == "tp16_moetp16ep1":
         from .kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling import (
             ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1,
         )
@@ -182,7 +205,7 @@ def route(
         f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} "
         f"split_set={getattr(mapping, 'moe_tp_ep_user_specified', False)} "
         f"attention_dp={mapping.enable_attention_dp}; the kimi_k3_vl targets are the MXFP4 "
-        "Kimi K3 checkpoint on sm100 (GB200), 16 ranks of tensor-parallel attention, with the "
+        "Kimi K3 checkpoint on sm100/sm103, 16 ranks of tensor-parallel attention, with the "
         "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1; "
-        "and group-size-16 NVFP4 Kimi K3 on sm107 with tp16 attention and moe_tp 4 x moe_ep 4"
+        "and group-size-16 NVFP4 Kimi K3 on sm103/sm107 with tp16 attention and moe_tp 4 x moe_ep 4"
     )

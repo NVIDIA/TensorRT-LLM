@@ -39,10 +39,10 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (  # noqa: E501
     decode_comm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (  # noqa: E501
     modeling as target,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -358,16 +358,14 @@ def test_gate_hands_the_state_to_the_k3_drafter_only():
     taken = []
     drafter = _drafter()
     drafter.use_decode_comm = taken.append
-    assert target.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
-        SimpleNamespace(draft_model=drafter), comm
-    )
+    assert target.ModelingV2KimiK3._gate_drafter_comm(SimpleNamespace(draft_model=drafter), comm)
     assert taken == [comm]
-    assert not target.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
+    assert not target.ModelingV2KimiK3._gate_drafter_comm(
         SimpleNamespace(draft_model=drafter), None
     )
     assert taken == [comm]
     for other in (None, SimpleNamespace(use_decode_comm=taken.append)):
-        assert not target.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
+        assert not target.ModelingV2KimiK3._gate_drafter_comm(
             SimpleNamespace(draft_model=other), comm
         )
     assert taken == [comm]

@@ -11,8 +11,8 @@ from pathlib import Path
 import torch
 
 import tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe as _k3_fused_moe
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    decode_moe as route_b_moe,
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
+    decode_moe_tp16 as route_b_moe,
 )
 
 

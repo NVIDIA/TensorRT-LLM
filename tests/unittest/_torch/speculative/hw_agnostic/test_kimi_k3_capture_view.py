@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.spec_worker import (  # noqa: E501
     capture_view,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata

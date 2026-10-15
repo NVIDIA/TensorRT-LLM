@@ -12,17 +12,12 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    modeling as route_a,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    modeling as route_b,
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (  # noqa: E501
+    modeling as shared,
 )
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod, RoutingMethodType
 
-TARGETS = pytest.mark.parametrize(
-    "target", [route_a, route_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"]
-)
+TARGETS = pytest.mark.parametrize("target", [shared], ids=["shared-k3"])
 
 NUM_EXPERTS, TOP_K, HIDDEN, LATENT = 896, 16, 7168, 3584
 # One tp16_moetp16ep1 rank's expert width: 192 of 3072, zero-padded to 256 by the loader.

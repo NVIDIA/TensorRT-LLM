@@ -377,10 +377,11 @@ def _run_one_rank(args) -> int:
     import importlib
 
     T = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
-        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling"
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.modeling"
     )
-    DM = T._decode_moe
+    DM = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.decode_moe_tp16"
+    )
     # First, before anything exists as an inference tensor: the decode MoE as post_load_weights builds it.
     code = ls.run_checks(R, [check_build])
     if code:

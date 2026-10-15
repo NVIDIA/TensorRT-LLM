@@ -9,17 +9,14 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    modeling as route_a,
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (  # noqa: E501
+    modeling as target,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.modeling import (  # noqa: E501
     DecodeStep,
     _attn_res_max_tokens,
     decode_step,
     latent_push,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    modeling as route_b,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -156,7 +153,6 @@ class _Layer:
         return hidden_states, num_snapshots
 
 
-@pytest.mark.parametrize("target", [route_a, route_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
 @pytest.mark.parametrize(
     "seq_lens,num_contexts,rows,path",
     [
@@ -174,7 +170,7 @@ class _Layer:
         ([8, 4], 0, 12, "generic"),
     ],
 )
-def test_each_step_takes_one_path_through_every_layer(target, seq_lens, num_contexts, rows, path):
+def test_each_step_takes_one_path_through_every_layer(seq_lens, num_contexts, rows, path):
     model = object.__new__(target.KimiLinearModel)
     torch.nn.Module.__init__(model)
     calls = []

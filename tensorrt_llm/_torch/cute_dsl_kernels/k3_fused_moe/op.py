@@ -87,8 +87,11 @@ def is_supported(w3_w1_weight: torch.Tensor, w3_w1_weight_scale: torch.Tensor, w
     """Whether these TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers fit the fused kernels.
 
     Only metadata is read, so the buffers may still be on the meta device."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        return False, "needs sm_100"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        return False, "needs sm_100 or sm_103"
     try:
         import cutlass  # noqa: F401
     except ImportError:
@@ -698,8 +701,11 @@ def m1_supported(
     logical intermediate; the buffers may hold it zero-padded to a multiple of 128, as TRT-LLM's loader lays out an
     unaligned shard (e.g. 192 -> 256 at TP16). Only metadata is read, so the buffers may still be on the meta
     device."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        return False, "needs sm_100"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        return False, "needs sm_100 or sm_103"
     try:
         import cutlass  # noqa: F401
     except ImportError:

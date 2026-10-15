@@ -26,10 +26,10 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.modeling import (  # noqa: E501
     K3DSparkDrafter,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.spec_worker import (  # noqa: E501
     KimiK3DFlashWorker,
     KimiK3DSparkWorker,
     dflash_ctx_rows_kwargs,
