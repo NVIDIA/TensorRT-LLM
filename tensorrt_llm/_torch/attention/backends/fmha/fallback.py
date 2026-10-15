@@ -48,6 +48,8 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
         "timestep",  # consumed by sparse prediction before FMHA dispatch
         "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
+        "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
+        "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
     }
 )
 

@@ -121,7 +121,8 @@ class Fmha(ABC):
             logger.debug(f"{type(self).__name__} does not support block-sparse inputs.")
             return False
         if (
-            forward_args.qk_fp8_per_tensor or forward_args.v_fp8_per_tensor
+            getattr(forward_args, "qk_fp8_per_tensor", False)
+            or getattr(forward_args, "v_fp8_per_tensor", False)
         ) and not self.supports_per_tensor_fp8:
             logger.debug(f"{type(self).__name__} does not support per-tensor FP8 recipes.")
             return False

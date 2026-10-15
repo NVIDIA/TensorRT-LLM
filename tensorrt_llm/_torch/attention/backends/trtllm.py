@@ -2465,8 +2465,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                              forward_args)
 
             if fmha is None:
-                if (forward_args.qk_fp8_per_tensor
-                        or forward_args.v_fp8_per_tensor):
+                if (getattr(forward_args, "qk_fp8_per_tensor", False)
+                        or getattr(forward_args, "v_fp8_per_tensor", False)):
                     raise RuntimeError(
                         "The per-tensor FP8 attention recipe needs the PrimTS "
                         "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
