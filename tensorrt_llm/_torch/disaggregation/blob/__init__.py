@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The blob backend: KV rows shared through a byte store.
 
-So far this package holds the private driver boundary (``store.py``) and the key encoding
-(``keys.py``). Nothing here imports the public backend contract or an optional store SDK at
-import time.
+No module here imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time.
+
+- ``store`` (the private driver boundary) and ``keys`` import only the standard library. How an
+  object is laid out in a store is its driver's private format.
+- ``backend`` (the public backend over a driver) imports only ``store``, ``keys`` and
+  ``base.backend``, plus numpy and ``tensorrt_llm.logger``.
 """
