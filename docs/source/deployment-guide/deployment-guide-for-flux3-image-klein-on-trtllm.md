@@ -6,19 +6,19 @@ This is a quick-start guide for running the FLUX.3 Klein image generation models
 
 ## Prerequisites
 
-* GPU: NVIDIA Hopper or Blackwell for the BF16 and FP8 variants. The NVFP4 variant requires Blackwell.
+* GPU: NVIDIA GPU with enough memory for the selected checkpoint. The NVFP4 variant uses Blackwell Tensor Cores.
 * OS: Linux
 * Docker with NVIDIA Container Toolkit installed
 
 ## Models
 
 * [FLUX.3 Klein Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base): `black-forest-labs/flux-3-image-klein-base` (text-to-image and image-to-image; supports CFG parallelism)
-* [FLUX.3 Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein): `black-forest-labs/flux-3-image-klein` (text-to-image and image-to-image; no CFG parallelism)
+* [FLUX.3 Klein (distilled)](https://huggingface.co/black-forest-labs/flux-3-image-klein): `black-forest-labs/flux-3-image-klein` (text-to-image and image-to-image; no CFG parallelism)
 
 Weight variants are selected with `--variant` in the example script, or with `pipeline_config.variant` in a YAML config:
 
 * BF16: omit the variant (root package)
-* FP8: `fp8r`
+* FP8: `fp8r` (rowwise)
 * NVFP4: `nvfp4`
 
 ## Deployment Steps
@@ -45,7 +45,7 @@ Inside the container, the example scripts and configs are at `/app/tensorrt_llm/
 
 ### Generate Images with the Example Script
 
-Run from `/app/tensorrt_llm/examples/visual_gen`:
+Run from `/app/tensorrt_llm/examples/visual_gen`. If you run the scripts outside the container, install the dependencies from the repo root first with `pip install -r requirements-dev.txt`.
 
 ```shell
 python models/flux3.py --model black-forest-labs/flux-3-image-klein-base \
@@ -73,7 +73,7 @@ The distilled checkpoint runs the same way with `--model black-forest-labs/flux-
 
 ### Launch the TensorRT LLM Server
 
-Native FLUX.3 checkpoints need `--visual_gen_args` to select VisualGen:
+Native FLUX.3 checkpoints need `--visual_gen_args <YAML path>` (or `--enable_visual_gen`) to select VisualGen:
 
 ```shell
 trtllm-serve black-forest-labs/flux-3-image-klein-base \
@@ -87,4 +87,4 @@ The server exposes OpenAI-compatible image endpoints, including `POST /v1/images
 
 ## Multi-GPU Parallelism
 
-The 1-GPU config is a starting point. For CFG, Ulysses, or tensor parallelism, see the [Multi-GPU Parallelism](../models/visual-generation.md) section of the Visual Generation doc.
+The 1-GPU config is a starting point. The Base checkpoint supports CFG parallelism; the distilled checkpoint does not. Both support Ulysses and tensor parallelism. See the [Multi-GPU Parallelism](../models/visual-generation.md#multi-gpu-parallelism) section of the Visual Generation doc.
