@@ -96,8 +96,8 @@ struct MinimaxM3AttnMegaParams
     unsigned int* flags; // mega: [0, 20) tile counters (4 per call), [32 + CTA] the attention CTAs' targets
     long long pf_a0, pf_b0, pf_a1, pf_b1; // mega: L2 prefetch regions issued in the attention window (bytes 0: none)
     int pf_hint;                          // 1: evict_last policy on the prefetch
-    alignas(64) CUtensorMap wmap;         // the [2560, 6144] E4M3 weight, 128 x 128 boxes, 128-byte swizzle
-    alignas(64) CUtensorMap wmap_o;       // mega: the [6144, 2048] E4M3 o_proj weight, same boxes
+    CUtensorMap wmap;                     // the [2560, 6144] E4M3 weight, 128 x 128 boxes, 128-byte swizzle
+    CUtensorMap wmap_o;                   // mega: the [6144, 2048] E4M3 o_proj weight, same boxes
 };
 
 //! Launch the megakernel on `stream`. The caller fills `params` except `wmap`, `wmap_o`, `packed`,
