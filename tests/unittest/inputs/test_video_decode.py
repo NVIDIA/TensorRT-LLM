@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -18,6 +21,7 @@ import cv2  # noqa: E402
 
 from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 from tensorrt_llm.inputs.multimodal import default_hasher  # noqa: E402
+from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
 from tensorrt_llm.inputs.utils import async_load_video, load_video  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
@@ -27,7 +31,7 @@ pytestmark = pytest.mark.cpu_only
 def sample_video_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     """Encode a tiny mp4 with distinguishable per-frame pixel values."""
     width, height, num_frames = 64, 64, 20
-    path = tmp_path_factory.mktemp("video_decode") / "sample.mp4"
+    path = tmp_path_factory.mktemp("video_decode") / "sample video.mp4"
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (width, height))
     for i in range(num_frames):
         writer.write(np.full((height, width, 3), (i * 10) % 256, dtype=np.uint8))
@@ -72,19 +76,65 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
     assert np.shares_memory(video.frames, batched[0])
 
 
-def test_offline_loaders_match_serve_video_hash(sample_video_path: str) -> None:
+@pytest.mark.parametrize("input_kind", ["path", "file_uri", "data_uri"])
+@pytest.mark.parametrize("force_tempfile", [False, True], ids=["auto_backend", "tempfile"])
+def test_offline_loaders_match_serve_video_hash(
+    sample_video_path: str,
+    input_kind: str,
+    force_tempfile: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The offline loaders must produce the same cache identity as serve's `VideoMediaIO`."""
 
-    def digest(video) -> str:
+    def digest(video: VideoData) -> str:
+        """Hash the video data and sampling metadata."""
         hasher = default_hasher()
         video.update_hash(hasher)
         return hasher.hexdigest()
 
-    serve = VideoMediaIO(num_frames=10).load_file(sample_video_path)
-    offline = load_video(sample_video_path, num_frames=10)
-    offline_async = asyncio.run(async_load_video(sample_video_path, num_frames=10))
+    path = Path(sample_video_path)
+    encoded = path.read_bytes()
+    if input_kind == "file_uri":
+        source = path.as_uri()
+    elif input_kind == "data_uri":
+        source = "data:video/mp4;base64," + base64.b64encode(encoded).decode("ascii")
+    else:
+        source = str(path)
+    if force_tempfile:
+        monkeypatch.setattr(
+            "tensorrt_llm.inputs.media_io._select_cv2_stream_buffered_backend", lambda: None
+        )
 
-    assert serve.raw_bytes_hash is not None
+    serve = asyncio.run(VideoMediaIO(num_frames=10).async_load(source))
+    offline = load_video(source, num_frames=10)
+    offline_async = asyncio.run(async_load_video(source, num_frames=10))
+
+    assert serve.raw_bytes_hash == default_hasher(encoded).hexdigest()
     assert offline.raw_bytes_hash == serve.raw_bytes_hash
     assert offline_async.raw_bytes_hash == serve.raw_bytes_hash
     assert digest(offline) == digest(serve) == digest(offline_async)
+
+
+@pytest.mark.parametrize("file_uri", [False, True], ids=["path", "file_uri"])
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("read_error", [FileNotFoundError, PermissionError])
+def test_offline_local_video_read_errors_are_value_errors(
+    tmp_path: Path,
+    file_uri: bool,
+    use_async: bool,
+    read_error: type[OSError],
+) -> None:
+    """Local read failures retain the offline loaders' ValueError contract."""
+    path = tmp_path / "input video.mp4"
+    path.write_bytes(b"not decoded")
+    source = path.as_uri() if file_uri else str(path)
+    failure = read_error("cannot read video")
+
+    with patch.object(Path, "read_bytes", side_effect=failure):
+        with pytest.raises(ValueError) as error:
+            if use_async:
+                asyncio.run(async_load_video(source))
+            else:
+                load_video(source)
+
+    assert error.value.__cause__ is failure

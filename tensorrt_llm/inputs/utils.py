@@ -143,6 +143,11 @@ def load_video(video: str,
                format: str = "pt",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
+    """Load video frames with the shared source-byte cache identity.
+
+    Local files are read fully into memory during decoding. Local-file I/O
+    failures raise ValueError, with the original OSError as their cause.
+    """
     # Decode through `VideoMediaIO`, the loader `trtllm-serve` uses, so the
     # same video gets the same source-byte anchor (`raw_bytes_hash`) and
     # therefore the same multimodal hash offline and in serving.
@@ -156,7 +161,10 @@ def load_video(video: str,
         resp = _safe_request_get(video, stream=False)
         return video_io.load_bytes(resp.content)
     elif parsed_url.scheme in ("", "file"):
-        return video_io.load_file(video)
+        try:
+            return video_io.load_file(video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     elif parsed_url.scheme == "data":
         return video_io.load_bytes(load_base64_video(video))
     else:
@@ -169,6 +177,11 @@ async def async_load_video(video: str,
                            format: str = "pt",
                            device: str = "cpu",
                            extract_audio: bool = False) -> VideoData:
+    """Load video frames without blocking the event loop.
+
+    Local files are read fully into memory during decoding. Local-file I/O
+    failures raise ValueError, with the original OSError as their cause.
+    """
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     # See `load_video`: share the serving decode path so hashes agree.
@@ -186,7 +199,10 @@ async def async_load_video(video: str,
         decoded_video = await asyncio.to_thread(load_base64_video, video)
         return await asyncio.to_thread(video_io.load_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
-        return await asyncio.to_thread(video_io.load_file, video)
+        try:
+            return await asyncio.to_thread(video_io.load_file, video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
