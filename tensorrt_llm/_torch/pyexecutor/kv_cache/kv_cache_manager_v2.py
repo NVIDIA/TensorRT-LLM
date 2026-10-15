@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import hashlib
 import math
 import os
 import sys
@@ -6485,18 +6484,9 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     @staticmethod
-    def _derive_reuse_salt(cache_salt: str | None) -> int | None:
-        """Derive ``ReuseScope.salt`` (int|None) from the ``cache_salt`` string.
-
-        Deterministic so the same string yields the same reuse namespace across
-        processes (matches C++ blockKey hashing on cacheSalt). Shared by cache
-        creation, prefetch, and the cache-aware router probe so they all hit the
-        same radix-tree namespace.
-        """
-        if cache_salt is None:
-            return None
-        digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], "little")
+    def _derive_reuse_salt(cache_salt: str | None) -> str | None:
+        """Return the string namespace shared by creation, prefetch and probes."""
+        return cache_salt
 
     def _create_kv_cache(
         self,
@@ -6522,10 +6512,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.index_mapper.size(),
             )
             return None
-        # Synthetic requests use repeated token 1, which can match a real
-        # request's prefix before stop_committing() is called. Salt 0 gives
-        # them a separate reuse scope from ordinary unsalted requests.
-        salt_int = 0 if is_dummy else self._derive_reuse_salt(cache_salt)
+        # Synthetic requests must neither claim real prefixes nor publish reusable blocks.
+        # Skipping the initial lookup avoids reserving any user-visible salt value.
+        if is_dummy:
+            if expected_prompt_length is None and input_tokens is not None:
+                expected_prompt_length = len(input_tokens)
+            input_tokens = None
+        reuse_salt = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
         if (
@@ -6540,7 +6533,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int, original_cache_salt=cache_salt),
+            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
@@ -6551,6 +6544,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
+            kv_cache.stop_committing()
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()
         index = self.index_mapper.add_new_sequence(request_id)
@@ -6575,9 +6569,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return 0
         if len(input_tokens) == 0:
             return 0
-        salt_int = self._derive_reuse_salt(cache_salt)
+        reuse_salt = self._derive_reuse_salt(cache_salt)
         return self.impl.probe_reuse(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
         )
 
@@ -6640,11 +6634,9 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens = self._context_reuse_tokens(req)
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.
-            salt_int = self._derive_reuse_salt(req.cache_salt)
+            reuse_salt = self._derive_reuse_salt(req.cache_salt)
             kv_cache = self.impl.create_kv_cache(
-                ReuseScope(
-                    lora_id=req.lora_task_id, salt=salt_int, original_cache_salt=req.cache_salt
-                ),
+                ReuseScope(lora_id=req.lora_task_id, salt=reuse_salt),
                 tokens,
             )
             try:

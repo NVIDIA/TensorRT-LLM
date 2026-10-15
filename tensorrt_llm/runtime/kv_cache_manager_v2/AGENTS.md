@@ -71,14 +71,12 @@ Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is 
 
 ## Gotchas
 
-- **Integer salt is the only salt used for matching.** `ReuseScope.salt` is the
-  optional integer salt used by scope equality, hashing, indexing, and prefix
-  reuse. `original_cache_salt` only preserves the request string for event
-  payloads; it must never participate in matching or provide a fallback identity.
-  Derive the integer in the request adapter before calling KVCM. Equal integer
-  salts with different original strings must reuse the same prefix; different
-  integer salts with the same string must remain isolated. Keep these regression
-  cases and the distinction between `salt=None` and `salt=0`.
+- **String salt participates directly in matching.** `ReuseScope.salt` is an
+  optional string used by scope equality, hashing, indexing, and prefix reuse.
+  Hash its full UTF-8 bytes with a length prefix; distinguish `None`, `""`, and
+  `"0"`. Stored events copy the scope salt through the attached block's root.
+  Integer salt conversion belongs only to V1 event hashing and must agree with
+  the router. Keep Unicode and embedded-NUL regression cases.
 - **Dual import trick.** `_load_cpp_module()` reaches the bindings two ways: through
   `tensorrt_llm.bindings...` when `tensorrt_llm` is already imported, otherwise by walking up
   from `find_spec("kv_cache_manager_v2")` to the `tensorrt_llm` root and importing

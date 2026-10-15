@@ -208,24 +208,22 @@ Eviction controller
 
 ## Correctness invariants
 
-- The salt component of reuse identity must always be the optional `uint64_t`
-  `ReuseScope::salt`. Scope equality, root/block-key hashing, indexing, and all
-  prefix matching must use this integer, never the original salt string. Preserve
-  the distinction between an absent integer salt and zero.
-- `ReuseScope::originalCacheSalt` and `NodeBase::originalCacheSalt` only preserve
-  the original request string for event payloads. Never compare or hash this
-  metadata, use it as a matching fallback, or derive a new reuse namespace from it
-  inside KVCM. String-to-integer salt derivation belongs to the request adapter.
-  Tests must cover equal integer salts with different strings reusing the same
-  prefix, and different integer salts with the same string remaining isolated.
+- `ReuseScope::salt` is an optional string used directly by scope equality and
+  root/block-key hashing. Hash its complete bytes, including embedded NULs, and
+  preserve the distinction between an absent salt and an empty string. Integer
+  conversion is confined to the V1 event hash format and must agree with the router.
+- `Block::root` is a non-owning back-pointer for reading scope metadata while
+  attached. Set it from the parent on construction and attachment; clear it with
+  `prev` on detachment. Stored events copy the root's salt while it is valid.
 - Block keys are SHA-256 digests over the reuse scope and the token sequence.
   They are a security boundary for cross-request reuse. Do not replace,
   truncate, or use a non-cryptographic hash unless prefix matching also gains a
   token-content equality check.
 - `knownNoDigest=true` is an external guarantee (for example `text_only`), not
   a hint derived by scanning tokens. Passing it incorrectly corrupts key hashes.
-- The radix tree owns child blocks and a child never outlives its parent. Preserve
-  parent/child attachment order when replacing or removing blocks.
+- The radix tree owns attached child blocks. Detach subtrees leaf-first; live
+  caches may retain orphan blocks after their former root is destroyed. Restore
+  `prev` and `root` when reattaching them, before publishing stored events.
 - Root removal is deferred through `proposeToEraseEmptyRoot()` and drained only
   at tree safe points. Do not erase roots directly from a destructor chain.
 - Pages are immutable after commit. Locking and CUDA events establish when their

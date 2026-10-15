@@ -1320,7 +1320,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         tokens = [TokenId(i) for i in range(64)]
         capacity = 128
         default_scope = ReuseScope()
-        scoped = ReuseScope(lora_id=7, salt=11)
+        scoped = ReuseScope(lora_id=7, salt="11")
 
         def commit_for(reuse_scope: ReuseScope | None) -> None:
             kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
@@ -1347,10 +1347,10 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         commit_for(scoped)
         self.assertGreater(num_reused(scoped), 0)
-        self.assertEqual(num_reused(ReuseScope(lora_id=7, salt=12)), 0)
-        self.assertEqual(num_reused(ReuseScope(lora_id=8, salt=11)), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=7, salt="12")), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=8, salt="11")), 0)
         self.assertEqual(num_reused(ReuseScope(lora_id=7)), 0)
-        self.assertEqual(num_reused(ReuseScope(salt=11)), 0)
+        self.assertEqual(num_reused(ReuseScope(salt="11")), 0)
         self.assertEqual(num_reused(None), 0)
 
         commit_for(None)

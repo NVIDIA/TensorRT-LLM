@@ -53,9 +53,7 @@ struct Block;
 struct ReuseScope
 {
     std::optional<LoraTaskIdType> loraId;
-    std::optional<std::uint64_t> salt;
-    //! Original salt for event payloads; excluded from reuse identity and block-key hashing.
-    std::shared_ptr<std::string const> originalCacheSalt;
+    std::optional<std::string> salt;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
@@ -71,7 +69,7 @@ struct ReuseScope
 // collision-resistant and >= 256-bit. The radix tree is a globally shared,
 // cross-request/cross-tenant cache index, prefix matching is decided purely by
 // digest equality with NO re-verification of the underlying tokens, and the
-// hashed input (tokens, the derived salt in ReuseScope, multimodal
+// hashed input (tokens, the salt string in ReuseScope, multimodal
 // content bytes) is attacker-influenceable. A hash collision therefore silently
 // reuses another request's KV blocks (cross-request corruption / data leak),
 // and tenant isolation via cache_salt relies entirely on this hash's collision
@@ -182,8 +180,6 @@ struct NodeBase
     BlockKey key;
     std::unordered_map<BlockKey, SharedPtr<Block>> next;
     EventSink* eventSink;
-    //! Shared event metadata remains valid after detachment without retaining ancestor nodes.
-    std::shared_ptr<std::string const> originalCacheSalt;
 
     virtual ~NodeBase();
 
@@ -200,10 +196,9 @@ struct NodeBase
     virtual LifeCycleId numLifeCycles() const noexcept = 0;
 
 protected:
-    NodeBase(BlockKey k, EventSink* sink, std::shared_ptr<std::string const> originalCacheSalt_)
+    NodeBase(BlockKey k, EventSink* sink)
         : key(k)
         , eventSink(sink)
-        , originalCacheSalt(std::move(originalCacheSalt_))
     {
     }
 };
@@ -250,6 +245,8 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Previous node in the chain (RootBlock or Block). Null after detaching from the tree.
     // Raw non-owning pointer: while attached, the prev node's `next` map owns us via shared_ptr.
     NodeBase* prev{nullptr};
+    //! Non-owning scope access while attached; cleared together with prev on detachment.
+    RootBlock* root{nullptr};
 
     TypedVec<LifeCycleId, CommittedPage*> storage;
 
