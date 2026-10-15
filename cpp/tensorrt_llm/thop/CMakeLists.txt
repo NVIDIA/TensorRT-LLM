@@ -109,6 +109,7 @@ add_th_common_family(
   mxfp8Gemm.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
+  glmFusedEmbeddingOp.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp

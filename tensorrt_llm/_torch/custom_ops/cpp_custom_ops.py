@@ -985,6 +985,10 @@ def _register_fake():
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
 
+    @torch.library.register_fake("trtllm::glm_fused_embedding")
+    def _(input: torch.Tensor, weight: torch.Tensor):
+        return weight.new_empty((*input.shape, weight.shape[1]))
+
     @torch.library.register_fake("trtllm::glm_dense_mlp_small_m")
     def _(x, gate_up_weight, down_weight, gate_up_tiling=-1, down_tiling=-1):
         return x.new_empty((x.shape[0], down_weight.shape[0]))
