@@ -27,16 +27,16 @@ import torch.nn.functional as F
 from utils.util import isSM100Family
 
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.backend import VSACuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.backend import VSACuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
 
 _REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")

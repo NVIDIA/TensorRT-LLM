@@ -272,6 +272,34 @@ class TestFunctional(unittest.TestCase):
             # The gap is too large for ue8m0, so we just make sure that it runs
             self.assertTrue(torch.allclose(a_pt, aq_fp32, atol=1, rtol=0))
 
+    @parameterized.expand(list([[torch.bfloat16, True], [torch.bfloat16, False],
+                                [torch.float8_e4m3fn, True],
+                                [torch.float8_e4m3fn, False]]),
+                          name_func=unittest_name_func)
+    @skip_pre_blackwell_unittest
+    def test_fp4_quantize_zero_rows(self, dtype, is_sf_swizzled_layout):
+        """No rows: empty outputs, and no launch error left for the next call."""
+        k = 512
+        a = torch.randn([4, k], dtype=torch.float32)
+        a_global_sf = ((448 * 6) / a.abs().max().float()).cuda()
+        a = a.to(dtype).cuda()
+        ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(a, a_global_sf, 16,
+                                                        False,
+                                                        is_sf_swizzled_layout)
+
+        empty = torch.empty([0, k], dtype=dtype, device="cuda")
+        empty_fp4, empty_sf = torch.ops.trtllm.fp4_quantize(
+            empty, a_global_sf, 16, False, is_sf_swizzled_layout)
+        self.assertEqual(tuple(empty_fp4.shape), (0, k // 2))
+        self.assertEqual(empty_sf.numel(), 0)
+
+        # A launch error left pending by the empty call is raised by the next
+        # kernel launch, here torch.equal's.
+        a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a, a_global_sf, 16, False,
+                                                    is_sf_swizzled_layout)
+        self.assertTrue(torch.equal(a_fp4, ref_fp4))
+        self.assertTrue(torch.equal(a_sf, ref_sf))
+
 
 class TestProfiling(unittest.TestCase):
 

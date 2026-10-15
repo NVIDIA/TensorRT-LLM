@@ -128,7 +128,7 @@ def _reference_scores(q, w, pool, tables, kv_lens, *, num_pools_max, q_scale, w_
     return out
 
 
-@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("precision", ["ieee", "tf32", "bf16"])
 def test_pool_scores_generation_rows(precision):
     gen = torch.Generator(device="cuda").manual_seed(1)
     n, heads, slots, pages = 6, 4, 64, 8
@@ -147,9 +147,17 @@ def test_pool_scores_generation_rows(precision):
     want = _reference_scores(q, w, pool, tables, kv_lens, **kwargs)
     visible = want > FP32_MIN
     assert torch.equal(got <= FP32_MIN, ~visible)
-    # bf16 inputs are exact in tf32, so both precisions are fp32 accumulations
-    # of exact products.
+    # bf16 x bf16 products are exact in fp32, so every precision is an fp32
+    # accumulation of exact products.
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+    if precision == "bf16":
+        # FP32 queries are not exact in bf16, so they keep the tf32 dot.
+        q32 = torch.randn(n, heads, HD, generator=gen, device="cuda")
+        args = (q32, w, pool, tables, kv_lens, TPB)
+        assert torch.equal(
+            kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="bf16", **kwargs),
+            kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="tf32", **kwargs),
+        )
 
 
 @pytest.mark.parametrize("layout", ["generation", "prefill_shared", "prefill_boundary"])
@@ -208,42 +216,70 @@ def test_pool_scores_strided_head_weights(layout, weight_head_stride):
     )
 
 
-def test_pool_scores_packed_context_rows_share_tables():
+@pytest.mark.parametrize("bounded", [False, True], ids=["full_capacity", "max_kv_len"])
+def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
     """rows_per_program=16 with request_ids: the packed query tokens
     of several requests, in position order, including a group straddling two
-    requests (per-row gather branch)."""
+    requests (per-row gather branch). With max_kv_len, only pools some row can
+    see are launched; columns past the bound are left unwritten."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import kernels
+
     gen = torch.Generator(device="cuda").manual_seed(2)
-    heads, slots, pages = 3, 64, 8
-    pool = _strided_index_pool(slots, gen)
-    tables = _paged_tables(2, pages, slots, gen)
-    # Request 0: 21 query tokens (positions 0..20), request 1: 19 (0..18).
-    lens = [21, 19]
+    heads, num_pools_max = 3, 520
+    pages = num_pools_max * KPOOL // TPB
+    pool = _strided_index_pool(2 * pages + 8, gen)
+    tables = _paged_tables(2, pages, 2 * pages + 8, gen)
+    # Request 0: 21 query tokens after 250 cached ones, request 1: 19 (0..18).
+    lens, cached = [21, 19], [250, 0]
     request_ids = torch.cat(
         [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
     ).cuda()
-    kv_lens = torch.cat([torch.arange(1, length + 1) for length in lens]).cuda()
+    kv_lens = torch.cat([torch.arange(c + 1, c + n + 1) for c, n in zip(cached, lens)]).cuda()
     n = kv_lens.shape[0]
     q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
     w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
-    kwargs = dict(num_pools_max=8, q_scale=HD**-0.5, w_scale=1.0)
+    kwargs = dict(num_pools_max=num_pools_max, q_scale=HD**-0.5, w_scale=1.0)
 
-    got = kpool_score(
-        q,
-        w,
-        pool,
-        tables,
-        kv_lens,
-        TPB,
-        head_dim=HD,
-        kpool=KPOOL,
-        rows_per_program=16,
-        request_ids=request_ids,
-        **kwargs,
-    )
+    def score(rows, max_kv_len):
+        return kpool_score(
+            q[rows],
+            w[rows],
+            pool,
+            tables,
+            kv_lens[rows],
+            TPB,
+            head_dim=HD,
+            kpool=KPOOL,
+            rows_per_program=16,
+            request_ids=request_ids[rows],
+            max_kv_len=max_kv_len,
+            **kwargs,
+        )
+
+    got = score(slice(None), int(kv_lens.max()) if bounded else None)
     want = _reference_scores(q, w, pool, tables[request_ids.long()], kv_lens, **kwargs)
     visible = want > FP32_MIN
-    assert torch.equal(got <= FP32_MIN, ~visible)
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+    if not bounded:
+        assert torch.equal(got <= FP32_MIN, ~visible)
+        return
+    # The indexer's pool top-k scans kv_len // kpool columns, so poisoning the
+    # rest changes no selection (rows without a complete pool select nothing).
+    indexer, num_cand = _meta_indexer(), (kv_lens // KPOOL).to(torch.int32)
+
+    def select(scores):
+        out = torch.empty(n, indexer.select_k, dtype=torch.int32, device="cuda")
+        indexer.pool_top_k(
+            scores, out, is_prefill=False, sequence_lengths=num_cand, scan_lengths=num_cand
+        )
+        return out.sort(dim=-1).values
+
+    selected = select(got.masked_fill(~visible, float("inf")))
+    assert torch.equal(selected, select(want))
+    assert (selected[num_cand == 0] == -1).all()
+    # The first rows of request 1 complete no pool, so nothing is launched.
+    monkeypatch.setattr(kernels, "_kpool_score_kernel", None)
+    score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
 
 
 def test_pool_scores_broadcast_table_single_context_request():
@@ -533,13 +569,12 @@ def test_pool_scores_offsets_beyond_int32() -> None:
         torch.testing.assert_close(out[-32:, :64], expected, rtol=0, atol=0)
 
 
-def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+def _meta_indexer():
+    """A GLM-5.3-Flash indexer (meta weights) exposing its pool top-k."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch import cute_dsl_utils
     from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
 
-    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
     config = SimpleNamespace(
         hidden_size=256,
         q_lora_rank=128,
@@ -550,7 +585,14 @@ def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatc
         index_kpool_always_select_tail=True,
     )
     with torch.device("meta"):
-        indexer = Glm5NextIndexer(config, layer_idx=0)
+        return Glm5NextIndexer(config, layer_idx=0)
+
+
+def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch import cute_dsl_utils
+
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    indexer = _meta_indexer()
     scores = torch.arange(520, dtype=torch.float32, device="cuda").repeat(3, 1)
     lengths = torch.tensor([0, 3, 513], dtype=torch.int32, device="cuda")
     selected = torch.empty(3, 512, dtype=torch.int32, device="cuda")

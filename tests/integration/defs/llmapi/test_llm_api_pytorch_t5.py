@@ -942,9 +942,9 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
             encoder_replay_keys.append(key)
             return original_encoder_replay(key, inputs)
 
-        def record_decoder_replay(key, inputs):
+        def record_decoder_replay(key, inputs, **kwargs):
             decoder_replay_keys.append(key)
-            return original_decoder_replay(key, inputs)
+            return original_decoder_replay(key, inputs, **kwargs)
 
         monkeypatch.setattr(encoder_runner, "replay", record_encoder_replay)
         monkeypatch.setattr(decoder_runner, "replay", record_decoder_replay)

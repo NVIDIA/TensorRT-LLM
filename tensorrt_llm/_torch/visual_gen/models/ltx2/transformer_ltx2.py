@@ -7,7 +7,7 @@
 #   - Linear projections  → tensorrt_llm._torch.modules.linear.Linear
 #   - RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
 #   - FeedForward (MLP)    → tensorrt_llm._torch.modules.mlp.MLP
-#   - Attention backend    → tensorrt_llm._torch.visual_gen.attention_backend
+#   - Attention backend    → tensorrt_llm._torch.visual_gen.attention.backends
 #
 # Architecture-specific components (RoPE, AdaLN, timestep/text embeddings,
 # modality dataclass, transformer args) are ported from LTX-2 and live
@@ -32,13 +32,13 @@ from tqdm import tqdm
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     UlyssesAttention,
     wrap_parallel_attention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
