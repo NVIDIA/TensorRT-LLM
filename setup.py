@@ -722,6 +722,7 @@ setup(
     scripts=[
         'tensorrt_llm/llmapi/trtllm-llmapi-launch',
         'tensorrt_llm/llmapi/_llmapi_process_guard.py',
+        'tensorrt_llm/llmapi/_llmapi_mpi_stop.py',
     ],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
