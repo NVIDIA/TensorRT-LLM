@@ -23,13 +23,19 @@ Weight variants are selected with `--variant` in the example script, or with `pi
 
 ## Deployment Steps
 
-### Run Docker Container
+### Build and Run Docker Container from Source
 
-Build and run the docker container. See the [Docker guide](source:docker/README.md) for details.
+FLUX.3 support is on the `feat/flux3-image-klein` branch, so check out that branch before building the image:
 
 ```shell
+git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
+git checkout feat/flux3-image-klein
+```
 
+Build the image from this checkout, then run it. See the [Docker guide](source:docker/README.md) for details.
+
+```shell
 make -C docker release_build IMAGE_TAG=flux3-local
 
 make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=flux3-local LOCAL_USER=1
