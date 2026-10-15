@@ -19,9 +19,8 @@ import signal
 import subprocess
 import time
 
-import pytest
 import requests
-from defs.conftest import get_sm_version
+from defs.conftest import get_sm_version, llm_models_root
 
 from tensorrt_llm.logger import logger
 
@@ -88,7 +87,7 @@ def start_context_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
@@ -115,7 +114,7 @@ def start_generation_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")
@@ -318,7 +317,7 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
     kill_automated_disaggregated_processes()
     cleanup_automated_output_files()
 
-    config = {"model_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}
+    config = {"model_path": "Qwen3/Qwen3-0.6B"}
 
     # Create configuration files
     create_config_files(config)
@@ -434,14 +433,14 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
         kill_automated_disaggregated_processes()
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_automated_disaggregated_complete(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          llama_model_root):
+                                          disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):

@@ -30,6 +30,8 @@ Python and C++ codebase with a PyTorch execution path.
 | Task | Command |
 |------|---------|
 | Unit tests | `pytest tests/unittest/` |
+| C++ component tests | `cmake --build cpp/build_RelWithDebInfo --target common-tests` (also `runtime-tests`, `executor-tests`, `batch-manager-tests`, `kernel-tests`) |
+| C++ test scheduling | `ctest --test-dir cpp/build_RelWithDebInfo -L common --output-on-failure` (build the selected tests first) |
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
@@ -168,11 +170,16 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
+`LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
+for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+continues to build all C++ tests; component aggregate targets build migrated tests.
+
 ### Advisory semantic review
 
-See [.github/semantic-review.md](.github/semantic-review.md) for the two-hour
-rotating candidate scan, fixed-version AI results, bounded timeout recovery, and manual
-retry procedure.
+The bot-to-bot semantic review workflow is disabled. See
+[.github/semantic-review.md](.github/semantic-review.md) for its current status and
+historical implementation details.
 
 ### Triggering CI
 

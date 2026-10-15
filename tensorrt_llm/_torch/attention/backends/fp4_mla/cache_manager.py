@@ -536,6 +536,10 @@ class Fp4MlaV2CacheLayoutPolicy:
             )
         self.kv_offset = torch.zeros_like(self.index_scales)
         self._index_scale_ints = self.index_scales.tolist()
+        # FP4 MLA builds one page table per lifecycle pool (each pool holds a
+        # single layer kind) and rejects enable_swa_scratch_reuse, so the base
+        # per-layer page-table copy never applies.
+        self._use_per_layer_page_tables = False
         self.num_attention_op_pools = num_pools
         self.host_kv_cache_block_offsets = torch.zeros(
             num_pools,

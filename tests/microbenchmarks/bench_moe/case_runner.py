@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -885,6 +886,13 @@ def _run_one_candidate(
                 moe.destroy()
             except Exception:
                 pass
+            # When a sweep runs many configs, OOM can occasionally occur because
+            # the MoE module (a reference cycle with its scheduler) is only freed
+            # when the cyclic GC happens to run.
+            # Collect explicitly so the weights are released
+            # before the next candidate builds its own module.
+            moe = None
+            gc.collect()
         if prev_force_comm is None:
             os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
         else:

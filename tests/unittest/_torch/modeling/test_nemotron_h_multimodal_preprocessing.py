@@ -19,6 +19,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     AUDIO_PLACEHOLDER,
     DynamicResolutionImageTiler,
     DynamicResolutionParams,
+    NemotronHMultimodalEncoder,
     NemotronHMultimodalInputProcessor,
     NemotronHMultimodalModel,
     NemotronHVisionEncoder,
@@ -32,7 +33,7 @@ from tensorrt_llm.inputs.multimodal import (
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
-from tensorrt_llm.inputs.multimodal_data import AudioData
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 
 pytestmark = pytest.mark.cpu_only
 
@@ -2472,3 +2473,167 @@ class TestFastPathVideoWithExtractedAudio:
         }
         actual_mm = sum(1 for t in expanded if t in mm_token_ids)
         assert actual_mm == declared
+
+
+class TestNemotronEpdEvs:
+    @staticmethod
+    def _processor(counts: list[list[int]]) -> NemotronHMultimodalInputProcessor:
+        processor = _make_fast_path_processor(
+            video_context_token_id=None, video_temporal_patch_size=2
+        )
+        processor._config.llm_config = SimpleNamespace(vocab_size=1024, hidden_size=2)
+        processor.video_pruning_rate = 0.5
+        processor._video_placeholder_token_ids = [600]
+        processor._add_video_prefix = False
+        processor.get_num_tokens_per_video = mock.Mock(
+            side_effect=[sum(item) + 2 * len(item) for item in counts]
+        )
+        processor._compute_token_numbers_per_video = mock.Mock(
+            side_effect=[[[sum(item), *([0] * (len(item) - 1))]] for item in counts]
+        )
+        processor._get_frame_separators = mock.Mock(
+            side_effect=[[["frame"] * len(item)] for item in counts]
+        )
+        processor.tokenizer.encode.side_effect = lambda text, **kwargs: [100]
+        return processor
+
+    @pytest.mark.parametrize(
+        "counts,single_video",
+        [([[2, 1]], True), ([[3, 0]], False), ([[2, 1, 1], [1, 2]], False)],
+    )
+    @pytest.mark.parametrize("tokenized", [False, True])
+    def test_handoff_rebuilds_pruned_video_layout(
+        self, counts: list[list[int]], single_video: bool, tokenized: bool
+    ) -> None:
+        processor = self._processor(counts)
+        tokens = [101] + [600] * len(counts) + [102]
+        if not tokenized:
+            processor.tokenizer.encode.side_effect = lambda text, **kwargs: (
+                tokens if text == "prompt" else [100]
+            )
+        # Odd frame counts require a padded final tubelet.
+        videos = [[Image.new("RGB", (32, 32))] * (2 * len(item) - 1) for item in counts]
+        inputs = {
+            "multi_modal_data": {
+                "video": VideoData(frames=videos[0], metadata={}) if single_video else videos
+            }
+        }
+        inputs["prompt_token_ids" if tokenized else "prompt"] = tokens if tokenized else "prompt"
+        handles = [
+            {"tensor_size": [sum(item), 2], "metadata": {"retained_token_counts": item}}
+            for item in counts
+        ]
+        handoff = processor.build_disagg_prefill_multimodal_inputs(inputs, handles)
+        expected = [101]
+        for item in counts:
+            for count in item:
+                expected.extend([100, 500, *([20] * count), 501])
+        expected.append(102)
+        assert handoff.prompt_token_ids == expected
+        assert handoff.multimodal_embedding_lengths == list(map(sum, counts))
+        assert handoff.multimodal_lengths == [sum(item) + 2 * len(item) for item in counts]
+        assert handoff.multimodal_item_run_cu_offsets == [
+            sum(len(item) for item in counts[:i]) for i in range(len(counts) + 1)
+        ]
+        assert handoff.multimodal_run_lengths == [count + 2 for item in counts for count in item]
+
+    @pytest.mark.parametrize("item_counts", [None, [3], [-1, 4], [2, 2], [True, 2], [1.0, 2]])
+    def test_handoff_rejects_invalid_retained_counts(
+        self, item_counts: list[int | float] | None
+    ) -> None:
+        processor = self._processor([[2, 1]])
+        handle = {"tensor_size": (3, 2)}
+        if item_counts is not None:
+            handle["metadata"] = {"retained_token_counts": item_counts}
+        with pytest.raises(ValueError, match="retained_token_counts"):
+            processor.build_disagg_prefill_multimodal_inputs(
+                {
+                    "prompt_token_ids": [600],
+                    "multi_modal_data": {"video": [[Image.new("RGB", (32, 32))] * 3]},
+                },
+                [handle],
+            )
+
+    def test_encoder_preserves_counts_per_video_and_request(self) -> None:
+        encoder = object.__new__(NemotronHMultimodalEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.video_temporal_patch_size = 2
+        params = [
+            MultimodalParams(
+                multimodal_data={
+                    "video": {"video_size": [(3, 1, 32, 32), (5, 1, 32, 32)]},
+                    "multimodal_embedding_lengths": [3, 4],
+                }
+            ),
+            MultimodalParams(
+                multimodal_data={
+                    "image": {},
+                    "multimodal_embedding_lengths": [1],
+                }
+            ),
+        ]
+
+        def encode(
+            views: list[MultimodalParams],
+        ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+            if "image" in views[0].multimodal_data:
+                return [torch.full((1, 2), 9.0)], None
+            return [torch.arange(14).reshape(7, 2)], [torch.tensor([2, 1, 3, 0, 1])]
+
+        with mock.patch.object(NemotronHVisionEncoder, "forward", side_effect=encode):
+            [embeddings] = encoder.forward(params)
+        assert params[0].multimodal_data["multimodal_embedding_metadata"] == [
+            {"retained_token_counts": [2, 1]},
+            {"retained_token_counts": [3, 0, 1]},
+        ]
+        assert "multimodal_embedding_metadata" not in params[1].multimodal_data
+        torch.testing.assert_close(embeddings[:7], torch.arange(14).reshape(7, 2).float())
+        torch.testing.assert_close(embeddings[7:], torch.full((1, 2), 9.0))
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_prefill_consumes_finalized_evs_layout_without_local_encoder(
+        self, chunked: bool
+    ) -> None:
+        model = TestEvsVideoContextTokenId._make_forward_model(None)
+        context = torch.tensor([1, 20, 20, 2, 20, 3])
+        embeddings = torch.tensor([[1000.0, 1001.0], [2000.0, 2001.0], [3000.0, 3001.0]])
+        runtime = None
+        if chunked:
+            runtime = MultimodalRuntimeData(
+                embed_mask_cumsum=(context == 20).cumsum(0), past_seen_token_num=3, chunk_end_pos=6
+            )
+            context = context[3:]
+        param = MultimodalParams(
+            multimodal_data={"modality_type": "video", "multimodal_embedding": [embeddings]},
+            multimodal_runtime=runtime,
+        )
+        metadata = SimpleNamespace(num_contexts=1, num_generations=1, num_ctx_tokens=len(context))
+        input_ids = torch.cat([context, torch.tensor([20])])
+        with mock.patch.object(
+            model, "merge_evs_mm_embeds", side_effect=AssertionError("remerged")
+        ):
+            model.forward(
+                metadata,
+                input_ids=input_ids,
+                multimodal_params=[param],
+                mm_token_indices=torch.where(context == 20)[0],
+                text_token_indices=torch.cat(
+                    [torch.where(context != 20)[0], torch.tensor([len(context)])]
+                ),
+            )
+        expected = torch.tensor(
+            [
+                [1.0, -1.0],
+                [1000.0, 1001.0],
+                [2000.0, 2001.0],
+                [2.0, -2.0],
+                [3000.0, 3001.0],
+                [3.0, -3.0],
+            ]
+        )
+        if chunked:
+            expected = expected[3:]
+        torch.testing.assert_close(
+            model.llm.forward.call_args.kwargs["inputs_embeds"],
+            torch.cat([expected, torch.tensor([[20.0, -20.0]])]),
+        )

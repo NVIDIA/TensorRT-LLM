@@ -154,7 +154,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_out_cache_loc: Optional[torch.Tensor] = None
     # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
     # to its mutable producer instead of hiding writes behind runtime metadata.
-    msa_layer_cache_tensors: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
+    msa_layer_cache_tensors: Optional[
+        dict[int, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
+    ] = None
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
@@ -165,6 +167,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are staged rather than derived at the call site.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
+    msa_qo_lens_cuda: Optional[torch.Tensor] = None
     msa_cu_q_lens: Optional[torch.Tensor] = None
     msa_cu_kv_lens: Optional[torch.Tensor] = None
     # msa_block_table with each slot expanded into the K and V sub-pages the
@@ -411,6 +414,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             layer_idx: (
                 kv_cache_manager.get_buffers(layer_idx, kv_layout="HND"),
                 self.msa_idx_k_cache(layer_idx),
+                (
+                    kv_cache_manager.get_block_scale_buffers(layer_idx, kv_layout="HND")
+                    if kv_cache_manager.is_nvfp4_layer(layer_idx)
+                    else None
+                ),
             )
             for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
             if layer_idx in kv_cache_manager.layer_offsets
@@ -451,6 +459,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
+            self.msa_qo_lens_cuda = self.get_empty(
+                buffers,
+                (max_num_sequences,),
+                cache_name="msa_qo_lens_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
             self.msa_cu_q_lens = self.get_empty(
                 buffers,
                 (max_num_sequences + 1,),
@@ -963,8 +978,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
+        # NVFP4 sparse layers run the MSA CSR kernel, which takes no plan.
         self._msa_prefill_gqa_plan = plan_for(
-            attn_rows,
+            None if self.kv_cache_manager.dtype == DataType.NVFP4 else attn_rows,
             num_qo_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             kv_block_num=params.topk,
@@ -1089,8 +1105,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_live_batch = batch_size
             self.msa_cu_q_lens[0].zero_()
             self.msa_cu_kv_lens[0].zero_()
+            qo_lens_cuda = self.msa_qo_lens_cuda[:batch_size]
+            qo_lens_cuda.copy_(qo_lens_cpu, non_blocking=True)
             torch.cumsum(
-                maybe_pin_memory(qo_lens_cpu).to(cache_device, non_blocking=True),
+                qo_lens_cuda,
                 0,
                 out=self.msa_cu_q_lens[1 : batch_size + 1],
             )

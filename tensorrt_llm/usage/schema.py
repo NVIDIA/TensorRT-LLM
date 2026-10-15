@@ -103,7 +103,7 @@ class _LlmCounterSnapshot(BaseModel):
 class TrtllmInitialReport(_LlmCounterSnapshot):
     """TRT-LLM initial report event parameters.
 
-    Sent once at startup with full environment and configuration details.
+    Sent once after initialization, or as marked partial context on early exit.
     All fields are required by the SMS schema (GXT convention: every declared
     property must be in ``required``). Fields use sentinel defaults (empty
     string for strings, 0 for ints) when the actual value is unavailable.
@@ -327,7 +327,7 @@ class TrtllmExitReport(_LlmCounterSnapshot):
 
 
 # ---------------------------------------------------------------------------
-# GXT Event Wrapper (single event in the events array)
+# GXT Event Wrapper (one entry in a potentially multi-event envelope)
 # ---------------------------------------------------------------------------
 
 

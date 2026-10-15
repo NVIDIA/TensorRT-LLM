@@ -38,7 +38,8 @@ void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from
     void* tid2eid,                 // nullptr if non-hash mode
     void* out_weights,             // [batch_size, topK] - pre-allocated
     void* out_indices,             // [batch_size, topK] - pre-allocated
-    int batch_size, int n_experts, float route_scale, bool is_hash, cudaStream_t stream);
+    int batch_size, int n_experts, float route_scale, bool is_hash, bool const* image_mask, float const* vision_bias,
+    cudaStream_t stream);
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

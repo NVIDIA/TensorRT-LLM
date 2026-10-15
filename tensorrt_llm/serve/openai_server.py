@@ -41,8 +41,10 @@ from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -101,8 +103,9 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, StartProfileRequest,
-    TokenizeRequest, TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    ResponseFormat, ResponsesRequest, ResponsesResponse,
+    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
+    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
@@ -125,6 +128,8 @@ from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
+from tensorrt_llm.serve.runtime_control_auth import (
+    RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
@@ -516,6 +521,21 @@ def _image_output_size(image) -> Optional[str]:
     return f"{width}x{height}"
 
 
+def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
+    """Fixed per-step draft bound to report, or None when there is not one.
+
+    Emitted as ``num_spec_tokens`` and used to size the acceptance histogram, so
+    a wrong answer here makes every histogram the wrong width. Returns None both
+    when speculative decoding is off and when ``draft_len_schedule`` is set --
+    the bound genuinely varies by batch size there, and None is the honest
+    answer rather than reporting whichever value happened to be configured.
+    """
+    spec_config = getattr(args, "speculative_config", None) if args else None
+    if spec_config is None or getattr(spec_config, "draft_len_schedule", None):
+        return None
+    return getattr(spec_config, "max_draft_len", None)
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -544,13 +564,42 @@ class OpenAIServer(_VideoRoutesMixin):
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None,
             enable_rl_control_endpoints: bool = False,
-            rl_control_api_key: Optional[str] = None):
+            rl_control_api_key: Optional[str] = None,
+            enable_runtime_control_endpoints: bool = False,
+            runtime_control_api_key: Optional[str] = None):
+        if enable_rl_control_endpoints:
+            logger.warning(
+                "RL control endpoints are deprecated; use generic runtime "
+                "control endpoints for memory checkpointing.")
+        if enable_rl_control_endpoints and enable_runtime_control_endpoints:
+            raise ValueError(
+                "Legacy RL control and runtime control endpoints cannot both "
+                "be enabled.")
         if enable_rl_control_endpoints and not rl_control_api_key:
             raise ValueError(
                 "rl_control_api_key is required when RL control endpoints are enabled"
             )
         if enable_rl_control_endpoints and not isinstance(generator, AsyncLLM):
             raise ValueError("RL control endpoints require AsyncLLM")
+        if (enable_runtime_control_endpoints
+                and server_role is ServerRole.EMBEDDING):
+            raise ValueError(
+                "Runtime control endpoints are not supported for embedding servers"
+            )
+        if enable_runtime_control_endpoints and not runtime_control_api_key:
+            raise ValueError(
+                "runtime_control_api_key is required when runtime control "
+                "endpoints are enabled")
+        if enable_runtime_control_endpoints and not isinstance(generator, LLM):
+            raise ValueError("Runtime control endpoints require LLM")
+        if (enable_runtime_control_endpoints
+                and generator.args.sleep_config is None):
+            raise ValueError("Runtime control endpoints require sleep_config")
+        if (enable_runtime_control_endpoints
+                and generator.args.num_serve_frontends > 1):
+            raise ValueError(
+                "Runtime control endpoints require num_serve_frontends=1 "
+                "because replay protection is local to each frontend.")
 
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
@@ -578,6 +627,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
         self._rl_control_api_key = rl_control_api_key
+        self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
+        self._runtime_control_api_key = runtime_control_api_key
+        self._runtime_control_replay_cache = RuntimeControlReplayCache()
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -611,6 +663,13 @@ class OpenAIServer(_VideoRoutesMixin):
                                            None) if args else None)
         self._collect_perf_metrics = (self._expose_perf_metrics
                                       or perf_metrics_output_dir is not None)
+        # Per-request spec-decode acceptance stats. Deliberately independent of
+        # return_perf_metrics: coupling them would mean asking for acceptance
+        # numbers silently mounts the Prometheus endpoint too.
+        self._per_request_spec_decode_stats = bool(
+            args and getattr(args, "per_request_spec_decode_stats", False))
+        self._spec_decode_num_spec_tokens = resolve_spec_decode_num_spec_tokens(
+            args)
         # AsyncLLM uses this flag to request engine-level snapshots. Preserve the
         # original value separately because only it controls public headers.
         if self._collect_perf_metrics and args is not None:
@@ -1096,11 +1155,17 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        # Over-length prompts are detected from the message text because they
+        # cross the executor IPC boundary as plain strings (RequestError), so
+        # no exception type survives to here.
+        code: Union[int, str] = status_code.value
+        if is_context_length_exceeded_message(message):
+            code = CONTEXT_LENGTH_EXCEEDED_CODE
         error_response = ErrorResponse(message=message,
                                        type=err_type,
-                                       code=status_code.value)
+                                       code=code)
         return JSONResponse(content=error_response.model_dump(),
-                            status_code=error_response.code)
+                            status_code=status_code.value)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1279,6 +1344,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.stop_profile,
                                methods=["POST"])
 
+        self._register_runtime_control_routes()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
@@ -1329,6 +1395,45 @@ class OpenAIServer(_VideoRoutesMixin):
         except ValueError as e:
             raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED,
                                 detail=str(e)) from e
+
+    async def _require_runtime_control_auth(self, raw_request: Request) -> None:
+        body = await raw_request.body()
+        try:
+            route = raw_request.scope.get("route")
+            route_path = getattr(route, "path", None)
+            if route_path is None:
+                raise ValueError("Runtime control route is unavailable.")
+            validate_runtime_control_request(
+                self._runtime_control_api_key,
+                raw_request.method,
+                route_path,
+                body,
+                raw_request.headers,
+                self._runtime_control_replay_cache,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=HTTPStatus.UNAUTHORIZED,
+                detail=str(error),
+            ) from error
+
+    def _register_runtime_control_routes(self) -> None:
+        if not self._enable_runtime_control_endpoints:
+            return
+
+        dependencies = [Depends(self._require_runtime_control_auth)]
+        self.app.add_api_route("/release_memory",
+                               self.runtime_release_memory,
+                               methods=["POST"],
+                               dependencies=dependencies)
+        self.app.add_api_route("/resume_memory",
+                               self.runtime_resume_memory,
+                               methods=["POST"],
+                               dependencies=dependencies)
+        self.app.add_api_route("/memory_status",
+                               self.runtime_memory_status,
+                               methods=["GET"],
+                               dependencies=dependencies)
 
     def _register_rl_control_routes(self) -> None:
         if not self._enable_rl_control_endpoints:
@@ -1803,6 +1908,30 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info("Iteration stats collector loop cancelled")
             raise
 
+    def _apply_spec_decode_stats_opt_in(self,
+                                        postproc_args: PostprocArgs) -> None:
+        """Enable per-request spec-decode stats when the server opted in.
+
+        Server-side only, deliberately: per_request_spec_decode_stats in the
+        YAML config is the entire opt-in, and a client sends nothing extra.
+        This differs from return_perf_metrics, which additionally requires a
+        per-request X-TRTLLM-return-metrics header.
+
+        The reason is that benchmarking clients discover this payload by shape
+        rather than being told which engine they are talking to -- requiring a
+        vendor-specific request header would mean the client has to know it is
+        talking to TensorRT-LLM before it can find out, which it does not. The
+        cost stays opt-in because an operator who does not set the YAML field
+        pays nothing, and one who does has asked for exactly this.
+        """
+        # getattr: servers built without __init__ (object.__new__, as tests
+        # do) must behave as not opted in rather than fail every request.
+        if not getattr(self, "_per_request_spec_decode_stats", False):
+            return
+        postproc_args.return_spec_decode_stats = True
+        postproc_args.spec_decode_num_spec_tokens = getattr(
+            self, "_spec_decode_num_spec_tokens", None)
+
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
 
@@ -2037,6 +2166,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
             postproc_args = ChatPostprocArgs.from_request(request)
+            self._apply_spec_decode_stats_opt_in(postproc_args)
             if (is_kimi_k3 and request.add_generation_prompt
                     and request.prompt_token_ids is None
                     and request.prompt_token_ids_b64 is None
@@ -2822,6 +2952,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.conversation_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
+                self._apply_spec_decode_stats_opt_in(postproc_args)
                 postproc_args.prompt_idx = idx
                 postproc_args.stream_response_id = stream_response_id
                 postproc_args.stream_created = stream_created
@@ -2994,6 +3125,14 @@ class OpenAIServer(_VideoRoutesMixin):
                              tracing.extract_trace_headers(raw_request.headers))
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
+            # No spec-decode opt-in here on purpose. The Harmony handlers build
+            # their choices in harmony_adapter, which carries no per-request
+            # spec-decode data at all -- avg_decoded_tokens_per_iter is absent
+            # from that path too -- so setting the flag would configure
+            # something nothing reads. Extending Harmony should cover both
+            # fields together; handle_non_streaming_response would need the
+            # GenerationResult threaded through, as it currently receives only
+            # the outputs.
             postproc_params = PostprocParams(
                 post_processor=chat_harmony_streaming_post_processor
                 if request.stream else chat_harmony_post_processor,
@@ -3359,6 +3498,68 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content={"error": str(e)}, status_code=500)
 
         return JSONResponse(content={"message": "Profiling stopped"})
+
+    @staticmethod
+    def _runtime_control_error_response(error: Exception) -> JSONResponse:
+        if isinstance(error, ValueError):
+            status_code = HTTPStatus.BAD_REQUEST
+        elif (isinstance(error, RuntimeError) and
+              ("already parked" in str(error) or "while state is" in str(error)
+               or "admission transition" in str(error))):
+            status_code = HTTPStatus.CONFLICT
+        else:
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        return JSONResponse(status_code=status_code,
+                            content={"error": {
+                                "message": str(error)
+                            }})
+
+    async def _call_runtime_memory_method(self, method: str,
+                                          tags: Optional[List[str]]) -> object:
+        operation = getattr(self.generator, method)
+        if isinstance(self.generator, AsyncLLM):
+            return await operation(tags)
+        return await asyncio.to_thread(operation, tags)
+
+    async def runtime_release_memory(
+        self,
+        request: Optional[RuntimeMemoryUpdateRequest] = None,
+    ) -> JSONResponse:
+        try:
+            if request is not None and request.tags == []:
+                raise ValueError("Runtime memory tags must not be empty.")
+            tags = None if request is None else request.tags
+            await self._call_runtime_memory_method("release", tags)
+        except Exception as error:
+            return self._runtime_control_error_response(error)
+        return JSONResponse(content={"status": "success"})
+
+    async def runtime_resume_memory(
+        self,
+        request: Optional[RuntimeMemoryUpdateRequest] = None,
+    ) -> JSONResponse:
+        try:
+            if request is not None and request.tags == []:
+                raise ValueError("Runtime memory tags must not be empty.")
+            tags = None if request is None else request.tags
+            await self._call_runtime_memory_method("resume", tags)
+        except Exception as error:
+            return self._runtime_control_error_response(error)
+        return JSONResponse(content={"status": "success"})
+
+    async def runtime_memory_status(self) -> JSONResponse:
+        try:
+            if isinstance(self.generator, AsyncLLM):
+                status = await self.generator.get_memory_status()
+            else:
+                status = await asyncio.to_thread(
+                    self.generator.get_memory_status)
+        except Exception as error:
+            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                                content={"error": {
+                                    "message": str(error)
+                                }})
+        return JSONResponse(content=status.model_dump(mode="json"))
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:
