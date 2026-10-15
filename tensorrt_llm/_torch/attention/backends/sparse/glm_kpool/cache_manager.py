@@ -49,6 +49,20 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 from .params import glm_kpool_cache_row_dim
 
 
+def glm_kpool_index_state_dim(model_config: ModelConfig) -> int:
+    """BF16 values per token of a sparse layer's indexer cache row.
+
+    A built model whose kernels lay the row out differently declares the width in
+    ``model_config.extra_attrs["glm_kpool_index_state_dim"]``; otherwise the row is
+    :func:`glm_kpool_cache_row_dim` of the checkpoint's ``index_head_dim``.
+    """
+    declared = model_config.extra_attrs.get("glm_kpool_index_state_dim")
+    if declared is not None:
+        return int(declared)
+    config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+    return glm_kpool_cache_row_dim(int(config.index_head_dim))
+
+
 class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """Manage KDA state, latent KV and indexer buffers in one V2 lifecycle.
 
@@ -421,12 +435,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             sum(layer_mask), mapping, spec_config=spec_config, layer_mask=layer_mask
         )
         local_attention_layers = sum(attention_mask[layer] for layer in local_layers)
-        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         # All GLM full-attention layers, including MTP layers, use the sparse indexer.
         # Indexer pages remain BF16 even when latent KV is quantized.
         index_bytes_per_token = (
             local_attention_layers
-            * glm_kpool_cache_row_dim(int(config.index_head_dim))
+            * glm_kpool_index_state_dim(model_config)
             * torch.bfloat16.itemsize
         )
         state_config = kv_cache_config.mamba_state_config

@@ -3560,9 +3560,9 @@ def _create_kv_cache_manager(
             kda_extra_kwargs["pretrained_config"] = config
         if is_glm5_next:
             from ..attention.backends.sparse.glm_kpool import \
-                glm_kpool_cache_row_dim
-            kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
-                int(text_config.index_head_dim))
+                glm_kpool_index_state_dim
+            kda_extra_kwargs["index_state_dim"] = glm_kpool_index_state_dim(
+                _model_config)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,

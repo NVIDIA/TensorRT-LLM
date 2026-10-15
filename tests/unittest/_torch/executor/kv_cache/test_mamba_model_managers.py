@@ -914,6 +914,7 @@ def test_kda_affine_estimator_includes_replay_scratch(
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(index_head_dim=128),
         quant_config=SimpleNamespace(mamba_ssm_stochastic_rounding=stochastic_rounding),
+        extra_attrs={},
     )
     monkeypatch.setattr(glm_module, "unwrap_glm5_next_text_config", lambda config: config)
     kv_config = KvCacheConfig(
