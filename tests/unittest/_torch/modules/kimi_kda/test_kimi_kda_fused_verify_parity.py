@@ -213,8 +213,11 @@ def _rep(name, a, b):
     ],
     ids=["full-rank-bf16", "full-rank-fp8", "low-rank-h16", "low-rank-h64", "large-state-stride"],
 )
+# Each layer computes the verify offsets itself (Kimi), or a model precomputes
+# them once per forward and shares them across layers (GLM-5.3-Flash).
+@pytest.mark.parametrize("model_offsets", [False, True], ids=["layer-offsets", "model-offsets"])
 def test_fused_vs_sequential_two_rounds(
-    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride
+    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride, model_offsets
 ):
     from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import kda_verify_cu_seqlens
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -305,8 +308,8 @@ def test_fused_vs_sequential_two_rounds(
         )
     )
     core2_fused = x2.new_empty(B * T, num_heads, K)
-    # Offsets precomputed once per forward, as a model shares them across layers.
     pending = cache_fused.prev_num_accepted_tokens[slot_indices]
+    offsets = (pending, kda_verify_cu_seqlens(pending, T)) if model_offsets else None
     with with_multi_stream(True):
         result2_fused = rt_fused.forward_verify(
             x2,
@@ -316,7 +319,7 @@ def test_fused_vs_sequential_two_rounds(
             ssm_pool_fused,
             slot_indices,
             output=core2_fused,
-            verify_offsets=(pending, kda_verify_cu_seqlens(pending, T)),
+            verify_offsets=offsets,
         )
     assert result2_fused is core2_fused
     out2_fused = rt_fused._project_output(core2_fused)
