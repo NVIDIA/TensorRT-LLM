@@ -118,3 +118,34 @@ def test_planner_turn_prompt_reports_what_changed(tmp_path: Path):
     assert "The run is stalled" in prompt(stalled=True)
     assert "orchestrator restarted" in prompt(resumed=True)
     assert "- task 'a' is DONE" in prompt(rejected=["task 'a' is DONE"])
+
+
+def test_human_messages_lead_the_turn_prompt(tmp_path: Path):
+    text = planner_turn_prompt(
+        turn_file=tmp_path / "turn_1.yaml",
+        plan=tmp_path / "plan.md",
+        task_yaml=tmp_path / "task.yaml",
+        results_dir=tmp_path,
+        finished=[("a", "DONE", "ok", tmp_path / "r.md")],
+        states=[("a", "done")],
+        running=0,
+        ready=0,
+        max_parallel=8,
+        finish=False,
+        stalled=False,
+        resumed=False,
+        rejected=[],
+        feedback=["Remove fla-fix-test.", "Prioritize gsm8k."],
+    )
+    assert text.startswith("## Messages from the human — act on these first")
+    assert (
+        text.index("Remove fla-fix-test.")
+        < text.index("Prioritize gsm8k.")
+        < text.index("- `a` DONE")
+    )
+
+
+def test_planner_prompt_limits_filler_work_and_puts_humans_first():
+    prompt = build_planner_system_prompt(max_parallel=8)
+    assert "Do not add\nwork outside this list" in prompt
+    assert "Human messages come first." in prompt

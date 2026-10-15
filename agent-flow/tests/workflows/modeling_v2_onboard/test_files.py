@@ -62,3 +62,16 @@ def test_previous_attempts_are_ordered_numerically(tmp_path):
         "task_result_t.1.attempt10.md",
     ]
     assert layout.result_path("t.1").name == "task_result_t.1.md"
+
+
+def test_inbox_messages_are_read_oldest_first(tmp_path):
+    from agent_flow.workflows.modeling_v2_onboard.files import post_feedback, read_inbox
+
+    layout = Layout(tmp_path)
+    assert read_inbox(layout) == []
+    first = post_feedback(tmp_path, "  first  ")
+    second = layout.inbox_dir / "99999999T999999-1.md"
+    second.write_text("second\n")
+    assert read_inbox(layout) == [(first, "first\n"), (second, "second\n")]
+    with pytest.raises(ValueError, match="empty"):
+        post_feedback(tmp_path, "\n")

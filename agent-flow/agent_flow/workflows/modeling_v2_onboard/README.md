@@ -17,6 +17,8 @@ Bring up a new model, or a new target of an existing model, in ModelingV2
 modeling-v2-onboard --task task.yaml --workspace /scratch/me/qwen3-onboard
 modeling-v2-onboard ... --backend codex          # every agent on Codex
 modeling-v2-onboard ... --max-parallel 4         # at most 4 workers at once
+modeling-v2-onboard --workspace /scratch/me/qwen3-onboard \
+    --feedback "Drop the regression tasks; they are not needed."   # steer a running run
 ```
 
 Rerunning the same command resumes an interrupted run. `--clean` starts over:
@@ -61,6 +63,15 @@ with an error (rerun to resume). After an interruption, rerunning resumes:
 tasks that were running restart in a new session on their branch, with their
 committed work, notes and detached jobs, and the planner is told.
 
+## Steering a running run
+
+`--feedback TEXT` (or `--feedback-file PATH`) only writes the message to
+`<workspace>/inbox/` and exits; the running orchestrator notices it within
+seconds and wakes the planner, whose next turn shows it first and is told to
+act on it before anything else. The message moves to `inbox/consumed/` once a
+turn that saw it has been applied, so a discarded turn or a crash hands it to
+the planner again.
+
 ## Task tags
 
 | tag | the worker is briefed to |
@@ -101,6 +112,7 @@ The planner's plan is checked before it runs (`plan.py`):
 | `plan.md` | the current plan |
 | `task_results/` | `task_result_<id>.md` per task, plus earlier attempts |
 | `planner_turns/` | `turn_<n>.yaml` per planner turn |
+| `inbox/`, `inbox/consumed/` | human messages waiting for the planner, and those it acted on |
 | `nodes/<id>/` | a task's notes and `jobs.json` (detached jobs) |
 | `worktrees/<id>/` | a running task's git worktree |
 | `test_commands.md` | Slurm commands the workers verified (Slurm runs only) |

@@ -12,6 +12,8 @@ plain files so the claude-code and codex backends behave identically.
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +30,9 @@ __all__ = [
     "Layout",
     "parse_planner_decision",
     "parse_task_result",
+    "post_feedback",
     "read_handoff",
+    "read_inbox",
 ]
 
 TASK_STATUSES: tuple[str, ...] = ("DONE", "FAILED")
@@ -105,6 +109,16 @@ class Layout:
     @property
     def nodes_dir(self) -> Path:
         return self.workspace / "nodes"
+
+    @property
+    def inbox_dir(self) -> Path:
+        """Human messages waiting for the planner, one file each."""
+        return self.workspace / "inbox"
+
+    @property
+    def consumed_dir(self) -> Path:
+        """Human messages a planner turn has acted on."""
+        return self.inbox_dir / "consumed"
 
     @property
     def worktrees_dir(self) -> Path:
@@ -206,3 +220,33 @@ def read_handoff(path: Path, parse):
     if not path.is_file():
         raise HandoffError(f"{path} was not written")
     return parse(path.read_text(encoding="utf-8"))
+
+
+def post_feedback(workspace: Path, text: str) -> Path:
+    """Leave a human message for the planner of the run in ``workspace``.
+
+    The running orchestrator picks it up within seconds and hands it to the
+    planner's next turn. Returns the message file.
+    """
+    if not text.strip():
+        raise ValueError("the message is empty")
+    inbox = Layout(Path(workspace).absolute()).inbox_dir
+    inbox.mkdir(parents=True, exist_ok=True)
+    now = time.time_ns()
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1e9))
+    # Names sort by time and never collide, so no message overwrites another.
+    path = inbox / f"{stamp}.{now % 10**9:09d}-{os.getpid()}.md"
+    tmp = inbox / f".{path.name}.tmp"
+    with open(tmp, "x", encoding="utf-8") as handle:
+        handle.write(text.strip() + "\n")
+    tmp.rename(path)
+    return path
+
+
+def read_inbox(layout: Layout) -> list[tuple[Path, str]]:
+    """Every waiting human message, oldest first."""
+    if not layout.inbox_dir.is_dir():
+        return []
+    return [
+        (path, path.read_text(encoding="utf-8")) for path in sorted(layout.inbox_dir.glob("*.md"))
+    ]

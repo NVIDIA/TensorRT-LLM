@@ -22,6 +22,7 @@ from agent_flow.workflows.modeling_bringup.task_schema import (
     load_and_validate_task_yaml,
 )
 
+from .files import post_feedback
 from .node_runner import AgentFactory
 from .plan import PlanError
 from .workflow import ModelingV2OnboardWorkflow, RunOutcome, WorkflowError
@@ -52,11 +53,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="modeling-v2-onboard",
         description=(
             "Bring up a model or a new target in ModelingV2: a planner writes plan.md, "
-            "workers run its tasks in parallel, and the planner revises the plan when a "
-            "task fails. Rerun the same command to resume."
+            "workers run its tasks in parallel, and the planner extends or revises the "
+            "plan whenever a worker finishes. Rerun the same command to resume; use "
+            "--feedback to steer a running run."
         ),
     )
-    parser.add_argument("--task", required=True, type=Path, help="Path to task.yaml.")
+    parser.add_argument("--task", type=Path, help="Path to task.yaml (required to run).")
     parser.add_argument(
         "--workspace",
         required=True,
@@ -78,6 +80,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=8,
         help="The most workers that run at the same time (default: 8).",
     )
+    message = parser.add_mutually_exclusive_group()
+    message.add_argument(
+        "--feedback",
+        metavar="TEXT",
+        help="Leave a message for the planner of the run in --workspace and exit. The "
+        "running orchestrator hands it to the planner's next turn, which acts on it first.",
+    )
+    message.add_argument(
+        "--feedback-file",
+        type=Path,
+        metavar="PATH",
+        help="Like --feedback, with the message read from a file.",
+    )
     parser.add_argument(
         "--clean",
         action="store_true",
@@ -86,11 +101,27 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.max_parallel < 1:
         parser.error("--max-parallel must be at least 1")
+    leaving_message = args.feedback is not None or args.feedback_file is not None
+    if leaving_message and args.clean:
+        parser.error("--feedback cannot be combined with --clean")
+    if not leaving_message and args.task is None:
+        parser.error("--task is required to run")
     return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    if args.feedback is not None or args.feedback_file is not None:
+        text = args.feedback
+        if text is None:
+            text = args.feedback_file.read_text(encoding="utf-8")
+        try:
+            path = post_feedback(args.workspace, text)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"message left for the planner: {path}")
+        return
     try:
         task_data = load_and_validate_task_yaml(args.task)
         workflow = ModelingV2OnboardWorkflow(

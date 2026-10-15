@@ -15,6 +15,10 @@
              - ABORT the run.
     done   the final task is DONE, or the planner aborted
 
+A human steers a running run by leaving a message in its inbox
+(``modeling-v2-onboard --workspace <ws> --feedback ...``): it wakes the planner,
+which acts on it first. A message is consumed only by a turn that applied.
+
 A ``FAILED`` task only holds back the tasks that depend on it; nothing pauses.
 There is no turn limit. When nothing is running and nothing can start, the
 planner gets a stalled turn; ``MAX_STALLED_TURNS`` in a row that change
@@ -30,7 +34,7 @@ import asyncio
 import json
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -43,7 +47,14 @@ from agent_flow.jobs.registry import JobRegistry
 from agent_flow.logger import get_logger
 from agent_flow.orchestration import Node, NodeState
 
-from .files import HandoffError, Layout, PlannerDecision, parse_planner_decision, read_handoff
+from .files import (
+    HandoffError,
+    Layout,
+    PlannerDecision,
+    parse_planner_decision,
+    read_handoff,
+    read_inbox,
+)
 from .node_runner import Agent, AgentFactory, make_run_task
 from .plan import PlanError, PlanSpec, parse_plan
 from .prompts import (
@@ -59,6 +70,8 @@ __all__ = ["ModelingV2OnboardWorkflow", "RunOutcome", "WorkflowError"]
 MAX_PLAN_FIXES = 3
 # How many stalled turns in a row the planner gets before the run stops.
 MAX_STALLED_TURNS = 3
+# How often the orchestrator looks for human messages in the inbox.
+INBOX_POLL_SECONDS = 10
 
 _STATE_VERSION = 2
 
@@ -83,6 +96,8 @@ class _State:
     turn: int = 0
     finish: bool = False
     tasks: dict[str, NodeState] = field(default_factory=dict)
+    # Tasks that finished since the planner's last turn: (id, status, summary).
+    finished: list[tuple[str, str, str]] = field(default_factory=list)
 
     def save(self, path: Path) -> None:
         data = {"version": _STATE_VERSION, **asdict(self)}
@@ -105,6 +120,7 @@ class _State:
             turn=data["turn"],
             finish=data["finish"],
             tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
+            finished=[tuple(item) for item in data.get("finished", [])],
         )
 
 
@@ -296,14 +312,14 @@ class ModelingV2OnboardWorkflow:
         is_final = node.id == self._plan.sink_id()
         dep_nodes = [self._plan.graph.by_id[dep] for dep in node.depends_on]
         try:
-            path = await self.isolation.acquire(node)
+            path = await self._git(self.isolation.acquire, node)
             try:
                 if dep_nodes:
-                    await self.isolation.prepare(node, dep_nodes, path)
+                    await self._git(self.isolation.prepare, node, dep_nodes, path)
                 result = await self._run_task(node, path, tags, is_final)
-                await self.isolation.commit(node, path)
+                await self._git(self.isolation.commit, node, path)
             finally:
-                await self.isolation.release(node)
+                await self._git(self.isolation.release, node)
         except Exception as exc:
             # Worker failures arrive as FAILED results; an exception here is the
             # orchestrator's own git machinery failing, which stops the run.
@@ -313,7 +329,8 @@ class ModelingV2OnboardWorkflow:
         del self._running[node.id]
         state = NodeState.DONE if result.status == "DONE" else NodeState.FAILED
         self._set(node.id, state)
-        self._finished.append((node.id, result.status, result.summary))
+        self._state.finished.append((node.id, result.status, result.summary))
+        self._save()
         if is_final and state == NodeState.DONE:
             self._outcome = RunOutcome.SUCCEEDED
         self._wake.set()
@@ -341,9 +358,24 @@ class ModelingV2OnboardWorkflow:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _git(self, operation: Callable[..., Awaitable[T]], *args: object) -> T:
+        """Run one git-worktree operation alone and to completion.
+
+        Operations on one repository run one at a time, and a cancelled task
+        waits for its operation to finish: a ``git worktree add`` killed
+        midway leaves a locked worktree that nothing can remove.
+        """
+        async with self._git_lock:
+            op = asyncio.ensure_future(operation(*args))
+            try:
+                return await asyncio.shield(op)
+            except asyncio.CancelledError:
+                await asyncio.gather(op, return_exceptions=True)
+                raise
+
     async def _discard(self, node: Node) -> None:
-        await self.isolation.release(node)
-        await self.isolation.reclaim(node)
+        await self._git(self.isolation.release, node)
+        await self._git(self.isolation.reclaim, node)
 
     # ---------------------------------------------------------------- planner
 
@@ -497,8 +529,9 @@ class ModelingV2OnboardWorkflow:
 
     async def _turn(self, *, stalled: bool, resumed: bool) -> None:
         """Wake the planner with what changed and apply its answer."""
-        finished, self._finished = self._finished, []
         state = self._state
+        finished = list(state.finished)
+        feedback = read_inbox(self.layout)
         state.turn += 1
         self._save()
         turn_file = self.layout.turn_path(state.turn)
@@ -520,6 +553,7 @@ class ModelingV2OnboardWorkflow:
             stalled=stalled,
             resumed=resumed,
             rejected=self._rejected,
+            feedback=[text for _, text in feedback],
         )
         self._rejected = []
         print_rule(f"[bold magenta]Planner turn {state.turn}[/bold magenta]", self._log)
@@ -538,10 +572,23 @@ class ModelingV2OnboardWorkflow:
             print_message("[yellow]planner turn discarded[/yellow]", self._log)
             return
         change, cancelled = applied[0]
+        # Only now has the planner acted on these; a discarded turn sees them again.
+        del state.finished[: len(finished)]
+        self._save()
+        self.layout.consumed_dir.mkdir(parents=True, exist_ok=True)
+        for path, _ in feedback:
+            path.replace(self.layout.consumed_dir / path.name)
         decision = change.decision
         print_message(f"planner: {decision.decision} — {decision.summary}", self._log)
         await self._reset(change, cancelled)
         self._dispatch()
+
+    async def _watch_inbox(self) -> None:
+        """Wake the planner when a human message arrives."""
+        while True:
+            if read_inbox(self.layout):
+                self._wake.set()
+            await asyncio.sleep(INBOX_POLL_SECONDS)
 
     def _idle(self) -> bool:
         return not self._running and not self._ready()
@@ -554,8 +601,10 @@ class ModelingV2OnboardWorkflow:
                 raise self._crash
             if self._outcome is not None:
                 return await self._finish(self._outcome)
-            stalled = self._idle() and not self._finished
-            if not (self._finished or stalled or resumed):
+            finished = bool(self._state.finished)
+            feedback = bool(read_inbox(self.layout))
+            stalled = self._idle() and not finished and not feedback
+            if not (finished or feedback or stalled or resumed):
                 self._wake.clear()
                 await self._wake.wait()
                 continue
@@ -595,7 +644,9 @@ class ModelingV2OnboardWorkflow:
     async def _main(self) -> RunOutcome:
         self._running: dict[str, asyncio.Task[None]] = {}
         self._resetting: set[str] = set()
-        self._finished: list[tuple[str, str, str]] = []
+        # Concurrent worktree adds/removes, merges and commits in one
+        # repository race on shared metadata under .git; see _git.
+        self._git_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._outcome: RunOutcome | None = None
         self._crash: Exception | None = None
@@ -614,7 +665,11 @@ class ModelingV2OnboardWorkflow:
             else:
                 await self._initial_plan()
             print_rule(f"[bold cyan]Run (up to {self.max_parallel} workers)[/bold cyan]", self._log)
-            return await self._loop(resumed=resumed)
+            watcher = asyncio.create_task(self._watch_inbox())
+            try:
+                return await self._loop(resumed=resumed)
+            finally:
+                watcher.cancel()
         finally:
             await self._stop_workers()
             await self._planner.__aexit__(None, None, None)

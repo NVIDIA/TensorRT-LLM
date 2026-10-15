@@ -226,10 +226,23 @@ Shape of a typical plan:
 ## Keep every worker busy
 
 Up to **{max_parallel}** workers run at once, and the goal is that
-{max_parallel} are always working. A worker slot only fills with a task that
-is in the graph and whose dependencies are done, so at every turn count the
-running tasks and the tasks ready to start, and if together they are fewer
-than {max_parallel}, add work that can start now.
+{max_parallel} are always working **on the goal**. A worker slot only fills
+with a task that is in the graph and whose dependencies are done, so at every
+turn count the running tasks and the tasks ready to start, and if together
+they are fewer than {max_parallel}, add work that can start now — taken from
+this list, in this order:
+
+1. work that proves a `completion_criteria` item, or unblocks such work;
+2. the features `task.yaml` asks for;
+3. performance work on the target.
+
+There is always more of 3, so a slot never needs anything else. **Do not add
+work outside this list**: re-running other models' suites to show a shared
+change is harmless, regression tests meant to send a fix upstream, extra
+reports, or polishing finished tasks. Such work costs a worker and, because
+every task leads to the final task, holds up landing. When a result shows a
+concrete risk to the goal, the task that fixes it belongs to 1; when a human
+asks for something, it belongs wherever they put it.
 
 - **Split along independent outcomes.** Every missing entry is its own
   `new_op` task, and they all run side by side. Checks of different modules
@@ -264,8 +277,17 @@ than {max_parallel}, add work that can start now.
 
 ## Each turn
 
-You are woken whenever one or more workers finish, and told which ones, what
-every task's state is and how many slots are free. Workers keep running while
+You are woken whenever one or more workers finish or a human leaves a
+message, and told which tasks finished, what every task's state is and how
+many slots are free.
+
+**Human messages come first.** A message from the human running this run is
+an instruction, not a suggestion: it overrides the plan, your own judgment
+and the rules above about what to add. Act on it in the same turn with the
+means below (rewrite, rewire, add or remove tasks; cancel running ones;
+FINISH or ABORT), and say in the turn's summary what you did about each
+message. If a message cannot be followed as written, do the closest thing
+that can and say why. Workers keep running while
 you think, so keep a turn short and decisive. In a turn:
 
 1. Read the results of the tasks that just finished.
@@ -329,6 +351,8 @@ cancel: []           # RUNNING tasks to stop
 | "The failed task was nearly done; mark the run DONE" | `DONE` needs evidence for every completion criterion. |
 | "Rewire this DONE task so the graph reads better" | A DONE task's graph entry is fixed and the plan will not validate. Add a new task instead. |
 | "Nothing to change this turn, but slots are free" | Free slots are the cue to add work: the next feature, a module check, a `perf` task. |
+| "This shared-code change should be proven harmless for other models" / "Add a regression test so the fix can go upstream" | Not a completion criterion and nobody asked. It holds up landing; fill the slot with perf work instead. |
+| "The human's request conflicts with my plan" | The human's request wins. Do it this turn and say how in the summary. |
 | "FINISH now; perf tasks can come later" | Nothing comes after the final task. Add the work first, then `FINISH`. |
 """
 
@@ -378,6 +402,7 @@ def planner_turn_prompt(
     stalled: bool,
     resumed: bool,
     rejected: Sequence[str],
+    feedback: Sequence[str] = (),
 ) -> str:
     """One planner turn while the workers run.
 
@@ -398,8 +423,14 @@ def planner_turn_prompt(
         resumed: The orchestrator restarted since the last turn.
         rejected: Problems that made the orchestrator discard the previous
             turn's changes.
+        feedback: Messages from the human, oldest first.
     """
     lines: list[str] = []
+    if feedback:
+        lines += ["## Messages from the human — act on these first", ""]
+        for i, text in enumerate(feedback, 1):
+            lines += [f"### Message {i}", "", text.strip(), ""]
+        lines += ["---", ""]
     if resumed:
         lines += [
             "The orchestrator restarted. Tasks that were running have been restarted "

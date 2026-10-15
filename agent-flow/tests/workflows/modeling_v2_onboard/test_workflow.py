@@ -447,6 +447,8 @@ def test_the_run_resumes_after_an_interruption(tmp_path, tmp_git_repo):
     workflow = _workflow(tmp_path, tmp_git_repo, factory)
     assert workflow.run() == RunOutcome.SUCCEEDED
     assert "The orchestrator restarted" in turns[0]
+    # a finished before the crash; the planner never got to act on it, so it still hears it.
+    assert "- `a` DONE" in turns[0]
     assert "a" not in second.attempts  # a was already DONE
     assert second.attempts["b"] == 1
     assert (tmp_git_repo / "b.txt").is_file()
@@ -464,7 +466,14 @@ def test_no_more_than_max_parallel_workers_run(tmp_path, tmp_git_repo):
         else:
             _finish_when_ready(prompt)
 
-    workers = _Workers()
+    async def overlap(agent, prompt, attempt):
+        # Hold on until another worker runs too (the fifth eventually runs alone).
+        for _ in range(500):
+            if workers.running >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+    workers = _Workers(**{f"t{i}": overlap for i in range(5)})
     workflow = _workflow(
         tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=workers), max_parallel=2
     )
@@ -537,3 +546,66 @@ def test_clean_removes_state_and_task_branches(tmp_path, tmp_git_repo):
     layout = Layout(tmp_path / "ws")
     assert not layout.state_path.exists() and not layout.results_dir.exists()
     assert _git(tmp_git_repo, "branch", "--list", "node/*") == ""
+
+
+def test_a_human_message_wakes_the_planner_and_is_acted_on(tmp_path, tmp_git_repo, monkeypatch):
+    from agent_flow.workflows.modeling_v2_onboard import workflow as workflow_module
+    from agent_flow.workflows.modeling_v2_onboard.files import post_feedback
+
+    monkeypatch.setattr(workflow_module, "INBOX_POLL_SECONDS", 0.05)
+    graph = """\
+  - id: a
+    type: new_op
+  - id: busywork
+    type: module_accuracy
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a, busywork]
+"""
+    without_busywork = """\
+  - id: a
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+"""
+    release_a = asyncio.Event()
+
+    async def a(agent, prompt, attempt):
+        # Nothing finishes until the human's message has been handled.
+        post_feedback(tmp_path / "ws", "busywork is useless: remove it.")
+        await release_a.wait()
+
+    async def busywork(agent, prompt, attempt):
+        await asyncio.Event().wait()
+
+    turns: list[str] = []
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _plan_path(prompt).write_text(_plan_text(graph))
+            return
+        turns.append(prompt)
+        if "busywork is useless" in prompt:
+            _edit_plan(prompt).write_text(_plan_text(without_busywork))
+            _decide(prompt, "FINISH", cancel=["busywork"])
+            release_a.set()
+        else:
+            _decide(prompt)
+
+    workers = _Workers(a=a, busywork=busywork)
+    factory = FakeFactory(planner=planner, worker=workers)
+    workflow = _workflow(tmp_path, tmp_git_repo, factory)
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert turns[0].startswith("## Messages from the human")
+    assert "busywork is useless" not in "".join(turns[1:])
+    layout = Layout(tmp_path / "ws")
+    assert list(layout.inbox_dir.glob("*.md")) == []
+    assert len(list(layout.consumed_dir.glob("*.md"))) == 1
+    # busywork may be cancelled before its worker even starts.
+    assert all(agent.closed for agent in factory.workers("busywork"))

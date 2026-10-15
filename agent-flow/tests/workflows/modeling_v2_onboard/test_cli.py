@@ -55,3 +55,24 @@ def test_an_invalid_task_exits_with_an_error(tmp_path, capsys):
         main(["--task", str(task), "--workspace", str(tmp_path / "ws")])
     assert info.value.code == 2
     assert "reference_code_path" in capsys.readouterr().err
+
+
+def test_feedback_leaves_a_message_without_a_task(tmp_path, capsys):
+    main(["--workspace", str(tmp_path / "ws"), "--feedback", "drop fla-fix-test"])
+    (message,) = (tmp_path / "ws" / "inbox").glob("*.md")
+    assert message.read_text() == "drop fla-fix-test\n"
+    assert str(message) in capsys.readouterr().out
+
+    note = tmp_path / "note.md"
+    note.write_text("second\n")
+    main(["--workspace", str(tmp_path / "ws"), "--feedback-file", str(note)])
+    assert len(list((tmp_path / "ws" / "inbox").glob("*.md"))) == 2
+
+
+def test_running_needs_a_task_and_feedback_excludes_clean(tmp_path):
+    with pytest.raises(SystemExit):
+        _parse_args(["--workspace", "ws"])
+    with pytest.raises(SystemExit):
+        _parse_args(["--workspace", "ws", "--feedback", "x", "--clean"])
+    with pytest.raises(SystemExit):
+        main(["--workspace", str(tmp_path), "--feedback", "   "])
