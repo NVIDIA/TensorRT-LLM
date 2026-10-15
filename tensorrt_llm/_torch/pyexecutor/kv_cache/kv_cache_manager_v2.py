@@ -38,6 +38,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1819,7 +1820,27 @@ class KVCacheManagerV2(BaseResourceManager):
         self.impl = candidate
         # Cached at construction so the per-locality-domain metadata invariants
         # stay stable for the manager's lifetime.
-        self._fork_join_attn = self.num_locality_domains > 1 and enable_locality_domains
+        self._fork_join_attn = False
+        if self.num_locality_domains > 1 and enable_locality_domains:
+            if is_locality_domain_enabled():
+                # Balanced generation dispatch splits rows in half (runner.py).
+                assert self.num_locality_domains == 2, (
+                    "fork-join attention supports exactly 2 locality domains; "
+                    f"got {self.num_locality_domains}"
+                )
+                self._fork_join_attn = True
+            elif os.environ.get("TRT_LLM_MOCK_LOCALIZATION_SUPPORT") == "1":
+                logger.info(
+                    "Mock localization: KV cache split across %d domains, "
+                    "attention stays on one stream",
+                    self.num_locality_domains,
+                )
+            else:
+                raise RuntimeError(
+                    "enable_locality_domains=True, but locality domain execution is "
+                    "disabled on this device (DISABLE_LOCALITY_DOMAINS=1 or no runtime "
+                    "support), so the KV cache would be localized without matching streams"
+                )
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -2074,6 +2095,16 @@ class KVCacheManagerV2(BaseResourceManager):
         value = self._guard_page_value
         if value is None:
             self._guard_page_fill = ""
+            return
+        if self.num_locality_domains > 1:
+            # The sentinel is restored per layer buffer after warmup scrubs, and a
+            # localized pool has no single layer buffer to index it against.
+            logger.warning(
+                "TRTLLM_KV_GUARD_PAGE is not supported with locality domains; "
+                "no guard page reserved"
+            )
+            self._guard_page_fill = ""
+            self._guard_page_value = None
             return
         kv_cache = self._create_kv_cache(_GUARD_PAGE_REQUEST_ID, None, [1], is_dummy=True)
         if kv_cache is None:
@@ -3863,7 +3894,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_block_reuse or req.py_request_id in self.kv_cache_map:
             return None
         return self.impl.probe_reuse(
-            ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)),
+            ReuseScope(
+                lora_id=req.lora_task_id,
+                salt=self._derive_reuse_salt(req.cache_salt),
+                locality_domain_id=self._request_locality_domain_id(req),
+            ),
             self._context_reuse_tokens(req),
         )
 
@@ -4741,6 +4776,7 @@ class KVCacheManagerV2(BaseResourceManager):
             None,
             cache_salt=req.cache_salt,
             is_dummy=req.is_dummy,
+            locality_domain_id=self._request_locality_domain_id(req),
         )
         if kv_cache is None:
             return None
@@ -6820,9 +6856,19 @@ class KVCacheManagerV2(BaseResourceManager):
         if len(input_tokens) == 0:
             return 0
         salt_int = self._derive_reuse_salt(cache_salt)
-        return self.impl.probe_reuse(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
-            input_tokens,
+        if self.num_locality_domains <= 1:
+            return self.impl.probe_reuse(
+                ReuseScope(lora_id=lora_task_id, salt=salt_int),
+                input_tokens,
+            )
+        # The router has no request yet, so no domain: blocks are keyed per
+        # domain and the request may land in any of them.
+        return max(
+            self.impl.probe_reuse(
+                ReuseScope(lora_id=lora_task_id, salt=salt_int, locality_domain_id=domain),
+                input_tokens,
+            )
+            for domain in range(self.num_locality_domains)
         )
 
     def probe_first_new_block_key(self, req: LlmRequest) -> bytes | None:
@@ -6865,7 +6911,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # A 1-token prompt marshals to an empty sequence: the last token is
             # excluded, so there is nothing to look up and nothing to contribute.
             return None
-        scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
+        scope = ReuseScope(
+            lora_id=req.lora_task_id,
+            salt=self._derive_reuse_salt(req.cache_salt),
+            locality_domain_id=self._request_locality_domain_id(req),
+        )
         return self.impl.probe_first_new_block_key(scope, tokens)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
@@ -6886,7 +6936,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # cache hits the same radix-tree blocks.
             salt_int = self._derive_reuse_salt(req.cache_salt)
             kv_cache = self.impl.create_kv_cache(
-                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+                ReuseScope(
+                    lora_id=req.lora_task_id,
+                    salt=salt_int,
+                    locality_domain_id=self._request_locality_domain_id(req),
+                ),
+                tokens,
             )
             try:
                 # Prefetch to the first tier below GPU (host if present,

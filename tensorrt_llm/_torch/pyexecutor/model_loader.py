@@ -955,14 +955,6 @@ class ModelLoader:
                 "weight shards.")
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
-        locality_domain_policy = getattr(config, "locality_domain_policy", None)
-        if (load_format == LoadFormat.GMS and locality_domain_policy is not None
-                and locality_domain_policy.enabled):
-            raise ValueError(
-                "LoadFormat.GMS is incompatible with locality domain localized weights. "
-                "GMS shares registered parameters, while locality domain execution "
-                "releases those parameters after creating partition-local weight shards."
-            )
 
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
@@ -2006,6 +1998,7 @@ class ModelLoader:
                 f"Could not read allreduce pre-allocation config from "
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
+
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)

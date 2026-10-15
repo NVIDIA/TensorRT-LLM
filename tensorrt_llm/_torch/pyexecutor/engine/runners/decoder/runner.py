@@ -145,6 +145,56 @@ def sort_generation_requests_by_locality_domain(requests: list[LlmRequest]) -> l
     return sorted(requests, key=lambda r: (r.is_cuda_graph_dummy, r.py_locality_domain_id))
 
 
+def balanced_generation_dispatch(num_rows: int, num_locality_domains: int) -> list[int]:
+    """Domain for each packed generation row, by position only.
+
+    CUDA graph capture bakes the per-domain request counts in as launch scalars,
+    so the split must depend on the padded row count alone, never on which
+    domain owns a row: capturing (half-2, half+2) and replaying (half+1, half-1)
+    crashes. Rows that are repeated padding dummies count once per occurrence.
+    """
+    base, extra = divmod(num_rows, num_locality_domains)
+    dispatch: list[int] = []
+    for domain in range(num_locality_domains):
+        dispatch.extend([domain] * (base + (1 if domain < extra else 0)))
+    return dispatch
+
+
+def locality_domain_generation_splits(
+    packed_requests: list[LlmRequest],
+    gen_sequence_lengths: list[int],
+    num_locality_domains: int,
+    *,
+    positional: bool,
+) -> tuple[list[int], list[int]]:
+    """Per-domain request and token counts over the packed generation rows.
+
+    The attention side slices each domain as one contiguous row range, so
+    ownership can only be followed when the packed order keeps every domain's
+    rows together. Mixed categories (extend, first_draft, generation) break
+    that, and then the rows are split by position instead, which is still
+    correct and only costs locality.
+    """
+    if not positional:
+        dispatch = [request.py_locality_domain_id for request in packed_requests]
+        seen: set[int] = set()
+        for i, domain in enumerate(dispatch):
+            if i > 0 and domain == dispatch[i - 1]:
+                continue
+            if domain in seen:
+                positional = True
+                break
+            seen.add(domain)
+    if positional:
+        dispatch = balanced_generation_dispatch(len(packed_requests), num_locality_domains)
+    per_domain_reqs = [0] * num_locality_domains
+    per_domain_tokens = [0] * num_locality_domains
+    for i, domain in enumerate(dispatch):
+        per_domain_reqs[domain] += 1
+        per_domain_tokens[domain] += gen_sequence_lengths[i]
+    return per_domain_reqs, per_domain_tokens
+
+
 def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> int:
     """Prompt token immediately following a context chunk. Uses the live C++
     ``mPromptLen``; ``py_prompt_len`` goes stale after a non-recompute preemption.
@@ -3699,25 +3749,9 @@ class DecoderRunner(ScheduledModelRunner):
         # place means the sampler and spec-decode see the same order as the model
         # input, so no logit un-permutation is needed.
         _all_gen_reqs = list(scheduled_requests.generation_requests)
-        _gen_dispatch_locality_domain: dict[int, int] = {}
         if _locality_domain_reorder and _all_gen_reqs:
             _all_gen_reqs = sort_generation_requests_by_locality_domain(_all_gen_reqs)
             scheduled_requests.generation_requests = _all_gen_reqs
-            if scheduled_requests.num_context_requests == 0:
-                # Split by position, not by placement: CUDA graph capture bakes the
-                # per-domain request counts in as launch scalars, so the split must
-                # depend only on the padded batch size. Placement-derived splits vary
-                # with batch composition -- capturing (half-2, half+2) and replaying
-                # (half+1, half-1) crashes. The assert keeps this to two domains: with
-                # four the expression still runs but silently stops balancing.
-                num_locality_domains_local = kv_cache_manager.num_locality_domains
-                assert num_locality_domains_local == 2, (
-                    "balanced generation locality domain dispatch currently supports "
-                    f"num_locality_domains == 2; got {num_locality_domains_local}"
-                )
-                half = (len(_all_gen_reqs) + 1) // 2
-                for idx, req in enumerate(_all_gen_reqs):
-                    _gen_dispatch_locality_domain[req.py_request_id] = 0 if idx < half else 1
 
         for request in scheduled_requests.generation_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
@@ -4437,13 +4471,16 @@ class DecoderRunner(ScheduledModelRunner):
                 per_locality_domain_ctx_reqs[u] += 1
                 per_locality_domain_ctx_tokens[u] += sequence_lengths[i]
 
-            gen_sequence_lengths = sequence_lengths[num_ctx_requests:]
-            for i, request in enumerate(_all_gen_reqs):
-                u = _gen_dispatch_locality_domain.get(
-                    request.py_request_id, request.py_locality_domain_id
+            # Rows are packed extend, first_draft, generation, which is not the
+            # domain-sorted order once categories mix, so count from the packed list.
+            per_locality_domain_gen_reqs, per_locality_domain_gen_tokens = (
+                locality_domain_generation_splits(
+                    extend_requests + first_draft_requests + generation_requests,
+                    sequence_lengths[num_ctx_requests:],
+                    num_locality_domains,
+                    positional=num_ctx_requests == 0,
                 )
-                per_locality_domain_gen_reqs[u] += 1
-                per_locality_domain_gen_tokens[u] += gen_sequence_lengths[i]
+            )
 
             attn_metadata.locality_domain_ctx_req_splits = [0] + list(
                 accumulate(per_locality_domain_ctx_reqs)
