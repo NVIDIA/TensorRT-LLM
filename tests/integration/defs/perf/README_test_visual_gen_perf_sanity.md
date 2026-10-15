@@ -38,11 +38,20 @@ synchronous image and image-edit routes use `e2e_latency` because they cannot
 observe a separate generation-complete boundary. Server timings remain
 diagnostic outputs of a detailed benchmark, rather than the regression metric.
 
-New uploaded results carry `s_visual_gen_metric_contract=v2_client_latency` as
-source metadata, not as a match key. The CI history policy accepts only records
-with this exact contract; missing and different contracts are excluded. It does
-not infer compatibility from dates or maintain a commit allowlist. Update the
-contract if the benchmark measurement window changes.
+New uploaded results carry `s_generation_timing_source` as measurement-source
+metadata, not as a match key or a versioned metric name:
+
+| Benchmark backend | Generation timing source |
+|-------------------|--------------------------|
+| `openai-videos` | `client_gen_latency` |
+| `openai-images`, `openai-image-edits` | `client_e2e_latency` |
+
+The CI history policy accepts only records with the source expected for their
+backend. Missing, unknown, and mismatched sources/backends are excluded. The
+producer records the source corresponding to metric extraction and rejects
+result/config backend mismatches. CI does not infer compatibility from
+dates or maintain a commit allowlist. Reassess compatibility if a measurement
+window changes; a source name alone does not establish unchanged semantics.
 
 The policy applies before selecting the latest main result, extracting threshold
 overrides, and computing the fallback baseline. It drops inherited `d_baseline_*`
@@ -52,9 +61,8 @@ are recomputed with the existing daily/rolling-percentile algorithm from
 compatible history and the new measurement. The lookup does not mutate DB
 records, and metric names remain unchanged. With no compatible history, the
 existing pipeline bootstraps from the current measurement; a passing first run
-is not evidence of an established
-regression baseline. Collect repeated current-window results before treating
-the case as a stable gate.
+alone does not verify that subsequent tests use compatible history. Default
+thresholds remain unchanged: 10% pre-merge and 5% post-merge.
 
 ### Historical metadata backfill and rollout
 
@@ -66,11 +74,11 @@ reviewed database migration, not a task performed by CI:
    original source. Verify the actual producer mapping at each commit (including
    release/backport branches); do not use the merge date as a timing cutoff.
 2. Review a dry-run list of exact document IDs and proposed metadata updates.
-   Only verified client-window records without a contract are eligible. Leave
-   server-window, unknown-source, and already-versioned records untouched.
-3. Add only `s_visual_gen_metric_contract=v2_client_latency`, conditionally on
-   the contract still being absent and the document still matching the reviewed
-   source. Preserve all metrics, baseline fields, timestamps, and result flags;
+   Only verified client-window records without timing-source metadata are eligible.
+   Leave server-window, unknown-source, and already-tagged records untouched.
+3. Add only `s_generation_timing_source` with the verified backend-specific value,
+   conditionally on the field still being absent and the document still matching
+   the reviewed source. Preserve all metrics, baseline fields, timestamps, and result flags;
    do not re-upload documents through the normal result-upload path.
 4. Read back the changed records and verify the compatible per-case history
    counts before enabling the gate. Retain the export and migration audit for
@@ -78,7 +86,18 @@ reviewed database migration, not a task performed by CI:
 
 Without this migration, untagged historical results remain stored and available
 for reference, but CI will bootstrap new baselines even for video cases. Flux
-also needs repeated new client-window samples if no compatible history exists.
+also needs new client-window samples if no compatible history exists.
+
+### Measurement-window fix verification
+
+To verify a cross-window false-regression fix, run the affected case with its
+waiver removed and inspect the uploaded timing source and regression log. A
+successful post-merge run must not use the old server-window baseline. Follow it
+with another same-config run that demonstrably reads the first client-window
+result as compatible history; a self-baselined first run alone is insufficient.
+Attach the merged fix and run evidence when resolving the issue through the
+team's bug workflow. Long-term baseline stability monitoring is separate from
+verifying this measurement-window fix; no fixed waiting period is required.
 
 ## Match Keys
 

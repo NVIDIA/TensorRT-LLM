@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from test_common.visual_gen_perf_history import (
-    VISUAL_GEN_METRIC_CONTRACT,
+    get_generation_timing_source,
     transform_visual_gen_history,
 )
 
@@ -23,6 +23,7 @@ _Modules = tuple[types.ModuleType, types.ModuleType, types.SimpleNamespace]
 def _row(commit: str, value: float, timestamp: str, **fields: object) -> dict:
     return {
         "s_runtime": "visual_gen",
+        "s_backend": "openai-images",
         "s_test_case_name": "flux2",
         "s_gpu_type": "b200",
         "s_commit": commit,
@@ -38,7 +39,11 @@ def _client_row(value: float, timestamp: str, **fields: object) -> dict:
         _CLIENT_COMMIT,
         value,
         timestamp,
-        s_visual_gen_metric_contract=VISUAL_GEN_METRIC_CONTRACT,
+        s_generation_timing_source=(
+            "client_gen_latency"
+            if fields.get("s_backend", "openai-images") == "openai-videos"
+            else "client_e2e_latency"
+        ),
         **fields,
     )
 
@@ -48,15 +53,15 @@ def test_old_window_is_excluded_even_with_a_new_date() -> None:
     assert transform_visual_gen_history(record) is None
 
 
-def test_unversioned_client_history_needs_explicit_backfill() -> None:
+def test_untagged_client_history_needs_explicit_backfill() -> None:
     record = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z")
     assert transform_visual_gen_history(record) is None
-    record["s_visual_gen_metric_contract"] = VISUAL_GEN_METRIC_CONTRACT
+    record["s_generation_timing_source"] = "client_e2e_latency"
     assert transform_visual_gen_history(record) == record
 
 
-@pytest.mark.parametrize("contract", [None, "", "server_generation", "v3_other"])
-def test_missing_or_different_contract_is_excluded(contract: str | None) -> None:
+@pytest.mark.parametrize("source", [None, "", "server_generation", "unknown_source"])
+def test_missing_or_different_source_is_excluded(source: str | None) -> None:
     assert transform_visual_gen_history(_row("f" * 40, 0.94, "2026-10-14T00:00:00Z")) is None
     assert (
         transform_visual_gen_history(
@@ -64,7 +69,7 @@ def test_missing_or_different_contract_is_excluded(contract: str | None) -> None
                 _CLIENT_COMMIT,
                 0.94,
                 "2026-10-14T00:00:00Z",
-                s_visual_gen_metric_contract=contract,
+                s_generation_timing_source=source,
             )
         )
         is None
@@ -76,9 +81,44 @@ def test_new_metadata_works_without_git_history() -> None:
         "f" * 40,
         0.94,
         "2026-10-14T00:00:00Z",
-        s_visual_gen_metric_contract=VISUAL_GEN_METRIC_CONTRACT,
+        s_generation_timing_source="client_e2e_latency",
     )
     assert transform_visual_gen_history(record) == record
+
+
+@pytest.mark.parametrize(
+    ("backend", "source"),
+    [
+        ("openai-videos", "client_gen_latency"),
+        ("openai-images", "client_e2e_latency"),
+        ("openai-image-edits", "client_e2e_latency"),
+    ],
+)
+def test_source_must_match_backend(backend: str, source: str) -> None:
+    assert get_generation_timing_source(backend) == source
+    record = _row(
+        _CLIENT_COMMIT,
+        0.94,
+        "2026-10-14T00:00:00Z",
+        s_backend=backend,
+        s_generation_timing_source=source,
+    )
+    assert transform_visual_gen_history(record) == record
+    record["s_generation_timing_source"] = (
+        "client_e2e_latency" if source == "client_gen_latency" else "client_gen_latency"
+    )
+    assert transform_visual_gen_history(record) is None
+
+
+@pytest.mark.parametrize("backend", [None, "", "future-backend"])
+def test_missing_or_unknown_backend_cannot_establish_compatibility(backend: str | None) -> None:
+    record = _client_row(0.94, "2026-10-14T00:00:00Z", s_backend=backend)
+    assert transform_visual_gen_history(record) is None
+
+
+def test_unknown_producer_backend_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Unsupported VisualGen benchmark backend"):
+        get_generation_timing_source("future-backend")
 
 
 def test_mixed_baselines_are_removed_but_thresholds_and_raw_records_survive() -> None:
@@ -181,12 +221,19 @@ def test_empty_compatible_history_and_db_failure_are_distinct(modules: _Modules)
 
 @pytest.mark.parametrize("post_merge", [False, True])
 @pytest.mark.parametrize("old_value", [0.8554, 1.2])
+@pytest.mark.parametrize("backend", ["openai-images", "openai-image-edits", "openai-videos"])
 def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
-    modules: _Modules, monkeypatch: pytest.MonkeyPatch, post_merge: bool, old_value: float
+    modules: _Modules,
+    monkeypatch: pytest.MonkeyPatch,
+    post_merge: bool,
+    old_value: float,
+    backend: str,
 ) -> None:
     _, pipeline, search = modules
-    old = _row(_SERVER_COMMIT, old_value, "2026-10-14T00:00:00Z")
-    good = _client_row(0.9433, "2026-09-14T00:00:00Z", d_baseline_median_generation=0.8554)
+    old = _row(_SERVER_COMMIT, old_value, "2026-10-14T00:00:00Z", s_backend=backend)
+    good = _client_row(
+        0.9433, "2026-09-14T00:00:00Z", s_backend=backend, d_baseline_median_generation=0.8554
+    )
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old, good]
     monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": post_merge})
     for value, should_fail in [(0.9433, False), (1.2, True)]:
@@ -194,11 +241,12 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
             "f" * 40,
             value,
             "2026-10-14T00:00:00Z",
-            s_visual_gen_metric_contract=VISUAL_GEN_METRIC_CONTRACT,
+            s_backend=backend,
+            s_generation_timing_source=get_generation_timing_source(backend),
         )
         kwargs = dict(
             new_data_dict={0: current},
-            match_keys=["s_test_case_name", "s_gpu_type", "s_runtime"],
+            match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
             maximize_metrics=[],
             minimize_metrics=["d_median_generation"],
             regression_metrics=["d_median_generation"],
@@ -240,9 +288,48 @@ def test_untagged_history_bootstraps_without_mutating_stored_results(
     assert history == originals
 
 
-def test_producer_stamps_metadata_without_changing_match_keys(
-    monkeypatch: pytest.MonkeyPatch,
+def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
+    modules: _Modules, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    db, pipeline, search = modules
+    history = [_row(_SERVER_COMMIT, 0.8554, "2026-09-11T00:00:00Z")]
+    search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: history
+
+    def upload(rows: list[dict], project: str) -> bool:
+        history.extend(dict(row) for row in rows)
+        return True
+
+    search.postToOpenSearchDB = upload
+    monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": True})
+    first = _client_row(0.9433, "2026-10-14T00:00:00Z")
+    kwargs = dict(
+        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
+        maximize_metrics=[],
+        minimize_metrics=["d_median_generation"],
+        regression_metrics=["d_median_generation"],
+        history_transform=transform_visual_gen_history,
+    )
+    pipeline.process_and_upload_test_results(new_data_dict={0: first}, **kwargs)
+    assert len(history) == 2
+    assert history[-1]["s_generation_timing_source"] == "client_e2e_latency"
+    latest, _, compatible = db.get_history_data(
+        {0: first}, kwargs["match_keys"], {}, history_transform=transform_visual_gen_history
+    )
+    assert latest[0]["s_commit"] == _CLIENT_COMMIT
+    assert len(compatible[0]) == 1
+
+    monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": False})
+    slower = _client_row(1.2, "2026-10-15T00:00:00Z")
+    with pytest.raises(RuntimeError, match="Regression"):
+        pipeline.process_and_upload_test_results(
+            new_data_dict={0: slower}, upload_to_db=False, **kwargs
+        )
+    assert slower["b_is_regression"] is True
+
+
+@pytest.fixture
+def producer(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """Load the actual metric mapping and producer without importing GPU code."""
     commands = types.ModuleType("tensorrt_llm.commands.utils")
     commands.get_visual_gen_num_gpus = lambda config: 1
     monkeypatch.setitem(sys.modules, "tensorrt_llm.commands.utils", commands)
@@ -251,16 +338,48 @@ def test_producer_stamps_metadata_without_changing_match_keys(
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(
-        module, "extract_visual_gen_metrics", lambda data: {"d_request_throughput": 2}
-    )
-    row = module.build_visual_gen_db_entry(
+    return module
+
+
+@pytest.mark.parametrize(
+    ("backend", "source", "generation"),
+    [
+        ("openai-videos", "client_gen_latency", 0.8),
+        ("openai-images", "client_e2e_latency", 0.94),
+        ("openai-image-edits", "client_e2e_latency", 0.94),
+    ],
+)
+def test_producer_source_agrees_with_extracted_metrics_without_changing_match_keys(
+    producer: types.ModuleType, backend: str, source: str, generation: float
+) -> None:
+    def latency(value: float) -> dict:
+        return {"mean": value, "median": value, "percentiles": {"p90": value, "p99": value}}
+
+    row = producer.build_visual_gen_db_entry(
         gpu_type="b200",
         model_name="flux2",
         server_name="flux2",
         server_config={},
-        client_config={"backend": "openai-images", "num_inference_steps": 50, "max_concurrency": 1},
-        result_data={},
+        client_config={"backend": backend, "num_inference_steps": 50, "max_concurrency": 1},
+        result_data={
+            "backend": backend,
+            "request_throughput": 2,
+            "e2e_latency": latency(0.94),
+            "gen_latency": latency(0.8),
+        },
     )
-    assert row["s_visual_gen_metric_contract"] == VISUAL_GEN_METRIC_CONTRACT
-    assert "s_visual_gen_metric_contract" not in module.get_visual_gen_match_keys()
+    assert row["s_generation_timing_source"] == source
+    assert row["d_median_generation"] == generation
+    assert "s_generation_timing_source" not in producer.get_visual_gen_match_keys()
+
+
+def test_producer_rejects_mismatched_result_backend(producer: types.ModuleType) -> None:
+    with pytest.raises(ValueError, match="backend does not match"):
+        producer.build_visual_gen_db_entry(
+            gpu_type="b200",
+            model_name="flux2",
+            server_name="flux2",
+            server_config={},
+            client_config={"backend": "openai-images"},
+            result_data={"backend": "openai-videos"},
+        )

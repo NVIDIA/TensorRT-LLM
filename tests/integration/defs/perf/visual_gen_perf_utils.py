@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from test_common.visual_gen_perf_history import VISUAL_GEN_METRIC_CONTRACT
+from test_common.visual_gen_perf_history import get_generation_timing_source
 
 from tensorrt_llm.commands.utils import get_visual_gen_num_gpus as resolve_visual_gen_num_gpus
 
@@ -170,9 +170,12 @@ def build_visual_gen_db_entry(
     """Build one OpenSearch document from VisualGen config and result JSON."""
     expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
     client_name = str(client_config.get("name", "default"))
+    backend = str(result_data.get("backend", ""))
+    if backend != str(client_config.get("backend")):
+        raise ValueError("VisualGen benchmark result backend does not match the client config")
     entry = {
         "s_runtime": "visual_gen",
-        "s_visual_gen_metric_contract": VISUAL_GEN_METRIC_CONTRACT,
+        "s_generation_timing_source": get_generation_timing_source(backend),
         "s_gpu_type": gpu_type,
         "s_model_name": str(model_name).lower(),
         "s_server_name": server_name,
