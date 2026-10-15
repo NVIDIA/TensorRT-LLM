@@ -138,6 +138,8 @@ class RocketKVCacheManager(KVCacheManager):
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
         )
+        if requests is None:
+            return None
         for req in requests:
             request_id = req.py_request_id
             kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
