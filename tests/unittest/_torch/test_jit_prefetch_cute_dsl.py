@@ -291,6 +291,11 @@ def test_topk_provider_finds_topk_inside_attention_backends():
     model = torch.nn.Module()
     model.layer = torch.nn.Module()
     model.layer.attn = Backend()
+    # Attributes of the same names that are not backends are skipped: an
+    # object without a __dict__ (an extension type) and a plain value.
+    model.other = torch.nn.Module()
+    model.other.attn = 3
+    model.other.backend = object()
     provider = jcd.TopKProvider(model, max_num_tokens=64, max_seq_len=4096)
     assert provider.cfgs == {("decode", 512)}
 

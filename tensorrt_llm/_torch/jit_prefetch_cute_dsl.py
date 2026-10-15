@@ -610,9 +610,12 @@ def _modules_with_attention_backends(model) -> List[Any]:
     for mod in list(out):
         for name in ("attn", "mqa", "mha", "backend", "attn_backend"):
             backend = mod.__dict__.get(name)
-            if backend is None or isinstance(backend, torch.nn.Module):
+            # Only plain Python backends: a module is already walked, and an
+            # extension or slotted object has no attributes to look through.
+            attrs = getattr(backend, "__dict__", None)
+            if attrs is None or isinstance(backend, torch.nn.Module):
                 continue
-            for value in list(vars(backend).values()):
+            for value in list(attrs.values()):
                 if isinstance(value, torch.nn.Module):
                     add(value)
     return out
