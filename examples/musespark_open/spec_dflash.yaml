@@ -1,0 +1,13 @@
+# Overlay for serve_config.yaml: enable DFlash2 speculative decoding for
+# Muse Spark Open. Merge these keys into the serving YAML (or append them
+# to a copy of serve_config.yaml) before launching trtllm-serve.
+#
+# Acceptance is strict — an accepted draft token is exactly the token the
+# target model emits — so speculation changes speed, not model output.
+# At temperature 0, near-tied logits may rarely resolve differently than
+# with speculation off (same variability class as ordinary batching);
+# this disappears at temperature > 0.
+speculative_config:
+  decoding_type: DFlash
+  max_draft_len: 7
+  speculative_model: nvidia/Muse-Spark-Open-816B-A42B-DFlash2

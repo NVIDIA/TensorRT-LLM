@@ -55,14 +55,31 @@ through the standard OpenAI `response_format` field.
 
 ## Speculative decoding (opt-in)
 
-Model-free suffix-automaton (SA) drafting is available; see the
-[speculative-decoding guide](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md)
-for its configuration and measured trade-offs.
+`spec_dflash.yaml` holds the keys that enable DFlash2 speculative decoding
+(a small drafter cross-attending to target hidden states, drafting 7 tokens
+per step) with the published drafter checkpoint
+[`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2).
+Merge the keys into a copy of `serve_config.yaml` and launch with that
+merged file:
+
+```bash
+cat serve_config.yaml spec_dflash.yaml > serve_config_spec.yaml
+trtllm-serve ${MODEL} \
+    --host 0.0.0.0 --port 8000 \
+    --config serve_config_spec.yaml \
+    --custom_tokenizer musespark_open \
+    --tool_parser musespark \
+    --reasoning_parser musespark
+```
 
 Acceptance is strict, so speculation changes serving speed, not what the
 model outputs. At temperature 0, near-tied logits may rarely resolve
 differently than with speculation off (the same variability class as
 ordinary batching); this disappears at temperature > 0.
+
+Model-free suffix-automaton (SA) drafting is also available; see the
+[speculative-decoding guide](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md)
+for its configuration and measured trade-offs.
 
 ## Configuration notes
 
