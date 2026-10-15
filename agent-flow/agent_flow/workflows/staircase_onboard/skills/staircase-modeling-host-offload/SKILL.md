@@ -157,7 +157,7 @@ gather is suspected.
 ## Gates
 
 boot → accuracy → **residency witness**, all under
-`TRTLLM_MODELING_V2=require`.
+`modeling_v2=require`.
 
 The witness is the gate that can actually see this feature. Shape it so only
 one outcome is possible if the feature is real:

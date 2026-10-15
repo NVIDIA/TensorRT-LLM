@@ -98,8 +98,8 @@ prediction from the checkpoint's own shapes, so re-asking it at a member whose
 attention weights are replicated rather than sharded compares a different
 delta against an expectation computed for another configuration.
 
-Every member's gates run with `TRTLLM_MODELING_V2=require` exported before the
-ranks start, so a member whose topology missed the target's routing criteria
+Every member's gates run with `modeling_v2=require`, so a member whose
+topology missed the target's routing criteria
 fails loudly instead of recording the built-in implementation's numbers.
 
 ## Adding a configuration later

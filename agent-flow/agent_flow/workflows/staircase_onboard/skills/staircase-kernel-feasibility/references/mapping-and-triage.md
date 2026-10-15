@@ -14,7 +14,7 @@ answer.
 |---|---|
 | `ARCHS` | the **architectures** the cells were driven on. An arch not in it is **unknown** — not passed, not failed |
 | `CELLS` | the input configurations certified, each a `Cell(why=..., spec=...)`; a multi-rank entry's world size is a `spec` axis |
-| `raw_call` signature | the arguments, by the op's own names — what a call site must supply |
+| `__call__` signature | the arguments, by the op's own names — what a call site must supply, every call |
 | `is_valid` | inputs the op accepts and answers wrongly; a value it refuses is outside the entry for good |
 | `note` | metadata consumed, preconditions, arch quirks, hard limits, and what is stated as not certified |
 
@@ -39,7 +39,7 @@ pre-merge, so its cells are re-proved on every commit.
 | shared entry exists, some value falls outside every cell | **CERT** | `staircase-kernel-verify`, with the value and the cell or `note` line that excludes it |
 | another target keeps the op in its own `ops/` | **GAP** (promotion) | `staircase-kernel-onboard`, target `<category>/<name>`, naming the existing entry in `note` — it and its test move to the shared catalog and the cells are driven again |
 | no entry, but `references/trtllm-ops.md` has a candidate callable | **GAP** (tier 1) | `staircase-kernel-onboard`, with the candidate and the step it serves; target `ops/<category>/<name>` when only this target calls it |
-| no entry and no trtllm op, but a FlashInfer public callable computes the step (`surface.md`, "FlashInfer API") | **GAP** (tier 3) | `staircase-kernel-onboard`, candidate `flashinfer.<module>.<name>`: the entry's `raw_call` calls it directly. FlashInfer is a pinned dependency; most of its kernels have no trtllm op, so the op inventory cannot see them |
+| no entry and no trtllm op, but a FlashInfer public callable computes the step (`surface.md`, "FlashInfer API") | **GAP** (tier 3) | `staircase-kernel-onboard`, candidate `flashinfer.<module>.<name>`: the entry's `__call__` calls it directly. FlashInfer is a pinned dependency; most of its kernels have no trtllm op, so the op inventory cannot see them |
 | no entry and no candidate | **ceiling** | nothing — the run ends here. **First rule out FlashInfer's API and a pybind binding**: the inventory is generated from the torch schema registry and lists `torch.ops.*` only, so a step served by a binding (`thop_attention` is one) searches empty and reads as a ceiling. Check the catalog's existing entries and their *uncertified* surfaces before concluding |
 
 One more case that dispatches nobody: **a step plain torch serves**. Native

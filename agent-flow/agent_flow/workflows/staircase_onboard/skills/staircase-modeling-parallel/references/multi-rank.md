@@ -36,18 +36,18 @@ under `__name__ == "__worker__"`. Measured consequences:
 | `os.environ` | — | **inherited** |
 
 A target is **not** registered by a script the ranks re-import. `_router_index.py`
-maps `architectures[0]` to `models/<family>/routing.py`, routing returns a
-synthetic class name, and `get_registered_model_class(name)` resolves it — in
-whichever process builds the model. There is nothing for a launcher to
-register and nothing for a worker to re-import, so nothing above depends on
-where a target's code sits in a file.
+maps `architectures[0]` to `models/<family>/routing.py`, whose `route` returns
+the target class, and the model loader carries it on
+`ModelConfig.modeling_v2_target` — in whichever process builds the model.
+There is nothing for a launcher to register and nothing for a worker to
+re-import, so nothing above depends on where a target's code sits in a file.
 
-What does have to reach a rank is the **mode**. `TRTLLM_MODELING_V2` is
-`off` / `auto` / `require`; anything attributed to modeling_v2 runs under
-`require`; and it must be **exported before the ranks start**, not merely
-before `LLM(...)` — see the second failure mode below. A driver resolving a
-target while its workers resolve the built-in is the silent split the variable
-exists to prevent.
+What does have to reach a rank is the **mode**. `modeling_v2` is an LLM-API
+argument, `off` / `auto` / `require`; anything attributed to modeling_v2 runs
+under `require`. Being an argument, it reaches every rank the way the rest of
+the arguments do — the second failure mode below is why a variable would not.
+A driver resolving a target while its workers resolve the built-in is the
+silent split `require` exists to catch.
 
 ### Two failure modes that exist only above world size 1
 
@@ -68,10 +68,11 @@ class object under the same name and pickle's identity comparison rejects it
 (`it's not the same object as ...`) — so the load has to be idempotent.
 
 In tree both halves are satisfied by construction: a target is an ordinary
-module of the modeling_v2 package, imported by name through the registry, so
+module of the modeling_v2 package, imported by name by its routing module, so
 the name resolves in every process and the import is idempotent. That is what
-the registry buys, and it is why the rule is stated rather than dropped — any
-mechanism that reaches a model class by file path re-opens both failures.
+an ordinary package module buys, and it is why the rule is stated rather than
+dropped — any mechanism that reaches a model class by file path re-opens both
+failures.
 
 **An environment variable set after MPI initializes never reaches a
 rank.** Importing `tensorrt_llm` initializes MPI, and OpenMPI hands a
@@ -80,7 +81,9 @@ exports into its own environment must do so *before* that import; one
 that hands a freshly spawned server a prepared environment satisfies this
 by construction. Long-lived ranks under `trtllm-llmapi-launch` receive the
 environment once, at launch, so a value set later reaches the driver and not
-them. `TRTLLM_MODELING_V2` is the variable this matters most for.
+them. It is why target selection is the LLM-API argument `modeling_v2`
+rather than a variable; `TRTLLM_MODELING_V2_VALIDATE` is still a variable and
+is still subject to it.
 
 ### The parallel segment and its knobs
 
@@ -90,8 +93,11 @@ them. `TRTLLM_MODELING_V2` is the variable this matters most for.
 | `tep<N>` | the above plus `moe_expert_parallel_size: N` (`--moe_ep_size N`) |
 | `dep<N>` | the above plus `enable_attention_dp: true` (`--enable_attention_dp`) |
 
-Routing derives the target *from* these, and the target then asserts every one
-of them against the mapping the engine actually built.
+Routing derives the target *from* these: the family's `routing.py` matches the
+segment against the mapping the engine actually built (`world_size`,
+`moe_ep_size`, `moe_tp_size`, `enable_attention_dp`) and raises `NoTarget`
+naming them when it does not fit. The target itself carries no configuration
+asserts.
 
 `tep4` and `dep4` were both observed building a serving engine and
 generating correct greedy text from the stock DeepSeek-V3-Lite NVFP4
@@ -124,8 +130,8 @@ are the four things this section used to list as unobserved.
 **`lm_head` is topology-aware, and that is a load obligation §4/§5 do
 not mention.** At `tp_size = 4` `DecoderModelForCausalLM` builds an
 `LMHead` of `[vocab/tp, hidden]` — vocab-parallel — so the load must
-feed *this rank's contiguous block of vocabulary rows* (override
-`ModelWeights.load`, whose base feeds `lm_head.weight` whole), and the
+feed *this rank's contiguous block of vocabulary rows* (the table's own
+`load` fills `lm_head.weight`, and the exemplars feed it whole), and the
 logits gather stays upstream's. Consequence: `vocab % tp_size == 0` is an
 identity fact for routing, which carries no such criterion today — put it
 in the family's `routing.py`, because the target carries no configuration

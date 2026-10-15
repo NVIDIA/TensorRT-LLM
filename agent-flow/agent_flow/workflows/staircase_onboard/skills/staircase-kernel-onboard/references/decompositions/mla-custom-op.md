@@ -74,7 +74,7 @@ Phase-specific:
 | attention core, all phases (5 certified configurations) | `attention/thop_attention` |
 
 <!-- PORT: verify — three entries named in this section are not in the in-tree
-     catalog index: `attention/create_mla_outputs`,
+     catalog: `attention/create_mla_outputs`,
      `attention/load_chunked_kv_cache_for_mla` and
      `attention/merge_chunked_attention_for_mla` (the chunked-prefill trio).
      The rows are kept because this document is the record of the completed

@@ -55,8 +55,7 @@ exactly what it is for.
 ## Gates
 
 boot with the feature's arguments → accuracy, both with
-`TRTLLM_MODELING_V2=require` exported before the ranks start. **No third
-gate.**
+`modeling_v2=require`. **No third gate.**
 
 Accuracy sees this feature: each rank holds a fraction of the expert table, so
 a binding that does not deliver the remote experts cannot silently produce the

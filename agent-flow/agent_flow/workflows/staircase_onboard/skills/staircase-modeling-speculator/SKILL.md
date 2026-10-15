@@ -49,8 +49,8 @@ and needs nothing registered.
 
 Concretely, per `references/runtime-boundary.md`: the shell gains the binding
 the runtime looks for, the core gains the draft container, **each of the two
-targets gains its own `mtp_forward`** with the draft ops bound in its own
-`__init__`, and the draft layer's `forward` is one routing line —
+targets gains its own `mtp_forward`** making the draft ops' calls with every
+argument at the call site, and the draft layer's `forward` is one routing line —
 `core._select_target(md).mtp_forward(...)`, read per call. The no-feature
 path must stay **bit-identical** — when the feature is off, both targets'
 `forward` are exactly what the recorded gate measured.
@@ -88,8 +88,8 @@ not a bigger number.
 ## Gates
 
 boot with the variant's arguments → accuracy → **acceptance**, all three with
-`TRTLLM_MODELING_V2=require` exported before the ranks start — except the
-stock leg of the third, which asks for `off` on purpose.
+`modeling_v2=require` — except the stock leg of the third, which asks for
+`off` on purpose.
 
 The third one is not optional and not a performance measurement.
 `references/acceptance-gate.md` has the protocol; the reason is this:
@@ -106,7 +106,7 @@ the case that looks like success.
 
 The reference is the same checkpoint under **stock in-tree modeling** at the
 same workload and the same `speculative_config` — that is
-`TRTLLM_MODELING_V2=off` against `=require`, **one variable rather than two
+`modeling_v2=off` against `=require`, **one variable rather than two
 harnesses**.
 
 Accuracy still runs, and it must be compared against an identity run **in the

@@ -11,7 +11,7 @@ One entry = one op invocation at the Python level.
 
 - The wrapper body makes exactly one kernel-launching call into trtllm — or, at sourcing tier 3, into FlashInfer's public API. Fusion is legal only inside that call: a fused kernel invoked once (silu-and-mul, allreduce+residual+rmsnorm) is one compliant entry.
 - Python-level composition is forbidden. A wrapper that chains split → norm → matmul, or bundles qkv-proj + RoPE + SDPA + o-proj into one function, is not an entry — it hides exactly the bugs the catalog exists to expose.
-- If inspection shows the requested op cannot be wrapped as one such call — its body is Python-level composition — it is a macro. Onboard nothing (no entry files, no index change); produce a decomposition report at `references/decompositions/<op>.md` instead, following the checklist in `references/decomposition.md`, "Writing a decomposition report for a new macro". Never onboard two entries in one run. <!-- PORT: verify — report location; see the marker in this skill's SKILL.md, "The macro path". -->
+- If inspection shows the requested op cannot be wrapped as one such call — its body is Python-level composition — it is a macro. Onboard nothing (no entry files); produce a decomposition report at `references/decompositions/<op>.md` instead, following the checklist in `references/decomposition.md`, "Writing a decomposition report for a new macro". Never onboard two entries in one run. <!-- PORT: verify — report location; see the marker in this skill's SKILL.md, "The macro path". -->
 
 Category placement: by compute role, not dtype (an nvfp4 gemm lives in `gemm/`); fused ops by dominant cost (allreduce+norm lives in `comm/`). Categories: `gemm attention moe norm activation quantization comm ssm`, the same set in the shared catalog and in a target's `ops/`. **Native torch calls are not entries**: a target calls torch directly, and there is no `torch/` category. When the honest verdict is that plain torch serves the step, report that verdict and write no entry. If no category fits, stop and report.
 
@@ -26,42 +26,45 @@ Two homes, decided by who calls the op:
 
 Your dispatch prompt's target says which: `ops/<category>/<name>` is the
 run's own target's `ops/`, anything else is the shared catalog. A target
-imports its own `ops/` relatively (`from .ops.moe.<name> import <Class>`) and
-the shared catalog absolutely; it never imports another target's `ops/`. An op
-a second target needs is **promoted**: the entry and its test move to the
-shared homes in one commit, and the cells are driven again on this machine.
+imports its own `ops/` relatively (`from .ops.moe.<name> import <name>`, the
+module-level instance) and the shared catalog absolutely; it never imports
+another target's `ops/`. An op a second target needs is **promoted**: the
+entry and its test move to the shared homes in one commit, and the cells are
+driven again on this machine.
 Each new `ops/<category>/` directory carries an `__init__.py` with the
 copyright header, like its siblings.
 
 ## The pieces
 
-An entry is **one Python file and its test**. There is no contract `.md`: the
-`OpWrapper` subclass in the wrapper file *is* the contract, in executable form
+An entry is **one Python file and its test**. There is no prose contract beside
+it and no index row: the `OpWrapper` subclass in the wrapper file *is* the
+contract, in executable form
 (`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/_op.py`):
 
 | member | what it states |
 |---|---|
-| `raw_call(...)` | the op call a target makes — exactly one kernel-launching call, every argument explicit |
+| `__call__(...)` | the op call a target makes — exactly one kernel-launching call, every argument explicit, nothing read off `self` |
 | `reference(...)` | what the op is supposed to compute, in plain torch, accumulating in fp32 |
 | `is_valid(...)` | raises on an input the op **accepts and answers wrongly**; never called on the way to the kernel |
-| `compare(out, ref)` | how close the two must be, and why (default: torch's dtype-aware band) |
 | `CELLS` | the input configurations the entry is certified over, one `Cell(why=..., spec=...)` each |
 | `ARCHS` | the architectures those cells were driven on (`frozenset({Arch.SM_103})`) |
 | `note` | what is left, and nothing that could have been one of the above |
 
 The test is what keeps every member true: it drives each cell through
-`raw_call` and `reference` and gates them with `compare`, so a claim that stops
-holding stops the build. Whoever calls the op reads the class and nothing
-else — no trtllm source — so every fact needed to call it correctly is in it.
+`__call__` and `reference` and gates one against the other within a band the
+test states and derives, so a claim that stops holding stops the build. How
+close the two have to be is the test's business, not the entry's. Whoever
+calls the op reads the class and nothing else — no trtllm source — so every
+fact needed to call it correctly is in it.
 When mentioning sibling or variant ops, state that they exist — never whether
-they are onboarded; catalog membership is `index.yaml`'s fact alone.
+they are onboarded; catalog membership is the tree's fact alone — an entry
+is in the catalog when its file is.
 
 ### `<name>.py` — the entry
 
 Follow the shape of the existing entries (`catalog/norm/flashinfer_rmsnorm.py`
-is the smallest): SPDX header, a module docstring, the class, and a
-module-level instance only if a target needs a shared one (targets normally
-instantiate their own — instances are stateful).
+is the smallest): SPDX header, a module docstring, the class, and the one
+module-level instance targets import (instances carry no state).
 
 ```python
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -81,19 +84,21 @@ class <Name>(OpWrapper):
     Metadata consumed, preconditions, arch quirks, and the hard limits.
     """
 
-    def raw_call(self, x: torch.Tensor, ...) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, ...) -> torch.Tensor:
         return torch.ops.trtllm.<op>(x, ...)
 
     def reference(self, x: torch.Tensor, ...) -> torch.Tensor:
         ...
+
+
+<name> = <Name>()
 ```
 
-- **`raw_call`: exactly one op invocation — a `torch.ops.trtllm.*` op, or at
+- **`__call__`: exactly one op invocation — a `torch.ops.trtllm.*` op, or at
   tier 3 one FlashInfer public callable — and it reads nothing off `self`.** Glue that launches no kernel is acceptable; tensor math is not. A
   gate in `tests/unittest/_torch/modeling_v2/test_modeling_v2_claims.py`
-  fails on any `self.` read inside it: the binding layer (`bind_const`,
-  `bind_layered`) merges bound values in `__call__` before `raw_call` runs, so
-  `CELLS` keeps covering the whole input space whatever a target binds.
+  fails on any `self.` read inside it: a target passes every argument at the
+  call site, every call, so `CELLS` covers the entry's whole input space.
 - **Return what you write.** `out = op(inp)`: an out-variant or in-place op
   still returns the tensor it filled, so a call site reads its outputs from
   the call rather than from an argument it passed in.
@@ -101,34 +106,34 @@ class <Name>(OpWrapper):
   names. A positional list that drifts silently is how an op-schema change
   turns into a wrong answer; a mirrored signature fails loudly instead.
 - `reference` takes the arguments a cell supplies, by the same names as
-  `raw_call`; it may narrow to the ones the computation needs (say which are
+  `__call__`; it may narrow to the ones the computation needs (say which are
   ignored in its docstring). It never calls the op, the entry, or another
   entry. A collective's reference takes the group's inputs in rank order and
   says so.
-- `is_valid`, when overridden, accepts every argument `raw_call` accepts —
+- `is_valid`, when overridden, accepts every argument `__call__` accepts —
   mirror the signature, or carry a `**kwargs` absorber; the claims test checks
   it. Guard only what is pure metadata (shape, stride, dtype, device) **and**
   was observed on this machine to fail silently. If the op validates its own
   inputs loudly, restating that only swaps its error for a worse one.
-- `compare` is overridden only with a derivation: name the dtype and the
-  accumulation order a wider band accounts for, and what was measured.
-  `assert_within_ulp` in `_op.py` is the gate for a reference that differs
-  only in accumulation order.
+- The band is not a member of the entry: it lives in the test, with its
+  derivation — name the dtype and the accumulation order it accounts for, and
+  what was measured. `assert_within_ulp` in
+  `tests/unittest/_torch/modeling_v2/_validating.py` is the gate for a
+  reference that differs only in accumulation order.
 - The default vocabulary is `torch.ops.trtllm.*`. **FlashInfer's public API
   is the second**, and needs no authorization: `flashinfer-python` is pinned in
   the engine's `requirements.txt`, and most of its kernels have no trtllm op.
   Call it as `flashinfer.<module>.<name>(...)` with a module-scope
   `import flashinfer` (the catalog package imports nothing, so only a target
-  that uses the entry pays for it), name that full path in the class docstring
-  and the index `impl` field, and pass `backend=` explicitly when the callable
-  takes one: `auto` resolves per architecture, so the cells certify the backend
+  that uses the entry pays for it), name that full path in the class
+  docstring, and pass `backend=` explicitly when the callable takes one: `auto` resolves per architecture, so the cells certify the backend
   that ran, and the `note` says which. FlashInfer JIT-compiles many kernels on
   the first call; the test's first call includes it. When a trtllm op wraps the
   same kernel, wrap the op instead — it carries the engine's PDL and workspace
   handling.
 - Wrapping any other Python callable (a pybind binding, say) is allowed only
   when the run's request explicitly authorizes it; record the import path in
-  the class docstring and the index `impl` field.
+  the class docstring.
 - If the device's architecture is not yet an `Arch` member, add it to
   `catalog/_op.py` in a commit of its own containing only that line — every
   entry's `ARCHS` is checked against that enum — and say so in your report.
@@ -158,20 +163,22 @@ the CI selector matches. A model-local entry's test sits in the tests tree's
 mirror of its target, one directory per category.
 
 ```python
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.<category>.<name> import <Name>
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.<category>.<name> import <name> as op
 
 # ".." for a shared entry's test; "../../../.." under models/<family>/<target>/<category>/
 __extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
-op = <Name>()
+
+def _compare(out, ref):
+    """The band, and its derivation: which dtype, which accumulation order, what was measured."""
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     args = _build(cell.spec, seed=...)
-    op.compare(op(*args), op.reference(*args))
+    _compare(op(*args), op.reference(*args))
 ```
 
 - **Parametrize off `op.CELLS`.** A cell list nothing executes reads as
@@ -180,7 +187,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811
   entry's.
 - **Arm `certifying`** (`tests/unittest/_torch/modeling_v2/_validating.py`) in
   every cell test: it interposes `is_valid` and refuses to finish unless the
-  entry's own `raw_call`, `reference` and `compare` ran. A test that compares
+  entry's own `__call__` and `reference` ran. A test that compares
   against a local copy of the reference certifies nothing the entry claims.
 - **Guard tests** use `with validating(op): ...` and `pytest.raises` for each
   input `is_valid` exists to refuse — after first showing, unguarded, that the
@@ -192,7 +199,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811
 - Cover decode-like (few tokens) and prefill-like (many tokens) shapes where
   relevant. Seed all randomness.
 - **Size persistent state — KV pages, recurrent and conv pools, any paged table — from the CACHE MANAGER, never from your batch.** These are two unrelated numbers. The batch is what the executor hands you; a pool's slot count is what the cache manager's capacity planning allocated, and the runtime picks it without reference to how many sequences are in flight. A test where `pool_slots == batch_size` is the one arrangement the runtime never produces, and it is worse than under-coverage: when the two are equal, "indexes the slot it was told to" and "indexes the row it happens to be" are the *same number*, so the test cannot see a slot-addressing defect at all. Take the width from a runtime-value dump if you have one and say so in the cell's `why`; otherwise take one plainly too large for the batch and record that you chose it. **Make the slot count a `spec` axis** — it is a cell dimension, not a free one. One run certified nine entries this way, each sized to its own batch by a different smith over two days, and an audit found all nine outside the engine's real width of 461 at once.
-- A band wider than `compare`'s default is the entry's `compare`, with its derivation. Where the loosening is more than marginal — a chain whose intermediate is requantized, say — a justification in prose is not enough: **measure the discrimination.** Run the wrong variants too (swapped operand halves, un-swizzled scales, an omitted permutation) and record how far outside the loosened gate each lands. A gate 3x above the correct result and 25-500x below every wrong one is defensible; the same gate with no wrong-variant numbers is a guess.
+- A band wider than torch's dtype-aware default is the test's own, with its derivation. Where the loosening is more than marginal — a chain whose intermediate is requantized, say — a justification in prose is not enough: **measure the discrimination.** Run the wrong variants too (swapped operand halves, un-swizzled scales, an omitted permutation) and record how far outside the loosened gate each lands. A gate 3x above the correct result and 25-500x below every wrong one is defensible; the same gate with no wrong-variant numbers is a guess.
 
 **When the surface you are certifying neighbours a known intermittent defect, prove the harness can see that defect before reporting a clean result.** Discrimination above answers "is my gate too loose"; this answers the different question "is my harness blind", and a clean sweep from a blind harness is worth nothing. Replay the documented arming sequence for the known defect in the same processes, confirm it fires, and only then report that the certified path ran through that state correctly. One run certified a workspace-backed collective this way — the neighbouring fused variant was measured wrong in 4 of 6 fresh processes by the same harness, and every call on the certified path that ran after it fired was still bitwise correct. Without the control, "no mismatches" would have been indistinguishable from "not looking".
 
@@ -234,21 +241,3 @@ then, the run you watched is the only evidence, and it is valid only if it
 test, which sit in two trees. Check it mechanically against the files' mtimes,
 not by recollection. A write to either after the run makes it stale; never add
 to `ARCHS` without rerunning the test.
-
-## Index fragment
-
-Only a shared catalog entry has one; `index.yaml` lists the shared vocabulary,
-and a target's `ops/` entries are found by its imports. Write the row as its
-own file,
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.d/<category>/<name>.yaml`,
-and commit it with the entry:
-
-```yaml
-path: norm/rms_norm.py
-impl: torch.ops.trtllm.<op>
-summary: "One-line compute-role summary"
-```
-
-`catalog/index.yaml` is generated from these fragments by the orchestrator and
-must not be edited by hand. When several smiths run at once, each commits only
-its own fragment, so no commit carries another entry's row.

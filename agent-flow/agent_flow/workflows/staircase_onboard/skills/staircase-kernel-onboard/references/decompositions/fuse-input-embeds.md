@@ -239,7 +239,7 @@ a short source does not raise this message.
 ## 5. Certification status
 
 **Nothing here is certified.** No entry files were written, no test file, no
-`index.yaml` row, no receipt. The launch counts, the bitwise equalities and the
+receipt. The launch counts, the bitwise equalities and the
 quoted `ValueError` above are observations from two probe runs on sm_103; they
 are evidence for the decomposition, not certification of any constituent.
 

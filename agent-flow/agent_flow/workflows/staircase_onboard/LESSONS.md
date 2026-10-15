@@ -355,7 +355,8 @@ verbatim error text, use [TROUBLESHOOTING.md](TROUBLESHOOTING.md) instead.
     under a lock and verifies the file list.
   - `--overlap-units` runs the next unit's assembler in its own worktree, and
     adopts the result only if it rebases cleanly.
-- **Open.** Index fragments per entry (plan 3.4).
+  - The catalog is its entry files: modeling_v2 keeps no catalog index, so a
+    smith's commit is one entry and its test, and no file two smiths share.
 
 ### 30. Commits meet the target repository's policy before the first one
 - **Symptom.** Dozens of unsigned commits found at delivery. A re-sign under
@@ -453,4 +454,3 @@ verbatim error text, use [TROUBLESHOOTING.md](TROUBLESHOOTING.md) instead.
 - **Prevented by.** `campaign.Campaign._stack`: an `eval-<slug>` worktree is
   the best tree plus the candidate's commits; a keep that moves the best
   tree re-stacks and re-measures the others before their verdict.
-

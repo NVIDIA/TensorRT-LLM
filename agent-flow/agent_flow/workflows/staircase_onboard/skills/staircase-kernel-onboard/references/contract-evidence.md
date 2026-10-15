@@ -1,7 +1,7 @@
 # Contract evidence — what makes a sentence in an entry defensible
 
-An entry's contract is its `OpWrapper` class: `reference`, `is_valid`,
-`compare` and `CELLS` are executable and the test keeps them true; the prose
+An entry's contract is its `OpWrapper` class: `__call__`, `reference`,
+`is_valid` and `CELLS` are executable and the test keeps them true; the prose
 around them — the class docstring, each cell's `why`, the `note` — is checked
 by nothing but you. Whoever calls the op reads the class and nothing else, so
 a sentence that is *almost* true is worse than a missing one — the caller acts

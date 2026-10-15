@@ -56,7 +56,7 @@ that carried draft tokens:
 `tests/integration/defs/accuracy/references/acceptance_length.yaml`.
 
 **The two legs are one case parametrized over the mode.** The whole comparison
-is `TRTLLM_MODELING_V2=require` against `=off` on the same checkpoint, same
+is `modeling_v2=require` against `=off` on the same checkpoint, same
 workload, same `speculative_config` — one variable, not two harnesses. Because
 a multi-rank job's mode is fixed when its ranks start, each leg asserts the
 environment it was given rather than choosing one, and skips otherwise.
@@ -123,7 +123,7 @@ stock in-tree modeling, at the same workload, with the same
 that get dropped:
 
 1. same checkpoint
-2. stock TensorRT-LLM's own modeling, not ours — i.e. `TRTLLM_MODELING_V2=off`
+2. stock TensorRT-LLM's own modeling, not ours — i.e. `modeling_v2=off`
 3. **same workload** — both legs are the same case running the same evaluation
    task with the same protocol, so both systems see identical requests. Do not
    compare across workloads

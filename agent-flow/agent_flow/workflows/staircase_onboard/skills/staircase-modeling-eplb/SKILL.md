@@ -67,8 +67,8 @@ imply.
 
 ## Gates
 
-boot with each variant → accuracy, both with `TRTLLM_MODELING_V2=require`
-exported before the ranks start. **No third gate.**
+boot with each variant → accuracy, both with `modeling_v2=require`.
+**No third gate.**
 
 Accuracy is not blind here: a wrong slot mapping routes tokens to the wrong
 experts and the score moves. The failure this feature can hide — a balancer

@@ -150,10 +150,9 @@ class ModelingV2<Checkpoint><Arch><Par>(DecoderModelForCausalLM[<Family><Par>Mod
             resource_manager=kw.get("resource_manager"))
 ```
 
-The class name is the synthetic one `routing.py` returns for this
-(checkpoint, GPU architecture, parallel topology) triple — no checkpoint
-declares it, and `test_modeling_v2_claims.py` asserts it agrees with the
-target's path.
+The class is the one `routing.py`'s `route` returns for this (checkpoint, GPU
+architecture, parallel topology) triple; its name carries the triple, and
+`test_modeling_v2_claims.py` asserts it agrees with the target's path.
 
 `get_spec_worker` is imported from `tensorrt_llm._torch.speculative` — the
 **runtime**, the part of the stack this project reuses, not modeling.
@@ -316,12 +315,11 @@ call is wrong on the rest. This is not the trunk's situation — the trunk
 routes and projects `step_args` once per forward because there is only one
 step in it. The layer therefore routes per call: its `forward` is
 `core._select_target(md).mtp_forward(...)`, and each target carries its own
-`mtp_forward` with the draft ops bound in its own `__init__` (on the
-deepseek exemplar, decode's binds 23 of prefill's 27 — the context attention
-instance, the kv_b projection and the two paged-KV helpers serve a path its
-routing guarantees never runs). One engine step's draft calls can cross from
-prefill to decode, and each call asks again. The layer runs inside the
-engine forward, so it never calls `advance_step_generation()` itself.
+`mtp_forward`, making only the calls its phase needs (on the deepseek
+exemplar, decode's never makes the context attention call, the kv_b
+projection or the two paged-KV helper calls — they serve a path its routing
+guarantees never runs). One engine step's draft calls can cross from
+prefill to decode, and each call asks again.
 
 The read is cheap and sync-free. `on_update()` recomputes `_num_ctx_tokens`,
 `_num_generations` and `_num_tokens` from `_seq_lens`, which is a **pinned
@@ -483,7 +481,7 @@ transposed concatenation, a norm applied to the wrong operand) lands
 somewhere above 1.0 and well below the reference, which no other measurement
 distinguishes from "this model is just hard to draft for". The reference is
 the same checkpoint under stock in-tree modeling at the same load and the
-same `speculative_config` — the same job with `TRTLLM_MODELING_V2=off`
+same `speculative_config` — the same job with `modeling_v2=off`
 instead of `=require`; acceptance is a property of the model, so a
 reference forced onto a different `max_num_tokens` / `max_seq_len` to boot
 is still a valid comparison.

@@ -40,9 +40,9 @@ category is where the candidates are.
 
 ### 2. Vocabulary mapping
 
-Map every step onto
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` (the shared
-vocabulary) and the entries themselves: an entry is an `OpWrapper` class whose
+Map every step onto the shared vocabulary — the entry files under
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/`, one per entry, with
+no index beside them: an entry is an `OpWrapper` class whose
 `CELLS`, `ARCHS` and `note` are what it certifies
 (`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/_op.py`). The surface
 survey also lists ops other targets keep in their own `ops/` — certified for
@@ -73,7 +73,7 @@ dependency of the engine, and the tree wraps only a handful of its kernels as
 trtllm ops; the rest — fp4 GEMMs, fused MoE runners, sampling, rope variants,
 paged-KV helpers — have no `torch.ops.trtllm` name, so the op inventory
 cannot see them. A step one of them computes is a **GAP at tier 3**: the entry's
-`raw_call` calls `flashinfer.<module>.<name>` directly, and the row names that
+`__call__` calls `flashinfer.<module>.<name>` directly, and the row names that
 path as its `candidate`. It is a wrapper and its cells, not an implementation,
 so it comes before native torch (tier 4) and Triton (tier 5). Prefer a trtllm op
 when one wraps the same kernel; the survey says which callables the engine

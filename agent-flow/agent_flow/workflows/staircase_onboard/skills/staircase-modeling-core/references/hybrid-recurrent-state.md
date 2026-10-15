@@ -21,14 +21,14 @@ the boot gate still passes, and the recurrent layers have no state.
      field the hybrid predicate actually tests was not re-confirmed here. What
      is confirmed is that it reads the published config. -->
 
-A target can neither change nor restate what that predicate sees. The synthetic
-class name routing returns is local to `_resolve_class` —
-`pretrained_config.architectures` is not mutated — so registration has no
-influence on what the runtime allocates, and there is no stub `config.json` to
-patch. If a checkpoint the target is meant to serve does not trip the predicate,
+A target can neither change nor restate what that predicate sees. Routing
+returns the target class itself and the loader carries it on
+`ModelConfig.modeling_v2_target` — `pretrained_config.architectures` is not
+mutated — so nothing a target names has any influence on what the runtime
+allocates, and there is no stub `config.json` to patch. If a checkpoint the target is meant to serve does not trip the predicate,
 that is a fact about the checkpoint and the runtime: **report it as a symptom**,
 and do not try to route around it from modeling code. `runtime-interface.md` §2
-has the registry precedence facts and the reasoning.
+has the resolution path and the reasoning.
 
 ## A nested `text_config` is not reliably mirrored
 

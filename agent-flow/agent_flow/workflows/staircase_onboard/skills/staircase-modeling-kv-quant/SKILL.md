@@ -75,7 +75,7 @@ kernel. So:
 
 ## Gates
 
-boot → accuracy → **kv_quant witness**, all under `TRTLLM_MODELING_V2=require`.
+boot → accuracy → **kv_quant witness**, all under `modeling_v2=require`.
 
 **The counter.** When `TRTLLM_MODELING_V2_WITNESS=1` is set, the target prints,
 once per rank after its KV pools are allocated:

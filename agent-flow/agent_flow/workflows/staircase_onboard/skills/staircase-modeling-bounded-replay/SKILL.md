@@ -151,7 +151,7 @@ replay row selection is data-dependent; keep it out of any capture.
 
 ## Gates
 
-boot → accuracy → **replay witness**, all under `TRTLLM_MODELING_V2=require`.
+boot → accuracy → **replay witness**, all under `modeling_v2=require`.
 
 **The switch.** Each feature is turned off by an environment variable the
 target reads at construction — for example

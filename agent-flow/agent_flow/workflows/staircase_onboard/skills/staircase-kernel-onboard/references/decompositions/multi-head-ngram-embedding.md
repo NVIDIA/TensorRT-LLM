@@ -314,6 +314,6 @@ rather than in that entry.
   head order the hash step fixes (`[2-gram block | 3-gram block]`, 8 heads
   each). It has **not** been checked against the trained `key_proj` /
   `value_proj` weights; that is an assembly-time comparison against the
-  `TRTLLM_MODELING_V2=off` oracle, not something either constituent can settle.
+  `modeling_v2=off` oracle, not something either constituent can settle.
 - **A second PLE layer.** `ple_layer_ids` is `[2]`; one layer, one table, one
   scale.

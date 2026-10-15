@@ -82,7 +82,7 @@ value) are restructured onto the GPU or kept outside the captured region.
 
 The right-hand column names torch shapes, not licenses: in a target
 forward the actual call must be a catalog entry. A replacement with no
-entry in
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` is a
-vocabulary gap — never paste raw torch math
+entry under
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/` (or the target's own
+`ops/`) is a vocabulary gap — never paste raw torch math
 into the forward to work around a sync.

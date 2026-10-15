@@ -272,7 +272,7 @@ it needs a reference to be read against:
 * **at the reference**: the layer computes what the checkpoint says.
 
 The reference is the same checkpoint under stock in-tree modeling — the same
-job under `TRTLLM_MODELING_V2=off` instead of `=require` — at the same load
+job under `modeling_v2=off` instead of `=require` — at the same load
 and the same speculative configuration. Acceptance is a property of the
 model, so a reference forced onto different memory knobs to boot is still
 comparable.

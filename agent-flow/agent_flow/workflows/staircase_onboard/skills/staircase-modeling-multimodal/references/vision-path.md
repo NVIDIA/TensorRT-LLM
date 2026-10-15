@@ -152,8 +152,8 @@ Two details of that path are protocol, not modelling, and they move the score:
 
 **A second module tree.** The vision tower plus the projector that maps its
 output into the language model's hidden size. Declared beside the language
-model under the same weight-table rule: `W` rows in the same `ModelWeights`
-subclass (`layers=None` or a `layers` callable over the tower's own blocks,
+model under the same weight-table rule: `W` rows in the same table's
+`WEIGHTS` (`layers=None` or a `layers` callable over the tower's own blocks,
 with its own key prefix), `torch.empty`, HF storage layout, every axis read
 from the config or pinned by routing.
 

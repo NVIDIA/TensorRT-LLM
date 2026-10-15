@@ -675,7 +675,7 @@ accuracy:
 
 ### A gate measured under `auto` is not measuring modeling_v2
 
-Under `TRTLLM_MODELING_V2=auto`, a configuration that misses a target's routing
+Under `modeling_v2=auto`, a configuration that misses a target's routing
 criteria silently gets the built-in implementation — and the number reads as
 modeling_v2's. Anything you will attribute to modeling_v2 runs under
 `require`, which raises instead of falling back.

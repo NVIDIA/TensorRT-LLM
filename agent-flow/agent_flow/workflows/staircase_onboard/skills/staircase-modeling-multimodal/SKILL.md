@@ -60,8 +60,8 @@ the per-engine feature constant so the text path stays bit-identical.
 
 ## Gates
 
-boot → accuracy on **MMMU-Pro**, both with `TRTLLM_MODELING_V2=require`
-exported before the ranks start. **No third gate.**
+boot → accuracy on **MMMU-Pro**, both with `modeling_v2=require`.
+**No third gate.**
 
 This feature is not blind to the first two: get the vision path wrong and the
 output is wrong. There is no distribution-preserving construction hiding the

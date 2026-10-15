@@ -153,8 +153,8 @@ place.
 Each of these is one Triton kernel launch plus allocation. Wrapping a
 non-`torch.ops.trtllm` callable is an **approved-exception** shape per
 `entry-spec.md` — it needs the run's explicit authorization, and the import
-path must be recorded in the wrapper docstring, the contract, and the index
-`impl` field (the precedent is `attention/thop_attention`).
+path must be recorded in the wrapper's class docstring (the precedent is
+`attention/thop_attention`).
 
 | role | symbol | proposed category |
 | --- | --- | --- |
@@ -222,7 +222,7 @@ Its atomic interior is `flashinfer.chunk_gated_delta_rule` — neither a
 `torch.ops.trtllm` op (probed absent, §3) nor a torch callable, but a function
 of **FlashInfer**, a pinned dependency of the engine. That is the sourcing
 ladder's tier 3 (`../decomposition.md`, "FlashInfer's public API"): the child
-is an `ssm` entry whose `raw_call` calls `flashinfer.chunk_gated_delta_rule`
+is an `ssm` entry whose `__call__` calls `flashinfer.chunk_gated_delta_rule`
 directly, and it needs no ruling. What is reachable, stated plainly:
 
 - `flashinfer.chunk_gated_delta_rule` — one call, explicit state, no registry.

@@ -19,7 +19,8 @@ The entry is the `OpWrapper` subclass in its `.py` — in the shared catalog
 (`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.py`)
 or in a target's own `ops/<category>/<name>.py` — and its test is at the
 matching path in the tests tree (see the entry spec's table). There is no
-contract file and no receipt frontmatter to read or write.
+prose contract beside it, no index row and no receipt frontmatter to read or
+write.
 
 ## Two outcomes
 
@@ -44,10 +45,10 @@ on every commit. All of that costs a file read and no GPU.
 2. **Add the cells to the entry's `CELLS`**, one `Cell(why=..., spec=...)` per
    distinct thing covered, and extend the test's `_build` only as far as the
    new `spec` keys need. The test stays parametrized off `op.CELLS`, arms
-   `certifying`, and compares through the entry's own `reference` and
-   `compare` — never a local reference, never another entry. Randomness is
-   seeded; any band wider than `compare`'s default is the entry's `compare`,
-   with its derivation
+   `certifying`, and gates `__call__` against the entry's own `reference`
+   within the band the test states — never a local reference, never another
+   entry. Randomness is seeded; any band wider than torch's dtype-aware
+   default is the test's own, with its derivation
 3. **Move what the `note` said was uncertified for this surface** into cells,
    from observed runs only, and rewrite the `note` to match. This is the part
    that gets skipped and it is the part the next target reads
@@ -65,11 +66,11 @@ git add tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.
 git commit -m "feat(catalog): certify <name> at <surface>"
 ```
 
-A verify does not touch `catalog/index.yaml`, which is generated. If a shared
-entry's one-line summary has to change, edit and commit its fragment,
-`catalog/index.d/<category>/<name>.yaml`.
+A verify touches nothing but the entry and its test: the catalog is its entry
+files, with no index to keep in step. If a shared entry's summary has to
+change, it is the class docstring.
 
-`raw_call` usually stays untouched. If it does not — if covering this surface
+`__call__`'s signature usually stays untouched. If it does not — if covering this surface
 needs a signature change — that is worth saying loudly in the report, because
 every existing caller is affected; and if the entry sits in another target's
 `ops/`, a verify for this run is a **promotion** (entry and test move to the

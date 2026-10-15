@@ -100,9 +100,10 @@ from TensorRT-LLM's own accuracy references, and the verdict is
 | **scheduler-equivalence** | every unit, every member | the overlap scheduler on vs off, greedy at batch 1, token-identical |
 | **launch** | last in each unit | a smoke through the unit's own deployment entry (`trtllm-serve`, or its disaggregated launcher) over HTTP |
 
-All of them run with **`TRTLLM_MODELING_V2=require`**. Under `auto` a
-configuration that misses a target's routing criteria silently gets the
-built-in implementation, and a number measured that way reads as
+All of them run with **`modeling_v2=require`**, the LLM-API argument (the
+gates export `TRTLLM_MODELING_V2`, and the harness hands it to the LLM API).
+Under `auto` a configuration that misses a target's routing criteria silently
+gets the built-in implementation, and a number measured that way reads as
 modeling_v2's — the single most expensive mistake available in this package.
 
 The **acceptance** gate exists because the first two are blind to speculative
@@ -307,13 +308,11 @@ recorded. A harness run outside the workflow records its own verdict with
   - An external driver must write the decision path its request names,
     verbatim.
   - Journal ordinals are claimed atomically.
-- **The catalog index is generated.**
-  - Smiths write a fragment, `catalog/index.d/<category>/<name>.yaml`.
-  - The orchestrator regenerates `catalog/index.yaml` from the fragments in
-    `HEAD` and commits it on its own.
-  - The first fragment migrates an old-style index losslessly.
-    `python -m agent_flow.workflows.staircase_onboard.catalog_index {migrate,generate,check} --repo R` does the same by
-    hand.
+- **The catalog is its entry files.**
+  - A smith commits one entry file and its test, and nothing else; there is
+    no index to write or regenerate.
+  - The survey lists the shared entries from `catalog/<category>/*.py`
+    themselves, and a target's own ops from its `ops/`.
 
 ## The six roles
 
@@ -478,7 +477,6 @@ Subcommands and tools that are not a run:
 | `python -m agent_flow.workflows.staircase_onboard.report <ws> [--final-report] [--check DOC...]` | regenerate the reports, or check documents against the ledger |
 | `python -m agent_flow.workflows.staircase_onboard.freshness {status,check-merge} <ws> --repo R` | stale verdicts and the re-run queue; whether a tree is the one regressed |
 | `python -m agent_flow.workflows.staircase_onboard.ledger record <ws> ...` | record a verdict measured outside the workflow |
-| `python -m agent_flow.workflows.staircase_onboard.catalog_index {migrate,generate,check} --repo R` | the catalog index from its per-entry fragments |
 | `python -m agent_flow.workflows.staircase_onboard.smith_brief --workspace W <request>` | one smith's call-site brief, by hand |
 
 ### `--overlap-units`
@@ -807,8 +805,6 @@ keep by reading the real checkout, and each reads only what main has:
   and against this checkout's quickstart once that has the arm;
 - `test_speculation_support.py` reads this checkout's quickstart and LLM API
   for the speculators they handle;
-- `test_catalog_index.py` migrates a copy of the real catalog index to
-  fragments without losing a row;
 - `test_build_and_test_doc.py` holds `BUILD_AND_TEST.md` to the repository:
   its paths, build flags and test lists.
 

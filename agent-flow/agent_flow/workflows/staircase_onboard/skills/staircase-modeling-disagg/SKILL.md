@@ -84,7 +84,7 @@ what a minutes-scale gate is for.
 ## Gates
 
 boot (aggregated) → accuracy (aggregated) → **equivalence witness
-(disaggregated)**, all under `TRTLLM_MODELING_V2=require`.
+(disaggregated)**, all under `modeling_v2=require`.
 
 The witness is the only measurement that can see the feature, and it is a
 *comparison*, not a smoke test:

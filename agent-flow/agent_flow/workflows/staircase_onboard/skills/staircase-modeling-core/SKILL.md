@@ -19,7 +19,7 @@ Two halves, and most readers need only the first.
 
 | file | read it when |
 |---|---|
-| `runtime-interface.md` | always, before writing — registration, the shell / core / two-target split, binding the entries, weight lifecycle, the weight table, forward duties, fail-fast ladder, serving-time costs |
+| `runtime-interface.md` | always, before writing — resolution, the shell / core / two-target split, calling the entries, weight lifecycle, the weight table, forward duties, fail-fast ladder, serving-time costs |
 | `graph-and-sync.md` | **always, before touching a forward** — what a replayed forward may contain, and which patterns stall the host |
 | `routing-identity.md` | placing a new target, or asking whether some quantity may select one |
 | `step-args.md` | building the attention call's arguments |
@@ -52,8 +52,9 @@ in-tree targets (`gpt_oss/gpt_oss_120b__sm_103__tp1`,
    and on load-time `.t()`/`.to()`, which run at init.
 2. **The engine surface is checked by running it, never declared twice.**
    Each target's `step_args(md)` is the one projection of the attention
-   metadata it consumes, and `Target._check_step_contract` calls it on the
-   first forward under `TRTLLM_MODELING_V2_VALIDATE=1`. A renamed custom op
+   metadata it consumes, and the target's own `_check_step_contract` calls it
+   on the first forward when `_router_index.step_contract_enabled()` says so
+   (`TRTLLM_MODELING_V2_VALIDATE=1`). A renamed custom op
    fails at its call. Do not add `REQUIRED_TRTLLM_OPS`, a `_STEP_FIELDS`
    tuple, or any hand-kept list of names beside the code that reads them —
    it is only something to forget to update.
@@ -70,10 +71,11 @@ in-tree targets (`gpt_oss/gpt_oss_120b__sm_103__tp1`,
    runtime reads from somewhere other than the config the target read. Those
    fail loudly at construction and say why; re-validating what the
    fingerprint already pins does not.
-4. **Weights are declared once, in the weight table.** `weights.py`
-   subclasses `ModelWeights` with one `W` row per weight role (shape, source,
-   dtype, transform, layers) and a `dims(core)` that is the only place a
-   derived width or padded size is computed; `MODEL_WEIGHTS` is its instance.
+4. **Weights are declared once, in the weight table.** `weights.py` defines
+   the `W` role class and a table class whose `WEIGHTS: tuple[W, ...]` holds
+   one `W` per weight role (shape, source, dtype, transform, layers), with a
+   `dims(core)` that is the only place a derived width or padded size is
+   computed; `MODEL_WEIGHTS = <Table>()` is its module-level instance.
    The core declares `self.w = MODEL_WEIGHTS.declare(dims)` — a flat
    `nn.ParameterDict`, `torch.empty` only, HF `[out, in]` storage — and the
    shell's `load_weights` calls `MODEL_WEIGHTS.load`. Never write a manifest
@@ -91,27 +93,27 @@ in-tree targets (`gpt_oss/gpt_oss_120b__sm_103__tp1`,
    These are writing rules, not tuning rules: a forward that violates them is
    wrong the first time it is captured.
 7. **The core dispatches; a prefill and a decode target run the step.** The
-   core's `forward` calls `advance_step_generation()` once and hands the step
-   to `self._select_target(md)`: `DecodeTarget` when `phase_of(md)` is
-   `Phase.DECODE` (`num_contexts == 0`), `PrefillTarget` otherwise — a mixed
-   batch is prefill's. Both are built in the core's `post_load_weights`,
-   hold the core by reference, and derive from `Target` directly with their
-   own `__init__`, `step_args` and `forward` — no shared body, base or mixin
-   between them. `DecodeTarget` states `num_contexts=0, num_ctx_tokens=0`
-   and never reads either back. Each forward is flat: one code path,
+   core's `forward` hands the step to `self._select_target(md)`:
+   `DecodeTarget` when `md.num_contexts == 0`, `PrefillTarget` otherwise — a
+   mixed batch is prefill's. Both are built in the core's
+   `post_load_weights`, hold the core by reference, and are plain classes
+   with their own `__init__`, `step_args`, `_check_step_contract` and
+   `forward` — no shared body, base or mixin between them. `DecodeTarget`
+   states `num_contexts=0, num_ctx_tokens=0` and never reads either back. Each forward is flat: one code path,
    branching only on metadata and per-capture constants. A draft step reads
    the phase per draft step, never cached.
-8. **Bind once; call with data.** Each target instantiates its own entries
-   and binds them in its `__init__` against the real weights —
-   `bind_const(...)` for values every layer shares, `bind_layered(i, ...)`
-   per layer, only on the layers that have the operand. What is known only
+8. **Every argument at the call site, every call.** Entries are stateless:
+   a target imports each entry's module-level instance and passes the
+   weights, the per-step batch state and the config scalars explicitly at
+   every call, so the call shows exactly what the kernel receives. What is
+   fixed once weights exist (per-layer weight views, `.t()` GEMM operands,
+   derived constants) the target takes in its `__init__`; what is known only
    per step (the `step_args` projection, windows from `md.max_seq_len`) is
-   rebound once at the top of `forward`, and per-step scratch is allocated
-   there too — never inside the layer loop. Call sites pass the data tensors
-   and `layer=i`, and every call states its outputs:
-   `out = op(in, out=buf, layer=i)`.
-9. **Self-containment.** A target directory imports the catalog, the
-   framework (`_target`, `_weights`, `catalog._op`), engine surface, and its
+   computed once at the top of `forward`, and per-step scratch is allocated
+   there too — never inside the layer loop. Every call states its outputs:
+   `attn_out = thop_attention(q=qkv, output=attn_out, ..., **step)`.
+9. **Self-containment.** A target directory imports the catalog,
+   `_router_index` (for `step_contract_enabled`), engine surface, and its
    own siblings (`.weights`, `.ops.<category>.<name>`) — nothing of another
    target's. An op only this target calls lives in its `ops/` with its GPU
    test at the mirrored path under
@@ -144,9 +146,9 @@ A target directory holds **two files**, plus target-owned ops when it has any:
 
 | product | |
 |---|---|
-| `modeling.py` | the core `<Family><Par>ModelingV2(DecoderModel)`: derived geometry, `self.w = MODEL_WEIGHTS.declare(...)`, `post_load_weights` building both targets, any unconditional first-step derivation, the dispatching `forward` · `PrefillTarget` and `DecodeTarget`, each with its bindings in `__init__`, its `step_args`, its `forward` · the runtime-value dump (below) · the `@register_auto_model(<synthetic name>)` shell `ModelingV2<Ckpt><Sm><Par>(DecoderModelForCausalLM[core, PretrainedConfig])`, whose `load_weights` calls `MODEL_WEIGHTS.load` and whose `post_load_weights` calls `super()` then `self.model.post_load_weights()` |
-| `weights.py` | the weight table: a `ModelWeights` subclass with its `W` rows, `dims`, load-time transforms and `expected_unconsumed` with each reason; `MODEL_WEIGHTS = <Subclass>()` |
-| `ops/<category>/<name>.py` | optional: `OpWrapper` subclasses only this target calls — the same executable contract as a catalog entry (`raw_call`, `reference`, `is_valid`, `compare`, `CELLS`, `ARCHS`) — each with its GPU test in the tests tree |
+| `modeling.py` | the core `<Family><Par>ModelingV2(DecoderModel)`: derived geometry, `self.w = MODEL_WEIGHTS.declare(...)`, `post_load_weights` building both targets, any unconditional first-step derivation, the dispatching `forward` · `PrefillTarget` and `DecodeTarget`, each taking the weight views and constants it reads in `__init__`, with its `step_args`, `_check_step_contract` and `forward` · the runtime-value dump (below) · the causal-LM shell `ModelingV2<Ckpt><Sm><Par>(DecoderModelForCausalLM[core, PretrainedConfig])` that `route` returns, whose `load_weights` calls `MODEL_WEIGHTS.load` and whose `post_load_weights` calls `super()` then `self.model.post_load_weights()` |
+| `weights.py` | the weight table: the `W` role class, a table class with its `WEIGHTS` rows, `dims`, `declare` / `manifest` / `load`, load-time transforms and `expected_unconsumed` with each reason; `MODEL_WEIGHTS = <Table>()` |
+| `ops/<category>/<name>.py` | optional: one `OpWrapper` subclass per file, only this target calls it, with its module-level instance — the same executable contract as a catalog entry (`__call__`, `reference`, `is_valid`, `CELLS`, `ARCHS`, `note`) — each with its GPU test in the tests tree |
 
 Four products the standalone layout had are gone. Each one's *responsibility*
 moved rather than disappearing, and knowing where is how you avoid recreating
@@ -155,40 +157,41 @@ it:
 | gone | where the responsibility went |
 |---|---|
 | `model_dir/` (stub `config.json` + symlinks) | nowhere — **the checkpoint is read exactly as published**, with no target-owned `config.json`. Nothing about the model is the target's to restate, so nothing can disagree |
-| `smoke.py` | the **boot gate**: `examples/llm-api/quickstart_advanced.py` with the target's topology flags and `TRTLLM_MODELING_V2=require`, run by the orchestrator. You author its keyword cases; you do not author its runner |
+| `smoke.py` | the **boot gate**: `examples/llm-api/quickstart_advanced.py` with the target's topology flags and `modeling_v2=require`, run by the orchestrator. You author its keyword cases; you do not author its runner |
 | `llm_args.yaml` | the topology comes from the **routing decision** and the gate's CLI flags. There is no file for it, which is also why a tuning knob can no longer be smuggled in beside it |
 | `TARGET.md` | **gate records go in the run journal** (workspace-scoped, uncommitted). Identity lives in the target path plus `models/<family>/routing.py` |
 
 And the thing that used to decide which class name a target answered to —
 `@register_auto_model("StaircaseForCausalLM")`, and the whole discussion of
 when a target must register under some other name instead — is **replaced by
-routing**. The checkpoint's own `architectures[0]` stays what it always was;
-`modeling_v2_resolve` rewrites it into a synthetic registry key
-(`ModelingV2GptOss120bSm103Tp1`) that the target's module registers, and the
-rewrite is local to `_resolve_class` — every other runtime branch keyed on the
-architecture string still sees the published name. So a target neither picks
-nor needs to pick that name: `models/<family>/routing.py` does, the class name
-carries the same triple as the path, and `test_modeling_v2_claims.py` asserts
-they agree. Read `references/routing-identity.md` before adding a target or
-proposing a new criterion.
+routing**. The checkpoint's own `architectures[0]` stays what it always was
+and is never rewritten: it selects the family's routing module, whose `route`
+returns the target's class itself (`ModelingV2GptOss120bSm103Tp1`). The loader
+carries that class on `ModelConfig.modeling_v2_target` and
+`AutoModelForCausalLM._resolve_class` builds it without consulting the
+registry, so every other runtime branch keyed on the architecture string still
+sees the published name. A target neither picks nor needs a registered name:
+the class name carries the same triple as the path, and
+`test_modeling_v2_claims.py` asserts they agree. Read
+`references/routing-identity.md` before adding a target or proposing a new
+criterion.
 
-**Registration goes at module scope** in `modeling.py`, which is what importing
-the module does. The routing module's `TARGET_MODULES` entry names that module
-by dotted path, and `modeling_v2_resolve` imports it once the tree has claimed
-the config — nothing else would put the class behind the synthetic key. Above
-world size 1 the engine is built in spawned ranks that import the module
-themselves, and the class travels to them by pickle, which resolves it by
-module name; an ordinary dotted module satisfies that without any help.
+**Nothing registers.** `route` imports the class on the branch that returns
+it (`from .<target>.modeling import ModelingV2<...>`), so a routing module
+that declines never loads modeling code, and that import line is where the
+claims suite reads a family's targets from. Above world size 1 the engine is
+built in spawned ranks whose own model loader resolves the configuration and
+imports the module; an ordinary dotted module satisfies that without any
+help.
 
 ## The runtime-value dump
 
 Each target's `forward` records the **metadata** of every entry call it
 makes — shapes, dtypes, the constants passed — into a set, and the boot
-gate's output carries it out of the run. With bound entries the call site
-holds only the data tensors, so record two things: the call's own arguments
-at the call, and the per-step bindings (the `step_args` projection, any
-per-step `bind_layered`) when they are bound. Construction-time bindings are
-read from the source.
+gate's output carries it out of the run. Every call passes all of its
+arguments at the call site, so record them there; the `step_args` projection,
+which every attention call of the step shares, can be recorded once where it
+is computed.
 
 This exists because of a class of value that nothing else surfaces: the
 shapes the engine **varies at runtime**. Decode batch sizes, page sizes,
@@ -227,9 +230,10 @@ is dispatched only for what is genuinely uncovered.
    unmappable step is a vocabulary gap: report it before creating files.
 2. **Place the target and its routing.** Create
    `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/`,
-   and add the target to that family's `routing.py`: the config-shape
-   fingerprint, the parallel segment, the synthetic class name and its
-   `TARGET_MODULES` entry. A family nothing routes yet also needs one row in
+   and add the target to that family's `routing.py`: a `route` branch on the
+   config-shape fingerprint, SM, parallel topology and speculative config that
+   imports and returns the class, and a `NoTarget` message that states those
+   facts. A family nothing routes yet also needs one row in
    `_router_index.py`. `references/routing-identity.md` is what may decide any
    of this — including every axis the derivation table says the exemplar's
    fingerprint does not pin.
@@ -237,8 +241,8 @@ is dispatched only for what is genuinely uncovered.
    shell)**, plus any target-owned op with its test, and draft the boot
    gate's keyword cases. Keywords stay provisional.
 4. **Inner loop — edit → import dry-run → boot gate, until the gate passes.**
-   The dry-run imports the target module and asserts the class registers under
-   the synthetic name, and that `explain.py` routes this configuration to it.
+   The dry-run imports the target module and asserts that the family's
+   `route` returns this class for this configuration.
    **Do not lint between edits.** The run lints once, at delivery, with the
    repo's `pre-commit`; during iteration spend the turns on the model, not on
    whitespace. **The first engine run doubles as keyword verification** —
@@ -286,8 +290,8 @@ Same file, same invariants, plus:
 - **derivation table**: each axis and what this model required. Flag every axis
   where this target differs from the exemplar you read
 - **vocabulary audit**: each target's call list, each trtllm op mapped to its
-  `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` path or
-  its `<target>/ops/<category>/<name>.py`. Scope it to each target's `forward`
+  `catalog/<category>/<name>.py` entry or its
+  `<target>/ops/<category>/<name>.py`. Scope it to each target's `forward`
   plus the private methods it reaches
 - **dump review**: which values the engine produced at runtime, and where each
   sits against its entry's `CELLS`

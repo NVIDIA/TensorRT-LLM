@@ -27,7 +27,7 @@ before spending an hour, because the answer is usually no:
 | what you changed | rebuild? |
 |---|---|
 | a target's `modeling.py` / `weights.py` | **no** — pure Python, editable install picks it up |
-| a catalog wrapper `.py` or contract `.md` | **no** |
+| a catalog entry `.py`, shared or in a target's `ops/` | **no** |
 | a FlashInfer call (sourcing tier 3) | **no** — the package is installed, its kernels JIT |
 | a Triton kernel (sourcing tier 5) | **no** — Triton is JIT |
 | routing, `_router_index.py` | **no** |
@@ -151,7 +151,7 @@ python scripts/test_to_stage_mapping.py --tests "test_modeling_v2_allgather"
 agent-flow-only change runs exactly that stage and no GPU stage at all.
 
 For the engine, CPU tests are the schema / list / prose audits — including the
-modeling_v2 contract audits, which are text scans and need no device.
+modeling_v2 claims audits, which are text scans and need no device.
 
 ### Single GPU
 
@@ -284,8 +284,8 @@ scancel <job_id>.0         # cancel one step
 1. **No device?** → a CPU list, and check whether a CBTS rule already narrows
    CI for your subtree (`jenkins/scripts/cbts/rules/`).
 2. **One device?** → the ordinary `l0_<gpu>.yml` for the architecture you
-   certified on. Receipts are per-architecture; a pass elsewhere is not a pass
-   here.
+   certified on. Certification is per-architecture (`ARCHS`); a pass elsewhere
+   is not a pass here.
 3. **Collectives or a TP/EP topology?** → `l0_*_multi_gpus.yml`, and give it a
    deadline.
 4. **Spans nodes?** → `l0_*_multi_nodes*.yml`, and it needs the launch rules
@@ -295,7 +295,7 @@ Then confirm with `scripts/test_to_stage_mapping.py` that it actually lands in
 a stage. A test on no list is a test nobody runs.
 
 **One trap for documentation-shaped changes:** `ModelingV2Rule` deliberately
-excludes `*.md` so a contract-only edit does not pull in multi-GPU GB300
+excludes `*.md` so a documentation-only edit does not pull in multi-GPU GB300
 stages. That is the right trade, but it means a check that *scans* `.md` files
 gets no CI trigger from the PRs most likely to break it. Put text audits in a
 pre-commit hook, not in a GPU test stage.

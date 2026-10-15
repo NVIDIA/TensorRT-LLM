@@ -69,8 +69,8 @@ from the gate's own arguments: `--tp_size` / `--moe_ep_size` /
 (`examples/llm-api/quickstart_advanced.py`), and the same three as LLM-API
 arguments — `tensor_parallel_size`, `moe_expert_parallel_size`,
 `enable_attention_dp` — in the accuracy case. Which member is default is the
-first row of Coverage. Every gate run of every member exports
-`TRTLLM_MODELING_V2=require` before the ranks start; under `auto` a member that
+first row of Coverage. Every gate run of every member passes
+`modeling_v2=require`; under `auto` a member that
 missed the target's criteria would quietly be the built-in implementation, and
 its row would be a record of the wrong system.
 

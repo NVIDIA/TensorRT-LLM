@@ -1,6 +1,6 @@
 ---
 name: staircase-kernel-onboard
-description: Load when smith must add a catalog entry for a TensorRT-LLM callable that has none — read the source, fix the single-call boundary, write the OpWrapper entry (raw_call, reference, CELLS, ARCHS) and its GPU test in the shared catalog or the target's own ops/, drive the cells, sync the index. Also covers the macro verdict, where the run produces a decomposition report and dispatches one child per constituent instead.
+description: Load when smith must add a catalog entry for a TensorRT-LLM callable that has none — read the source, fix the single-call boundary, write the OpWrapper entry (__call__, reference, is_valid, CELLS, ARCHS) and its GPU test in the shared catalog or the target's own ops/, drive the cells. Also covers the macro verdict, where the run produces a decomposition report and dispatches one child per constituent instead.
 ---
 
 # staircase-kernel-onboard
@@ -9,20 +9,20 @@ One run, one entry. Three possible outcomes, all of them valid products:
 
 | outcome | when |
 |---|---|
-| a new entry, its cells driven and passing, `ARCHS` naming this arch, index synced | the callable is one kernel-launching call |
+| a new entry, its cells driven and passing, `ARCHS` naming this arch | the callable is one kernel-launching call |
 | an entry whose failing value is refused, not certified — `is_valid` guards it if the op answers wrongly, the `note` records what was measured | wrapper and test are right and the op demonstrably fails at a value the call site needs. **Land it anyway** — that is knowledge |
 | a decomposition report, no entry | the callable turns out to be a macro |
 
 References: `references/entry-spec.md` is the shared spec (atomicity, where an
-entry goes, the `OpWrapper` members, certification, index).
+entry goes, the `OpWrapper` members, certification).
 `references/contract-evidence.md` is what makes a sentence in an entry
 defensible. `references/decomposition.md` is the macro path. Read the first
 two before writing anything.
 
-An entry is **one `OpWrapper` subclass and its GPU test**, and there is no
-contract `.md`: the class is the contract (`raw_call`, `reference`, `is_valid`,
-`compare`, `CELLS`, `ARCHS`, `note`), and the test that drives its cells is what
-keeps it true. It lives in one of two homes, which your dispatch target names:
+An entry is **one `OpWrapper` subclass in its own file and its GPU test**,
+and nothing else — no prose contract beside it, no index row: the class is the
+contract (`__call__`, `reference`, `is_valid`, `CELLS`, `ARCHS`, `note`), and
+the test that drives its cells is what keeps it true. It lives in one of two homes, which your dispatch target names:
 
 | target | entry | test |
 |---|---|---|
@@ -55,11 +55,15 @@ file of the entry" means both.
    The home is the one your dispatch target names; if you find the op is also
    called by another target, say so in the report rather than moving it.
    **A macro verdict here ends this path**: go to `references/decomposition.md`.
-3. **Write the entry and its test**, to the spec. `raw_call` makes the one op
-   call and reads nothing off `self`; it returns what it writes. `CELLS` are
+3. **Write the entry and its test**, to the spec. `__call__` makes the one op
+   call, takes every argument explicitly and reads nothing off `self`; it
+   returns what it writes. The file ends with the entry's one module-level
+   instance (`<name> = <Class>()`), which is what targets import. `CELLS` are
    the configurations the smith brief lists, one `Cell(why=..., spec=...)` per
-   distinct thing covered. The test parametrizes off `op.CELLS`, arms the
-   `certifying` fixture, and adds a guard test per input `is_valid` refuses.
+   distinct thing covered. The test parametrizes off `op.CELLS`, arms
+   `_validating.py`'s `certifying` fixture (or runs the call under its
+   `validating`), gates `__call__` against `reference` within a band it states
+   and derives, and adds a guard test per input `is_valid` refuses.
    The test file is named `test_modeling_v2_<name>.py`, always — that name is
    what keeps it from colliding with upstream's test of the same op, and what
    the CI selector matches. A new `ops/<category>/` directory gets an
@@ -74,12 +78,7 @@ file of the entry" means both.
 5. **Certify from that observed run only**: add this device's arch to `ARCHS`
    (from `torch.cuda.get_device_capability()`; if `Arch` has no member for it,
    add one in `catalog/_op.py` in a commit of its own), and nothing else.
-6. **Shared entries only: write the index fragment**
-   `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.d/<category>/<name>.yaml`
-   (shape in `references/entry-spec.md`). Never edit `catalog/index.yaml`: the
-   orchestrator regenerates it from the committed fragments. A target's
-   `ops/` entry has no index row.
-7. **Do not format or lint during iteration.** The repo's `pre-commit` runs
+6. **Do not format or lint during iteration.** The repo's `pre-commit` runs
    once, at delivery, and covers formatting, import order and the general lint
    rules in one pass. What the retired per-entry recipe taught is why that pass
    is not narrowed: an import-only check (`ruff check --select I`) restricts
@@ -88,19 +87,18 @@ file of the entry" means both.
    test because the recipe stopped at the first two. If you do run a checker by
    hand, run it **by name on your own files**, so a sweep does not reformat
    entries you did not touch.
-8. **Revalidate the run.** Steps 5–7 can all write to the entry after the
+7. **Revalidate the run.** Steps 5–6 can both write to the entry after the
    test last ran — a cell added, a helper renamed, a formatter rewriting the
    test file. The run you certify from is valid only if it **post-dates the
    last write to every file of the entry, in both trees**. Check it
    mechanically against the files' mtimes, not by recollection: a
    certification that predated its own test file has shipped here before, and
    it read as green. Stale → rerun the whole test file.
-9. **Commit**, pathspec-scoped to exactly your files. Shared:
+8. **Commit**, pathspec-scoped to exactly your files. Shared:
 
 ```bash
 git add tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.py \
-        tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py \
-        tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.d/<category>/<name>.yaml
+        tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py
 git commit -m "feat(catalog): onboard <name> — <one line>"
 ```
 
@@ -114,7 +112,7 @@ git commit -m "feat(ops): onboard <name> for <target> — <one line>"
 
    plus the new `ops/<category>/__init__.py` when you created one.
 
-10. **Report.**
+9. **Report.**
 
 ## The macro path
 
