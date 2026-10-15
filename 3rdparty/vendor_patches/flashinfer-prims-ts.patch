@@ -61,19 +61,19 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415450369df 100644
+index d1ded2838cd43501aaf7bf866ce5631045c30eab..577896447822853e8cc4469a4b1bb15c54868bb0 100644
 --- a/context.py
 +++ b/context.py
-@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
- 
- import torch
+@@ -54,7 +54,7 @@ from .vc_attention import (
+     vc_scale_shapes,
+ )
  
 -from flashinfer.api_logging import flashinfer_experimental_api
 +from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
  
  if TYPE_CHECKING:
-@@ -488,7 +488,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -521,7 +521,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):

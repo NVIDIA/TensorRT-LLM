@@ -191,6 +191,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Metadata creation and preparation
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
+    - PrimTS per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV)
+    - VC-Attention recipes (quant_attention_config with vc_attention, requires unfused QKV)
     - Separate-QKV forwarding for generic block-sparse attention and backends that reject fused QKV
     """
 
@@ -233,6 +235,23 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
+        if quant_attention_config is not None and quant_attention_config.vc_attention:
+            if not any(fmha.supports_vc_attention for fmha in self._fmha_manager.fmha_libs):
+                raise RuntimeError(
+                    "The VC-Attention recipe needs the PrimTS FMHA library "
+                    "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                    "platform."
+                )
+        elif (
+            quant_attention_config is not None
+            and quant_attention_config.q_block_size == 0
+            and not any(fmha.supports_per_tensor_fp8 for fmha in self._fmha_manager.fmha_libs)
+        ):
+            raise RuntimeError(
+                "The per-tensor FP8 attention recipe needs the PrimTS FMHA library "
+                "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                "platform."
+            )
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -392,13 +411,22 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         if use_separate_qkv:
             q, k, v = self._compact_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
             quant_cfg = self.quant_attention_config
-            if quant_cfg is not None:
+            if quant_cfg is not None and quant_cfg.vc_attention:
+                sage_kwargs = {
+                    "vc_attention": True,
+                    "vc_attention_qk_fp8": quant_cfg.qk_dtype == "fp8",
+                    "vc_repair_budget": quant_cfg.vc_repair_budget,
+                }
+            elif quant_cfg is not None:
                 sage_kwargs = {
                     "sage_attn_num_elts_per_blk_q": quant_cfg.q_block_size,
                     "sage_attn_num_elts_per_blk_k": quant_cfg.k_block_size,
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
                     "sage_attn_qk_int8": quant_cfg.qk_dtype == "int8",
                     "sage_attn_smooth_k": quant_cfg.smooth_k,
+                    "qk_fp8_per_tensor": quant_cfg.q_block_size == 0
+                    and quant_cfg.qk_dtype == "fp8",
+                    "v_fp8_per_tensor": quant_cfg.v_block_size == 0 and quant_cfg.v_dtype == "fp8",
                 }
         else:
             if k is None and v is None:
