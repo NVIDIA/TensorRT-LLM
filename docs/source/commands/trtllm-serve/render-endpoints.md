@@ -1,0 +1,118 @@
+# Render endpoints
+
+The render endpoints turn an OpenAI-style request into the prompt token ids a worker would use, without running
+the model. A router or gateway can use the ids to choose a worker, and a client can send them to a worker to skip
+its tokenization and chat templating.
+
+- `POST /v1/chat/completions/render`
+- `POST /v1/completions/render`
+
+Both take the same body as the inference route of the same name. They are a prototype and are not registered with
+`trtllm-serve` by default. In this page, a *worker* is a `trtllm-serve` server that runs the model.
+
+## Start the endpoints
+
+On a worker, set `TRTLLM_ENABLE_RENDER_ENDPOINTS=1` before starting `trtllm-serve`.
+
+On a CPU-only host, `trtllm-render` loads only the tokenizer, configuration and processor files of a checkpoint:
+
+```bash
+trtllm-render --model <checkpoint> --port 8100
+```
+
+Give it the same model, tokenizer, chat template and parser options as the workers it fronts. Both processes publish
+a rendering fingerprint on `GET /server_info`. Equal `render_fingerprint.digest` values mean the ids are valid for
+that worker, so compare them once when a worker is added.
+
+## The response
+
+Chat returns one rendered request. This is the response for a chat request with a system and a user message:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "chat",
+  "request_id": "chatcmpl-9651e194058642d9b538b695bb179c68",
+  "token_ids": [151644, 8948, 198, 2610, 525, 50537, "..."],
+  "model": "Qwen3-0.6B",
+  "reasoning_ended": null,
+  "reasoning_parser_kwargs": {"chat_template_kwargs": {}},
+  "cache_salt": null,
+  "request": {
+    "model": "Qwen3-0.6B",
+    "messages": [
+      {"role": "system", "content": "You are terse."},
+      {"role": "user", "content": "Name three primary colors."}
+    ],
+    "max_tokens": 24,
+    "temperature": 0
+  }
+}
+```
+
+Completions return a list with one rendered request per prompt. In each, `request` is the original body with `prompt`
+replaced by the ids:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "completion",
+  "request_id": "cmpl-2eb4d58b52984d25916f70687f565577-0",
+  "token_ids": [785, 6722, 315, 9625, 374],
+  "model": "Qwen3-0.6B",
+  "reasoning_ended": null,
+  "reasoning_parser_kwargs": null,
+  "cache_salt": null,
+  "request": {"model": "Qwen3-0.6B", "prompt": [785, 6722, 315, 9625, 374], "max_tokens": 8, "temperature": 0}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"chat"` or `"completion"`: which route `request` belongs to. |
+| `request_id` | Identifies this rendered request. |
+| `token_ids` | The rendered prompt. |
+| `model`, `cache_salt` | Copied from the request. |
+| `reasoning_ended` | Whether reasoning had already ended before the first generated token, read off the prompt for the reasoning parser the renderer is started with. `null` when there is no such parser or the prompt does not say. |
+| `reasoning_parser_kwargs` | The `chat_template_kwargs` the prompt was rendered with. Set for chat when the renderer has a reasoning parser, otherwise `null`. |
+| `request` | The request body. For chat it is the original body. |
+
+## Send the result to the inference endpoints
+
+The original request is always valid to send to a worker. The ids only let the worker skip rendering.
+
+### Completions
+
+Each item's `request` is ready to send:
+
+```bash
+curl -s $RENDERER/v1/completions/render -d @request.json \
+  | jq -c '.[].request' \
+  | while read -r body; do curl -s $WORKER/v1/completions -d "$body"; done
+```
+
+### Chat
+
+Add the ids as `prompt_token_ids`:
+
+```bash
+curl -s $RENDERER/v1/chat/completions/render -d @request.json \
+  | jq '.request + {prompt_token_ids: .token_ids}' \
+  | curl -s $WORKER/v1/chat/completions -d @-
+```
+
+```python
+import requests
+
+rendered = requests.post(f"{RENDERER}/v1/chat/completions/render", json=body).json()
+send = {**rendered["request"], "prompt_token_ids": rendered["token_ids"]}
+reply = requests.post(f"{WORKER}/v1/chat/completions", json=send).json()
+```
+
+A request with a named `tool_choice` (the model must call one specific function) is the exception. The worker
+appends a forced tool-call prefix when it renders, and rejects the request together with `prompt_token_ids`. Send
+`rendered["request"]` as it is for those.
+
+## Limits
+
+Multimodal requests (images, video, audio) are not yet supported. The endpoints return `400` for them.
