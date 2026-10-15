@@ -20,16 +20,23 @@ import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
+    forward_generation_sparse_attn,
+)
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM, DeepseekV3Model
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.speculative import SpecMetadata
 
 from . import weights as _weights
 from .ops.embedding.fused_embedding import fused_embedding
 from .ops.gemm.dense_mlp_small_m import INTER_PER_RANK, dense_mlp_small_m
+from .ops.gemm.fused_a_gemm import MAX_TOKENS as FUSED_A_MAX_TOKENS
+from .ops.gemm.fused_a_gemm import OUT_FEATURES as FUSED_A_OUT_FEATURES
+from .ops.gemm.fused_a_gemm import fused_a_gemm
 
 # The deployment this target is written for; route() selects it on the same
 # facts, and the constructor states them again for a direct construction.
@@ -79,6 +86,11 @@ class DecodeTarget:
       following norm; the experts finalize before theirs (16 ranks span nodes).
     - The last all-reduce applies the model's final norm (``next_layer_layernorm``).
 
+    Attention is MLA with the DSA indexer on the generation rows: q_a, the
+    compressed KV and its rope part come from one GEMM over the stored
+    kv_a_proj_with_mqa weight (up to 8 rows), and the built-in modules compute
+    the rest.
+
     The embedding table is whole on every rank, so the lookup is one local
     kernel. The dense MLP runs as two weight-streaming kernels on this rank's
     768 intermediate columns for up to 8 rows (every c1 step: one request and
@@ -88,7 +100,15 @@ class DecodeTarget:
     def __init__(self, core: "Glm52Nvfp4Sm107Tp16Core") -> None:
         self.core = core
         for layer in core.layers[: core.num_hidden_layers]:
+            mla = layer.self_attn
             assert layer.allreduce is not None and layer.next_layer_layernorm is not None
+            assert not mla.apply_rotary_emb and not mla.mapping.has_cp_helix()
+            assert tuple(mla.kv_a_proj_with_mqa.weight.shape) == (
+                FUSED_A_OUT_FEATURES,
+                core.config.hidden_size,
+            ) and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16, (
+                f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
+            )
             assert layer.input_layernorm.nvfp4_scale is None, "kv_a_proj is not NVFP4"
             if isinstance(layer.mlp, GatedMLP):
                 assert (
@@ -120,27 +140,78 @@ class DecodeTarget:
             inputs_embeds = fused_embedding(input_ids, core.embed_tokens.weight)
         residual = inputs_embeds
         hidden_states = core.layers[0].input_layernorm(inputs_embeds)
+        rows = hidden_states.shape[0]
         small_m = torch.ops.trtllm.glm_dense_mlp_small_m_supported(
-            hidden_states.shape[0], core.config.hidden_size, INTER_PER_RANK
+            rows, core.config.hidden_size, INTER_PER_RANK
         )
+        fused_a = rows <= FUSED_A_MAX_TOKENS
         for layer in core.layers[: core.num_hidden_layers]:
             if isinstance(layer.mlp, GatedMLP):
                 hidden_states, residual = self._dense_layer(
-                    layer, position_ids, hidden_states, residual, attn_metadata, small_m
+                    layer, position_ids, hidden_states, residual, attn_metadata, fused_a, small_m
                 )
             else:
                 hidden_states, residual = self._moe_layer(
-                    layer, position_ids, hidden_states, residual, attn_metadata
+                    layer, position_ids, hidden_states, residual, attn_metadata, fused_a
                 )
         return hidden_states
 
     @staticmethod
-    def _dense_layer(layer, position_ids, hidden_states, residual, attn_metadata, small_m):
-        hidden_states = layer.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=True),
+    def _attention(layer, position_ids, hidden_states, attn_metadata, all_reduce_params, fused_a):
+        """MLA with the DSA indexer over generation rows, through o_proj."""
+        mla = layer.self_attn
+        num_tokens = attn_metadata.num_tokens
+        if fused_a:
+            kv_a = fused_a_gemm(hidden_states, mla.kv_a_proj_with_mqa.weight, [])
+        else:
+            kv_a = mla.kv_a_proj_with_mqa(hidden_states)
+        q, compressed_kv, k_pe = kv_a.split(
+            [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], -1
+        )
+        (q, qr), compressed_kv = maybe_execute_in_parallel(
+            lambda: mla._q_a_layernorm_maybe_fused(q, return_norm_out=True),
+            lambda: mla.kv_a_layernorm(compressed_kv),
+            mla.ln_events[0],
+            mla.ln_events[1],
+            mla.aux_stream,
+        )
+        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        q = mla.q_b_proj(q)
+        indexer = mla.mqa.indexer
+        indexer_intermediates = None
+        if indexer is not None:
+            indexer_intermediates = [
+                t[:num_tokens]
+                for t in indexer.pre_indexer_proj(qr, hidden_states, position_ids)
+            ]
+            indexer._update_k_cache(indexer_intermediates[1], indexer_intermediates[2], attn_metadata)
+        output = hidden_states.new_empty([hidden_states.shape[0], mla.attention_output_hidden_size])
+        forward_generation_sparse_attn(
+            mla,
+            q[:num_tokens],
+            compressed_kv[:num_tokens],
+            k_pe[:num_tokens],
+            attn_metadata,
+            output[:num_tokens],
+            position_ids=position_ids[..., :num_tokens],
+            latent_cache=latent_cache[:num_tokens],
+            indexer_intermediates=indexer_intermediates,
+        )
+        if indexer is not None:
+            indexer.maybe_join_prev_topk_copy()
+        return mla.o_proj(output, all_reduce_params=all_reduce_params, layer_idx=mla.layer_idx)
+
+    @staticmethod
+    def _dense_layer(
+        layer, position_ids, hidden_states, residual, attn_metadata, fused_a, small_m
+    ):
+        hidden_states = DecodeTarget._attention(
+            layer,
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            AllReduceParams(enable_allreduce=True),
+            fused_a,
         )
         hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
         if small_m:
@@ -163,12 +234,14 @@ class DecodeTarget:
         )
 
     @staticmethod
-    def _moe_layer(layer, position_ids, hidden_states, residual, attn_metadata):
-        hidden_states = layer.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=False),
+    def _moe_layer(layer, position_ids, hidden_states, residual, attn_metadata, fused_a):
+        hidden_states = DecodeTarget._attention(
+            layer,
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            AllReduceParams(enable_allreduce=False),
+            fused_a,
         )
         hidden_states, residual = layer.allreduce(
             hidden_states,
