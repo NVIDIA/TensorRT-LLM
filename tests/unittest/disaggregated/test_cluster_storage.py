@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import subprocess
 import tempfile
 import threading
@@ -9,11 +10,14 @@ import pytest
 import pytest_asyncio
 import uvicorn
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, StorageItem, WatchEvent, WatchEventType,
     create_cluster_storage, create_cluster_storage_client, is_loopback_host,
     validate_http_cluster_storage_scope)
+from tensorrt_llm.serve.disagg_auth import \
+    build_internal_disagg_control_auth_headers
 
 pytestmark = pytest.mark.cpu_only
 
@@ -79,6 +83,32 @@ def test_http_cluster_storage_scope_rejects_non_loopback_scope(
         cluster_uri, server_host):
     with pytest.raises(ValueError, match="loopback-only"):
         validate_http_cluster_storage_scope(cluster_uri, server_host)
+
+
+def test_http_cluster_storage_scope_allows_non_loopback_with_auth_key():
+    validate_http_cluster_storage_scope("http://10.0.0.1:18000", "0.0.0.0",
+                                        "secret")
+
+
+def test_http_cluster_storage_routes_require_auth_when_key_configured():
+    storage = HttpClusterStorageServer("", "")
+    app = FastAPI()
+    storage.add_routes(app, internal_request_auth_key="secret")
+    client = TestClient(app)
+    body = {
+        "key": "test-key",
+        "value": "test-value",
+        "overwrite_if_exists": True
+    }
+
+    assert client.post("/set", json=body).status_code == 401
+    raw_body = json.dumps(body).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json"
+    } | build_internal_disagg_control_auth_headers(
+        "secret", "POST", "/set", body=raw_body)
+    assert client.post("/set", content=raw_body,
+                       headers=headers).status_code == 200
 
 
 @pytest.mark.parametrize(

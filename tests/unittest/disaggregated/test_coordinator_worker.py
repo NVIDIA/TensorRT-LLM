@@ -41,8 +41,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
+import msgpack
 import pytest
 import uvicorn
+from fastapi.testclient import TestClient
 
 from tensorrt_llm.llmapi.disagg_utils import (
     CtxGenServerConfig,
@@ -51,7 +53,8 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     ServerRole,
 )
-from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+from tensorrt_llm.serve.coordinator_server import MSGPACK_MEDIA_TYPE, CoordinatorServer
+from tensorrt_llm.serve.disagg_auth import build_internal_disagg_control_auth_headers
 from tensorrt_llm.serve.disagg_coordinator import (
     COORDINATOR_RESERVATION_TIMEOUT_ENV,
     CoordinatorClient,
@@ -199,6 +202,51 @@ class _CoordinatorThread:
     def __exit__(self, *a):
         self._server.should_exit = True
         self._thread.join(timeout=10)
+
+
+class _AuthCoordinator:
+    cluster_storage = None
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def select(self, role, routing_key, req_id, exclude_server):
+        return "gen:8000", {}, req_id
+
+    async def finish(self, role, req_id, success):
+        pass
+
+    async def renew(self, role, req_id):
+        pass
+
+    async def cluster_info(self):
+        return {"is_ready": True}
+
+    async def is_ready(self):
+        return True
+
+
+def test_coordinator_control_routes_require_auth_header():
+    payload = msgpack.packb(
+        {"role": "generation", "routing_key": {}, "req_id": 123}, use_bin_type=True
+    )
+    server = CoordinatorServer(_AuthCoordinator(), internal_request_auth_key="secret")
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/select", content=payload, headers={"Content-Type": MSGPACK_MEDIA_TYPE}
+        )
+        assert response.status_code == 401
+
+        headers = {"Content-Type": MSGPACK_MEDIA_TYPE} | build_internal_disagg_control_auth_headers(
+            "secret", "POST", "/select", body=payload
+        )
+        response = client.post("/select", content=payload, headers=headers)
+        assert response.status_code == 200
+        assert msgpack.unpackb(response.content, raw=False)["server"] == "gen:8000"
 
 
 async def _wait_coord_ready(url, timeout_s=30.0):
@@ -873,6 +921,7 @@ async def test_coordinator_tcp_listener_uses_the_prebound_socket(monkeypatch, ud
 
     server = object.__new__(CoordinatorServer)
     server._coordinator = AsyncMock()
+    server._internal_request_auth_key = "secret"
     server.app = object()
 
     tcp_server = SimpleNamespace(serve=AsyncMock())

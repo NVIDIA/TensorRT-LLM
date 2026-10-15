@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import subprocess
 import tempfile
 import time
@@ -13,7 +14,8 @@ from test_cluster_storage import http_server_storage
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
-from tensorrt_llm.serve.cluster_storage import (WatchEventType,
+from tensorrt_llm.serve.cluster_storage import (StorageItem, WatchEvent,
+                                                WatchEventType,
                                                 create_cluster_storage,
                                                 create_cluster_storage_client,
                                                 key_time)
@@ -50,6 +52,43 @@ async def test_registration_failure_without_retry_returns_false():
     assert not registered
     assert worker._last_heartbeat == 0
     assert worker._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_signed_worker_registration_rejects_tampered_storage_value():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.set.return_value = True
+    worker = DisaggClusterWorker(ServerRole.CONTEXT,
+                                 "127.0.0.1",
+                                 8001,
+                                 config,
+                                 storage,
+                                 internal_request_auth_key="secret")
+
+    assert await worker.register_worker(retry_interval=0)
+    encoded_worker_info = storage.set.await_args.args[1]
+    event = WatchEvent(storage_item=StorageItem(key=worker.worker_key,
+                                                value=encoded_worker_info),
+                       event_type=WatchEventType.SET)
+    manager = DisaggClusterManager(config,
+                                   storage,
+                                   internal_request_auth_key="secret")
+
+    assert manager._parse_worker_info(event) == worker.worker_info
+
+    tampered = json.loads(encoded_worker_info)
+    tampered["worker_info"]["port"] = 9000
+    tampered_event = WatchEvent(storage_item=StorageItem(
+        key=worker.worker_key, value=json.dumps(tampered)),
+                                event_type=WatchEventType.SET)
+    tampered_manager = DisaggClusterManager(config,
+                                            storage,
+                                            internal_request_auth_key="secret")
+
+    assert tampered_manager._parse_worker_info(
+        tampered_event).worker_id == worker.worker_key
+    assert tampered_manager.current_ctx_worker_num == 0
 
 
 @pytest.mark.asyncio

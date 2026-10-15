@@ -44,7 +44,8 @@ from fastapi.responses import Response
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
-from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
+from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer, is_loopback_host
+from tensorrt_llm.serve.disagg_auth import validate_internal_disagg_control_request
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -55,8 +56,11 @@ MSGPACK_MEDIA_TYPE = "application/msgpack"
 class CoordinatorServer:
     """Serve a :class:`DisaggCoordinatorService`'s coordination API over HTTP."""
 
-    def __init__(self, coordinator: DisaggCoordinatorService) -> None:
+    def __init__(
+        self, coordinator: DisaggCoordinatorService, internal_request_auth_key: Optional[str] = None
+    ) -> None:
         self._coordinator = coordinator
+        self._internal_request_auth_key = internal_request_auth_key
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -73,7 +77,9 @@ class CoordinatorServer:
         self.app.add_api_route("/version", self.version, methods=["GET"])
         cluster_storage = self._coordinator.cluster_storage
         if isinstance(cluster_storage, HttpClusterStorageServer):
-            cluster_storage.add_routes(self.app)
+            cluster_storage.add_routes(
+                self.app, internal_request_auth_key=self._internal_request_auth_key
+            )
 
     @staticmethod
     def _response(content: object, status_code: int = 200) -> Response:
@@ -83,9 +89,29 @@ class CoordinatorServer:
             media_type=MSGPACK_MEDIA_TYPE,
         )
 
-    async def select(self, raw_req: Request) -> Response:
+    def _validate_control_request(self, raw_req: Request, body: bytes) -> Optional[Response]:
+        if not self._internal_request_auth_key:
+            return None
         try:
-            body = msgpack.unpackb(await raw_req.body(), raw=False)
+            validate_internal_disagg_control_request(
+                self._internal_request_auth_key,
+                raw_req.method,
+                raw_req.url.path,
+                raw_req.url.query,
+                body,
+                raw_req.headers,
+            )
+        except ValueError as error:
+            return self._response({"error": str(error)}, status_code=401)
+        return None
+
+    async def select(self, raw_req: Request) -> Response:
+        raw_body = await raw_req.body()
+        auth_error = self._validate_control_request(raw_req, raw_body)
+        if auth_error is not None:
+            return auth_error
+        try:
+            body = msgpack.unpackb(raw_body, raw=False)
         except Exception as e:
             return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
         if (
@@ -119,8 +145,12 @@ class CoordinatorServer:
         return self._response({"server": server, "info": info, "req_id": req_id})
 
     async def finish(self, raw_req: Request) -> Response:
+        raw_body = await raw_req.body()
+        auth_error = self._validate_control_request(raw_req, raw_body)
+        if auth_error is not None:
+            return auth_error
         try:
-            body = msgpack.unpackb(await raw_req.body(), raw=False)
+            body = msgpack.unpackb(raw_body, raw=False)
         except Exception as e:
             return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
         if not isinstance(body, dict) or "role" not in body or "req_id" not in body:
@@ -140,8 +170,12 @@ class CoordinatorServer:
         return self._response({})
 
     async def renew(self, raw_req: Request) -> Response:
+        raw_body = await raw_req.body()
+        auth_error = self._validate_control_request(raw_req, raw_body)
+        if auth_error is not None:
+            return auth_error
         try:
-            body = msgpack.unpackb(await raw_req.body(), raw=False)
+            body = msgpack.unpackb(raw_body, raw=False)
         except Exception as e:
             return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
         if not isinstance(body, dict) or "role" not in body or "req_id" not in body:
@@ -163,7 +197,10 @@ class CoordinatorServer:
             return self._response({"error": str(e)}, status_code=500)
         return self._response({})
 
-    async def cluster_info(self) -> Response:
+    async def cluster_info(self, raw_req: Request) -> Response:
+        auth_error = self._validate_control_request(raw_req, b"")
+        if auth_error is not None:
+            return auth_error
         return self._response(await self._coordinator.cluster_info())
 
     async def health(self) -> Response:
@@ -192,6 +229,11 @@ class CoordinatorServer:
         # link-local resolves to fe80:: with scope id 0 -- an address the kernel
         # always refuses ("invalid argument"), since the scope id can only come
         # from an interface name.
+        if not self._internal_request_auth_key and not is_loopback_host(host):
+            raise ValueError(
+                "internal_request_auth_key is required when the disaggregated "
+                "coordinator binds a non-loopback host"
+            )
         kwargs = dict(workers=1, log_level="info", timeout_keep_alive=keep_alive_timeout)
         if uds:
             # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
@@ -213,5 +255,14 @@ class CoordinatorServer:
             await create_uvicorn_server(config).serve(sockets=sockets)
 
 
-def serve_coordinator(host: str, port: int, coordinator: DisaggCoordinatorService) -> None:
-    asyncio.run(CoordinatorServer(coordinator)(host, port))
+def serve_coordinator(
+    host: str,
+    port: int,
+    coordinator: DisaggCoordinatorService,
+    internal_request_auth_key: Optional[str] = None,
+) -> None:
+    asyncio.run(
+        CoordinatorServer(coordinator, internal_request_auth_key=internal_request_auth_key)(
+            host, port
+        )
+    )

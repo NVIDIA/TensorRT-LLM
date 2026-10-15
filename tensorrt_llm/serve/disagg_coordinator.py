@@ -58,6 +58,7 @@ from tensorrt_llm.serve.cluster_storage import (
     WatchEventType,
     create_cluster_storage,
 )
+from tensorrt_llm.serve.disagg_auth import build_internal_disagg_control_auth_headers
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
@@ -325,7 +326,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         if self._config.disagg_cluster_config and self._cluster_storage:
             logger.info("Starting disagg cluster manager")
             self._disagg_cluster_manager = DisaggClusterManager(
-                self._config.disagg_cluster_config, self._cluster_storage
+                self._config.disagg_cluster_config,
+                self._cluster_storage,
+                internal_request_auth_key=self._config.internal_request_auth_key,
             )
             await self._disagg_cluster_manager.start()
             await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
@@ -513,6 +516,7 @@ class CoordinatorClient(DisaggCoordinator):
         metadata_config: Optional[MetadataServerConfig] = None,
         request_timeout_s: float = 5.0,
         startup_timeout_s: float = 180.0,
+        internal_request_auth_key: Optional[str] = None,
     ):
         # remote_url may be a TCP URL or unix:/path. Resolve to a request base
         # URL now; the session (with the right connector) is created lazily so it
@@ -521,6 +525,9 @@ class CoordinatorClient(DisaggCoordinator):
         self._remote_url = coordinator_base_url(remote_url)
         self._request_timeout_s = request_timeout_s
         self._startup_timeout_s = startup_timeout_s
+        self._internal_request_auth_key = (
+            internal_request_auth_key or config.internal_request_auth_key
+        )
         self._session: Optional[aiohttp.ClientSession] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._is_ready = False
@@ -557,7 +564,11 @@ class CoordinatorClient(DisaggCoordinator):
         # delegating router picks the UDS connector when applicable.
         if hasattr(local_router, "get_next_server_by_key"):
             return CoordinatorDelegatingRouter(
-                self._remote_url_raw, local_router, role, self._request_timeout_s
+                self._remote_url_raw,
+                local_router,
+                role,
+                self._request_timeout_s,
+                internal_request_auth_key=self._internal_request_auth_key,
             )
         return local_router
 
@@ -574,6 +585,13 @@ class CoordinatorClient(DisaggCoordinator):
         if self._session is None:
             self._session = make_coordinator_session(self._remote_url_raw)
         return self._session
+
+    def _auth_headers(
+        self, method: str, path: str, query=None, body: bytes = b""
+    ) -> dict[str, str]:
+        return build_internal_disagg_control_auth_headers(
+            self._internal_request_auth_key, method, path, query, body
+        )
 
     async def start(self) -> None:
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
@@ -610,7 +628,9 @@ class CoordinatorClient(DisaggCoordinator):
         while True:
             try:
                 async with self.session.get(
-                    f"{self._remote_url}/cluster_info", timeout=self._request_timeout_s
+                    f"{self._remote_url}/cluster_info",
+                    headers=self._auth_headers("GET", "/cluster_info"),
+                    timeout=self._request_timeout_s,
                 ) as resp:
                     if resp.status == 200:
                         logger.info(
@@ -686,7 +706,9 @@ class CoordinatorClient(DisaggCoordinator):
     async def cluster_info(self) -> Dict[str, Any]:
         try:
             async with self.session.get(
-                f"{self._remote_url}/cluster_info", timeout=self._request_timeout_s
+                f"{self._remote_url}/cluster_info",
+                headers=self._auth_headers("GET", "/cluster_info"),
+                timeout=self._request_timeout_s,
             ) as resp:
                 if resp.status == 200:
                     return msgpack.unpackb(await resp.read(), raw=False)
@@ -703,7 +725,8 @@ class CoordinatorClient(DisaggCoordinator):
         content_type: Optional[str],
     ) -> Tuple[bytes, int, Optional[str]]:
         """Forward a public HTTP-storage request to the coordinator."""
-        headers = {"Content-Type": content_type} if content_type else None
+        headers = {"Content-Type": content_type} if content_type else {}
+        headers.update(self._auth_headers(method, path, query=query, body=body))
         async with self.session.request(
             method,
             f"{self._remote_url}{path}",

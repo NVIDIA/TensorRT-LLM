@@ -26,6 +26,8 @@ from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
+from tensorrt_llm.serve.disagg_auth import \
+    build_internal_disagg_control_auth_headers
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 # Shared tokenization / block-hashing utilities (single source of truth).
@@ -1724,7 +1726,8 @@ class CoordinatorDelegatingRouter(Router):
                  coordinator_url: str,
                  local_router: "Router",
                  role: str,
-                 request_timeout_s: float = 5.0):
+                 request_timeout_s: float = 5.0,
+                 internal_request_auth_key: Optional[str] = None):
         # Intentionally NOT calling Router.__init__: this is a thin proxy whose
         # server-pool state lives on the wrapped local router (see __getattr__).
         # coordinator_url may be a TCP URL or unix:/path (UDS avoids the TCP
@@ -1737,6 +1740,7 @@ class CoordinatorDelegatingRouter(Router):
         self._local = local_router
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
+        self._internal_request_auth_key = internal_request_auth_key
         self._session: Optional[aiohttp.ClientSession] = None
         self._finish_queue: asyncio.Queue[tuple[int, bool]] = asyncio.Queue(
             maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
@@ -1761,6 +1765,11 @@ class CoordinatorDelegatingRouter(Router):
                 make_coordinator_session
             self._session = make_coordinator_session(self._coordinator_url_raw)
         return self._session
+
+    def _auth_headers(self, method: str, path: str,
+                      body: bytes) -> dict[str, str]:
+        return build_internal_disagg_control_auth_headers(
+            self._internal_request_auth_key, method, path, body=body)
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
@@ -1847,7 +1856,8 @@ class CoordinatorDelegatingRouter(Router):
                 async with self.session.post(
                         f"{self._coordinator_url}/select",
                         data=data,
-                        headers=_MSGPACK_HEADERS,
+                        headers=_MSGPACK_HEADERS
+                        | self._auth_headers("POST", "/select", data),
                         timeout=self._request_timeout_s) as resp:
                     body = msgpack.unpackb(await resp.read(), raw=False)
                     if resp.status != 200:
@@ -1890,11 +1900,13 @@ class CoordinatorDelegatingRouter(Router):
                             req_id: Optional[int] = None) -> None:
         req_id = self._request_id(request, req_id)
         payload = {"role": self._role, "req_id": req_id}
-        async with self.session.post(f"{self._coordinator_url}/renew",
-                                     data=msgpack.packb(payload,
-                                                        use_bin_type=True),
-                                     headers=_MSGPACK_HEADERS,
-                                     timeout=self._request_timeout_s) as resp:
+        data = msgpack.packb(payload, use_bin_type=True)
+        async with self.session.post(
+                f"{self._coordinator_url}/renew",
+                data=data,
+                headers=_MSGPACK_HEADERS
+                | self._auth_headers("POST", "/renew", data),
+                timeout=self._request_timeout_s) as resp:
             body = msgpack.unpackb(await resp.read(), raw=False)
             if resp.status != 200:
                 raise ValueError(f"coordinator /renew returned {resp.status}: "
@@ -1921,14 +1933,15 @@ class CoordinatorDelegatingRouter(Router):
             try:
                 async with self.session.post(
                         f"{self._coordinator_url}/finish",
-                        data=msgpack.packb(
+                        data=(data := msgpack.packb(
                             {
                                 "role": self._role,
                                 "req_id": req_id,
                                 "success": success
                             },
-                            use_bin_type=True),
-                        headers=_MSGPACK_HEADERS,
+                            use_bin_type=True)),
+                        headers=_MSGPACK_HEADERS
+                        | self._auth_headers("POST", "/finish", data),
                         timeout=min(self._request_timeout_s,
                                     COORDINATOR_FINISH_TIMEOUT_S)) as resp:
                     if resp.status != 200:

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import json
 import os
 import random
 import socket
@@ -26,6 +25,8 @@ from tensorrt_llm.logger import logger
 
 from .cluster_storage import (ClusterStorage, StorageItem, WatchEvent,
                               WatchEventType, key_time)
+from .disagg_auth import (decode_internal_disagg_worker_info,
+                          encode_internal_disagg_worker_info)
 
 
 @dataclass
@@ -62,9 +63,13 @@ class DisaggClusterManager:
     It will watch the workers and notify the router when the workers are changed.
     """
 
-    def __init__(self, config: DisaggClusterConfig, storage: ClusterStorage):
+    def __init__(self,
+                 config: DisaggClusterConfig,
+                 storage: ClusterStorage,
+                 internal_request_auth_key: Optional[str] = None):
         self._config = config
         self._cluster_storage = storage
+        self._internal_request_auth_key = internal_request_auth_key
         self._lock = asyncio.Lock()
         self._minimal_ctx_worker_num = config.minimal_instances.context_servers
         self._minimal_gen_worker_num = config.minimal_instances.generation_servers
@@ -236,7 +241,9 @@ class DisaggClusterManager:
                 worker_info = workers.pop(event.storage_item.key)
         elif event.event_type == WatchEventType.SET:
             try:
-                worker_info = WorkerInfo(**json.loads(event.storage_item.value))
+                worker_info = WorkerInfo(**decode_internal_disagg_worker_info(
+                    self._internal_request_auth_key, event.storage_item.key,
+                    event.storage_item.value))
                 worker_info.role = ServerRole(worker_info.role)
                 workers = self._get_workers(worker_info.role)
                 workers[event.storage_item.key] = worker_info
@@ -277,12 +284,18 @@ class DisaggClusterWorker:
     # still gets one real attempt and _refresh_registration terminates.
     _MIN_REFRESH_TIMEOUT_SEC = 1.0
 
-    def __init__(self, role: ServerRole, host: str, port: int,
-                 config: DisaggClusterConfig, storage: ClusterStorage):
+    def __init__(self,
+                 role: ServerRole,
+                 host: str,
+                 port: int,
+                 config: DisaggClusterConfig,
+                 storage: ClusterStorage,
+                 internal_request_auth_key: Optional[str] = None):
         self._role = role
         self._port = port
         self._config = config
         self._cluster_storage = storage
+        self._internal_request_auth_key = internal_request_auth_key
         self._stop = False
         self._heartbeat_task = None
         self._last_heartbeat = 0
@@ -336,9 +349,12 @@ class DisaggClusterWorker:
             f"Worker {self.worker_info.worker_id} registering, {asdict(worker_info)}"
         )
         ttl_applied_after = key_time()
+        encoded_worker_info = encode_internal_disagg_worker_info(
+            self._internal_request_auth_key, self.worker_key,
+            asdict(worker_info))
         success = await self._cluster_storage.set(
             self.worker_key,
-            json.dumps(asdict(worker_info)),
+            encoded_worker_info,
             overwrite_if_exists=overwrite_if_exists,
             ttl=self._config.inactive_timeout_sec)
         if not success:
