@@ -37,6 +37,9 @@ ALL_LAYER_COMMIT_MIN_BATCH = 16
 NUM_GDN_LAYERS = 36
 #: The recurrent pool's slot count of a full-size engine run.
 ENGINE_SLOTS = 461
+#: Layers per slot at which the last of `ENGINE_SLOTS` slots starts past 2^31 elements of
+#: the pool (`460 * L * 48 * 128 * 128 > 2**31` from L = 6).
+PAST_INT32_LAYERS = 8
 
 
 def _cell_spec(path, n, t, **spec) -> dict:
@@ -57,7 +60,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     2. the `T` new tokens run the gated delta rule in order (q/k head
        `hv // (HV // H)`, so a v-head group shares one q/k head):
        `h *= exp(g_t); u_t = beta_t (v_t - h k_t); h += u_t k_t^T; o_t = h (scale q_t)`,
-       q and k L2-normalized first (`/ (||x|| + 1e-6)`) when
+       q and k L2-normalized first (`x / sqrt(sum(x^2) + 1e-6)`) when
        `use_qk_l2norm_in_kernel`, `scale=None` meaning `K ** -0.5`; with
        `A_log` given, `g = -exp(A_log) * softplus(g + dt_bias)` and
        `beta = sigmoid(beta)` are applied to the raw projections inside;
@@ -103,12 +106,14 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     # after 5 context tokens), packed (False: the q/k/v views over the packed
     # rows without packed_qkv, as a mixed batch passes them), pdl
     # (launch_with_pdl, default True), ab ("split": separate [n, t, 48]
-    # projections | "strided": the column halves of one [n*t, 96] projection).
+    # projections | "strided": the column halves of one [n*t, 96] projection),
+    # dup (rows given the SAME slot, as CUDA-graph padding repeats one dummy slot;
+    # only the other rows and slots are held to the reference).
     CELLS: tuple[Cell, ...] = (
         Cell(why="small n=1 T=2: one sequence, MTP-1", spec=_cell_spec("small", 1, 2, steps=12)),
         Cell(why="small n=4 T=3", spec=_cell_spec("small", 4, 3)),
         Cell(
-            why="small n=8 T=4 S=461: engine pool, slots 0 and 460",
+            why="small n=8 T=4 L=2 S=461: slots 0 and 460 of a 461-slot axis",
             spec=_cell_spec("small", 8, 4, slots=ENGINE_SLOTS, edge_slots=True),
         ),
         Cell(
@@ -122,6 +127,10 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
         Cell(
             why="small n=6 T=3 pad: rows 1, 4 at slot -1, prefix output",
             spec=_cell_spec("small", 6, 3, pad=(1, 4), output="prefix"),
+        ),
+        Cell(
+            why="small n=8 T=3 dup: rows 5..7 share one padding slot",
+            spec=_cell_spec("small", 8, 3, dup=(5, 6, 7), steps=6),
         ),
         Cell(
             why="small n=4 T=2 unpacked: q/k/v views alone",
@@ -139,7 +148,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             why="all_layer n=16 T=4: the partition threshold", spec=_cell_spec("all_layer", 16, 4)
         ),
         Cell(
-            why="all_layer n=24 T=3 S=461: slots 0 and 460",
+            why="all_layer n=24 T=3 L=2 S=461: slots 0 and 460 of a 461-slot axis",
             spec=_cell_spec("all_layer", 24, 3, slots=ENGINE_SLOTS, edge_slots=True),
         ),
         Cell(
@@ -147,8 +156,20 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             spec=_cell_spec("all_layer", 32, 4),
         ),
         Cell(
-            why="all_layer n=32 T=3 L=36: every GDN layer, one commit",
+            why="all_layer n=32 T=3 L=36 S=40: every GDN layer, one commit",
             spec=_cell_spec("all_layer", 32, 3, layers=NUM_GDN_LAYERS, slots=40, steps=6),
+        ),
+        Cell(
+            why="all_layer n=16 T=3 L=8 S=461: slot 460's offset is past 2^31 elements",
+            spec=_cell_spec(
+                "all_layer",
+                16,
+                3,
+                layers=PAST_INT32_LAYERS,
+                slots=ENGINE_SLOTS,
+                edge_slots=True,
+                steps=3,
+            ),
         ),
         Cell(
             why="all_layer n=20 T=4 fresh: after prefill",
@@ -194,8 +215,12 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     presence switches the in-kernel commit off. `old_beta` is never read or written.
 
     Preconditions not checkable from metadata:
-    * live slots distinct -- two rows on one slot both append to the same history
-      positions and the appended u is a per-element mixture of the two rows;
+    * rows on distinct slots, except padding: two rows on one slot both append to the
+      same history positions and the appended u is a per-element mixture of the two
+      rows, so that slot's state and those rows' outputs are unspecified. The rows of
+      CUDA-graph padding repeat one shared dummy slot (the manager's `_padding_slot`);
+      the rows on unique slots are exact whatever the padding does, and the dummy slot
+      is nobody's state;
     * `prev_num_accepted_tokens` in `[0, history_size]`, `cache_buf_idx` in `{0, 1}`,
       and the pending entries written by earlier calls of this op. A slot fresh from
       prefill starts at 0 pending (the manager zeroes the count, the half and the
@@ -229,7 +254,11 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     than N (the trailing rows read past it and append to a slot nobody named);
     history buffers whose shape disagrees with `history_size` or the head geometry
     (the kernel addresses them by `history_size`, so 16-deep buffers called at 12
-    read other slots' entries).
+    read other slots' entries); history buffers, `prev_num_accepted_tokens` or
+    `cache_buf_idx` covering fewer slots than `ssm_states` (a slot of the pool past
+    their end is read and written out of bounds); a strided `prev_num_accepted_tokens`
+    or `cache_buf_idx` (read at element `slot`). A strided `state_indices` is
+    harmless: the entry's input guard makes it contiguous.
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
     False`; a bf16 `ssm_states` (a different launch mapping); HV/H other than 3, K
@@ -362,8 +391,8 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             v = rows[..., 2 * H * K :].view(N, T, HV, V)
         qf, kf, vf = q.float(), k.float(), v.float()
         if use_qk_l2norm_in_kernel:
-            qf = qf / (qf.square().sum(-1, keepdim=True).sqrt() + 1e-6)
-            kf = kf / (kf.square().sum(-1, keepdim=True).sqrt() + 1e-6)
+            qf = qf / torch.sqrt(qf.square().sum(-1, keepdim=True) + 1e-6)
+            kf = kf / torch.sqrt(kf.square().sum(-1, keepdim=True) + 1e-6)
         qf = (qf * scale).repeat_interleave(rep, dim=2)  # [N, T, HV, K]
         kv = kf.repeat_interleave(rep, dim=2)  # [N, T, HV, K]
         if A_log is not None:
@@ -469,7 +498,19 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             "kernel reads one slot per sequence with no bound, so a shorter tensor hands the "
             "trailing rows whatever follows it in memory, and they write that slot's history"
         )
-        slots = old_u.shape[0]
+        pool_slots, slots = ssm_states.shape[0], old_u.shape[0]
+        assert slots >= pool_slots, (
+            f"the history buffers have {slots} slots for a {pool_slots}-slot pool -- a slot "
+            "past the history's end is read and written out of bounds"
+        )
+        for name, tensor in (
+            ("prev_num_accepted_tokens", prev_num_accepted_tokens),
+            ("cache_buf_idx", cache_buf_idx),
+        ):
+            assert tensor.dim() == 1 and tensor.is_contiguous() and tensor.shape[0] >= pool_slots, (
+                f"{name} has shape {tuple(tensor.shape)} and stride {tensor.stride()}; the kernel "
+                f"reads one element per slot of the {pool_slots}-slot pool, at the slot's index"
+            )
         expected = {
             "old_u": (old_u, (slots, 2, history_size, HV, V)),
             "old_k": (old_k, (slots, 2, history_size, H, K)),

@@ -42,7 +42,7 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     (stored `[V, K]`, K innermost), per token, all in fp32:
 
         g    = -exp(A_log) * softplus_b(a + dt_bias)    beta = sigmoid(b)
-        q, k = q / (|q| + 1e-6), k / (|k| + 1e-6)       (only with use_qk_l2norm_in_kernel)
+        q, k = q / sqrt(q.q + 1e-6), k / sqrt(k.k + 1e-6)  (only with use_qk_l2norm_in_kernel)
         h   *= exp(g);  u = (v - h^T k) * beta;  h += k u^T;  o = h^T (scale * q)
 
     `softplus_b(x) = log(1 + exp(beta_s x)) / beta_s` below `softplus_threshold`
@@ -301,8 +301,8 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
                 )
                 beta = torch.sigmoid(b3[row, t].float())
                 if use_qk_l2norm_in_kernel:
-                    q_t = q_t / (q_t.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6)
-                    k_t = k_t / (k_t.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6)
+                    q_t = q_t / torch.sqrt(q_t.pow(2).sum(-1, keepdim=True) + 1e-6)
+                    k_t = k_t / torch.sqrt(k_t.pow(2).sum(-1, keepdim=True) + 1e-6)
                 state = state * torch.exp(neg_exp_a * softplus)[:, None, None]
                 u = (v[row, t].float() - (state * k_t[:, :, None]).sum(1)) * beta[:, None]
                 state = state + k_t[:, :, None] * u[:, None, :]

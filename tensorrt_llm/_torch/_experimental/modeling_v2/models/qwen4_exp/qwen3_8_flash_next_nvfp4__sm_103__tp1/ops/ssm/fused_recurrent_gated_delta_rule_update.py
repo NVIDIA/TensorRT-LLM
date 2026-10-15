@@ -47,7 +47,7 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     """Advance each sequence's `[K, V]` recurrent state by *all* its tokens, in
     order. Per token and v-head `hv` (q/k head `hv // (HV // H)`):
 
-        q, k = q / (||q|| + 1e-6), k / (||k|| + 1e-6)    # if use_qk_l2norm_in_kernel
+        q, k = q / sqrt(q.q + 1e-6), k / sqrt(k.k + 1e-6)    # if use_qk_l2norm_in_kernel
         h *= exp(g);  u = (v - h^T k) * beta;  h += k u^T;  o = h^T (scale * q)
 
     in fp32 throughout. `h` starts at `initial_state_source[idx]` (`[S, HV, V,
@@ -295,8 +295,8 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
                 q_t = q[b, t].float().repeat_interleave(rep, dim=0)  # [HV, K]
                 k_t = k[b, t].float().repeat_interleave(rep, dim=0)
                 if use_qk_l2norm_in_kernel:
-                    q_t = q_t / (q_t.square().sum(-1, keepdim=True).sqrt() + 1e-6)
-                    k_t = k_t / (k_t.square().sum(-1, keepdim=True).sqrt() + 1e-6)
+                    q_t = q_t / torch.sqrt(q_t.square().sum(-1, keepdim=True) + 1e-6)
+                    k_t = k_t / torch.sqrt(k_t.square().sum(-1, keepdim=True) + 1e-6)
                 q_t = q_t * scale
                 h = h * torch.exp(g[b, t].float())[:, None, None]
                 u = v[b, t].float() - (h * k_t[:, :, None]).sum(1)  # [HV, V]

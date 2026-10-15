@@ -194,8 +194,14 @@ class _Bench:
         chosen = chosen.to(torch.int32)
         for row in spec.get("pad", ()):
             chosen[row] = -1
+        live_rows = chosen >= 0
+        dup = tuple(spec.get("dup", ()))
+        if dup:
+            chosen[list(dup)] = int(chosen[dup[0]])
+            # The padding rows' shared slot is nobody's state: the bookkeeping never names it.
+            live_rows[list(dup)] = False
         self.state_indices = chosen.to(DEV)
-        self.live = self.state_indices[self.state_indices >= 0].clone()
+        self.live = self.state_indices[live_rows.to(DEV)].clone()
 
         # [slots, layers, HV, V, K]: each layer's state is a slot-strided view,
         # the affine layout whose strides the all-layer commit is handed.
@@ -384,9 +390,49 @@ def _deviation(got, want):
     return ((g - w).abs() / scale).max().item()
 
 
+def _check_duplicate_padding_slot(cell) -> None:
+    """The last rows of a batch share one slot, as CUDA-graph padding repeats the manager's
+    dummy slot: the rows on unique slots, and every slot but the shared one, are held to
+    the reference run on those rows alone -- the padding rows change nothing about them.
+    The shared slot's state and the padding rows' outputs are unspecified."""
+    bench = _Bench(cell.spec, seed=_seed(cell.why), exact=False)
+    dup = cell.spec["dup"]
+    unique = bench.n - len(dup)
+    assert dup == tuple(range(unique, bench.n)), "the padding rows trail the batch"
+    shared = int(bench.state_indices[unique])
+    assert (bench.state_indices[unique:] == shared).all()
+    assert shared not in bench.live.tolist()
+    others = torch.ones(bench.slots, dtype=torch.bool, device=DEV)
+    others[shared] = False
+    for _ in range(bench.steps):
+        for layer in range(bench.layers):
+            act = bench.inputs()
+            kw = bench.kwargs(layer, act)
+            alone = dict(
+                kw,
+                q=kw["q"][:unique],
+                k=kw["k"][:unique],
+                v=kw["v"][:unique],
+                g=kw["g"][:unique],
+                beta=kw["beta"][:unique],
+                state_indices=kw["state_indices"][:unique],
+                packed_qkv=act["packed"][: unique * bench.t],
+            )
+            ref = op.reference(**alone)
+            got = op(**kw)
+            pool, u, k, G = bench.state(layer)
+            _compare(
+                (got[:unique], pool[others], u[others], k[others], G[others]),
+                (ref[0], *(x[others] for x in ref[1:])),
+            )
+        bench.accept(bench.draw_acceptance())
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
+    if "dup" in cell.spec:
+        return _check_duplicate_padding_slot(cell)
     bench = _Bench(cell.spec, seed=_seed(cell.why))
     pad = list(cell.spec.get("pad", ()))
     wraps = appends = 0
@@ -717,6 +763,39 @@ def test_a_history_off_history_size_is_misread_and_is_refused() -> None:
     with pytest.raises(AssertionError, match="old_u has shape"):
         with validating(op):
             op(**dict(kw, history_size=12))
+
+
+@pytest.mark.parametrize(
+    "name, form",
+    (
+        ("history", "fewer slots"),
+        ("prev_num_accepted_tokens", "fewer slots"),
+        ("cache_buf_idx", "fewer slots"),
+        ("prev_num_accepted_tokens", "strided"),
+        ("cache_buf_idx", "strided"),
+    ),
+)
+def test_bookkeeping_that_does_not_cover_the_pool_is_refused(name, form) -> None:
+    """The kernel addresses the history buffers, `prev_num_accepted_tokens` and
+    `cache_buf_idx` by the pool's slot id: one with fewer slots than `ssm_states` is read and
+    written past its end for the slots beyond it, and a strided per-slot vector is read at the
+    wrong elements. Only the refusal runs; the unguarded call is out of bounds."""
+    bench = _Bench(dict(path="small", n=4, t=2, layers=1), seed=109, exact=False)
+    kw = bench.kwargs(0, bench.inputs())
+    last = bench.slots - 1
+    if name == "history":
+        kw = dict(kw, old_u=kw["old_u"][:last], old_k=kw["old_k"][:last], old_G=kw["old_G"][:last])
+        match = "history buffers have"
+    else:
+        vec = kw[name]
+        if form == "fewer slots":
+            kw[name] = vec[:last]
+        else:
+            kw[name] = torch.stack([vec, vec], 1)[:, 0]
+        match = f"{name} has shape"
+    with pytest.raises(AssertionError, match=match):
+        with validating(op):
+            op(**kw)
 
 
 def test_op_refuses_what_it_refuses() -> None:
