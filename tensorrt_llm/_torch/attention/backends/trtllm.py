@@ -2161,8 +2161,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         from tensorrt_llm.quantization import QuantMode
 
-        from ...pyexecutor.kv_cache.mixed_precision_view import \
-            MixedPrecisionCache
+        from .mixed_precision import MixedPrecisionCache
 
         staged = MixedPrecisionCache.create(
             metadata,
@@ -2184,7 +2183,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 raise NotImplementedError(
                     "Mixed-precision staging requires new K/V inputs")
             staged_meta = copy.copy(metadata)
-            staged_meta.kv_cache_manager = staged.view
+            staged_meta.kv_cache_manager = staged
             staged_meta.kv_cache_block_offsets = staged.block_offsets()
             staged_meta.use_paged_context_fmha = True
             staged_meta.fmha_plan_caches = {}

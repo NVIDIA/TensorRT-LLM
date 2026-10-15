@@ -594,7 +594,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         # FP8/NVFP4 KV caches use a low-precision context kernel even when the
         # projection output is FP16/BF16, so the FP16/BF16 fallbacks do not apply.
         has_low_precision_kv_cache = kv_cache_dtype in (DataType.FP8, DataType.NVFP4)
-        from ....pyexecutor.kv_cache.mixed_precision_view import AttentionCacheView
+        from ..mixed_precision import MixedPrecisionCache
 
         if (
             phase in (None, FmhaPhase.CONTEXT)
@@ -604,7 +604,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and attn.head_dim != 512
             and not has_q_only
             and meta.num_generations == 0
-            and not isinstance(meta.kv_cache_manager, AttentionCacheView)
+            and not isinstance(meta.kv_cache_manager, MixedPrecisionCache)
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.

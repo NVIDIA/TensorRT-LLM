@@ -8,7 +8,6 @@ backend writes new, post-RoPE K/V into that staging cache; writeback then stores
 both representations without quantizing the high copy through the low copy.
 """
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,39 +15,10 @@ import torch
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 
-from .mixed_precision_cache import MixedPrecisionKVCacheManager
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-
-
-@dataclass
-class AttentionCacheView:
-    """Backend-facing view of scratch storage, not another cache manager."""
-
-    pool: torch.Tensor
-    tokens_per_block: int
-    max_seq_len: int
-    layer_offsets: dict[int, int]
-    kv_cache_pool_pointers: torch.Tensor
-    kv_cache_pool_mapping: torch.Tensor
-    kv_layout: str
-    max_attention_window_vec: tuple[None, ...] = (None,)
-
-    @property
-    def dtype(self) -> DataType:
-        return torch_dtype_to_binding(self.pool.dtype)
-
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
-        if kv_layout != self.kv_layout:
-            return self.pool.transpose(2, 3)
-        return self.pool
-
-    def get_attention_op_num_blocks(self, local_layer_idx: int) -> int:
-        return self.pool.shape[0] * 2
-
-    def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
-        return 1
 
 
 class MixedPrecisionCache:
@@ -66,6 +36,8 @@ class MixedPrecisionCache:
     ) -> "MixedPrecisionCache | None":
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
+            return None
+        if manager.layer_offsets[layer_idx] not in manager.high_layers:
             return None
         if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
             raise NotImplementedError(
@@ -124,15 +96,12 @@ class MixedPrecisionCache:
         self.history_scale = (
             history_dequant_scale if self.history.dtype == torch.float8_e4m3fn else None
         )
-        self.view = AttentionCacheView(
-            self.pool,
-            self.stage_block_size,
-            self.manager.max_seq_len,
-            {layer_idx: 0},
-            torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64),
-            torch.zeros((1, 2), dtype=torch.int32),
-            self.layout,
-        )
+        self.tokens_per_block = self.stage_block_size
+        self.max_seq_len = self.manager.max_seq_len
+        self.layer_offsets = {layer_idx: 0}
+        self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
+        self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
+        self.max_attention_window_vec = (None,)
         for row, cached in enumerate(self.cached_lengths):
             if self.lengths[row] > len(self.history_ids[row]) * self.block_size:
                 raise ValueError("Mixed-precision history does not cover the requested KV length")
@@ -152,6 +121,19 @@ class MixedPrecisionCache:
                 if high_id < 0:
                     continue
                 target.copy_(self._tokens(self.high, high_id, offset, count))
+
+    @property
+    def dtype(self) -> DataType:
+        return torch_dtype_to_binding(self.pool.dtype)
+
+    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
+        return self.pool if kv_layout == self.layout else self.pool.transpose(2, 3)
+
+    def get_attention_op_num_blocks(self, local_layer_idx: int) -> int:
+        return self.pool.shape[0] * 2
+
+    def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
+        return 1
 
     def _tokens(self, pool: torch.Tensor, page: int, offset: int, count: int) -> torch.Tensor:
         if self.layout == "HND":

@@ -2854,8 +2854,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
-        from ...pyexecutor.kv_cache.mixed_precision_view import \
-            MixedPrecisionCache
+        from .mixed_precision import MixedPrecisionCache
 
         staged = MixedPrecisionCache.create(metadata, self.layer_idx, q.dtype)
         if staged is not None:
@@ -2866,7 +2865,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 raise NotImplementedError(
                     "Mixed-precision staging requires new K/V inputs")
             staged_meta = copy.copy(metadata)
-            staged_meta.kv_cache_manager = staged.view
+            staged_meta.kv_cache_manager = staged
             # Keep the native prepared row lengths, append positions and CSR
             # boundaries, replacing only the pages consumed by the wrappers.
             if list(metadata.num_blocks) != staged.page_counts:
