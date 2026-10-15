@@ -113,29 +113,33 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
             return None
         target_tables = self.glm_block_tables
         if self._glm_draft_block_tables is None:
-            self._glm_draft_block_tables = torch.zeros_like(target_tables)
-            self._glm_draft_block_tables_cpu = torch.zeros(
+            draft_tables = torch.zeros_like(target_tables)
+            draft_tables_cpu = torch.zeros(
                 target_tables.shape, dtype=torch.long, pin_memory=prefer_pinned()
             )
-        self.glm_block_tables = self._glm_draft_block_tables
-        saved_state = {"glm_block_tables": target_tables}
+            self._glm_draft_block_tables = draft_tables
+            self._glm_draft_block_tables_cpu = draft_tables_cpu
         # Recording a capture executes no kernels. Eager forwards and the
         # pre-replay call from the model engine refresh the tables.
         request_ids = attn_metadata.request_ids
         capturing = target_tables.is_cuda and torch.cuda.is_current_stream_capturing()
-        if capturing or request_ids is None:
-            return saved_state
-        batch = attn_metadata.seq_lens.shape[0]
-        pages = manager.get_batch_slot_tables(list(request_ids)[:batch])
-        staging = self._glm_draft_block_tables_cpu
-        staging[:batch].zero_()
-        width = staging.shape[1]
-        for row, page_ids in enumerate(pages):
-            if page_ids:
-                count = min(len(page_ids), width)
-                staging[row, :count].copy_(torch.as_tensor(page_ids[:count], dtype=torch.long))
-        self._glm_draft_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
-        return saved_state
+        if not capturing and request_ids is not None:
+            batch = attn_metadata.seq_lens.shape[0]
+            pages = manager.get_batch_slot_tables(list(request_ids)[:batch])
+            staging = self._glm_draft_block_tables_cpu
+            staging[:batch].zero_()
+            width = staging.shape[1]
+            for row, page_ids in enumerate(pages):
+                if len(page_ids) > width:
+                    raise RuntimeError(
+                        f"glm5_next draft slot-table row {row} has {len(page_ids)} pages, "
+                        f"exceeding buffer width {width}; captured CUDA graph buffers cannot grow"
+                    )
+                if page_ids:
+                    staging[row, : len(page_ids)].copy_(torch.as_tensor(page_ids, dtype=torch.long))
+            self._glm_draft_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
+        self.glm_block_tables = self._glm_draft_block_tables
+        return {"glm_block_tables": target_tables}
 
     def restore_after_draft_forward(
         self, attn_metadata: TrtllmAttentionMetadata, saved_state: dict | None

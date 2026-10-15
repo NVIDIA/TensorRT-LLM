@@ -36,7 +36,9 @@ from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from ..pyexecutor.llm_request import LlmRequest
+    from ..pyexecutor.resource_manager import KVCacheManager
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -167,8 +169,10 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
     return None
 
 
-def prepare_attn_metadata_for_draft_replay(attn_metadata,
-                                           draft_kv_cache_manager):
+def prepare_attn_metadata_for_draft_replay(
+    attn_metadata: AttentionMetadata,
+    draft_kv_cache_manager: "KVCacheManager | KVCacheManagerV2 | None",
+) -> dict[str, dict] | None:
     """
     Prepare attention metadata for a draft forward or CUDA graph replay when using a
     separate draft KV cache. Swaps cache-layout-dependent buffers, refreshes FlashMLA
@@ -189,34 +193,46 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     # Marks that a swap happened and carries the backend's state for its
     # restore hook; swap_for_draft records the originals on attn_metadata.
     saved = {}
-    if attn_metadata.enable_flash_mla:
-        if (attn_metadata.draft_block_ids_per_seq is None
-                or attn_metadata.draft_kv_block_ids_per_seq is None):
-            raise RuntimeError(
-                "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
-            )
-        attn_metadata.swap_for_draft('block_ids_per_seq',
-                                     attn_metadata.draft_block_ids_per_seq)
-        attn_metadata.swap_for_draft('kv_block_ids_per_seq',
-                                     attn_metadata.draft_kv_block_ids_per_seq)
-    attn_metadata.swap_for_draft('kv_cache_manager', draft_kv_cache_manager)
-    attn_metadata.swap_for_draft('kv_cache_block_offsets',
-                                 attn_metadata.draft_kv_cache_block_offsets)
-    attn_metadata.swap_for_draft(
-        'host_kv_cache_block_offsets',
-        draft_kv_cache_manager.host_kv_cache_block_offsets)
-    if attn_metadata.enable_flash_mla:
-        attn_metadata.prepare_flash_mla()
+    prepared = False
+    try:
+        if attn_metadata.enable_flash_mla:
+            if (attn_metadata.draft_block_ids_per_seq is None
+                    or attn_metadata.draft_kv_block_ids_per_seq is None):
+                raise RuntimeError(
+                    "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
+                )
+            attn_metadata.swap_for_draft('block_ids_per_seq',
+                                         attn_metadata.draft_block_ids_per_seq)
+            attn_metadata.swap_for_draft(
+                'kv_block_ids_per_seq',
+                attn_metadata.draft_kv_block_ids_per_seq)
+        attn_metadata.swap_for_draft('kv_cache_manager', draft_kv_cache_manager)
+        attn_metadata.swap_for_draft('kv_cache_block_offsets',
+                                     attn_metadata.draft_kv_cache_block_offsets)
+        attn_metadata.swap_for_draft(
+            'host_kv_cache_block_offsets',
+            draft_kv_cache_manager.host_kv_cache_block_offsets)
+        if attn_metadata.enable_flash_mla:
+            attn_metadata.prepare_flash_mla()
 
-    # Backends select any additional draft-forward state, such as native DSA
-    # indexer buffers or DeepSeek-V4 sparse tables and pool pointers.
-    backend_saved = attn_metadata.prepare_for_draft_forward()
-    if backend_saved is not None:
-        saved['saved_backend_state'] = backend_saved
-    return saved
+        # Backends select any additional draft-forward state, such as native DSA
+        # indexer buffers or DeepSeek-V4 sparse tables and pool pointers.
+        backend_saved = attn_metadata.prepare_for_draft_forward()
+        if backend_saved is not None:
+            saved['saved_backend_state'] = backend_saved
+        prepared = True
+        return saved
+    finally:
+        if not prepared:
+            attn_metadata.restore_draft_swaps()
+            if attn_metadata.enable_flash_mla:
+                attn_metadata._flash_mla_metadata_valid = False
 
 
-def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
+def restore_attn_metadata_after_draft_replay(
+    attn_metadata: TrtllmAttentionMetadata,
+    saved_state: dict[str, dict] | None,
+) -> None:
     """Restore attention metadata after draft replay. No-op if saved_state is None."""
     if saved_state is None:
         return
