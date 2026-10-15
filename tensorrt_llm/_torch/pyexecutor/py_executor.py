@@ -6208,6 +6208,11 @@ class PyExecutor:
             if self._can_pause_for_rebalance():
                 self._maybe_rebalance_kv_pools()
 
+            # Need to wait for the copy of previous iteration before
+            # modifying any host memory copied to GPU. The V2 scheduler
+            # modifies the host page table, so wait before scheduling.
+            self._wait_for_model_engine_input_copy()
+
             iter_start_time = time.time() if self.enable_iter_perf_stats else 0
             scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
             if scheduled_batch is None:
@@ -6305,6 +6310,11 @@ class PyExecutor:
 
             self._kv_connector_terminate_requests()
             self.iter_counter += 1
+
+            # Drain buffers from per-rank-divergent _process_previous_batch
+            # above; rank-symmetric companion to overlap loop's drain call.
+            self.disagg.handle_timeouts_synced()
+            self._flush_iter_stats_synced()
 
         try:
             with self._profiler() as profile_step, self.hang_detector:
