@@ -67,7 +67,8 @@ private:
             // --- Read raw scores and apply preprocess ---
             for (int ie = 0; ie < param.numExperts; ++ie)
             {
-                float score = static_cast<float>(bufferCast<T>(*this->mPtrScoresHost)[it * param.numExperts + ie]);
+                float score
+                    = static_cast<float>(this->mPtrScoresHost->template getBufferPtr<T>()[it * param.numExperts + ie]);
 
                 if (param.preprocessType == RoutingPreprocessType::Sigmoid)
                 {
@@ -78,7 +79,7 @@ private:
                 {
                     float sig = sigmoid_accurate(score);
                     sigmoidScores[ie] = sig;
-                    float bias = static_cast<float>(bufferCast<T>(*mPtrRoutingBiasHost)[ie]);
+                    float bias = static_cast<float>(mPtrRoutingBiasHost->getBufferPtr<T>()[ie]);
                     score = sig + bias;
                 }
 
@@ -168,16 +169,20 @@ private:
                 }
 
                 PackedType si{static_cast<T>(expIdx[ie].score), expIdx[ie].idx};
-                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
+                reinterpret_cast<PackedType*>(
+                    this->mPtrTopKPackedHost->template getBufferPtr<int8_t>())[it * param.topK + ie]
+                    = si;
                 if (param.useTopKAsInput)
                 {
-                    bufferCast<int32_t>(*this->mPtrTopKIdsHost)[it * param.topK + ie]
+                    this->mPtrTopKIdsHost->template getBufferPtr<int32_t>()[it * param.topK + ie]
                         = static_cast<int32_t>(expIdx[ie].idx);
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(expIdx[ie].score);
+                    this->mPtrTopKWeightsHost->template getBufferPtr<T>()[it * param.topK + ie]
+                        = static_cast<T>(expIdx[ie].score);
                 }
                 else if (param.getExpWeights)
                 {
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(expIdx[ie].score);
+                    this->mPtrTopKWeightsHost->template getBufferPtr<T>()[it * param.topK + ie]
+                        = static_cast<T>(expIdx[ie].score);
                 }
             }
         }
@@ -208,14 +213,14 @@ protected:
             // Raw-score paths must initialize both count regions themselves. A
             // nonzero device sentinel makes the cooperative-path tests catch
             // any accidental dependency on allocator contents.
-            TLLM_CUDA_CHECK(cudaMemsetAsync(bufferCast<int32_t>(*this->mPtrExpertCountsDevice), 0x7F,
+            TLLM_CUDA_CHECK(cudaMemsetAsync(this->mPtrExpertCountsDevice->template getBufferPtr<int32_t>(), 0x7F,
                 this->mPtrExpertCountsDevice->getSizeInBytes(), this->mStream->get()));
         }
 
         // Initialize routing bias with small random values
         if (param.preprocessType == RoutingPreprocessType::SigmoidBias)
         {
-            T* biasPtr = bufferCast<T>(*mPtrRoutingBiasHost);
+            T* biasPtr = mPtrRoutingBiasHost->getBufferPtr<T>();
             initData(biasPtr, param.numExperts, mSeed + 7);
             mBufferManager->copy(*mPtrRoutingBiasHost, *mPtrRoutingBiasDevice);
         }
@@ -245,7 +250,7 @@ protected:
         // Set routing bias and scale when using SigmoidBias preprocess
         if (param.preprocessType == RoutingPreprocessType::SigmoidBias)
         {
-            routingData.mPtrRoutingBias = bufferCast<T>(*mPtrRoutingBiasDevice);
+            routingData.mPtrRoutingBias = mPtrRoutingBiasDevice->getBufferPtr<T>();
             // Bias dtype matches T (the test's type parameter)
             routingData.mDtypeBias = (sizeof(T) == 4) ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
             routingData.mRouteScale = param.routedScalingFactor;
@@ -253,7 +258,7 @@ protected:
 
         if (param.useTopKAsInput)
         {
-            routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrTopKIds = this->mPtrTopKIdsDevice->template getBufferPtr<int32_t>();
             routingData.mPtrScores = nullptr;
         }
         else if (param.useTopKPackedAsInput)
@@ -265,7 +270,7 @@ protected:
         else
         {
             routingData.mPtrTopKIds = nullptr;
-            routingData.mPtrScores = bufferCast<T>(*this->mPtrScoresDevice);
+            routingData.mPtrScores = this->mPtrScoresDevice->template getBufferPtr<T>();
         }
     }
 
@@ -1448,7 +1453,7 @@ TYPED_TEST(RoutingCustomKernelTest, MiniMax2MixedBiasDtype)
         = this->mBufferManager->pinned(ITensor::makeShape({param.numExperts}), TRTDataType<OtherT>::value);
     auto otherBiasDevice
         = this->mBufferManager->gpu(ITensor::makeShape({param.numExperts}), TRTDataType<OtherT>::value);
-    auto otherBiasPtr = bufferCast<OtherT>(*otherBiasHost);
+    auto otherBiasPtr = otherBiasHost->template getBufferPtr<OtherT>();
     for (int i = 0; i < param.numExperts; i++)
     {
         otherBiasPtr[i] = static_cast<OtherT>(0.01f * (i % 100));
@@ -1464,8 +1469,8 @@ TYPED_TEST(RoutingCustomKernelTest, MiniMax2MixedBiasDtype)
     routingData.mPreprocessType = param.preprocessType;
     routingData.mPostprocessType = param.postprocessType;
     routingData.mNormTopkProb = param.normTopkProb;
-    routingData.mPtrScores = bufferCast<TypeParam>(*this->mPtrScoresDevice);
-    routingData.mPtrRoutingBias = bufferCast<OtherT>(*otherBiasDevice);
+    routingData.mPtrScores = this->mPtrScoresDevice->template getBufferPtr<TypeParam>();
+    routingData.mPtrRoutingBias = otherBiasDevice->template getBufferPtr<OtherT>();
     routingData.mDtypeBias = (sizeof(OtherT) == 4) ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     routingData.mRouteScale = param.routedScalingFactor;
 
