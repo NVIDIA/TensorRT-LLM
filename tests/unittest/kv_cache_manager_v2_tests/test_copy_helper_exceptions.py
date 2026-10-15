@@ -42,6 +42,13 @@ DEFAULT_STREAM = 0
     ["copy_host_to_device", "copy_device_to_host", "copy_device_to_device"],
 )
 def test_copy_helper_raises_on_unaligned_byte_count(helper_name: str) -> None:
+    if helper_name != "copy_device_to_device" and copy_helpers.use_copy_engine_for_host_copy(
+        UNALIGNED_NUM_BYTES
+    ):
+        pytest.skip(
+            "the copy engines accept any byte count; the kernel-only rejection is not reachable in "
+            "this process (TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES selects them for this size)"
+        )
     helper = getattr(copy_helpers, helper_name)
     with pytest.raises(Exception, match="multiple of 16"):
         helper(TASKS, UNALIGNED_NUM_BYTES, DEFAULT_STREAM)
