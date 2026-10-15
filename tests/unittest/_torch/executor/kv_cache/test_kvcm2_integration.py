@@ -1365,6 +1365,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._kv_reserve_draft_tokens = 4
     manager._effective_draft_len = Mock(return_value=2)
     manager.kv_compression_manages_history = False
@@ -1374,6 +1375,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
     assert manager._allocated_draft_lens[request.py_request_id] == 4
+    assert manager._inflight_draft_lens[request.py_request_id] == [4]
 
     batch = ScheduledRequests()
     batch.generation_requests.append(request)
@@ -1385,6 +1387,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     assert kv_cache.resize.call_args_list[1].args == (103, 102)
     assert request.py_request_id not in manager._allocated_draft_lens
+    assert request.py_request_id not in manager._inflight_draft_lens
 
 
 def _revert_context_request(request_id: int) -> SimpleNamespace:
@@ -1612,7 +1615,7 @@ class _ContextRequest:
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
-    py_connector_served_position: int = 0
+    py_served_prefix_end: int = 0
     py_num_connector_matched_tokens: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
@@ -2938,10 +2941,13 @@ def _make_fresh_fill_manager(
     monkeypatch: pytest.MonkeyPatch,
     fill_value: float | None = _FRESH_FILL,
 ) -> KVCacheManagerV2:
-    # The production path synchronises so the fill lands before the forward
-    # pass; these tests run on CPU tensors.
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    # These tests use CPU tensors and an explicit stream double; a device-wide wait is forbidden.
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", Mock(side_effect=AssertionError("device-wide fill sync"))
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock(return_value=Mock()))
     manager = object.__new__(KVCacheManagerV2)
+    manager._stream = SimpleNamespace(device=torch.device("cuda:0"))
     manager._fresh_page_fill = fill_value
     manager._fresh_pages_filled = {}
     manager._fresh_fill_announced = True
@@ -2962,11 +2968,29 @@ def test_fresh_fill_covers_pages_on_allocation(monkeypatch: pytest.MonkeyPatch) 
     buffer = torch.zeros(8, 2)
     kv_cache = _FreshFillKVCache([2, 5])
     manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+    other_buffer = torch.zeros_like(buffer)
+    manager.pp_layers = [0, 1]
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager.layer_to_pool_mapping_dict = {0: 0, 1: 0}
+    manager.get_buffers = lambda layer_idx: (buffer, other_buffer)[layer_idx]
+    order = Mock()
+    order.attach_mock(torch.cuda.current_stream.return_value, "stream")
+    fill = Mock(wraps=kv_cache_v2_module._fill_kv_pages)
+    monkeypatch.setattr(kv_cache_v2_module, "_fill_kv_pages", fill)
+    order.attach_mock(fill, "fill")
 
     manager._fill_fresh_kv_pages(1)
+    torch.cuda.current_stream.assert_called_once_with(device=manager._stream.device)
+    assert order.mock_calls == [
+        call.stream.wait_stream(manager._stream),
+        call.fill(buffer, [2, 5], _FRESH_FILL),
+        call.fill(other_buffer, [2, 5], _FRESH_FILL),
+        call.stream.synchronize(),
+    ]
     assert torch.equal(buffer[2], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[0], torch.zeros(2))
+    assert torch.equal(other_buffer, buffer)
 
     # The owner writes its KV into page 2; growing by one page must fill only
     # the new page, not rewrite what the owner already stored.
@@ -2975,6 +2999,12 @@ def test_fresh_fill_covers_pages_on_allocation(monkeypatch: pytest.MonkeyPatch) 
     manager._fill_fresh_kv_pages(1)
     assert torch.equal(buffer[6], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[2], torch.full((2,), 1.5))
+    assert order.mock_calls[-4:] == [
+        call.stream.wait_stream(manager._stream),
+        call.fill(buffer, [6], _FRESH_FILL),
+        call.fill(other_buffer, [6], _FRESH_FILL),
+        call.stream.synchronize(),
+    ]
 
 
 def test_fresh_fill_skips_committed_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3002,6 +3032,7 @@ def test_fresh_fill_disabled_or_unknown_request_is_a_noop(
     manager._fresh_page_fill = _FRESH_FILL
     manager._fill_fresh_kv_pages(99)
     assert torch.equal(buffer, torch.zeros(4, 2))
+    torch.cuda.current_stream.assert_not_called()
 
 
 def test_fresh_fill_refills_page_reassigned_after_release(

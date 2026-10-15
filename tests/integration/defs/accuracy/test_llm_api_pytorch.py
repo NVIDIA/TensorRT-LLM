@@ -229,7 +229,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
-            use_kv_cache_manager_v2=False,
         )
         # Keep the TP=1 worker in this process so the call counter observes the
         # real PrimTS launch. Compile Inductor kernels synchronously because its
@@ -7493,6 +7492,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             overlap_scheduler=True,
             fuse_qkv_index_projection=fuse_qkv_index_projection,
             eval_mode="default",
+            kv_dtype="nvfp4",
             piecewise=True)
 
     def _run_nvfp4_eagle3(self,

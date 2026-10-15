@@ -73,7 +73,7 @@ class Fp4MlaFmha(PhasedFmha):
     ) -> bool:
         # Mask/output formats and the attention phase are represented in the cache key.
         # K/V presence is fixed per phase; optional features and pools are instance invariants.
-        del q, phase
+        del phase
         if forward_args.output_sf is not None:
             raise NotImplementedError("FP4 MLA does not support quantized attention output.")
         if forward_args.attention_mask != PredefinedAttentionMask.CAUSAL:
@@ -122,6 +122,22 @@ class Fp4MlaFmha(PhasedFmha):
         elif attention_input_type == AttentionInputType.generation_only:
             if k is not None or v is not None:
                 raise RuntimeError("FP4 MLA generation expects a fused query input.")
+            # Helix combines the per-rank partial outputs with these stats, so a
+            # Helix generation without them would combine uninitialized memory.
+            if getattr(metadata, "helix_position_offsets", None) is not None:
+                softmax_stats = forward_args.softmax_stats_tensor
+                expected_shape = (q.shape[0], self.attn.num_heads, 2)
+                if softmax_stats is None:
+                    raise RuntimeError("FP4 MLA Helix requires softmax_stats_tensor.")
+                if (
+                    softmax_stats.shape != expected_shape
+                    or softmax_stats.dtype != torch.float32
+                    or not softmax_stats.is_contiguous()
+                ):
+                    raise ValueError(
+                        "FP4 MLA Helix requires contiguous float32 softmax stats "
+                        f"with shape {expected_shape}."
+                    )
         else:
             raise NotImplementedError("FP4 MLA requires a context-only or generation-only call.")
         return True
