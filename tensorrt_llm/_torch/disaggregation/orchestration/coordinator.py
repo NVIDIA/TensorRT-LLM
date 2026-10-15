@@ -341,10 +341,12 @@ class DisaggTransferCoordinator:
         per request, and a client cancel or a transfer timeout retires a request
         rank-locally, so one CP rank can have room before its peer. The pp=1
         loops call this on every rank every iteration; the dropped requests give
-        back their V2 KV and are retried on a later iteration. A request passes
-        the intersection only if attention-DP routed it to the same DP rank on
-        every CP rank, which ``ADPRouter.gather_all_rank_states`` arranges
-        under helix.
+        back their V2 KV and are retried on a later iteration. Under
+        attention-DP, a request passes the intersection only if every CP rank
+        routed it to the same DP rank. ``ADPRouter.gather_all_rank_states``
+        gives the CP ranks the same loads. ``ADPRouter.create`` does not build
+        ``KVCacheAwareADPRouter`` under helix CP, because each CP rank probes
+        its own prefix matches and they can differ.
         """
         if self._dist.cp_size == 1:
             return admitted
