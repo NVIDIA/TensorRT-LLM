@@ -168,6 +168,56 @@ def test_a_second_warmup_on_another_pool_is_planned_too():
     assert not provider.plan_all(), "launch classes planned twice"
 
 
+def test_helper_compiles_every_planned_decode_kernel(tmp_path):
+    """The CPU-only Triton helper imports a kernel's module with stand-ins for
+    the rest of tensorrt_llm; every kernel the decode provider plans (also the
+    cache manager's state promote) must compile there."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager as mcm
+
+    buf = _Buffers()
+    jpd._RECORDS.clear()
+    jpd.start_recording()
+    try:
+        buf.ssu(0, 4)
+        buf.conv(0, 4)
+        dst = torch.zeros(2, CACHE, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        inter = torch.zeros(2, MAX_ROWS, 4, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        rows = buf.state_indices[:4]
+        mcm._promote_mamba_state_triton(dst, inter, rows, rows, rows)
+        torch.cuda.synchronize()
+    finally:
+        jpd.stop_recording()
+    assert set(jpd.recorded_launchers()) == {
+        "selective_state_update",
+        "causal_conv1d_update",
+        "_promote_mamba_state_triton",
+    }
+    specs, names = [], set()
+    for call in jpd.MambaDecodeProvider(max_batch_size=MAX_ROWS).plan_all():
+        variants, _ = jp._expand(call)
+        jit_fn, _, _ = jp._unwrap_jit(call.fn)
+        found = jp._lookup_or_serialize(jit_fn, call.args, variants[0])
+        if found is not None and jit_fn.fn.__name__ not in names:
+            names.add(jit_fn.fn.__name__)
+            specs.append(found[1])
+    assert "_promote_mamba_state_kernel" in names, names
+    helper = os.path.join(os.path.dirname(os.path.abspath(jp.__file__)), "jit_prefetch_helper.py")
+    pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(jp.__file__))))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1",
+               TRITON_CACHE_DIR=str(tmp_path))  # fmt: skip
+    env.pop("PYTHONPATH", None)
+    lines = "".join(json.dumps({"tag": i, "spec": s}) + "\n" for i, s in enumerate(specs))
+    out = subprocess.run([sys.executable, "-u", helper, pkg_root], input=lines,
+                         capture_output=True, text=True, env=env, timeout=600).stdout  # fmt: skip
+    replies = [json.loads(line) for line in out.splitlines()][1:]
+    assert len(replies) == len(specs) and all(r["ok"] for r in replies), replies
+
+
 def test_recording_stops_and_restores_launchers():
     from tensorrt_llm._torch.modules.mamba import selective_state_update as ssu
 
