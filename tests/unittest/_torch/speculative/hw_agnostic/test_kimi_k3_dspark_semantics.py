@@ -891,17 +891,26 @@ def _run_paged_block_decode(drafter, requests):
 
 @needs_dflash_trtllm_gen
 @pytest.mark.parametrize(
-    "batch_size,kernel",
-    [(1, "decode_rows"), (2, "context")],
-    ids=["decode_rows", "context"],
+    "batch_size,rows_max_batch_size,kernel",
+    [(1, None, "decode_rows"), (2, None, "decode_rows"), (2, 1, "context")],
+    ids=["decode_rows_b1", "decode_rows_b2", "context"],
 )
-def test_plain_dflash_trtllm_block_decode_matches_full_attention_reference(batch_size, kernel):
+def test_plain_dflash_trtllm_block_decode_matches_full_attention_reference(
+    batch_size, rows_max_batch_size, kernel, monkeypatch
+):
     """Both TRTLLM forms of the non-causal, unwindowed block attention match
-    the eager reference: single-query decode rows at batch 1, one context-FMHA
-    call above it. Counting the kernel calls keeps a silent fallback from
-    passing the parity check for the wrong form."""
+    the eager reference: single-query decode rows up to the batch ceiling, one
+    context-FMHA call above it (forced here by lowering the ceiling). Counting
+    the kernel calls keeps a silent fallback from passing the parity check for
+    the wrong form."""
     from dataclasses import replace
 
+    from tensorrt_llm._torch.models import modeling_dflash
+
+    if rows_max_batch_size is not None:
+        monkeypatch.setattr(
+            modeling_dflash, "_NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE", rows_max_batch_size
+        )
     weights = _tiny_weights()
     drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
     calls = {"decode_rows": 0, "context": 0}

@@ -32,9 +32,11 @@ from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, reg
 # Largest draft batch whose non-causal, unwindowed TRTLLM block attention runs
 # as B * block_size single-query decode rows instead of one context-FMHA call.
 # Every row reads its request's whole KV, so the row form trades block_size
-# times the KV traffic for split-KV parallelism; that only pays off while the
-# context kernel leaves most of the GPU idle.
-_NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE = 1
+# times the KV traffic for split-KV parallelism. The context kernel launches
+# few CTAs at small batch, so the rows stay ahead up to at least B = 32 (the
+# largest batch measured); the cap also bounds the workspace and counter
+# buffers, which are sized for B * block_size requests below it.
+_NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE = 32
 
 
 def dspark_layer_window_size(
