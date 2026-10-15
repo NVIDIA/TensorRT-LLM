@@ -245,7 +245,8 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
         # Stop the MPI Comm server
-        run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
+        stop_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_llmapi_mpi_stop.py"
+        run_child_command python3 "$stop_path"
         mpi_exit_code=$?
         log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
 

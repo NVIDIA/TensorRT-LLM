@@ -229,6 +229,14 @@ The following tips typically assist new LLM API users who are familiar with othe
 
   This limitation is applicable for multi-GPU inference only.
 
+### Remote MPI shutdown
+
+After the task exits, `trtllm-llmapi-launch` sends the authenticated stop request
+with a standalone helper. The helper imports `pyzmq`, but does not import
+TensorRT-LLM or initialize MPI. Its send waits up to five seconds for a connected
+peer, with at most one second of socket linger afterward. These socket limits
+do not bound Python startup or the server's shutdown.
+
 ### Unified compiled-artifact cache
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
