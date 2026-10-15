@@ -30,10 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MapperKind,
     PoolView,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import (
-    find_replicated_role_mismatch,
-    get_pool_view_global_layer_ids,
-)
+from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -637,41 +634,3 @@ class MambaPolicy:
         else:
             ratio = self_tp // peer_tp
             return (self_rank // ratio) == peer_rank
-
-
-def mamba_receiver_payload_bytes(
-    sender_page_table: KVCachePageTable,
-    receiver_page_table: KVCachePageTable,
-    dst_slot: Optional[int],
-) -> int:
-    """Recurrent-state bytes that will land in the receiver's slot.
-
-    Receiver-local invariant: regardless of the sender-side shard pairing,
-    the slot receives exactly the receiver's own per-layer slot bytes over
-    the overlapping mamba layers.  This avoids the RankInfoServer rank-0
-    limitation that makes sender-side simulation return 0 for non-rank-0
-    receivers.
-    """
-    if dst_slot is None:
-        return 0
-    sender_mlg = MambaPolicy._find_mamba_layer_group(sender_page_table)
-    receiver_mlg = MambaPolicy._find_mamba_layer_group(receiver_page_table)
-    if sender_mlg is None or receiver_mlg is None:
-        return 0
-
-    sender_views = {
-        (pool_view.pool_role, pool_view.mapper_kind): pool_view
-        for pool_view in sender_mlg.pool_views
-    }
-    total = 0
-    for receiver_view in receiver_mlg.pool_views:
-        sender_view = sender_views.get((receiver_view.pool_role, receiver_view.mapper_kind))
-        if sender_view is None:
-            continue
-        sender_layers = set(get_pool_view_global_layer_ids(sender_view, sender_mlg))
-        receiver_layers = set(get_pool_view_global_layer_ids(receiver_view, receiver_mlg))
-        overlap = sender_layers & receiver_layers
-        if not overlap:
-            continue
-        total += len(overlap) * receiver_view.bytes_per_layer
-    return total
