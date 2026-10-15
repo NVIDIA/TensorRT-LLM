@@ -1460,21 +1460,25 @@ def test_the_tune_entry_starts_a_fresh_workspace_at_tune(tmp_path, task_file, mo
     import agent_flow.workflows.staircase_onboard.tune.stage as stage
 
     seen = []
-    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: seen.append(state.stage) or "tuned")
+    monkeypatch.setattr(
+        stage, "run_tune_phase", lambda wf, state, log: seen.append(state.stage) or "tuned"
+    )
     workflow = _workflow(tmp_path, entry_stage="tune")
     calls = _install(monkeypatch, workflow, Script(None))
     with workflow:
         workflow.run(_with_perf(task_file))
     state = load_state(tmp_path / "ws" / ".staircase_onboard_state.json")
     assert seen == ["tune"] and state.done and state.verdict == "tuned"
-    assert [name for name, _ in calls] == []      # no onboarding role ran
+    assert [name for name, _ in calls] == []  # no onboarding role ran
     assert state.tune.get("entry") == "standalone"
 
 
 def test_the_tune_entry_honors_dry_run(tmp_path, task_file, monkeypatch):
     import agent_flow.workflows.staircase_onboard.tune.stage as stage
 
-    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: pytest.fail("measured under --dry-run"))
+    monkeypatch.setattr(
+        stage, "run_tune_phase", lambda wf, state, log: pytest.fail("measured under --dry-run")
+    )
     workflow = _workflow(tmp_path, entry_stage="tune", dry_run=True)
     _install(monkeypatch, workflow, Script(None))
     with workflow:
@@ -1487,7 +1491,9 @@ def test_perf_enabled_chains_tune_after_delivery(tmp_path, task_file, monkeypatc
     import agent_flow.workflows.staircase_onboard.tune.stage as stage
 
     seen = []
-    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: seen.append("tune") or "tuned")
+    monkeypatch.setattr(
+        stage, "run_tune_phase", lambda wf, state, log: seen.append("tune") or "tuned"
+    )
     workflow = _workflow(tmp_path)
     script = Script(None)
     calls = _install(monkeypatch, workflow, script)
@@ -1511,21 +1517,35 @@ def test_perf_enabled_chains_tune_after_delivery(tmp_path, task_file, monkeypatc
 def test_a_delivered_run_is_re_entered_at_tune(tmp_path, task_file, monkeypatch):
     import agent_flow.workflows.staircase_onboard.tune.stage as stage
     from agent_flow.workflows.staircase_onboard.state import WorkflowState, save_state
-
     from agent_flow.workflows.staircase_onboard.task_schema import assembly_units
 
     ws = tmp_path / "ws"
     ws.mkdir()
     task = _with_perf(task_file)
     units = list(assembly_units(yaml.safe_load(task.read_text())))
-    save_state(ws / ".staircase_onboard_state.json",
-               WorkflowState(task_path=str(ws / "task.yaml"), stage="deliver", done=True, verdict="delivered",
-                             units_done=units, tune={"phase": "done", "misses": 3, "kept": ["a"]}))
+    save_state(
+        ws / ".staircase_onboard_state.json",
+        WorkflowState(
+            task_path=str(ws / "task.yaml"),
+            stage="deliver",
+            done=True,
+            verdict="delivered",
+            units_done=units,
+            tune={"phase": "done", "misses": 3, "kept": ["a"]},
+        ),
+    )
     seen = []
-    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: seen.append(dict(state.tune)) or "tuned")
+    monkeypatch.setattr(
+        stage, "run_tune_phase", lambda wf, state, log: seen.append(dict(state.tune)) or "tuned"
+    )
     workflow = _workflow(tmp_path, entry_stage="tune")
     calls = _install(monkeypatch, workflow, Script(None))
     with workflow:
         workflow.run(task)
     assert [name for name, _ in calls] == []
-    assert seen and seen[0]["misses"] == 0 and seen[0]["kept"] == ["a"] and seen[0]["phase"] == "campaign"
+    assert (
+        seen
+        and seen[0]["misses"] == 0
+        and seen[0]["kept"] == ["a"]
+        and seen[0]["phase"] == "campaign"
+    )

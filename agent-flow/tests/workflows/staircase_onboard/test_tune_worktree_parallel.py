@@ -3,14 +3,16 @@
 """Candidate worktrees are registered under the repo lock and checked out side by side."""
 
 import subprocess
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
 
 
 def _git(cwd, *args):
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 def test_candidates_open_in_parallel_with_their_files(tmp_path):
@@ -25,7 +27,11 @@ def test_candidates_open_in_parallel_with_their_files(tmp_path):
     _git(repo, "commit", "-qm", "base")
     slugs = [f"cand-{i}" for i in range(4)]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        trees = list(pool.map(lambda s: open_candidate(repo, tmp_path / "wt", s, "HEAD", prefix="tune/run"), slugs))
+        trees = list(
+            pool.map(
+                lambda s: open_candidate(repo, tmp_path / "wt", s, "HEAD", prefix="tune/run"), slugs
+            )
+        )
     for slug, tree in zip(slugs, trees):
         assert (tree / "f19.py").read_text() == "X = 19\n"
         assert _git(tree, "status", "--porcelain") == ""
@@ -33,8 +39,10 @@ def test_candidates_open_in_parallel_with_their_files(tmp_path):
 
 
 def test_a_half_created_worktree_is_rebuilt(tmp_path):
-    """An orchestrator stopped mid `git worktree add` leaves the tree locked 'initializing' with no
-    index; the next open rebuilds it instead of handing a tuner an empty checkout."""
+    """An orchestrator stopped mid `git worktree add` leaves the tree locked 'initializing' with no index.
+
+    The next open rebuilds it instead of handing a tuner an empty checkout.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q")

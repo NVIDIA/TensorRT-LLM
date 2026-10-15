@@ -367,12 +367,19 @@ def test_the_watchdog_returns_on_the_first_alert(tmp_path):
 
 
 def test_a_process_that_escaped_the_jobs_session_is_reaped(spool, clock, tmp_path):
-    """nsys profile setsid()s itself and the server it launches; once the job's leader
-    exits they are re-parented to init and were never killed, holding the GPU for every
-    later job (observed 2026-10-12 on a GB300 session)."""
+    """Nsys profile setsid()s itself and the server it launches.
+
+    Once the job's leader exits they are re-parented to init and were never killed, holding
+    the GPU for every later job (observed 2026-10-12 on a GB300 session).
+    """
     pidfile = tmp_path / "escaped.pid"
     sched = make(spool, clock)
-    submit(spool, "escapes", f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 300' & sleep 0.5; exit 0", header="gpus=1")
+    submit(
+        spool,
+        "escapes",
+        f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 300' & sleep 0.5; exit 0",
+        header="gpus=1",
+    )
     pump(sched, lambda: pidfile.exists() and pidfile.read_text().strip())
     escaped = int(pidfile.read_text().strip())
     pump(sched, lambda: rc(spool, "escapes") is not None)

@@ -13,8 +13,8 @@ from agent_flow.workflows.staircase_onboard.tune.ladder import (
     BenchSpec,
     Ladder,
     Rung,
-    default_rungs,
     deep_merge,
+    default_rungs,
 )
 from agent_flow.workflows.staircase_onboard.tune.records import Measurement, NoiseFloor, compare
 
@@ -55,11 +55,25 @@ class FakeRunner:
             d = self.data / label
             d.mkdir(parents=True, exist_ok=True)
             rows = [
-                {"concurrency": 1, "tok_s_user": lat, "output_tok_s_gpu": lat, "mean_tpot_ms": 1000 / lat, "mean_ttft_ms": 200},
-                {"concurrency": 128, "tok_s_user": thr / 128, "output_tok_s_gpu": thr, "mean_tpot_ms": 50, "mean_ttft_ms": 4000},
+                {
+                    "concurrency": 1,
+                    "tok_s_user": lat,
+                    "output_tok_s_gpu": lat,
+                    "mean_tpot_ms": 1000 / lat,
+                    "mean_ttft_ms": 200,
+                },
+                {
+                    "concurrency": 128,
+                    "tok_s_user": thr / 128,
+                    "output_tok_s_gpu": thr,
+                    "mean_tpot_ms": 50,
+                    "mean_ttft_ms": 4000,
+                },
             ]
             (d / "summary.json").write_text(json.dumps(rows))
-            (d / "meta.json").write_text(json.dumps({"label": label, "modeling_v2": "require", "tree": {}}))
+            (d / "meta.json").write_text(
+                json.dumps({"label": label, "modeling_v2": "require", "tree": {}})
+            )
             del self.inflight[name]
             done.append((label, spool, 0))
         return done
@@ -84,14 +98,33 @@ def _effect(config: dict, label: str):
 def _ladder(tmp_path: Path, rungs):
     base = tmp_path / "identity.yaml"
     base.write_text(yaml.safe_dump({"modeling_v2": "require", "max_batch_size": 128}))
-    bench = BenchSpec(bench_py="bench.py", model="m", env_script="env.sh", isl=8192, osl=1024, concurrencies=[1, 128], tree=".")
+    bench = BenchSpec(
+        bench_py="bench.py",
+        model="m",
+        env_script="env.sh",
+        isl=8192,
+        osl=1024,
+        concurrencies=[1, 128],
+        tree=".",
+    )
     runner = FakeRunner(["s1", "s2", "s3"], tmp_path / "work" / "data", _effect)
-    ladder = Ladder(workdir=tmp_path / "work", base_configs=[base], rungs=rungs, bench=bench, runner=runner, log=lambda m: None)
+    ladder = Ladder(
+        workdir=tmp_path / "work",
+        base_configs=[base],
+        rungs=rungs,
+        bench=bench,
+        runner=runner,
+        log=lambda m: None,
+    )
     return ladder, runner
 
 
 def test_ladder_keeps_winners_and_stops(tmp_path):
-    rungs = [r for r in default_rungs() if r.name in ("cg-padding", "cg-dense", "in-graph-sampling", "mnt-2x", "gc-gen0-100k")]
+    rungs = [
+        r
+        for r in default_rungs()
+        if r.name in ("cg-padding", "cg-dense", "in-graph-sampling", "mnt-2x", "gc-gen0-100k")
+    ]
     ladder, runner = _ladder(tmp_path, rungs)
     for _ in range(50):
         if not ladder.step():
@@ -105,7 +138,10 @@ def test_ladder_keeps_winners_and_stops(tmp_path):
     final = yaml.safe_load((tmp_path / "work" / "ladder_final.yaml").read_text())
     assert final["cuda_graph_config"] == {"enable_padding": True, "max_batch_size": 128}
     assert final["enable_in_graph_sampling"] is True
-    kinds = [json.loads(l)["kind"] for l in (tmp_path / "work" / "perf_ledger.jsonl").read_text().splitlines()]
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (tmp_path / "work" / "perf_ledger.jsonl").read_text().splitlines()
+    ]
     assert "noise_floor" in kinds and "ladder_combine" in kinds and kinds[-1] == "ladder_done"
 
 
@@ -139,10 +175,26 @@ def test_keep_rule_scales_with_noise(tmp_path):
     def m(label, lat, thr):
         d = tmp_path / label
         d.mkdir()
-        (d / "summary.json").write_text(json.dumps([
-            {"concurrency": 1, "tok_s_user": lat, "output_tok_s_gpu": lat, "mean_tpot_ms": 1, "mean_ttft_ms": 1},
-            {"concurrency": 128, "tok_s_user": thr / 128, "output_tok_s_gpu": thr, "mean_tpot_ms": 1, "mean_ttft_ms": 1},
-        ]))
+        (d / "summary.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "concurrency": 1,
+                        "tok_s_user": lat,
+                        "output_tok_s_gpu": lat,
+                        "mean_tpot_ms": 1,
+                        "mean_ttft_ms": 1,
+                    },
+                    {
+                        "concurrency": 128,
+                        "tok_s_user": thr / 128,
+                        "output_tok_s_gpu": thr,
+                        "mean_tpot_ms": 1,
+                        "mean_ttft_ms": 1,
+                    },
+                ]
+            )
+        )
         (d / "meta.json").write_text(json.dumps({"label": label}))
         return Measurement.load(d)
 
@@ -155,8 +207,10 @@ def test_keep_rule_scales_with_noise(tmp_path):
 
 
 def test_probes_are_judged_against_their_own_host(tmp_path):
-    """GB300 nodes differed by 4% at the latency end for identical configs; a no-op rung
-    measured on the slow node was judged a LOSS against the fast node's control."""
+    """GB300 nodes differed by 4% at the latency end for identical configs.
+
+    A no-op rung measured on the slow node was judged a LOSS against the fast node's control.
+    """
     spools = []
     for name, host in (("s1", "fast"), ("s2", "slow")):
         d = tmp_path / name
@@ -183,11 +237,28 @@ def test_probes_are_judged_against_their_own_host(tmp_path):
 
     base = tmp_path / "identity.yaml"
     base.write_text(yaml.safe_dump({"modeling_v2": "require"}))
-    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=".")
+    bench = BenchSpec(
+        bench_py="b",
+        model="m",
+        env_script="e",
+        isl=8192,
+        osl=1024,
+        concurrencies=[1, 128],
+        tree=".",
+    )
     runner = HostRunner(spools, tmp_path / "work" / "data", lambda config, label: (100.0, 2000.0))
-    rungs = [Rung("noop-a", {"garbage_collection_gen0_threshold": 1}, "no effect"),
-             Rung("noop-b", {"stream_interval": 1}, "no effect")]
-    ladder = Ladder(workdir=tmp_path / "work", base_configs=[base], rungs=rungs, bench=bench, runner=runner, log=lambda m: None)
+    rungs = [
+        Rung("noop-a", {"garbage_collection_gen0_threshold": 1}, "no effect"),
+        Rung("noop-b", {"stream_interval": 1}, "no effect"),
+    ]
+    ladder = Ladder(
+        workdir=tmp_path / "work",
+        base_configs=[base],
+        rungs=rungs,
+        bench=bench,
+        runner=runner,
+        log=lambda m: None,
+    )
     for _ in range(50):
         if not ladder.step():
             break
@@ -196,8 +267,11 @@ def test_probes_are_judged_against_their_own_host(tmp_path):
 
 
 def test_a_job_on_a_session_that_died_is_reported_lost(tmp_path):
-    """The Slurm job behind a spool ended (its watcher died): the measurement in
-    flight there is reported lost (rc 212) and set aside, not waited on forever."""
+    """The Slurm job behind a spool ended (its watcher died).
+
+    The measurement in flight there is reported lost (rc 212) and set aside, not waited
+    on forever.
+    """
     import time as _time
 
     from agent_flow.workflows.staircase_onboard.substrate.scheduler import SpoolPaths
@@ -215,31 +289,57 @@ def test_a_job_on_a_session_that_died_is_reported_lost(tmp_path):
 
 
 def test_only_near_miss_neutral_rungs_are_probed_again(tmp_path):
-    """After a keep, a neutral rung that came within reach (+0.7%) is measured against the
-    new control; a flat one (+0.0%) is not -- re-probing every neutral rung costs a wave."""
+    """After a keep, a neutral rung that came within reach (+0.7%) is measured against the new control.
+
+    A flat one (+0.0%) is not -- re-probing every neutral rung costs a wave.
+    """
 
     def effect(config, label):
         lat = 100.0 * (1.05 if config.get("enable_in_graph_sampling") else 1.0)
         return lat * (1.007 if config.get("stream_interval") == 4 else 1.0), 2000.0
 
-    rungs = [r for r in default_rungs() if r.name in ("in-graph-sampling", "stream-interval-4", "gc-gen0-100k")]
+    rungs = [
+        r
+        for r in default_rungs()
+        if r.name in ("in-graph-sampling", "stream-interval-4", "gc-gen0-100k")
+    ]
     base = tmp_path / "identity.yaml"
     base.write_text(yaml.safe_dump({"modeling_v2": "require", "max_batch_size": 128}))
-    bench = BenchSpec(bench_py="bench.py", model="m", env_script="env.sh", isl=8192, osl=1024, concurrencies=[1, 128], tree=".")
+    bench = BenchSpec(
+        bench_py="bench.py",
+        model="m",
+        env_script="env.sh",
+        isl=8192,
+        osl=1024,
+        concurrencies=[1, 128],
+        tree=".",
+    )
     runner = FakeRunner(["s1", "s2", "s3"], tmp_path / "work" / "data", effect)
-    ladder = Ladder(workdir=tmp_path / "work", base_configs=[base], rungs=rungs, bench=bench, runner=runner,
-                    min_gain=0.01, noise_factor=1.0, log=lambda m: None)
+    ladder = Ladder(
+        workdir=tmp_path / "work",
+        base_configs=[base],
+        rungs=rungs,
+        bench=bench,
+        runner=runner,
+        min_gain=0.01,
+        noise_factor=1.0,
+        log=lambda m: None,
+    )
     for _ in range(80):
         if not ladder.step():
             break
-    probes = [l for l in runner.submitted if "control" not in l and "combine" not in l]
-    assert sum("stream-interval-4" in l for l in probes) == 2, probes
-    assert sum("gc-gen0-100k" in l for l in probes) == 1, probes
+    probes = [
+        label for label in runner.submitted if "control" not in label and "combine" not in label
+    ]
+    assert sum("stream-interval-4" in label for label in probes) == 2, probes
+    assert sum("gc-gen0-100k" in label for label in probes) == 1, probes
 
 
 def test_a_probe_that_finished_while_no_process_watched_is_judged_on_resume(tmp_path):
-    """The orchestrator restarts after a probe finished but before it polled it: the
-    rung's measurement is on disk, so the resumed ladder judges it instead of waiting."""
+    """The orchestrator restarts after a probe finished but before it polled it.
+
+    The rung's measurement is on disk, so the resumed ladder judges it instead of waiting.
+    """
     rungs = [r for r in default_rungs() if r.name in ("cg-padding", "in-graph-sampling")]
     ladder, runner = _ladder(tmp_path, rungs)
     ladder.step()  # controls queued
@@ -251,12 +351,16 @@ def test_a_probe_that_finished_while_no_process_watched_is_judged_on_resume(tmp_
         if not again.step():
             break
     assert set(again.state.kept) == {"cg-padding", "in-graph-sampling"}
-    assert not any(l.startswith("w00-cg-padding") for l in runner2.submitted)  # not measured twice
+    assert not any(
+        label.startswith("w00-cg-padding") for label in runner2.submitted
+    )  # not measured twice
 
 
 def test_a_dead_session_gets_no_control(tmp_path):
-    """A session preempted mid-ladder refuses jobs (stale heartbeat); queuing a control
-    there crashed the stage. Controls go to live sessions only."""
+    """A session preempted mid-ladder refuses jobs (stale heartbeat).
+
+    Queuing a control there crashed the stage. Controls go to live sessions only.
+    """
 
     class OneDead(FakeRunner):
         def free_spools(self):
@@ -265,11 +369,26 @@ def test_a_dead_session_gets_no_control(tmp_path):
     rungs = [r for r in default_rungs() if r.name in ("cg-padding", "in-graph-sampling")]
     base = tmp_path / "identity.yaml"
     base.write_text(yaml.safe_dump({"modeling_v2": "require", "max_batch_size": 128}))
-    bench = BenchSpec(bench_py="bench.py", model="m", env_script="env.sh", isl=8192, osl=1024, concurrencies=[1, 128], tree=".")
+    bench = BenchSpec(
+        bench_py="bench.py",
+        model="m",
+        env_script="env.sh",
+        isl=8192,
+        osl=1024,
+        concurrencies=[1, 128],
+        tree=".",
+    )
     runner = OneDead(["s1", "s2", "s3"], tmp_path / "work" / "data", _effect)
-    ladder = Ladder(workdir=tmp_path / "work", base_configs=[base], rungs=rungs, bench=bench, runner=runner, log=lambda m: None)
+    ladder = Ladder(
+        workdir=tmp_path / "work",
+        base_configs=[base],
+        rungs=rungs,
+        bench=bench,
+        runner=runner,
+        log=lambda m: None,
+    )
     for _ in range(50):
         if not ladder.step():
             break
     assert set(ladder.state.kept) == {"cg-padding", "in-graph-sampling"}
-    assert not any(l.endswith("control-s3") for l in runner.submitted)
+    assert not any(label.endswith("control-s3") for label in runner.submitted)

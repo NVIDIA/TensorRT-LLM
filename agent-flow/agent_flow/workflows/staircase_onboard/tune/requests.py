@@ -64,34 +64,41 @@ def render_request(
         else "**Do not edit the target's forward in this turn**: deliver the entry (or entries), their GPU tests "
         "and the micro-bench; integration into the forward is a later candidate."
     )
+    skills = (
+        "`PKG/skills/staircase-perf-tuning/SKILL.md` + `references/`, "
+        "`PKG/skills/staircase-modeling-core/SKILL.md` (+ `references/graph-and-sync.md`), "
+        "`PKG/skills/staircase-kernel-onboard/SKILL.md`"
+    )
+    kernel_choices = ctx.perf_root / "08-kernel-sources" / "kernel_choices.json"
+    job = f"{job_prefix}-<what>"
     text = f"""# Tuner request: {slug}
 
-Issued {time.strftime('%Y-%m-%d %H:%M %Z')} by the tune stage.
+Issued {time.strftime("%Y-%m-%d %H:%M %Z")} by the tune stage.
 
 ## Paths
 
 | name | value |
 |---|---|
 | repo (main checkout, read-only for you) | `{R}` |
-| **your worktree** (edit here only) | `{worktree}`, branch `{branch or 'tune/' + slug}` off `{base[:10]}` |
+| **your worktree** (edit here only) | `{worktree}`, branch `{branch or "tune/" + slug}` off `{base[:10]}` |
 | target dir (inside the worktree) | `{ctx.target_dir}` |
 | target tests (inside the worktree) | `{ctx.target_tests}` |
 | package (skills, microbench, spoolctl) | `PKG = {ctx.package}` |
-| skills to read first | `PKG/skills/staircase-perf-tuning/SKILL.md` + `references/`, `PKG/skills/staircase-modeling-core/SKILL.md` (+ `references/graph-and-sync.md`), `PKG/skills/staircase-kernel-onboard/SKILL.md` |
+| skills to read first | {skills} |
 | dev spools (1-GPU jobs) | {spools} |
 | env script every job sources | `{ctx.env_script}` |
 | campaign workdir | `{ctx.campaign_dir}` |
 | your output dir | `{out_dir}` (micro-bench cases + results under `microbench/`) |
-| **decision file to write** | `{out_dir / 'decision.yaml'}` |
-| kernel choices to append | `{ctx.perf_root / '08-kernel-sources' / 'kernel_choices.json'}` (a JSON list; create if absent) |
+| **decision file to write** | `{out_dir / "decision.yaml"}` |
+| kernel choices to append | `{kernel_choices}` (a JSON list; create if absent) |
 | model | `{ctx.model}` |
 
 Job pattern (never block; launch, then poll with short calls; job names start with `{job_prefix}-`):
 
 ```bash
-python3 PKG/substrate/spoolctl.py --spool <spool> launch --gpus 1 --wall 45m --tree {worktree} {job_prefix}-<what> \\
+python3 PKG/substrate/spoolctl.py --spool <spool> launch --gpus 1 --wall 45m --tree {worktree} {job} \\
   'source {ctx.env_script}; cd {worktree}/tests/unittest && python -m pytest -q -p no:cacheprovider <path>'
-python3 PKG/substrate/spoolctl.py --spool <spool> status; cat <spool>/done/{job_prefix}-<what>.rc; tail -n 60 <spool>/logs/{job_prefix}-<what>.log
+python3 PKG/substrate/spoolctl.py --spool <spool> status; cat <spool>/done/{job}.rc; tail -n 60 <spool>/logs/{job}.log
 ```
 
 Micro-bench: `python PKG/tune/microbench.py <case file> --out <json>` inside a job with `--tree {worktree}`.
@@ -129,7 +136,7 @@ def turn_prompt(package: Path, request: Path, *, budget_hours: float = 3.0) -> s
     """The driver's message for one tuner turn run by a general-purpose agent."""
     return f"""You are executing ONE turn of the `tuner` role of the staircase-onboard tune stage.
 
-STEP 0 -- your role definition: read {package / 'prompts' / 'tuner.py'}; its SYSTEM_PROMPT string is your
+STEP 0 -- your role definition: read {package / "prompts" / "tuner.py"}; its SYSTEM_PROMPT string is your
 system prompt for this turn. Follow it exactly.
 
 STEP 1 -- your request: read {request}. It names your worktree, spools, skills (plain files: read them),
@@ -151,11 +158,14 @@ Operating rules for this environment:
 Final message: <= 25 lines: decision, files changed, test results, micro-bench table, projection, risks."""
 
 
-def render_rebase_request(ctx: CampaignContext, *, slug: str, worktree: Path, best_branch: str, reason: str) -> Path:
+def render_rebase_request(
+    ctx: CampaignContext, *, slug: str, worktree: Path, best_branch: str, reason: str
+) -> Path:
     """A candidate that won on its own but does not stack on the best tree: rebase it.
 
     Parallel candidates written from one base collide in the forward file once
-    one of them is kept; the textual conflict is not a verdict on either."""
+    one of them is kept; the textual conflict is not a verdict on either.
+    """
     out_dir = ctx.campaign_dir / "candidates" / slug
     out_dir.mkdir(parents=True, exist_ok=True)
     text = f"""# Tuner request: rebase {slug}
@@ -171,14 +181,14 @@ winners being measured on top of it):
    best tree's kept changes untouched, your candidate's change applied on top -- in both PrefillTarget and
    DecodeTarget where it applies). Read your own `decision.yaml` in `{out_dir}` for what the candidate does.
 2. Run the target tests that cover both sides plus the claims / target-contract / weight-table tests on the
-   dev spools ({', '.join(f'`{s}`' for s in ctx.dev_spools)}; launch + poll, `--tree {worktree}`, env script
+   dev spools ({", ".join(f"`{s}`" for s in ctx.dev_spools)}; launch + poll, `--tree {worktree}`, env script
    `{ctx.env_script}`).
 3. Commit with `git -C {worktree} commit -s` if you changed code beyond the conflict markers. Do not push.
-4. Update `{out_dir / 'decision.yaml'}` in place: `commits:` = `git -C {worktree} rev-list --reverse
+4. Update `{out_dir / "decision.yaml"}` in place: `commits:` = `git -C {worktree} rev-list --reverse
    {best_branch}..HEAD`, `rebased_onto: <sha>`, a `notes` line on the conflict and its resolution;
    `decision: CANDIDATE` if the tests pass, else `BLOCKED` with the failure.
 
-Embargo: {', '.join(f'`{e}`' for e in ctx.embargo)}.
+Embargo: {", ".join(f"`{e}`" for e in ctx.embargo)}.
 """
     path = out_dir / "rebase-request.md"
     path.write_text(text)

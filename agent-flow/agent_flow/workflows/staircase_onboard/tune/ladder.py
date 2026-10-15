@@ -68,10 +68,12 @@ class Rung:
 
 
 def default_rungs() -> list[Rung]:
-    """The ladder for a single-GPU aggregated target. Order is the prior: cheapest and
-    most-often-winning first. Every observation here is a starting point, re-measured
-    per target -- a rung that won elsewhere can lose here (padding lost 11% on one
-    tp1 MLA target)."""
+    """The ladder for a single-GPU aggregated target.
+
+    Order is the prior: cheapest and most-often-winning first. Every observation here
+    is a starting point, re-measured per target -- a rung that won elsewhere can lose
+    here (padding lost 11% on one tp1 MLA target).
+    """
     return [
         Rung(
             "cg-padding",
@@ -229,11 +231,26 @@ class BenchSpec:
     wall: str = "2h"
 
     def command(self, label: str, out_root: Path, configs: Sequence[Path]) -> str:
-        argv = ["python", self.bench_py, "--model", self.model, "--label", label, "--out-root", str(out_root)]
+        argv = [
+            "python",
+            self.bench_py,
+            "--model",
+            self.model,
+            "--label",
+            label,
+            "--out-root",
+            str(out_root),
+        ]
         for cfg in configs:
             argv += ["--config", str(cfg)]
         argv += ["--isl", str(self.isl), "--osl", str(self.osl)]
-        argv += ["--concurrency", ",".join(str(c) for c in self.concurrencies), "--tree", self.tree, "--force"]
+        argv += [
+            "--concurrency",
+            ",".join(str(c) for c in self.concurrencies),
+            "--tree",
+            self.tree,
+            "--force",
+        ]
         argv += list(self.extra_args)
         return f"source {shlex.quote(self.env_script)}\n" + " ".join(shlex.quote(a) for a in argv)
 
@@ -243,7 +260,8 @@ class SpoolRunner:
 
     ``submit`` returns immediately; ``poll`` returns the jobs that finished. The
     substrate's own client (``spoolctl.queue_job``) does the queuing, so names,
-    receipts and archiving follow the same protocol the gates use."""
+    receipts and archiving follow the same protocol the gates use.
+    """
 
     def __init__(self, spools: Sequence[str], prefix: str = "tune") -> None:
         from ..substrate import spoolctl
@@ -265,7 +283,16 @@ class SpoolRunner:
                 live.append(spool)
         return live
 
-    def submit(self, spool: str, label: str, command: str, *, wall: str = "2h", tree: str | None = None, gpus: str = "all") -> str:
+    def submit(
+        self,
+        spool: str,
+        label: str,
+        command: str,
+        *,
+        wall: str = "2h",
+        tree: str | None = None,
+        gpus: str = "all",
+    ) -> str:
         name = f"{self.prefix}-{label}"
         header = {"gpus": gpus, "wall": wall}
         if tree:
@@ -291,7 +318,10 @@ class SpoolRunner:
         name = f"{self.prefix}-{label}"
         for spool in self.spools:
             root = Path(spool)
-            if any((root / sub / f"{name}{ext}").exists() for sub, ext in (("pending", ".sh"), ("running", ".sh"), ("done", ".rc"))):
+            if any(
+                (root / sub / f"{name}{ext}").exists()
+                for sub, ext in (("pending", ".sh"), ("running", ".sh"), ("done", ".rc"))
+            ):
                 self.inflight[name] = (spool, label)
                 return True
         return False
@@ -431,7 +461,8 @@ class Ladder:
         """Count existing measurements of the identity config as wave-0 control repeats.
 
         They must have been taken with the same base configs and workload; the
-        caller vouches for that (the ladder records which dirs it adopted)."""
+        caller vouches for that (the ladder records which dirs it adopted).
+        """
         if self.state.wave != 0 or self.state.control_labels:
             return
         for src in dirs:
@@ -439,12 +470,16 @@ class Ladder:
             if not link.exists():
                 link.symlink_to(src.resolve(), target_is_directory=True)
             self.state.control_labels.append(src.name)
-        self.ledger.append("ladder_seed_controls", labels=[d.name for d in dirs], dirs=[str(d) for d in dirs])
+        self.ledger.append(
+            "ladder_seed_controls", labels=[d.name for d in dirs], dirs=[str(d) for d in dirs]
+        )
         self.state.save(self.state_path)
 
     def _resume(self) -> None:
         st = self.state
-        labels = list(st.control_labels) + [rs.label for rs in st.rungs.values() if rs.status == "running"]
+        labels = list(st.control_labels) + [
+            rs.label for rs in st.rungs.values() if rs.status == "running"
+        ]
         if st.combine_label:
             labels.append(st.combine_label)
         for rs in st.rungs.values():
@@ -453,7 +488,9 @@ class Ladder:
                 rs.status = "measured"
         for label in labels:
             if label and not self._measurement(label) and not self.runner.adopt(label):
-                self.log(f"[ladder] resume: {label} has no measurement and no job; it will be re-queued")
+                self.log(
+                    f"[ladder] resume: {label} has no measurement and no job; it will be re-queued"
+                )
                 for rs in st.rungs.values():
                     if rs.label == label and rs.status == "running":
                         rs.status, rs.label = "pending", ""
@@ -490,7 +527,7 @@ class Ladder:
         return None
 
     def _controls(self) -> list[Measurement]:
-        return [m for m in (self._measurement(l) for l in self.state.control_labels) if m]
+        return [m for m in (self._measurement(label) for label in self.state.control_labels) if m]
 
     def noise(self) -> NoiseFloor:
         """Same-host repeat spread, the worst host's.
@@ -499,9 +536,12 @@ class Ladder:
         latency end of identical configs differed by up to 4% between nodes while
         repeats on one node agreed within 0.1% (2026-10-12). So a probe is
         judged against a control from its own host (:meth:`control`), and the
-        floor is the same-host spread, never the cross-host one."""
+        floor is the same-host spread, never the cross-host one.
+        """
         if self.state.noise_spread:
-            return NoiseFloor(spread=dict(self.state.noise_spread), samples=self.state.noise_samples)
+            return NoiseFloor(
+                spread=dict(self.state.noise_spread), samples=self.state.noise_samples
+            )
         by_host: dict[str, list[Measurement]] = {}
         for m in self._controls():
             by_host.setdefault(str(m.meta.get("hostname")), []).append(m)
@@ -532,10 +572,15 @@ class Ladder:
             return ""
 
     def _spools_without_control(self) -> list[str]:
-        """Live sessions whose host has no control yet. A session that died (preempted,
-        its Slurm job requeued) refuses jobs; it gets a control when it is back."""
+        """Live sessions whose host has no control yet.
+
+        A session that died (preempted, its Slurm job requeued) refuses jobs; it gets a
+        control when it is back.
+        """
         hosts = {m.meta.get("hostname") for m in self._controls()}
-        live = set(self.runner.free_spools()) | {spool for spool, _ in self.runner.inflight.values()}
+        live = set(self.runner.free_spools()) | {
+            spool for spool, _ in self.runner.inflight.values()
+        }
         return [s for s in self.runner.spools if s in live and self.spool_host(s) not in hosts]
 
     def _submit(self, label: str, configs: Sequence[Path]) -> bool:
@@ -560,7 +605,9 @@ class Ladder:
                 if rs.label == label and rs.status == "running":
                     rs.status = "measured" if m else "failed"
                     if not m:
-                        rs.reason = f"measurement failed rc={rc}; see {self.data / (label + '.partial')}"
+                        rs.reason = (
+                            f"measurement failed rc={rc}; see {self.data / (label + '.partial')}"
+                        )
         if st.phase == "control":
             # One control per session host: a probe is judged against its own host.
             inflight_spools = {spool for spool, _ in self.runner.inflight.values()}
@@ -581,7 +628,9 @@ class Ladder:
             noise = self.noise()
             if not st.noise_spread and noise.samples >= 2:
                 st.noise_spread, st.noise_samples = dict(noise.spread), noise.samples
-            self.ledger.append("noise_floor", wave=st.wave, spread=noise.spread, samples=noise.samples)
+            self.ledger.append(
+                "noise_floor", wave=st.wave, spread=noise.spread, samples=noise.samples
+            )
             self.log(f"[ladder] noise floor wave {st.wave}: {noise.spread}")
         if st.phase == "probe":
             pending = [rs for rs in st.rungs.values() if rs.status == "pending"]
@@ -592,7 +641,10 @@ class Ladder:
                 overlay = self.rungs[rs.name].resolve(self.fill)
                 if self._submit(label, self._configs(overlay, rs.name)):
                     rs.status, rs.label, rs.wave = "running", label, st.wave
-            if any(rs.status in ("pending", "running") for rs in st.rungs.values()) or self.runner.inflight:
+            if (
+                any(rs.status in ("pending", "running") for rs in st.rungs.values())
+                or self.runner.inflight
+            ):
                 self.state.save(self.state_path)
                 return True
             self._decide_wave()
@@ -615,13 +667,21 @@ class Ladder:
             winners = self._winners()
             ctrl = self.control(combo.meta.get("hostname") if combo else None)
             if combo and ctrl:
-                cmp = compare(combo, ctrl, self.noise(), min_gain=self.min_gain, noise_factor=self.noise_factor)
+                cmp = compare(
+                    combo,
+                    ctrl,
+                    self.noise(),
+                    min_gain=self.min_gain,
+                    noise_factor=self.noise_factor,
+                )
                 self.ledger.append("ladder_combine", wave=st.wave, rungs=winners, **cmp.as_dict())
                 if cmp.verdict == "WIN":
                     self._adopt(winners, label=st.combine_label)
                 else:
                     best = winners[:1]
-                    self.log(f"[ladder] stack did not hold ({cmp.reason}); keeping best single {best}")
+                    self.log(
+                        f"[ladder] stack did not hold ({cmp.reason}); keeping best single {best}"
+                    )
                     self._adopt(best)
             return self._next_wave()
         return st.phase != "done"
@@ -649,10 +709,18 @@ class Ladder:
             if not (cand and ctrl):
                 rs.status, rs.reason = "failed", "no measurement"
                 continue
-            cmp: Comparison = compare(cand, ctrl, noise, min_gain=self.min_gain, noise_factor=self.noise_factor)
+            cmp: Comparison = compare(
+                cand, ctrl, noise, min_gain=self.min_gain, noise_factor=self.noise_factor
+            )
             rs.verdict, rs.reason, rs.deltas = cmp.verdict, cmp.reason, dict(cmp.deltas)
             rs.status = "measured"
-            self.ledger.append("ladder_probe", wave=st.wave, rung=rs.name, regate=self.rungs[rs.name].regate, **cmp.as_dict())
+            self.ledger.append(
+                "ladder_probe",
+                wave=st.wave,
+                rung=rs.name,
+                regate=self.rungs[rs.name].regate,
+                **cmp.as_dict(),
+            )
             self.log(f"[ladder] {rs.name}: {cmp.verdict} {cmp.reason}")
         st.phase = "combine"
 
@@ -675,8 +743,17 @@ class Ladder:
             st.control_overlay = deep_merge(st.control_overlay, self._stack(names))
         if not label and names:
             label = next((rs.label for rs in st.rungs.values() if rs.name == names[0]), "")
-        st.history.append({"wave": st.wave, "kept": list(names), "label": label, "control_overlay": st.control_overlay})
-        self.ledger.append("ladder_adopt", wave=st.wave, kept=list(names), control_overlay=st.control_overlay)
+        st.history.append(
+            {
+                "wave": st.wave,
+                "kept": list(names),
+                "label": label,
+                "control_overlay": st.control_overlay,
+            }
+        )
+        self.ledger.append(
+            "ladder_adopt", wave=st.wave, kept=list(names), control_overlay=st.control_overlay
+        )
         self.log(f"[ladder] wave {st.wave} kept {list(names) or 'nothing'}")
 
     def _next_wave(self) -> bool:
@@ -699,7 +776,11 @@ class Ladder:
         st.control_labels = [adoption] if adoption else []
         for rs in st.rungs.values():
             group = self.rungs[rs.name].group or rs.name
-            if rs.status == "neutral" and group not in kept_groups and max(rs.deltas.values() or [0.0]) >= self.reprobe_min:
+            if (
+                rs.status == "neutral"
+                and group not in kept_groups
+                and max(rs.deltas.values() or [0.0]) >= self.reprobe_min
+            ):
                 rs.status, rs.label, rs.verdict, rs.reason, rs.deltas = "pending", "", "", "", {}
         if not any(rs.status == "pending" for rs in st.rungs.values()):
             st.phase = "done"
@@ -716,7 +797,9 @@ class Ladder:
             + yaml.safe_dump(final, sort_keys=False)
         )
         self.ledger.append("ladder_done", kept=self.state.kept, overlay=final)
-        self.log(f"[ladder] done; kept {self.state.kept}; overlay -> {self.workdir / 'ladder_final.yaml'}")
+        self.log(
+            f"[ladder] done; kept {self.state.kept}; overlay -> {self.workdir / 'ladder_final.yaml'}"
+        )
 
     def run(self, poll_s: float = 20.0) -> dict:
         while self.step():
@@ -725,8 +808,13 @@ class Ladder:
 
     def summary(self) -> str:
         st = self.state
-        lines = [f"phase={st.phase} wave={st.wave} kept={st.kept}", f"control labels={st.control_labels}"]
+        lines = [
+            f"phase={st.phase} wave={st.wave} kept={st.kept}",
+            f"control labels={st.control_labels}",
+        ]
         for rs in st.rungs.values():
             d = ", ".join(f"{k} {v:+.1%}" for k, v in rs.deltas.items())
-            lines.append(f"  {rs.name:22s} {rs.status:9s} w{rs.wave} {rs.verdict:7s} {d} {rs.reason[:90]}")
+            lines.append(
+                f"  {rs.name:22s} {rs.status:9s} w{rs.wave} {rs.verdict:7s} {d} {rs.reason[:90]}"
+            )
         return "\n".join(lines)

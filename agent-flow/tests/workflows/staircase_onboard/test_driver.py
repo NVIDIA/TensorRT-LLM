@@ -146,8 +146,10 @@ def test_the_orchestrator_heart_beats_and_says_when_it_exits(workspace):
 
 
 def test_the_heartbeat_survives_a_full_filesystem(workspace, monkeypatch):
-    """A shared project quota filled for minutes; the beat thread died on EDQUOT and
-    the driver read a live orchestrator as exited."""
+    """A shared project quota filled for minutes.
+
+    The beat thread died on EDQUOT and the driver read a live orchestrator as exited.
+    """
     import errno
 
     from agent_flow.runtime.turns import file_dispatch

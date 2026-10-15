@@ -71,14 +71,17 @@ class NoiseFloor:
 
     ``spread[m]`` is the largest relative deviation from the mean among the
     repeats. With fewer than two repeats the floor is unknown and ``default``
-    stands in -- a decision then says so."""
+    stands in -- a decision then says so.
+    """
 
     spread: dict[str, float] = field(default_factory=dict)
     samples: int = 0
     default: float = 0.02
 
     @classmethod
-    def from_measurements(cls, repeats: Iterable[Measurement], default: float = 0.02) -> "NoiseFloor":
+    def from_measurements(
+        cls, repeats: Iterable[Measurement], default: float = 0.02
+    ) -> "NoiseFloor":
         repeats = list(repeats)
         if len(repeats) < 2:
             return cls(samples=len(repeats), default=default)
@@ -123,7 +126,8 @@ def compare(
     """The keep rule: better by at least the threshold somewhere, worse beyond the noise nowhere.
 
     The threshold is ``max(min_gain, noise_factor * spread)`` per metric: a 3%
-    gain on a metric whose repeats wander by 2.5% is not a gain."""
+    gain on a metric whose repeats wander by 2.5% is not a gain.
+    """
     cand, ctrl = candidate.headline(), control.headline()
     deltas = {m: relative(cand[m], ctrl[m]) for m in ctrl if m in cand}
     wins, losses = [], []
@@ -164,7 +168,10 @@ class PerfLedger:
             path=str(m.path),
             modeling_v2=m.meta.get("modeling_v2"),
             headline=m.headline(),
-            points={str(c): {k: r.get(k) for k in (LATENCY_METRIC, THROUGHPUT_METRIC, *SECONDARY)} for c, r in m.points.items()},
+            points={
+                str(c): {k: r.get(k) for k in (LATENCY_METRIC, THROUGHPUT_METRIC, *SECONDARY)}
+                for c, r in m.points.items()
+            },
             commit=tree.get("commit"),
             dirty=bool(tree.get("dirty_files")),
             diff_sha256=tree.get("diff_sha256"),
@@ -191,20 +198,40 @@ class PerfLedger:
 def format_table(measurements: Iterable[Measurement], baseline: Measurement | None = None) -> str:
     """A markdown curve table, one row per label, deltas against ``baseline``."""
     rows = list(measurements)
-    head = "| label | modeling_v2 | commit | " + " | ".join(
-        ["con lo tok/s/user", "con lo TPOT ms", "con lo TTFT ms", "con hi tok/s/GPU", "con hi TPOT ms", "con hi TTFT ms", "vs baseline"]
-    ) + " |"
+    head = (
+        "| label | modeling_v2 | commit | "
+        + " | ".join(
+            [
+                "con lo tok/s/user",
+                "con lo TPOT ms",
+                "con lo TTFT ms",
+                "con hi tok/s/GPU",
+                "con hi TPOT ms",
+                "con hi TTFT ms",
+                "vs baseline",
+            ]
+        )
+        + " |"
+    )
     lines = [head, "|" + "---|" * (head.count("|") - 1)]
     base = baseline.headline() if baseline else {}
     for m in rows:
         lo, hi = min(m.points), max(m.points)
         h = m.headline()
-        vs = ", ".join(f"{k.split('.')[0]} {relative(h[k], base[k]):+.1%}" for k in base if k in h and k.split(".")[1] in (LATENCY_METRIC, THROUGHPUT_METRIC) and not (k.endswith(LATENCY_METRIC) and k.startswith(f"con{hi}") and lo != hi))
+        vs = ", ".join(
+            f"{k.split('.')[0]} {relative(h[k], base[k]):+.1%}"
+            for k in base
+            if k in h
+            and k.split(".")[1] in (LATENCY_METRIC, THROUGHPUT_METRIC)
+            and not (k.endswith(LATENCY_METRIC) and k.startswith(f"con{hi}") and lo != hi)
+        )
         tree = m.meta.get("tree") or {}
         commit = (tree.get("commit") or "")[:10] + ("*" if tree.get("dirty_files") else "")
         p_lo, p_hi = m.points[lo], m.points[hi]
         lines.append(
-            f"| {m.label} | {m.meta.get('modeling_v2')} | {commit} | {p_lo[LATENCY_METRIC]:.2f} | {p_lo['mean_tpot_ms']:.2f} | "
-            f"{p_lo['mean_ttft_ms']:.0f} | {p_hi[THROUGHPUT_METRIC]:.1f} | {p_hi['mean_tpot_ms']:.2f} | {p_hi['mean_ttft_ms']:.0f} | {vs} |"
+            f"| {m.label} | {m.meta.get('modeling_v2')} | {commit} | "
+            f"{p_lo[LATENCY_METRIC]:.2f} | {p_lo['mean_tpot_ms']:.2f} | {p_lo['mean_ttft_ms']:.0f} | "
+            f"{p_hi[THROUGHPUT_METRIC]:.1f} | {p_hi['mean_tpot_ms']:.2f} | {p_hi['mean_ttft_ms']:.0f} | "
+            f"{vs} |"
         )
     return "\n".join(lines)

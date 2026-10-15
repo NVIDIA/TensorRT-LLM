@@ -205,7 +205,9 @@ def run_client(
         if time.monotonic() >= deadline:
             client.kill()
             client.wait()
-            raise SystemExit(f"client exceeded {CLIENT_POINT_TIMEOUT_S}s at concurrency {concurrency}")
+            raise SystemExit(
+                f"client exceeded {CLIENT_POINT_TIMEOUT_S}s at concurrency {concurrency}"
+            )
 
 
 class NsysWindow:
@@ -223,7 +225,9 @@ class NsysWindow:
 
     def _nsys(self, *args: str) -> None:
         out = subprocess.run(["nsys", *args], capture_output=True, text=True, timeout=1800)
-        self.log.append(f"nsys {' '.join(args)} -> rc={out.returncode} {out.stdout[-400:]} {out.stderr[-400:]}")
+        self.log.append(
+            f"nsys {' '.join(args)} -> rc={out.returncode} {out.stdout[-400:]} {out.stderr[-400:]}"
+        )
 
     def _run(self) -> None:
         time.sleep(self.delay)
@@ -248,13 +252,16 @@ def tree_identity(tree: Path) -> dict:
     """What the measurement ran on: HEAD, and a digest of the uncommitted diff.
 
     A perf number is only comparable to another taken on the same tree, so the
-    dirty state is part of the identity, not a footnote."""
+    dirty state is part of the identity, not a footnote.
+    """
     diff = git(tree, "diff", "HEAD")
     return {
         "tree": str(tree),
         "commit": git(tree, "rev-parse", "HEAD") or None,
         "branch": git(tree, "rev-parse", "--abbrev-ref", "HEAD") or None,
-        "dirty_files": [line for line in git(tree, "status", "--porcelain", "-uno").splitlines() if line],
+        "dirty_files": [
+            line for line in git(tree, "status", "--porcelain", "-uno").splitlines() if line
+        ],
         "diff_sha256": hashlib.sha256(diff.encode()).hexdigest() if diff else None,
     }
 
@@ -332,7 +339,9 @@ def print_summary(rows: list[dict]) -> None:
         )
 
 
-def warmup_shape(concurrencies: list[int], concurrency: int = 0, prompts: int = 0) -> tuple[int, int]:
+def warmup_shape(
+    concurrencies: list[int], concurrency: int = 0, prompts: int = 0
+) -> tuple[int, int]:
     """Warmup concurrency and prompt count; 0 means the largest point and twice its prompts."""
     con = concurrency or max(concurrencies or [16])
     return con, prompts or 2 * con
@@ -362,12 +371,16 @@ def main() -> int:
     parser.add_argument("--model", required=True, help="HF checkpoint dir served by trtllm-serve")
     parser.add_argument("--label", required=True, help="label; data lands in <out-root>/<label>/")
     parser.add_argument("--out-root", required=True, type=Path)
-    parser.add_argument("--config", action="append", type=Path, default=[], help="LLM-API yaml; repeat to layer")
+    parser.add_argument(
+        "--config", action="append", type=Path, default=[], help="LLM-API yaml; repeat to layer"
+    )
     parser.add_argument("--set", action="append", default=[], help="dotted key=value applied last")
     parser.add_argument("--isl", type=int, default=8192)
     parser.add_argument("--osl", type=int, default=1024)
     parser.add_argument("--concurrency", default="1,128", help="comma-separated points")
-    parser.add_argument("--rounds", type=int, default=None, help="requests per point = concurrency x rounds")
+    parser.add_argument(
+        "--rounds", type=int, default=None, help="requests per point = concurrency x rounds"
+    )
     parser.add_argument("--num-prompts", default="", help="per-point override, e.g. 1:16,128:512")
     # 0 = the largest point and twice its prompts: a warmup below the largest point leaves its batch
     # shapes (JIT kernels, autotuner tactics, mixed-step caches) to be built inside the first measured
@@ -375,19 +388,35 @@ def main() -> int:
     parser.add_argument("--warmup-prompts", type=int, default=0)
     parser.add_argument("--warmup-concurrency", type=int, default=0)
     parser.add_argument("--warmup-osl", type=int, default=64)
-    parser.add_argument("--tree", type=Path, default=None, help="checkout the measurement runs on (identity only)")
-    parser.add_argument("--nsys", default=None, metavar="PREFIX", help="profile the server under nsys")
-    parser.add_argument("--nsys-extra", default="", help="extra nsys profile flags (space separated)")
+    parser.add_argument(
+        "--tree", type=Path, default=None, help="checkout the measurement runs on (identity only)"
+    )
+    parser.add_argument(
+        "--nsys", default=None, metavar="PREFIX", help="profile the server under nsys"
+    )
+    parser.add_argument(
+        "--nsys-extra", default="", help="extra nsys profile flags (space separated)"
+    )
     parser.add_argument("--nsys-mode", choices=["session", "api"], default="session")
-    parser.add_argument("--nsys-delay", type=float, default=30.0, help="session mode: seconds into the first point")
-    parser.add_argument("--nsys-duration", type=float, default=3.0, help="session mode: seconds collected")
-    parser.add_argument("--allow-auto", action="store_true", help="permit modeling_v2: auto (not recommended)")
+    parser.add_argument(
+        "--nsys-delay", type=float, default=30.0, help="session mode: seconds into the first point"
+    )
+    parser.add_argument(
+        "--nsys-duration", type=float, default=3.0, help="session mode: seconds collected"
+    )
+    parser.add_argument(
+        "--allow-auto", action="store_true", help="permit modeling_v2: auto (not recommended)"
+    )
     parser.add_argument("--force", action="store_true", help="overwrite a completed label")
-    parser.add_argument("--max-used-mib", type=int, default=2048, help="refuse a device with more memory in use")
+    parser.add_argument(
+        "--max-used-mib", type=int, default=2048, help="refuse a device with more memory in use"
+    )
     args = parser.parse_args()
 
     concurrencies = [int(c) for c in args.concurrency.split(",") if c]
-    args.warmup_concurrency, args.warmup_prompts = warmup_shape(concurrencies, args.warmup_concurrency, args.warmup_prompts)
+    args.warmup_concurrency, args.warmup_prompts = warmup_shape(
+        concurrencies, args.warmup_concurrency, args.warmup_prompts
+    )
     fixed = {}
     for item in filter(None, args.num_prompts.split(",")):
         con, _, n = item.partition(":")
@@ -459,7 +488,9 @@ def main() -> int:
     client_log = out_dir / "client.log"
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     load_before = host_load()
-    print(f"[perf] label={args.label} modeling_v2={mode} isl={args.isl} osl={args.osl} points={concurrencies}")
+    print(
+        f"[perf] label={args.label} modeling_v2={mode} isl={args.isl} osl={args.osl} points={concurrencies}"
+    )
     print(f"[perf] server log: {log_path}", flush=True)
     timings: dict = {}
     with log_path.open("wb") as log:
@@ -509,7 +540,11 @@ def main() -> int:
     rows = summarize(out_dir, concurrencies, world_size)
     # The tree the scheduler put first on the path (and whose import it checked)
     # is the one measured; `--tree` names it only when the job ran without one.
-    tree = Path(os.environ["STAIRCASE_TREE"]) if os.environ.get("STAIRCASE_TREE") else (args.tree or Path.cwd())
+    tree = (
+        Path(os.environ["STAIRCASE_TREE"])
+        if os.environ.get("STAIRCASE_TREE")
+        else (args.tree or Path.cwd())
+    )
     try:
         import importlib.metadata as md
 
@@ -526,7 +561,11 @@ def main() -> int:
         "osl": args.osl,
         "concurrencies": concurrencies,
         "num_prompts": {c: num_prompts_for(c, args.rounds, fixed) for c in concurrencies},
-        "warmup": {"prompts": args.warmup_prompts, "concurrency": args.warmup_concurrency, "osl": args.warmup_osl},
+        "warmup": {
+            "prompts": args.warmup_prompts,
+            "concurrency": args.warmup_concurrency,
+            "osl": args.warmup_osl,
+        },
         "hostname": socket.gethostname(),
         "gpu": gpu_identity(),
         "host_before": load_before,

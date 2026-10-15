@@ -433,7 +433,8 @@ def processes_with_marker(
     leader exits (``nsys profile`` and the application it launches do exactly
     that) is neither in the leader's session nor its descendant any more, so
     :func:`job_processes` stops seeing it. Its environment still carries the
-    markers every job is started with, and that is what this finds."""
+    markers every job is started with, and that is what this finds.
+    """
     want = {f"STAIRCASE_SPOOL_JOB={job}".encode(), f"STAIRCASE_SPOOL_WATCHER={watcher}".encode()}
     found = []
     for pid, info in table.items():
@@ -743,7 +744,11 @@ class Scheduler:
                 # A full filesystem (a shared project quota other users fill) fails
                 # our small writes for minutes at a time. The jobs keep running;
                 # dying here would orphan every one of them and end the session.
-                print(f"watcher: {exc.strerror} at {utc_iso()}; retrying next tick", file=sys.stderr, flush=True)
+                print(
+                    f"watcher: {exc.strerror} at {utc_iso()}; retrying next tick",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if self.stopping() and not self.jobs:
                 self._append_status(f"watcher: STOP honoured, exiting at {utc_iso()}")
                 self._retire()

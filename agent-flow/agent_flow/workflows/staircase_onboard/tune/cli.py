@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``staircase-onboard tune ...``: the perf stage's command line.
 
-    tune ladder run    --spec tune.yaml      drive the config ladder to completion
-    tune ladder status --spec tune.yaml      where the ladder stands
-    tune table         --spec tune.yaml [DIR ...]   markdown curve table of label dirs
+tune ladder run    --spec tune.yaml      drive the config ladder to completion
+tune ladder status --spec tune.yaml      where the ladder stands
+tune table         --spec tune.yaml [DIR ...]   markdown curve table of label dirs
 """
 
 from __future__ import annotations
@@ -50,7 +50,11 @@ def build_ladder(perf: dict, log=print) -> Ladder:
     ladder_spec = perf.get("ladder", {}) or {}
     skip = set(ladder_spec.get("skip", []))
     only = set(ladder_spec.get("only", []))
-    rungs = [r for r in default_rungs() + rungs_from_spec(ladder_spec.get("extra_rungs", [])) if r.name not in skip]
+    rungs = [
+        r
+        for r in default_rungs() + rungs_from_spec(ladder_spec.get("extra_rungs", []))
+        if r.name not in skip
+    ]
     if only:
         rungs = [r for r in rungs if r.name in only]
     runner = SpoolRunner(perf["spools"], prefix=ladder_spec.get("job_prefix", "tune"))
@@ -91,8 +95,16 @@ def build_campaign(perf: dict, log=print) -> Campaign:
     workdir = Path(c.get("workdir") or Path(perf["workdir"]).parent / "campaign")
     workdir.mkdir(parents=True, exist_ok=True)
     repo = Path(perf["tree"])
-    prefix = str(c.get("branch_prefix", "tune"))  # a second campaign in one repository needs its own
-    best = open_candidate(repo, Path(c.get("worktrees", workdir / "worktrees")), "best", c.get("base", "HEAD"), prefix=prefix)
+    prefix = str(
+        c.get("branch_prefix", "tune")
+    )  # a second campaign in one repository needs its own
+    best = open_candidate(
+        repo,
+        Path(c.get("worktrees", workdir / "worktrees")),
+        "best",
+        c.get("base", "HEAD"),
+        prefix=prefix,
+    )
     noise_spread = c.get("noise_spread") or {}
     camp = Campaign(
         workdir=workdir,
@@ -101,9 +113,15 @@ def build_campaign(perf: dict, log=print) -> Campaign:
         base_configs=[Path(p) for p in perf["identity_configs"]],
         perf_runner=SpoolRunner(c.get("perf_spools", perf["spools"]), prefix="camp"),
         gate_runner=SpoolRunner(c.get("gate_spools", perf["spools"]), prefix="camp"),
-        gate_cmd=gate_command(Path(__file__).resolve().parent.parent, Path(perf["env_script"]), perf["model"],
-                              float(c.get("anchor", 0.0)), c.get("task", "gsm8k"), tests=c.get("gate_tests") or (),
-                              eval_args=str(c.get("eval_args", ""))),
+        gate_cmd=gate_command(
+            Path(__file__).resolve().parent.parent,
+            Path(perf["env_script"]),
+            perf["model"],
+            float(c.get("anchor", 0.0)),
+            c.get("task", "gsm8k"),
+            tests=c.get("gate_tests") or (),
+            eval_args=str(c.get("eval_args", "")),
+        ),
         noise=NoiseFloor(spread=noise_spread, samples=int(c.get("noise_samples", 0))),
         min_gain=float(c.get("min_gain", 0.01)),
         noise_factor=float(c.get("noise_factor", 3.0)),
@@ -112,7 +130,9 @@ def build_campaign(perf: dict, log=print) -> Campaign:
     )
     if not camp.state.best_tree:
         camp.state.best_tree = str(best)
-        camp.state.best_commit = subprocess.run(["git", "-C", str(best), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        camp.state.best_commit = subprocess.run(
+            ["git", "-C", str(best), "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
     if c.get("config_overlays") and not camp.state.config_overlays:
         camp.state.config_overlays = [str(p) for p in c["config_overlays"]]
     if c.get("control") and not camp.state.control_label:
@@ -134,7 +154,9 @@ def main(argv: list[str] | None = None) -> int:
     camp.add_argument("--slug", default="")
     camp.add_argument("--decision", type=Path, default=None)
     camp.add_argument("--poll", type=float, default=30.0)
-    camp.add_argument("--idle-exit", type=float, default=0.0, help="seconds idle before `run` exits; 0 = never")
+    camp.add_argument(
+        "--idle-exit", type=float, default=0.0, help="seconds idle before `run` exits; 0 = never"
+    )
     tab = sub.add_parser("table")
     tab.add_argument("--baseline", type=Path, default=None)
     tab.add_argument("dirs", nargs="+", type=Path)

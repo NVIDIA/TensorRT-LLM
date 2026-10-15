@@ -26,8 +26,8 @@ from .plan_drafter import SYSTEM_PROMPT as PLAN_DRAFTER_SYSTEM_PROMPT
 from .plan_reviewer import SYSTEM_PROMPT as PLAN_REVIEWER_SYSTEM_PROMPT
 from .reviewer import SYSTEM_PROMPT as REVIEWER_SYSTEM_PROMPT
 from .runner import SYSTEM_PROMPT as RUNNER_SYSTEM_PROMPT
-from .tuner import SYSTEM_PROMPT as TUNER_SYSTEM_PROMPT
 from .smith import SYSTEM_PROMPT as SMITH_SYSTEM_PROMPT
+from .tuner import SYSTEM_PROMPT as TUNER_SYSTEM_PROMPT
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for type checkers only
     from ..environment import RunEnvironment

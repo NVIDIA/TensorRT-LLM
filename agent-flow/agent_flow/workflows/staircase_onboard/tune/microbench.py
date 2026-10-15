@@ -7,16 +7,20 @@ Runs **by path inside the engine container**. A *case file* is a Python file
 that defines ``cases()``, yielding :class:`Case` objects. Each case names one
 workload shape and maps implementation names to callables::
 
-    from microbench import Case          # this file's directory is on sys.path
+    from microbench import Case  # this file's directory is on sys.path
+
+
     def cases():
         for m in (1, 128, 8192):
             x = torch.randn(m, 10240, device="cuda", dtype=torch.bfloat16)
-            ws = [torch.randn(...) for _ in range(48)]       # one copy per layer
+            ws = [torch.randn(...) for _ in range(48)]  # one copy per layer
             yield Case(
                 name=f"hc_mix m={m}",
-                impls={"current": lambda i: cur(x, ws[i % 48]),
-                       "fused":   lambda i: fused(x, ws[i % 48])},
-                reference="current",                         # the one the others are checked against
+                impls={
+                    "current": lambda i: cur(x, ws[i % 48]),
+                    "fused": lambda i: fused(x, ws[i % 48]),
+                },
+                reference="current",  # the one the others are checked against
                 check=lambda a, b: torch.testing.assert_close(a, b, rtol=2e-2, atol=2e-2),
             )
 
@@ -160,7 +164,10 @@ def load_cases(path: Path):
 
 
 def format_rows(rows: list[dict]) -> str:
-    lines = ["| case | impl | graph us | eager us | speedup (graph) | check |", "|---|---|---|---|---|---|"]
+    lines = [
+        "| case | impl | graph us | eager us | speedup (graph) | check |",
+        "|---|---|---|---|---|---|",
+    ]
     for r in rows:
         lines.append(
             f"| {r['case']} | {r['impl']} | {r.get('graph_us', r.get('graph_error', '-'))} | "
@@ -188,7 +195,15 @@ def main() -> int:
     for case in module.cases():
         if args.only and args.only not in case.name:
             continue
-        rows.extend(run_case(case, iters=args.iters, warmup=args.warmup, graph=not args.no_graph, eager=not args.no_eager))
+        rows.extend(
+            run_case(
+                case,
+                iters=args.iters,
+                warmup=args.warmup,
+                graph=not args.no_graph,
+                eager=not args.no_eager,
+            )
+        )
         torch.cuda.empty_cache()
     env = {
         "device": torch.cuda.get_device_name(),

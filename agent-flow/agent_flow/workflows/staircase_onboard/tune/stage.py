@@ -108,11 +108,16 @@ class TuneSpec:
             reference=str(perf.get("reference", "stock")),
             spools=[str(Path(s).resolve()) for s in spools],
             dev_spools=[str(Path(s).resolve()) for s in perf.get("dev_spools") or spools],
-            env_script=Path(perf.get("env_script") or Path(workspace) / "tune" / "env.sh").resolve(),
+            env_script=Path(
+                perf.get("env_script") or Path(workspace) / "tune" / "env.sh"
+            ).resolve(),
             noise_repeats=int(perf.get("noise_repeats", 2)),
             ladder=dict(perf.get("ladder") or {}),
             campaign=dict(perf.get("campaign") or {}),
-            embargo=[str(e) for e in (task.get("source_embargo") or []) + (perf.get("source_embargo") or [])],
+            embargo=[
+                str(e)
+                for e in (task.get("source_embargo") or []) + (perf.get("source_embargo") or [])
+            ],
             sister_engines=[str(s) for s in perf.get("sister_engines") or []],
             wall=str(perf.get("wall", "2h")),
         )
@@ -165,12 +170,20 @@ class TuneStage:
         self.t.setdefault("phase", "ground")
 
     # ------------------------------------------------------------------ helpers
-    def _measure(self, labels: Mapping[str, Sequence[Path]], tree: str | None = None,
-                 on: str | None = None) -> dict[str, Measurement | None]:
-        """Measure every label not yet on disk, as many at once as there are sessions -- or, with
-        ``on``, one after another on that session (same-host repeats) while it lives."""
+    def _measure(
+        self, labels: Mapping[str, Sequence[Path]], tree: str | None = None, on: str | None = None
+    ) -> dict[str, Measurement | None]:
+        """Measure every label not yet on disk, as many at once as there are sessions.
+
+        With ``on``, the labels run one after another on that session instead (same-host
+        repeats), while it lives.
+        """
         bench = self.spec.bench()
-        todo = {l: c for l, c in labels.items() if not (self.data / l / "meta.json").exists()}
+        todo = {
+            label: c
+            for label, c in labels.items()
+            if not (self.data / label / "meta.json").exists()
+        }
         for label in todo:
             self.perf.adopt(label)
         queued = {name.split("-", 1)[1] for name in self.perf.inflight}
@@ -190,7 +203,13 @@ class TuneStage:
                         on = None
                 if not free:
                     break
-                self.perf.submit(free[0], label, bench.command(label, self.data, configs), wall=bench.wall, tree=tree)
+                self.perf.submit(
+                    free[0],
+                    label,
+                    bench.command(label, self.data, configs),
+                    wall=bench.wall,
+                    tree=tree,
+                )
                 self.t.setdefault("measured_on", {})[label] = str(free[0])
                 queued.add(label)
                 self.log(f"[tune] measuring {label} on {free[0]}")
@@ -230,22 +249,30 @@ class TuneStage:
         # repeats follow the baseline onto its session instead of spreading across sessions.
         if s.noise_repeats < 2:
             # Two samples once read 0.32% at con128 where the same host ranged 1.2% over the run.
-            self.log(f"[tune] noise_repeats={s.noise_repeats}: the noise floor rests on {s.noise_repeats + 1} samples "
-                     "and under-estimates the same-host range; con128 changes under ~2% are not resolvable")
+            self.log(
+                f"[tune] noise_repeats={s.noise_repeats}: the noise floor rests on {s.noise_repeats + 1} samples "
+                "and under-estimates the same-host range; con128 changes under ~2% are not resolvable"
+            )
         repeats = {f"t-baseline-r{i}": s.identity_configs for i in range(1, s.noise_repeats + 1)}
         got.update(self._measure(repeats, on=(self.t.get("measured_on") or {}).get("t-baseline")))
         repeats = [m for k, m in got.items() if k.startswith("t-baseline") and m]
         noise = NoiseFloor.from_measurements(repeats)
         self.t.update(baseline="t-baseline", reference="t-reference" if s.reference == "stock" else "",
                       noise_spread=noise.spread, noise_samples=noise.samples, phase="ladder")  # fmt: skip
-        self.ledger.append("noise_floor", phase="ground", spread=noise.spread, samples=noise.samples)
+        self.ledger.append(
+            "noise_floor", phase="ground", spread=noise.spread, samples=noise.samples
+        )
         self.checkpoint()
         return True
 
     def ladder(self) -> None:
         s, cfg = self.spec, self.spec.ladder
         if cfg.get("enabled", True):
-            rungs = [r for r in default_rungs() + rungs_from_spec(cfg.get("extra_rungs", [])) if r.name not in set(cfg.get("skip", []))]
+            rungs = [
+                r
+                for r in default_rungs() + rungs_from_spec(cfg.get("extra_rungs", []))
+                if r.name not in set(cfg.get("skip", []))
+            ]
             if cfg.get("only"):
                 rungs = [r for r in rungs if r.name in set(cfg["only"])]
             lad = Ladder(
@@ -254,7 +281,13 @@ class TuneStage:
                 noise_factor=float(cfg.get("noise_factor", 3.0)), reprobe_min=float(cfg.get("reprobe_min", 0.005)),
                 log=self.log,
             )  # fmt: skip
-            seeds = [self.data / l for l in ["t-baseline", *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)]]]
+            seeds = [
+                self.data / label
+                for label in [
+                    "t-baseline",
+                    *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)],
+                ]
+            ]
             lad.seed_controls([p for p in seeds if (p / "meta.json").exists()])
             while True:
                 try:
@@ -267,7 +300,9 @@ class TuneStage:
             self.t["ladder_overlay"] = lad.state.control_overlay
             self.t["ladder_kept"] = lad.state.kept
         overlay = self.t.get("ladder_overlay") or {}
-        self.t["config_overlays"] = [str(_overlay_file(s.workdir, "ladder-final", overlay))] if overlay else []
+        self.t["config_overlays"] = (
+            [str(_overlay_file(s.workdir, "ladder-final", overlay))] if overlay else []
+        )
         self.t["phase"] = "campaign"
         self.checkpoint()
 
@@ -287,9 +322,11 @@ class TuneStage:
         surface = s.workdir.parent / "surface.md"
         lines = ["## Sources to check before writing a kernel", ""]
         if surface.exists():
-            lines.append(f"- FlashInfer **as installed**: `{surface}` section 'FlashInfer API' lists the installed version's "
-                         "public callables the engine does not call yet -- a demand one answers is a tier-3 entry "
-                         "(`from flashinfer import ...` in the entry), not a new kernel.")
+            lines.append(
+                f"- FlashInfer **as installed**: `{surface}` section 'FlashInfer API' lists the installed version's "
+                "public callables the engine does not call yet -- a demand one answers is a tier-3 entry "
+                "(`from flashinfer import ...` in the entry), not a new kernel."
+            )
         lines += [
             f"- Earlier choices for this target: `{s.workdir / '08-kernel-sources' / 'kernel_choices.json'}` (chosen + "
             "alternatives with timings); extend it, do not re-race what is recorded.",
@@ -301,8 +338,10 @@ class TuneStage:
         return "\n".join(lines)
 
     def _roadmap_paths(self) -> str:
-        """What a roadmap turn needs to profile the best tree without asking: the same facts a candidate
-        request carries, and the embargo."""
+        """What a roadmap turn needs to profile the best tree without asking.
+
+        The same facts a candidate request carries, and the embargo.
+        """
         s = self.spec
         configs = [*s.identity_configs, *(Path(p) for p in self.t.get("config_overlays") or [])]
         rows = [
@@ -315,17 +354,29 @@ class TuneStage:
         ]
         lines = ["## Paths", "", "| name | value |", "|---|---|"]
         lines += [f"| {k} | {v if str(v).startswith('`') else f'`{v}`'} |" for k, v in rows]
-        lines += ["", "## Embargo (do not read, grep or call)", "", *(f"- `{e}`" for e in s.embargo)]
+        lines += [
+            "",
+            "## Embargo (do not read, grep or call)",
+            "",
+            *(f"- `{e}`" for e in s.embargo),
+        ]
         return "\n".join(lines)
 
     def _sisters_line(self) -> str:
         if not self.spec.sister_engines:
             return ""
-        return ("\n- Other engines that implement this model (strategies, not code): "
-                + ", ".join(f"`{e}`" for e in self.spec.sister_engines) + ".")
+        return (
+            "\n- Other engines that implement this model (strategies, not code): "
+            + ", ".join(f"`{e}`" for e in self.spec.sister_engines)
+            + "."
+        )
 
     def _standings(self) -> str:
-        ms = [Measurement.load(self.data / l) for l in (self.t.get("baseline"), self.t.get("reference")) if l and (self.data / l / "meta.json").exists()]
+        ms = [
+            Measurement.load(self.data / label)
+            for label in (self.t.get("baseline"), self.t.get("reference"))
+            if label and (self.data / label / "meta.json").exists()
+        ]
         return format_table(ms, ms[0] if ms else None) if ms else "(no measurement yet)"
 
     def _gate_tests(self) -> list[str]:
@@ -333,8 +384,15 @@ class TuneStage:
         if not self.spec.campaign.get("gate_tests", True):
             return []
         shared = "tests/unittest/_torch/modeling_v2/"
-        return [self.spec.target.replace("tensorrt_llm/_torch/_experimental/", "tests/unittest/_torch/"),
-                *(shared + f"test_modeling_v2_{n}.py" for n in ("claims", "no_stale_claims", "target_contract", "routing"))]
+        return [
+            self.spec.target.replace(
+                "tensorrt_llm/_torch/_experimental/", "tests/unittest/_torch/"
+            ),
+            *(
+                shared + f"test_modeling_v2_{n}.py"
+                for n in ("claims", "no_stale_claims", "target_contract", "routing")
+            ),
+        ]
 
     def _roadmap(self, n: int = 1, tried: Sequence[str] = ()) -> list[dict]:
         """Roadmap ``n``: the first from the baseline profile, later ones re-profiled on the moved best tree."""
@@ -345,21 +403,37 @@ class TuneStage:
             again = ""
             if tried:
                 again = (
-                    "\n\nThis is roadmap " + str(n) + ": re-profile the best tree (`" + str(self.spec.workdir / "worktrees" / "best")
-                    + "`) -- the kept candidates moved the profile. Already attempted (do not repeat; their decision files under `"
-                    + str(self.spec.workdir / "candidates") + "/<slug>/decision.yaml` list measured follow-ups worth ranking): "
-                    + ", ".join(f"`{t}`" for t in tried) + "."
+                    "\n\nThis is roadmap "
+                    + str(n)
+                    + ": re-profile the best tree (`"
+                    + str(self.spec.workdir / "worktrees" / "best")
+                    + "`) -- the kept candidates moved the profile. Already attempted (do not repeat; "
+                    "their decision files under `"
+                    + str(self.spec.workdir / "candidates")
+                    + "/<slug>/decision.yaml` list measured follow-ups worth ranking): "
+                    + ", ".join(f"`{t}`" for t in tried)
+                    + "."
                 )
             request.write_text(
                 f"# Tuner request: {what}\n\nProfile the target at the campaign config (nsys through the substrate, "
                 f"see the skill's references/nsys.md), read the forward, and write `{path}`: a YAML list of "
-                "`{slug, kind, hypothesis, evidence, expected, modeling_edits, sources}` ranked by the exclusive time each "
-                "can remove; `sources` names where the idea and its kernel options come from (`profile`, `code-reading`, "
-                "`flashinfer`, `repo-prior-art`, `sister-engine`, `kernel-choices`, each with a reference). Then write the "
-                "decision file `" + str(self.spec.workdir / f"{what}-decision.yaml")
-                + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`." + self._ledger_ask(what) + again
-                + "\n\n" + self._roadmap_paths()
-                + "\n\n## Standings\n\n" + self._standings() + "\n\n" + self._sources_note() + self._sisters_line() + "\n"
+                "`{slug, kind, hypothesis, evidence, expected, modeling_edits, sources}` ranked by the "
+                "exclusive time each can remove; `sources` names where the idea and its kernel options "
+                "come from (`profile`, `code-reading`, `flashinfer`, `repo-prior-art`, `sister-engine`, "
+                "`kernel-choices`, each with a reference). Then write the "
+                "decision file `"
+                + str(self.spec.workdir / f"{what}-decision.yaml")
+                + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`."
+                + self._ledger_ask(what)
+                + again
+                + "\n\n"
+                + self._roadmap_paths()
+                + "\n\n## Standings\n\n"
+                + self._standings()
+                + "\n\n"
+                + self._sources_note()
+                + self._sisters_line()
+                + "\n"
             )
             self.dispatch("tuner", what, turn_prompt(PACKAGE, request))
         if not path.exists():
@@ -374,14 +448,21 @@ class TuneStage:
                     f"# Tuner request: {what}-ledger\n\nThe kernel ledger of `{path}` does not validate. Fix "
                     f"`{self._ledger_path(what)}` (and add roadmap items to `{path}` where a kernel's answer is a "
                     "new item); re-profile only if a share is missing. Then write `"
-                    + str(self.spec.workdir / f"{what}-ledger-decision.yaml") + "` with `decision: CANDIDATE`.\n\n"
-                    + "## Problems\n\n" + "\n".join(f"- {e}" for e in errors) + "\n" + self._ledger_ask(what) + "\n"
+                    + str(self.spec.workdir / f"{what}-ledger-decision.yaml")
+                    + "` with `decision: CANDIDATE`.\n\n"
+                    + "## Problems\n\n"
+                    + "\n".join(f"- {e}" for e in errors)
+                    + "\n"
+                    + self._ledger_ask(what)
+                    + "\n"
                 )
                 self.dispatch("tuner", f"{what}-ledger", turn_prompt(PACKAGE, fix))
                 items = [dict(r) for r in yaml.safe_load(path.read_text()) or []]
                 errors = self._check_ledger(what, items)
             if errors:
-                self.log(f"[tune] {what}: kernel ledger still incomplete; the campaign proceeds ({errors[0][:240]})")
+                self.log(
+                    f"[tune] {what}: kernel ledger still incomplete; the campaign proceeds ({errors[0][:240]})"
+                )
                 self.ledger.append("kernel_ledger", roadmap=what, errors=errors)
             self.t[f"{what}_ledger_checked"] = True
             self.checkpoint()
@@ -406,13 +487,18 @@ class TuneStage:
             f"best tree's decode profile, down the ranking until the rows cover >= {target:g}% of GPU time "
             "(`nsys_summary.py --top 40`); each row answers elimination / faster / fusion / overlap with a "
             "roadmap slug (`disposition: item`) or an evidence-backed dismissal. Without an ncu pass, write "
-            "`ncu: \"unavailable: nsys-only roadmap turn\"` and the estimated `bound` on the row. The stage "
+            '`ncu: "unavailable: nsys-only roadmap turn"` and the estimated `bound` on the row. The stage '
             "validates it with perf_optimize's own `load_ledger` + `cross_validate`."
         )
 
     def _check_ledger(self, what: str, items: Sequence[Mapping]) -> list[str]:
         """Validate the roadmap's kernel ledger with perf_optimize's validator; returns the problems."""
-        from agent_flow.workflows.perf_optimize.kernel_ledger import QUESTIONS, LedgerError, cross_validate, load_ledger
+        from agent_flow.workflows.perf_optimize.kernel_ledger import (
+            QUESTIONS,
+            LedgerError,
+            cross_validate,
+            load_ledger,
+        )
 
         try:
             ledger = load_ledger(self._ledger_path(what))
@@ -422,11 +508,20 @@ class TuneStage:
         errors = cross_validate(ledger, {"items": [{"id": r.get("slug")} for r in items]}, target)
         if not errors:
             rows = ledger.get("kernels") or []
-            answers = {q: sum(1 for r in rows if (r.get(q) or {}).get("disposition") == "item") for q in QUESTIONS}
-            self.ledger.append("kernel_ledger", roadmap=what, rows=len(rows),
-                               enumerated_share_pct=(ledger.get("coverage") or {}).get("enumerated_share_pct"),
-                               items_per_question=answers)
-            self.log(f"[tune] {what}: kernel ledger valid ({len(rows)} kernels, items per question {answers})")
+            answers = {
+                q: sum(1 for r in rows if (r.get(q) or {}).get("disposition") == "item")
+                for q in QUESTIONS
+            }
+            self.ledger.append(
+                "kernel_ledger",
+                roadmap=what,
+                rows=len(rows),
+                enumerated_share_pct=(ledger.get("coverage") or {}).get("enumerated_share_pct"),
+                items_per_question=answers,
+            )
+            self.log(
+                f"[tune] {what}: kernel ledger valid ({len(rows)} kernels, items per question {answers})"
+            )
         return errors
 
     def campaign(self) -> None:
@@ -439,16 +534,20 @@ class TuneStage:
         camp = Campaign(
             workdir=s.workdir, repo=s.repo, bench=s.bench(), base_configs=s.identity_configs,
             perf_runner=self.runners(s.spools, "tunec"), gate_runner=self.runners(s.dev_spools, "tuneg"),
-            gate_cmd=gate_command(PACKAGE, s.env_script, s.model, float(acc.get("anchor", 0.0)), acc.get("task", "gsm8k"),
-                                  tests=self._gate_tests(), eval_args=str(acc.get("eval_args", ""))),
-            noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}), samples=int(self.t.get("noise_samples", 0))),
+            gate_cmd=gate_command(PACKAGE, s.env_script, s.model, float(acc.get("anchor", 0.0)),
+                                  acc.get("task", "gsm8k"), tests=self._gate_tests(),
+                                  eval_args=str(acc.get("eval_args", ""))),
+            noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}),
+                             samples=int(self.t.get("noise_samples", 0))),
             min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)),
             branch_prefix=self.branch_prefix, log=self.log, stack_near=bool(cfg.get("stack_near", True)),
             near_min=float(cfg["near_min"]) if "near_min" in cfg else None,
         )  # fmt: skip
         worktrees = s.workdir / "worktrees"
         if not camp.state.best_tree:
-            camp.state.best_tree = str(open_candidate(s.repo, worktrees, "best", "HEAD", prefix=self.branch_prefix))
+            camp.state.best_tree = str(
+                open_candidate(s.repo, worktrees, "best", "HEAD", prefix=self.branch_prefix)
+            )
             camp.state.best_commit = git(Path(camp.state.best_tree), "rev-parse", "HEAD")
             camp.state.config_overlays = list(self.t.get("config_overlays") or [])
         if not camp.state.control_label:
@@ -457,19 +556,29 @@ class TuneStage:
             # Other hosts get theirs lazily, behind the first measurement that needs
             # one -- the tuner turns start now instead of after a control run.
             lad = s.workdir / "ladder"
-            labels = json.loads((lad / "ladder_state.json").read_text()).get("control_labels") or [] if (lad / "ladder_state.json").exists() else []
+            labels = (
+                json.loads((lad / "ladder_state.json").read_text()).get("control_labels") or []
+                if (lad / "ladder_state.json").exists()
+                else []
+            )
             for label in labels:
                 if (lad / "data" / label / "meta.json").exists():
                     camp.set_control(lad / "data" / label)
             if not labels and not camp.state.config_overlays:
                 # No ladder overlay: the ground baseline (and its repeats) measured this tree at
                 # these configs, so they are the first controls.
-                for label in ["t-baseline", *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)]]:
+                for label in [
+                    "t-baseline",
+                    *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)],
+                ]:
                     if (self.data / label / "meta.json").exists():
                         camp.set_control(self.data / label)
         n_road = int(self.t.get("roadmaps", 1))
-        roadmap = [r for r in self._roadmap(n_road, tried=list(camp.state.candidates) if n_road > 1 else ())
-                   if r.get("slug") not in camp.state.candidates]
+        roadmap = [
+            r
+            for r in self._roadmap(n_road, tried=list(camp.state.candidates) if n_road > 1 else ())
+            if r.get("slug") not in camp.state.candidates
+        ]
         max_roadmaps = int(cfg.get("max_roadmaps", 2))
         max_par = int(cfg.get("max_parallel_tuners", 4))
         misses, budget = int(self.t.get("misses", 0)), int(cfg.get("max_iterations", 12))
@@ -477,7 +586,11 @@ class TuneStage:
         futures: dict[str, Future] = {}
         with ThreadPoolExecutor(max_workers=max(1, max_par), thread_name_prefix="tuner") as pool:
             while True:
-                while roadmap and len(futures) < max_par and len(camp.state.candidates) + len(futures) < budget:
+                while (
+                    roadmap
+                    and len(futures) < max_par
+                    and len(camp.state.candidates) + len(futures) < budget
+                ):
                     item = roadmap.pop(0)
                     slug = str(item["slug"])
                     done = s.workdir / "candidates" / slug / "decision.yaml"
@@ -490,19 +603,30 @@ class TuneStage:
                             self.log(f"[tune] {slug}: decision found on resume; not re-dispatched")
                             continue
                         except (OSError, ValueError) as exc:
-                            self.log(f"[tune] {slug}: unreadable decision on resume ({exc}); dispatching")
+                            self.log(
+                                f"[tune] {slug}: unreadable decision on resume ({exc}); dispatching"
+                            )
                     base = camp.state.best_commit or "HEAD"
                     standings = self._standings()
 
-                    def start(slug: str = slug, item: Mapping = item, base: str = base, standings: str = standings) -> str:
+                    def start(
+                        slug: str = slug,
+                        item: Mapping = item,
+                        base: str = base,
+                        standings: str = standings,
+                    ) -> str:
                         # The worktree checkout (minutes on a parallel filesystem) runs in the turn's
                         # own thread, so turns start side by side instead of one checkout at a time.
-                        wt = open_candidate(s.repo, worktrees, slug, base, prefix=self.branch_prefix)
+                        wt = open_candidate(
+                            s.repo, worktrees, slug, base, prefix=self.branch_prefix
+                        )
                         req = render_request(
                             self._context(standings), slug=slug, worktree=wt, base=base,
                             branch=f"{self.branch_prefix}/{slug}",
                             hypothesis=str(item.get("hypothesis", "")), job_prefix=slug[:12],
-                            deliverables=str(item.get("deliverables", "Commits, entry tests, micro-bench, decision.yaml.")),
+                            deliverables=str(
+                                item.get("deliverables", "Commits, entry tests, micro-bench, decision.yaml.")
+                            ),
                             modeling_edits=bool(item.get("modeling_edits", True)),
                         )  # fmt: skip
                         return self.dispatch("tuner", slug, turn_prompt(PACKAGE, req))
@@ -514,7 +638,9 @@ class TuneStage:
                         decision = s.workdir / "candidates" / slug / "decision.yaml"
                         try:
                             read_decision(decision)
-                            if slug in camp.state.candidates and camp.state.candidates[slug].status not in ("conflict", "blocked"):
+                            if slug in camp.state.candidates and camp.state.candidates[
+                                slug
+                            ].status not in ("conflict", "blocked"):
                                 continue
                             camp.submit_candidate(slug, decision)
                         except (OSError, ValueError) as exc:
@@ -525,31 +651,65 @@ class TuneStage:
                     # One rebase per tree it conflicted with: a winner left out of a batch is
                     # rebased onto the batch (pinned to its commit) while the batch is measured.
                     key = f"rebase-{st.slug}-{st.rebase_ref[:10]}"
-                    if st.status == "conflict" and not self.t.get(key) and st.slug not in futures and st.worktree:
+                    if (
+                        st.status == "conflict"
+                        and not self.t.get(key)
+                        and st.slug not in futures
+                        and st.worktree
+                    ):
                         # A textual conflict with an earlier keep is not a verdict: rebase and retry.
                         self.t[key] = True
-                        onto = st.rebase_ref if st.rebase_onto == "tune/eval-batch" else f"{self.branch_prefix}/best"
-                        req = render_rebase_request(self._context(self._standings()), slug=st.slug,
-                                                    worktree=Path(st.worktree), best_branch=onto, reason=st.reason)
-                        futures[st.slug] = pool.submit(self.dispatch, "tuner", f"rebase-{st.slug}", turn_prompt(PACKAGE, req))
+                        onto = (
+                            st.rebase_ref
+                            if st.rebase_onto == "tune/eval-batch"
+                            else f"{self.branch_prefix}/best"
+                        )
+                        req = render_rebase_request(
+                            self._context(self._standings()),
+                            slug=st.slug,
+                            worktree=Path(st.worktree),
+                            best_branch=onto,
+                            reason=st.reason,
+                        )
+                        futures[st.slug] = pool.submit(
+                            self.dispatch, "tuner", f"rebase-{st.slug}", turn_prompt(PACKAGE, req)
+                        )
                 for st in camp.state.candidates.values():
                     if st.status in ("kept",) and not self.t.get(f"counted-{st.slug}"):
                         self.t[f"counted-{st.slug}"] = True
                         misses = 0
-                    elif st.status in ("reverted", "dropped", "blocked") and not self.t.get(f"counted-{st.slug}"):
+                    elif st.status in ("reverted", "dropped", "blocked") and not self.t.get(
+                        f"counted-{st.slug}"
+                    ):
                         self.t[f"counted-{st.slug}"] = True
                         misses += 1
                 self.t["misses"] = misses
                 self.checkpoint()
                 n = int(self.t.get("roadmaps", 1))
-                if (not futures and not busy and not roadmap and misses < max_misses and len(camp.state.candidates) < budget
-                        and n < max_roadmaps):
+                if (
+                    not futures
+                    and not busy
+                    and not roadmap
+                    and misses < max_misses
+                    and len(camp.state.candidates) < budget
+                    and n < max_roadmaps
+                ):
                     # The roadmap is spent with budget left: profile the moved best tree for the next one.
                     self.t["roadmaps"] = n + 1
                     self.checkpoint()
-                    roadmap = [r for r in self._roadmap(n + 1, tried=list(camp.state.candidates)) if r.get("slug") not in camp.state.candidates]
+                    roadmap = [
+                        r
+                        for r in self._roadmap(n + 1, tried=list(camp.state.candidates))
+                        if r.get("slug") not in camp.state.candidates
+                    ]
                     continue
-                if not futures and not busy and (not roadmap or misses >= max_misses or len(camp.state.candidates) >= budget):
+                if (
+                    not futures
+                    and not busy
+                    and (
+                        not roadmap or misses >= max_misses or len(camp.state.candidates) >= budget
+                    )
+                ):
                     break
                 time.sleep(self.poll_s)
         self.t["best_tree"], self.t["best_commit"] = camp.state.best_tree, camp.state.best_commit
@@ -564,9 +724,12 @@ class TuneStage:
         got = self._measure(labels, tree=self.t.get("best_tree") or None)
         if s.reference == "stock" and overlays:
             stock = _overlay_file(s.workdir, "stock", {"modeling_v2": "off"})
-            got.update(self._measure({"t-reference-tuned": [*s.identity_configs, *overlays, stock]}))
-        rows = [Measurement.load(self.data / l) for l in ("t-baseline", "t-reference", "t-reference-tuned", "t-control", "t-final")
-                if (self.data / l / "meta.json").exists()]  # fmt: skip
+            got.update(
+                self._measure({"t-reference-tuned": [*s.identity_configs, *overlays, stock]})
+            )
+        rows = [Measurement.load(self.data / label)
+                for label in ("t-baseline", "t-reference", "t-reference-tuned", "t-control", "t-final")
+                if (self.data / label / "meta.json").exists()]  # fmt: skip
         summary = s.workdir / "summary.md"
         summary.write_text(
             "# Tune stage summary\n\n"

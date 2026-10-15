@@ -574,8 +574,10 @@ def test_stop_drains_running_work_then_exits(spool, clock):
 
 def test_a_full_filesystem_does_not_end_the_session(spool, clock):
     """A shared project quota hits its limit: the heartbeat write fails with EDQUOT.
+
     The watcher keeps serving (its running job finishes and is reaped) instead of
-    exiting and orphaning every job in the session."""
+    exiting and orphaning every job in the session.
+    """
     import errno
 
     sched = make(spool, clock, poll_s=0.02)

@@ -38,7 +38,10 @@ FAMILIES = [
     ("conv1d", r"conv1d"),
     ("quant", r"quantiz|fp4|fp8|e4m3|e2m1"),
     ("triton", r"triton|_kernel$"),
-    ("elementwise", r"elementwise|vectorized|unrolled|reduce_kernel|index|copy|cat|fill|where|arange"),
+    (
+        "elementwise",
+        r"elementwise|vectorized|unrolled|reduce_kernel|index|copy|cat|fill|where|arange",
+    ),
 ]
 
 
@@ -69,15 +72,21 @@ def load(db: str):
     tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     nvtx = []
     if "NVTX_EVENTS" in tables:
-        for start, end, text, textid in cur.execute("SELECT start, end, text, textId FROM NVTX_EVENTS WHERE end IS NOT NULL"):
+        for start, end, text, textid in cur.execute(
+            "SELECT start, end, text, textId FROM NVTX_EVENTS WHERE end IS NOT NULL"
+        ):
             nvtx.append((start, end, text if text is not None else names.get(textid, "")))
     api = {}
     if "CUPTI_ACTIVITY_KIND_RUNTIME" in tables:
-        for corr, start in cur.execute("SELECT correlationId, start FROM CUPTI_ACTIVITY_KIND_RUNTIME"):
+        for corr, start in cur.execute(
+            "SELECT correlationId, start FROM CUPTI_ACTIVITY_KIND_RUNTIME"
+        ):
             api[corr] = start
     cols = {r[1] for r in cur.execute("PRAGMA table_info(CUPTI_ACTIVITY_KIND_KERNEL)")}
     has_graph = {"graphId", "graphNodeId"} <= cols
-    query = "SELECT start, end, correlationId, shortName" + (", graphId, graphNodeId" if has_graph else "")
+    query = "SELECT start, end, correlationId, shortName" + (
+        ", graphId, graphNodeId" if has_graph else ""
+    )
     kernels, graph = [], defaultdict(list)
     for row in cur.execute(query + " FROM CUPTI_ACTIVITY_KIND_KERNEL"):
         start, end, corr, nameid = row[:4]
@@ -120,7 +129,16 @@ def summarize(db: str, top: int = 15) -> dict:
         if m:
             n, ctx, ctx_tok, gen = map(int, m.groups())
             kind = "prefill" if gen == 0 else ("decode" if ctx == 0 else "mixed")
-            steps.append({"n": n, "host": (start, end), "kind": kind, "ctx_tokens": ctx_tok, "gen": gen, "k": []})
+            steps.append(
+                {
+                    "n": n,
+                    "host": (start, end),
+                    "kind": kind,
+                    "ctx_tokens": ctx_tok,
+                    "gen": gen,
+                    "k": [],
+                }
+            )
     steps.sort(key=lambda s: s["host"][0])
     starts = [s["host"][0] for s in steps]
     import bisect
@@ -131,15 +149,27 @@ def summarize(db: str, top: int = 15) -> dict:
             steps[i]["k"].append(k)
     host = defaultdict(list)
     for start, end, text in nvtx:
-        for key in ("_prepare_inputs", "_handle_responses", "_sample_async", "_update_requests", "_schedule", "_fetch_new_requests"):
+        for key in (
+            "_prepare_inputs",
+            "_handle_responses",
+            "_sample_async",
+            "_update_requests",
+            "_schedule",
+            "_fetch_new_requests",
+        ):
             if text and text.endswith(key):
                 host[key].append((end - start) / 1e3)
-    out = {"db": db, "classes": {}, "host_us": {k: round(statistics.median(v), 1) for k, v in host.items() if v}}
+    out = {
+        "db": db,
+        "classes": {},
+        "host_us": {k: round(statistics.median(v), 1) for k, v in host.items() if v},
+    }
     by_kind = defaultdict(list)
     for s in steps:
         if s["k"]:
             by_kind[s["kind"]].append(s)
     for kind, ss in by_kind.items():
+
         def core(step):
             # A step with a graph replay is judged on the replay: eager kernels
             # launched in the same host range run around another step's replay.
@@ -148,7 +178,11 @@ def summarize(db: str, top: int = 15) -> dict:
 
         busy = [union_us([(k[0], k[1]) for k in core(s)]) for s in ss]
         span = [(max(k[1] for k in core(s)) - min(k[0] for k in core(s))) / 1e3 for s in ss]
-        eager = [sum((k[1] - k[0]) for k in s["k"] if not k[4]) / 1e3 for s in ss if any(k[4] for k in s["k"])]
+        eager = [
+            sum((k[1] - k[0]) for k in s["k"] if not k[4]) / 1e3
+            for s in ss
+            if any(k[4] for k in s["k"])
+        ]
         fam = defaultdict(float)
         names = defaultdict(lambda: [0.0, 0])
         for s in ss:
@@ -163,13 +197,21 @@ def summarize(db: str, top: int = 15) -> dict:
             "ctx_tokens_median": statistics.median(s["ctx_tokens"] for s in ss),
             "gpu_busy_us": round(statistics.median(busy), 1),
             "gpu_span_us": round(statistics.median(span), 1),
-            "idle_in_span_pct": round(100 * (1 - statistics.median(busy) / max(statistics.median(span), 1e-9)), 1),
+            "idle_in_span_pct": round(
+                100 * (1 - statistics.median(busy) / max(statistics.median(span), 1e-9)), 1
+            ),
             "kernels_per_step": round(sum(len(s["k"]) for s in ss) / n, 1),
             "graph_replay": any(k[4] for s in ss for k in s["k"]),
             "eager_us_beside_replay": round(statistics.median(eager), 1) if eager else 0.0,
-            "family_us_per_step": {f: round(t / n, 1) for f, t in sorted(fam.items(), key=lambda x: -x[1])},
+            "family_us_per_step": {
+                f: round(t / n, 1) for f, t in sorted(fam.items(), key=lambda x: -x[1])
+            },
             "top_kernels": [
-                {"name": nm[:120], "us_per_step": round(t / n, 1), "calls_per_step": round(c / n, 1)}
+                {
+                    "name": nm[:120],
+                    "us_per_step": round(t / n, 1),
+                    "calls_per_step": round(c / n, 1),
+                }
                 for nm, (t, c) in sorted(names.items(), key=lambda x: -x[1][0])[:top]
             ],
         }
@@ -179,21 +221,31 @@ def summarize(db: str, top: int = 15) -> dict:
 def render(summary: dict) -> str:
     lines = [f"# nsys summary: {summary['db']}", ""]
     if summary["host_us"]:
-        lines.append("host ranges (median us): " + ", ".join(f"{k} {v}" for k, v in summary["host_us"].items()))
+        lines.append(
+            "host ranges (median us): "
+            + ", ".join(f"{k} {v}" for k, v in summary["host_us"].items())
+        )
     for kind, c in summary["classes"].items():
         lines += [
             "",
             f"## {kind}: {c['steps']} steps, gen reqs ~{c['gen_reqs_median']}, ctx tokens ~{c['ctx_tokens_median']}",
             f"GPU busy {c['gpu_busy_us']} us, span {c['gpu_span_us']} us, idle in span {c['idle_in_span_pct']}%, "
             f"{c['kernels_per_step']} kernels/step"
-            + (f" (graph replay; {c['eager_us_beside_replay']} us of eager kernels beside it)" if c.get("graph_replay") else ""),
+            + (
+                f" (graph replay; {c['eager_us_beside_replay']} us of eager kernels beside it)"
+                if c.get("graph_replay")
+                else ""
+            ),
             "",
             "| family | us/step |",
             "|---|---|",
         ]
         lines += [f"| {f} | {t} |" for f, t in c["family_us_per_step"].items()]
         lines += ["", "| kernel | us/step | calls/step |", "|---|---|---|"]
-        lines += [f"| {k['name']} | {k['us_per_step']} | {k['calls_per_step']} |" for k in c["top_kernels"]]
+        lines += [
+            f"| {k['name']} | {k['us_per_step']} | {k['calls_per_step']} |"
+            for k in c["top_kernels"]
+        ]
     return "\n".join(lines)
 
 

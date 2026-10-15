@@ -30,9 +30,12 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
 
 @contextlib.contextmanager
 def repo_lock(repo: Path):
-    """Serialize worktree creation: concurrent `git worktree add` on one repository
-    (a campaign stacking a candidate while a tuner request opens another) failed with
-    `Could not reset index file to revision 'HEAD'`."""
+    """Serialize worktree creation on one repository.
+
+    Concurrent `git worktree add` on one repository (a campaign stacking a candidate
+    while a tuner request opens another) failed with `Could not reset index file to
+    revision 'HEAD'`.
+    """
     path = Path(_git(repo, "rev-parse", "--git-common-dir"))
     if not path.is_absolute():
         path = repo / path
@@ -48,11 +51,15 @@ def add_worktree(repo: Path, tree: Path, *args: str) -> None:
     """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt.
 
     Only the registration holds the lock (``--no-checkout``); the checkout, the slow part, runs
-    outside it against the worktree's own index, so several candidates check out at once."""
+    outside it against the worktree's own index, so several candidates check out at once.
+    """
     with repo_lock(repo):
         for attempt in (1, 2):
-            out = subprocess.run(["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
-                                 capture_output=True, text=True)
+            out = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
+                capture_output=True,
+                text=True,
+            )
             if out.returncode == 0:
                 break
             _git(repo, "worktree", "remove", "--force", str(tree), check=False)
@@ -72,11 +79,14 @@ def _complete(tree: Path) -> bool:
     return not (lock.exists() and "initializing" in lock.read_text(errors="replace"))
 
 
-def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD", prefix: str = "tune") -> Path:
+def open_candidate(
+    repo: Path, root: Path, slug: str, base: str = "HEAD", prefix: str = "tune"
+) -> Path:
     """Create (or reuse) ``root/<slug>`` on branch ``<prefix>/<slug>`` from ``base``.
 
     A run passes its own prefix: two campaigns in one repository must not share
-    ``tune/best`` (git refuses a branch checked out by another worktree)."""
+    ``tune/best`` (git refuses a branch checked out by another worktree).
+    """
     tree = root / slug
     if tree.exists():
         if _complete(tree):
