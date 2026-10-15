@@ -939,6 +939,16 @@ def _register_fake():
             logits.new_empty(logits.shape, dtype=torch.float32),
         )
 
+    @torch.library.register_fake("trtllm::glm_verify_head_accept")
+    def _(target_tokens: torch.Tensor, draft_tokens: torch.Tensor,
+          num_contexts: int, accepted_tokens: Optional[torch.Tensor],
+          force_pool: Optional[torch.Tensor],
+          force_counter: Optional[torch.Tensor], force_mode: int,
+          force_base: int, force_max: int, force_frac: float,
+          counter_stride: int, slot_stride: int, pool_size: int):
+        return draft_tokens.new_empty(
+            (num_contexts + draft_tokens.shape[0], ))
+
     @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
     def _(
         logits: torch.Tensor,
