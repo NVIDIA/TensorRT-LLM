@@ -188,7 +188,7 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
                                                        : CU_TENSOR_MAP_SWIZZLE_NONE;
     CUresult rc = cuTensorMapEncodeTiled(&tm, dtype, 2, base, gmemDims, gmemStrides, smemDims, elemStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TLLM_CHECK_WITH_INFO(rc == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed ({})", static_cast<int>(rc));
+    TLLM_CHECK_WITH_INFO(rc == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed ({})", rc);
     return tm;
 }
 

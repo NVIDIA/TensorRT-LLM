@@ -483,7 +483,7 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
         || heurResult.workspaceSize > CUBLAS_WORKSPACE_SIZE)
     {
         TLLM_LOG_WARNING("CheckTactic failed with status: {} and heuristic status: {} with workspace size: {}.\n",
-            static_cast<int>(algoStatus), static_cast<int>(heurResult.state), heurResult.workspaceSize);
+            algoStatus, heurResult.state, heurResult.workspaceSize);
         return false;
     }
 

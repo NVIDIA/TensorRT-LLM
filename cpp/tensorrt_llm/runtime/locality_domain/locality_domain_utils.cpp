@@ -259,7 +259,7 @@ public:
         CUresult result = mApi.deviceGetDevResource(device, &fullResource, CU_DEV_RESOURCE_TYPE_SM);
         if (result != CUDA_SUCCESS)
         {
-            TLLM_LOG_WARNING("[Localization] cuDeviceGetDevResource failed (result={})", static_cast<int>(result));
+            TLLM_LOG_WARNING("[Localization] cuDeviceGetDevResource failed (result={})", result);
             return false;
         }
         if (fullResource.type != CU_DEV_RESOURCE_TYPE_SM || fullResource.sm.smCount == 0)
@@ -287,8 +287,7 @@ public:
             /*flags=*/0, groupParams.data());
         if (result != CUDA_SUCCESS)
         {
-            TLLM_LOG_WARNING(
-                "[Localization] Public locality-domain SM split failed (result={})", static_cast<int>(result));
+            TLLM_LOG_WARNING("[Localization] Public locality-domain SM split failed (result={})", result);
             return false;
         }
 
@@ -479,8 +478,7 @@ private:
                 CUresult const result = cuStreamDestroy(stream);
                 if (result != CUDA_SUCCESS)
                 {
-                    TLLM_LOG_WARNING(
-                        "[Localization] Failed to destroy localized stream (result={})", static_cast<int>(result));
+                    TLLM_LOG_WARNING("[Localization] Failed to destroy localized stream (result={})", result);
                 }
                 stream = nullptr;
             }
@@ -491,8 +489,7 @@ private:
             CUresult const result = cuStreamDestroy(mRemainderStream);
             if (result != CUDA_SUCCESS)
             {
-                TLLM_LOG_WARNING(
-                    "[Localization] Failed to destroy remainder stream (result={})", static_cast<int>(result));
+                TLLM_LOG_WARNING("[Localization] Failed to destroy remainder stream (result={})", result);
             }
             mRemainderStream = nullptr;
         }
@@ -502,8 +499,7 @@ private:
             CUresult const result = mApi.greenCtxDestroy(mRemainderGreenContext);
             if (result != CUDA_SUCCESS)
             {
-                TLLM_LOG_WARNING(
-                    "[Localization] Failed to destroy remainder Green Context (result={})", static_cast<int>(result));
+                TLLM_LOG_WARNING("[Localization] Failed to destroy remainder Green Context (result={})", result);
             }
             mRemainderGreenContext = nullptr;
         }
@@ -517,8 +513,7 @@ private:
                     CUresult const result = mApi.greenCtxDestroy(greenContext);
                     if (result != CUDA_SUCCESS)
                     {
-                        TLLM_LOG_WARNING(
-                            "[Localization] Failed to destroy Green Context (result={})", static_cast<int>(result));
+                        TLLM_LOG_WARNING("[Localization] Failed to destroy Green Context (result={})", result);
                     }
                     greenContext = nullptr;
                 }

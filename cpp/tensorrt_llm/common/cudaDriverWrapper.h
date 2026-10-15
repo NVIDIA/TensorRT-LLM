@@ -24,8 +24,11 @@
 #include <cuda.h>
 
 #include <cstdio>
+#include <format>
 #include <memory>
 #include <source_location>
+#include <string>
+#include <string_view>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -36,6 +39,10 @@ class CUDADriverWrapper
 {
 public:
     static std::shared_ptr<CUDADriverWrapper> getInstance();
+
+    //! The live wrapper, or nullptr when none exists. Unlike getInstance(), this never loads the driver, so it is
+    //! safe during process teardown.
+    static std::shared_ptr<CUDADriverWrapper> getInstanceIfLoaded();
 
     ~CUDADriverWrapper();
     CUDADriverWrapper(CUDADriverWrapper const&) = delete;
@@ -171,6 +178,25 @@ void checkDriverExitSafe(T result, char const* const func, std::source_location 
 } // namespace common
 
 TRTLLM_NAMESPACE_END
+
+//! Format CUDA driver results by name, e.g. "CUDA_ERROR_INVALID_VALUE". The name comes from the driver, so the numeric
+//! code is printed when no CUDADriverWrapper is alive, as during process teardown.
+template <>
+struct std::formatter<CUresult> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(CUresult const result, Context& context) const
+    {
+        char const* name = nullptr;
+        auto const driver = tensorrt_llm::common::CUDADriverWrapper::getInstanceIfLoaded();
+        if (driver == nullptr || driver->cuGetErrorName(result, &name) != CUDA_SUCCESS || name == nullptr)
+        {
+            return std::formatter<std::string_view>::format(std::to_string(static_cast<int>(result)), context);
+        }
+        return std::formatter<std::string_view>::format(name, context);
+    }
+};
+
 /*
  * Macros compliant with TensorRT coding conventions
  */

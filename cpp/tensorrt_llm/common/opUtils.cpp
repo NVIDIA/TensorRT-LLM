@@ -159,7 +159,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
                     // Logging may fail during static destruction, so wrap in try-catch
                     try
                     {
-                        TLLM_LOG_WARNING("ncclCommDestroy failed with error: {}", static_cast<int>(result));
+                        TLLM_LOG_WARNING("ncclCommDestroy failed with error: {}", result);
                     }
                     catch (...)
                     {
@@ -344,8 +344,7 @@ void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasSta
         "Failed to create {}. "
         "Status: {}, Context: {:p}, Free Memory: {} MB ({:.1f}%), Total: {} MB. "
         "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
-        operation, static_cast<int>(status), static_cast<void const*>(ctx), mem.free_mb, mem.free_percent,
-        mem.total_mb);
+        operation, status, static_cast<void const*>(ctx), mem.free_mb, mem.free_percent, mem.total_mb);
 }
 
 } // namespace
@@ -373,7 +372,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
             auto status = cublasDestroy(*handle);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: {}", static_cast<int>(status));
+                TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: {}", status);
             }
             delete handle;
             handle = nullptr;
@@ -404,7 +403,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
             auto status = cublasLtDestroy(*handle);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: {}", static_cast<int>(status));
+                TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: {}", status);
             }
             delete handle;
             handle = nullptr;

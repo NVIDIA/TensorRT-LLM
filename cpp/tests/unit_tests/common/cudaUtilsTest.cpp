@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include <format>
 #include <gtest/gtest.h>
 #include <memory>
 
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
@@ -51,4 +53,15 @@ TEST(TestGetPtrCudaMemoryType, TestMemoryTypesAreAsExpected)
     ASSERT_EQ(tc::getPtrCudaMemoryType(deviceBuffer->data()), cudaMemoryType::cudaMemoryTypeDevice);
     auto const deviceSyncBuffer = std::make_unique<tr::StaticDeviceBuffer>(1024, tr::TRTDataType<float>::value);
     ASSERT_EQ(tc::getPtrCudaMemoryType(deviceSyncBuffer->data()), cudaMemoryType::cudaMemoryTypeDevice);
+}
+
+TEST(ErrorCodeFormatting, PrintsErrorNames)
+{
+    EXPECT_EQ(std::format("{}", cudaErrorInvalidValue), "cudaErrorInvalidValue");
+    EXPECT_EQ(std::format("[{:>26}]", cudaErrorInvalidValue), "[     cudaErrorInvalidValue]");
+    EXPECT_EQ(std::format("{}", CUBLAS_STATUS_NOT_INITIALIZED), "CUBLAS_STATUS_NOT_INITIALIZED");
+
+    // Driver result names come from the loaded driver.
+    auto const driver = tc::CUDADriverWrapper::getInstance();
+    EXPECT_EQ(std::format("{}", CUDA_ERROR_INVALID_VALUE), "CUDA_ERROR_INVALID_VALUE");
 }

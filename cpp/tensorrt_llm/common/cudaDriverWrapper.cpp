@@ -43,24 +43,40 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
+namespace
+{
+
+//! The wrapper shared by getInstance() and getInstanceIfLoaded(); it expires when the last user releases it.
+std::weak_ptr<CUDADriverWrapper>& loadedInstance()
+{
+    static std::weak_ptr<CUDADriverWrapper> instance;
+    return instance;
+}
+
+} // namespace
+
 std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
 {
     static std::mutex mutex;
-    static std::weak_ptr<CUDADriverWrapper> instance;
-    std::shared_ptr<CUDADriverWrapper> result = instance.lock();
+    std::shared_ptr<CUDADriverWrapper> result = loadedInstance().lock();
     if (result)
     {
         return result;
     }
 
     std::lock_guard<std::mutex> const lock(mutex);
-    result = instance.lock();
+    result = loadedInstance().lock();
     if (!result)
     {
         result = std::shared_ptr<CUDADriverWrapper>(new CUDADriverWrapper());
-        instance = result;
+        loadedInstance() = result;
     }
     return result;
+}
+
+std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstanceIfLoaded()
+{
+    return loadedInstance().lock();
 }
 
 CUDADriverWrapper::CUDADriverWrapper()

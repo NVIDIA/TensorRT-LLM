@@ -726,8 +726,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     cudaError_t cudaErr = cudaDeviceSynchronize();
     if (cudaErr != cudaSuccess)
     {
-        TLLM_LOG_WARNING("[NCCLUtil] cudaDeviceSynchronize failed with error: {} before cleanup for comm {:p}",
-            static_cast<int>(cudaErr), static_cast<void*>(comm));
+        TLLM_LOG_WARNING("[NCCLUtil] cudaDeviceSynchronize failed with error: {} before cleanup for comm {:p}", cudaErr,
+            static_cast<void*>(comm));
         // Continue anyway - the sync failure might be from a previous error
     }
 
@@ -792,7 +792,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
                     TLLM_LOG_WARNING(
                         "[NCCLUtil] ncclCommWindowDeregister failed with error: {} for comm {:p}, "
                         "window {:p} (buffer inUse: {})",
-                        static_cast<int>(result), static_cast<void*>(comm), static_cast<void*>(entry.buffer.window),
+                        result, static_cast<void*>(comm), static_cast<void*>(entry.buffer.window),
                         static_cast<int>(entry.inUse));
                 }
             }
@@ -806,7 +806,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
                     ncclResult_t ncclResult = ncclMemFree(entry.buffer.ptr);
                     if (ncclResult != ncclSuccess)
                     {
-                        TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed with error: {}", static_cast<int>(ncclResult));
+                        TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed with error: {}", ncclResult);
                     }
                 }
                 catch (...)

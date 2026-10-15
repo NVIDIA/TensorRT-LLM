@@ -23,6 +23,20 @@
 #include <mpi.h>
 #include <nccl.h>
 
+#include <format>
+#include <string_view>
+
+//! Format NCCL results by their description, e.g. "invalid argument".
+template <>
+struct std::formatter<ncclResult_t> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(ncclResult_t const result, Context& context) const
+    {
+        return std::formatter<std::string_view>::format(ncclGetErrorString(result), context);
+    }
+};
+
 #define TLLM_MPI_CHECK(cmd)                                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \

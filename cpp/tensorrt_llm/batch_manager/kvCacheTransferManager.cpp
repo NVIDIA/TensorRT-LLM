@@ -45,7 +45,7 @@ static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string con
     std::vector<uint8_t> hostBuffer(numBytes);
 
     cudaError_t cpyErr = cudaMemcpy(hostBuffer.data(), srcPtr->data(), numBytes, cudaMemcpyDeviceToHost);
-    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error={}", static_cast<int>(cpyErr));
+    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error={}", cpyErr);
 
     ssize_t written = ::write(fd, hostBuffer.data(), numBytes);
     TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error={}", written);
@@ -70,7 +70,7 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
     TLLM_LOG_DEBUG("Read {} bytes from {} (POSIX fallback)", bytesRead, filename.c_str());
 
     cudaError_t cpyErr = cudaMemcpy(dstPtr->data(), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
-    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error={}", static_cast<int>(cpyErr));
+    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error={}", cpyErr);
 
     ::close(fd);
     return true;

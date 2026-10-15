@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include <format>
 #include <gtest/gtest.h>
 #include <mutex>
 #include <nccl.h>
@@ -72,6 +73,11 @@ cudaError_t fakeCudaGetLastError()
 }
 } // namespace
 
+TEST(NCCLResultFormatting, PrintsDescription)
+{
+    EXPECT_EQ(std::format("{}", ncclInvalidArgument), ncclGetErrorString(ncclInvalidArgument));
+}
+
 TEST(NCCLWindowSupportTest, RuntimeVersionAndGB10Gate)
 {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
@@ -96,7 +102,7 @@ std::shared_ptr<ncclComm_t> createSplitComm(ncclComm_t parentComm, int color, in
     ncclResult_t result = ncclCommSplit(parentComm, color, key, &newComm, nullptr);
     if (result != ncclSuccess)
     {
-        TLLM_THROW("ncclCommSplit failed with error: {}", static_cast<int>(result));
+        TLLM_THROW("ncclCommSplit failed with error: {}", result);
     }
 
     // Create a shared_ptr with custom deleter that cleans up resources first
@@ -112,7 +118,7 @@ std::shared_ptr<ncclComm_t> createSplitComm(ncclComm_t parentComm, int color, in
                 ncclResult_t result = ncclCommDestroy(*comm);
                 if (result != ncclSuccess)
                 {
-                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: {}", static_cast<int>(result));
+                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: {}", result);
                 }
 
                 // STEP 3: Free the memory

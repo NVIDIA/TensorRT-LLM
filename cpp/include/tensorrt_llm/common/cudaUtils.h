@@ -33,6 +33,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_types.h>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <memory>
@@ -40,6 +41,7 @@
 #include <source_location>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
@@ -1410,6 +1412,28 @@ DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 } // namespace common
 
 TRTLLM_NAMESPACE_END
+
+//! Format CUDA runtime errors by name, e.g. "cudaErrorInvalidValue"; width and alignment apply to the name.
+template <>
+struct std::formatter<cudaError_t> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(cudaError_t const error, Context& context) const
+    {
+        return std::formatter<std::string_view>::format(cudaGetErrorName(error), context);
+    }
+};
+
+//! Format cuBLAS statuses by name, e.g. "CUBLAS_STATUS_NOT_INITIALIZED".
+template <>
+struct std::formatter<cublasStatus_t> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(cublasStatus_t const status, Context& context) const
+    {
+        return std::formatter<std::string_view>::format(cublasGetStatusName(status), context);
+    }
+};
 
 /*
  * Macros compliant with TensorRT coding conventions
