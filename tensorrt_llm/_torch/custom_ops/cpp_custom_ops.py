@@ -985,6 +985,10 @@ def _register_fake():
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
 
+    @torch.library.register_fake("trtllm::glm_dense_mlp_small_m")
+    def _(x, gate_up_weight, down_weight, gate_up_tiling=-1, down_tiling=-1):
+        return x.new_empty((x.shape[0], down_weight.shape[0]))
+
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
     def _(input: torch.Tensor,
           use_r128c4_layout: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
