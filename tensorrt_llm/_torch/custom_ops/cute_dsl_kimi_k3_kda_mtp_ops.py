@@ -49,9 +49,7 @@ Productization deltas vs the drop's host wrapper (``reference.py``):
 
 Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 ``HV == H``, one V pass (TILE_V=128, 512 threads). ``num_spec`` is a
-compile-time constant per cache allocation; every shape compiles the same
-kernel structure (the drop's benchmark-only setmaxreg / register-weight
-specializations were retired with the latency restructuring).
+compile-time constant per cache allocation.
 """
 
 import os
@@ -130,10 +128,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_eps: cutlass.Constexpr[float],
         scale_leading_dim: cutlass.Constexpr[int],
         USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
-        USE_SETMAXREG: cutlass.Constexpr[bool],
         USE_REGULAR_METADATA: cutlass.Constexpr[bool],
         USE_PACKED_TOKEN_LAYOUT: cutlass.Constexpr[bool],
-        USE_REG_Q_WEIGHTS: cutlass.Constexpr[bool],
         USE_ZERO_ACCEPTED: cutlass.Constexpr[bool],
         FUSE_PRECOMPUTE: cutlass.Constexpr[bool],
         RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
@@ -344,10 +340,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_eps,
             scale_leading_dim,
             USE_FLAT_LAYOUT,
-            USE_SETMAXREG,
             USE_REGULAR_METADATA,
             USE_PACKED_TOKEN_LAYOUT,
-            USE_REG_Q_WEIGHTS,
             USE_ZERO_ACCEPTED,
             FUSE_PRECOMPUTE,
             RUNTIME_PRECOMPUTE_FLAG,
@@ -869,11 +863,6 @@ def kda_mtp_decode_impl(
         V=V_dim,
     )
     pool_size = h0_arg.shape[0]
-    # The restructured kernel keeps the conv weights in smem and prefetches
-    # the recurrent state before precompute; the drop's setmaxreg and
-    # register-weight specializations no longer apply to any shape.
-    use_setmaxreg = False
-    use_reg_q_weights = False
     use_regular_metadata = bool(regular_metadata_hint)
     # The kernel's USE_ZERO_ACCEPTED fast path unrolls exactly
     # 1 + NUM_SPEC == 3 new tokens, so it is only valid for num_spec == 2.
@@ -934,10 +923,8 @@ def kda_mtp_decode_impl(
         _layout_key(ssm_state_indices, dynamic_layout=True, assumed_align=4),
         _layout_key(cu_seqlens_arg, dynamic_layout=True, assumed_align=4),
         _layout_key(num_accepted_tokens, dynamic_layout=True, assumed_align=4),
-        use_setmaxreg,
         use_regular_metadata,
         bool(packed_token_layout),
-        use_reg_q_weights,
         use_zero_accepted,
         float(onorm_eps),
         bool(fuse_output_norm),
@@ -998,10 +985,8 @@ def kda_mtp_decode_impl(
             onorm_eps=float(onorm_eps),
             scale_leading_dim=scale_leading_dim,
             USE_FLAT_LAYOUT=use_flat_layout,
-            USE_SETMAXREG=use_setmaxreg,
             USE_REGULAR_METADATA=use_regular_metadata,
             USE_PACKED_TOKEN_LAYOUT=bool(packed_token_layout),
-            USE_REG_Q_WEIGHTS=use_reg_q_weights,
             USE_ZERO_ACCEPTED=use_zero_accepted,
             FUSE_PRECOMPUTE=True,
             RUNTIME_PRECOMPUTE_FLAG=False,

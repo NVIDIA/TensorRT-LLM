@@ -306,10 +306,8 @@ def kda_decode_mtp_kernel(
     onorm_eps: cutlass.Constexpr[float],
     scale_leading_dim: cutlass.Constexpr[int],
     USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
-    USE_SETMAXREG: cutlass.Constexpr[bool],
     USE_REGULAR_METADATA: cutlass.Constexpr[bool],
     USE_PACKED_TOKEN_LAYOUT: cutlass.Constexpr[bool],
-    USE_REG_Q_WEIGHTS: cutlass.Constexpr[bool],
     USE_ZERO_ACCEPTED: cutlass.Constexpr[bool],
     FUSE_PRECOMPUTE: cutlass.Constexpr[bool],
     RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
@@ -468,13 +466,9 @@ def kda_decode_mtp_kernel(
     vec_size = TILE_K // 32
     num_v_tiles = V // TILE_V
     NUM_V_ROWS = TILE_V // (NUM_THREADS // 32)
-    # The restructured kernel assumes one V pass with eight rows per warp,
-    # smem-resident conv weights and no setmaxreg register juggling.
+    # The kernel assumes one V pass with eight rows per warp.
     assert num_v_tiles == 1 and NUM_V_ROWS == 8, (
         f"kda_decode_mtp_kernel expects TILE_V == V and 8 rows per warp, got TILE_V={TILE_V}, V={V}"
-    )
-    assert not USE_REG_Q_WEIGHTS and not USE_SETMAXREG, (
-        "kda_decode_mtp_kernel reads conv weights from smem and does not use setmaxreg"
     )
     q_weight_elems = KERNEL_WIDTH * K
     v_weight_elems = KERNEL_WIDTH * V
