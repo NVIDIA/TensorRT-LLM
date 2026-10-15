@@ -507,12 +507,10 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
         "_apply_attn_res",
         unexpected_fallback,
     )
-    # The shipped default ceiling is 1 (persistent port off means "behaviour
-    # unchanged", i.e. fused at the decode shape only), so the multi-token
-    # arms would legitimately fall back. Raise it for the dispatch assertion
-    # only -- after the reference above was computed under the default -- so
-    # this test keeps covering the multi-token fused kernel without changing
-    # what production does by default.
+    # The ceiling is configurable through KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS;
+    # keep every parametrized token count inside it for the dispatch
+    # assertion, so this test covers the multi-token fused kernel whatever the
+    # environment sets.
     monkeypatch.setattr(
         modeling_kimi_linear,
         "_FUSED_ATTN_RES_MAX_TOKENS",
@@ -530,6 +528,18 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
     unexpected_fallback.assert_not_called()
     assert cosine > 0.9999
     assert relative_l2 < 5e-3
+
+
+@pytest.mark.parametrize("topology", ["per_token", "persistent", "split"])
+def test_default_token_ceiling_covers_multi_token_steps(
+    topology: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Speculative verify steps (several tokens per request) and small decode
+    batches take the fused epilogue by default, whatever the topology."""
+    monkeypatch.delenv(modeling_kimi_linear.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(modeling_kimi_linear, "_ATTN_RES_TOPOLOGY", topology)
+    assert modeling_kimi_linear._read_fused_attn_res_max_tokens() == 32
 
 
 @torch.no_grad()
