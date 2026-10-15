@@ -548,6 +548,30 @@ def test_dspark_block_size_must_match_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "draft_config, expected_variant",
+    [
+        ({"architectures": ["DFlashDraftModel"]}, 1),
+        ({"architectures": ["DFlash2DraftModel"]}, 2),
+        ({"dflash_config": {"conv_kernel_size": 2}}, 2),
+        ({"dflash_config": {"selector_rank": 4}}, 2),
+        ({"architectures": ["LiLiCorrDraftModel"],
+          "dflash_config": {"selector_rank": 4}}, 1),
+    ],
+    ids=["dflash", "dflash2_label", "dflash2_conv", "dflash2_selector",
+         "lilicorr"])
+def test_dflash_spec_dec_variant_resolved_from_checkpoint(
+        tmp_path, draft_config, expected_variant):
+    (tmp_path / "config.json").write_text(json.dumps(draft_config))
+    spec_cfg = DFlashDecodingConfig(max_draft_len=3,
+                                    speculative_model=str(tmp_path))
+
+    spec_cfg.resolve_from_checkpoint()
+
+    assert spec_cfg.spec_dec_variant == expected_variant
+
+
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
     # When the user leaves target_layer_ids unset, the checkpoint's ordered
     # dspark_target_layer_ids must be adopted verbatim.

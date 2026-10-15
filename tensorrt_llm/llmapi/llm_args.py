@@ -2371,6 +2371,15 @@ class DecodingBaseConfig(StrictBaseModel):
         "any of these penalties is rejected at admission rather than silently decoded "
         "without them.")
 
+    spec_dec_variant: PositiveInt = Field(
+        default=1,
+        init=False,
+        description=
+        "Version of the algorithm within its decoding_type family (e.g. DFlash "
+        "1 vs. 2), for versions that share one decoding config. Resolved from "
+        "the draft checkpoint where a family has versions. Do not set manually."
+    )
+
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
@@ -3419,6 +3428,26 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
     return translated
 
 
+def is_lilicorr_checkpoint(architectures: Optional[List[str]],
+                           dflash_config: dict) -> bool:
+    """Whether a DFlash drafter checkpoint requires the LiLiCorr candidate scorer."""
+    return bool(
+        dflash_config.get("projector_type") == "lilicorr"
+        or dflash_config.get("lilicorr_enabled", False)
+        or "LiLiCorrDraftModel" in (architectures or []))
+
+
+def is_dflash2_checkpoint(architectures: Optional[List[str]],
+                          dflash_config: dict) -> bool:
+    """
+    Whether a DFlash drafter checkpoint declares DFlash 2 features.
+    """
+    return (int(dflash_config.get("conv_kernel_size", 0) or 0) > 0
+            or int(dflash_config.get("selector_rank", 0) or 0) > 0
+            or any("dflash2" in str(arch).lower().replace("_", "").replace(
+                "-", "") for arch in (architectures or [])))
+
+
 class DFlashDecodingConfig(DecodingBaseConfig):
     """Configuration for DFlash speculative decoding.
 
@@ -3507,8 +3536,8 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         if not os.path.exists(draft_config_path):
             return
         with open(draft_config_path) as f:
-            dflash_cfg = translate_speculators_dspark_config(json.load(f)).get(
-                "dflash_config", {})
+            draft_cfg = translate_speculators_dspark_config(json.load(f))
+        dflash_cfg = draft_cfg.get("dflash_config", {})
 
         if self.target_layer_ids is None:
             layer_ids = dflash_cfg.get("target_layer_ids")
@@ -3518,6 +3547,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
             mask_id = dflash_cfg.get("mask_token_id")
             if mask_id is not None:
                 self.mask_token_id = mask_id
+        architectures = draft_cfg.get("architectures")
+        self.spec_dec_variant = 2 if (
+            is_dflash2_checkpoint(architectures, dflash_cfg)
+            and not is_lilicorr_checkpoint(architectures, dflash_cfg)) else 1
         if self.context_recompute_tail is None:
             # Reached only when the user explicitly set None (the default is 0,
             # recompute off): auto-resolve the tail from the drafter geometry.
