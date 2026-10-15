@@ -681,13 +681,11 @@ if(ENABLE_UCX)
       # upgraded rapids-cmake uses another CPM version, it ignores this file and
       # downloads its own, no side effect.
       set(ucxx_cpm_file "${CMAKE_BINARY_DIR}/ucxx/build/cmake/CPM_0.40.0.cmake")
-      if(NOT EXISTS "${ucxx_cpm_file}")
-        file(
-          DOWNLOAD
-          "$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download/v0.40.0/CPM.cmake"
-          "${ucxx_cpm_file}"
-          EXPECTED_MD5 6c9866a0aa0f804a36fe8c3866fb8a2c)
-      endif()
+      file(
+        DOWNLOAD
+        "$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download/v0.40.0/CPM.cmake"
+        "${ucxx_cpm_file}"
+        EXPECTED_MD5 6c9866a0aa0f804a36fe8c3866fb8a2c)
     endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation
