@@ -115,6 +115,8 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     , mAvgReusedLength(config.poolRebalance.movingAverageDecay)
     , mAvgSqrCapacity(config.poolRebalance.movingAverageDecay)
     , mAvgSqrHistoryLength(config.poolRebalance.movingAverageDecay)
+    , mAvgBeamWidth(config.poolRebalance.movingAverageDecay)
+    , mAvgPromptLength(config.poolRebalance.movingAverageDecay)
 {
     mConfig.validate();
 
