@@ -275,6 +275,59 @@ def test_deepseek_v4_eplb_weight_loader_pages_out_each_moe_layer(monkeypatch):
     assert pageout_calls == [(".safetensors", "dontneed")]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("partition_enabled", [False, True])
+def test_deepseek_v4_loader_rebinds_absorption_weight(partition_enabled: bool) -> None:
+    from tensorrt_llm._torch.attention import mla as mla_module
+    from tensorrt_llm.models import modeling_utils
+
+    attention = mla_module.MLA.__new__(mla_module.MLA)
+    nn.Module.__init__(attention)
+    attention.kv_b_proj = nn.Linear(4, 16, bias=False, dtype=torch.bfloat16)
+    attention.kv_b_proj.partition_plan = SimpleNamespace(
+        enabled=partition_enabled, op_kind="bf16_linear"
+    )
+    attention.k_b_proj_trans = nn.Parameter(torch.zeros(2, 4, 4, dtype=torch.bfloat16))
+    attention._weights_transformed = True
+
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].self_attn = attention
+    model.config = SimpleNamespace(
+        q_lora_rank=4,
+        num_attention_heads=2,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        kv_lora_rank=4,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=0,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=False,
+        ),
+        moe_load_balancer=None,
+        quant_config=modeling_utils.QuantConfig(),
+    )
+    weight = torch.arange(64, dtype=torch.bfloat16).view(16, 4)
+    DeepseekV4WeightLoader(model)._load_weights_impl(
+        {"model.layers.0.self_attn.kv_b_proj.weight": weight}
+    )
+
+    torch.testing.assert_close(attention.v_b_proj, weight.view(2, 8, 4)[:, 4:])
+    shares_storage = (
+        attention.v_b_proj.untyped_storage().data_ptr()
+        == attention.kv_b_proj.weight.untyped_storage().data_ptr()
+    )
+    assert shares_storage is not partition_enabled
+    assert not attention._weights_transformed
+
+
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
     module = torch.nn.Module()
     module.weight = torch.nn.Parameter(torch.empty((2048, 7168), dtype=torch.float8_e4m3fn))
@@ -697,6 +750,7 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
         pretrained_config=config,
         mapping=Mapping(world_size=4, rank=2, tp_size=4),
         quant_config=quant_config,
+        use_cute_dsl_blockscaling_mm=True,
     )
 
     mtp_layer = DeepseekV4MTP(
@@ -715,6 +769,8 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
     assert mtp_layer.h_proj.out_features == config.hidden_size
     assert mtp_layer.e_proj.reduce_output is True
     assert mtp_layer.h_proj.reduce_output is True
+    assert mtp_layer.e_proj.use_cute_dsl_blockscaling_mm is True
+    assert mtp_layer.h_proj.use_cute_dsl_blockscaling_mm is True
     assert mtp_layer.e_proj.weight.dtype is torch.float8_e4m3fn
     assert mtp_layer.h_proj.weight.dtype is torch.float8_e4m3fn
     assert hasattr(mtp_layer.e_proj, "weight_scale")

@@ -26,18 +26,18 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm.serve.extensions.kimi_k3 import (
+    dynamic_tool_dicts,
+    enforce_kimi_param_policy,
+    validate_kimi_dynamic_tools,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
     StreamOptions,
     _response_format_to_guided_decoding_params,
 )
-from tensorrt_llm.serve.openai_server import (
-    _apply_kimi_chat_extensions,
-    _dynamic_tool_dicts,
-    _enforce_kimi_param_policy,
-    _validate_kimi_dynamic_tools,
-)
+from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import (
     KimiK3ToolParser,
     _escape_attr,
@@ -162,11 +162,11 @@ class TestMessageToolsCarrierValidation:
                 USER_MSG,
             ]
         )
-        assert _dynamic_tool_dicts(req.messages) == []
+        assert dynamic_tool_dicts(req.messages) == []
 
     def test_system_tools_key_survives_validation(self) -> None:
         req = make_request(messages=[dynamic_system_msg([WEATHER_TOOL]), USER_MSG])
-        assert _dynamic_tool_dicts(req.messages) == [WEATHER_TOOL]
+        assert dynamic_tool_dicts(req.messages) == [WEATHER_TOOL]
 
     def test_system_tools_with_content_survives_validation(self) -> None:
         # Content correctness is enforced by the kimi-gated serving layer,
@@ -174,12 +174,12 @@ class TestMessageToolsCarrierValidation:
         req = make_request(
             messages=[dynamic_system_msg([WEATHER_TOOL], content="not empty"), USER_MSG]
         )
-        assert _dynamic_tool_dicts(req.messages) == [WEATHER_TOOL]
+        assert dynamic_tool_dicts(req.messages) == [WEATHER_TOOL]
 
 
 class TestKimiDynamicToolsValidation:
     def check(self, messages: list, **kwargs) -> None:
-        _validate_kimi_dynamic_tools(make_request(messages=messages, **kwargs))
+        validate_kimi_dynamic_tools(make_request(messages=messages, **kwargs))
 
     def test_valid_dynamic_tool_passes(self) -> None:
         self.check([dynamic_system_msg([WEATHER_TOOL]), USER_MSG])
@@ -275,7 +275,7 @@ class TestKimiDynamicToolsValidation:
 class TestKimiExtensionMapping:
     def apply(self, model_type: str = "kimi_k3", **kwargs) -> ChatCompletionRequest:
         req = make_request(**kwargs)
-        _apply_kimi_chat_extensions(req, model_type)
+        apply_model_chat_extensions(req, model_type)
         return req
 
     def kwargs_of(self, req: ChatCompletionRequest) -> dict:
@@ -397,7 +397,7 @@ class TestKimiParamPolicy:
 
     def enforce(self, **kwargs) -> ChatCompletionRequest:
         req = make_request(**kwargs)
-        _enforce_kimi_param_policy(req)
+        enforce_kimi_param_policy(req)
         return req
 
     def test_policy_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:

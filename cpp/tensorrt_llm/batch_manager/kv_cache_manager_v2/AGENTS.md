@@ -25,6 +25,7 @@ layouts or ownership models must not override the implementation.
 - `blockRadixTree.*`: the shared prefix-reuse tree and SHA-256 block keys.
 - `page.*`, `kvCache.*`, and `kvCacheManager.*`: page lifecycle, per-request
   cache state, and the top-level manager.
+- `batch.*`: stable request rows, dirty tracking, and raw GPU metadata publication.
 - `storage/`, `storageManager.*`, `evictionController.*`, and `copyEngine.*`:
   pools, eviction ownership, migration, and data movement.
 - `lifeCycleRegistry.*`: layer-group/lifecycle mapping, including attention and
@@ -58,7 +59,8 @@ must eventually be `close()`d. Its normal flow is:
 
 1. Match the input `TokenSpan` against `BlockRadixTree` within a `ReuseScope`.
 2. Allocate request-local pages for unmatched blocks through `StorageManager`.
-3. Lock or migrate required committed pages to GPU before model execution.
+3. Lock or restore required pages before model execution: GPU for writable and
+   dense pages, level-1 host memory for cold sparse history.
 4. Commit completed blocks to the tree, making their immutable pages available
    for later requests; `stopCommitting()` finalizes this process.
 5. Suspend or close the request, returning pages to holding/eviction ownership.
@@ -68,10 +70,23 @@ may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
 
+Attention lifecycle identity also includes `isSparse`. All buffers in one
+attention layer must agree on this flag. Sparse buffers require `HOST_MEM` at
+level 1 and are invalid for SSM layers. Sparse and dense GPU pools stay separate
+even when their slot sizes match; compatible sparse buffers still coalesce.
+
 `StorageManager` coordinates GPU, host, and disk cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it
 directly and must not round-trip through Python bindings.
+
+`Batch` groups requests from one manager across all layer groups. Request changes
+invalidate their stable rows; `publish()` uploads final raw indices and eligible
+history counts, including post-rollback state. Device addresses remain fixed.
+Publish and wait for readiness outside graph capture; after submitting readers
+or replaying a graph, call `recordRead()` before mutating requests or membership.
+Publication waits for offload and prior readers, and retains each staging buffer
+until its upload completes. DLPack views keep the allocation alive, not KV pages.
 
 The dependency direction is broadly:
 
@@ -91,8 +106,8 @@ types/config/exceptions
 
 - `SUSPENDED`: no active CUDA-stream use; committed pages can be held or
   evicted.
-- `ACTIVE`: pages required by the request are locked to GPU and use the cache's
-  CUDA stream.
+- `ACTIVE`: pages required by the request are locked at their intended storage
+  levels and use the cache's CUDA stream.
 - `CLOSED`: resources are released; further use is invalid.
 
 `commit()` finalizes full blocks. Its `isEnd=true` form is a terminal-memory
@@ -105,7 +120,9 @@ pages and performs final commit-state bookkeeping.
 
 ### Page status
 
-- `LOCKED`: required on GPU; neither eviction nor dropping is permitted.
+- `LOCKED`: pinned at the current storage level; neither eviction nor dropping
+  is permitted. GPU locks support every lifecycle. Level-1 `HOST_MEM` locks
+  support sparse attention only; disk pages cannot be locked.
 - `HELD`: eviction is allowed, but dropping is not.
 - `DROPPABLE`: both eviction and dropping are allowed.
 
@@ -114,6 +131,22 @@ transitions. CUDA ready/finish events are part of their correctness contract:
 they establish write completion, migration ordering, and safe reuse across
 streams. A stream change for an active cache intentionally synchronizes the
 new stream with the old one.
+
+`batchedLockPages()` takes an explicit destination per page and restores cold
+pages before locking, deduplicating pages shared by multiple owners. Resume,
+prefetch, and prefix rebasing preserve host-resident sparse history. A partial
+prefix copies from the source's actual tier into a private GPU page without
+moving a shared host source. Rollback records the original lock level, and
+`ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
+offload requires a separate transfer and GPU-slot ownership handoff.
+
+Prefill admission, prefetch, and rebasing promote a host-locked sparse page into
+one shared GPU slot. Promotion waits for all owners' prior work and finished
+readers, updates every owner's page indices and metadata version, and releases
+the source host slot with a copy-completion fence. Allocation or copy failure
+preserves host ownership. Decoding owners retain deferred-offload work so that
+`Batch.publish()` retries demotion after the prefill owner enters decode,
+suspends, or closes, even without history growth.
 
 ## Ownership and lifetime
 
@@ -130,6 +163,11 @@ KvCache
 |- KvCacheManager (shared; cache keeps manager alive)
 `- per-beam/per-block page holders and locks
 
+Batch
+|- KvCacheManager (shared)
+|- request rows (non-owning; exclusive membership, driven by one owning thread)
+`- fixed device metadata and event-protected staging buffers
+
 BlockRadixTree
 `- roots -> child Blocks (strong ownership through next maps)
               `- lifecycle page entries (raw observer links)
@@ -143,6 +181,10 @@ Eviction controller
   strong ones merely to simplify access.
 - `KvCache` keeps its `KvCacheManager` alive. The manager's registry of living
   caches must not create the reverse strong-reference cycle.
+- Closing a request removes its `Batch` row; closing a batch detaches its live
+  requests without closing them. Removed rows stay dirty until publication clears
+  them. Batch destruction waits for uploads and recorded readers before freeing
+  memory; exported arrays can extend the allocation lifetime beyond `close()`.
 - A committed page is referenced by the radix tree without making the tree its
   permanent owner. Eviction queues may be the only strong owner of a droppable
   page, so never store a raw pointer past the operation that obtained it.
@@ -248,7 +290,12 @@ the manager, the storage manager, or the radix tree.
 - Purely per-object accessors (`stopCommitting`, `updateBasePageIndex`, ...) do
   not take it.
 - A wrapper whose only shared-state access is a call to an already-locking API
-  (`setCapacity` -> `resize`) does not take it either.
+  (`setCapacity` -> `resize`, or the cached-token attribution drop methods ->
+  `markStatsDirty`/`clearStatsDirty`) does not take it either.
+- Internal statistics accumulators (`commitStats`, `commitSsmSnapshotIterationStats`,
+  `commitReusedBlocksByLevel`, `commitCachedTokensByLevel`, and `recordDiskPrefetchBlocks`)
+  use the caller's exclusive lock. `commitPendingStats()` and `prefetch()` provide it;
+  direct C++ callers, including tests, must do the same.
 - `std::shared_mutex` is not recursive, but public APIs call each other freely
   here. `ReentrantSharedMutex` compares the owning thread before it looks at the
   requested mode, so on a thread that already holds the lock **exclusively**
@@ -279,6 +326,7 @@ Two exposed accessors look like they might leak shared state and do not:
   state, the eviction lists, or the stats aggregates. Accessors that read only
   state fixed at construction are lock-free: `num_layers`, `layer_ids`,
   `tokens_per_block`, `cache_tier_list`, `all_buffer_ids`, `get_layer_group_id`,
+  `get_life_cycle_pool_group_indices`,
   `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
   `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
   config flags. `get_page_index_upper_bound` resembles that group but reads a
@@ -368,7 +416,16 @@ Two rules follow for code that touches events:
   under the shared lock can be reissued by a concurrent reader, so handles stay
   exclusive-only as above.
 
-**Introspection is out of scope.** The `_introspection` submodule (`StorageStatistics`,
+**Storage statistics use the manager API.** `get_storage_statistics(cache_level)`
+samples all pools in the requested level under the manager's shared lock and
+returns independent value copies. The binding releases the GIL before acquiring
+the lock. `get_life_cycle_pool_group_indices(cache_level)` returns a copied
+lifecycle-to-pool mapping in that level's numbering without locking: the mapping
+and its level bounds are fixed at construction.
+Production code and tests must use these manager APIs for storage statistics and
+lifecycle-to-pool mappings. To query one lifecycle, index the returned mapping.
+
+**Introspection is out of scope.** The `_introspection` submodule (`storage_utilization`,
 `set_target_ratio_list_gpu`, `reuse_match_pages`, test block/codec helpers, ...)
 reaches private members directly, by design, and takes no locks. It is
 test/white-box only and is **not thread-safe**. Do not call it concurrently with
@@ -453,11 +510,12 @@ Use extra review and tests for changes involving:
   `radixBlockTreeTest.cpp`, `kvCacheManagerTest.cpp`,
   `kvCacheManagerV2DigestPoolTest.cpp`, `kvCacheManagerV2HostMemTest.cpp`,
   `kvCacheManagerV2StatsTest.cpp`, and `kvCacheManagerV2TypedIndexTest.cpp`.
-- Python behavior and backend-parity tests are in
-  `tests/unittest/kv_cache_manager_v2_tests/`. During development, prefer the
-  fast path below: set `PYTHONPATH` to `tensorrt_llm/runtime/` and execute the
-  test file directly with `python`. Do not use `pytest` for this fast path; the
-  file's test runner avoids importing the full `tensorrt_llm` package.
+- Python behavior tests are in `tests/unittest/kv_cache_manager_v2_tests/`, and
+  drive this C++ implementation through the nanobind bindings. During
+  development, prefer the fast path below: set `PYTHONPATH` to
+  `tensorrt_llm/runtime/` and execute the test file directly with `python`. Do
+  not use `pytest` for this fast path; the file's test runner avoids importing
+  the full `tensorrt_llm` package.
 
   ```bash
   REPO_ROOT="$(git rev-parse --show-toplevel)"

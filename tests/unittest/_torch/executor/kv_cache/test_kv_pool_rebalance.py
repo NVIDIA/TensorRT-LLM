@@ -34,7 +34,7 @@ isolation -- it is spread across three points inside
 ``test_py_executor.py`` does for the PP scheduling path.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -57,6 +57,7 @@ def _make_executor(
     cp_size: int = 1,
     enable_attention_dp: bool = False,
     kv_cache_transceiver=None,
+    kv_connector_manager=None,
     is_warmup: bool = False,
     is_shutdown: bool = False,
     max_beam_width: int = 1,
@@ -90,6 +91,7 @@ def _make_executor(
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
+    exe.kv_connector_manager = kv_connector_manager
     exe.is_warmup = is_warmup
     exe.is_shutdown = is_shutdown
     exe.drafter = drafter
@@ -203,6 +205,13 @@ class TestCanPauseForRebalance:
         exe = _make_executor(kv_cache_transceiver=MagicMock())
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
+    def test_connector_present_returns_false(self):
+        """A rebalance reassigns ``slot_id``, and a connector holds addresses
+        derived from it across iterations (``update_state_after_alloc``), so
+        every connector run is exposed -- synchronous ones included."""
+        exe = _make_executor(kv_connector_manager=MagicMock())
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
     def test_warmup_returns_false(self):
         exe = _make_executor(is_warmup=True)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
@@ -211,9 +220,11 @@ class TestCanPauseForRebalance:
         exe = _make_executor(is_shutdown=True)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
-    def test_beam_width_gt_one_returns_false(self):
+    def test_beam_width_gt_one_is_allowed(self):
+        # suspend/resume already walk every beam and adjust() does not touch beam
+        # width; the tuner's target ratio is what had to become beam-aware.
         exe = _make_executor(max_beam_width=2)
-        assert PyExecutor._can_pause_for_rebalance(exe) is False
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
 
     def test_drafter_present_returns_false(self):
         exe = _make_executor(drafter=MagicMock())
@@ -923,9 +934,11 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._rebalance_kv_pools_now = MagicMock()
 
     # Per-iteration no-ops.
-    exe._handle_disagg_cache_errors_synced = MagicMock()
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
+    # No tentative attention-DP dummy is pending, so a skipped microbatch's
+    # rollback (_finalize_adp_dummy_allocation(False)) is a no-op.
+    exe._pending_adp_dummy_request = None
     exe._revert_gen_alloc = MagicMock()
     exe._add_inflight_ids = MagicMock()
     exe._handle_dynamic_draft_len = MagicMock()
@@ -1048,6 +1061,20 @@ class TestPpLoopDrainWiring:
         # And the rebalance ran exactly once, at the end of the drain.
         exe._rebalance_kv_pools_now.assert_called_once()
         assert exe._pp_rebalance_drain_iters is None
+
+    def test_skipped_microbatch_rolls_back_pending_adp_dummy(self, monkeypatch):
+        """Every microbatch the drain skips rolls back its tentative ADP dummy.
+
+        Otherwise a dummy allocated for a skipped microbatch keeps its KV
+        cache allocation.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(True, False))
+        exe._finalize_adp_dummy_allocation = MagicMock()
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        assert exe._finalize_adp_dummy_allocation.call_args_list == [call(False), call(False)]
 
     def test_drain_length_follows_the_ring_depth(self, monkeypatch):
         """A deeper ring drains for longer before rebalancing.

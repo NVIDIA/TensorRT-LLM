@@ -169,17 +169,17 @@ CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, 
     }
 }
 
-CUresult copyHostToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyHostToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     return launchBatchedCopy(true, tasks, numBytes, stream);
 }
 
-CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     return launchBatchedCopy(true, tasks, numBytes, stream);
 }
 
-CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     return launchBatchedCopy(false, tasks, numBytes, stream);
 }
@@ -254,12 +254,12 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
 {
     using namespace tensorrt_llm::runtime;
 
-    auto const* srcPtr = bufferCast<tk::KVCacheIndex::UnderlyingType const>(input);
-    auto* dstPtr = bufferCast<tk::KVCacheIndex::UnderlyingType>(
-        output); // [numPools, maxNumSequences, kvFactor, numBlocksPerSeq]
-    auto const* copyIndexPtr = bufferCast<SizeType32 const>(copyIndex);
-    auto const* indexScalesPtr = bufferCast<SizeType32 const>(indexScales);
-    auto const* kvOffsetPtr = bufferCast<SizeType32 const>(kvOffset);
+    auto const* srcPtr = input.getBufferPtr<tk::KVCacheIndex::UnderlyingType const>();
+    // [numPools, maxNumSequences, kvFactor, numBlocksPerSeq]
+    auto* dstPtr = output.getBufferPtr<tk::KVCacheIndex::UnderlyingType>();
+    auto const* copyIndexPtr = copyIndex.getBufferPtr<SizeType32 const>();
+    auto const* indexScalesPtr = indexScales.getBufferPtr<SizeType32 const>();
+    auto const* kvOffsetPtr = kvOffset.getBufferPtr<SizeType32 const>();
     auto const& srcShape = input.getShape();
     auto const& dstShape = output.getShape();
     auto const& copyIndexShape = copyIndex.getShape();

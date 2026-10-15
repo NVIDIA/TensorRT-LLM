@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -53,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -477,9 +478,16 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
 
     # Virtual layers: build inverse mapping internal_layer_id -> (model_layer, attn_type)
     # and encode as model_layer * num_attn_types + attn_type_value
+    # `setdefault`, not assignment: the mapping is many-to-one under DeepSeek-V4.1,
+    # where long-range layers that share a compressed cache all resolve to the
+    # LayerId of the layer that allocated it. The owner is inserted first (it
+    # precedes its dependents in layer order), so keeping the first entry names the
+    # owner. Keeping the last would name whichever dependent happened to come last
+    # on this rank, which differs between PP ranks and would break the peer
+    # matching this ID is required to be consistent for.
     inverse = {}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-        inverse[layer_id] = (model_layer, attn_type.value)
+        inverse.setdefault(layer_id, (model_layer, attn_type.value))
 
     # Use the full enum range for consistent encoding across all PP ranks.
     # Different PP ranks may have different subsets of attention types (e.g.,
@@ -499,6 +507,8 @@ def _build_pool_views_for_variant(
     default_mapper_kind: MapperKind,
     layer_group_id: int,
     role_layouts: Optional[Dict] = None,
+    ignored_roles: frozenset[DataRole] = frozenset(),
+    view_partition: Optional[Callable] = None,
 ) -> List[PoolView]:
     """Bucket one slot-desc variant's coalesced buffers into pool views.
 
@@ -515,11 +525,21 @@ def _build_pool_views_for_variant(
         single_buffer_size = int(coalesced_buffer.single_buffer_size)
         offset = 0
         for buffer_id in coalesced_buffer.buffer_ids:
-            kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
-            bucket_key = (pool_idx, kind)
-            bucket_entries[bucket_key].append((int(buffer_id.layer_id), offset, single_buffer_size))
-            bucket_roles[bucket_key].add(str(buffer_id.role))
-            bucket_layouts[bucket_key].add(role_layouts.get(buffer_id.role))
+            # Local-only buffers still occupy physical slot offsets,
+            # but do not contribute model state to a transfer view.
+            if buffer_id.role not in ignored_roles:
+                kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
+                partition = (
+                    view_partition(buffer_id.layer_id, buffer_id.role)
+                    if view_partition is not None
+                    else None
+                )
+                bucket_key = (pool_idx, kind, partition)
+                bucket_entries[bucket_key].append(
+                    (int(buffer_id.layer_id), offset, single_buffer_size)
+                )
+                bucket_roles[bucket_key].add(str(buffer_id.role))
+                bucket_layouts[bucket_key].add(role_layouts.get(buffer_id.role))
             offset += single_buffer_size
 
     # All ordering below is canonicalization — the page table is
@@ -532,7 +552,7 @@ def _build_pool_views_for_variant(
         key=lambda key: (key[0], min(entry[1] for entry in bucket_entries[key])),
     )
     for bucket_key in lg_bucket_keys:
-        pool_idx, mapper_kind = bucket_key
+        pool_idx, mapper_kind, _ = bucket_key
         roles = frozenset(bucket_roles[bucket_key])
         context = (
             f"View(layer_group={layer_group_id}, pool={pool_idx}, "
@@ -601,6 +621,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     # Every V2 manager declares how native roles map to the closed set of
     # disaggregation mapper kinds; Role.ALL is the required fallback.
     role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    ignored_roles = frozenset(getattr(manager, "get_disagg_ignored_roles", lambda: frozenset())())
     if Role.ALL not in role_mapper_kinds:
         raise ValueError("Disaggregation role mapping must define Role.ALL")
     for role, mapper_kind in role_mapper_kinds.items():
@@ -625,6 +646,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             )
     default_mapper_kind = role_mapper_kinds[Role.ALL]
     role_layouts = manager.get_disagg_role_layouts()
+    view_partition = getattr(manager, "get_disagg_pool_view_partition", None)
     for role, layout in role_layouts.items():
         if not isinstance(layout, RoleLayout):
             raise ValueError(f"Invalid disaggregation role layout {layout!r} for role {role!s}")
@@ -707,6 +729,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 default_mapper_kind,
                 layer_group_id,
                 role_layouts=role_layouts,
+                ignored_roles=ignored_roles,
+                view_partition=view_partition,
             )
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:

@@ -147,6 +147,7 @@ class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
         self.encoder_calls = 0
         self.audio_tower = None
         self.embed_audio = object()
+        self._initialize_multimodal_encoder_cache(4096)
 
     @property
     def embedding_dim(self) -> int:
@@ -817,6 +818,8 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         )
         model = Gemma4ForConditionalGeneration(mc)
 
+        self.assertIs(model.model_config.extra_attrs, mc.extra_attrs)
+        self.assertIs(model.llm.model.model_config.extra_attrs, mc.extra_attrs)
         self.assertIsNotNone(model.llm)
         self.assertIsNotNone(model.vision_tower)
         self.assertIsNotNone(model.embed_vision)
@@ -1546,7 +1549,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
 # ---------------------------------------------------------------------------
 #
 # Reuses ``test_modeling_multimodal.TestModelingMultimodal`` (the abstract
-# base used by qwen3vl / nemotron_nano_v2_vl / etc.). Mirrors the qwen3vl
+# base used by qwen3vl / nemotron_h_multimodal / etc.). Mirrors the qwen3vl
 # pattern: provide config + class hooks, gate on LLM_MODELS_ROOT.
 #
 # Audio scenarios are intentionally not included — audio tower refactor is

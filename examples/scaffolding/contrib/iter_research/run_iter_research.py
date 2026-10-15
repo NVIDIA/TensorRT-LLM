@@ -61,13 +61,13 @@ _MCP_SERVICE_ORDER = (
 )
 
 
-def _mcp_sse_urls(cfg: dict) -> list[str]:
+def _mcp_streamable_http_urls(cfg: dict) -> list[str]:
     tools = cfg.get("mcp_tools") or {}
     ch = str(cfg.get("mcp_client_host") or "127.0.0.1")
     out: list[str] = []
     for name, default_port in _MCP_SERVICE_ORDER:
         t = tools.get(name) or {}
-        out.append(f"http://{t.get('client_host') or ch}:{int(t.get('port', default_port))}/sse")
+        out.append(f"http://{t.get('client_host') or ch}:{int(t.get('port', default_port))}/mcp")
     return out
 
 
@@ -90,7 +90,7 @@ async def main():
     openai_api_key = args.openai_api_key or cfg.get("openai_api_key", "tensorrt_llm")
     base_url = args.base_url or cfg.get("base_url", "http://localhost:8000/v1")
     model = args.model or cfg.get("model", "Qwen/Qwen2.5-72B-Instruct")
-    mcp_urls = _mcp_sse_urls(cfg)
+    mcp_urls = _mcp_streamable_http_urls(cfg)
     max_turn = args.max_turn or cfg.get("max_turn", 25)
     max_tokens = args.max_tokens or cfg.get("max_tokens", 16384)
     max_tavily_search_chars = (
@@ -111,7 +111,7 @@ async def main():
     client = AsyncOpenAI(api_key=openai_api_key, base_url=base_url)
     generation_worker = TRTOpenaiWorker(client, model)
 
-    print(f"MCP SSE URLs ({len(mcp_urls)}): {mcp_urls}")
+    print(f"MCP Streamable HTTP URLs ({len(mcp_urls)}): {mcp_urls}")
     if args.enable_statistics:
         TaskMetricsCollector.reset()
         print(

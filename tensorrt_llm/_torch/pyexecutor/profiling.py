@@ -608,6 +608,9 @@ class PyExecutorProfileManager:
         start_event_2 = None
         end_event_2 = torch.cuda.Event(enable_timing=True)
         prev_device_step_time = None
+        # Cumulative fetch counter as of the previous iter log line; the
+        # per-iteration ``num_fetched`` on the log line is the delta.
+        prev_fetch_requests_cur_rank = 0
 
         env_torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         if env_torch_trace_path is not None:
@@ -659,7 +662,7 @@ class PyExecutorProfileManager:
         def profile_step_fn():
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
-            nonlocal prev_device_step_time
+            nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
             calibrator.post_step(it)
@@ -747,6 +750,17 @@ class PyExecutorProfileManager:
                     import datetime
 
                     formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # Per-rank routing/scheduling observability for
+                    # attention-DP load-imbalance diagnosis. ``num_fetched``
+                    # is the number of new requests the ADP router assigned
+                    # to this rank since the previous log line.
+                    # ``num_dummy`` / ``num_unscheduled`` are sampled at
+                    # schedule time, so here they lag one iteration (like
+                    # ``num_scheduled_requests``).
+                    num_fetched = (
+                        executor.num_fetch_requests_cur_rank - prev_fetch_requests_cur_rank
+                    )
+                    prev_fetch_requests_cur_rank = executor.num_fetch_requests_cur_rank
                     logger.info(
                         f"iter = {executor.iter_counter}, "
                         f"global_rank = {executor.global_rank}, "
@@ -760,7 +774,11 @@ class PyExecutorProfileManager:
                         f"host_step_time = {host_step_time}ms, "
                         f"prev_device_step_time = {prev_device_step_time_str}, "
                         f"timestamp = {formatted_timestamp}, "
-                        f"states = {executor.model_engine.iter_states}"
+                        f"states = {executor.model_engine.iter_states}, "
+                        f"num_active = {len(executor.active_requests)}, "
+                        f"num_fetched = {num_fetched}, "
+                        f"num_dummy = {executor.num_dummy_requests}, "
+                        f"num_unscheduled = {executor.num_unscheduled_requests}"
                     )
 
             # profile_step runs at the start of each executor loop after

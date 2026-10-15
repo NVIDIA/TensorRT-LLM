@@ -21,6 +21,7 @@ import torch
 from torch.nn.parameter import Parameter
 from triton_kernels.matmul import FlexCtx, PrecisionConfig, matmul
 from triton_kernels.numerics import InFlexData
+from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
 
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.mapping import Mapping
@@ -277,6 +278,7 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
         else:
             flex_ctx = FlexCtx()
         pc = PrecisionConfig(b_mx_scale=module.weight_scale,
+                             b_microblock_size=MXFP_BLOCK_SIZE.value,
                              flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)

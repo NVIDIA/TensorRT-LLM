@@ -23,6 +23,7 @@ This file tests:
 """
 
 import builtins
+import functools
 import random
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -57,7 +58,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.params import use_self_sampling_gvr
+from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
@@ -343,6 +344,7 @@ def test_kv_lens_row_reorder_threshold():
             num_generations=num_generations,
             num_sms=num_sms,
             max_draft_tokens=next_n - 1,
+            gen_token_stride=next_n,
             num_contexts=0,
             num_seqs=num_generations,
             kv_lens_cuda=kv_lens_cuda,
@@ -472,6 +474,8 @@ def test_shared_topk_lifecycle(monkeypatch):
     )
     metadata._create_kv_lens_2d_buffer = Mock()
     metadata.create_expanded_buffers = Mock()
+    metadata._ragged_num_rows = 0
+    metadata._attn_num_rows = 0
 
     with patch(
         "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.prefer_pinned",
@@ -545,6 +549,34 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.on_update_kv_lens()
 
     assert metadata.shared_topk_indices is buffer
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kv_len_update_refreshes_ragged_rows_only_when_enabled(enabled):
+    metadata = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = None
+    metadata._num_tokens = 0
+    metadata._num_generations = 0
+    metadata.enable_ragged_verification = enabled
+    metadata._invalidate_pool_view_cache = Mock()
+    metadata._compute_kv_lens_row_reorder = Mock()
+    metadata.prepare_dense_topk_indices = Mock()
+    metadata.kv_lens_cuda = None
+    metadata.refresh_ragged_row_kv_lens = Mock()
+    metadata.refresh_token_major_gen_rows = Mock()
+
+    with (
+        patch.object(TrtllmAttentionMetadata, "on_update_kv_lens"),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata._fused_dsa_meta_enabled",
+            return_value=False,
+        ),
+    ):
+        metadata.on_update_kv_lens()
+
+    expected_calls = int(enabled)
+    assert metadata.refresh_ragged_row_kv_lens.call_count == expected_calls
+    assert metadata.refresh_token_major_gen_rows.call_count == expected_calls
 
 
 def test_indexer_post_load_weights_caches_fused_weight():
@@ -774,7 +806,7 @@ def create_dsa_cache_manager(
     num_layers: int = 1,
     indexer_k_dtype: str = "fp8",
     index_topk: int = 2048,
-    use_kv_cache_manager_v2: bool = False,
+    use_kv_cache_manager_v2: bool = True,
     pretrained_config=None,
 ):
     """Helper to create a DSA cache manager for testing."""
@@ -1396,8 +1428,8 @@ def test_dsa_cache_manager_v2_remaps_indexer_after_empty_layers() -> None:
         cache_manager.shutdown()
 
 
-def create_indexer(sparse_attn_config, layer_idx=0):
-    """Helper to create an Indexer for testing."""
+def create_indexer(sparse_attn_config, layer_idx=0, pretrained_config=None, compress_ratio=1):
+    """Create a test indexer using checkpoint-derived parameters and an explicit pooling ratio."""
     # Create RopeParams
     rope_params = RopeParams(
         dim=64,  # qk_rope_head_dim
@@ -1420,7 +1452,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             self.q_lora_rank = 512  # Example q_lora_rank
             self.qk_rope_head_dim = 64
 
-    sparse_params = sparse_attn_config.to_sparse_params()
+    sparse_params = sparse_attn_config.to_sparse_params(pretrained_config=pretrained_config)
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
@@ -1439,6 +1471,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             skip_create_weights_in_init=True,  # Skip weight creation for test
             sparse_params=sparse_params,
             dtype=torch.bfloat16,
+            compress_ratio=compress_ratio,
             layer_idx=layer_idx,
         )
 
@@ -1747,6 +1780,8 @@ def _create_mock_metadata(
             self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
+            self._radix_rows_per_sequence = 1 + self.max_draft_tokens
+            self._create_radix_aux_buffers(capture_graph=False)
             self.enable_indexer_skip = enable_indexer_skip
             self.indexer_head_dim = indexer_head_dim
             self.indexer_quant_block_size = 128
@@ -2093,8 +2128,8 @@ def test_indexer_k_cache_scatter_custom_op():
     max_seq_len = 512
 
     # Use different layers for CUDA vs Python to test non-contiguous handling
-    layer_idx_cuda = 1  # CUDA kernel writes to layer 0
-    layer_idx_python = 2  # Python reference writes to layer 1
+    layer_idx_cuda = 1
+    layer_idx_python = 2
 
     # Create cache manager with multiple layers
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
@@ -2149,17 +2184,34 @@ def test_indexer_k_cache_scatter_custom_op():
     flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
 
     # ========== Use Different Layers for CUDA vs Python ==========
-    # Simple approach: use layer 0 for CUDA, layer 1 for Python
     # Both get the same input data, but write to different layers
     # Then we extract and compare the outputs from each layer
 
-    # Get k_cache for CUDA path (layer 0)
+    # Get k_cache for CUDA path
     k_cache_cuda = cache_manager.get_indexer_k_cache_buffers(layer_idx_cuda)
     k_cache_cuda.zero_()
 
-    # Get k_cache for Python path (layer 1)
+    # Get k_cache for Python path
     k_cache_python = cache_manager.get_indexer_k_cache_buffers(layer_idx_python)
     k_cache_python.zero_()
+
+    # Use each layer's physical slots so the scatter still exercises strided
+    # storage. Metadata addresses the manager's contiguous shared-page views.
+    page_scale = cache_manager.indexer_k_cache_page_scale
+    k_cache_cuda = k_cache_cuda[::page_scale]
+    k_cache_python = k_cache_python[::page_scale]
+    assert k_cache_cuda.shape == k_cache_python.shape
+    assert not k_cache_cuda.is_contiguous()
+    assert not k_cache_python.is_contiguous()
+    page_bytes = block_size * (head_dim + scale_size)
+
+    def physical_slot_indices(indices):
+        pages = indices // page_bytes
+        assert torch.all(pages % page_scale == 0)
+        return (pages // page_scale) * page_bytes + indices % page_bytes
+
+    flat_indices_fp8 = physical_slot_indices(flat_indices_fp8)
+    flat_indices_scale = physical_slot_indices(flat_indices_scale)
 
     # Print cache properties
     print("\n=== Cache Properties ===")
@@ -2180,8 +2232,8 @@ def test_indexer_k_cache_scatter_custom_op():
         k_fp8,
         k_scale,
         k_cache_cuda,
-        metadata.slot_mapping_fp8,
-        metadata.slot_mapping_scale,
+        flat_indices_fp8,
+        flat_indices_scale,
         num_tokens,
     )
     torch.cuda.synchronize()
@@ -2240,8 +2292,8 @@ def test_indexer_k_cache_scatter_custom_op():
         for idx in diff_indices:
             flat_idx = idx.item()
             print(
-                f"  Byte {flat_idx}: CUDA={k_cache_cuda.view(-1)[flat_idx].item()}, "
-                f"Python={k_cache_python.view(-1)[flat_idx].item()}"
+                f"  Byte {flat_idx}: CUDA={k_cache_cuda.reshape(-1)[flat_idx].item()}, "
+                f"Python={k_cache_python.reshape(-1)[flat_idx].item()}"
             )
 
         # Fail the test
@@ -4556,6 +4608,9 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
         meta.prepare_for_draft_forward.return_value = None
+        meta.draft_replay_swapped_attrs = {}
+        for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+            setattr(meta, helper, functools.partial(getattr(TrtllmAttentionMetadata, helper), meta))
         return meta
 
     @staticmethod
@@ -4588,7 +4643,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
         assert saved is not None
-        assert saved["target_kv_cache_manager"] is original_kv_mgr
+        assert meta.draft_replay_swapped_attrs["kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
         assert "saved_backend_state" not in saved
         meta.prepare_for_draft_forward.assert_called_once_with()

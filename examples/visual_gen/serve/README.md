@@ -314,6 +314,18 @@ You can customize these by:
 
 > **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
 
+#### Media-storage directory
+
+Generated media is written under `TRTLLM_MEDIA_STORAGE_PATH`, whatever `response_format` the request asks for — a `file` download is served from a file written there first.
+
+| `TRTLLM_MEDIA_STORAGE_PATH` | Where media lands |
+|---|---|
+| set | the directory named, as given |
+| unset, or set to an empty string | `$CWD/trtllm_generated/<yymmdd-hhmmss>/`, a new directory per server |
+| unset, and the working directory cannot be written | a temporary directory |
+
+The stamped directory keeps one run's output separable from the next, and lets two servers on one node write side by side. The server logs the directory it settled on as it starts, which is the way to find the fallback one. Nothing removes any of it: media accumulates until you delete it.
+
 #### Tensor-format consumer contract
 
 When `format="safetensors"` or `format="pt"`, the payload bundles every populated tensor (`image` / `video` / `audio` / `action`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.

@@ -15,6 +15,7 @@
 import os
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from utils.util import getSMVersion, isSM100Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                                 IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 
@@ -470,13 +472,55 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
         output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
             a_fp8, b_fp8, a_sf, b_sf)
 
-    output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(a_fp8, b_fp8, a_sf,
-                                                        b_sf)
     expected = a @ b.t()
+    alpha = cute_dsl_custom_ops._get_mxfp8_gemm_alpha(a.device)
+    seen_alphas = []
+    real_get_alpha = cute_dsl_custom_ops._get_mxfp8_gemm_alpha
+
+    def _get_alpha_spy(device):
+        cached = real_get_alpha(device)
+        seen_alphas.append(cached)
+        return cached
+
+    # After the one-time warmup above, the steady-state call must reuse the
+    # cached scalar instead of filling a fresh one.
+    with mock.patch.object(
+            cute_dsl_custom_ops,
+            "_get_mxfp8_gemm_alpha",
+            side_effect=_get_alpha_spy,
+    ), mock.patch.object(
+            torch,
+            "ones",
+            side_effect=AssertionError("unexpected per-call fill"),
+    ):
+        output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            a_fp8, b_fp8, a_sf, b_sf)
+
+    assert len(seen_alphas) == 1
+    assert all(seen is alpha for seen in seen_alphas)
+    assert {seen.data_ptr() for seen in seen_alphas} == {alpha.data_ptr()}
 
     diff = calc_diff(output, expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
+    """A capture cannot perform the per-device cache's one-time allocation."""
+    device = torch.device("cuda", 31415)
+    assert device not in cute_dsl_custom_ops._MXFP8_GEMM_ALPHA_CACHE
+
+    with mock.patch.object(torch.cuda,
+                           "device") as device_guard, mock.patch.object(
+                               torch.cuda,
+                               "is_current_stream_capturing",
+                               return_value=True):
+        with pytest.raises(RuntimeError,
+                           match="run one eager GEMM warmup first"):
+            cute_dsl_custom_ops._get_mxfp8_gemm_alpha(device)
+
+    device_guard.assert_called_once_with(device)
+    assert device not in cute_dsl_custom_ops._MXFP8_GEMM_ALPHA_CACHE
 
 
 @pytest.mark.skipif(
@@ -735,6 +779,88 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_clc_dynamic_prefetch_multi_wav
     assert calc_diff(static_output, expected) < 1e-3
     assert calc_diff(dynamic_output, expected) < 1e-3
     torch.testing.assert_close(dynamic_output, static_output, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "batch_size", "use_2cta_instrs", "cluster_shape_mn", "expected"),
+    [
+        # 64 x 1024 = 65536 single-CTA clusters: one past the grid-Z limit.
+        (8192, 65536, 1, False, (1, 1), False),
+        (8192, 65472, 1, False, (1, 1), True),
+        # Split-K multiplies the L extent of the launch.
+        (8192, 32768, 2, False, (1, 1), False),
+        # Larger clusters reduce the cluster count.
+        (8192, 65536, 1, False, (2, 1), True),
+        # 2-CTA instructions halve the per-CTA M tile, doubling the CTAs.
+        (8192, 32768, 1, True, (2, 1), True),
+    ],
+)
+def test_clc_raster_n_launchable_grid(m, n, batch_size, use_2cta_instrs,
+                                      cluster_shape_mn, expected):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        _clc_raster_n_has_launchable_grid
+
+    assert _clc_raster_n_has_launchable_grid(m, n, batch_size, (128, 64),
+                                             use_2cta_instrs,
+                                             cluster_shape_mn) is expected
+
+
+@pytest.mark.parametrize(
+    ("scheduler_mode", "raster_order", "n", "expected"),
+    [
+        # A raster-N CLC tactic reused for a shape past the grid-Z limit.
+        ("clc_dynamic", "n", 65536, "m"),
+        ("clc_dynamic", "n", 65472, "n"),
+        # The grid-Z limit applies to CLC raster-N only, as in get_valid_tactics.
+        ("static", "n", 65536, "n"),
+        ("clc_dynamic", "m", 65536, "m"),
+    ],
+)
+def test_launchable_raster_order_falls_back_past_grid_z(scheduler_mode,
+                                                        raster_order, n,
+                                                        expected):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        _launchable_raster_order
+
+    assert _launchable_raster_order(scheduler_mode, raster_order, 8192, n, 1,
+                                    (128, 64), False, (1, 1)) == expected
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and SM107 CuTe DSL support.",
+)
+def test_cute_dsl_mxfp8_gemm_rubin_rejects_clc_grid_z_overflow():
+    """CLC raster-N tactics must not exceed CUDA's grid-Z limit."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLMXFP8RubinLinear
+
+    m, n, k = 8192, 65536, 1536
+    a_fp8 = torch.empty((m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_fp8 = torch.empty((n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    a_sf = torch.empty((393216, ), device="cuda", dtype=torch.uint8)
+    b_sf = torch.empty((3145728, ), device="cuda", dtype=torch.uint8)
+    alpha = torch.ones((), dtype=torch.float32, device="cuda")
+    inputs = [a_fp8, b_fp8, a_sf, b_sf, alpha]
+
+    invalid_tactic = (
+        "base",
+        (128, 64, 128),
+        (128, 64, 64),
+        (1, 1),
+        False,
+        True,
+        "clc_dynamic",
+        "n",
+        1,
+    )
+    valid_tactic = (*invalid_tactic[:-2], "m", 1)
+    tactics = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
+                                      use_tvm_ffi=True).get_valid_tactics(
+                                          inputs, None)
+
+    assert invalid_tactic not in tactics
+    assert valid_tactic in tactics
 
 
 @pytest.mark.skipif(

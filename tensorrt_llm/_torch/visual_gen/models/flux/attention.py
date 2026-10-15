@@ -22,12 +22,12 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
     FluxJointAttnMLPProj,
     FluxJointQKVMLPProj,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -512,7 +512,9 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             return False
 
         return (
-            gate_up_proj.use_cute_dsl_blockscaling_mm
+            # Same predicate the weight transform uses, so dispatch can never
+            # consume a layout the loader did not produce.
+            gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell()
             and gate_up_proj.has_nvfp4
             and not gate_up_proj.has_bias
             and self._is_cute_dsl_swiglu_layout_compatible(

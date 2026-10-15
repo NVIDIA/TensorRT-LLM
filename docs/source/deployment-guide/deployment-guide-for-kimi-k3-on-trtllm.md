@@ -39,7 +39,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
 * **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) generation kernels.
-* **Speculative decoding and disaggregated serving are not yet available** for Kimi K3; support is under development. See the "Current limitations" section of `examples/kimi_k3/README.md`.
+* **Disaggregated serving and suffix-automaton speculative decoding are available.** Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see `examples/kimi_k3/disagg/README.md`. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the "Current limitations" section of `examples/kimi_k3/README.md` for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).
 
 ## Deployment Steps
 
@@ -281,7 +281,7 @@ sbatch --account <account> --partition batch --qos <qos> --time 04:00:00 \
     --task gsm8k --parallel tep
 ```
 
-The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. `KIMI_K3_FP8_WEIGHT_READ` defaults to `0`, which is the precision the reference scores were measured at.
+The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. The reference scores used BF16 shared/latent MLP projections, which remain the default (`KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0`). Set `KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1` to opt into lossy FP8 conversion of those projections. Attention projection datatypes follow the checkpoint quantization configuration.
 
 Measured on 16 GB200 GPUs (4 nodes, `100-real` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
 

@@ -89,17 +89,27 @@ class MLAStaticTileSchedulerParams:
         return values
 
     def __new_from_mlir_values__(self, values):
-        problem_shape_b = cutlass.new_from_mlir_values(self.problem_shape_b,
-                                                       (values[0], ))
-        problem_shape_s = cutlass.new_from_mlir_values(self.problem_shape_s,
-                                                       (values[1], ))
-        split_kv = cutlass.new_from_mlir_values(self.split_kv, (values[2], ))
-        problem_shape_b_fdd = cutlass.new_from_mlir_values(
-            self.problem_shape_b_fdd, (values[3], ))
-        problem_shape_s_fdd = cutlass.new_from_mlir_values(
-            self.problem_shape_s_fdd, (values[4], ))
-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd,
-                                                    (values[5], ))
+        # Slice per field by that field's own extraction width, in
+        # __extract_mlir_values__ order. FastDivmodDivisor occupies 2 SSA values
+        # on nvidia-cutlass-dsl-internal, so fixed indices mis-slice (cutlass #3243).
+        fields = (
+            self.problem_shape_b,
+            self.problem_shape_s,
+            self.split_kv,
+            self.problem_shape_b_fdd,
+            self.problem_shape_s_fdd,
+            self.split_kv_fdd,
+        )
+        rebuilt = []
+        offset = 0
+        for field in fields:
+            width = len(cutlass.extract_mlir_values(field))
+            rebuilt.append(
+                cutlass.new_from_mlir_values(
+                    field, tuple(values[offset:offset + width])))
+            offset += width
+        (problem_shape_b, problem_shape_s, split_kv, problem_shape_b_fdd,
+         problem_shape_s_fdd, split_kv_fdd) = rebuilt
         return MLAStaticTileSchedulerParams(
             self.is_persistent,
             problem_shape_b,
@@ -281,16 +291,21 @@ class MLAStaticTileScheduler:
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 13
-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
-        new_current_work_linear_idx = cutlass.new_from_mlir_values(
-            self.current_work_linear_idx, [values[6]])
-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord,
-                                                     values[7:10])
-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape,
-                                                      values[10:])
-        return MLAStaticTileScheduler(new_params, new_current_work_linear_idx,
-                                      new_blk_coord, new_grid_shape)
+        # Width-driven slicing, as in MLAStaticTileSchedulerParams: params holds
+        # three FastDivmodDivisors, which are not 1 SSA value each on every
+        # cutlass-dsl build, so the old fixed 6/1/3/rest split mis-slices.
+        rebuilt = []
+        offset = 0
+        for field in (self.params, self.current_work_linear_idx, self.blk_coord,
+                      self.grid_shape):
+            width = len(cutlass.extract_mlir_values(field))
+            rebuilt.append(
+                cutlass.new_from_mlir_values(
+                    field, list(values[offset:offset + width])))
+            offset += width
+        assert offset == len(values), (
+            f"MLAStaticTileScheduler consumed {offset} of {len(values)} values")
+        return MLAStaticTileScheduler(*rebuilt)
 
 
 def create_mla_static_tile_scheduler(
@@ -306,5 +321,67 @@ LOG2_E = 1.4426950408889634074
 MAX_SPLITS = 256
 
 
+@cute.jit
+def get_variable_query_tile_info(
+    num_heads: cutlass.Constexpr,
+    q_tile_idx: cutlass.Int32,
+    batch_idx: cutlass.Int32,
+    cum_seq_lens_q: cute.Tensor,
+    m_tile: cutlass.Constexpr,
+) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    """Return request-local metadata for one compact token/head tile.
+
+    Compact Q uses ``row = token * num_heads + head``. Returns
+    ``(q_begin, q_len, valid_rows)``; ``valid_rows == 0`` identifies a
+    rectangular schedule slot beyond the request. Such a slot must remain
+    scheduler-valid and become a no-op rather than terminate a persistent
+    scheduler iteration.
+    """
+    # Every caller supplies a CTA-uniform request index. Marking the two indptr
+    # loads warp-uniform avoids issuing the same scalar load in every lane,
+    # especially in the many small standalone-reducer CTAs.
+    q_begin = cute.arch.make_warp_uniform(cum_seq_lens_q[batch_idx])
+    q_end = cute.arch.make_warp_uniform(cum_seq_lens_q[batch_idx + 1])
+    q_len = q_end - q_begin
+
+    remaining_rows = q_len * num_heads - q_tile_idx * m_tile
+    valid_rows = cutlass.max(
+        cutlass.Int32(0),
+        cutlass.min(cutlass.Int32(m_tile), remaining_rows),
+    )
+    return q_begin, q_len, valid_rows
+
+
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def compute_q_tile_layout(num_heads: int,
+                          seq_len_q: int,
+                          m_tile: int = 128) -> tuple[int, int, int]:
+    """Return ``(total_rows, num_tiles, tail_rows)`` for flat query packing.
+
+    Query-token and head modes are one affine row space ordered as
+    ``flat_row = q_token * num_heads + q_head``.  Consecutive M tiles may
+    therefore cross token boundaries; only the final tile can be partial.
+    ``tail_rows`` is always in ``[1, m_tile]`` and equals ``m_tile`` when the
+    flattened row count exactly fills the final tile.
+
+    This host-side helper is shared by launch/workspace selection and both
+    kernel variants so their split-KV geometry cannot drift apart.
+    """
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+    if seq_len_q <= 0:
+        raise ValueError(f"seq_len_q must be positive, got {seq_len_q}")
+    if m_tile <= 0:
+        raise ValueError(f"m_tile must be positive, got {m_tile}")
+    if num_heads > m_tile:
+        raise ValueError(
+            f"num_heads ({num_heads}) must not exceed the MMA M tile ({m_tile})"
+        )
+
+    total_rows = num_heads * seq_len_q
+    num_tiles = ceil_div(total_rows, m_tile)
+    tail_rows = total_rows - (num_tiles - 1) * m_tile
+    return total_rows, num_tiles, tail_rows

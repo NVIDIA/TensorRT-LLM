@@ -28,6 +28,12 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
+from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
+from ..nccl_ep_utils import (
+    is_nccl_ep_installed,
+    nccl_ep_supports_group_timeout,
+    nccl_ep_supports_version,
+)
 from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
@@ -124,7 +130,14 @@ class CommunicationFactory:
         Note:
             Most parameters are extracted from model_config. Only MoE-specific parameters
             (num_experts, num_slots, top_k, expert_size_per_partition) need to be provided separately.
+
+        Raises:
+            ValueError: If the MoE communication timeout environment variables are invalid.
         """
+        # Backend constructors apply these budgets, and auto-selection below treats a constructor
+        # error as "backend unavailable", so an invalid variable must fail here instead.
+        get_moe_comm_timeout_budgets()
+
         # Extract parameters from model_config
         mapping = model_config.mapping
         if mapping.has_cp_helix():
@@ -258,6 +271,8 @@ class CommunicationFactory:
                     max_num_tokens,
                     moe_max_num_tokens,
                     top_k=top_k,
+                    quant_config=quant_config,
+                    use_low_precision_combine=use_low_precision_combine,
                 )
                 logger.info("Selected communication strategy: NcclEP")
                 return strategy
@@ -439,6 +454,8 @@ class CommunicationFactory:
                 max_num_tokens,
                 moe_max_num_tokens,
                 top_k=top_k,
+                quant_config=quant_config,
+                use_low_precision_combine=use_low_precision_combine,
             )
         elif method == "ALLGATHER":
             return AllGatherReduceScatter(mapping)
@@ -457,7 +474,7 @@ class CommunicationFactory:
     ) -> Optional[str]:
         if act_dtype != torch.bfloat16:
             return f"NcclEP requires act_dtype=torch.bfloat16, got {act_dtype}."
-        if quant_config is not None:
+        if not nccl_ep_supports_version("0.2") and quant_config is not None:
             quant_mode = getattr(quant_config, "layer_quant_mode", None)
             if quant_mode is not None and quant_mode.has_any_quant(exclude_kv_cache=True):
                 return "NcclEP v0.1 does not support quantized MoE communication."
@@ -472,7 +489,7 @@ class CommunicationFactory:
             )
         if top_k <= 0 or top_k > num_slots:
             return f"NcclEP requires 0 < top_k <= num_slots, got {top_k=}, {num_slots=}."
-        if torch.cuda.is_available():
+        if not nccl_ep_supports_version("0.2") and torch.cuda.is_available():
             device_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
             required_smem = _get_nccl_ep_ll_combine_smem_requirement(
                 num_slots, hidden_size, device_properties.multi_processor_count
@@ -494,4 +511,9 @@ class CommunicationFactory:
                     f"{required_smem} bytes of dynamic shared memory, but the current device "
                     f"supports only {max_dynamic_smem} bytes."
                 )
+        if is_nccl_ep_installed() and not nccl_ep_supports_group_timeout():
+            return (
+                "NcclEP requires nccl.ep.Group.set_timeout_ns; rebuild so nccl-extensions "
+                "carries 3rdparty/patches/nccl_ep_group_timeout.patch."
+            )
         return None

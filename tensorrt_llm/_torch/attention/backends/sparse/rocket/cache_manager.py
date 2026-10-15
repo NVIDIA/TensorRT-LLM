@@ -101,11 +101,11 @@ class RocketKVCacheManager(KVCacheManager):
         self.num_blocks = self.blocks_in_primary_pool
         self.kt_cache_pool_per_layer = [
             torch.empty(
-                (self.num_blocks, self.kt_tokens_per_block, num_kv_heads, head_dim * 2),
+                (self.num_blocks, self.kt_tokens_per_block, local_kv_heads, head_dim * 2),
                 device="cuda",
                 dtype=self.kt_cache_dtype,
             )
-            for _ in range(self.num_local_layers)
+            for local_kv_heads in self.num_kv_heads_per_layer
         ]
         self.max_kt_blocks_per_seq = self.num_blocks
 

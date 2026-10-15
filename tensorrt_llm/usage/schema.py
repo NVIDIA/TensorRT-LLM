@@ -103,7 +103,7 @@ class _LlmCounterSnapshot(BaseModel):
 class TrtllmInitialReport(_LlmCounterSnapshot):
     """TRT-LLM initial report event parameters.
 
-    Sent once at startup with full environment and configuration details.
+    Sent once after initialization, or as marked partial context on early exit.
     All fields are required by the SMS schema (GXT convention: every declared
     property must be in ``required``). Fields use sentinel defaults (empty
     string for strings, 0 for ints) when the actual value is unavailable.
@@ -199,7 +199,7 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
     """TRT-LLM heartbeat event parameters.
 
     Sent periodically to signal the session is still alive.
-    Contains a monotonically increasing sequence counter, process correlation
+    Contains a sequence counter saturating at uint32 max, process correlation
     fields, and the latest aggregate LLM lifecycle counter snapshot.
     """
 
@@ -208,7 +208,7 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
         ge=0,
         le=_UINT32_MAX,
         alias="seq",
-        description="Zero-based heartbeat sequence number for this session.",
+        description="Zero-based heartbeat sequence number, saturating at uint32 max.",
     )
     ingress_point: str = Field(
         default="",
@@ -327,7 +327,7 @@ class TrtllmExitReport(_LlmCounterSnapshot):
 
 
 # ---------------------------------------------------------------------------
-# GXT Event Wrapper (single event in the events array)
+# GXT Event Wrapper (one entry in a potentially multi-event envelope)
 # ---------------------------------------------------------------------------
 
 
