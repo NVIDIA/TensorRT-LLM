@@ -27,6 +27,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -304,7 +305,7 @@ class PrefillTarget:
             kv_cache_block_offsets=md.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-            workspace_=md.effective_workspace,
+            workspace=md.effective_workspace,
             tokens_per_block=md.tokens_per_block,
             max_num_requests=md.max_num_requests,
             max_context_length=md.max_context_length,
@@ -322,7 +323,7 @@ class PrefillTarget:
             use_spec_decoding=md.use_spec_decoding,
             is_spec_dec_tree=md.is_spec_dec_tree,
             spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_position_offsets=get_spec_decoding_position_offsets(md),
             spec_decoding_packed_mask=md.spec_decoding_packed_mask,
             spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
@@ -505,7 +506,7 @@ class DecodeTarget:
             kv_cache_block_offsets=md.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-            workspace_=md.effective_workspace,
+            workspace=md.effective_workspace,
             tokens_per_block=md.tokens_per_block,
             max_num_requests=md.max_num_requests,
             max_context_length=md.max_context_length,
@@ -523,7 +524,7 @@ class DecodeTarget:
             use_spec_decoding=md.use_spec_decoding,
             is_spec_dec_tree=md.is_spec_dec_tree,
             spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_position_offsets=get_spec_decoding_position_offsets(md),
             spec_decoding_packed_mask=md.spec_decoding_packed_mask,
             spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,

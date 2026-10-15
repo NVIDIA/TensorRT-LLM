@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import get_sm_version
 
 from .interface import Fmha
 
@@ -73,26 +74,52 @@ class FmhaParams:
     batch_size: int = 0
     # Number of logical requests in the active phase.
     num_requests: int = 0
+    use_spec_decoding: bool = False
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
     is_cross: bool = False
+
+
+def get_spec_decoding_position_offsets(
+    metadata: "TrtllmAttentionMetadata",
+) -> Optional[torch.Tensor]:
+    """Return the active int32 offsets as a zero-copy [requests, query width] view."""
+    if not (metadata.is_spec_decoding_enabled and metadata.use_spec_decoding):
+        return None
+    offsets = metadata.spec_decoding_position_offsets
+    if offsets is not None and offsets.dim() == 1:
+        if not metadata.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+            # Hopper offsets use the current compact query width, which can be
+            # smaller than the persistent buffer's capacity.
+            query_len = metadata.spec_decoding_query_len
+            if query_len <= 0:
+                raise ValueError(
+                    "1-D speculative position offsets require a positive query length."
+                )
+            offsets = offsets[: metadata.max_num_requests * query_len].view(
+                metadata.max_num_requests, query_len
+            )
+        else:
+            offsets = offsets.view(metadata.max_num_requests, -1)
+    return offsets
 
 
 class PhasedFmha(Fmha):
     """FMHA helper for paged-KV libraries that split work by request phase."""
 
     REQUIRES_PAGED_KV = True
+    # Required by backends that construct tensor views over the KV pool.
+    NEEDS_BLOCK_EXTENT = True
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self.kv_factor = 1 if attn.is_mla_enable else 2
-        kv_lora_rank = attn.kv_lora_rank or 0
-        self.generation_out_head_size = (
-            kv_lora_rank if attn.is_mla_enable and kv_lora_rank else attn.head_dim
-        )
-        self.context_out_head_size = (
-            attn.v_head_dim if attn.is_mla_enable and attn.v_head_dim else attn.head_dim
-        )
+        self.generation_out_head_size = attn.out_head_size(is_gen_only=True)
+        self.context_out_head_size = attn.out_head_size(is_gen_only=False)
         self._v1_total_num_blocks_cache: Optional[tuple[object, int, int]] = None
 
     def _get_total_num_blocks(
@@ -188,6 +215,13 @@ class PhasedFmha(Fmha):
         num_contexts = metadata.num_contexts
         num_ctx_tokens = metadata.num_ctx_tokens
         num_generations = metadata.num_generations
+        has_context = num_contexts > 0 and not is_gen_only
+        has_generation = (
+            num_generations > 0 and attention_input_type != AttentionInputType.context_only
+        )
+        fused_epilogue = forward_args.enable_dsv4_epilogue_fusion
+        if fused_epilogue and has_context and has_generation:
+            raise ValueError("DSv4 fused epilogue requires separate context and generation calls.")
         num_gen_tokens = num_tokens if is_gen_only else num_tokens - num_ctx_tokens
         if num_gen_tokens < 0:
             raise RuntimeError(
@@ -204,8 +238,17 @@ class PhasedFmha(Fmha):
             workspace,
         )
 
-        out_head_size = self.generation_out_head_size if is_gen_only else self.context_out_head_size
-        out_tensor = output.view(num_tokens, attn.num_heads, out_head_size)
+        if fused_epilogue:
+            # DSv4 owns a contiguous [groups, tokens, K] output buffer for each phase.
+            out_tensor = output
+        else:
+            out_head_size = (
+                self.generation_out_head_size if is_gen_only else self.context_out_head_size
+            )
+            if output.dtype == torch.uint8:
+                # NVFP4 stores two output values in each byte.
+                out_head_size //= 2
+            out_tensor = output.view(num_tokens, attn.num_heads, out_head_size)
 
         attention_window_size = forward_args.attention_window_size
         cache_indirection = metadata.cache_indirection
@@ -232,14 +275,16 @@ class PhasedFmha(Fmha):
             cyclic_attention_window_size=attention_window_size,
             tokens_per_block=tokens_per_block,
             kv_factor=self.kv_factor,
-            total_num_blocks=self._get_total_num_blocks(metadata),
+            total_num_blocks=(
+                self._get_total_num_blocks(metadata) if self.NEEDS_BLOCK_EXTENT else 0
+            ),
             is_cross=metadata.is_cross,
         )
 
         sequence_length = metadata.kv_lens_cuda_runtime
         host_past_key_value_lengths = metadata.kv_lens_runtime
 
-        if num_contexts > 0 and attention_input_type != AttentionInputType.generation_only:
+        if has_context:
             seq_offset = 0
             token_offset = 0
             num_seqs = num_contexts
@@ -260,7 +305,11 @@ class PhasedFmha(Fmha):
             params.value_input = (
                 v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
             )
-            params.output = out_tensor[token_offset : token_offset + num_ctx_tokens]
+            params.output = (
+                out_tensor
+                if fused_epilogue
+                else out_tensor[token_offset : token_offset + num_ctx_tokens]
+            )
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
@@ -275,7 +324,7 @@ class PhasedFmha(Fmha):
             else:
                 self.run_context(params)
 
-        if num_generations > 0 and attention_input_type != AttentionInputType.context_only:
+        if has_generation:
             seq_offset = num_contexts
             token_offset = 0 if is_gen_only else num_ctx_tokens
             num_seqs = num_generations
@@ -285,17 +334,20 @@ class PhasedFmha(Fmha):
             )
             input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
 
-            predicted_tokens_per_seq = attn.predicted_tokens_per_seq
-            spec_gen_lengths = None
-            spec_pos_offsets = None
-            if metadata.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
-                spec_gen_lengths = metadata.spec_decoding_generation_lengths
-                position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
-                if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
-                    position_offsets_for_cpp = position_offsets_for_cpp.view(
-                        metadata.max_num_requests, -1
-                    )
-                spec_pos_offsets = position_offsets_for_cpp
+            params.use_spec_decoding = (
+                metadata.is_spec_decoding_enabled and metadata.use_spec_decoding
+            )
+            if params.use_spec_decoding:
+                params.spec_decoding_generation_lengths = metadata.spec_decoding_generation_lengths
+                params.spec_decoding_position_offsets = get_spec_decoding_position_offsets(metadata)
+                params.spec_decoding_packed_mask = metadata.spec_decoding_packed_mask
+                params.spec_decoding_bl_tree_mask_offset = (
+                    metadata.spec_decoding_bl_tree_mask_offset
+                )
+                params.spec_decoding_bl_tree_mask = metadata.spec_decoding_bl_tree_mask
+                params.spec_bl_tree_first_sparse_mask_offset_kv = (
+                    metadata.spec_bl_tree_first_sparse_mask_offset_kv
+                )
 
             phase_input = q[token_offset : token_offset + num_gen_tokens]
             params.qkv_input = phase_input if is_fused_qkv else None
@@ -306,8 +358,15 @@ class PhasedFmha(Fmha):
             params.value_input = (
                 v[token_offset : token_offset + num_gen_tokens] if v is not None else None
             )
-            params.output = out_tensor[token_offset : token_offset + num_gen_tokens]
+            params.output = (
+                out_tensor
+                if fused_epilogue
+                else out_tensor[token_offset : token_offset + num_gen_tokens]
+            )
             params.sequence_lengths = sequence_length[seq_offset:]
+            params.context_lengths = metadata.prompt_lens_cuda_runtime[
+                seq_offset : seq_offset + num_seqs
+            ]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_gen_tokens
             params.seq_offset = seq_offset
@@ -315,8 +374,6 @@ class PhasedFmha(Fmha):
             params.input_seq_length = input_seq_length
             params.batch_size = num_seqs
             params.num_requests = num_seqs // metadata.beam_width
-            params.spec_decoding_generation_lengths = spec_gen_lengths
-            params.spec_decoding_position_offsets = spec_pos_offsets
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:

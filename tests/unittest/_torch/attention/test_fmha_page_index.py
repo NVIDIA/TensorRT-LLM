@@ -12,9 +12,9 @@ from tensorrt_llm._torch.attention.backends.fmha import (
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
-    _get_multi_ctas_kv_counter_size,
 )
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -102,13 +102,13 @@ def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
     # product clears the multi-processor floor, so pick a case that does.
     num_heads, batch, beam, sm_count = 6, 16, 2, 148
     needed = num_heads * batch * beam * torch.int32.itemsize
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) < needed
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch * beam, sm_count) >= needed
+    assert get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) < needed
+    assert get_multi_ctas_kv_counter_size(num_heads, batch * beam, sm_count) >= needed
 
 
 def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor() -> None:
     num_heads, batch, sm_count = 6, 1, 148
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) >= (
+    assert get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) >= (
         sm_count * torch.int32.itemsize
     )
 
@@ -133,7 +133,7 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
 
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen."
-        "_get_multi_ctas_kv_counter_size",
+        "get_multi_ctas_kv_counter_size",
         check_counter_size_args,
     )
 

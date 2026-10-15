@@ -70,7 +70,6 @@ add_cuda_architectures(tllm_common_cuda 89)
 
 add_library(
   common_src OBJECT
-  attentionOp.cpp
   cublasMMWrapper.cpp
   cudaFp8Utils.cu
   cudaProfilerUtils.cpp
