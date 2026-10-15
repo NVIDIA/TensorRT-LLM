@@ -61,6 +61,10 @@ LOG_EVERY_REQUESTS = 1000
 # text has that probe at the same position. The probe must be longer than any
 # suffix the chat template appends after the last message.
 PROBE_CHARS = 256
+# Piecewise mode re-tokenizes from a prompt's last added token, so it is used only when one
+# starts this close to the end, as chat templates' generation prompts do. Otherwise the offsets
+# splice, which backs off about this far, re-tokenizes less.
+PIECEWISE_TAIL_CHARS = 256
 
 
 class OffsetTokenizer(Protocol):
@@ -125,6 +129,7 @@ class _Entry:
     # token ``split_token``, which starts at character ``split_char``.
     split_token: int
     split_char: int
+    piecewise: bool  # split at an added token, so splicing pieces from it is exact
     probe: str  # the last PROBE_CHARS characters of ``text``
 
 
@@ -179,6 +184,9 @@ class _PieceEncoder:
         probe = "".join(f"a {t.content} 1\n{t.content}{t.content}b " for t in added.values())
         expected = tokenizer(probe, add_special_tokens=False)["input_ids"]
         return encoder if encoder.encode(probe)[0].tolist() == expected else None
+
+    def ends_near_added_token(self, text: str) -> bool:
+        return self._split.search(text, max(0, len(text) - PIECEWISE_TAIL_CHARS)) is not None
 
     def encode(self, text: str) -> tuple[array, int, int]:
         """Return the int32 ids of ``text`` and the token and char index of its last added token.
@@ -270,10 +278,15 @@ class PrefixTokenCache:
     def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         found = self._lookup(text)
         entry = None if found is None else found[1]
-        if self._pieces is None:
-            ids, split_token, split_char, spliced = self._splice_offsets(tokenizer, entry, text)
-        else:
+        piecewise = (
+            self._pieces is not None
+            and (entry is None or entry.piecewise)
+            and self._pieces.ends_near_added_token(text)
+        )
+        if piecewise:
             ids, split_token, split_char, spliced = self._splice_pieces(entry, text)
+        else:
+            ids, split_token, split_char, spliced = self._splice_offsets(tokenizer, entry, text)
 
         with self._lock:
             if spliced:
@@ -285,7 +298,7 @@ class PrefixTokenCache:
             if found is not None:
                 self._remove(found[0])
             if split_token > 0:
-                self._insert(text, ids, split_token, split_char)
+                self._insert(text, ids, split_token, split_char, piecewise)
             report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
             summary = self.summary() if report else None
         if summary is not None:
@@ -360,14 +373,16 @@ class PrefixTokenCache:
             # splice from; _remove() on it is a no-op.
         return best
 
-    def _insert(self, text: str, ids: array, split_token: int, split_char: int) -> None:
+    def _insert(
+        self, text: str, ids: array, split_token: int, split_char: int, piecewise: bool
+    ) -> None:
         """Caller holds the lock."""
         key = self._bucket_key(text)
         bucket = self._buckets.setdefault(key, {})
         if any(entry.text == text for entry in bucket.values()):
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
-        entry = _Entry(text, ids, split_token, split_char, text[-PROBE_CHARS:])
+        entry = _Entry(text, ids, split_token, split_char, piecewise, text[-PROBE_CHARS:])
         self._entries[eid] = entry
         bucket[eid] = entry
         self._total_chars += len(text)

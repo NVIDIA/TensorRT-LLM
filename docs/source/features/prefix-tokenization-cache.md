@@ -33,6 +33,11 @@ chosen at startup only if it is exact for the tokenizer: no added token with
 off, no Python-side preprocessing in the tokenizer class, and a probe that
 encodes identically both ways. The startup log line says which mode is in use,
 and the piece LRU is bounded by `TLLM_PREFIX_TOKEN_CACHE_MAX_CHARS` on its own.
+A prompt is split piecewise only if an added token starts within its last 256
+characters, as a chat template's generation prompt does; otherwise, for example
+with plain-text role markers, it takes the offsets splice. Either way, a prompt
+that extends a cached one re-tokenizes at most a few hundred characters of the
+cached text.
 
 ## Enabling the cache
 

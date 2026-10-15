@@ -322,6 +322,20 @@ def test_piecewise_growth_and_edits_are_identical_to_full_tokenization(
     assert cache.hits == len(messages) - 1
 
 
+def test_piecewise_keeps_offsets_splice_for_prompts_not_ending_near_an_added_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
+    tokenizer = _bpe_tokenizer()
+    cache = create_prefix_token_cache(tokenizer)
+    # Plain-text turns after one leading marker, as in templates without added-token roles.
+    for prompt in _turns(8, preamble="<|system|>" + _PREAMBLE * 3):
+        expected = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        assert cache.encode(tokenizer, prompt) == expected
+    assert cache.hits > 0
+    assert not any(entry.piecewise for entry in cache._entries.values())
+
+
 @pytest.mark.parametrize(
     "options",
     [
