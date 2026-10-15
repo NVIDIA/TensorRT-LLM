@@ -1,0 +1,233 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Parse and validate the planner's ``plan.md``.
+
+``plan.md`` carries one ``### <task-id>`` section per task (the prose a worker
+reads) and a ``## Execution Graph`` block the scheduler runs. Each graph node is
+a task; its ``type`` is the task's primary tag and an optional ``tags`` list adds
+more. The engine's :class:`~agent_flow.orchestration.Node` keeps only ``type``,
+so the tags are read from the same YAML block here.
+
+The rules below are what make a plan runnable by this workflow. Every violation
+is collected so the planner can fix them all in one retry.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+
+import yaml
+
+from agent_flow.orchestration import (
+    ExecutionGraph,
+    ExecutionGraphError,
+    NodeState,
+    parse_execution_graph,
+)
+
+__all__ = [
+    "TAGS",
+    "PlanError",
+    "PlanSpec",
+    "parse_plan",
+]
+
+# The task tags a plan may use. Each one selects an extra block of worker
+# system prompt (see ``prompts.tags``).
+TAGS: tuple[str, ...] = ("new_op", "target", "merge", "module_accuracy", "e2e_accuracy")
+
+# Task ids become git branch names (``node/<id>``) and file names, so keep them
+# to a character set that is safe in both.
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# Same heading shape ``agent_team.execution_graph`` accepts, including an
+# optional leading section number.
+_GRAPH_HEADING_RE = re.compile(r"##\s+(?:\d+[.)]?\s+)?Execution\s+Graph\s*$")
+_FENCE = "```"
+
+
+class PlanError(ValueError):
+    """``plan.md`` is missing, malformed, or breaks a workflow rule.
+
+    Attributes:
+        problems: Every rule violation found, one human-readable line each.
+    """
+
+    def __init__(self, problems: Iterable[str]) -> None:
+        self.problems = list(problems)
+        super().__init__("plan.md is not runnable:\n- " + "\n- ".join(self.problems))
+
+
+@dataclass(frozen=True)
+class PlanSpec:
+    """A validated plan.
+
+    Attributes:
+        graph: The execution graph the scheduler runs.
+        tags: Each task's tags, primary tag first.
+        text: The plan.md text this spec was parsed from.
+    """
+
+    graph: ExecutionGraph
+    tags: Mapping[str, tuple[str, ...]]
+    text: str
+
+    def sink_id(self) -> str:
+        """The id of the plan's single final task."""
+        return _sinks(self.graph)[0]
+
+
+def _graph_block(text: str) -> str | None:
+    """Return the body of the first fenced block under ``## Execution Graph``."""
+    lines = text.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if _GRAPH_HEADING_RE.fullmatch(line.strip())),
+        None,
+    )
+    if start is None:
+        return None
+    body: list[str] | None = None
+    for line in lines[start + 1 :]:
+        stripped = line.strip()
+        if body is None:
+            if stripped.startswith("## "):
+                return None
+            if stripped.startswith(_FENCE):
+                body = []
+            continue
+        if stripped == _FENCE:
+            return "\n".join(body)
+        body.append(line)
+    return None
+
+
+def _sinks(graph: ExecutionGraph) -> list[str]:
+    depended_on = {dep for node in graph.nodes for dep in node.depends_on}
+    return [node.id for node in graph.nodes if node.id not in depended_on]
+
+
+def _raw_tags(block: str) -> dict[str, object]:
+    data = yaml.safe_load(block)
+    return {
+        raw["id"]: raw.get("tags")
+        for raw in data["nodes"] or []
+        if isinstance(raw, dict) and isinstance(raw.get("id"), str)
+    }
+
+
+def _task_tags(node_type: str, extra: object, problems: list[str], node_id: str) -> tuple[str, ...]:
+    if extra is None:
+        extra = []
+    if not isinstance(extra, list) or not all(isinstance(t, str) for t in extra):
+        problems.append(f"task {node_id!r}: `tags` must be a list of strings")
+        extra = []
+    tags = tuple(dict.fromkeys([node_type, *extra]))
+    unknown = [t for t in tags if t not in TAGS]
+    if unknown:
+        problems.append(
+            f"task {node_id!r}: unknown tag(s) {unknown}; the tags are {', '.join(TAGS)}"
+        )
+    return tags
+
+
+def _has_task_section(text: str, node_id: str) -> bool:
+    return re.search(rf"^###\s+{re.escape(node_id)}\b", text, flags=re.MULTILINE) is not None
+
+
+def parse_plan(
+    text: str,
+    *,
+    previous: PlanSpec | None = None,
+    states: Mapping[str, NodeState] | None = None,
+) -> PlanSpec:
+    """Parse ``plan.md`` text and check every workflow rule.
+
+    Args:
+        text: The full ``plan.md``.
+        previous: The plan the last build ran, when this is a revision.
+        states: The task states that build ended with. A ``DONE`` task of
+            ``previous`` must keep its definition, so it is never re-run.
+
+    Returns:
+        The validated :class:`PlanSpec`.
+
+    Raises:
+        PlanError: Listing every rule the plan breaks.
+    """
+    block = _graph_block(text)
+    if block is None:
+        raise PlanError(['no "## Execution Graph" heading followed by a fenced ```yaml block'])
+    try:
+        graph = parse_execution_graph(block)
+    except ExecutionGraphError as exc:
+        raise PlanError([f"execution graph: {exc}"]) from exc
+
+    problems: list[str] = []
+    if not graph.nodes:
+        raise PlanError(["the execution graph has no tasks"])
+
+    raw_tags = _raw_tags(block)
+    tags: dict[str, tuple[str, ...]] = {}
+    for node in graph.nodes:
+        if node.children:
+            problems.append(
+                f"task {node.id!r}: nested `children` are not used; keep the graph flat"
+            )
+        if not _ID_RE.match(node.id):
+            problems.append(
+                f"task {node.id!r}: ids may use letters, digits, '_', '.', '-' and must "
+                "start with a letter or digit"
+            )
+        node_tags = _task_tags(node.type, raw_tags.get(node.id), problems, node.id)
+        tags[node.id] = node_tags
+        is_merge = "merge" in node_tags
+        if is_merge != (node.kind == "merge"):
+            problems.append(f"task {node.id!r}: tag `merge` and `kind: merge` must go together")
+        if len(node.depends_on) > 1 and not is_merge:
+            problems.append(
+                f"task {node.id!r} depends on {len(node.depends_on)} tasks; a task that "
+                "joins several branches must be tagged `merge`"
+            )
+        if not _has_task_section(text, node.id):
+            problems.append(f"task {node.id!r} has no `### {node.id}` section describing it")
+
+    sinks = _sinks(graph)
+    shared = [node.id for node in graph.nodes if node.isolation == "shared"]
+    if len(sinks) != 1:
+        problems.append(
+            f"the graph must end in exactly one final task that every other task leads "
+            f"to; found {len(sinks)}: {sinks}"
+        )
+    if len(shared) != 1 or shared != sinks[:1]:
+        problems.append(
+            "exactly one task — the final one — takes `isolation: shared`, which lands "
+            f"the result in the TensorRT-LLM checkout; found shared tasks {shared}"
+        )
+    elif "merge" not in tags[shared[0]]:
+        problems.append(f"the final task {shared[0]!r} must be tagged `merge`")
+
+    if previous is not None and states is not None:
+        for node_id, state in states.items():
+            if state != NodeState.DONE or node_id not in previous.graph.by_id:
+                continue
+            old = previous.graph.by_id[node_id]
+            new = graph.by_id.get(node_id)
+            if new is None:
+                problems.append(f"task {node_id!r} is DONE and cannot be removed")
+            elif (old.type, old.depends_on, old.kind, old.isolation) != (
+                new.type,
+                new.depends_on,
+                new.kind,
+                new.isolation,
+            ) or previous.tags.get(node_id) != tags.get(node_id):
+                problems.append(
+                    f"task {node_id!r} is DONE and its graph entry cannot change; add a new "
+                    "task for follow-up work instead"
+                )
+
+    if problems:
+        raise PlanError(problems)
+    return PlanSpec(graph=graph, tags=tags, text=text)
