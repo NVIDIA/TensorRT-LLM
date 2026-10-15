@@ -1065,7 +1065,12 @@ class PyTorchModelEngine(ModelEngine):
         finally:
             if record_decode:
                 jit_prefetch_decode.stop_recording()
-        self._init_jit_prefetch()
+        try:
+            self._init_jit_prefetch()
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(
+                f"[JIT prefetch] setup failed, serving without prefetch: "
+                f"{type(e).__name__}: {e}")
 
     def _init_jit_prefetch(self) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
