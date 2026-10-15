@@ -166,6 +166,23 @@ async def test_model_info_reports_the_context_window_and_capabilities():
     assert model_pb2.GUIDED_DECODING_MODE_JSON_SCHEMA in info.generation.guided_decoding.modes
     assert info.generation.output_logprobs.supported is True
     assert info.supports_token_ids_input is True
+    assert info.supports_multimodal is False
+    assert list(info.extra["trtllm_supported_modalities"]) == []
+
+
+@pytest.mark.asyncio
+async def test_model_info_advertises_loaded_image_support(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm.grpc.openengine.control.supported_media_modalities",
+        lambda llm: frozenset({"image"}),
+    )
+
+    info = await _servicer().GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+
+    assert info.supports_multimodal is True
+    assert list(info.extra["trtllm_supported_modalities"]) == ["image"]
 
 
 @pytest.mark.asyncio
