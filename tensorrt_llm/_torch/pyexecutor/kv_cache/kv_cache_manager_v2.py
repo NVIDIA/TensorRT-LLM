@@ -1721,7 +1721,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if cold_page_codec_provider is None:
                 return None
             return cold_page_codec_provider.create_cold_page_codec(
-                cache_config,
+                self._cold_page_codec_config(cache_config),
                 runtime_dtype=self.dtype,
                 pp_layers=self.pp_layers,
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
@@ -3094,6 +3094,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
+        return config
+
+    def _cold_page_codec_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Select buffers to compress; omitted groups retain native raw copying."""
         return config
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:

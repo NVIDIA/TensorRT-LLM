@@ -2854,6 +2854,37 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        from ...pyexecutor.kv_cache.mixed_precision_view import \
+            MixedPrecisionCache
+
+        staged = MixedPrecisionCache.create(metadata, self.layer_idx, q.dtype)
+        if staged is not None:
+            if self.is_mla_enable:
+                raise NotImplementedError(
+                    "Mixed-precision staging requires dense K/V Attention")
+            if k is None or v is None:
+                raise NotImplementedError(
+                    "Mixed-precision staging requires new K/V inputs")
+            staged_meta = copy.copy(metadata)
+            staged_meta.kv_cache_manager = staged.view
+            # Keep the native prepared row lengths, append positions and CSR
+            # boundaries, replacing only the pages consumed by the wrappers.
+            if list(metadata.num_blocks) != staged.page_counts:
+                raise NotImplementedError(
+                    "Mixed-precision staging requires logical page tables")
+            staged_meta._host_paged_kv_indices = torch.arange(sum(
+                staged.page_counts),
+                                                              dtype=torch.int32)
+            staged_meta._paged_kv_indices = staged_meta._host_paged_kv_indices.to(
+                q.device)
+            staged_meta._vswa_layer_to_pool = None
+            staged_meta._vswa_active_pool_id = None
+            staged_meta._plan_params_to_wrappers = {}
+            staged_attn = copy.copy(self)
+            staged_attn.has_fp8_kv_cache = False
+            result = staged_attn.forward(q, k, v, staged_meta, forward_args)
+            staged.writeback()
+            return result
 
         attention_mask_data = forward_args.attention_mask_data
         latent_cache = forward_args.latent_cache

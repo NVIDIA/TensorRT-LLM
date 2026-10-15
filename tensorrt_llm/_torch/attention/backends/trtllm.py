@@ -14,11 +14,12 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
                     List, Optional, Tuple)
 
@@ -2158,6 +2159,51 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        from tensorrt_llm.quantization import QuantMode
+
+        from ...pyexecutor.kv_cache.mixed_precision_view import \
+            MixedPrecisionCache
+
+        staged = MixedPrecisionCache.create(
+            metadata,
+            self.layer_idx,
+            q.dtype,
+            max_page_size=64,
+            history_dequant_scale=(forward_args.kv_scale_quant_orig
+                                   if forward_args.kv_scale_quant_orig
+                                   is not None else self.kv_scale_quant_orig))
+        if staged is not None:
+            if self.is_mla_enable or self.sparse_params is not None:
+                raise NotImplementedError(
+                    "Mixed-precision staging requires dense K/V Attention")
+            if metadata.kv_layout != "HND":
+                raise NotImplementedError(
+                    "TRTLLM mixed-precision writes require HND layout")
+            if k is None and v is None and q.shape[
+                    -1] == self.num_heads * self.head_dim:
+                raise NotImplementedError(
+                    "Mixed-precision staging requires new K/V inputs")
+            staged_meta = copy.copy(metadata)
+            staged_meta.kv_cache_manager = staged.view
+            staged_meta.kv_cache_block_offsets = staged.block_offsets()
+            staged_meta.use_paged_context_fmha = True
+            staged_meta.fmha_plan_caches = {}
+            staged_attn = copy.copy(self)
+            staged_attn.local_layer_idx = 0
+            staged_attn.quant_mode = int(
+                QuantMode(self.quant_mode)
+                & ~(QuantMode.FP8_KV_CACHE | QuantMode.INT8_KV_CACHE
+                    | QuantMode.NVFP4_KV_CACHE))
+            staged_attn.has_fp8_kv_cache = False
+            staged_attn.has_fp4_kv_cache = False
+            staged_attn._fmha_manager = FmhaManager(staged_attn)
+            result = staged_attn.forward(
+                q, k, v, staged_meta,
+                replace(forward_args,
+                        kv_scale_orig_quant=None,
+                        kv_scale_quant_orig=None))
+            staged.writeback()
+            return result
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
