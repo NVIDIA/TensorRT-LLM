@@ -1727,6 +1727,28 @@ class TestPerRequestWeightedSplit:
         assert draft_config.max_gpu_total_bytes == 2 * GB
         assert target_config.max_gpu_total_bytes == 8 * GB
 
+    @pytest.mark.parametrize(
+        "value, match",
+        [
+            ("abc", "must be a number"),
+            ("0", "must be positive"),
+            ("-1", "must be positive"),
+            ("nan", "must be positive"),
+        ],
+    )
+    def test_draft_gpu_budget_cap_rejects_invalid_values(self, monkeypatch, value, match):
+        """A malformed or non-positive cap fails with the variable's name instead
+        of leaving the draft a zero or negative slope budget."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", value)
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, bytes_per_request=GB),
+            draft=CacheCost(slope=20, bytes_per_request=GB),
+        )
+
+        with pytest.raises(ValueError, match=f"TLLM_DRAFT_KV_GPU_BUDGET_GIB {match}"):
+            c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
     def test_draft_gpu_budget_cap_ignores_offload_budgets(self, monkeypatch):
         """The cap applies to the GPU budget only."""
         monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "0")

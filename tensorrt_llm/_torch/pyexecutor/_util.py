@@ -2607,7 +2607,18 @@ class KvCacheCreator:
         # draft's GPU share and hands the rest to the target pool.
         draft_cap_gib = os.environ.get("TLLM_DRAFT_KV_GPU_BUDGET_GIB")
         if draft_cap_gib and budget_attr == "max_gpu_total_bytes":
-            draft_cap = draft_kv.intercept + int(float(draft_cap_gib) * GB)
+            try:
+                cap_gib = float(draft_cap_gib)
+            except ValueError as e:
+                raise ValueError(
+                    "TLLM_DRAFT_KV_GPU_BUDGET_GIB must be a number of GiB, got "
+                    f"{draft_cap_gib!r}") from e
+            # Reject NaN too: it fails every comparison below.
+            if not cap_gib > 0:
+                raise ValueError(
+                    "TLLM_DRAFT_KV_GPU_BUDGET_GIB must be positive, got "
+                    f"{draft_cap_gib!r}")
+            draft_cap = draft_kv.intercept + int(cap_gib * GB)
             if draft_kv.quota_per_request is not None:
                 # The allocator raises the draft quota to one request's floor
                 # regardless of the split (see _compute_draft_budget_shares),
