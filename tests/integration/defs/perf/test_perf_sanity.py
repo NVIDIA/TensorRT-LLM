@@ -1722,6 +1722,10 @@ class ServerConfig:
         self.enable_lm_head_tp_in_adp = server_config_data.get("enable_lm_head_tp_in_adp", False)
         self.backend = server_config_data.get("backend", "pytorch")
         self.extra_llm_api_config_path = server_config_data.get("extra_llm_api_config_path", "")
+        # Optional `trtllm-serve --chat_template` file, for chat-completions clients
+        # (e.g. AgentX) against checkpoints whose tokenizer does not expose one.
+        # A relative path is resolved against the model directory.
+        self.chat_template = server_config_data.get("chat_template", "")
 
         # attention_dp_config
         attention_dp_config = server_config_data.get("attention_dp_config", {})
@@ -1819,6 +1823,7 @@ class ServerConfig:
             "client_configs",
             "backend",
             "extra_llm_api_config_path",
+            "chat_template",
             "server_env_var",
         ]
         self.extra_llm_api_config_data = {
@@ -1852,6 +1857,13 @@ class ServerConfig:
             "--config",
             config_path,
         ]
+        if self.chat_template:
+            chat_template_path = (
+                self.chat_template
+                if os.path.isabs(self.chat_template)
+                else os.path.join(self.model_path, self.chat_template)
+            )
+            cmd += ["--chat_template", chat_template_path]
         return cmd
 
     def to_env(self) -> Dict[str, str]:
