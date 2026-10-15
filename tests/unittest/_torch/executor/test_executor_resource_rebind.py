@@ -71,10 +71,29 @@ def executor(monkeypatch):
 
 def test_release_preserves_model_and_orders_gpu_teardown(executor):
     ex, events = executor
+    draft_engine = SimpleNamespace(
+        attn_metadata=object(),
+        _release_cuda_graphs=lambda: events.append("draft_graphs"),
+    )
+    ex.draft_model_engine = draft_engine
+    ex.sampler = Mock(spec=AsyncWorkerMixin)
+    ex.sampler.async_worker_enabled.return_value = True
+    ex.sampler.async_worker_stop.side_effect = lambda: events.append("sampler_stop")
     engine, stream, sampler = ex.model_engine, ex.execution_stream, ex.sampler
     ex.release_resources()
 
-    assert events == ["stop", "join", "graphs", "synchronize", "unregister", "cache"]
+    assert events == [
+        "stop",
+        "join",
+        "sampler_stop",
+        "graphs",
+        "draft_graphs",
+        "synchronize",
+        "unregister",
+        "cache",
+    ]
+    assert ex.draft_model_engine is draft_engine
+    assert draft_engine.attn_metadata is None
     assert ex.model_engine is engine
     assert ex.execution_stream is stream
     assert ex.sampler is sampler
@@ -103,6 +122,9 @@ def test_final_shutdown_after_release_does_not_release_resources_twice(executor)
     ex, events = executor
     ex.release_resources()
     before = events.copy()
+    with pytest.raises(RuntimeError, match="already released"):
+        ex.release_resources()
+    assert events == before
     ex.shutdown()
     ex.shutdown()
     assert events == before
@@ -167,28 +189,6 @@ def test_failed_rebind_cannot_be_retried_over_partial_resources(executor):
     cache.shutdown.assert_called_once_with()
 
 
-def test_release_destroys_draft_graphs_before_cache(executor):
-    ex, events = executor
-    draft_engine = SimpleNamespace(
-        attn_metadata=object(),
-        _release_cuda_graphs=lambda: events.append("draft_graphs"),
-    )
-    ex.draft_model_engine = draft_engine
-    ex.release_resources()
-    assert events.index("draft_graphs") < events.index("synchronize") < events.index("cache")
-    assert ex.draft_model_engine is draft_engine
-    assert draft_engine.attn_metadata is None
-
-
-def test_release_cannot_be_repeated(executor):
-    ex, events = executor
-    ex.release_resources()
-    before = events.copy()
-    with pytest.raises(RuntimeError, match="already released"):
-        ex.release_resources()
-    assert events == before
-
-
 def test_hung_worker_does_not_release_live_resources(executor):
     ex, events = executor
     ex.hang_detector.detected.return_value = True
@@ -203,15 +203,6 @@ def test_hung_worker_does_not_release_live_resources(executor):
     assert ex._mpi_progress_thread is None
     assert ex.resource_manager is not None
     assert not ex._resources_released
-
-
-def test_async_sampler_stops_before_gpu_resource_release(executor):
-    ex, events = executor
-    ex.sampler = Mock(spec=AsyncWorkerMixin)
-    ex.sampler.async_worker_enabled.return_value = True
-    ex.sampler.async_worker_stop.side_effect = lambda: events.append("sampler_stop")
-    ex.release_resources()
-    assert events.index("join") < events.index("sampler_stop") < events.index("graphs")
 
 
 def test_transfer_shutdown_failure_keeps_cache_owned(executor):
