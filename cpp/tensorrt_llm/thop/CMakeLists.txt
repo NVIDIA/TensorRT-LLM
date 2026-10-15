@@ -135,6 +135,7 @@ add_th_common_family(
   allreduceOp.cpp
   alltoallOp.cpp
   asyncUlyssesOp.cpp
+  glmMnnvlHopOp.cpp
   ulyssesPostUnscatterOp.cpp
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
