@@ -21,37 +21,46 @@ Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen c
 
 ## Health checks
 
-OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as inference. `Check` returns the current status, and `Watch` immediately sends the current status and streams subsequent changes. Use the named services `inference` and `liveness`:
+OpenEngine serves the standard `grpc.health.v1.Health` service on its gRPC port. Set `--openengine-health-port` to start a second listener that serves only Health. It binds to `0.0.0.0` so Kubernetes can reach it through the Pod IP. Keep the inference listener on `127.0.0.1` when a sidecar in the same Pod is its only client.
+
+`Check` returns the current status. `Watch` sends the current status and later status changes. Rapid changes can merge into one update. The empty service has the same status as `inference`. Use these named services for Kubernetes probes:
 
 | Service | Meaning | Kubernetes use |
 |---------|---------|----------------|
 | `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Startup and readiness probes |
 | `liveness` | The gRPC server has started and is not shutting down. | Liveness probe |
 
-The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. Both services report `NOT_SERVING` during graceful shutdown. A stopped or failed server cannot answer the probe.
+The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. Both services report `NOT_SERVING` during graceful shutdown. Each `Watch` ends after this final status. A stopped or failed server cannot answer the probe.
 
-For a pod exposing port 50051, configure the probes with their service names:
+For a Pod with a loopback inference port at 50051, start the health-only listener on port 50052:
+
+```bash
+trtllm-serve <model> --grpc --grpc-protocol openengine \
+  --host 127.0.0.1 --port 50051 --openengine-health-port 50052
+```
+
+Configure Kubernetes to probe port 50052:
 
 ```yaml
 startupProbe:
   grpc:
-    port: 50051
+    port: 50052
     service: inference
   periodSeconds: 10
   failureThreshold: 60
 readinessProbe:
   grpc:
-    port: 50051
+    port: 50052
     service: inference
 livenessProbe:
   grpc:
-    port: 50051
+    port: 50052
     service: liveness
 ```
 
 The example allows about ten minutes for model loading. Set `failureThreshold * periodSeconds` to cover the worst-case startup time for your model and deployment.
 
-Bind the listener to the pod IP or `0.0.0.0` so kubelet can reach it. OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states.
+The health-only port does not serve inference or Control RPCs. Do not expose the inference port to the Pod network unless a network restriction and the unauthenticated RPC exposure have been reviewed. OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 

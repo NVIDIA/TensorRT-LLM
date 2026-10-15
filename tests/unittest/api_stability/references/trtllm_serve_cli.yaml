@@ -378,6 +378,15 @@ commands:
         is_flag: true
         flags:
         - "--openengine-enable-load-metrics"
+      openengine_health_port:
+        type: int
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-health-port"
       otlp_traces_endpoint:
         type: str
         default: null
