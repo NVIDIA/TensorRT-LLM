@@ -629,12 +629,16 @@ class DecoderRunner(ScheduledModelRunner):
         self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping()
 
     def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner | None:
-        runner_type = DSparkCUDAGraphRunner if self._dspark_confidence_enabled else CUDAGraphRunner
-        cuda_graph_runner = runner_type(self._cuda_graph_runner_config())
+        cuda_graph_runner = self._create_cuda_graph_runner(self._cuda_graph_runner_config())
         register_hooks = getattr(self.model, "register_cuda_graph_pre_replay_hooks", None)
         if register_hooks is not None:
             register_hooks(cuda_graph_runner)
         return cuda_graph_runner
+
+    def _create_cuda_graph_runner(self, config: CUDAGraphRunnerConfig) -> CUDAGraphRunner:
+        """Construction seam for explicit offline tooling, with ordinary defaults retained."""
+        runner_type = DSparkCUDAGraphRunner if self._dspark_confidence_enabled else CUDAGraphRunner
+        return runner_type(config)
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return CUDAGraphRunnerConfig(
@@ -3783,12 +3787,12 @@ class DecoderRunner(ScheduledModelRunner):
         Returns True when applied; False when a precondition fails (the step
         then runs the shape split as-is, which is a valid window assignment).
         """
+        from tensorrt_llm._torch.speculative.dspark_schedule import DSparkFusedScheduleError
         from tensorrt_llm._torch.speculative.dspark_select import (
             gather_packed_draft_tokens,
             materialize_compact_layout,
             select_windows_device,
         )
-        from tensorrt_llm._torch.speculative.dspark_schedule import DSparkFusedScheduleError
 
         runner = self.cuda_graph_runner
         budget = self._dspark_device_budget

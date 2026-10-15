@@ -481,6 +481,13 @@ receipt generation and performance qualification are external, and the composed 
 build, GPU/full-model, accuracy and performance validation. Optional mixed scheduling has the
 separate evidence and route requirements below; no composed-tip GPU qualification is implied.
 
+The source includes candidate [offline cost profiling](COST_PROFILING.md),
+[cost export and artifact reuse](COST_EXPORT.md), and
+[calibration collection plus matched static/dynamic commands](CONFIDENCE_REPRODUCTION.md).
+These use ordinary runtime configuration and configurable physical K and batch size, without
+private harnesses or cluster-specific inputs. Their end-to-end validation and publication status
+remain as stated in those guides; source availability alone is not GPU qualification.
+
 `K` is the physical draft length, `G` is the rank-local request count for a captured graph, and
 `V` is its verifier-token budget. In the cost table, `V=0` denotes the native full-width path;
 positive `V` values denote measured compact layouts. The table must cover the configured physical
@@ -570,10 +577,12 @@ With `validate_confidence_artifact_freshness: true`, provide all four prototype 
 - `confidence_admission_receipt_sha256`: the expected lowercase SHA256 of the **receipt file
   bytes**, obtained from a trusted, separately reviewed deployment package.
 
-There is no supported public cost-profile/calibration/receipt-generation command in this source
-change. Self-generation requires the separate profiling tooling and its validated instructions;
-the fields above are consumers, not a cost collector. Do not manufacture costs or an admitting
-receipt from unit-test fixtures. A strict receipt's producer must preserve the measured cost,
+The candidate [self-generation workflow](CONFIDENCE_REPRODUCTION.md) provides separate cost
+profiling/export and correctly paired calibration collection/fitting commands. They do not
+generate a positive strict-admission receipt. The fields above consume artifacts; strict
+freshness validation is optional and remains separate from default artifact reuse. Do not
+manufacture costs or an admitting receipt from unit-test fixtures. A strict receipt's producer
+must preserve the measured cost,
 workload, calibration, selector-replay and runtime evidence and review their applicability to the
 actual deployment. A source, calibration, physical-`K` or workload change requires reassessment;
 historical scores or timing results cannot be relabeled as new-source qualification.

@@ -3997,6 +3997,7 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
     max_num_sequences: Optional[int] = None,
+    executor_type: Optional[type[PyExecutor]] = None,
 ) -> PyExecutor:
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
@@ -4366,7 +4367,8 @@ def create_py_executor_instance(
             executor_max_seq_len = min(executor_max_seq_len,
                                        int(decoder_position_limit))
 
-    return PyExecutor(
+    executor_type = PyExecutor if executor_type is None else executor_type
+    return executor_type(
         resource_manager,
         scheduler,
         model_engine=model_engine,

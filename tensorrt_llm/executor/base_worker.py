@@ -158,6 +158,13 @@ class BaseWorker(GenerationExecutor):
 
         return comm_ranks, device_ids
 
+    def _get_pytorch_executor_factory(self):
+        """Keep normal construction unchanged; offline subclasses may supply a factory."""
+        from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+            create_py_executor
+
+        return create_py_executor
+
     def setup_engine(self):
         """
         Setup the engine for the worker.
@@ -173,9 +180,7 @@ class BaseWorker(GenerationExecutor):
             ), "llm_args should be with backend in _create_py_executor"
             _ = self._get_comm_ranks_device_id()
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
-                create_executor = create_py_executor
+                create_executor = self._get_pytorch_executor_factory()
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
