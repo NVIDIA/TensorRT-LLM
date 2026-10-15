@@ -34,7 +34,12 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -292,7 +297,10 @@ _QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.mode
 )
 def test_qwen4_exp_tp1_matches(spec_config):
     config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
-    target = modeling_v2_resolve(config, _llm_args("require"))
+    # MTP is verified by GDN cached replay unless TRTLLM_USE_GDN_REPLAY=0, on an fp32
+    # recurrent-state cache.
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
+    target = modeling_v2_resolve(config, _llm_args("require", kv_cache_config=kv_cache_config))
     assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
 
 
@@ -338,3 +346,82 @@ def test_qwen4_exp_deepstack_vision_tower_does_not_match():
 def test_qwen4_exp_on_two_ranks_does_not_match():
     config = _model_config(_qwen4_exp_config(), world_size=2, tp_size=2)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+# --- qwen4_exp: engine choices the constructor would refuse -----------------------
+
+
+def _declined(config, llm_args_kwargs=None, match=None):
+    """``auto`` falls back to the built-in model and ``require`` says why."""
+    kwargs = llm_args_kwargs or {}
+    assert modeling_v2_resolve(config, _llm_args("auto", **kwargs)) is None
+    with pytest.raises(ValueError, match=match):
+        modeling_v2_resolve(config, _llm_args("require", **kwargs))
+
+
+def _claimed(config, llm_args_kwargs=None):
+    target = modeling_v2_resolve(config, _llm_args("require", **(llm_args_kwargs or {})))
+    assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
+
+
+@pytest.mark.parametrize("algo", ["nvfp4"])
+def test_qwen4_exp_kv_cache_dtype_nvfp4_falls_back(algo):
+    config = _model_config(_qwen4_exp_config())
+    _declined(config, dict(kv_cache_config=KvCacheConfig(dtype=algo)), match="kv_cache_quant_algo")
+
+
+def test_qwen4_exp_kv_cache_dtype_fp8_matches():
+    _claimed(_model_config(_qwen4_exp_config()), dict(kv_cache_config=KvCacheConfig(dtype="fp8")))
+
+
+@pytest.mark.parametrize("backend", ["CUTLASS", "TRITON", "DEEPGEMM", "VANILLA"])
+def test_qwen4_exp_unimplemented_moe_backend_falls_back(backend):
+    config = replace(_model_config(_qwen4_exp_config()), moe_backend_requested=backend)
+    _declined(config, match="moe_config.backend")
+
+
+@pytest.mark.parametrize("backend", ["AUTO", "TRTLLM", "CUTEDSL"])
+def test_qwen4_exp_implemented_moe_backend_matches(backend):
+    _claimed(replace(_model_config(_qwen4_exp_config()), moe_backend_requested=backend))
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs",
+    [
+        dict(max_concurrency=8),
+        dict(draft_len_schedule={4: 3, 8: 1}),
+        dict(acceptance_rate_threshold=0.5),
+    ],
+    ids=["max-concurrency", "draft-len-schedule", "acceptance-rate"],
+)
+def test_qwen4_exp_runtime_draft_length_falls_back(spec_kwargs):
+    """The verify step runs at one width; a draft length that changes at runtime
+    would trip the width assert in the first reduced step."""
+    spec = MTPDecodingConfig(max_draft_len=3, **spec_kwargs)
+    _declined(_model_config(_qwen4_exp_config(), spec_config=spec), match="draft length")
+
+
+def test_qwen4_exp_mtp_on_a_bf16_state_cache_falls_back(monkeypatch):
+    """The engine verifies with GDN cached replay by default, which the target runs
+    on an fp32 recurrent-state cache; `auto` resolves to bf16 for this checkpoint."""
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    _declined(config, match="recurrent-state cache")
+
+
+def test_qwen4_exp_mtp_on_an_fp32_state_cache_matches(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
+    _claimed(config, dict(kv_cache_config=kv_cache_config))
+
+
+def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    _claimed(config)
+
+
+def test_qwen4_exp_no_speculation_ignores_the_state_cache_dtype(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    _claimed(_model_config(_qwen4_exp_config()))

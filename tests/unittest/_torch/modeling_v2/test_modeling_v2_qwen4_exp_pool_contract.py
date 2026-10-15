@@ -14,6 +14,7 @@ import torch
 
 __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import routing
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
@@ -243,3 +244,8 @@ def test_shared_selection_rejects_missing_row_and_width() -> None:
         M.check_shared_selection(shared, {3: 2}, 3, 512)
     with pytest.raises(AssertionError, match="blocks per row"):
         M.check_shared_selection(shared, {3: 1}, 3, 256)
+
+
+def test_routing_admits_exactly_the_moe_backends_the_target_implements() -> None:
+    """`route` declines a backend request the constructor would assert on."""
+    assert set(routing._MOE_BACKENDS) == set(M._TRUNK_MOE_BACKENDS)

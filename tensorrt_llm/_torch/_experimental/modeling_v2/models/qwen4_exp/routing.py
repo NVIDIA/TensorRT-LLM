@@ -14,9 +14,12 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+import torch
 
-from ..._router_index import NoTarget
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+from ..._router_index import EngineFacts, NoTarget
 
 # (layers, hidden, experts, attention heads, linear value heads, vocab). Shape-sniffing
 # also matches fine-tunes; the accuracy gate pins identity.
@@ -27,12 +30,57 @@ _TEXT_SHAPE = (48, 2560, 512, 24, 48, 248320)
 # list this target lacks.
 _VISION_SHAPE = (27, 1152, 16, 2, 2560, 2304, (), "gelu_pytorch_tanh")
 
+# `moe_config.backend` requests the target implements (`_TRUNK_MOE_BACKENDS` in modeling.py).
+_MOE_BACKENDS = ("AUTO", "TRTLLM", "CUTEDSL")
+
+
+def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> None:
+    """Decline what the target's constructor or first forward would refuse.
+
+    Without this ``auto`` claims the deployment and then fails mid-build instead of
+    falling back to the built-in implementation.
+    """
+    if spec_config is not None and (
+        getattr(spec_config, "draft_len_schedule", None) is not None
+        or getattr(spec_config, "acceptance_rate_threshold", None) is not None
+    ):
+        raise NoTarget(
+            "the draft length changes at runtime (draft_len_schedule, max_concurrency or "
+            "acceptance_rate_threshold), but this target's verify step runs at the one "
+            "width max_draft_len + 1"
+        )
+    if engine is None:
+        return
+    if engine.torch_dtype != torch.bfloat16:
+        raise NoTarget(f"the engine runs the model in {engine.torch_dtype}; the target is bf16")
+    if engine.kv_cache_quant_algo not in (None, QuantAlgo.FP8):
+        raise NoTarget(
+            f"the engine resolved kv_cache_quant_algo {engine.kv_cache_quant_algo}; the target "
+            "stores K/V as the checkpoint's bf16 or as FP8"
+        )
+    if str(engine.moe_backend).upper() not in _MOE_BACKENDS:
+        raise NoTarget(
+            f"moe_config.backend={engine.moe_backend!r}; the target runs the trunk's routed "
+            f"experts on {', '.join(_MOE_BACKENDS)}"
+        )
+    if (
+        spec_config is not None
+        and engine.gdn_replay
+        and engine.mamba_ssm_cache_dtype != torch.float32
+    ):
+        raise NoTarget(
+            f"MTP with a {engine.mamba_ssm_cache_dtype} recurrent-state cache: the engine "
+            "verifies with GDN cached replay, which the target runs on an fp32 cache. Set "
+            "kv_cache_config.mamba_ssm_cache_dtype to float32 or export TRTLLM_USE_GDN_REPLAY=0"
+        )
+
 
 def route(
     pretrained_config: Any,
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    engine: Optional[EngineFacts] = None,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
@@ -101,6 +149,7 @@ def route(
         # isort: on
         # fmt: on
 
+        _check_engine(spec_config, engine)
         return ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
 
     raise NoTarget(
