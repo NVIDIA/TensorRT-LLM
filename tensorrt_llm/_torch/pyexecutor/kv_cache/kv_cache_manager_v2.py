@@ -1469,7 +1469,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Only the pp=1 executor loops call
                 # DisaggTransferCoordinator.align_gen_admission_across_cp. Without
                 # it a CP rank can admit a gen-init request its peers did not
-                # admit and enter the gen transfer status collective alone.
+                # admit and hang alone in the gen transfer status collective.
+                # KvCacheTransceiverV2._check_compatible rejects the same
+                # combination; lift both together.
                 raise ValueError(
                     "KVCacheManagerV2 does not support attention-DP with helix "
                     "context parallelism when pp_size > 1 "

@@ -433,9 +433,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
         if m.enable_attention_dp:
-            # DP groups schedule independently, but the PP ranks and the helix CP
-            # ranks of one DP group share the same requests, so gen-side consensus
-            # spans PP x CP (like the C++ transceiver's mGroupDataComm). Without it
+            # DP groups schedule independently, but the PP or helix CP ranks of
+            # one DP group share the same requests, so gen-side consensus spans
+            # that group (like the C++ transceiver's mGroupDataComm). Without it
             # a CP rank can start decoding before its partner received the KV and
             # the helix all-to-all deadlocks.
             #
@@ -448,11 +448,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # CP rank can have room before its peer. The pp=1 loops intersect
             # the admitted ids over CP first
             # (DisaggTransferCoordinator.align_gen_admission_across_cp).
+            # The PP loop does not, so _check_compatible rejects attention-DP
+            # with both helix CP and pp_size > 1.
+            #
             # Non-DP tp x cp gathers over the world behind the same predicate and
             # goes through the same step, which lines up its CP ranks but not its
             # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP. The PP loop does not align admission, so
-            # _check_compatible rejects attention DP with both CP and PP.
+            # can without CP.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
@@ -460,7 +462,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._gen_allgather = self._dist.allgather
 
     def _dp_group_allgather(self, obj):
-        """Allgather over the PP x CP ranks of this DP group (CP first, then PP)."""
+        """Allgather over the CP ranks, then the PP ranks, of this DP group.
+
+        Under attention-DP, _check_compatible keeps cp_size or pp_size at 1, so
+        at most one of the two gathers runs.
+        """
         m = self._mapping
         gathered = list(self._dist.cp_allgather(obj)) if m.cp_size > 1 else [obj]
         if m.pp_size > 1:
@@ -1648,15 +1654,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"(cp_size={m.cp_size}, cp_type={m.cp_config.get('cp_type')}); "
                 f"only cp_size == 1 or helix CP is supported"
             )
-        # Under attention DP the gen-side completion consensus spans the CP x PP
+        # Under attention-DP the gen-side completion consensus spans the helix CP
         # ranks of a DP group, so they must admit the same gen-init requests in
-        # the same iteration. Only the pp=1 executor loops align that admission
-        # (DisaggTransferCoordinator.align_gen_admission_across_cp); in the PP
-        # loop a CP rank can admit a request its peers did not and enter the
-        # consensus collective alone.
-        if m.enable_attention_dp and m.cp_size > 1 and m.pp_size > 1:
+        # the same iteration. The pp=1 executor loops align that admission
+        # (DisaggTransferCoordinator.align_gen_admission_across_cp). The PP loop
+        # does not: under attention-DP with tp_size > 1, each rank of the first
+        # PP stage schedules and admits on its own
+        # (PyExecutor._pp_schedule_and_propagate), so a CP rank can admit a
+        # request its peers did not and hang alone in the gen transfer status
+        # collective. With tp_size == 1 only rank 0 schedules and the CP ranks
+        # follow it, but the check rejects that case too to keep one rule; it
+        # costs nothing, since attention-DP then has a single DP rank.
+        # KVCacheManagerV2 rejects the same combination at construction; lift
+        # both checks together.
+        if m.enable_attention_dp and m.has_cp_helix() and m.pp_size > 1:
             raise ValueError(
-                "KvCacheTransceiverV2 does not support attention DP with helix "
+                "KvCacheTransceiverV2 does not support attention-DP with helix "
                 f"context parallelism when pp_size > 1 (got pp_size={m.pp_size}). "
                 "Set pipeline_parallel_size=1 or enable_attention_dp=False."
             )

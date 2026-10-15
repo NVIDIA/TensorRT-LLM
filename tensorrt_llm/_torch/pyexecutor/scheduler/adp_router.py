@@ -124,9 +124,10 @@ class ADPRouter(ABC):
                 requests in per-rank load.  Ignored by DefaultADPRouter.
 
         Returns:
-            A KVCacheAwareADPRouter if config requests it and the
-            kv_cache_manager has block reuse enabled; DefaultADPRouter
-            otherwise.
+            A ConversationAwareADPRouter if kv_cache_routing_conversation_affinity
+            is set; otherwise a KVCacheAwareADPRouter if enable_kv_cache_aware_routing
+            is set, the kv_cache_manager has block reuse enabled and helix CP is
+            off; otherwise a DefaultADPRouter.
         """
         if (
             attention_dp_config is not None
@@ -150,6 +151,19 @@ class ADPRouter(ABC):
             and kv_cache_manager is not None
             and kv_cache_manager.enable_block_reuse
         ):
+            if dist.has_cp_helix:
+                # Each helix CP rank probes prefix matches in its own slice of the
+                # KV cache, so the CP ranks of a DP group could route one request
+                # to different DP ranks, and that request would never pass
+                # DisaggTransferCoordinator.align_gen_admission_across_cp (see
+                # _use_max_load_across_cp). Only KV cache manager V1 gets here; V2
+                # rejects block reuse under helix CP.
+                logger.warning(
+                    "attention_dp_config.enable_kv_cache_aware_routing is not "
+                    "supported with helix context parallelism; falling back to "
+                    "load-based attention-DP routing."
+                )
+                return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
             return KVCacheAwareADPRouter(
                 dist=dist,
                 has_seq_slot_headroom=has_seq_slot_headroom,
@@ -222,7 +236,7 @@ class ADPRouter(ABC):
         return [RankState.deserialize(data=resp) for resp in responses]
 
     def _use_max_load_across_cp(self, local_state: RankState) -> None:
-        """Replace this DP rank's load with its maximum across the helix CP group.
+        """Replace this DP rank's request and token counts with their CP-group maximum.
 
         The CP ranks of one DP group must pop and route the same new requests.
         If they route a request to different DP ranks, it never passes
@@ -230,9 +244,9 @@ class ADPRouter(ABC):
         starts.
 
         A client cancel or a transfer timeout can retire a request on one CP
-        rank before its peers, so their own loads can differ. With the maximum,
-        every CP rank gathers the same loads over TP, and no CP rank goes over
-        ``max_num_active_requests``.
+        rank before its peers, so the CP ranks' own loads can differ. With the
+        maximum, every CP rank gathers the same loads over TP, and no CP rank
+        goes over ``max_num_active_requests``.
         """
         loads_per_cp_rank = self.dist.cp_allgather_int64(
             [local_state.num_active_requests, local_state.num_active_tokens]
@@ -477,8 +491,9 @@ class KVCacheAwareADPRouter(ADPRouter):
     ranks (floored at req_tokens) so that both terms remain on the same
     scale regardless of absolute load levels.
 
-    Requires a KV cache manager with enable_block_reuse=True.
-    Falls back to load-based routing when no cache hits exist.
+    Requires a KV cache manager with enable_block_reuse=True. Falls back to
+    load-based routing when no cache hits exist. Not used under helix CP
+    (see ADPRouter.create).
     """
 
     needs_prefix_matches: bool = True

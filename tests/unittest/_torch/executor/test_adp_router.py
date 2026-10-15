@@ -488,6 +488,21 @@ class TestDefaultADPRouter:
             "ConversationAwareADPRouter",
         }
 
+    def test_router_factory_uses_default_router_for_kv_cache_aware_routing_under_helix(self):
+        attention_dp_config = Mock(
+            kv_cache_routing_conversation_affinity=False,
+            enable_kv_cache_aware_routing=True,
+        )
+
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=2, has_cp_helix=True),
+            has_seq_slot_headroom=False,
+            kv_cache_manager=Mock(enable_block_reuse=True),
+            attention_dp_config=attention_dp_config,
+        )
+
+        assert type(router) is DefaultADPRouter
+
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)
         router = DefaultADPRouter(dist=dist)
@@ -605,13 +620,12 @@ class TestDefaultADPRouter:
             return state
 
         # Routing on each CP rank's own view splits the request.
-        own_views = [[own_state(cp, dp) for dp in dp_ranks] for cp in cp_ranks]
-        assert route(own_views[0]) != route(own_views[1])
+        own_routes = [route([own_state(cp, dp) for dp in dp_ranks]) for cp in cp_ranks]
+        assert own_routes == [{0: [7], 1: []}, {0: [], 1: [7]}]
 
         # With the CP-max load, both CP ranks see DP rank 0 as full and pick DP rank 1.
-        routes = [route([gathered_state(cp, dp) for dp in dp_ranks]) for cp in cp_ranks]
-        assert routes[0] == routes[1]
-        assert routes[0][1] == [7]
+        cp_max_routes = [route([gathered_state(cp, dp) for dp in dp_ranks]) for cp in cp_ranks]
+        assert cp_max_routes == [{0: [], 1: [7]}] * len(cp_ranks)
 
     def test_kv_load_payload_only_changes_wire_shape_when_enabled(self):
         payload = RankIterStatsPayload(
