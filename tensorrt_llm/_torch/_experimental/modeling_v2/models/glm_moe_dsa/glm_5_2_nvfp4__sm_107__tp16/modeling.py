@@ -34,7 +34,10 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendF
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM, DeepseekV3Model
-from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import (
+    SpecDecOneEngineForCausalLM,
+    _slice_spec_position_ids,
+)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.swiglu import swiglu
@@ -49,7 +52,13 @@ from tensorrt_llm._torch.utils import EventType
 from . import weights as _weights
 from .ops.attention.mla_kv_half_append import mla_kv_half_append
 from .ops.attention.sparse_mla_flash_decode import sparse_mla_flash_decode
-from .ops.comm._mnnvl_workspace import hop_supported, hop_workspace, publish_target
+from .ops.comm._mnnvl_workspace import (
+    LamportExchangeWorkspace,
+    hop_supported,
+    hop_workspace,
+    publish_target,
+)
+from .ops.comm.mnnvl_allgather import mnnvl_allgather
 from .ops.comm.mnnvl_hop import mnnvl_hop
 from .ops.comm.mnnvl_moe_finalize_hop import mnnvl_moe_finalize_hop
 from .ops.dsa._fp8_paged_mqa_logits import num_sms
@@ -85,6 +94,9 @@ from .ops.moe.routed_experts import (
 # facts, and the constructor states them again for a direct construction.
 _COMPUTE_CAPABILITY = (10, 7)
 _TP = 16
+# One Lamport buffer of the verify logits' all-gather: every rank's BF16 vocabulary shard of
+# up to 8 rows, with room to spare.
+_LOGITS_EXCHANGE_BYTES = 16 << 20
 
 
 class PrefillTarget:
@@ -149,6 +161,9 @@ class DecodeTarget:
       router GEMV in its routing kernel, joins the NVFP4 input (quantized on its
       own stream) right before FC1, runs FC2 on the K = 128 kernel and leaves the
       finalize step to the post-MoE hop.
+
+    The verify logits come from the LM head on this rank's vocabulary shard
+    (split-K GEMM) and one MNNVL all-gather that widens them to FP32.
 
     A larger batch runs the built-in modules in the same order.
     """
@@ -269,6 +284,7 @@ class DecodeTarget:
             get_hist_topk_workspace(self.mapping) if hist_topk_supported(self.mapping) else None
         )
         self._hist_buffers = None
+        self._logits_workspace = LamportExchangeWorkspace(self.mapping, _LOGITS_EXCHANGE_BYTES)
         self._k_tail_stream = torch.cuda.Stream()
         self._k_tail_fork = torch.cuda.Event()
         self._k_tail_done = torch.cuda.Event()
@@ -347,6 +363,23 @@ class DecodeTarget:
             else:
                 hidden_states, residual = self._moe(layer, hidden_states, residual)
         return hidden_states
+
+    def logits(self, lm_head, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """FP32 logits over the whole vocabulary of the rows, or None for a batch the kernels
+        do not serve: this rank's vocabulary shard from the LM head, then the all-gather."""
+        rows = hidden_states.shape[0]
+        weight = lm_head.weight
+        if not self._fast(rows) or weight.shape[0] * self.mapping.tp_size != lm_head.num_embeddings:
+            return None
+        shard = low_m_gemm(
+            hidden_states.contiguous(), weight, hidden_states.new_empty(rows, weight.shape[0])
+        )
+        return mnnvl_allgather(
+            shard,
+            self._logits_workspace.comm_buffer,
+            self._logits_workspace.buffer_flags,
+            self.mapping.tp_size,
+        )
 
     def _shard_indexer_keys(self, attn_metadata) -> bool:
         """Point this rank's indexer at its 1/16 shard of the request's keys for this step:
@@ -850,6 +883,11 @@ class Glm52Nvfp4Sm107Tp16Core(DeepseekV3Model):
             self.post_load_weights()
         return self._prefill if attn_metadata.num_contexts > 0 else self._decode
 
+    def decode_target(self, attn_metadata: AttentionMetadata) -> Optional[DecodeTarget]:
+        """The decode target when this step runs it, else None."""
+        target = self._select_target(attn_metadata)
+        return target if target is self._decode else None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -920,15 +958,47 @@ class ModelingV2Glm52Nvfp4Sm107Tp16(
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        return super().forward(
-            attn_metadata=attn_metadata,
+        decode = self.model.decode_target(attn_metadata)
+        if decode is None or self.spec_worker is None:
+            return super().forward(
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                return_context_logits=return_context_logits,
+                spec_metadata=spec_metadata,
+                resource_manager=resource_manager,
+                **kwargs,
+            )
+        # A generation step with speculative decoding: the verify logits on the decode
+        # target's kernels where they serve the rows, then the spec worker.
+        hidden_states = self.model(
             input_ids=input_ids,
+            attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            return_context_logits=return_context_logits,
             spec_metadata=spec_metadata,
-            resource_manager=resource_manager,
             **kwargs,
+        )
+        if attn_metadata.padded_num_tokens is not None:
+            num_tokens = attn_metadata.num_tokens
+            hidden_states = hidden_states[:num_tokens]
+            if input_ids is not None:
+                input_ids = input_ids[:num_tokens]
+            position_ids = _slice_spec_position_ids(position_ids, num_tokens)
+        rows = hidden_states[spec_metadata.gather_ids]
+        logits = decode.logits(self.lm_head, rows)
+        if logits is None:
+            logits = self.logits_processor.forward(rows, self.lm_head, attn_metadata, True)
+        return self.spec_worker(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=resource_manager,
         )
 
     def load_weights(self, weights, *args, **kwargs):
