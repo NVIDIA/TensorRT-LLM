@@ -13,14 +13,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import mmap
 import os
+from multiprocessing import shared_memory
 
 import pytest
 
-from tensorrt_llm._torch.mmap_utils import populate_file_pages
+from tensorrt_llm._torch.mmap_utils import populate_file_pages, reserve_shared_memory
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_reserve_shared_memory_allocates_backing_pages():
+    shm = shared_memory.SharedMemory(create=True, size=mmap.PAGESIZE + 1)
+    try:
+        reserve_shared_memory(shm)
+        assert os.fstat(shm._fd).st_blocks * 512 >= shm.size
+        shm.buf[:] = b"x" * shm.size
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+@pytest.mark.parametrize("error_code", (errno.ENOSPC, errno.EOPNOTSUPP))
+def test_reserve_shared_memory_reports_allocation_error(monkeypatch, error_code):
+    shm = shared_memory.SharedMemory(create=True, size=mmap.PAGESIZE)
+
+    def fail_reservation(descriptor, offset, size):
+        assert descriptor == shm._fd
+        assert offset == 0
+        assert size == shm.size
+        raise OSError(error_code, os.strerror(error_code))
+
+    monkeypatch.setattr(os, "posix_fallocate", fail_reservation)
+    try:
+        with pytest.raises(OSError, match="requested=.*available=.*capacity=") as error:
+            reserve_shared_memory(shm)
+        assert error.value.errno == error_code
+        assert isinstance(error.value.__cause__, OSError)
+    finally:
+        shm.close()
+        shm.unlink()
 
 
 def test_populate_file_pages_reports_exact_bounded_progress(tmp_path):

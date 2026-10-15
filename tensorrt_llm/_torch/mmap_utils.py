@@ -27,12 +27,14 @@ import errno as errno_codes
 import mmap
 import os
 from collections.abc import Callable
+from multiprocessing import shared_memory
 
 __all__ = [
     "madvise_range",
     "populate_file_pages",
     "pageout_file_backed_regions",
     "advise_tensor_pageout",
+    "reserve_shared_memory",
 ]
 
 _MADV_DONTNEED = 4
@@ -40,6 +42,29 @@ _MADV_PAGEOUT = 21
 _MADV_ADVICE_BY_MODE = {"dontneed": _MADV_DONTNEED, "pageout": _MADV_PAGEOUT}
 _MADV_POPULATE_READ = 22  # Requires Linux >= 5.14.
 _MMAP_FAILED = ctypes.c_void_p(-1).value
+
+
+def reserve_shared_memory(shm: shared_memory.SharedMemory) -> None:
+    """Reserve POSIX shm backing pages before writing its mapping on Linux.
+
+    SharedMemory creation only truncates the backing file. Reserving its
+    storage with posix_fallocate reports allocation errors before a write can
+    fault with SIGBUS. The descriptor belongs to the SharedMemory instance;
+    the caller remains responsible for closing and unlinking it on failure.
+    """
+    try:
+        os.posix_fallocate(shm._fd, 0, shm.size)
+    except OSError as error:
+        usage = os.fstatvfs(shm._fd)
+        available = usage.f_bavail * usage.f_frsize
+        capacity = usage.f_blocks * usage.f_frsize
+        raise OSError(
+            error.errno,
+            f"Shared memory reservation failed for {shm.name!r}: "
+            f"requested={shm.size} bytes, available={available} bytes, "
+            f"capacity={capacity} bytes. Check the shared memory mount and "
+            "host/cgroup memory budget before increasing its capacity.",
+        ) from error
 
 
 def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:

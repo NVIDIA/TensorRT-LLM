@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import errno
 import os
 import unittest
 from collections.abc import Iterator
+from multiprocessing import shared_memory
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,12 +15,107 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
-    get_moe_load_balancer, maybe_create_moe_load_balancer,
-    moe_load_balancer_add_single_layer)
+    HostMoeTensorSharer, MoeLoadBalancer, MoeLoadBalancerIterContext,
+    SingleLayerMoeLoadBalancer, get_moe_load_balancer,
+    maybe_create_moe_load_balancer, moe_load_balancer_add_single_layer)
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("error_code", (errno.ENOSPC, errno.EOPNOTSUPP))
+def test_host_moe_tensor_sharer_cleans_up_failed_reservation(
+        monkeypatch, error_code):
+    communicator = MagicMock()
+    communicator.Get_rank.return_value = 0
+    communicator.Get_size.return_value = 1
+    sharer = HostMoeTensorSharer(0, 1, communicator)
+    shm = shared_memory.SharedMemory(create=True, size=256)
+    shm_name = shm.name
+    monkeypatch.setattr(sharer, "get_shared_memory_name", lambda: shm_name)
+    sharer.share_host_tensor_with_shape(0, "weight", torch.ones(2, 2))
+
+    def allocate(**kwargs):
+        return shm
+
+    def reserve(mapping):
+        raise OSError(error_code, os.strerror(error_code))
+
+    with patch("tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.shared_memory.SharedMemory", allocate), \
+         patch("tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.reserve_shared_memory", reserve):
+        with pytest.raises(
+                RuntimeError,
+                match="Unable to allocate EPLB.*layer 0, local rank 0"
+        ) as error:
+            sharer.finalize_layer_weights()
+
+    assert sharer.own_shm is None
+    assert not sharer.host_weights
+    assert shm.buf is None
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=shm_name)
+    assert error.value.__cause__.errno == error_code
+    communicator.allgather.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16,
+                                   torch.uint8, torch.float8_e4m3fn))
+def test_host_moe_tensor_sharer_copies_into_reserved_storage(dtype):
+    communicator = MagicMock()
+    communicator.Get_rank.return_value = 0
+    communicator.Get_size.return_value = 1
+    sharer = HostMoeTensorSharer(0, 2, communicator)
+    shm = shared_memory.SharedMemory(create=True, size=1)
+    shm_name = shm.name
+    shm.close()
+    shm.unlink()
+    sharer.get_shared_memory_name = lambda: shm_name
+    weights = [torch.arange(12).to(dtype).reshape(3, 4) for expert in range(2)]
+    for expert, weight in enumerate(weights):
+        sharer.share_host_tensor_with_shape(expert, "weight", weight)
+        sharer.share_host_tensor_with_shape(expert, "scale",
+                                            torch.tensor(2).to(dtype))
+    try:
+        sharer.finalize_layer_weights()
+        for expert, weight in enumerate(weights):
+            assert torch.equal(
+                sharer.host_weights[(expert, "weight")].view(torch.uint8),
+                weight.view(torch.uint8))
+            assert torch.equal(
+                sharer.host_weights[(expert,
+                                     "scale")].reshape(-1).view(torch.uint8),
+                torch.tensor([2]).to(dtype).view(torch.uint8))
+        assert not sharer.shared_tensors
+    finally:
+        sharer.host_weights.clear()
+        if sharer.own_shm is not None:
+            sharer.own_shm.close()
+            sharer.own_shm.unlink()
+
+
+@pytest.mark.cpu_only
+def test_host_moe_tensor_sharer_reports_creation_failure():
+    communicator = MagicMock()
+    communicator.Get_rank.return_value = 0
+    communicator.Get_size.return_value = 1
+    sharer = HostMoeTensorSharer(0, 1, communicator)
+    sharer.set_shared_memory_base_name("test_creation_failure")
+    sharer.share_host_tensor_with_shape(0, "weight", torch.ones(2, 2))
+    with patch(
+            "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.shared_memory.SharedMemory",
+            side_effect=OSError(errno.ENOSPC, "No space left on device")
+    ), patch(
+            "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.reserve_shared_memory"
+    ) as reserve:
+        with pytest.raises(RuntimeError,
+                           match="Unable to allocate EPLB") as error:
+            sharer.finalize_layer_weights()
+    assert error.value.__cause__.errno == errno.ENOSPC
+    assert sharer.own_shm is None
+    assert not sharer.host_weights
+    reserve.assert_not_called()
 
 
 class TestMoeLoadBalancer(unittest.TestCase):

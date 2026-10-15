@@ -15,7 +15,8 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch.distributed import AllReduce
-from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
+from tensorrt_llm._torch.mmap_utils import (advise_tensor_pageout,
+                                            reserve_shared_memory)
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm.logger import logger
@@ -193,20 +194,31 @@ class HostMoeTensorSharer:
                 total_size += aligned_size
 
         shm_name = self.get_shared_memory_name()
+        shm = None
         try:
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
-        except FileExistsError:
-            tensorrt_llm.logger.warning(
-                f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
-            )
-            existing_shm = shared_memory.SharedMemory(name=shm_name)
-            existing_shm.close()
-            existing_shm.unlink()
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name,
+                                                 create=True,
+                                                 size=total_size)
+            except FileExistsError:
+                tensorrt_llm.logger.warning(
+                    f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
+                )
+                existing_shm = shared_memory.SharedMemory(name=shm_name)
+                existing_shm.close()
+                existing_shm.unlink()
+                shm = shared_memory.SharedMemory(name=shm_name,
+                                                 create=True,
+                                                 size=total_size)
+            reserve_shared_memory(shm)
+        except OSError as error:
+            if shm is not None:
+                shm.close()
+                shm.unlink()
+            raise RuntimeError(
+                f"Unable to allocate EPLB shared host weights for layer "
+                f"{self.layer_id}, local rank {self.local_rank}: {error}"
+            ) from error
         self.own_shm = shm
 
         offset = 0
@@ -215,8 +227,6 @@ class HostMoeTensorSharer:
                 t = self.shared_tensors[(expert_id, name)].contiguous().cpu()
                 data_size = t.numel() * t.element_size()
                 aligned_size = self.align_size(data_size)
-                shm.buf[offset:offset + data_size] = t.flatten().view(
-                    torch.int8).numpy().tobytes()
                 dtype = t.dtype
                 tensor_shape = t.shape
                 elt_count = t.numel()
@@ -224,6 +234,7 @@ class HostMoeTensorSharer:
                                       dtype=dtype,
                                       offset=offset,
                                       count=elt_count).view(tensor_shape)
+                st.copy_(t)
                 key = (expert_id, name)
                 assert key not in self.host_weights.keys(
                 ), f"key={key} already exists"
