@@ -260,16 +260,23 @@ async def test_standard_health_tracks_frontend_group_readiness():
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
+                control = openengine_pb2_grpc.ControlStub(channel)
                 request = health_pb2.HealthCheckRequest(service="inference")
                 assert (
                     await health.Check(request, timeout=5)
                 ).status == health_pb2.HealthCheckResponse.SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_READY
 
                 coordinator.ready = False
                 await server._refresh_inference_health()
                 assert (
                     await health.Check(request, timeout=5)
                 ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_NOT_READY
                 assert (
                     await health.Check(health_pb2.HealthCheckRequest(service="liveness"), timeout=5)
                 ).status == health_pb2.HealthCheckResponse.SERVING
@@ -279,6 +286,18 @@ async def test_standard_health_tracks_frontend_group_readiness():
                 assert (
                     await health.Check(request, timeout=5)
                 ).status == health_pb2.HealthCheckResponse.SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_READY
+
+                coordinator.stopping = True
+                await server._refresh_inference_health()
+                assert (
+                    await health.Check(request, timeout=5)
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_NOT_READY
         finally:
             await server.stop()
 
