@@ -394,6 +394,50 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4,
             }
         },
+        # GLM-5.3 FP8 uses the deployment guide's TP8 / DEEPGEMM recipe.
+        {
+            'patterns': ['glm_5.3_fp8-bench-pytorch'],
+            'config': {
+                'trust_remote_code': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 10240,
+                'moe_config': {
+                    'backend': 'DEEPGEMM',
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.75,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 128,
+                },
+            }
+        },
+        # GLM-5.3-Flash FP8: four Blackwell GPUs, TP4/EP4, BF16 KV.
+        {
+            'patterns': ['glm_5.3_flash_fp8-serve-pytorch'],
+            'config': {
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'kv_cache_config': {
+                    'dtype': 'bfloat16',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+            }
+        },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
         # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
