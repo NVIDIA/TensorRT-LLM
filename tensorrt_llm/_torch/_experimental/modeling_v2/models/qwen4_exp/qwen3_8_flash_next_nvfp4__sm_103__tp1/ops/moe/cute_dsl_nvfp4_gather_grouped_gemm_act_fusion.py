@@ -118,7 +118,7 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
     - the four sort tensors, exactly as `moe_sort` returns them for the same
       `top_k` and `tile_tokens_dim == tile_size`.
     - `global_sf` fp32, one element: the FC2 input's global scale, `1 /
-      down_proj.input_scale` of the layer.
+      max(down_proj.input_scale)` of the layer.
     - `num_experts`, `num_local_experts`, `local_expert_offset`: read only by the
       autotuner's shape buckets and cache key; the kernel takes the expert count
       from `weight.size(0)` and the expert from the tile.
@@ -261,8 +261,8 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
       row interleave as the weight, alpha not shifted by an expert.
     - One `alpha` per expert scales BOTH halves, so up_proj and gate_proj must
       share `weight_scale_2`, and `input_scale` must be one value per layer; this
-      checkpoint satisfies both, as it does for `down_proj.input_scale`, which
-      `global_sf` inverts.
+      checkpoint satisfies both. `global_sf` inverts the largest
+      `down_proj.input_scale`; the spread of the rest is FC2's `alpha`.
     - `input_scale` LINEAR. Swizzled scales have the same size when T % 128 == 0
       and are read as garbage without error.
     - The sort from moe_sort with the same `top_k` and tile_tokens_dim ==

@@ -657,6 +657,59 @@ def check_shared_selection(shared, slots, layer: int, block_topk: int) -> None:
     )
 
 
+def _moe_layer_scalars(w, i: int, backend: str) -> dict[str, torch.Tensor]:
+    """Layer `i`'s routed-expert scalars for `backend`, built from the checkpoint's
+    `input_scale` / `weight_scale_2` rows.
+
+    The checkpoint stores modelopt reciprocals (`input_scale = 1 / g_act`,
+    `weight_scale_2 = 1 / g_w`), so a quantizer's global scale is `1 / input_scale` and
+    the runner's scalars are products of the two.
+    """
+    isc1, isc1_up = w[f"l{i}_e_isc1"], w[f"l{i}_e_isc1_up"]
+    assert torch.equal(isc1, isc1_up), (
+        f"layer {i}: expert gate/up input_scale differ; the fused FC1 "
+        "reads one activation quantization for both halves"
+    )
+    assert torch.equal(w[f"l{i}_e_ws2_1"], w[f"l{i}_e_ws2_1_up"]), (
+        f"layer {i}: expert gate/up weight_scale_2 differ; the fused "
+        "FC1 carries one alpha per expert for both halves"
+    )
+    # One activation quantization feeds all 512 experts, so FC1's activation
+    # global scale must be one number (the shared expert is bf16, no scale).
+    assert torch.equal(isc1.min(), isc1.max()), (
+        f"layer {i}: the routed experts do not share one "
+        "gate_proj.input_scale, so a single activation quantization "
+        "cannot feed them all and this assembly is wrong for this "
+        "checkpoint"
+    )
+    e_isc2, ws2_2 = w[f"l{i}_e_isc2"], w[f"l{i}_e_ws2_2"]
+    gate1 = (isc1 * w[f"l{i}_e_ws2_1"]).contiguous()
+    # Routed FC1 activation global scale (one per layer).
+    scalars = dict(global_scale=(1.0 / isc1[:1]).contiguous())
+    if backend == "CUTEDSL":
+        # The CuteDSL FC1 epilogue requantizes with one global scale for the whole layer,
+        # where trtllm-gen folds each expert's `down_proj.input_scale` into its FC1
+        # scalar. Quantizing at `1 / max(input_scale)` (the smallest per-expert global
+        # scale, so no block scale saturates) and putting the same factor into FC2's alpha
+        # makes `global_sf * alpha2[e] == ws2_2[e]` for every expert, whatever the spread.
+        isc2_max = e_isc2.max()
+        scalars.update(
+            # [num_experts] each: activation scale times weight scale.
+            alpha1=gate1,
+            alpha2=(isc2_max * ws2_2).contiguous(),
+            # The FC2 activation's quantization scale, numel 1.
+            global_sf=(1.0 / isc2_max).reshape(1).contiguous(),
+        )
+    else:
+        scalars.update(
+            # [num_experts] each. Swapping the first two is finite and silent.
+            output1_scale_scalar=(gate1 / e_isc2).contiguous(),
+            output1_scale_gate_scalar=gate1,
+            output2_scale_scalar=(e_isc2 * ws2_2).contiguous(),
+        )
+    return scalars
+
+
 class Qwen4ExpTp1ModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig, composite_config: PretrainedConfig):
         """`composite_config` is passed in because the text sub-config adopted as
@@ -1210,56 +1263,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         Not an override (DecoderModel has no such hook); named for the shell hook."""
         w = self.w
         device = w["embed"].device
-        moe_scalars = []
-        for i in range(self.num_layers):
-            # The checkpoint stores modelopt reciprocals (`input_scale = 1 / g_act`,
-            # `weight_scale_2 = 1 / g_w`), so the quantizer's global scale is
-            # `1 / input_scale` and the runner's scalars are products of the two.
-            isc1, isc1_up = w[f"l{i}_e_isc1"], w[f"l{i}_e_isc1_up"]
-            assert torch.equal(isc1, isc1_up), (
-                f"layer {i}: expert gate/up input_scale differ; the fused FC1 "
-                "reads one activation quantization for both halves"
-            )
-            assert torch.equal(w[f"l{i}_e_ws2_1"], w[f"l{i}_e_ws2_1_up"]), (
-                f"layer {i}: expert gate/up weight_scale_2 differ; the fused "
-                "FC1 carries one alpha per expert for both halves"
-            )
-            # One activation quantization feeds all 512 experts, so FC1's activation
-            # global scale must be one number (the shared expert is bf16, no scale).
-            assert torch.equal(isc1.min(), isc1.max()), (
-                f"layer {i}: the routed experts do not share one "
-                "gate_proj.input_scale, so a single activation quantization "
-                "cannot feed them all and this assembly is wrong for this "
-                "checkpoint"
-            )
-            e_isc2 = w[f"l{i}_e_isc2"]
-            gate1 = (isc1 * w[f"l{i}_e_ws2_1"]).contiguous()
-            # Routed FC1 activation global scale (one per layer).
-            scalars = dict(global_scale=(1.0 / isc1[:1]).contiguous())
-            if self.trunk_moe_backend == "CUTEDSL":
-                # The CuteDSL FC1 epilogue requantizes with one global scale for the whole
-                # layer, where trtllm-gen folds each expert's `down_proj.input_scale` into
-                # its FC1 scalar; the two agree only if every expert shares one.
-                assert torch.equal(e_isc2.min(), e_isc2.max()), (
-                    f"layer {i}: the routed experts do not share one down_proj.input_scale, "
-                    "so the CuteDSL FC1's single requantization scale would quantize the FC2 "
-                    "input differently from the checkpoint's per-expert scales"
-                )
-                scalars.update(
-                    # [num_experts] each: activation scale times weight scale.
-                    alpha1=gate1,
-                    alpha2=(e_isc2 * w[f"l{i}_e_ws2_2"]).contiguous(),
-                    # The FC2 activation's quantization scale, numel 1.
-                    global_sf=(1.0 / e_isc2[:1]).contiguous(),
-                )
-            else:
-                scalars.update(
-                    # [num_experts] each. Swapping the first two is finite and silent.
-                    output1_scale_scalar=(gate1 / e_isc2).contiguous(),
-                    output1_scale_gate_scalar=gate1,
-                    output2_scale_scalar=(e_isc2 * w[f"l{i}_e_ws2_2"]).contiguous(),
-                )
-            moe_scalars.append(scalars)
+        moe_scalars = [
+            _moe_layer_scalars(w, i, self.trunk_moe_backend) for i in range(self.num_layers)
+        ]
         self._moe_scalars = moe_scalars
         # Both delta-rule entries index A_log and dt_bias as `ptr + head` and certify
         # fp32; the checkpoint is bf16.

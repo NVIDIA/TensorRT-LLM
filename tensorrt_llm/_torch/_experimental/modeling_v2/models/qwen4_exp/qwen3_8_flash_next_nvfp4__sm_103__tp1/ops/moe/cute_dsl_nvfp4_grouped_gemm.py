@@ -100,7 +100,7 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
       checkpoint's row order. No 32-row shuffle (that is trtllm-gen's layout).
     - `weight_scale` `[E, H, I/16]` uint8: its e4m3 block scales, 128x4-swizzled
       per expert (`block_scale_interleave`).
-    - `alpha` `[E]` fp32: per expert, `down_proj.input_scale * weight_scale_2[e]`
+    - `alpha` `[E]` fp32: per expert, `max(down_proj.input_scale) * weight_scale_2[e]`
       -- the inverse of FC1's `global_sf` times the expert's weight scale.
     - `tile_idx_to_group_idx` `[M / tile_size]` int32 and `num_non_exiting_tiles`
       `[1]` int32: moe_sort's `tile_idx_to_expert_idx` and
@@ -262,8 +262,8 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
       finite output, and put most of the pair rows' elements outside the test's
       gate: trtllm-gen's 32-row shuffle, weight scales left linear, input scales
       linear, alpha shifted by one expert, one alpha for the whole layer.
-    - `alpha` per expert, `down_proj.input_scale * weight_scale_2[e]`, with
-      `input_scale` the one value per layer that FC1's `global_sf` inverts.
+    - `alpha` per expert, `max(down_proj.input_scale) * weight_scale_2[e]`, with
+      the maximum the value FC1's `global_sf` inverts.
     - `tile_idx_to_group_idx` / `num_non_exiting_tiles` from the same sort as
       FC1's input, tile_tokens_dim == `tile_size`, and every expert index below
       `weight.size(0)`: nothing checks the values (a tile naming expert 512 of
