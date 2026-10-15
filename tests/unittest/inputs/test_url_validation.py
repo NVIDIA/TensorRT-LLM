@@ -26,6 +26,7 @@ import pytest
 
 from tensorrt_llm.inputs.media_io import (
     _MAX_REDIRECTS,
+    MediaFetchError,
     _safe_aiohttp_get,
     _safe_request_get,
     _validate_url,
@@ -129,7 +130,7 @@ class TestValidateUrl:
         side_effect=socket.gaierror("Name or service not known"),
     )
     def test_rejects_unresolvable_hostname(self, _):
-        with pytest.raises(RuntimeError, match="Could not resolve"):
+        with pytest.raises(MediaFetchError, match="Could not resolve"):
             _validate_url("http://this.does.not.exist.invalid/")
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
@@ -345,6 +346,24 @@ class TestSafeRequestGet:
 class TestSafeAiohttpGet:
     def _run(self, coro):
         return asyncio.run(coro)
+
+    @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
+    def test_maps_timeout_to_fetch_error(self, _):
+        class _FakeSession:
+            def get(self, url, **kwargs):
+                raise asyncio.TimeoutError("timed out")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+        with patch(
+            "tensorrt_llm.inputs.media_io.aiohttp.ClientSession", return_value=_FakeSession()
+        ):
+            with pytest.raises(MediaFetchError, match="fetch failed"):
+                self._run(_safe_aiohttp_get("http://example.com/file.bin"))
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_reads_response_chunks_to_eof(self, _):
