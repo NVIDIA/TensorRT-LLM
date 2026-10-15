@@ -2854,9 +2854,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
-        from .mixed_precision import MixedPrecisionCache
+        from .mixed_precision_kv_view import MixedPrecisionKVView
 
-        staged = MixedPrecisionCache.create(metadata, self.layer_idx, q.dtype)
+        staged = MixedPrecisionKVView.create(metadata, self.layer_idx, q.dtype)
         if staged is not None:
             if self.is_mla_enable:
                 raise NotImplementedError(

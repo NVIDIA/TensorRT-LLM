@@ -21,8 +21,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 
-class MixedPrecisionCache:
-    """Stage selected values and return only new writes to the owning pools."""
+class MixedPrecisionKVView:
+    """Present temporary paged KV to Attention and return new writes to its pools."""
 
     @classmethod
     def create(
@@ -33,7 +33,7 @@ class MixedPrecisionCache:
         *,
         history_dequant_scale: torch.Tensor | None = None,
         max_page_size: int | None = None,
-    ) -> "MixedPrecisionCache | None":
+    ) -> "MixedPrecisionKVView | None":
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
             return None

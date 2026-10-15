@@ -2161,9 +2161,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         from tensorrt_llm.quantization import QuantMode
 
-        from .mixed_precision import MixedPrecisionCache
+        from .mixed_precision_kv_view import MixedPrecisionKVView
 
-        staged = MixedPrecisionCache.create(
+        staged = MixedPrecisionKVView.create(
             metadata,
             self.layer_idx,
             q.dtype,
