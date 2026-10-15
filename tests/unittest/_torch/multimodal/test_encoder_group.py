@@ -6,8 +6,7 @@ Covers the pure helpers behind ``encode_multimodal_by_groups``:
 
 * ``_lengths_by_modality`` — invert prompt-ordered ``multimodal_embedding_lengths``
   into per-modality per-item lists using ``mm_item_order``.
-* ``_synthesize_single_modality_manifest`` — trivial manifest for single-modality
-  requests that don't carry an explicit one.
+* ``_get_multimodal_item_layout`` — shared item metadata with legacy fallbacks.
 * ``_reorder_embeds_by_manifest`` — slice per-modality tensors and concat in
   each request's prompt-order manifest.
 """
@@ -18,10 +17,14 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    _get_multimodal_item_layout,
     _lengths_by_modality,
     _reorder_embeds_by_manifest,
-    _synthesize_single_modality_manifest,
 )
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _mp(*, mm_item_order=None, embedding_lengths=None, buckets=None):
@@ -89,19 +92,36 @@ class TestLengthsByModality:
         assert _lengths_by_modality([mp], ("image",)) == {"image": []}
 
 
-class TestSynthesizeSingleModalityManifest:
+class TestMultimodalItemLayout:
     def test_image_only(self):
         mp = _mp(embedding_lengths=[10, 20, 30], buckets={"image": {}})
-        assert _synthesize_single_modality_manifest(mp, ("image", "video")) == [
-            {"modality": "image", "index": 0},
-            {"modality": "image", "index": 1},
-            {"modality": "image", "index": 2},
-        ]
+        assert _get_multimodal_item_layout(mp, ("image", "video")) == (
+            [("image", 0), ("image", 1), ("image", 2)],
+            [10, 20, 30],
+        )
 
     def test_no_group_modality_returns_empty(self):
         # Request has audio but the group only covers image/video.
         mp = _mp(embedding_lengths=[10], buckets={"audio": {}})
-        assert _synthesize_single_modality_manifest(mp, ("image", "video")) == []
+        assert _get_multimodal_item_layout(mp, ("image", "video")) == ([], [])
+
+    def test_item_metadata_owns_order_and_lengths(self) -> None:
+        metadata = MultimodalEncoderItemMetadata(
+            [("video", 0), ("image", 0), ("audio", 0)], [24, 16, 8], [6, 4, 2]
+        )
+        mp = _mp(
+            mm_item_order=[{"modality": "image", "index": 0}],
+            embedding_lengths=[99],
+            buckets={"image": {}, "video": {}, "audio": {}},
+        )
+        mp.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+
+        item_refs, lengths = _get_multimodal_item_layout(mp, ("image", "video"))
+
+        assert item_refs is metadata.item_refs
+        assert lengths is metadata.output_embedding_lengths
+        assert _lengths_by_modality([mp], ("image", "video")) == {"image": [4], "video": [6]}
+        assert _lengths_by_modality([mp], ("audio",)) == {"audio": [2]}
 
 
 class TestReorderEmbedsByManifest:

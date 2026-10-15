@@ -31,7 +31,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Union,
+    cast,
 )
 
 import torch
@@ -39,7 +39,12 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.inputs.registry import (
     MultimodalEncoderItemMetadata,
     get_multimodal_encoder_item_metadata,
@@ -87,7 +92,8 @@ class EncoderGroup:
     Batching all items in a group into one encoder invocation amortizes
     fixed costs (kernel launches, dispatch) across items. The framework
     splits the output back per-modality and reorders it into prompt order
-    via each request's `mm_item_order` manifest.
+    via each request's `MultimodalEncoderItemMetadata.item_refs` manifest,
+    falling back to `mm_item_order` for legacy processors.
 
     Contract between `build_batched_input` and `encoder_fn`:
 
@@ -100,7 +106,7 @@ class EncoderGroup:
     * `encoder_fn` must return one tensor whose rows correspond 1:1 to the
       input layout produced by `build_batched_input`, so the framework can
       split the output by `_lengths_by_modality` and reorder into prompt
-      order via each request's `mm_item_order` manifest.
+      order via each request's item manifest.
     """
 
     modalities: Tuple[str, ...]
@@ -127,9 +133,8 @@ def _lengths_by_modality(
     multimodal_params: List[MultimodalParams],
     modalities: Tuple[str, ...],
 ) -> Dict[str, List[int]]:
-    """Invert prompt-ordered `multimodal_embedding_lengths` (number of
-    embedding rows per item) into per-modality per-item lengths, matching
-    the per-modality item order used by `EncoderGroup.build_batched_input`.
+    """Invert prompt-ordered output lengths into the per-modality item order
+    used by `EncoderGroup.build_batched_input`.
 
     Glossary used below:
 
@@ -148,26 +153,15 @@ def _lengths_by_modality(
     """
     by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
     for mp in multimodal_params:
-        flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
-        if mp.mm_item_order:
-            for entry, length in zip(mp.mm_item_order, flat, strict=True):
-                if entry["modality"] in by_modality:
-                    by_modality[entry["modality"]].append(length)
+        item_refs, lengths = _get_multimodal_item_layout(mp, modalities)
+        if not item_refs:
             continue
-        # Raw-prompt entrypoints (non chat-parsing) do not attach a manifest,
-        # so this is the single enforcement point that a >1-modality request
-        # must carry `mm_item_order` to make prompt-order reordering possible.
-        # Check the *request-level* modality set so multi-group models (each
-        # group with a single modality) still catch cross-group mixes — the
-        # group-local `modalities` tuple can have length 1 and never trip.
-        present = [m for m in _MM_DATA_INPUT_MODALITY_KEYS if mp.multimodal_data.get(m) is not None]
-        if len(present) > 1:
-            raise ValueError(
-                "Request with multiple modalities present "
-                f"({present}) must carry mm_item_order on MultimodalParams."
-            )
-        if present and present[0] in by_modality:
-            by_modality[present[0]].extend(flat)
+        request_lengths: dict[str, list[tuple[int, int]]] = {m: [] for m in modalities}
+        for (modality, index), length in zip(item_refs, lengths, strict=True):
+            if modality in request_lengths:
+                request_lengths[modality].append((index, length))
+        for modality, indexed_lengths in request_lengths.items():
+            by_modality[modality].extend(length for _, length in sorted(indexed_lengths))
     return by_modality
 
 
@@ -190,10 +184,10 @@ def _reorder_embeds_by_manifest(
         modality, embedding = populated_modalities[0]
         prompt_order_matches_encoder = True
         for mp in multimodal_params:
-            manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
-                mp, per_modality_embeds.keys()
-            )
-            item_indices = [entry["index"] for entry in manifest if entry["modality"] == modality]
+            item_refs, _ = _get_multimodal_item_layout(mp, per_modality_embeds.keys())
+            item_indices = [
+                index for item_modality, index in item_refs if item_modality == modality
+            ]
             if item_indices != list(range(len(item_indices))):
                 prompt_order_matches_encoder = False
                 break
@@ -208,19 +202,16 @@ def _reorder_embeds_by_manifest(
     }
 
     slices: List[torch.Tensor] = []
-    # `entry["index"]` is per-request per-modality; advance a cursor to
+    # Item indices are per-request per-modality; advance a cursor to
     # translate it into a global item index within `per_modality_embeds`.
     per_modality_cursor: Dict[str, int] = {m: 0 for m in per_modality_embeds}
     for mp in multimodal_params:
-        manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
-            mp, per_modality_embeds.keys()
-        )
+        item_refs, _ = _get_multimodal_item_layout(mp, per_modality_embeds.keys())
         req_counts: Dict[str, int] = {}
-        for entry in manifest:
-            m = entry["modality"]
+        for m, item_index in item_refs:
             if m not in per_modality_embeds:
                 continue
-            i = per_modality_cursor[m] + entry["index"]
+            i = per_modality_cursor[m] + item_index
             starts = per_modality_row_starts[m]
             slices.append(per_modality_embeds[m][starts[i] : starts[i + 1]])
             req_counts[m] = req_counts.get(m, 0) + 1
@@ -243,16 +234,36 @@ def _reorder_embeds_by_manifest(
     return torch.cat(slices, dim=0)
 
 
-def _synthesize_single_modality_manifest(
+def _get_multimodal_item_layout(
     mp: MultimodalParams,
     modalities: Iterable[str],
-) -> List[Dict[str, Union[str, int]]]:
-    """Trivial manifest for requests with only one modality present."""
+) -> tuple[list[tuple[str, int]], list[int]]:
+    """Read prompt-order refs and output lengths from the item metadata.
+
+    Legacy processors supply `mm_item_order` and embedding lengths instead.
+    Single-modality requests can omit the order; mixed requests cannot.
+    """
+    metadata = get_multimodal_encoder_item_metadata(mp.multimodal_data)
+    if metadata is not None:
+        return metadata.item_refs, metadata.output_embedding_lengths
+
     flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
-    for m in modalities:
-        if mp.multimodal_data.get(m) is not None:
-            return [{"modality": m, "index": i} for i in range(len(flat))]
-    return []
+    if mp.mm_item_order:
+        item_refs = cast(
+            list[tuple[str, int]],
+            [(entry["modality"], entry["index"]) for entry in mp.mm_item_order],
+        )
+        return item_refs, flat
+
+    present = [m for m in _MM_DATA_INPUT_MODALITY_KEYS if mp.multimodal_data.get(m) is not None]
+    if len(present) > 1:
+        raise ValueError(
+            "Request with multiple modalities present "
+            f"({present}) must carry item metadata or mm_item_order on MultimodalParams."
+        )
+    if present and present[0] in modalities:
+        return [(present[0], i) for i in range(len(flat))], flat
+    return [], []
 
 
 def encode_multimodal_by_groups(
@@ -265,9 +276,9 @@ def encode_multimodal_by_groups(
     For each group present in the batch, one encoder call is issued over all
     items across all requests belonging to that group's modalities
     (arithmetic-intensity win). The output is split back per-modality using
-    the prompt-ordered `multimodal_embedding_lengths` already stashed on
-    `multimodal_data`, then reordered into each request's `mm_item_order`
-    prompt sequence.
+    the prompt-ordered output lengths in `MultimodalEncoderItemMetadata`,
+    then reordered by the same metadata's `item_refs`. Legacy processors
+    fall back to `multimodal_embedding_lengths` and `mm_item_order`.
 
     Shared entry point for both the aggregated (`MultimodalModelMixin`) and
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
@@ -1421,7 +1432,25 @@ class MultimodalModelMixin:
         Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
         the parallel per-item metadata slice so every model gets it identically.
         """
-        source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
+        metadata = get_multimodal_encoder_item_metadata(source.multimodal_data)
+        if metadata is not None:
+            local_counts: dict[str, int] = {}
+            item_refs = []
+            for i in item_indices:
+                modality = metadata.item_refs[i][0]
+                local_index = local_counts.get(modality, 0)
+                item_refs.append((modality, local_index))
+                local_counts[modality] = local_index + 1
+            residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
+                MultimodalEncoderItemMetadata(
+                    item_refs,
+                    [metadata.encoder_token_lengths[i] for i in item_indices],
+                    [metadata.output_embedding_lengths[i] for i in item_indices],
+                )
+            )
+            source_lengths = metadata.output_embedding_lengths
+        else:
+            source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
         residual.multimodal_data["multimodal_embedding_lengths"] = [
             source_lengths[i] for i in item_indices
         ]
