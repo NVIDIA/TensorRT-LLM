@@ -4413,8 +4413,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Commit the slot's pending accepted drafts and its conv window into
         its V2 SSM and conv states, in place, and clear its draft count.
 
-        Afterwards the V2 states hold exactly what the next verify would have
-        started from (``commit_kda_pending_drafts``).
+        Afterwards the V2 states hold what the next verify would have started
+        from: the conv window exactly, the SSM state to the verify kernel's
+        accuracy (``commit_kda_pending_drafts``).
         """
         from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import \
             commit_kda_pending_drafts
@@ -4437,7 +4438,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     self.kda_conv_q[layer_offset],
                     self.kda_conv_k[layer_offset],
                     self.kda_conv_v[layer_offset],
-                    self.kda_qkg_cache[layer_offset],
+                    self.kda_k_cache[layer_offset],
+                    self.kda_g_cache[layer_offset],
                     self.kda_v_cache[layer_offset],
                     self.kda_beta_cache[layer_offset],
                     slots,

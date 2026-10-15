@@ -1096,7 +1096,7 @@ def _verify_after_round_one(B, H, num_spec, seed):
         data[name].copy_(data[name].bfloat16().float())
     first = cute_run(data)
     data = make_conv_data(B, H, M=num_spec, seed=seed + 1)
-    for name in ("qkg_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
         data[name] = first[name]
     data["initial_state_cute"] = first["state_v_first"]
     data["num_accepted_tokens"] = torch.arange(B, dtype=torch.int32, device="cuda") % (num_spec + 1)
@@ -1106,15 +1106,17 @@ def _verify_after_round_one(B, H, num_spec, seed):
 @pytest.mark.parametrize("B,H,num_spec", [(32, 12, 2), (32, 6, 2), (4, 6, 7)], ids=lambda v: str(v))
 def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
     """Committing the pending drafts first leaves the next verify's results
-    unchanged, bit for bit.
+    unchanged.
 
     This is what the cache manager does across a suspend.
     ``kda_mtp_commit_pending_drafts`` folds the accepted drafts into the
     state, ``store_kda_replay_conv_window`` puts the conv window after them in
     the bf16 conv pool, and the resume seeds the replay caches from that pool
-    with nothing pending. The verify that follows must give exactly the
-    outputs, state, caches and windows of the verify that replays the drafts
-    itself."""
+    with nothing pending. The verify that follows must give the caches and
+    windows of the verify that replays the drafts itself bit for bit, and its
+    outputs and state to the kernel's accuracy: the tensor-core verify computes
+    a chunk in one WY-form pass, so splitting the replayed drafts and the new
+    tokens into two chunks rounds differently."""
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
         kda_mtp_commit_pending_drafts,
     )
@@ -1133,7 +1135,8 @@ def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
     kda_mtp_commit_pending_drafts(
         state,
         *cs,
-        data["qkg_cache"].clone(),
+        data["k_cache"].clone(),
+        data["g_cache"].clone(),
         data["v_cache"].clone(),
         data["beta_cache"].clone(),
         slots,
@@ -1158,7 +1161,8 @@ def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
         cs_q=cs[0],
         cs_k=cs[1],
         cs_v=cs[2],
-        qkg_cache=torch.zeros_like(data["qkg_cache"]),
+        k_cache=torch.zeros_like(data["k_cache"]),
+        g_cache=torch.zeros_like(data["g_cache"]),
         v_cache=torch.zeros_like(data["v_cache"]),
         beta_cache=torch.zeros_like(data["beta_cache"]),
         num_accepted_tokens=torch.zeros_like(accepted),
@@ -1168,17 +1172,86 @@ def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
     )
     resumed = cute_run(resumed)
 
-    for name in (
-        "out",
-        "state_v_first",
-        "qkg_cache",
-        "v_cache",
-        "beta_cache",
-        "cs_q",
-        "cs_k",
-        "cs_v",
-    ):
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
         assert torch.equal(resumed[name], replayed[name]), name
+    _assert_close("out(commit vs replay)", resumed["out"], replayed["out"], atol=2e-2)
+    _assert_close(
+        "state(commit vs replay)",
+        resumed["state_v_first"],
+        replayed["state_v_first"],
+        atol=2e-4,
+        rtol=1e-4,
+    )
+
+
+def _replay_drafts_reference(data, slots, accepted):
+    """fp32 CPU replay of each selected slot's first ``accepted`` cached drafts onto its state,
+    the replay steps of ``cpu_reference``. Returns the K-first states of every slot."""
+    H, K, V = data["H"], data["K"], data["V"]
+    state = data["initial_state_kfirst"].float().cpu().clone()
+    caches = {
+        name: data[name].float().cpu() for name in ("k_cache", "g_cache", "v_cache", "beta_cache")
+    }
+    for slot, count in zip(slots.tolist(), accepted.tolist()):
+        for h in range(H):
+            hk, hv = h * K, h * V
+            h_state = state[slot, h]
+            for t in range(count):
+                k_t = caches["k_cache"][slot, t, hk : hk + K]
+                decay = torch.exp(caches["g_cache"][slot, t, hk : hk + K])
+                v_t = caches["v_cache"][slot, t, hv : hv + V]
+                beta_t = caches["beta_cache"][slot, t, h]
+                h_state = h_state * decay.unsqueeze(1)
+                v_new = (v_t - (h_state * k_t.unsqueeze(1)).sum(dim=0)) * beta_t
+                h_state = h_state + k_t.unsqueeze(1) * v_new.unsqueeze(0)
+            state[slot, h] = h_state
+    return state
+
+
+@pytest.mark.parametrize(
+    "B,H,M", [(32, 12, 2), (32, 6, 2), (2, 12, 7), (16, 12, 7)], ids=lambda v: str(v)
+)
+def test_commit_pending_drafts_matches_the_replay_reference(B, H, M):
+    """The replay-only variant of the verify kernel commits, for each selected slot, the state
+    after its accepted drafts: the replay steps of a full verify, checked against the fp32 CPU
+    replay. It only reads the conv and replay caches, leaves a slot with nothing pending and the
+    unselected slots bit for bit, and covers both the cluster-pair and the one-CTA launch."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        kda_mtp_commit_pending_drafts,
+    )
+
+    data, accept = _round2_inputs(B, H, M)
+    # Every other slot, in reverse order, with its own accepted count (0 included).
+    slots = torch.arange(B - 1, -1, -2, dtype=torch.int32)
+    accepted = accept[slots.long()]
+    expected = _replay_drafts_reference(data, slots, accepted).cuda()
+
+    state = data["initial_state_cute"].clone()
+    cs = [_dim_contiguous_clone(data[name]) for name in ("cs_q", "cs_k", "cs_v")]
+    caches = [data[name].clone() for name in ("k_cache", "g_cache", "v_cache", "beta_cache")]
+    kda_mtp_commit_pending_drafts(
+        state,
+        *cs,
+        *caches,
+        slots.cuda(),
+        accepted.cuda(),
+        M,
+        conv_width=data["W"],
+    )
+
+    committed = state.permute(0, 1, 3, 2)
+    _assert_close(
+        "state(commit vs cpu replay)", committed[slots.long()], expected[slots.long()], atol=1e-4
+    )
+    for slot, count in zip(slots.tolist(), accepted.tolist()):
+        if count == 0:
+            assert torch.equal(state[slot], data["initial_state_cute"][slot]), slot
+    others = [slot for slot in range(B) if slot not in slots.tolist()]
+    assert torch.equal(state[others], data["initial_state_cute"][others])
+    for name, cache in zip(("cs_q", "cs_k", "cs_v"), cs):
+        assert torch.equal(cache, data[name]), name
+    for name, cache in zip(("k_cache", "g_cache", "v_cache", "beta_cache"), caches):
+        assert torch.equal(cache, data[name]), name
 
 
 def test_commit_pending_drafts_replays_the_per_token_records():

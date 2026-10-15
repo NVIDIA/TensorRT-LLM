@@ -471,7 +471,8 @@ def commit_kda_pending_drafts(
     conv_q: torch.Tensor,
     conv_k: torch.Tensor,
     conv_v: torch.Tensor,
-    qkg_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
     v_cache: torch.Tensor,
     beta_cache: torch.Tensor,
     state_indices: torch.Tensor,
@@ -483,14 +484,17 @@ def commit_kda_pending_drafts(
     ``num_accepted_tokens[n]`` is the number of drafts of slot
     ``state_indices[n]`` the last verify accepted, which the next verify
     would take up first. Afterwards ``recurrent_state`` and ``conv_pool``
-    hold the state and the conv window that verify would start from, bit for
-    bit, and the caller clears the slot's count:
+    hold the state and the conv window that verify would start from (the
+    window bit for bit), and the caller clears the slot's count:
 
     * with per-token states (``state_tok``), the drafts are replayed from the
       per-draft records the Kimi K3 verify kernels keep there
       (``replay_kda_token_records``);
-    * otherwise they are replayed from the replay caches by the fused verify
-      kernel's own replay steps (``kda_mtp_commit_pending_drafts``).
+    * otherwise they are replayed from the replay caches (``k_cache`` /
+      ``g_cache`` / ``v_cache`` / ``beta_cache``) by the fused verify kernel's
+      own replay steps (``kda_mtp_commit_pending_drafts``). The tensor-core
+      verify computes a chunk in one pass, so this commit rounds the state
+      differently from a verify that replays the drafts itself.
     """
     num_spec = conv_q.shape[2] - conv_pool.shape[2]
     if state_tok is not None:
@@ -501,7 +505,8 @@ def commit_kda_pending_drafts(
             conv_q,
             conv_k,
             conv_v,
-            qkg_cache,
+            k_cache,
+            g_cache,
             v_cache,
             beta_cache,
             state_indices,
