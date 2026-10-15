@@ -6204,6 +6204,32 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
+    compact_beam_widths: List[PositiveInt] = Field(
+        default_factory=list,
+        description=
+        ("Opt-in execution widths (at least 2) for compact variable-width beam search. "
+         "Empty disables compaction. Only single-GPU dense Llama, Qwen2 and "
+         "Qwen3 decode with TRTLLM attention is supported. CUDA graphs are "
+         "captured separately for each width. Changing forward shapes can "
+         "change floating-point rounding and beam rankings."),
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_compact_beam_widths(self) -> 'TorchLlmArgs':
+        if 1 in self.compact_beam_widths:
+            raise ValueError("compact_beam_widths must be at least 2")
+        if self.compact_beam_widths and (self.enable_lora
+                                         or self.lora_config is not None):
+            raise ValueError("compact_beam_widths does not support LoRA")
+        capacity = self.max_beam_width or 1
+        if any(width > capacity for width in self.compact_beam_widths):
+            raise ValueError(
+                "compact_beam_widths must not exceed max_beam_width")
+        self.compact_beam_widths = sorted(
+            {width
+             for width in self.compact_beam_widths if width < capacity})
+        return self
+
     cuda_graph_config: Optional[CudaGraphConfigType] = Field(
         default_factory=CudaGraphConfig,
         description="CUDA graph config. If true, use CUDA graphs for decoding. \

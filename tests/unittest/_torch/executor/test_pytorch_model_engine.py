@@ -826,6 +826,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace()
+        runner.beam_compaction.execution_width.return_value = 0
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = True
         request = _make_request_stub(7)

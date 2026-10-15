@@ -27,6 +27,7 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
+from .beam_compaction import BeamCompaction
 from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
@@ -76,6 +77,8 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # Zero selects the original capacity-width forward.
+    beam_execution_width: int = 0
 
 
 def _save_spec_decode_capture_state(
@@ -151,6 +154,7 @@ class CUDAGraphRunnerConfig:
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    compact_beam_widths: Tuple[int, ...] = ()
 
 
 class CUDAGraphRunner:
@@ -165,6 +169,8 @@ class CUDAGraphRunner:
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
+        self.beam_compaction = BeamCompaction(config.max_beam_width,
+                                              config.compact_beam_widths)
 
         # High-level configuration from the config object
         self.enabled = config.use_cuda_graph
@@ -420,17 +426,21 @@ class CUDAGraphRunner:
         num_encoder_tokens = sum(
             int(request.encoder_output_len) for request in context_requests
             if not request.py_skip_cross_kv_projection)
-        return KeyType(batch_size=batch_size,
-                       draft_len=draft_len,
-                       is_first_draft=False,
-                       short_seq_len_mode=short_seq_len_mode,
-                       is_all_greedy_sample=is_all_greedy_sample,
-                       sample_type=sample_type,
-                       num_contexts=num_contexts,
-                       context_query_len=context_query_len,
-                       num_encoder_tokens=num_encoder_tokens,
-                       peft_cache_data_type=peft_cache_data_type,
-                       use_lora_graph=use_lora_graph)
+        return KeyType(
+            batch_size=batch_size,
+            draft_len=draft_len,
+            is_first_draft=False,
+            short_seq_len_mode=short_seq_len_mode,
+            is_all_greedy_sample=is_all_greedy_sample,
+            sample_type=sample_type,
+            num_contexts=num_contexts,
+            context_query_len=context_query_len,
+            num_encoder_tokens=num_encoder_tokens,
+            peft_cache_data_type=peft_cache_data_type,
+            use_lora_graph=use_lora_graph,
+            beam_execution_width=(self.beam_compaction.execution_width(
+                batch, new_tensors_device is not None) if not use_lora_graph
+                                  and not draft_len else 0))
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -689,6 +699,31 @@ class CUDAGraphRunner:
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
+        """Warm up every execution width before capturing any shared workspace."""
+        key = KeyType(*key)
+        widths = (key.beam_execution_width, )
+        if (not key.beam_execution_width and not key.num_contexts
+                and not key.draft_len and not enable_spec_decode
+                and not key.use_lora_graph
+                and self.beam_compaction.supports_inputs(initial_inputs)):
+            widths = (*self.config.compact_beam_widths, 0)
+        result = None
+        for width in widths:
+            inputs = initial_inputs.copy()
+            self.beam_compaction.prepare_inputs(inputs, width)
+            output = self._capture(key._replace(beam_execution_width=width),
+                                   forward_fn, inputs, enable_spec_decode,
+                                   postprocess_fn)
+            if width == key.beam_execution_width:
+                result = output
+        return result
+
+    def _capture(self,
+                 key: KeyType,
+                 forward_fn: Callable,
+                 initial_inputs: Dict[str, Any],
+                 enable_spec_decode: bool = False,
+                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
         # Preserve compatibility with direct callers that still pass the
         # original three-field generation-only tuple.
@@ -745,8 +780,12 @@ class CUDAGraphRunner:
             attn_metadata, enable_spec_decode)
 
         self.graph_metadata[key] = {
-            "attn_metadata": attn_metadata,
-            "spec_metadata": initial_inputs.get("spec_metadata", None),
+            "attn_metadata":
+            attn_metadata,
+            "spec_metadata":
+            initial_inputs.get("spec_metadata", None),
+            "compact_metadata": (initial_inputs["beam_compaction"].metadata if
+                                 "beam_compaction" in initial_inputs else None),
         }
 
         output = None
@@ -800,6 +839,13 @@ class CUDAGraphRunner:
         """
         key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
+        if key.beam_execution_width:
+            compact = current_inputs.get("beam_compaction")
+            if compact is None or compact.metadata is not stored_meta[
+                    "compact_metadata"]:
+                raise RuntimeError(
+                    "Compact CUDA graph replay requires refreshed compact metadata"
+                )
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:
             assert current_inputs.get(
@@ -972,6 +1018,10 @@ class CUDAGraphRunner:
         stored_meta = self.graph_metadata[key]
         stored_meta["attn_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
             stored_meta["attn_metadata"])
+        if stored_meta.get("compact_metadata") is not None:
+            stored_meta[
+                "compact_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
+                    stored_meta["compact_metadata"])
         if stored_meta["spec_metadata"] is not None:
             stored_meta[
                 "spec_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
@@ -985,6 +1035,10 @@ class CUDAGraphRunner:
         if "attn_metadata_ptrs" in stored_meta:
             self._assert_graph_tensor_ptrs_stable(
                 stored_meta["attn_metadata"], stored_meta["attn_metadata_ptrs"])
+        if "compact_metadata_ptrs" in stored_meta:
+            self._assert_graph_tensor_ptrs_stable(
+                stored_meta["compact_metadata"],
+                stored_meta["compact_metadata_ptrs"])
         if "spec_metadata_ptrs" in stored_meta:
             self._assert_graph_tensor_ptrs_stable(
                 stored_meta["spec_metadata"], stored_meta["spec_metadata_ptrs"])
@@ -1337,6 +1391,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.beam_compaction.clear()
         self._pre_replay_position_ids = None
         self.padding_dummy_requests = {}
         del self.memory_pool
