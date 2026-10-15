@@ -502,7 +502,7 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
 
 def host_model_rows(cache, size):
     """Every block's row and key count as the host computes them from the host table:
-    whole pages of the fixed region and the window, then the private region, then zeros."""
+    whole pages of the fixed region and the window, then the private pages, then zeros."""
     blk = cache._layout(size)
     rows, lengths = [], []
     for i in range(blk.num_blocks):
@@ -510,7 +510,7 @@ def host_model_rows(cache, size):
         runs = cache._whole_page_runs(spans)
         cached, _ = cache._host_block(blk, i)
         whole = [int(cache._host_table[p]) for a, b in runs for p in range(a, b)]
-        row = whole + blk.host_regions[i].tolist()
+        row = whole + blk.host_private_pages[i].tolist()
         rows.append(row + [0] * (cache._table.numel() - len(row)))
         lengths.append(cached + size)
     return rows, lengths
@@ -528,7 +528,7 @@ def test_device_layout_matches_the_host_model(cache):
             assert cache.causal_block_lengths(size)[1].tolist() == lengths
             offsets = cache.block_offsets(size)[0]
             assert offsets[:, 0].tolist() == [[r * cache.kv_factor for r in row] for row in rows]
-            # The pieces: the host model names each resident token's home and the region
+            # The pieces: the host model names each resident token's home and the private
             # slot its copy goes to. After a rotation the device reads the fixed tail
             # from the moved page (the same launch refills the tail's new home from it),
             # so translate that page to the new home before comparing.
@@ -544,8 +544,8 @@ def test_device_layout_matches_the_host_model(cache):
             }
             device = {(moved.get(s // rpp, s // rpp) * rpp + s % rpp, d) for s, d in device}
             home, copy = cache._mirror_rows(0, cache.staging_offset)
-            regions = set(blk.host_regions.reshape(-1).tolist())
-            host = {(h, c) for h, c in zip(home.tolist(), copy.tolist()) if c // rpp in regions}
+            private = set(blk.host_private_pages.reshape(-1).tolist())
+            host = {(h, c) for h, c in zip(home.tolist(), copy.tolist()) if c // rpp in private}
             assert device == host
         cache.commit(cache.max_staged_tokens)
     assert cache.history_tokens > cache.window_tokens  # eviction happened

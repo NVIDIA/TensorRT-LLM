@@ -25,7 +25,7 @@ DEV = torch.device("cuda")
 
 TPB = 4
 TABLE = [10, 11, 12, 13, 14, 15]  # view page of each logical page
-REGION = [20, 21, 22, 23]  # one block's private pages
+PRIVATE_PAGES = [20, 21, 22, 23]  # one block's private pages
 RPP = 2 * 1 * TPB  # pool rows per view page with one K/V head
 KV_FACTOR, KV_OFFSET = 2, 1
 
@@ -58,7 +58,7 @@ def layout(block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
     )
     torch.ops.trtllm.causal_layout_(
         i32(TABLE),
-        i32([REGION]),
+        i32([PRIVATE_PAGES]),
         *out.values(),
         *(extra.values() if shared else (None, None, None)),
         block_size,
@@ -83,9 +83,9 @@ def test_hand_layout():
     assert got["rows"] == [[20, 21, 22, 23, 0, 0]]
     assert got["block_offsets"] == [[[[40, 42, 44, 46, 0, 0], [41, 43, 45, 47, 1, 1]]]]
     assert got["seq_len_kv"] == [0 * TPB + 5 + 4]
-    # Own tokens take region slots 5..8: page 21 slots 1-3, then page 22 slot 0.
+    # Own tokens take private slots 5..8: page 21 slots 1-3, then page 22 slot 0.
     assert got["own_slots"] == [21 * TPB + 1, 21 * TPB + 2, 21 * TPB + 3, 22 * TPB + 0]
-    # Pieces: positions 0, 1, 3 (page 10) and 4, 5 (page 11) into region slots 0..4.
+    # Pieces: positions 0, 1, 3 (page 10) and 4, 5 (page 11) into private slots 0..4.
     assert got["piece_src"] == [10 * RPP + 0, 10 * RPP + 1, 10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1] + [-1] * 4
     assert got["piece_dst"] == [20 * RPP + 0, 20 * RPP + 1, 20 * RPP + 2, 20 * RPP + 3, 21 * RPP + 0] + [-1] * 4
     # No staged token on a partial page: every extra is the padding (own first token).
@@ -110,7 +110,7 @@ def test_staged_tokens_on_a_partial_page_become_extras():
     # Two blocks of 2: block 1 starts at 8 and sees [0, 2) and [5, 8); positions 6, 7 are
     # block 0's staged tokens on block 1's start page (page 1 holds 4..7).
     n, block_size, row_len = 2, 2, len(TABLE)
-    regions = i32([REGION, [30, 31, 32, 33]])
+    private_pages = i32([PRIVATE_PAGES, [30, 31, 32, 33]])
     out = dict(
         rows=torch.zeros(n, row_len, dtype=torch.int32, device=DEV),
         block_offsets=torch.zeros(1, n, 2, row_len, dtype=torch.int32, device=DEV),
@@ -122,7 +122,7 @@ def test_staged_tokens_on_a_partial_page_become_extras():
         piece_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
     )
     torch.ops.trtllm.causal_layout_(
-        i32(TABLE), regions, *out.values(), None, None, None, block_size, TPB, 6, 2, 3,
+        i32(TABLE), private_pages, *out.values(), None, None, None, block_size, TPB, 6, 2, 3,
         len(TABLE), 0, KV_FACTOR, KV_OFFSET, RPP,
     )
     got = {k: v.tolist() for k, v in out.items()}
@@ -132,7 +132,7 @@ def test_staged_tokens_on_a_partial_page_become_extras():
     assert got["piece_src"][12:18] == [-1] * 6
     extra_src, extra_dst = got["extra_src"][6:], got["extra_dst"][6:]
     assert extra_src[:2] == [0, 1]  # staged tokens 6 - past, 7 - past
-    assert extra_dst[:2] == [30 * TPB + 3, 31 * TPB + 0]  # region slots 3 and 4
+    assert extra_dst[:2] == [30 * TPB + 3, 31 * TPB + 0]  # private slots 3 and 4
     assert extra_src[2:] == [block_size * 1] * 4 and extra_dst[2:] == [31 * TPB + 1] * 4
 
 
@@ -149,7 +149,40 @@ def test_bad_arguments():
         n, row_len = 1, len(TABLE)
         z = lambda *shape, dtype=torch.int64: torch.zeros(*shape, dtype=dtype, device=DEV)  # noqa: E731
         torch.ops.trtllm.causal_layout_(
-            i32(TABLE), i32([REGION]), z(n, row_len, dtype=torch.int32),
+            i32(TABLE), i32([PRIVATE_PAGES]), z(n, row_len, dtype=torch.int32),
             z(1, n, 2, row_len, dtype=torch.int32), z(n, dtype=torch.int32), z(4), z(6), z(6),
             z(9), z(9), None, z(TPB), None, 4, TPB, 6, 2, 3, len(TABLE), 0, KV_FACTOR, KV_OFFSET, RPP,
+        )
+
+
+def test_page_size_must_be_a_power_of_two():
+    def z(*shape, dtype=torch.int64):
+        return torch.zeros(*shape, dtype=dtype, device=DEV)
+
+    row_len = len(TABLE)
+    with pytest.raises(RuntimeError, match="power of two"):
+        torch.ops.trtllm.causal_layout_(
+            i32(TABLE),
+            i32([PRIVATE_PAGES]),
+            z(1, row_len, dtype=torch.int32),
+            z(1, 1, 2, row_len, dtype=torch.int32),
+            z(1, dtype=torch.int32),
+            z(4),
+            z(4),
+            z(4),
+            z(6),
+            z(6),
+            None,
+            None,
+            None,
+            4,
+            3,
+            6,
+            2,
+            3,
+            row_len,
+            0,
+            KV_FACTOR,
+            KV_OFFSET,
+            2 * 3,
         )

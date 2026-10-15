@@ -40,7 +40,7 @@ void checkIndex(torch::Tensor const& t, char const* op, char const* name, c10::S
 } // namespace
 
 //! In place: the per-block tensors of one causal block size, from the cache's page table.
-//! ``table``: ``[>= num_pages]`` int32 view pages. ``regions``: ``[num_blocks, region_pages]`` int32
+//! ``table``: ``[>= num_pages]`` int32 view pages. ``private_pages``: ``[num_blocks, num_private_pages]`` int32
 //! private view pages. Written: ``rows [num_blocks, row_len]`` and ``block_offsets [1, num_blocks, 2,
 //! row_len]`` int32, ``seq_len_kv [num_blocks]`` int32, ``own_slots [num_blocks * block_size]``,
 //! ``extra_src``/``extra_dst [num_blocks * 2 * (tokens_per_page - 1)]`` and
@@ -49,7 +49,7 @@ void checkIndex(torch::Tensor const& t, char const* op, char const* name, c10::S
 //! ``refill_dst`` (int64, ``tokens_per_page`` long), also writes those. ``drop_pages`` is the page
 //! count the rotation preceding this call moved to the ring's tail, 0 if none. No allocation,
 //! safe inside CUDA graph capture.
-void causal_layout_(torch::Tensor table, torch::Tensor regions, torch::Tensor rows, torch::Tensor block_offsets,
+void causal_layout_(torch::Tensor table, torch::Tensor private_pages, torch::Tensor rows, torch::Tensor block_offsets,
     torch::Tensor seq_len_kv, torch::Tensor own_slots, torch::Tensor extra_src, torch::Tensor extra_dst,
     torch::Tensor piece_src, torch::Tensor piece_dst, std::optional<torch::Tensor> staged_slots,
     std::optional<torch::Tensor> refill_src, std::optional<torch::Tensor> refill_dst, int64_t block_size,
@@ -60,20 +60,22 @@ void causal_layout_(torch::Tensor table, torch::Tensor regions, torch::Tensor ro
     CHECK_TH_CUDA(table);
     TORCH_CHECK(table.dim() == 1 && table.scalar_type() == torch::kInt32 && table.is_contiguous(), op,
         ": table must be a contiguous 1-D int32 tensor");
-    TORCH_CHECK(regions.dim() == 2, op, ": regions must be [num_blocks, region_pages]");
-    int64_t const n = regions.size(0);
-    int64_t const region_pages = regions.size(1);
+    TORCH_CHECK(private_pages.dim() == 2, op, ": private_pages must be [num_blocks, num_private_pages]");
+    int64_t const n = private_pages.size(0);
+    int64_t const num_private_pages = private_pages.size(1);
     TORCH_CHECK(block_size > 0 && tokens_per_page > 1, op, ": block_size must be positive and tokens_per_page > 1");
+    TORCH_CHECK((tokens_per_page & (tokens_per_page - 1)) == 0, op, ": tokens_per_page must be a power of two, got ",
+        tokens_per_page);
     TORCH_CHECK(0 <= fixed_tokens && fixed_tokens <= past && window_tokens > 0, op,
         ": need 0 <= fixed_tokens <= past and window_tokens > 0");
     TORCH_CHECK(0 <= drop_pages && drop_pages < num_pages && num_pages <= table.size(0), op,
         ": need 0 <= drop_pages < num_pages <= table length");
     TORCH_CHECK((past + n * block_size + tokens_per_page - 1) / tokens_per_page <= num_pages, op,
         ": the staged tokens end past page ", num_pages);
-    TORCH_CHECK(region_pages * tokens_per_page >= 3 * (tokens_per_page - 1) + block_size, op, ": a region of ",
-        region_pages, " pages cannot hold three partial pages plus a block of ", block_size);
+    TORCH_CHECK(num_private_pages * tokens_per_page >= 3 * (tokens_per_page - 1) + block_size, op, ": ",
+        num_private_pages, " private pages cannot hold three partial pages plus a block of ", block_size);
     auto const device = table.device();
-    checkIndex(regions, op, "regions", torch::kInt32, {n, region_pages}, device);
+    checkIndex(private_pages, op, "private_pages", torch::kInt32, {n, num_private_pages}, device);
     TORCH_CHECK(rows.dim() == 2 && rows.size(0) == n, op, ": rows must be [num_blocks, row_len]");
     int64_t const row_len = rows.size(1);
     TORCH_CHECK(row_len >= 1, op, ": rows must have at least one column");
@@ -102,14 +104,15 @@ void causal_layout_(torch::Tensor table, torch::Tensor regions, torch::Tensor ro
         checkIndex(*refill_dst, op, "refill_dst", torch::kInt64, {tokens_per_page}, device);
     }
 
-    tensorrt_llm::kernels::CausalLayoutParams p{};
+    tensorrt_llm::kernels::causalLayout::CausalLayoutParams p{};
     p.table = table.data_ptr<int32_t>();
-    p.regions = regions.data_ptr<int32_t>();
+    p.privatePages = private_pages.data_ptr<int32_t>();
     p.numPages = num_pages;
-    p.regionPages = region_pages;
+    p.numPrivatePages = num_private_pages;
     p.numBlocks = n;
     p.blockSize = block_size;
     p.tokensPerPage = tokens_per_page;
+    p.pageShift = __builtin_ctzll(static_cast<unsigned long long>(tokens_per_page));
     p.past = past;
     p.fixedTokens = fixed_tokens;
     p.windowTokens = window_tokens;
@@ -132,7 +135,7 @@ void causal_layout_(torch::Tensor table, torch::Tensor regions, torch::Tensor ro
     p.refillDst = refill_dst ? refill_dst->data_ptr<int64_t>() : nullptr;
 
     at::cuda::CUDAGuard const guard(device);
-    tensorrt_llm::kernels::invokeCausalLayout(p, at::cuda::getCurrentCUDAStream(device.index()));
+    tensorrt_llm::kernels::causalLayout::invokeCausalLayout(p, at::cuda::getCurrentCUDAStream(device.index()));
 }
 
 //! In place, within one pool: entry ``e`` copies the token at pool row ``src[e]`` to pool row
@@ -158,7 +161,7 @@ void copy_kv_slots_(torch::Tensor pool, torch::Tensor src, torch::Tensor dst, in
     {
         return;
     }
-    tensorrt_llm::kernels::CopyKvSlotsParams p{};
+    tensorrt_llm::kernels::causalLayout::CopyKvSlotsParams p{};
     p.pool = pool.data_ptr();
     p.src = src.data_ptr<int64_t>();
     p.dst = dst.data_ptr<int64_t>();
@@ -170,7 +173,7 @@ void copy_kv_slots_(torch::Tensor pool, torch::Tensor src, torch::Tensor dst, in
     p.rowsPerPage = 2 * num_heads * tokens_per_page;
 
     at::cuda::CUDAGuard const guard(pool.device());
-    tensorrt_llm::kernels::invokeCopyKvSlots(
+    tensorrt_llm::kernels::causalLayout::invokeCopyKvSlots(
         p, static_cast<int>(pool.element_size()), at::cuda::getCurrentCUDAStream(pool.get_device()));
 }
 
@@ -179,7 +182,7 @@ void copy_kv_slots_(torch::Tensor pool, torch::Tensor src, torch::Tensor dst, in
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "causal_layout_(Tensor table, Tensor regions, Tensor(a!) rows, Tensor(b!) block_offsets, "
+        "causal_layout_(Tensor table, Tensor private_pages, Tensor(a!) rows, Tensor(b!) block_offsets, "
         "Tensor(c!) seq_len_kv, Tensor(d!) own_slots, Tensor(e!) extra_src, Tensor(f!) extra_dst, "
         "Tensor(g!) piece_src, Tensor(h!) piece_dst, Tensor(i!)? staged_slots, Tensor(j!)? refill_src, "
         "Tensor(k!)? refill_dst, int block_size, int tokens_per_page, int past, int fixed_tokens, "

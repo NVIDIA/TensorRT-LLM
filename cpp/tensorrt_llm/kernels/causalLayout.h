@@ -24,15 +24,15 @@
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels
+namespace kernels::causalLayout
 {
 
 //! The per-causal-block tensors of one block size for a causal K/V cache, computed on the device
 //! from the cache's page table. The cache holds logical tokens ``[0, past)``: ``fixedTokens`` fixed
 //! ones, then history; a forward stages ``numBlocks * blockSize`` tokens at ``past``. Block ``i``
-//! starts at ``past + i * blockSize`` and sees the fixed region, the ``windowTokens`` before it, the
-//! earlier blocks and itself. Its row lists every page it sees in full, then its private region:
-//! the visible slots of the pages it sees only partly (at most three: where the fixed region ends,
+//! starts at ``past + i * blockSize`` and sees the fixed tokens, the ``windowTokens`` before it, the
+//! earlier blocks and itself. Its row lists every page it sees in full, then its private pages:
+//! the visible slots of the pages it sees only partly (at most three: where the fixed tokens end,
 //! where the window starts, where the block starts), then its own tokens.
 //!
 //! A view page is a layer-0 page index as the table stores it; a slot id is
@@ -40,16 +40,17 @@ namespace kernels
 struct CausalLayoutParams
 {
     int32_t const* table;   //!< [numPages] view page of each logical page
-    int32_t const* regions; //!< [numBlocks, regionPages] private view pages of each block
+    int32_t const* privatePages; //!< [numBlocks, numPrivatePages] private view pages of each block
     int64_t numPages;
-    int64_t regionPages;
+    int64_t numPrivatePages;
     int64_t numBlocks;
     int64_t blockSize;
     int64_t tokensPerPage;
+    int pageShift; //!< log2(tokensPerPage); tokensPerPage is a power of two
     int64_t past;
     int64_t fixedTokens;
     int64_t windowTokens;
-    //! Pages dropped by the rotation this commit (0 if none). The page the fixed region's tail
+    //! Pages dropped by the rotation this commit (0 if none). The page the fixed tokens' tail
     //! shares with the history then has a new view page; its old one, now at logical page
     //! ``numPages - dropPages``, still holds the fixed tail and is the source for it.
     int64_t dropPages;
@@ -66,7 +67,7 @@ struct CausalLayoutParams
     //! per block, (staged token index, slot id), padded with the block's own first token.
     int64_t* extraSrc;
     int64_t* extraDst;
-    //! Fixed and history tokens copied into a block's private region: ``3 * (tokensPerPage - 1)``
+    //! Fixed and history tokens copied into a block's private pages: ``3 * (tokensPerPage - 1)``
     //! entries per block, (source pool row, destination pool row), -1 past the used ones.
     int64_t* pieceSrc;
     int64_t* pieceDst;
@@ -101,6 +102,6 @@ struct CopyKvSlotsParams
 
 void invokeCopyKvSlots(CopyKvSlotsParams const& params, int elemSize, cudaStream_t stream);
 
-} // namespace kernels
+} // namespace kernels::causalLayout
 
 TRTLLM_NAMESPACE_END
