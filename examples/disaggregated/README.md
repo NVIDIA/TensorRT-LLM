@@ -44,8 +44,6 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 
 **Note:** Containers built from NGC PyTorch base images with AWS EFA development files at `/opt/amazon/efa` build the NIXL-LIBFABRIC plugin against that installation by default (see `docker/common/install_nixl.sh`). With these containers on EFA-enabled instances, no extra library installation is needed — set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`. Other base images fall back to system libfabric detection and may not include the plugin. Use the installation options below if the plugin is missing or you need a custom libfabric installation.
 
-For the CUDA VMM allocations used by KV cache V2, the NGC PyTorch 26.09 build also patches bundled AWS libfabric 2.4.0amzn5.0 and NIXL 1.4.0. These fixes handle context-independent allocations without requiring `NIXL_DISABLE_CUDA_ADDR_WA`. The libfabric rebuild retains the bundled provider set and CUDA, GDRCopy and Neuron support. A different bundled libfabric version requires revalidating the backport in `docker/common/install_libfabric.sh` before building.
-
 #### Prerequisites
 
 ##### For LIBFABRIC Backend
@@ -56,7 +54,6 @@ For the CUDA VMM allocations used by KV cache V2, the NGC PyTorch 26.09 build al
 - Bundled in NGC PyTorch base images with AWS EFA at `/opt/amazon/efa`. No extra library installation is needed when using these containers on EFA-enabled instances.
 - For a custom libfabric installation, see [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
 - **Minimum required version:** v1.21.0
-- CUDA VMM additionally requires the [libfabric synchronization fixes](https://github.com/ofiwg/libfabric/issues/12853) and the [NIXL allocation-context fix](https://github.com/ai-dynamo/nixl/pull/2425). The minimum version alone does not guarantee VMM support; custom installations must include these fixes or an upstream release containing them.
 - For EFA-enabled AWS instances using a non-bundled version, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
 
 **hwloc**
@@ -96,7 +93,7 @@ If you have a pre-compiled `libplugin_LIBFABRIC.so` that matches your NIXL versi
 1. Place the plugin file in a directory of your choice
 2. Set the environment variable to point to the plugin directory:
    ```bash
-   export NIXL_PLUGIN_DIR=/path/to/plugin/directory
+   export NIXL_PLUGINS_DIR=/path/to/plugin/directory
    export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
    ```
 3. Ensure the plugin was built with the same NIXL version as in your container
@@ -150,7 +147,7 @@ CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
 export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
 
 # If using pre-compiled plugin:
-# export NIXL_PLUGIN_DIR=/path/to/plugin/directory
+# export NIXL_PLUGINS_DIR=/path/to/plugin/directory
 
 # For AWS EFA (optional):
 # export FI_PROVIDER=efa
@@ -187,7 +184,7 @@ CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
 - Standard UCX environment variables apply
 
 **For LIBFABRIC backend:**
-- `NIXL_PLUGIN_DIR`: Directory containing the NIXL LIBFABRIC plugin (`libplugin_LIBFABRIC.so`) if using pre-compiled plugin
+- `NIXL_PLUGINS_DIR`: Directory containing the NIXL LIBFABRIC plugin (`libplugin_LIBFABRIC.so`) if using pre-compiled plugin
 - `FI_PROVIDER`: Specifies the libfabric provider to use (e.g., `efa` for AWS EFA)
 - `FI_EFA_USE_DEVICE_RDMA`: Set to `1` to enable GPU Direct RDMA on AWS EFA (if supported)
 - `FI_LOG_LEVEL`: Controls libfabric logging verbosity (e.g., `warn`, `info`, `debug`)
@@ -605,4 +602,4 @@ A: Check that the container includes the NIXL LIBFABRIC plugin and the dependenc
 1. **Missing plugin**: Older or custom images without libfabric development files at build time may not include the plugin. Follow [LIBFABRIC Backend Setup](#libfabric-backend-setup) to install it.
 2. **EFA devices unavailable**: If using EFA, confirm the instance supports it and the devices are passed through to the container.
 3. **Custom libfabric version mismatch**: If you rebuilt NIXL against a different libfabric installation, confirm it meets the minimum required version (v1.21.0) and that the plugin was built against that same libfabric.
-4. **Using a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGIN_DIR` to point to its directory.
+4. **Using a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory.
