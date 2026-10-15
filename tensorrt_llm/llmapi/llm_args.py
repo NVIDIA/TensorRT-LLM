@@ -3387,7 +3387,8 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
             type(layer_id) is not int or layer_id < 1
             for layer_id in aux_layer_ids)):
         raise ValueError(
-            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids to be "
+            "a non-empty list of positive integers (>= 1, excluding bool) "
             "(layer 0's input is the embedding output, which is not captured); "
             f"got {aux_layer_ids}")
     num_layers = layer["num_hidden_layers"]
