@@ -3443,13 +3443,12 @@ def is_lilicorr_checkpoint(architectures: Optional[List[str]],
 
 def is_dflash2_checkpoint(architectures: Optional[List[str]],
                           dflash_config: dict) -> bool:
-    """
-    Whether a DFlash drafter checkpoint declares DFlash 2 features.
-    """
-    return (int(dflash_config.get("conv_kernel_size", 0) or 0) > 0
-            or int(dflash_config.get("selector_rank", 0) or 0) > 0
-            or any("dflash2" in str(arch).lower().replace("_", "").replace(
-                "-", "") for arch in (architectures or [])))
+    """Whether a DFlash drafter checkpoint declares DFlash 2 features."""
+    return (
+        int(dflash_config.get("conv_kernel_size", 0) or 0) > 0
+        or int(dflash_config.get("selector_rank", 0) or 0) > 0
+        or any("dflash2" in str(arch).lower().replace("_", "").replace("-", "")
+               for arch in (architectures or [])))
 
 
 class DFlashDecodingConfig(DecodingBaseConfig):
