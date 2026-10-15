@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS — Change-Based Testing Selection
 
 CI test-selection tool. Narrows the Jenkins stages and per-stage tests that
@@ -47,10 +50,10 @@ Ten rules, registered in `main.py::RULE_CLASSES`:
 | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (excl. docs; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
 | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
-| `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) |
+| `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
-| `DocsRule` | `docsonly` | `docs/**` → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, QA / dev test lists, `.test_durations`, `microbenchmarks/` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
+| `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure; see `rules/README.md` |
 
 See `rules/README.md` for per-rule logic.
 
@@ -68,7 +71,7 @@ See `rules/README.md` for per-rule logic.
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
 | `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run the complete `l0_cpu` suite on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
 | `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `modelingv2only`, `agentflowonly`, `openengineonly`, `docsonly`); their narrows union. |
-| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry). Layer 2 still applies. |
+| `noop` | Rule(s) claimed files without contributing tests. Always-run CPU stages remain; a pure noop uses the source CPU list. In mixed PRs, other rules and coverage decide the remaining tests. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
 `_combine_scopes` (main.py): rules with `scope="noop"` give way to any
@@ -79,6 +82,15 @@ testsonly-family mixes combine to `testsonly`; anything else returns
 A rule can yield `noop` (no impact), a narrow (actionable scope), or
 `None` (cannot decide → fallback). Files matched by a rule are claimed;
 unclaimed files in `pr.changed_files` → fallback.
+
+Outside noop paths, Python docstring edits are a documentation contribution even in a mixed PR.
+Input analysis verifies the raw patch against the checkout and parses both
+source images. Literal docstring lines in existing scopes are removed from the
+executable selection diff; the original patch is retained for reconstruction.
+`DocsRule` claims a Python file only when no executable edits remain. Mixed
+files continue through the other rules or coverage, and their selections union
+with the docs build and CPU checks. This is a low-risk documentation policy,
+not an exhaustive analysis of runtime `__doc__` readers.
 
 ## File map
 
@@ -228,9 +240,9 @@ Decision JSON:
 ```
 
 - `scope: null` → fallback; Groovy defers to baseline.
-- `scope: "noop"` → rule(s) fired but no narrow contribution; affected
-  stages may be empty. Layer 2 still honors `sanity_required` /
-  `perfsanity_required`.
+- `scope: "noop"` → rule(s) fired without a test contribution; the final
+  affected stages still include the always-run CPU baseline. Layer 2 also
+  honors `sanity_required` / `perfsanity_required`.
 - `test_db_dir_override: null` → no Layer 3 narrowing; trt-test-db reads
   the source test-db.
 - `affected_stage_test_counts` → per-stage kept-entry count (telemetry).
