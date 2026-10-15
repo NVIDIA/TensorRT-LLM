@@ -1816,6 +1816,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
+        # Without iteration stats the engine produces none, so there is
+        # nothing to wait for.
         if not getattr(self.generator.args, "enable_iter_perf_stats", True):
             return JSONResponse(content=[])
 
@@ -1831,9 +1833,10 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=stats)
 
         # Legacy path: no background collector -> read the queue directly.
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
+        # The read waits up to 2 s for stats inside a blocking executor call,
+        # so it runs in a worker thread; on the event loop it would stall every
+        # response being streamed for as long as it waits.
+        stats = await asyncio.to_thread(self.generator.get_stats, 2)
         return JSONResponse(content=stats)
 
     async def get_energy_metrics(self) -> JSONResponse:
