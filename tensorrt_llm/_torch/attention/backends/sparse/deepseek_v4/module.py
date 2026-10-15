@@ -1424,7 +1424,12 @@ def forward_sparse_attn(
 
     def _q_branch():
         self._fused_q_rope_applied = False
-        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(self, q, position_ids, attn_metadata):
+        # The fused q_b output leaves no Q work for generation, which then runs
+        # the RoPE op KV-only; that mode needs the fused kv-norm weight, so the
+        # two prologue fusions must be active together.
+        if self._fused_kv_norm_active and _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
+            self, q, position_ids, attn_metadata
+        ):
             assert position_ids is not None
             q_shape_carrier, quant_q_buffer, quant_scale_qkv = (
                 _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(self, q, position_ids, attn_metadata)
