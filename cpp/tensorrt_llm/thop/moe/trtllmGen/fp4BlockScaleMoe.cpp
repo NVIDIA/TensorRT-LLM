@@ -50,7 +50,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     std::optional<int64_t> const hidden_states_ready_event = std::nullopt,
     torch::optional<torch::Tensor> const& router_hidden_states = torch::nullopt,
     torch::optional<torch::Tensor> const& router_weight = torch::nullopt,
-    torch::optional<torch::Tensor> const& router_workspace = torch::nullopt)
+    torch::optional<torch::Tensor> const& router_workspace = torch::nullopt, bool const prefer_gemm2_k128 = false)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -528,6 +528,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.output1_scales_gate_scalar = output1_scales_gate_scalar.data_ptr<float>();
     args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
     args.do_finalize = do_finalize;
+    args.prefer_gemm2_k128 = prefer_gemm2_k128;
 
     auto const workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
 
@@ -635,7 +636,7 @@ public:
         std::optional<int64_t> const hidden_states_ready_event = std::nullopt,
         torch::optional<torch::Tensor> const& router_hidden_states = torch::nullopt,
         torch::optional<torch::Tensor> const& router_weight = torch::nullopt,
-        torch::optional<torch::Tensor> const& router_workspace = torch::nullopt)
+        torch::optional<torch::Tensor> const& router_workspace = torch::nullopt, bool const prefer_gemm2_k128 = false)
     {
         int64_t tileN = moeConfigIndex[0];
         int64_t config = moeConfigIndex[1];
@@ -686,7 +687,7 @@ public:
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *runner, configToRun,
             topk_weights, topk_ids, output, hidden_states_ready_event, router_hidden_states, router_weight,
-            router_workspace);
+            router_workspace, prefer_gemm2_k128);
     }
 
 private:

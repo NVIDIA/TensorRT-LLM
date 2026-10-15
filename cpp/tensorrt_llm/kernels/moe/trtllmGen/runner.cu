@@ -15,6 +15,7 @@
  */
 
 #include "DevKernel.h"
+#include "Gemm2K128.h"
 #include "routing/RoutingKernel.h"
 #include "runner.h"
 #include "tensorrt_llm/common/config.h"
@@ -713,6 +714,10 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
     , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim, useFineGrained))
     , mActType(actType)
     , mTileTokensDim(tileTokensDim)
+    , mDtypeAct(dtypeAct)
+    , mDtypeWeights(dtypeWeights)
+    , mUseDeepSeekFp8(useDeepSeekFp8)
+    , mUseFineGrained(useFineGrained)
 {
     auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
     auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
@@ -906,13 +911,50 @@ void Runner::run(
     }
 
     // Run gemm2
-    mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
-        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, totalExpertsPerToken,
-        args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, totalLocalExperts, args.num_tokens,
-        workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
-        workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
-        args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+    int32_t const gemm2HiddenSize = args.output_hidden_size.value_or(args.hidden_size);
+    int32_t const gemm2MaxNumCtas
+        = Routing::getMaxNumCgasInBatchDim(args.num_tokens, totalExpertsPerToken, totalLocalExperts, mTileTokensDim);
+    // gemm2K128 covers the FC2 of the NVFP4 MoE at intermediate size 128 and tile N 8 (for example GLM-5 decode at MoE
+    // TP16): the same output rows as the Gemm2 cubin, bitwise (see Gemm2K128.cu).
+    if (args.prefer_gemm2_k128 && mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1
+        && !mUseDeepSeekFp8 && !mUseFineGrained && mTileTokensDim == 8 && args.num_fused_shared_experts == 0
+        && args.intermediate_size == 128
+        && args.valid_intermediate_size.value_or(args.intermediate_size) == args.intermediate_size
+        && args.valid_hidden_size.value_or(args.hidden_size) == gemm2HiddenSize && args.gemm2_bias == nullptr
+        && args.output2_scales_scalar != nullptr && moe::dev::gemm2K128::isSupported(gemm2HiddenSize, gemm2MaxNumCtas))
+    {
+        moe::dev::gemm2K128::Data gemm2Data{};
+        gemm2Data.weights = args.gemm2_weights;
+        gemm2Data.weightsScale = args.gemm2_weights_scale;
+        gemm2Data.act = gemm2_input;
+        gemm2Data.actScale = gemm2_input_scale;
+        gemm2Data.outputScale = args.output2_scales_scalar;
+        gemm2Data.numNonExitingCtas = workspace.num_non_exiting_ctas;
+        gemm2Data.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
+        gemm2Data.ctaIdxXyToMnLimit = workspace.cta_idx_xy_to_mn_limit;
+        gemm2Data.output = workspace.gemm2_output;
+        gemm2Data.hiddenSize = gemm2HiddenSize;
+        gemm2Data.numLocalExperts = totalLocalExperts;
+        gemm2Data.maxNumCtas = gemm2MaxNumCtas;
+        gemm2Data.usePdl = tensorrt_llm::common::getEnvEnablePDL();
+        // The maximum shared-memory carveout preferred. Without a preference the driver can run the 141 KB CTAs in the
+        // 164 KB configuration. The finalize kernel that gemm2K128 lets launch early (for example an all-reduce hop
+        // with the finalize fused) then shares those SMs and keeps them in that configuration until it ends, so the
+        // next layer's large-shared-memory CTAs that land there start only after it. A scheduling hint only: the
+        // outputs are unchanged.
+        gemm2Data.sharedMemCarveout = static_cast<int32_t>(cudaSharedmemCarveoutMaxShared);
+        moe::dev::gemm2K128::run(gemm2Data, stream);
+    }
+    else
+    {
+        mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
+            args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale,
+            totalExpertsPerToken, gemm2HiddenSize, args.intermediate_size, totalLocalExperts, args.num_tokens,
+            workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+            workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
+            args.valid_hidden_size.value_or(args.hidden_size),
+            args.valid_intermediate_size.value_or(args.intermediate_size));
+    }
 
     // Run finalize
     if (args.do_finalize)

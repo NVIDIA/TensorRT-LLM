@@ -461,7 +461,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 prefer_gemm2_k128: bool = False):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -474,6 +475,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
         self.act_type = act_type
+        self.prefer_gemm2_k128 = prefer_gemm2_k128
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -483,8 +485,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+        key = (self.top_k, self.intermediate_size, self.local_num_experts,
+               self.act_type)
+        # FC2 on gemm2K128 times the tile-8 tactics differently.
+        return key + ("gemm2_k128", ) if self.prefer_gemm2_k128 else key
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -522,7 +526,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.routed_scaling_factor, self.routing_method_type,
             self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
             hidden_states_ready_event, router_hidden_states, router_weight,
-            router_workspace)
+            router_workspace, self.prefer_gemm2_k128)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -690,7 +694,8 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                router_hidden_states: Optional[
                                    torch.Tensor] = None,
                                router_weight: Optional[torch.Tensor] = None,
-                               router_workspace: Optional[torch.Tensor] = None
+                               router_workspace: Optional[torch.Tensor] = None,
+                               prefer_gemm2_k128: bool = False
                                ) -> List[torch.Tensor]:
     """hidden_states_ready_event: raw cudaEvent_t (torch.cuda.Event.cuda_event)
     recorded on another stream once hidden_states and hidden_states_scale are
@@ -703,7 +708,12 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     there and routing_logits only gives their shape (it is not read or
     written). router_workspace: int32 [FUSED_ROUTER_WORKSPACE_WORDS], see
     make_fused_router_workspace; the kernel uses and restores it. Profiling
-    runs of the autotuner route from routing_logits as usual."""
+    runs of the autotuner route from routing_logits as usual.
+
+    prefer_gemm2_k128: FC2 runs on the persistent K = 128 kernel where it
+    covers the shape (NVFP4, tile N 8, intermediate size 128, no bias, enough
+    SMs), with the output rows of the Gemm2 cubin, bitwise; elsewhere the cubin
+    runs."""
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -720,6 +730,7 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
+        prefer_gemm2_k128=prefer_gemm2_k128,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -873,7 +884,8 @@ def _(routing_logits,
       hidden_states_ready_event: Optional[int] = None,
       router_hidden_states: Optional[torch.Tensor] = None,
       router_weight: Optional[torch.Tensor] = None,
-      router_workspace: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+      router_workspace: Optional[torch.Tensor] = None,
+      prefer_gemm2_k128: bool = False) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

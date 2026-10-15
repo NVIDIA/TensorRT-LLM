@@ -366,6 +366,10 @@ struct MoERunnerArgs
 
     // finalize
     bool do_finalize{true};
+
+    // Run gemm2 on moe::dev::gemm2K128 instead of the Gemm2 cubin where it covers the shape (see Runner::run); the
+    // output rows are the cubin's, bitwise.
+    bool prefer_gemm2_k128{false};
 };
 
 struct MoEWorkspace
@@ -455,6 +459,11 @@ private:
     // Kept so setOpsData can tell the activation launcher how much per-expert
     // tile padding the permuted row space carries.
     int32_t mTileTokensDim;
+    // Kept to tell whether gemm2K128 covers this runner's Gemm2 (see run()).
+    batchedGemm::trtllm::gen::Dtype mDtypeAct;
+    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
+    bool mUseDeepSeekFp8;
+    bool mUseFineGrained;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately
