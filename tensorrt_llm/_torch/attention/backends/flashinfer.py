@@ -2856,7 +2856,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         from .mixed_precision_kv_view import MixedPrecisionKVView
 
-        staged = MixedPrecisionKVView.create(metadata, self.layer_idx, q.dtype)
+        staged = MixedPrecisionKVView.create(
+            metadata,
+            self.layer_idx,
+            q.dtype,
+            history_dequant_scale=forward_args.kv_scale_quant_orig)
         if staged is not None:
             if self.is_mla_enable:
                 raise NotImplementedError(

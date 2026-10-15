@@ -6793,8 +6793,12 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             raise NotImplementedError("Mixed precision currently requires single-beam dense K/V")
         if config.enable_swa_scratch_reuse:
             raise NotImplementedError("Mixed-precision staging requires ordinary SWA page tables")
-        if get_size_in_bytes(16, self.high_dtype) < get_size_in_bytes(16, self.dtype):
-            raise ValueError("The high pool cannot have a narrower dtype than the history pool")
+        if self.dtype != DataType.NVFP4 or self.high_dtype not in (
+            DataType.HALF,
+            DataType.BF16,
+            DataType.FP8,
+        ):
+            raise ValueError("Mixed precision requires NVFP4 history and FP16/BF16/FP8 high KV")
         layers = list(config.layers)
         next_id = max(int(layer.layer_id) for layer in layers) + 1
         largest_page = 0
@@ -6807,6 +6811,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             ]
             if not kv_buffers or any(buffer.is_sparse or not buffer.size for buffer in kv_buffers):
                 continue
+            if len(kv_buffers) != 2:
+                raise NotImplementedError("Mixed-precision conversion currently requires dense K/V")
             if layer.reuse_policy != AttentionReusePolicy.REQUIRED:
                 raise ValueError("Mixed-precision history must be REQUIRED for reuse")
             local_layer = int(layer.layer_id)
@@ -6841,7 +6847,9 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         # One reusable layer-sized BF16/FP16 view, including all reused tokens.
         pages = self.max_batch_size * math.ceil(self.max_seq_len / self.tokens_per_block)
         self._staging_bytes = pages * largest_page * 2
-        reserve = self._staging_bytes + largest_page * 12
+        # Reserve temporary gather/dequantize/quantize buffers as well as the
+        # persistent paged view. All are bounded by one layer of this batch.
+        reserve = 4 * self._staging_bytes + largest_page * 12
         tiers = []
         for tier in config.cache_tiers:
             if isinstance(tier, GpuCacheTierConfig):
@@ -6853,11 +6861,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
 
     def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
         if layer_id in self.high_layers.values():
-            return (
-                Role.KEY_BLOCK_SCALE
-                if self.high_dtype == DataType.NVFP4 and role_a == Role.KEY
-                else None
-            )
+            return None
         return super()._get_block_scale_role(role_a, layer_id)
 
     def get_layer_bytes_per_token(
@@ -6877,25 +6881,54 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         local = self.layer_offsets[layer_idx]
         high_id = self.high_layers[local]
         address = self.impl.get_mem_pool_base_address(high_id, Role.KEY, PageIndexMode.SHARED)
-        packed = self.high_dtype == DataType.NVFP4
         shape = [
             self.impl.get_page_index_upper_bound(high_id, Role.KEY) // self.kv_factor,
             self.kv_factor,
             self.tokens_per_block,
             self.num_kv_heads_per_layer[local],
-            self.head_dim_per_layer[local] // (2 if packed else 1),
+            self.head_dim_per_layer[local],
         ]
         if kv_layout == "HND":
             shape[2], shape[3] = shape[3], shape[2]
         elif kv_layout != "NHD":
             raise ValueError(f"Unsupported KV layout: {kv_layout}")
-        view = convert_to_torch_tensor(
-            TensorWrapper(address, torch.int8 if packed else self.high_dtype, shape)
-        )
+        view = convert_to_torch_tensor(TensorWrapper(address, self.high_dtype, shape))
         indices = self._get_batch_cache_indices_by_pool_id(
             request_ids,
             pool_id=int(self.impl.get_layer_group_id(high_id)),
             index_scale=int(self.impl.get_page_index_converter(high_id, Role.KEY).scale),
+        )
+        return view, indices
+
+    def get_history_block_scales(
+        self, layer_idx: int, request_ids: list[int], kv_layout: str
+    ) -> tuple[torch.Tensor, list[list[int]]]:
+        """Return linear NVFP4 scales using their own native page-index mapping."""
+        local = self.layer_offsets[layer_idx]
+        role = Role.KEY_BLOCK_SCALE
+        address = self.impl.get_mem_pool_base_address(local, role, PageIndexMode.SHARED)
+        value_address = self.impl.get_mem_pool_base_address(
+            local, Role.VALUE_BLOCK_SCALE, PageIndexMode.SHARED
+        )
+        stride = self.impl.get_page_stride(local, role)
+        if address + stride != value_address:
+            raise ValueError("Mixed-precision KV requires adjacent K/V block-scale pages")
+        shape = [
+            self.impl.get_page_index_upper_bound(local, role) // self.kv_factor,
+            self.kv_factor,
+            self.tokens_per_block,
+            self.num_kv_heads_per_layer[local],
+            self.head_dim_per_layer[local] // 16,
+        ]
+        if kv_layout == "HND":
+            shape[2], shape[3] = shape[3], shape[2]
+        elif kv_layout != "NHD":
+            raise ValueError(f"Unsupported KV layout: {kv_layout}")
+        view = convert_to_torch_tensor(TensorWrapper(address, torch.uint8, shape))
+        indices = self._get_batch_cache_indices_by_pool_id(
+            request_ids,
+            pool_id=int(self.impl.get_layer_group_id(local)),
+            index_scale=int(self.impl.get_page_index_converter(local, role).scale),
         )
         return view, indices
 

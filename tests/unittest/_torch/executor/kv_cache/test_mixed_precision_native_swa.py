@@ -26,11 +26,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 def manager(request):
     policy = request.param if isinstance(request.param, str) else "per_request"
     history_dtype, high_dtype = (
-        (DataType.FP8, DataType.BF16) if isinstance(request.param, str) else request.param
+        (DataType.NVFP4, DataType.BF16) if isinstance(request.param, str) else request.param
     )
     manager = MixedPrecisionKVCacheManager(
         KvCacheConfig(
-            max_tokens=16384,
+            max_tokens=65536,
             host_cache_size=0,
             enable_block_reuse=True,
             pool_ratio=[0.75, 0.25],
@@ -58,10 +58,7 @@ def manager(request):
     [
         (DataType.NVFP4, DataType.FP8),
         (DataType.NVFP4, DataType.BF16),
-        (DataType.NVFP4, DataType.NVFP4),
-        (DataType.FP8, DataType.HALF),
-        (DataType.HALF, DataType.BF16),
-        (DataType.BF16, DataType.FLOAT),
+        (DataType.NVFP4, DataType.HALF),
     ],
     indirect=True,
 )
