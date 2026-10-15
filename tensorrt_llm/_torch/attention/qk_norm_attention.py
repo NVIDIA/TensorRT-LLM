@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
@@ -360,23 +360,10 @@ class QKNormRoPEAttention(Attention):
         The apply_rope method is called in the forward method of the Attention class.
         The apply_rope method is overridden in this class to apply QK norm and RoPE to the input tensor.
         """
-        # The native fused QK norm and RoPE kernel only supports BF16.
-        if self.fuse_qk_norm_rope and q.dtype != torch.bfloat16:
-            params = self.pos_embd_params
-            if (params is None or params.rope is None
-                    or params.type not in (PositionEmbeddingType.rope_gptj,
-                                           PositionEmbeddingType.rope_gpt_neox)
-                    or params.rope.scale_type != RotaryScalingType.none
-                    or params.rope.scale != 1.0
-                    or params.mrope_section is not None
-                    or params.mrope_interleaved):
-                raise NotImplementedError(
-                    "Automatic QK norm and RoPE fallback for non-BF16 inputs "
-                    "only supports unscaled ordinary RoPE.")
-        if not self.fuse_qk_norm_rope or q.dtype != torch.bfloat16:
+        # Apply QK norm before RoPE.
+        if not self.fuse_qk_norm_rope:
             q, k, v = self.split_qkv(q, k, v)
-            if self.is_qk_norm:
-                q, k = self.apply_qk_norm(q, k)
+            q, k = self.apply_qk_norm(q, k)
             if not self.skip_rope:
                 return super().apply_rope(q, k, v, position_ids)
             else:
