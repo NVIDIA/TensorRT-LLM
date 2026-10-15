@@ -1587,8 +1587,11 @@ def test_sparse_decode_preserves_bf16_dispatch(monkeypatch, dtype: torch.dtype) 
         prefix + ".fmha.msa_prefill._aligned_nvfp4_dequant_scales",
         lambda *_: (torch.ones(1), torch.ones(1)),
     )
-    manager = Mock(spec_set=["is_nvfp4_layer", "get_block_scale_buffers"])
+    manager = Mock(
+        spec_set=["is_nvfp4_layer", "nvfp4_scale_pool_aligned", "get_block_scale_buffers"]
+    )
     manager.is_nvfp4_layer.return_value = True
+    manager.nvfp4_scale_pool_aligned.return_value = True
     manager.get_block_scale_buffers.return_value = torch.ones(1, 2)
     attn = Mock(spec_set=["head_dim", "num_heads", "layer_idx", "q_scaling"])
     attn.head_dim, attn.num_heads, attn.layer_idx, attn.q_scaling = 128, 16, 0, 1.0
