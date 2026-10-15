@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
+from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import MixedPrecisionKVRows
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -284,10 +285,24 @@ class Compressor(nn.Module):
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
         total_tokens = kv_comp.shape[0]
 
-        # Allocate optional returned postprocess buffers for indexer paths.
+        # The same postprocess output supplies the indexer or high-precision pool.
         kv_out = None
         quant_output = None
         scale_output = None
+        manager = metadata.kv_cache_manager
+        high_rows = (
+            MixedPrecisionKVRows.create(
+                metadata,
+                int(manager._layer_attn_to_layer_id[self.layer_idx, compress_type]),
+                compress_type.role,
+            )
+            if not self.is_indexer
+            else None
+        )
+        if high_rows is not None:
+            if self.kv_cache_dtype != KVCacheDtype.NVFP4_BLOCKWISE:
+                raise ValueError("Mixed-precision CSA requires the native NVFP4 compressor writer")
+            kv_out = torch.empty_like(kv_comp)
         if self.is_indexer:
             if self.kv_cache_dtype == KVCacheDtype.NONE:
                 kv_out = torch.empty_like(kv_comp)
@@ -351,6 +366,17 @@ class Compressor(nn.Module):
             quant_output,
             scale_output,
         )
+
+        if high_rows is not None:
+            row_indices = torch.arange(total_tokens, device=kv_comp.device)
+            requests = torch.searchsorted(cu_new_comp_kv[1 : bsz + 1], row_indices, right=True)
+            valid_requests = requests < bsz
+            requests = requests.clamp_max(bsz - 1)
+            local_rows = row_indices - cu_new_comp_kv[requests]
+            valid = compressed_mask & valid_requests & (local_rows < num_comp_tokens[requests])
+            high_rows.store(kv_out, requests, start_pos[requests] + local_rows, valid)
+            # Keep the compressor's ordinary return contract unchanged.
+            kv_out = None
 
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:

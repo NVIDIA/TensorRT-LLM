@@ -1230,6 +1230,7 @@ def _spec_recompute_claim_limit(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    _uses_native_mixed_precision_rows = False
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.

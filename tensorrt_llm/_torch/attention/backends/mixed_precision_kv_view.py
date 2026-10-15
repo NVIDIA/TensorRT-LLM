@@ -14,6 +14,7 @@ import torch
 
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, DataRole
 
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from ..kv_cache_conversion import dequantize_nvfp4_kv, encode_high_precision_kv, quantize_nvfp4_kv
@@ -47,6 +48,8 @@ class MixedPrecisionKVView:
     ) -> "MixedPrecisionKVView | None":
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
+            return None
+        if manager.kv_factor == 1 and manager._uses_native_mixed_precision_rows:
             return None
         if manager.layer_offsets[layer_idx] not in manager.high_layers:
             return None
@@ -214,3 +217,83 @@ class MixedPrecisionKVView:
             rows = locations.high_rows
             high_values = encode_high_precision_kv(values[rows], self.high.dtype)
             self._scatter(self.high, locations.high[rows], locations.offset[rows], high_values)
+
+
+class MixedPrecisionKVRows:
+    """Copy fresh model-native rows to SWA and select them after the native gather."""
+
+    @classmethod
+    def create(
+        cls, metadata: "AttentionMetadata", layer_id: int, role: DataRole
+    ) -> "MixedPrecisionKVRows | None":
+        manager = metadata.kv_cache_manager
+        if (
+            not isinstance(manager, MixedPrecisionKVCacheManager)
+            or layer_id not in manager.high_layers
+        ):
+            return None
+        if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError("Mixed-precision row selection requires eager execution")
+        return cls(manager, layer_id, role, metadata.request_ids)
+
+    def __init__(
+        self,
+        manager: MixedPrecisionKVCacheManager,
+        layer_id: int,
+        role: DataRole,
+        request_ids: list[int],
+    ) -> None:
+        self.pool, tables = manager.get_high_precision_rows(layer_id, role, request_ids)
+        self.rows_per_block = manager.high_layouts[layer_id].rows_per_block
+        width = max((len(row) for row in tables), default=0)
+        table = torch.full((max(1, len(tables)), max(1, width)), BAD_PAGE_INDEX, dtype=torch.int64)
+        for index, row in enumerate(tables):
+            table[index, : len(row)] = torch.tensor(row, dtype=torch.int64)
+        self.table = table.to(self.pool.device)
+
+    def _locations(
+        self, requests: torch.Tensor, rows: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        requests, rows = torch.broadcast_tensors(requests, rows)
+        requests, rows = requests.reshape(-1).long(), rows.reshape(-1).long()
+        blocks = rows // self.rows_per_block
+        valid = (requests >= 0) & (requests < self.table.shape[0]) & (rows >= 0)
+        valid &= blocks < self.table.shape[1]
+        pages = self.table[
+            requests.clamp(0, self.table.shape[0] - 1), blocks.clamp(0, self.table.shape[1] - 1)
+        ]
+        valid &= pages >= 0
+        return pages, rows % self.rows_per_block, valid
+
+    def store(
+        self,
+        values: torch.Tensor,
+        requests: torch.Tensor,
+        rows: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> None:
+        """Store only valid new writes, before any NVFP4 round trip."""
+        pages, offsets, selected = self._locations(requests, rows)
+        selected &= valid.reshape(-1)
+        source = values.reshape(-1, *self.pool.shape[2:])[selected]
+        encoded = encode_high_precision_kv(source, self.pool.dtype)
+        self.pool.view(torch.uint8)[pages[selected], offsets[selected]] = encoded.view(torch.uint8)
+
+    def overlay(
+        self,
+        output: torch.Tensor,
+        output_rows: torch.Tensor,
+        requests: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        """Replace gathered low-precision rows only where native SWA retains high KV."""
+        pages, offsets, selected = self._locations(requests, rows)
+        destinations = output_rows.reshape(-1).long()
+        selected &= destinations >= 0
+        values = self.pool.view(torch.uint8)[pages[selected], offsets[selected]].view(
+            self.pool.dtype
+        )
+        values = encode_high_precision_kv(values, output.dtype)
+        output.view(-1, *self.pool.shape[2:]).view(torch.uint8)[destinations[selected]] = (
+            values.view(torch.uint8)
+        )

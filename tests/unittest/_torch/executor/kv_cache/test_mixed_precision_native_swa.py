@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import MixedPrecisionKVRows
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     MixedPrecisionKVCacheManager,
@@ -189,8 +190,8 @@ def test_short_sequence_uses_high_values_for_every_page(manager):
 
 @pytest.mark.parametrize("family", ("dsa", "deepseek_v4"))
 @pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
-def test_model_manager_layouts_keep_native_nvfp4_and_auxiliary_buffers(family, high_dtype):
-    """Use the real model managers; this tests allocation, not model inference."""
+def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
+    """Exercise native allocation and row selection, not full model inference."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
         DeepseekV4CacheManager,
     )
@@ -276,6 +277,7 @@ def test_model_manager_layouts_keep_native_nvfp4_and_auxiliary_buffers(family, h
         cache = manager.impl.create_kv_cache(None, [])
         assert cache.resume(torch.cuda.current_stream().cuda_stream) and cache.resize(640)
         manager.kv_cache_map[0] = cache
+        written = []
         for layer_id, spec in manager.high_layouts.items():
             if family == "dsa":
                 assert spec.roles == (Role.KEY,)
@@ -297,6 +299,32 @@ def test_model_manager_layouts_keep_native_nvfp4_and_auxiliary_buffers(family, h
                 assert pool.shape[1:] == (spec.rows_per_block, spec.num_heads, spec.head_dim)
                 assert len(tables[0]) == 5
                 assert all(0 <= index < pool.shape[0] for index in tables[0])
+                count = 5 * spec.rows_per_block
+                rows = torch.arange(count + 2, device="cuda")
+                rows[-2:] = -1  # Padded compressor/index rows must never access a page.
+                values = (
+                    (torch.arange(rows.numel() * spec.head_dim, device="cuda") % 31 / 4)
+                    .to(torch.bfloat16)
+                    .view(-1, 1, spec.head_dim)
+                )
+                selected = MixedPrecisionKVRows(manager, layer_id, buffer.role, [0])
+                selected.store(values, torch.zeros_like(rows), rows, rows >= 0)
+                written.append((layer_id, buffer.role, rows, values))
+
+        cache.commit(list(range(640)))
+        cache.suspend()
+        assert cache.resume(torch.cuda.current_stream().cuda_stream, is_decoding=True)
+        for layer_id, role, rows, values in written:
+            selected = MixedPrecisionKVRows(manager, layer_id, role, [0])
+            output = torch.full_like(values, -1)
+            selected.overlay(
+                output, torch.arange(len(rows), device="cuda"), torch.zeros_like(rows), rows
+            )
+            block_rows = manager.high_layouts[layer_id].rows_per_block
+            retained = (rows >= 0) & ((rows < block_rows) | (rows >= 4 * block_rows))
+            expected = torch.full_like(values, -1)
+            expected[retained] = values[retained].to(selected.pool.dtype).to(values.dtype)
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
     finally:
         manager.kv_cache_map.pop(0, None)
         if cache is not None:
