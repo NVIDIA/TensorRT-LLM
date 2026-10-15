@@ -2074,6 +2074,154 @@ def test_added_module_function_with_safe_definition_expressions_is_resolved() ->
     assert analysis.new_declaration_bindings == {"helper"}
 
 
+def _added_dataclass_change(
+    declaration: str, *, prefix: str = "from dataclasses import dataclass\n\n"
+) -> tuple[str, str]:
+    helper = "def helper():\n    return Budget(2).doubled\n\n"
+    caller = "def caller():\n    return helper()\n"
+    before = prefix + "def helper():\n    return None\n\n" + caller
+    source = prefix + declaration + "\n" + helper + caller
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    return source, diff
+
+
+_ADDED_DATACLASS = (
+    "@dataclass(frozen=True)\n"
+    "class Budget:\n"
+    '    "A value produced by helper."\n'
+    "    amount: int\n\n"
+    "    @property\n"
+    "    def doubled(self) -> int:\n"
+    "        return self.amount * 2\n"
+)
+
+
+@pytest.mark.parametrize("alias", ("dataclass", "record"))
+@pytest.mark.parametrize("postponed", (False, True))
+def test_added_dataclass_resolves_binding_consumers(alias: str, postponed: bool) -> None:
+    prefix = "from __future__ import annotations\n" if postponed else ""
+    prefix += f"from dataclasses import dataclass as {alias}\n\n"
+    source, diff = _added_dataclass_change(
+        _ADDED_DATACLASS.replace("@dataclass", f"@{alias}"), prefix=prefix
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"Budget"}
+    assert analysis.new_declaration_bindings == analysis.new_class_bindings == {"Budget"}
+    assert analysis.binding_consumers == {"helper"}
+    assert analysis.callers == {"helper": {"caller"}}
+
+
+@pytest.mark.parametrize("decorator", ("@dataclass", "@dataclass()", "@dataclass(frozen=False)"))
+def test_added_dataclass_accepts_immutable_defaults(decorator: str) -> None:
+    source, diff = _added_dataclass_change(
+        f"{decorator}\nclass Budget:\n    amount: int = 1\n    offsets: tuple = (1, -2)\n"
+    )
+
+    assert not _analyze(source, diff).limitation
+
+
+def test_added_dataclass_annotation_contributes_its_function_consumer() -> None:
+    prefix = "from dataclasses import dataclass\n\n"
+    before = prefix + "def caller():\n    return None\n"
+    source = (
+        prefix + _ADDED_DATACLASS + "\n"
+        "def helper() -> Budget:\n    return Budget(2)\n\n"
+        "def caller():\n    return helper()\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper", "caller"}
+
+
+@pytest.mark.parametrize("consumer", ("INSTANCE = Budget(2)\n", "register(Budget)\n"))
+def test_added_dataclass_import_time_consumers_still_decline(consumer: str) -> None:
+    source, diff = _added_dataclass_change(_ADDED_DATACLASS + "\n" + consumer)
+
+    assert _analyze(source, diff).limitation
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "@custom\nclass Budget:\n    amount: int\n",
+        "@dataclass(slots=True)\nclass Budget:\n    amount: int\n",
+        "@dataclass(frozen=setting)\nclass Budget:\n    amount: int\n",
+        "@dataclass(factory())\nclass Budget:\n    amount: int\n",
+        "@dataclass\nclass Budget(Base):\n    amount: int\n",
+        "@dataclass\nclass Budget(metaclass=Meta):\n    amount: int\n",
+        "@dataclass\nclass Budget:\n    amount: Custom\n",
+        "@dataclass\nclass Budget:\n    amount: int = factory()\n",
+        "@dataclass\nclass Budget:\n    amount: list = []\n",
+        "@dataclass\nclass Budget:\n    amount: int = 1\n    required: int\n",
+        "@dataclass\nclass Budget:\n    amount: int\n    amount: int\n",
+        "@dataclass\nclass Budget:\n    amount: int\n    register()\n",
+        "@dataclass\nclass Budget:\n    amount: int\n    class Nested:\n        pass\n",
+        "@dataclass\nclass Budget:\n    amount: int\n    def method(self, value=factory()):\n        pass\n",
+        "@dataclass\nclass Budget:\n    amount: int\n    @custom\n    def method(self):\n        pass\n",
+        "@dataclass\nclass Budget:\n    amount: int\n    def __init_subclass__(cls):\n        register(cls)\n",
+    ),
+)
+def test_added_dataclass_preserves_unsupported_declaration_effects(declaration: str) -> None:
+    source, diff = _added_dataclass_change(declaration)
+
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "from project import dataclass\n\n",
+        "from dataclasses import dataclass\ndataclass = custom\n\n",
+        "from dataclasses import dataclass, field as dataclass\n\n",
+        "from dataclasses import dataclass\nfrom project import *\n\n",
+        "from dataclasses import dataclass\nint = Custom\n\n",
+        "from dataclasses import dataclass\nproperty = custom\n\n",
+        "from dataclasses import dataclass\nBudget = None\n\n",
+        "from dataclasses import dataclass\ndef discover(name):\n    return globals()[name]\n\n",
+        "from dataclasses import dataclass\ndef discover(module):\n    return vars(module)\n\n",
+        "from dataclasses import dataclass\nnamespace = globals\n\n",
+        "from dataclasses import dataclass\nfrom builtins import globals as namespace\n\n",
+        "from dataclasses import dataclass\ndef discover(fn):\n    return fn.__globals__\n\n",
+    ),
+)
+def test_added_dataclass_preserves_shadowing_and_namespace_discovery(prefix: str) -> None:
+    source, diff = _added_dataclass_change(_ADDED_DATACLASS, prefix=prefix)
+
+    assert _analyze(source, diff).limitation
+
+
+def test_added_dataclass_cannot_absorb_an_effectful_deletion() -> None:
+    prefix = "from dataclasses import dataclass\n\n"
+    before = prefix + "register()\n"
+    source = prefix + _ADDED_DATACLASS
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation
+
+
+def test_added_dataclass_requires_an_existing_stdlib_import() -> None:
+    source = "from dataclasses import dataclass\n\n" + _ADDED_DATACLASS
+    diff = "".join(difflib.unified_diff([], source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation
+
+
+def test_added_dataclass_does_not_hide_decorated_method_signature_changes() -> None:
+    prefix = "from dataclasses import dataclass\n\n"
+    kernel = "class Kernel:\n    @jit\n    def run(self, value):\n        return value\n"
+    before = prefix + kernel
+    source = prefix + _ADDED_DATACLASS + kernel.replace("value):", "value, option=0):")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
 def test_added_method_can_use_earlier_module_class_annotation() -> None:
     source = (
         "class Budget:\n"
@@ -2501,6 +2649,52 @@ def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
     assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
     assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+@pytest.mark.parametrize("covered_caller", (True, False))
+def test_selector_bounds_new_dataclass_methods_by_existing_binding_consumers(
+    covered_caller: bool,
+) -> None:
+    source, diff = _added_dataclass_change(_ADDED_DATACLASS)
+    checked_bindings: set[str] = set()
+
+    def external(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.update(names)
+        return set()
+
+    db = _FakeDB()
+    if not covered_caller:
+        db.rows["caller"] = set()
+    selector = CoverageSelector(
+        db, REPO_ROOT, read_source=lambda _path: source, external_references=external
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert result.ok, result.reason
+    assert "Budget" in checked_bindings
+    assert result.impacted == {
+        "A10-PyTorch": {"test_caller"} | (set() if covered_caller else {"test_unrelated"})
+    }
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"} if covered_caller else set()}
+    assert result.caller_bounded_funcs == (
+        ["tensorrt_llm/example.py::helper"] if covered_caller else []
+    )
+
+
+def test_selector_preserves_external_references_to_new_dataclasses() -> None:
+    source, diff = _added_dataclass_change(_ADDED_DATACLASS)
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"Budget"},
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert not result.ok
+    assert "external binding" in result.reason
 
 
 @pytest.mark.parametrize("reference_api", ("names", "paths"))
