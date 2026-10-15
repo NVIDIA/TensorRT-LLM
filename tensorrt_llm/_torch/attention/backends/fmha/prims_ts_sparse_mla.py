@@ -33,8 +33,9 @@ output in the group-major ``[G, T, (H/G)*512]`` layout with FP32 scales
 ``o_a_proj`` BMM consumes the attention output without a separate quant
 kernel.
 
-The library is opt-in (``TLLM_FMHA_LIBS=+prims_ts_sparse_mla``) and leaves
-the context phase to the fallback library.
+The library is enabled by default on SM100/SM103 and precedes the TRTLLM-Gen
+fallback for the DeepSeek-V4 generation phase; ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla``
+restores the previous library. The context phase stays on the fallback library.
 """
 
 from __future__ import annotations
@@ -193,48 +194,45 @@ class PrimsTSSparseMlaFmha(Fmha):
     # ------------------------------------------------------------------ availability
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        sm = get_sm_version()
-        if sm not in (100, 103):
-            logger.debug(
-                f"PrimTS sparse MLA FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
-            )
-            return False
         if not attn.is_mla_enable:
             return False
         if getattr(getattr(attn, "sparse_params", None), "algorithm", None) != "deepseek_v4":
             return False
+        reason = cls._unavailable_reason(attn)
+        if reason is not None:
+            # A DeepSeek-V4 layer that does not get this library falls back to
+            # TRTLLM-Gen silently otherwise; say so once per layer at info.
+            logger.info(
+                f"PrimTS sparse MLA FMHA is unavailable for layer "
+                f"{getattr(attn, 'layer_idx', None)}: {reason}"
+            )
+            return False
+        return True
+
+    @classmethod
+    def _unavailable_reason(cls, attn: "TrtllmAttention") -> Optional[str]:
+        sm = get_sm_version()
+        if sm not in (100, 103):
+            return f"requires SM100 or SM103, got SM{sm}."
         if getattr(attn, "use_fp8_ds_mla", False) or getattr(attn, "kv_cache_dtype", "auto") == (
             "fp8_ds_mla"
         ):
-            logger.debug(
-                "PrimTS sparse MLA FMHA is unavailable: the footer-scale fp8_ds_mla "
-                "cache layout is not a native E4M3 pool."
-            )
-            return False
+            return "the footer-scale fp8_ds_mla cache layout is not a native E4M3 pool."
         if getattr(attn, "_uses_nvfp4_compress", False):
-            logger.debug(
-                "PrimTS sparse MLA FMHA is unavailable: NVFP4 compressed pools are not supported."
-            )
-            return False
+            return "NVFP4 compressed pools are not supported."
         if (
             int(attn.kv_lora_rank) + int(attn.qk_rope_head_dim) != _LATENT_DIM
             or int(attn.head_dim) != _LATENT_DIM
         ):
-            logger.debug(
-                "PrimTS sparse MLA FMHA is unavailable: requires a 512-wide latent "
-                f"(kv_lora_rank + qk_rope_head_dim), got {attn.kv_lora_rank} + "
-                f"{attn.qk_rope_head_dim} with head_dim {attn.head_dim}."
+            return (
+                "requires a 512-wide latent (kv_lora_rank + qk_rope_head_dim), got "
+                f"{attn.kv_lora_rank} + {attn.qk_rope_head_dim} with head_dim {attn.head_dim}."
             )
-            return False
         if int(attn.qk_rope_head_dim) != _ROPE_DIM:
-            return False
+            return f"requires a {_ROPE_DIM}-wide RoPE segment, got {attn.qk_rope_head_dim}."
         if not 1 <= int(attn.num_heads) <= cls.MAX_HEADS:
-            return False
-        reason = get_prims_ts_toolchain_unsupported_reason()
-        if reason is not None:
-            logger.debug(f"PrimTS sparse MLA FMHA is unavailable: {reason}")
-            return False
-        return True
+            return f"supports 1..{cls.MAX_HEADS} heads, got {attn.num_heads}."
+        return get_prims_ts_toolchain_unsupported_reason()
 
     # ------------------------------------------------------------------ support
     def _is_supported(

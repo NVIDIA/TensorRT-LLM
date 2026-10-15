@@ -35,11 +35,21 @@ def _skip_unless_toolchain() -> None:
         pytest.skip(reason)
 
 
-def test_registry_entry_is_opt_in() -> None:
+def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
+    """The library ships enabled and ahead of the TRTLLM-Gen fallback.
+
+    Its ``is_available`` restricts it to DeepSeek-V4 on SM100/SM103, so being
+    in the default set changes nothing for other models or architectures.
+    """
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     assert registry.FMHA_LIBS[LIB_NAME] is PrimsTSSparseMlaFmha
-    assert LIB_NAME not in registry.DEFAULT_FMHA_LIBS
+    assert LIB_NAME in registry.DEFAULT_FMHA_LIBS
     names = tuple(registry.FMHA_LIBS)
+    assert names.index(LIB_NAME) < names.index("flashinfer_trtllm_gen")
     assert names.index(LIB_NAME) < names.index("fallback")
+    assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes()
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")
+    assert PrimsTSSparseMlaFmha not in registry.get_enabled_fmha_lib_classes()
 
 
 def _rope_table(max_positions: int, device: torch.device) -> torch.Tensor:
@@ -255,9 +265,13 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
     ],
 )
 def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_dtype):
-    """Run the DeepSeek-V4 module test with the PrimTS library serving generation."""
+    """Run the DeepSeek-V4 module test on the default library set.
+
+    No ``TLLM_FMHA_LIBS`` override: the PrimTS library is in the default set and
+    must win the generation phase on its own.
+    """
     _skip_unless_toolchain()
-    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     calls = []
     original_forward = PrimsTSSparseMlaFmha.forward
 
@@ -268,3 +282,139 @@ def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_d
     monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", counting_forward)
     _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
     assert calls, "the PrimTS sparse MLA FMHA did not serve the generation phase"
+
+
+def _dequant_fused(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Dequantize a fused DSv4 epilogue buffer.
+
+    ``values`` is ``[G, T, C]`` E4M3 and ``scales`` is ``[G, C // 128, pad4(T)]``
+    FP32, exactly as ``_create_dsv4_epilogue_buffers`` allocates them.
+    """
+    groups, rows, channels = values.shape
+    sc = scales[..., :rows].permute(0, 2, 1)  # [G, T, blocks]
+    blocks = values.float().view(groups, rows, channels // BLOCK, BLOCK)
+    return (blocks * sc[..., None]).flatten(-2), sc
+
+
+def _assert_fused_close(got, got_sc, ref, ref_sc, channels, device):
+    """Same tolerance as the kernel-level fused test: two relative E4M3 ulps plus
+    half a quantization step, two steps on the RoPE channels D[448:512]."""
+    torch.testing.assert_close(got_sc, ref_sc, rtol=2e-2, atol=1e-6)
+    block_scales = ref_sc.repeat_interleave(BLOCK, dim=-1)
+    is_rope = torch.zeros(channels, dtype=torch.bool, device=device)
+    is_rope.view(-1, LATENT)[:, LATENT - ROPE :] = True
+    step_allowance = torch.where(is_rope, 2.0, 0.5) * block_scales
+    diff = (got - ref).abs()
+    ulp = ref.abs() / 8.0
+    assert (diff <= 2.0 * ulp + step_allowance + 1e-6).all(), (
+        f"max diff {diff.max().item():.4g} vs allowance "
+        f"{(2.0 * ulp + step_allowance).max().item():.4g}"
+    )
+    assert diff.mean().item() <= 0.02 * ref.abs().mean().item() + 1e-6
+
+
+@pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("batch_name", ["small_decode", "medium_decode", "single_decode"])
+def test_forward_sparse_mla_unified_fused_epilogue(monkeypatch, batch_name, kv_cache_dtype):
+    """Module-level coverage of the fused DSv4 epilogue (production ADP path).
+
+    ``prepare_sparse_attn_outputs`` only hands out the 3D fused buffer under
+    attention-DP with 128 heads, an FP8 cache and an FP8 ``o_a_proj``, which the
+    module test harness does not configure. The generation entry point
+    ``forward_generation_sparse_attn`` takes ``enable_dsv4_epilogue_fusion``
+    directly, so wrap the harness's call to it and, on the same prepared cache,
+    metadata and inputs, additionally run the fused mode on the default library
+    set: PrimTS must serve it with ``forward_args.enable_dsv4_epilogue_fusion``
+    set, and its fused output must match the unfused BF16 output pushed through
+    ``trtllm.fused_inv_rope_fp8_quant_vllm_port`` (the path the module takes when
+    fusion is off). The harness's own reference check still runs on the unfused
+    call.
+
+    The TRTLLM-Gen fallback is not run in fused mode here: the module only
+    enables the fused epilogue for it at 128 heads, and at the harness's 64
+    heads its C++ op aborts the process rather than raising.
+    """
+    _skip_unless_toolchain()
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+
+    from .. import test_sparse_mla_forward as harness
+
+    original_gen = harness.forward_generation_deepseek_v4_mla
+    original_forward = PrimsTSSparseMlaFmha.forward
+    seen_fused_flags: list[bool] = []
+    results: dict[str, object] = {}
+
+    def spy_forward(self, q, k, v, metadata, forward_args):
+        seen_fused_flags.append(bool(forward_args.enable_dsv4_epilogue_fusion))
+        return original_forward(self, q, k, v, metadata, forward_args)
+
+    _INPLACE_INPUTS = ("q", "compressed_kv", "k_pe", "latent_cache")
+
+    def run_fused(mla, kwargs, pristine):
+        # The RoPE/KV-write prologue rotates ``q`` and ``latent_cache`` in
+        # place, so every call needs the inputs as they were before the first.
+        fused_kwargs = dict(kwargs)
+        fused_kwargs.update({k: v.clone() for k, v in pristine.items()})
+        fused_kwargs["output"] = None
+        fused_kwargs["enable_dsv4_epilogue_fusion"] = True
+        return original_gen(mla, **fused_kwargs)
+
+    def wrapped_gen(mla, **kwargs):
+        pristine = {k: kwargs[k].clone() for k in _INPLACE_INPUTS if kwargs.get(k) is not None}
+        # 1. The harness's unfused call, untouched (it validates against the
+        #    Python reference afterwards).
+        out = original_gen(mla, **kwargs)
+        output = kwargs["output"]
+        rows = output.shape[0]
+        heads = mla.num_heads_tp
+        groups = mla.n_local_groups
+        positions = kwargs["position_ids"].view(-1).to(torch.int32)
+        cos_sin = mla.inverse_rotary_emb.rotary_cos_sin
+        torch.cuda.synchronize()
+
+        # Path B: the standalone inverse-RoPE + FP8 quant op on the BF16 output.
+        ref_fp8, ref_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
+            output.view(rows, heads, LATENT).clone(),
+            positions,
+            cos_sin,
+            groups,
+            heads // groups,
+            LATENT - ROPE,
+            ROPE,
+            BLOCK,
+            False,
+        )
+
+        # 2. Path A on the default library set: PrimTS serves the fused epilogue.
+        #    (The module hands out the 3D buffer only under ADP + 128 heads + FP8,
+        #    which is what production throughput configs run.)
+        before = len(seen_fused_flags)
+        prims_fp8, prims_scale = run_fused(mla, kwargs, pristine)
+        torch.cuda.synchronize()
+        assert seen_fused_flags[before:] == [True], (
+            "the PrimTS sparse MLA FMHA did not serve the fused generation call"
+        )
+
+        results.update(
+            rows=rows,
+            heads=heads,
+            groups=groups,
+            ref=(ref_fp8.clone(), ref_scale.clone()),
+            prims=(prims_fp8.clone(), prims_scale.clone()),
+        )
+        return out
+
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", spy_forward)
+    monkeypatch.setattr(harness, "forward_generation_deepseek_v4_mla", wrapped_gen)
+    _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
+
+    assert results, "the generation phase never ran"
+    assert seen_fused_flags.count(False) >= 1, "the unfused call did not reach PrimTS"
+    device = results["prims"][0].device
+    channels = results["heads"] // results["groups"] * LATENT
+
+    ref, ref_sc = _dequant_fused(*results["ref"])
+    got, got_sc = _dequant_fused(*results["prims"])
+    assert got.shape == ref.shape
+    _assert_fused_close(got, got_sc, ref, ref_sc, channels, device)

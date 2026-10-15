@@ -44,7 +44,7 @@ def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
     assert PRIMS_TS not in registry.DEFAULT_FMHA_LIBS
-    assert PRIMS_TS_SPARSE_MLA not in registry.DEFAULT_FMHA_LIBS
+    assert PRIMS_TS_SPARSE_MLA in registry.DEFAULT_FMHA_LIBS
     assert PRIMS_TS_BLOCK_SPARSE in registry.DEFAULT_FMHA_LIBS
     assert set(registry.DEFAULT_FMHA_LIBS) <= set(registry.FMHA_LIBS)
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS

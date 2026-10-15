@@ -53,7 +53,10 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "prims_ts": PrimsTSFmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         # DeepSeek-V4 generation on the vendored PrimTS native sparse MLA
-        # kernel; opt-in like prims_ts until it graduates from validation.
+        # kernel. Enabled by default: it only reports itself available for
+        # DeepSeek-V4 on SM100/SM103, so every other model and architecture
+        # never sees it, and it precedes the TRTLLM-Gen fallback that served
+        # that phase before.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
@@ -61,7 +64,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts", "prims_ts_sparse_mla"})
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts"})
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
