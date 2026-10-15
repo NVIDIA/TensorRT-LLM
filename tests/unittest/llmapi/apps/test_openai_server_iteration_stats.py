@@ -22,6 +22,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from tensorrt_llm.executor.rpc import RPCCancelled
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'; without the marker every
@@ -36,6 +37,7 @@ class _FakeGenerator:
         iter_stats_max_iterations: int | None = None,
         enable_iter_perf_stats: bool = True,
         stats_delay: float = 0.0,
+        stats_error: Exception | None = None,
     ):
         self.args = SimpleNamespace(
             iter_stats_max_iterations=iter_stats_max_iterations,
@@ -45,12 +47,15 @@ class _FakeGenerator:
         self._executor = SimpleNamespace(resource_governor_queue=None)
         self._stat_batches = deque(stat_batches)
         self._stats_delay = stats_delay
+        self._stats_error = stats_error
         self.stats_timeouts = []
 
     def get_stats(self, timeout: float | None) -> list[dict]:
         # Blocks like the executor's stats RPC, which waits for stats to arrive.
         self.stats_timeouts.append(timeout)
         time.sleep(self._stats_delay)
+        if self._stats_error is not None:
+            raise self._stats_error
         return list(self._stat_batches.popleft()) if self._stat_batches else []
 
     def get_stats_async(self, timeout: float | None):
@@ -80,10 +85,15 @@ def _make_server(
     iter_stats_max_iterations: int | None = None,
     enable_iter_perf_stats: bool = True,
     stats_delay: float = 0.0,
+    stats_error: Exception | None = None,
 ) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
     server.generator = _FakeGenerator(
-        stat_batches, iter_stats_max_iterations, enable_iter_perf_stats, stats_delay
+        stat_batches,
+        iter_stats_max_iterations,
+        enable_iter_perf_stats,
+        stats_delay,
+        stats_error,
     )
     server.metrics_collector = _FakeMetricsCollector()
     server._is_visual_gen = is_visual_gen
@@ -159,6 +169,21 @@ async def test_metrics_endpoint_does_not_block_the_event_loop():
     assert _response_content(response) == stats
     # About 50 ticks fit in the 0.5 s wait; none would if it held the loop.
     assert ticks >= 10
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_reports_no_stats_when_executor_unreachable():
+    server = _make_server(
+        [],
+        with_stats_buffer=False,
+        stats_error=RPCCancelled("Server is shutting down, request cancelled"),
+    )
+
+    response = await server.get_iteration_stats()
+
+    assert response.status_code == 200
+    assert _response_content(response) == []
+    assert server.generator.stats_timeouts == [2]
 
 
 @pytest.mark.asyncio
