@@ -489,6 +489,22 @@ def test_dflash_trtllm_gen_buffers_reuse_and_grow():
         get_props.assert_called_once_with(torch.device("cpu"))
 
 
+@pytest.mark.parametrize("max_batch_size,max_num_requests", [(1, 4), (2, 4), (8, 8)])
+def test_dflash_trtllm_gen_buffers_cover_noncausal_decode_rows(max_batch_size, max_num_requests):
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, max_batch_size)
+
+    ops = wrapper._dflash_trtllm_gen_ops
+    assert ops.get_workspace_size.call_args.kwargs["max_num_requests"] == max_num_requests
+    assert ops.get_multi_ctas_kv_counter_size.call_args.args[1] == max_num_requests
+
+
 def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
     wrapper = _fake_dflash_buffer_wrapper()
     device_properties = SimpleNamespace(multi_processor_count=148)

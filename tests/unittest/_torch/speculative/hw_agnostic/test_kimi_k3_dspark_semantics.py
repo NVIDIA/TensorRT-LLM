@@ -829,6 +829,120 @@ def test_plain_dflash_block_decode_matches_full_attention_reference():
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
 
 
+def _has_dflash_trtllm_gen() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    from tensorrt_llm._torch.speculative.dflash_attention import (
+        dflash_trtllm_gen_unavailability_reason,
+    )
+
+    return dflash_trtllm_gen_unavailability_reason() is None
+
+
+needs_dflash_trtllm_gen = pytest.mark.skipif(
+    not _has_dflash_trtllm_gen(),
+    reason="the DFlash TRTLLM backend needs flashinfer on an SM100-family GPU",
+)
+
+GQA_PAGE = 32
+GQA_CTX_LENS = (40, 20)
+
+
+def _run_paged_block_decode(drafter, requests):
+    """One TRTLLM block decode over disjoint page ranges per request."""
+    dev = "cuda"
+    blk = TINY["block_size"]
+    batch = len(requests)
+    ctx_lens = [c.shape[0] for c, _ in requests]
+    ctx_kv = [
+        drafter.precompute_context_kv(
+            drafter.project_target_hidden(captured.to(dev, torch.bfloat16)),
+            torch.arange(captured.shape[0], device=dev),
+        )
+        for captured, _ in requests
+    ]
+    L = drafter._num_attn_layers
+    nkv, hd = drafter._num_kv_heads, drafter._head_dim
+    per_req = -(-(max(ctx_lens) + blk) // GQA_PAGE)
+    pool = [
+        torch.zeros(batch * per_req, 2, nkv, GQA_PAGE, hd, dtype=torch.bfloat16, device=dev)
+        for _ in range(L)
+    ]
+    for b, (k, v) in enumerate(ctx_kv):
+        pos = torch.arange(ctx_lens[b], device=dev)
+        rows = b * per_req + pos // GQA_PAGE
+        cols = pos % GQA_PAGE
+        for layer_idx in range(L):
+            pool[layer_idx][rows, 0, :, cols] = k[:, layer_idx]
+            pool[layer_idx][rows, 1, :, cols] = v[:, layer_idx]
+    page_table = torch.arange(batch * per_req, device=dev, dtype=torch.int32).view(batch, per_req)
+    out = drafter.dflash_forward(
+        noise_embedding=torch.stack([n.to(dev, torch.bfloat16) for _, n in requests]),
+        query_positions=torch.stack([torch.arange(n, n + blk, device=dev) for n in ctx_lens]),
+        num_ctx_per_req=torch.tensor(ctx_lens, device=dev),
+        ctx_k_cache=pool[0],
+        ctx_v_cache=None,
+        ctx_cache_batch_idx=torch.arange(batch, device=dev),
+        ctx_kv_cache=pool,
+        ctx_page_table=page_table,
+    )
+    return out.reshape(batch, blk, -1).float().cpu()
+
+
+@needs_dflash_trtllm_gen
+@pytest.mark.parametrize(
+    "batch_size,kernel",
+    [(1, "decode_rows"), (2, "context")],
+    ids=["decode_rows", "context"],
+)
+def test_plain_dflash_trtllm_block_decode_matches_full_attention_reference(batch_size, kernel):
+    """Both TRTLLM forms of the non-causal, unwindowed block attention match
+    the eager reference: single-query decode rows at batch 1, one context-FMHA
+    call above it. Counting the kernel calls keeps a silent fallback from
+    passing the parity check for the wrong form."""
+    from dataclasses import replace
+
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    calls = {"decode_rows": 0, "context": 0}
+    ops = drafter._dflash_trtllm_gen_ops
+
+    def _decode(**kwargs):
+        assert kwargs["q_len_per_req"] == 1
+        calls["decode_rows"] += 1
+        return ops.batch_decode_with_kv_cache(**kwargs)
+
+    def _context(**kwargs):
+        calls["context"] += 1
+        return ops.batch_context_with_kv_cache(**kwargs)
+
+    drafter._dflash_trtllm_gen_ops = replace(
+        ops, batch_decode_with_kv_cache=_decode, batch_context_with_kv_cache=_context
+    )
+
+    g = torch.Generator().manual_seed(44)
+    requests = [
+        (
+            torch.randn(n, TINY["hidden_size"] * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5,
+        )
+        for n in GQA_CTX_LENS[:batch_size]
+    ]
+    out = _run_paged_block_decode(drafter, requests)
+    expected = torch.stack(
+        [
+            _reference_block_decode(weights, c.to(torch.bfloat16), n.to(torch.bfloat16), False)
+            for c, n in requests
+        ]
+    )
+
+    assert calls[kernel] == TINY["num_hidden_layers"] and sum(calls.values()) == calls[kernel], (
+        f"batch {batch_size} took the wrong attention form: {calls}"
+    )
+    diff = (out - expected).abs().max().item()
+    assert diff < 0.02, f"TRTLLM {kernel} parity failed: max abs diff {diff}"
+
+
 # ---------------------------------------------------------------------------
 # MLA-backboned DSpark drafter (Inferact/Kimi-K3-DSpark shape).
 #
