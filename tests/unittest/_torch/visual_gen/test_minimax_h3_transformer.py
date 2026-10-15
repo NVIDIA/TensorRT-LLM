@@ -25,15 +25,18 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
+from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
+from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -1418,3 +1421,89 @@ def test_fa4_rejects_interior_padding() -> None:
     inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
     with torch.inference_mode(), pytest.raises(NotImplementedError, match="trailing"):
         model(**inputs)
+
+
+class _RecordingAsyncUlysses:
+    """Stands in for an async UlyssesAttention: runs the three closures and returns Q."""
+
+    preferred_layout = AttentionTensorLayout.NHD
+
+    def __init__(self) -> None:
+        self.captured: dict[str, object] = {}
+
+    def forward_async(self, compute_q, compute_k, compute_v, **kwargs: object) -> torch.Tensor:
+        self.captured.update(q=compute_q(), k=compute_k(), v=compute_v(), kwargs=kwargs)
+        return self.captured["q"]
+
+
+def _make_ulysses_config(async_ulysses: bool) -> DiffusionModelConfig:
+    config = _make_model_config()
+    config.visual_gen_mapping = SimpleNamespace(ulysses_size=2, cp_size=1, ring_size=1, cfg_size=1)
+    config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=async_ulysses)
+    return config
+
+
+def test_attention_keeps_fused_qkv_without_async_ulysses() -> None:
+    attention = h3.MiniMaxH3Attention(
+        hidden_size=12,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        qk_norm_eps=1e-5,
+        model_config=_make_model_config(),
+        layer_idx=0,
+        module_name="test.attn",
+    )
+    assert attention.qkv_mode is QKVMode.FUSE_QKV
+    assert not attention.use_async_ulysses
+
+
+def test_async_ulysses_projections_match_the_sync_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The async closures apply the per-head norm and partial RoPE to Q and K only, like forward."""
+    recorder = _RecordingAsyncUlysses()
+    monkeypatch.setattr(
+        attention_module,
+        "wrap_parallel_attention",
+        lambda attn, **kwargs: recorder if kwargs["async_ulysses"] else attn,
+    )
+    kwargs = dict(
+        hidden_size=12, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5, layer_idx=0
+    )
+    asynchronous = h3.MiniMaxH3Attention(
+        model_config=_make_ulysses_config(async_ulysses=True), module_name="async.attn", **kwargs
+    )
+    synchronous = h3.MiniMaxH3Attention(
+        model_config=_make_ulysses_config(async_ulysses=False), module_name="sync.attn", **kwargs
+    )
+    assert asynchronous.qkv_mode is QKVMode.SEPARATE_QKV and asynchronous.use_async_ulysses
+    assert synchronous.qkv_mode is QKVMode.FUSE_QKV and not synchronous.use_async_ulysses
+    _initialize_weights(asynchronous)
+    _initialize_weights(synchronous)
+    with torch.no_grad():
+        synchronous.qkv_proj.weight.copy_(
+            torch.cat(
+                [asynchronous.to_q.weight, asynchronous.to_k.weight, asynchronous.to_v.weight]
+            )
+        )
+        synchronous.to_out[0].weight.copy_(asynchronous.to_out[0].weight)
+    sync_inputs: dict[str, torch.Tensor] = {}
+
+    def _identity_attention(query, key, value, **attn_kwargs):
+        sync_inputs.update(q=query, k=key, v=value, kwargs=attn_kwargs)
+        return query
+
+    synchronous._attn_impl = _identity_attention
+    hidden_states = torch.randn(1, 3, 12, dtype=torch.bfloat16)
+    rotary_emb = h3.MiniMaxH3RotaryPosEmbed(rope_freq_dim=1)(
+        torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0]])
+    )
+    mask = torch.tensor([[True, True, False]])
+
+    async_out = asynchronous(hidden_states, rotary_emb, key_padding_mask=mask)
+    sync_out = synchronous(hidden_states, rotary_emb, key_padding_mask=mask)
+
+    for name in ("q", "k", "v"):
+        torch.testing.assert_close(
+            recorder.captured[name].flatten(2), sync_inputs[name], rtol=0, atol=0
+        )
+    assert recorder.captured["kwargs"]["key_padding_mask"] is mask
+    torch.testing.assert_close(async_out, sync_out, rtol=0, atol=0)
