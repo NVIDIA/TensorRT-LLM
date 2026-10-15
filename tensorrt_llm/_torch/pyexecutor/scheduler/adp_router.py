@@ -191,6 +191,10 @@ class ADPRouter(ABC):
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
+        Under helix CP, each state's ``num_active_requests`` and
+        ``num_active_tokens`` are that DP rank's maximum across the CP group
+        (see ``_use_max_load_across_cp``).
+
         Args:
             active_requests: Currently active LlmRequests on this rank.
             new_requests: New requests popped from the waiting queue.
@@ -212,8 +216,30 @@ class ADPRouter(ABC):
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
+        if self.dist.has_cp_helix:
+            self._use_max_load_across_cp(local_state)
         responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
         return [RankState.deserialize(data=resp) for resp in responses]
+
+    def _use_max_load_across_cp(self, local_state: RankState) -> None:
+        """Replace this DP rank's load with its maximum across the helix CP group.
+
+        The CP ranks of one DP group must pop and route the same new requests.
+        If they route a request to different DP ranks, it never passes
+        ``DisaggTransferCoordinator.align_gen_admission_across_cp`` and never
+        starts.
+
+        A client cancel or a transfer timeout can retire a request on one CP
+        rank before its peers, so their own loads can differ. With the maximum,
+        every CP rank gathers the same loads over TP, and no CP rank goes over
+        ``max_num_active_requests``.
+        """
+        loads_per_cp_rank = self.dist.cp_allgather_int64(
+            [local_state.num_active_requests, local_state.num_active_tokens]
+        )
+        max_requests, max_tokens = loads_per_cp_rank.max(axis=0)
+        local_state.num_active_requests = int(max_requests)
+        local_state.num_active_tokens = int(max_tokens)
 
     @staticmethod
     def _assign_explicit_dp_ranks(
