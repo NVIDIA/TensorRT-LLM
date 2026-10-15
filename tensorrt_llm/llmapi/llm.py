@@ -333,6 +333,21 @@ def _multimodal_params_have_encoder_features(
                       dict) and "encoder_input_features" in audio_data
 
 
+def _multimodal_params_replace_prompt_ids(
+        multimodal_params: Optional["MultimodalParams"]) -> bool:
+    """Whether the request carries multimodal content that replaces prompt ids.
+
+    mRoPE position metadata alone (as rebuilt for a disaggregated text-only
+    request) replaces no embedding, so it does not count.
+    """
+    if multimodal_params is None:
+        return False
+    if multimodal_params.multimodal_input is not None:
+        return True
+    return any(key != "mrope_config"
+               for key in (multimodal_params.multimodal_data or {}))
+
+
 def _check_prompt_token_id_range(prompt_token_ids: Union[Sequence[int],
                                                          torch.Tensor,
                                                          np.ndarray],
@@ -713,6 +728,26 @@ class BaseLLM:
                 return vocab_size
         return None
 
+    def _check_prompt_token_ids(
+            self, prompt_token_ids: Sequence[int],
+            encoder_input_token_ids: Optional[Sequence[int]],
+            multimodal_params: Optional[MultimodalParams],
+            prompt_adapter_request: Optional[PromptAdapterRequest],
+            is_gen_only: bool) -> None:
+        """Reject token ids that the embedding lookup cannot index."""
+        vocab_size = self._prompt_vocab_size()
+        _check_prompt_token_id_range(
+            prompt_token_ids,
+            vocab_size,
+            allow_out_of_vocab=_multimodal_params_replace_prompt_ids(
+                multimodal_params) or prompt_adapter_request is not None
+            or is_gen_only)
+        if encoder_input_token_ids is not None:
+            _check_prompt_token_id_range(
+                encoder_input_token_ids,
+                vocab_size,
+                allow_out_of_vocab=prompt_adapter_request is not None)
+
     def _is_encoder_decoder_model(self) -> bool:
         return bool(getattr(self._hf_model_config, "is_encoder_decoder", False))
 
@@ -920,11 +955,11 @@ class BaseLLM:
         self._check_arguments(len(prompt_token_ids),
                               sampling_params,
                               is_gen_only=is_gen_only)
-        _check_prompt_token_id_range(
-            prompt_token_ids,
-            self._prompt_vocab_size(),
-            allow_out_of_vocab=multimodal_params is not None
-            or prompt_adapter_request is not None or is_gen_only)
+        self._check_prompt_token_ids(prompt_token_ids,
+                                     encoder_input_token_ids,
+                                     multimodal_params,
+                                     prompt_adapter_request,
+                                     is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)

@@ -14,14 +14,23 @@
 # limitations under the License.
 """Prompt token ids outside the vocabulary are rejected before submission."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 
+import tensorrt_llm.llmapi.llm as llm_module
 from tensorrt_llm.executor.utils import RequestError
-from tensorrt_llm.llmapi.llm import BaseLLM, _check_prompt_token_id_range
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm import (
+    BaseLLM,
+    PreprocessedInputs,
+    _check_prompt_token_id_range,
+    _multimodal_params_replace_prompt_ids,
+)
+from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -85,3 +94,99 @@ def test_empty_prompt_is_left_to_other_checks():
 def test_prompt_vocab_size_reads_the_text_config_first(hf_model_config, expected):
     llm = SimpleNamespace(_hf_model_config=hf_model_config)
     assert BaseLLM._prompt_vocab_size(llm) == expected
+
+
+@pytest.mark.parametrize(
+    "multimodal_params,expected",
+    [
+        (None, False),
+        (MultimodalParams(), False),
+        (MultimodalParams(multimodal_data={"mrope_config": {"mrope_position_ids": None}}), False),
+        (MultimodalParams(multimodal_data={"multimodal_embedding": torch.zeros(1)}), True),
+        (MultimodalParams(multimodal_data={"image": {"pixel_values": torch.zeros(1)}}), True),
+    ],
+)
+def test_only_replacing_multimodal_content_exempts_prompt_ids(multimodal_params, expected):
+    assert _multimodal_params_replace_prompt_ids(multimodal_params) is expected
+
+
+def _fake_llm(monkeypatch, *, encoder_decoder=False):
+    """Just enough of a BaseLLM to drive generate_async up to the executor."""
+    executor = MagicMock()
+    executor.is_shutdown.return_value = False
+    llm = SimpleNamespace(
+        _encode_only=False,
+        _executor=executor,
+        _hf_model_config=SimpleNamespace(vocab_size=_VOCAB),
+        args=SimpleNamespace(return_perf_metrics=False),
+        tokenizer=None,
+        _post_processor_hook=None,
+        _prepare_sampling_params=lambda sampling_params: sampling_params or SamplingParams(),
+        _check_arguments=lambda *args, **kwargs: None,
+        _is_encoder_decoder_model=lambda: encoder_decoder,
+        _get_decoder_prompt_token_ids=lambda sampling_params: [0],
+        _normalize_token_ids=lambda token_ids, name: list(token_ids),
+    )
+    llm._prompt_vocab_size = MethodType(BaseLLM._prompt_vocab_size, llm)
+    llm._check_prompt_token_ids = MethodType(BaseLLM._check_prompt_token_ids, llm)
+    monkeypatch.setattr(
+        llm_module.RequestOutput, "_from_generation_result", lambda *args, **kwargs: "output"
+    )
+    return llm, executor
+
+
+_GEN_ONLY = SimpleNamespace(request_type="generation_only")
+
+
+@pytest.mark.parametrize(
+    "inputs,kwargs,encoder_decoder",
+    [
+        (PreprocessedInputs(prompt_token_ids=[1, _VOCAB]), {}, False),
+        (PreprocessedInputs(prompt_token_ids=[1, -1]), {}, False),
+        (PreprocessedInputs(prompt_token_ids=[-1]), {"disaggregated_params": _GEN_ONLY}, False),
+        (
+            PreprocessedInputs(
+                prompt_token_ids=[1, _VOCAB],
+                multimodal_params=MultimodalParams(
+                    multimodal_data={"mrope_config": {"mrope_position_ids": None}}
+                ),
+            ),
+            {},
+            False,
+        ),
+        (PreprocessedInputs(prompt_token_ids=[0], encoder_input_token_ids=[1, _VOCAB]), {}, True),
+    ],
+    ids=["above_vocab", "negative", "negative_gen_only", "mrope_only", "encoder_ids"],
+)
+def test_generate_async_rejects_before_submission(monkeypatch, inputs, kwargs, encoder_decoder):
+    llm, executor = _fake_llm(monkeypatch, encoder_decoder=encoder_decoder)
+    with pytest.raises(RequestError):
+        BaseLLM.generate_async(llm, inputs, **kwargs)
+    executor.generate_async.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "inputs,kwargs",
+    [
+        (PreprocessedInputs(prompt_token_ids=[0, _VOCAB - 1]), {}),
+        (PreprocessedInputs(prompt_token_ids=[1, _VOCAB + 3]), {"disaggregated_params": _GEN_ONLY}),
+        (
+            PreprocessedInputs(
+                prompt_token_ids=[1, _VOCAB + 3],
+                multimodal_params=MultimodalParams(
+                    multimodal_data={"multimodal_embedding": torch.zeros(1)}
+                ),
+            ),
+            {},
+        ),
+        (
+            PreprocessedInputs(prompt_token_ids=[1, _VOCAB + 3]),
+            {"prompt_adapter_request": object()},
+        ),
+    ],
+    ids=["in_range", "gen_only", "multimodal_embedding", "prompt_adapter"],
+)
+def test_generate_async_submits_accepted_prompts(monkeypatch, inputs, kwargs):
+    llm, executor = _fake_llm(monkeypatch)
+    assert BaseLLM.generate_async(llm, inputs, **kwargs) == "output"
+    executor.generate_async.assert_called_once()
