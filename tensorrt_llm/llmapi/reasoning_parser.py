@@ -737,7 +737,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         atomic delta, so we only need to check `delta_text` (not the
         parent's internal buffer)."""
         if (self.in_reasoning and self._tool_call_start in delta_text
-                and self.reasoning_end not in self._buffer):
+                and self.reasoning_end not in self._buffer + delta_text):
             remaining = self._buffer
             self._buffer = ""
             self.in_reasoning = False
