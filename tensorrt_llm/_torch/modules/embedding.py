@@ -18,17 +18,19 @@ from .linear import Linear, TensorParallelMode
 
 
 def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
-                              output_dtype: torch.dtype) -> torch.Tensor:
-    """Compute ``input @ weight.T`` and write the result in ``output_dtype``.
+                              output_dtype: torch.dtype | None) -> torch.Tensor:
+    """Compute ``input @ weight.T`` with an optional output dtype override.
 
-    ``input`` and ``weight`` stay in the model dtype; the GEMM accumulates in
-    float32 and stores the result directly in ``output_dtype``, so the output
-    is not rounded to the model dtype first.
+    None keeps the model dtype. An FP32 override stores the result directly
+    in FP32 without first rounding it to the BF16/FP16 model dtype.
     """
     out_features = weight.shape[0]
     output_shape = (*input.shape[:-1], out_features)
     input_2d = input.reshape(-1, input.shape[-1])
-    output = torch.mm(input_2d, weight.t(), out_dtype=output_dtype)
+    mm_kwargs = {}
+    if output_dtype is not None and output_dtype != weight.dtype:
+        mm_kwargs["out_dtype"] = output_dtype
+    output = torch.mm(input_2d, weight.t(), **mm_kwargs)
     return output.view(output_shape)
 
 
@@ -182,11 +184,7 @@ class LMHead(Linear):
             slice_start = tp_rank * slice_width
             slice_end = min((tp_rank + 1) * slice_width, self.out_features)
             weight = self.weight[slice_start:slice_end, :]
-            if self._writes_output_dtype():
-                output = _matmul_with_output_dtype(input, weight,
-                                                   self.output_dtype)
-            else:
-                output = F.linear(input, weight, None)
+            output = _matmul_with_output_dtype(input, weight, self.output_dtype)
         else:
             output = super().forward(input, all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output

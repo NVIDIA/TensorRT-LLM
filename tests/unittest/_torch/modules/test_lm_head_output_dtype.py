@@ -110,14 +110,18 @@ def test_float32_output_one_dim_input() -> None:
     )
 
 
-def test_float32_output_spec_decoding_head_slice() -> None:
-    """Keep FP32 output precision when the speculative head slices the vocabulary."""
+@pytest.mark.parametrize("output_dtype", [None, DTYPE, torch.float32], ids=["auto", "bf16", "fp32"])
+@pytest.mark.parametrize("num_tokens", [0, 1, 16])
+def test_output_dtype_spec_decoding_head_slice(
+    num_tokens: int, output_dtype: torch.dtype | None
+) -> None:
+    """Preserve default and FP32 output precision for a sliced speculative head."""
     # With lm_head TP in attention DP, the spec-decoding head slices the vocab at forward time.
-    hidden, weight = _make_inputs(16)
+    hidden, weight = _make_inputs(num_tokens)
     mapping = Mapping(enable_attention_dp=True, enable_lm_head_tp_in_adp=True)
     lm_head = _make_lm_head(
         weight,
-        torch.float32,
+        output_dtype,
         mapping=mapping,
         tensor_parallel_mode=TensorParallelMode.COLUMN,
         gather_output=True,
@@ -126,8 +130,12 @@ def test_float32_output_spec_decoding_head_slice() -> None:
     lm_head_tp = Mapping(world_size=2, tp_size=2, rank=1)
     logits = lm_head(hidden, mapping_lm_head_tp=lm_head_tp, is_spec_decoding_head=True)
     reference = _reference_logits(hidden, weight)[:, VOCAB_SIZE // 2 :]
-    assert logits.dtype == torch.float32
-    torch.testing.assert_close(logits.double(), reference, rtol=1e-4, atol=1e-3)
+    assert logits.dtype == (output_dtype or DTYPE)
+    assert logits.shape == reference.shape
+    if output_dtype == torch.float32:
+        torch.testing.assert_close(logits.double(), reference, rtol=1e-4, atol=1e-3)
+    else:
+        torch.testing.assert_close(logits, reference.to(DTYPE))
 
 
 def test_output_dtype_rejects_quantized_head() -> None:
