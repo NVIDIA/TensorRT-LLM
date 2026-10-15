@@ -23,10 +23,12 @@
 // variable mid-process the tests pick sizes on both sides of the default and ask the policy predicate which path a size
 // takes; the raw-value semantics of the knob are tested through hostCopyDmaMinBytesFor().
 
-#include "kvCacheManagerV2TestUtils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/tllmException.h"
+
+// After the header that brings in ATen: nvcc fails to parse the torch headers when this one comes first.
+#include "kvCacheManagerV2TestUtils.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
