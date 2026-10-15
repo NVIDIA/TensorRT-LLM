@@ -161,14 +161,22 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool const shape_ok = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim
-        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
-    // The low-latency kernels load both operands in 16-byte chunks, so an operand that does not start on a
-    // 16-byte boundary is copied (clone keeps its layout).
-    auto const aligned16
-        = [](th::Tensor const& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0 ? t : t.clone(); };
-    th::Tensor const input = shape_ok ? aligned16(mat_a) : mat_a;
-    th::Tensor const weights = shape_ok ? aligned16(mat_b) : mat_b;
+    // The low-latency kernels and the cuBLAS fallback both read rows of hidden_dim elements (the input is
+    // row-major, the weights column-major) that start on a 16-byte boundary. Copy an operand that is padded
+    // or misaligned into that layout.
+    auto const packed = [hidden_dim](th::Tensor const& t, int pitch_dim)
+    {
+        if (t.strides()[pitch_dim] == hidden_dim && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0)
+        {
+            return t;
+        }
+        return pitch_dim == 0 ? t.clone(at::MemoryFormat::Contiguous) : t.t().clone(at::MemoryFormat::Contiguous).t();
+    };
+    th::Tensor const input = packed(mat_a, 0);
+    th::Tensor const weights = packed(mat_b, 1);
+    bool const shape_ok
+        = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16
+            && mat_b.scalar_type() == data_type && out_dtype_ == torch::kFloat32 && !bias.has_value());
 
     if (shape_ok && num_experts == kNumExpertsKimiK3 && hidden_dim == kHiddenDim7168)
     {
@@ -203,7 +211,7 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     }
     else // fallback to cublas, can be slow
     {
-        cublas_mm_out(mat_a, mat_b, bias, out);
+        cublas_mm_out(input, weights, bias, out);
     }
 
     return out;

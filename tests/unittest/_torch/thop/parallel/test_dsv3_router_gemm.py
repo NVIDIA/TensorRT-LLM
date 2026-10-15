@@ -22,6 +22,18 @@ def router_gemm_ref(input, weight, bias, dtype):
     return logits_ref
 
 
+def make_operand(rows, cols, layout, device):
+    # "unaligned" starts 8 bytes past a 16-byte boundary; "padded" slices rows
+    # out of wider rows.
+    if layout == "unaligned":
+        return torch.randn(rows * cols + 4, dtype=torch.bfloat16,
+                           device=device)[4:].view(rows, cols)
+    if layout == "padded":
+        return torch.randn(rows, cols + 64, dtype=torch.bfloat16,
+                           device=device)[:, :cols]
+    return torch.randn(rows, cols, dtype=torch.bfloat16, device=device)
+
+
 @pytest.mark.parametrize(
     "num_tokens", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
 # 256 experts: DeepSeek-V3/V4, GLM-5 (scalar FFMA kernel, all three hidden sizes).
@@ -31,33 +43,25 @@ def router_gemm_ref(input, weight, bias, dtype):
                                                      (256, 4096), (288, 4096),
                                                      (896, 7168), (896, 6144),
                                                      (896, 4096)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-# An input 8 bytes past a 16-byte boundary must still be read correctly.
-@pytest.mark.parametrize("storage_offset", [0, 4])
-def test_router_gemm_run(num_tokens, num_experts, hidden_size, dtype,
-                         storage_offset):
+@pytest.mark.parametrize("layout", ["packed", "unaligned", "padded"])
+def test_router_gemm_run(num_tokens, num_experts, hidden_size, layout):
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
     device = torch.device("cuda")
-    input = torch.randn(num_tokens * hidden_size + storage_offset,
-                        dtype=dtype,
-                        device=device)[storage_offset:].view(
-                            num_tokens, hidden_size)
-    weight = torch.randn((num_experts, hidden_size), dtype=dtype, device=device)
-    bias = None
-    logits = torch.ops.trtllm.dsv3_router_gemm_op(input, weight.t(), bias,
+    input = make_operand(num_tokens, hidden_size, layout, device)
+    weight = make_operand(num_experts, hidden_size, layout, device)
+    logits = torch.ops.trtllm.dsv3_router_gemm_op(input, weight.t(), None,
                                                   torch.float32)
-    logtis_ref = router_gemm_ref(input.float(),
-                                 weight.t().float(), bias, torch.float32)
-    # Logits have std ~ sqrt(hidden_size) ~ 85; fp32 accumulation-order noise (~1e-3) on
-    # near-zero logits fails a pure relative tolerance, hence the absolute term.
-    assert torch.allclose(logits, logtis_ref, rtol=5e-2, atol=1e-2)
+    logits_ref = router_gemm_ref(input.float(),
+                                 weight.t().float(), None, torch.float32)
+    # BF16 products are exact in FP32; only the accumulation order differs.
+    torch.testing.assert_close(logits, logits_ref, atol=1e-2, rtol=1e-3)
     # The router output only matters through the top-k selection that follows it.
     top_k = 16 if num_experts == 896 else 8
     assert torch.equal(
         torch.topk(logits, top_k, dim=-1).indices.sort(dim=-1).values,
-        torch.topk(logtis_ref, top_k, dim=-1).indices.sort(dim=-1).values)
+        torch.topk(logits_ref, top_k, dim=-1).indices.sort(dim=-1).values)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available()
