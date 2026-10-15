@@ -19,6 +19,9 @@ from typing import Any, Literal, Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
     forward_generation_sparse_attn,
@@ -29,7 +32,14 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import (
+    extract_routing_params,
+    get_data_or_none,
+    to_trtllm_gen_act_type,
+)
 from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._torch.utils import EventType
 
 from . import weights as _weights
 from .ops.embedding.fused_embedding import fused_embedding
@@ -37,6 +47,12 @@ from .ops.gemm.dense_mlp_small_m import INTER_PER_RANK, dense_mlp_small_m
 from .ops.gemm.fused_a_gemm import MAX_TOKENS as FUSED_A_MAX_TOKENS
 from .ops.gemm.fused_a_gemm import OUT_FEATURES as FUSED_A_OUT_FEATURES
 from .ops.gemm.fused_a_gemm import fused_a_gemm
+from .ops.gemm.low_m_gemm import low_m_gemm
+from .ops.moe.routed_experts import (
+    FUSED_ROUTER_MAX_TOKENS,
+    make_fused_router_workspace,
+    routed_experts,
+)
 
 # The deployment this target is written for; route() selects it on the same
 # facts, and the constructor states them again for a direct construction.
@@ -91,6 +107,13 @@ class DecodeTarget:
     kv_a_proj_with_mqa weight (up to 8 rows), and the built-in modules compute
     the rest.
 
+    The MoE block over up to 8 rows runs its shared expert as two split-K
+    GEMMs around SwiGLU on the aux stream, and its routed experts in one
+    trtllm-gen call on the main stream: the routing kernel runs the router GEMV
+    itself, the NVFP4 input quantizes on its own stream and joins right before
+    FC1, and FC2 runs on the K = 128 kernel. A larger batch takes the built-in
+    MoE module.
+
     The embedding table is whole on every rank, so the lookup is one local
     kernel. The dense MLP runs as two weight-streaming kernels on this rank's
     768 intermediate columns for up to 8 rows (every c1 step: one request and
@@ -99,13 +122,15 @@ class DecodeTarget:
 
     def __init__(self, core: "Glm52Nvfp4Sm107Tp16Core") -> None:
         self.core = core
+        config = core.model_config.pretrained_config
+        self.hidden_size = config.hidden_size
         for layer in core.layers[: core.num_hidden_layers]:
             mla = layer.self_attn
             assert layer.allreduce is not None and layer.next_layer_layernorm is not None
             assert not mla.apply_rotary_emb and not mla.mapping.has_cp_helix()
             assert tuple(mla.kv_a_proj_with_mqa.weight.shape) == (
                 FUSED_A_OUT_FEATURES,
-                core.config.hidden_size,
+                config.hidden_size,
             ) and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16, (
                 f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
             )
@@ -125,6 +150,41 @@ class DecodeTarget:
                     and layer.fusion_config.POST_MOE_FUSION
                     and layer.mapping.is_multi_node()
                 ), f"layer {layer.layer_idx}: unexpected MoE-layer configuration"
+                shared = layer.mlp.shared_experts
+                assert (
+                    shared is not None
+                    and layer.mlp.shared_output_scale is None
+                    and shared._is_plain_swiglu()
+                    and shared.swiglu_limit is None
+                    and shared.gate_up_proj.weight.dtype == torch.bfloat16
+                    and shared.down_proj.weight.dtype == torch.bfloat16
+                ), f"layer {layer.layer_idx}: the shared expert is not a plain BF16 SwiGLU MLP"
+                backend = getattr(layer.mlp.experts, "backend", layer.mlp.experts)
+                assert (
+                    backend.has_nvfp4
+                    and backend.scaling_vector_size == 16
+                    and getattr(backend, "fc31_act_scale", None) is None
+                    and not backend.bias
+                    and backend.w3_w1_weight.shape[-1] * 2 == config.hidden_size
+                ), f"layer {layer.layer_idx}: routed experts are not unpadded TRTLLM-Gen NVFP4"
+        moe_layers = [
+            layer
+            for layer in core.layers[: core.num_hidden_layers]
+            if not isinstance(layer.mlp, GatedMLP)
+        ]
+        device = core.embed_tokens.weight.device
+        # One exchange workspace per router call site: its launches must run in stream order.
+        self._router_workspace = {
+            layer.layer_idx: make_fused_router_workspace(device) for layer in moe_layers
+        }
+        # The routing kernel runs the router GEMV, so the logits it is handed only give the
+        # shape; autotuner profiling routes from them, so they hold random values.
+        self._router_logits = torch.randn(
+            FUSED_ROUTER_MAX_TOKENS, config.n_routed_experts, device=device
+        )
+        self._quant_stream = torch.cuda.Stream()
+        self._quant_fork = torch.cuda.Event()
+        self._quant_ready = torch.cuda.Event()
 
     def forward(
         self,
@@ -142,7 +202,7 @@ class DecodeTarget:
         hidden_states = core.layers[0].input_layernorm(inputs_embeds)
         rows = hidden_states.shape[0]
         small_m = torch.ops.trtllm.glm_dense_mlp_small_m_supported(
-            rows, core.config.hidden_size, INTER_PER_RANK
+            rows, self.hidden_size, INTER_PER_RANK
         )
         fused_a = rows <= FUSED_A_MAX_TOKENS
         for layer in core.layers[: core.num_hidden_layers]:
@@ -155,6 +215,80 @@ class DecodeTarget:
                     layer, position_ids, hidden_states, residual, attn_metadata, fused_a
                 )
         return hidden_states
+
+    def _experts(self, layer, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The MoE block's output for up to 8 rows: shared expert plus routed experts."""
+        mlp = layer.mlp
+        backend = getattr(mlp.experts, "backend", mlp.experts)
+        rows = hidden_states.shape[0]
+
+        self._quant_fork.record()
+        with torch.cuda.stream(self._quant_stream):
+            self._quant_stream.wait_event(self._quant_fork)
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states, backend.fc31_input_scale, backend.scaling_vector_size, False, False
+            )
+            self._quant_ready.record()
+        routing = extract_routing_params(backend.routing_method)
+
+        def routed() -> torch.Tensor:
+            return routed_experts(
+                self._router_logits[:rows],
+                routing.routing_bias,
+                x_fp4,
+                x_sf.flatten().view(torch.float8_e4m3fn),
+                backend.w3_w1_weight,
+                backend.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                None,
+                backend.act_alpha,
+                backend.act_beta,
+                backend.act_clamp,
+                backend.w2_weight,
+                backend.w2_weight_scale.view(torch.float8_e4m3fn),
+                None,
+                get_data_or_none(backend, "fc31_scale_c"),
+                get_data_or_none(backend, "fc31_alpha"),
+                get_data_or_none(backend, "fc2_alpha"),
+                backend.num_slots,
+                routing.top_k,
+                routing.n_group,
+                routing.topk_group,
+                backend.w3_w1_weight.shape[-2] // 2,
+                backend.slot_start,
+                backend.expert_size_per_partition,
+                routing.routed_scaling_factor,
+                backend.routing_method.routing_method_type,
+                True,
+                to_trtllm_gen_act_type(backend.activation_type),
+                None,
+                None,
+                None,
+                backend.max_num_tokens,
+                False,
+                self._quant_ready.cuda_event,
+                hidden_states,
+                mlp.gate.weight,
+                self._router_workspace[layer.layer_idx],
+                True,
+            )[0]
+
+        def shared() -> torch.Tensor:
+            expert = mlp.shared_experts
+            gate_up = expert.gate_up_proj.weight
+            h = low_m_gemm(hidden_states, gate_up, hidden_states.new_empty(rows, gate_up.shape[0]))
+            h = swiglu(h)
+            return low_m_gemm(
+                h, expert.down_proj.weight, hidden_states.new_empty(rows, hidden_states.shape[1])
+            )
+
+        routed_output, shared_output = maybe_execute_in_parallel(
+            routed,
+            shared,
+            mlp.event_dict[EventType.Main],
+            mlp.event_dict[EventType.MoeShared],
+            mlp.aux_stream,
+        )
+        return shared_output.add_(routed_output)
 
     @staticmethod
     def _attention(layer, position_ids, hidden_states, attn_metadata, all_reduce_params, fused_a):
@@ -233,8 +367,7 @@ class DecodeTarget:
             ),
         )
 
-    @staticmethod
-    def _moe_layer(layer, position_ids, hidden_states, residual, attn_metadata, fused_a):
+    def _moe_layer(self, layer, position_ids, hidden_states, residual, attn_metadata, fused_a):
         hidden_states = DecodeTarget._attention(
             layer,
             position_ids,
@@ -253,13 +386,16 @@ class DecodeTarget:
                 trigger_completion_at_end=False,
             ),
         )
-        hidden_states = layer.mlp(
-            hidden_states,
-            None,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=False),
-            do_finalize=True,
-        )
+        if hidden_states.shape[0] <= FUSED_ROUTER_MAX_TOKENS:
+            hidden_states = self._experts(layer, hidden_states)
+        else:
+            hidden_states = layer.mlp(
+                hidden_states,
+                None,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=False),
+                do_finalize=True,
+            )
         return layer.allreduce(
             hidden_states,
             all_reduce_params=AllReduceParams(
