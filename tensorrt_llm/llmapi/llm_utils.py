@@ -445,6 +445,17 @@ class CachedModelLoader:
         # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
         self.model_loader._update_from_hf_quant_config()
 
+        # Issue #11083 — context-aware defaults (two-stage loading, stage 1):
+        # read the on-disk config.json (pure Python, no GPU), resolve the
+        # model class, and apply model-specific default overrides to llm_args
+        # **before** weight loading. This surfaces model-aware defaults early
+        # enough for LLM construction, telemetry, and user inspection of
+        # llm.args. The same resolution runs a second time inside
+        # ModelLoader.load_config_and_apply_defaults during executor creation,
+        # but that richer pass is GPU-dependent.
+        if self.llm_args.backend == "pytorch":
+            apply_early_model_defaults(self._hf_model_dir, self.llm_args)
+
         return self._hf_model_dir
 
     @print_traceback_on_error
@@ -486,6 +497,7 @@ __all__ = [
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
     'apply_model_defaults_to_llm_args',
+    'apply_early_model_defaults',
 ]
 
 
@@ -557,6 +569,107 @@ def apply_model_defaults_to_llm_args(
         return applied
 
     return _compute_applied(model_defaults_dict, user_overrides)
+
+
+def apply_early_model_defaults(model_dir: Union[str, Path],
+                               llm_args: 'TorchLlmArgs') -> Dict[str, Any]:
+    """Read config.json and apply model-specific LLM API defaults **before**
+    weight loading.
+
+    This is the two-stage loading step described in Issue #11083: we read only
+    the on-disk ``config.json`` (a pure-Python, no-GPU operation), identify the
+    model architecture, and ask the resolved model class for its
+    :meth:`get_model_defaults` overrides. The overrides are merged into
+    ``llm_args`` without touching any field the user explicitly set.
+
+    The same resolution happens a second time inside
+    :meth:`ModelLoader.load_config_and_apply_defaults` during executor creation.
+    That second pass operates on a richer ``ModelConfig`` produced by the
+    checkpoint loader (spec config, quant config, etc.) and also resolves
+    ``"auto"`` sentinel values. This helper is intentionally lean: it does
+    **not** replicate any of that. Its job is merely to surface model-aware
+    defaults early enough that :class:`LLM` construction, telemetry, and any
+    user inspection of ``llm.args`` see the same defaults the executor will.
+
+    Safe to call with no GPU. Returns the applied-defaults dict (empty if no
+    model class matched or no defaults were produced). Never raises for
+    missing/unknown config — falls back silently so a malformed or unsupported
+    checkpoint cannot crash LLM construction.
+    """
+    if not isinstance(llm_args, TorchLlmArgs):
+        return {}
+
+    config_path = Path(model_dir) / "config.json"
+    if not config_path.is_file():
+        logger.debug(
+            f"apply_early_model_defaults: no config.json at {config_path}; "
+            "skipping early defaults.")
+        return {}
+
+    # Pure-Python config read — no transformers, no torch, no GPU required.
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            hf_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug(
+            f"apply_early_model_defaults: failed to read {config_path}: {exc}; "
+            "skipping early defaults.")
+        return {}
+
+    architectures = hf_config.get("architectures") or []
+    if not architectures:
+        model_type = hf_config.get("model_type") or "(unknown)"
+        logger.debug(
+            f"apply_early_model_defaults: config.json has no 'architectures' "
+            f"field (model_type={model_type}); cannot resolve a model class "
+            "for early defaults.")
+        return {}
+
+    # Lazy import: the model registry lives under _torch.models and is only
+    # populated on demand. Importing it here does not pull in CUDA.
+    try:
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+    except Exception as exc:
+        logger.debug(
+            f"apply_early_model_defaults: cannot import model registry: {exc}; "
+            "skipping early defaults.")
+        return {}
+
+    model_cls = get_registered_model_class(architectures[0])
+    if model_cls is None:
+        logger.debug(
+            f"apply_early_model_defaults: no registered class for "
+            f"architecture {architectures[0]!r}; skipping early defaults.")
+        return {}
+
+    if not hasattr(model_cls, "get_model_defaults"):
+        return {}
+
+    try:
+        model_defaults = model_cls.get_model_defaults(llm_args) or {}
+    except Exception as exc:
+        logger.debug(
+            f"apply_early_model_defaults: {model_cls.__name__}.get_model_defaults "
+            f"raised {exc}; skipping early defaults.")
+        return {}
+
+    if not model_defaults:
+        return {}
+
+    try:
+        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
+    except Exception as exc:
+        logger.debug(
+            f"apply_early_model_defaults: applying defaults for "
+            f"{model_cls.__name__} raised {exc}; skipping early defaults.")
+        return {}
+
+    if applied:
+        logger.info(
+            f"[early] Applied model defaults for {model_cls.__name__}: "
+            f"{applied}")
+    return applied
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
