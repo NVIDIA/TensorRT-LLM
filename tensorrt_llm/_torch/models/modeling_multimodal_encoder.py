@@ -181,15 +181,24 @@ class MultimodalEncoderMixin:
         config: "MultimodalEncoderCudaGraphConfig | None" = None,
         *,
         device: torch.device | None = None,
+        max_num_tokens: int | None = None,
     ) -> None:
         """Capture configured block graphs once, after weights and metadata are ready.
 
         The engine drives this lifecycle for every local multimodal encoder.
-        Standalone callers may provide an explicit config and device.
+        Standalone callers may provide an explicit config and device. Automatic
+        configs use their own token cap or the engine's original encoder budget;
+        raising the scheduling budget for an oversized item does not enlarge captures.
         """
         config = config if config is not None else self._encoder_cuda_graph_config
         if config is None or self._blocks_graph_runner is not None:
             return
+        if config.buckets is None and config.max_num_tokens is None:
+            if max_num_tokens is None or max_num_tokens <= 0:
+                raise ValueError("Automatic encoder graphs need max_num_tokens "
+                                 "from the config or engine.")
+            config = config.model_copy(
+                update={"max_num_tokens": max_num_tokens})
         runner = self._build_blocks_graph_runner(config)
         if device is None:
             device = next(cast(nn.Module, self).parameters()).device

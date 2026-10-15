@@ -771,7 +771,11 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # order.
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
-    def setup_attn_metadata(self, max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override the default to add `kv_layout="NHD"` for FlashInfer.
         # FlashInfer's original default is "NHD"; TRT-LLM switched the default
         # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
@@ -779,8 +783,10 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # always in NHD format ([tokens, heads, dim]).
         # Floor the request capacity at the same legacy fallback as the mixin
         # default while allowing one attention segment per encoder token.
-        capacities = self.get_encoder_attention_metadata_capacity(
-            max_num_tokens)
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
         metadata_kwargs = dict(
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,

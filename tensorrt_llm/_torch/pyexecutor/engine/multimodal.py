@@ -164,6 +164,8 @@ def mm_encoder_cache_enabled(model: nn.Module) -> bool:
 def setup_mm_encoder_cuda_graphs(
     model: nn.Module,
     graph_configs: Mapping[str, MultimodalEncoderCudaGraphConfig] | None = None,
+    *,
+    max_num_tokens: int | None = None,
 ) -> None:
     """Validate local encoder capabilities, then capture graphs before KV sizing.
 
@@ -171,6 +173,8 @@ def setup_mm_encoder_cuda_graphs(
         model: Loaded model whose local encoders have already initialized their metadata.
         graph_configs: Model-wide modality configs. Validate against all local towers together;
             models without local encoders may delegate encoding to another process.
+        max_num_tokens: Encoder token budget before any scheduling-only increase for large items.
+            Supplies the default capture capacity for automatic configs in each tower.
     """
     encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
     if graph_configs is not None and encoders:
@@ -186,7 +190,7 @@ def setup_mm_encoder_cuda_graphs(
                 f"Supported modalities: {sorted(supported_modalities)}."
             )
     for module in encoders:
-        module.enable_blocks_cuda_graph()
+        module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
 
 
 def setup_mm_encoder_attn_metadata(
@@ -220,10 +224,31 @@ def setup_mm_encoder_attn_metadata(
 
     for module in encoders:
         setup_kwargs: dict[str, Any] = dict(max_num_tokens=encoder_max_num_tokens)
+        encoder_max_seq_len = max_seq_len
         if attention_metadata_capacity is not None:
             setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
+        graph_config = module._encoder_cuda_graph_config
+        if graph_config is not None and graph_config.buckets is None:
+            # The default packed adapter isolates padding in one extra context/token.
+            # Reserve this small margin for automatic configs before any graph is captured.
+            reserve = int(graph_config.enable_padding)
+            graph_tokens = graph_config.max_num_tokens or encoder_max_num_tokens
+            max_batch_size = graph_config.max_batch_size
+            assert max_batch_size is not None
+            metadata_tokens = max(encoder_max_num_tokens, graph_tokens) + reserve
+            encoder_max_seq_len = max(max_seq_len, graph_tokens)
+            capacities = (
+                attention_metadata_capacity
+                if attention_metadata_capacity is not None
+                else module.get_encoder_attention_metadata_capacity(metadata_tokens)
+            )
+            setup_kwargs["max_num_tokens"] = metadata_tokens
+            setup_kwargs["attention_metadata_capacity"] = {
+                name: max(capacity, max_batch_size + reserve)
+                for name, capacity in capacities.items()
+            }
         module.setup_attn_metadata(**setup_kwargs)
-        module.set_attn_max_seq_len(max_seq_len)
+        module.set_attn_max_seq_len(encoder_max_seq_len)
 
 
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:

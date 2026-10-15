@@ -65,7 +65,7 @@ class EncoderGraphKey(NamedTuple):
 
     The fields' meaning depends on how the key is used:
 
-    * As a configured bucket, `total_tokens` is the maximum number of real (post-encode) tokens
+    * As a configured bucket, `total_tokens` is the maximum number of real block-input tokens
       the bucket is meant to cover, and `num_contexts` is the number of real contexts.
       Neither includes any padding reservation; the runner adds that internally.
     * As a captured graph key, both fields describe the adapter's fixed capture capacity.
@@ -106,6 +106,30 @@ class EncoderGraphIOAdapter(ABC):
     into graph-owned buffers; collection may trim different axes or output lengths without
     assuming that the encoder preserves the input token count.
     """
+
+    def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
+        """Generate shapes for every batch size within the total token budget.
+
+        Each context count uses per-context capacities starting at 256 tokens and doubling up
+        to its share of the budget, followed by the full token budget. Dense ``[batch, time, ...]``
+        layouts can round down their time dimension when allocating buffers and check it in
+        ``can_replay``. Adapters with additional alignment or minimum-length constraints can
+        override this.
+
+        Args:
+            max_batch_size: Maximum number of independent encoder contexts.
+            max_num_tokens: Maximum total tokens, including layout padding but excluding any
+                adapter-specific reservation added by ``graph_key``.
+        """
+        buckets = []
+        for num_contexts in range(1, min(max_batch_size, max_num_tokens) + 1):
+            max_seq_len = max_num_tokens // num_contexts
+            seq_len = min(256, max_seq_len)
+            while seq_len < max_seq_len:
+                buckets.append(EncoderGraphKey(seq_len * num_contexts, num_contexts))
+                seq_len *= 2
+            buckets.append(EncoderGraphKey(max_num_tokens, num_contexts))
+        return sorted(buckets)
 
     @abstractmethod
     def allocate_inputs(
@@ -329,17 +353,25 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         # Adopted from the first captured graph so subsequent bucket captures share the pool.
         self._memory_pool = None
 
-        if not config.buckets:
+        buckets = config.buckets
+        if buckets is None:
+            if config.max_batch_size is None or config.max_num_tokens is None:
+                raise ValueError(
+                    "Automatic encoder graphs require max_batch_size and a resolved "
+                    "max_num_tokens budget."
+                )
+            buckets = io_adapter.capture_buckets(config.max_batch_size, config.max_num_tokens)
+        if not buckets:
             raise ValueError(
-                "MultimodalEncoderCudaGraphConfig.buckets is empty; the runner has nothing to "
-                "capture."
+                "MultimodalEncoderCudaGraphConfig.buckets is empty; the runner has "
+                "nothing to capture."
             )
 
         # Field order is (total_tokens, num_contexts), matching the desired bucket ordering for
         # smallest-fit selection in `maybe_run()`.
         self._buckets: List[EncoderGraphKey] = sorted(
             EncoderGraphKey(total_tokens=total_tokens, num_contexts=num_contexts)
-            for total_tokens, num_contexts in config.buckets
+            for total_tokens, num_contexts in buckets
         )
         self._log_cuda_graph_memory_warning()
 

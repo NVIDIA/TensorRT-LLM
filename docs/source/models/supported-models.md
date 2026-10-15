@@ -162,6 +162,54 @@ Note:
 The following optimizations are available to models that implement
 `MultimodalModelMixin`.
 
+### Encoder CUDA graphs
+
+For encoders with CUDA graph support, set a maximum batch size in the model's
+modality configuration. For example, pass this YAML through `trtllm-serve --config`:
+
+```yaml
+multimodal_config:
+  encoder_cuda_graph:
+    vision:
+      max_batch_size: 8
+```
+
+The encoder adapter automatically generates capture shapes for batch sizes 1 through 8,
+within `encoder_max_num_tokens` (or `max_num_tokens` when unset). Use the optional
+per-modality `max_num_tokens` to limit capture memory and startup work. Batch size counts
+independent encoder contexts: images, video frame groups, or audio chunks as defined by
+the encoder. It does not count concurrent API requests or the scheduler's atomic items.
+Larger or unsupported shapes fall back to eager execution. Graphs remain disabled by default.
+
+Each supported tower reads its own modality entry. An audio adapter uses the same settings,
+with its own shape, mask, and output rules:
+
+```yaml
+multimodal_config:
+  encoder_cuda_graph:
+    vision:
+      max_batch_size: 8
+    audio:
+      max_batch_size: 4
+      max_num_tokens: 2048
+```
+
+The second example requires a model with graph-enabled vision and audio towers. The current
+production integrations are Qwen3-VL and related Qwen vision encoders, RADIO (`vision`), and
+GLM5-Next (`image` instead of `vision`). The shared audio adapter interface is available,
+but production audio towers still need an implementation and model validation. Requesting an
+unsupported modality fails before any graphs are captured.
+
+Advanced users can supply `buckets: [[256, 1], [512, 2]]` instead of `max_batch_size`
+and `max_num_tokens`. Each pair specifies total real encoder tokens and an exact context count.
+Automatic shapes use per-context capacities starting at 256 tokens (or the available budget
+when smaller), doubling up to each batch size's token budget. Adapters can override these
+shapes for additional alignment constraints. Padded replay is enabled by default; disabling it
+requires an exact token-count match. Encoder graphs and encoder side-stream prefetch are
+mutually exclusive.
+
+### Side streams and embeddings cache
+
 | Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
 | ------------------ | ------------------------------ | --------------------------- |
 | `Gemma4ForConditionalGeneration` | Yes | Yes |

@@ -156,6 +156,75 @@ def test_unsupported_encoder_graph_modality_fails_before_any_capture() -> None:
         setup_mm_encoder_cuda_graphs(model, graph_configs)
 
 
+def test_automatic_encoder_graph_budgets_are_resolved_per_tower_without_mutating_config() -> None:
+    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
+        def __init__(self, modality: str, mm_config: MultimodalConfig) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.encoder_cuda_graph_modality = modality
+            self.configure_encoder_cuda_graph(mm_config)
+            self.build_runner = Mock(return_value=Mock())
+
+        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
+            return self.build_runner(config)
+
+    mm_config = MultimodalConfig(
+        encoder_cuda_graph={
+            "vision": {"max_batch_size": 8},
+            "audio": {"max_batch_size": 4, "max_num_tokens": 512},
+        }
+    )
+    model = torch.nn.Module()
+    model.vision = Encoder("vision", mm_config)
+    model.audio = Encoder("audio", mm_config)
+    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph, max_num_tokens=2048)
+    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph, max_num_tokens=2048)
+
+    vision_config = model.vision.build_runner.call_args.args[0]
+    audio_config = model.audio.build_runner.call_args.args[0]
+    assert vision_config.max_batch_size == 8
+    assert vision_config.max_num_tokens == 2048
+    assert audio_config.max_batch_size == 4
+    assert audio_config.max_num_tokens == 512
+    assert mm_config.encoder_cuda_graph["vision"].max_num_tokens is None
+    assert mm_config.encoder_cuda_graph["audio"].max_num_tokens == 512
+    model.vision.build_runner.assert_called_once()
+    model.audio.build_runner.assert_called_once()
+    model.vision._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
+    model.audio._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
+
+
+def test_automatic_encoder_graphs_need_a_token_budget_before_capture() -> None:
+    encoder = MultimodalEncoderMixin()
+    encoder._encoder_cuda_graph_config = MultimodalEncoderCudaGraphConfig(max_batch_size=8)
+    with pytest.raises(ValueError, match="from the config or engine"):
+        encoder.enable_blocks_cuda_graph()
+
+
+@pytest.mark.parametrize("enable_padding", [False, True])
+def test_automatic_encoder_graph_metadata_reserves_padding_capacity(enable_padding) -> None:
+    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
+        def __init__(self) -> None:
+            super().__init__()
+            self._encoder_cuda_graph_config = MultimodalEncoderCudaGraphConfig(
+                max_batch_size=8, max_num_tokens=64, enable_padding=enable_padding
+            )
+            self.setup_attn_metadata = Mock()
+            self.set_attn_max_seq_len = Mock()
+
+    model = torch.nn.Module()
+    model.encoder = Encoder()
+    capacities = {"attention": 4}
+    setup_mm_encoder_attn_metadata(model, object(), 32, capacities)
+    reserve = int(enable_padding)
+    model.encoder.setup_attn_metadata.assert_called_once_with(
+        max_num_tokens=64 + reserve,
+        attention_metadata_capacity={"attention": 8 + reserve},
+    )
+    model.encoder.set_attn_max_seq_len.assert_called_once_with(64)
+    assert capacities == {"attention": 4}
+
+
 def test_encoder_graph_modality_validation_allows_delegated_encoders() -> None:
     model = torch.nn.Module()
     model.mm_encoder = None

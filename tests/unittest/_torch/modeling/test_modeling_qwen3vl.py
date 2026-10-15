@@ -652,16 +652,31 @@ def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 @pytest.mark.parametrize("deepstack_visual_indexes", [[0], [1, 0]])
+@pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
 def test_qwen3_vision_cuda_graph_replay_matches_eager(
-    monkeypatch: pytest.MonkeyPatch, attn_backend: str, deepstack_visual_indexes: list[int]
+    monkeypatch: pytest.MonkeyPatch,
+    attn_backend: str,
+    deepstack_visual_indexes: list[int],
+    automatic: bool,
 ) -> None:
+    from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
+        setup_mm_encoder_attn_metadata,
+        setup_mm_encoder_cuda_graphs,
+    )
+
     config_dict = copy.deepcopy(QWEN3_VL_8B_CONFIG)
     config_dict["vision_config"].update(depth=2, deepstack_visual_indexes=deepstack_visual_indexes)
     model_config = ModelConfig(
         pretrained_config=Qwen3VLConfig.from_dict(config_dict),
         attn_backend=attn_backend,
         multimodal_config=MultimodalConfig(
-            encoder_cuda_graph={"vision": MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])}
+            encoder_cuda_graph={
+                "vision": (
+                    MultimodalEncoderCudaGraphConfig(max_batch_size=2)
+                    if automatic
+                    else MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
+                )
+            }
         ),
     )
     torch.manual_seed(0)
@@ -673,13 +688,19 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
             else:
                 param.normal_(std=0.02)
     vision = encoder.visual
-    vision.setup_attn_metadata(max_num_tokens=1024)
+    if automatic:
+        setup_mm_encoder_attn_metadata(encoder, object(), 256, None)
+    else:
+        vision.setup_attn_metadata(max_num_tokens=1024)
     # 192 real tokens replay the (256, 1) bucket with a 65-token padding context.
     grid_thw = torch.tensor([[1, 12, 16]])
     pixel_values = torch.randn(192, 3 * 2 * 16 * 16, device="cuda")
     eager = encoder.encode_batched(pixel_values, grid_thw)
 
-    vision.enable_blocks_cuda_graph()
+    if automatic:
+        setup_mm_encoder_cuda_graphs(encoder, max_num_tokens=256)
+    else:
+        vision.enable_blocks_cuda_graph()
 
     def fail_eager_fallback(*args: object, **kwargs: object) -> None:
         raise AssertionError("Qwen3-VL vision CUDA graph replay fell back to eager.")
@@ -688,7 +709,7 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     graph = encoder.encode_batched(pixel_values, grid_thw)
 
     torch.testing.assert_close(graph, eager, rtol=5e-2, atol=5e-2)
-    (captured,) = vision._blocks_graph_runner._captured.values()
+    captured = vision._blocks_graph_runner._captured[(257, 2)]
     # Replay must refresh the device lengths read by attention, not only the host copy.
     assert captured.metadata.seq_lens_cuda.tolist() == [192, 65]
 
