@@ -8,9 +8,10 @@ from contextlib import asynccontextmanager, suppress
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-import grpc
 import pytest
-from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+grpc = pytest.importorskip("grpc", reason="gRPC runtime not installed")
+from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.coordinator as coordination  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402

@@ -20,11 +20,12 @@ import socket
 from types import SimpleNamespace
 
 import pytest
-from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 grpc = pytest.importorskip(  # noqa: E402
     "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
+from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
+
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     kv_pb2,
     openengine_pb2_grpc,
