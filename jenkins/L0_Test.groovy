@@ -160,6 +160,19 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // K8s pod retry, so 1 pod × 2 SLURM attempts = 2 total.
 SLURM_INFRA_RETRY_MAX = 1
 
+// Only source-specific signatures are safe to match against arbitrary test
+// stdout/stderr in the SLURM job log. Keep the concrete terms and their retry
+// policy owned by FailureClassifier.
+SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
+    "slurm-ucx-worker-address",
+    "cuda-device-unavailable",
+    "cuda-buffer-mapping",
+    "nvidia-driver-unavailable",
+    "gpu-lost",
+    "gpu-ecc-uncorrectable",
+    "nvlink-fabric-failure",
+]
+
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
 // independently as production telemetry comes in. Patterns tagged scope=K8S
@@ -316,11 +329,13 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
     }
 }
 
-// Stream-scan the complete remote job log for SLURM failure signatures,
-// returning at most one occurrence of each term. Matching policy and query
-// precedence remain in the shared libraries.
+// Stream-scan the complete remote job log for the source-safe catalog subset,
+// returning at most one occurrence of each signature. Matching policy and
+// query precedence remain in the shared libraries.
 def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
-    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM)
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM).findAll {
+        SLURM_JOB_LOG_EVIDENCE_QUERY_IDS.contains(it.id)
+    }
     def queryTerms = queries.collectMany { it.anyOf ?: (it.allOf ?: []) }.unique()
     if (!queryTerms) return [source: "SLURM_JOB_LOG", collectionStatus: "NO_MATCH"]
     def grepPatterns = queryTerms.collect {
