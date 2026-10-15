@@ -169,15 +169,13 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     f"request_id '{request_id}' is already active",
                 )
                 return
-            if request.media:
-                raise UnsupportedFeatureError("multimodal media is not supported")
             if request.lora_name:
                 raise UnsupportedFeatureError("LoRA selection is not supported")
             if request.HasField("kv"):
                 if request.kv.HasField("bypass_prefix_cache") and request.kv.bypass_prefix_cache:
                     raise UnsupportedFeatureError("prefix cache bypass is not supported")
 
-            inputs = _input_from_request(request)
+            inputs = await _input_from_request(request, self._llm)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
