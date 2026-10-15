@@ -122,7 +122,7 @@ def calc_engine_setting(
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
     if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
         mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
-        if mamba_ssm_cache_dtype != "auto":
+        if mamba_ssm_cache_dtype not in (None, "auto"):
             if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
                 bytes_per_elem = 4.0
 

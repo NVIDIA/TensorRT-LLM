@@ -20,12 +20,15 @@ import pytest
 
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.bench.tuning import heuristics
+from tensorrt_llm.bench.tuning.dataclasses import NemotronHybridConfig
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
     DatasetFormatError,
     create_dataset_from_stream,
     initialize_tokenizer,
 )
+from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
@@ -199,3 +202,43 @@ def test_acceptance_length_weighted_by_iterations():
     # (= sum(output_tokens) / total_decoding_iterations). This would fail under
     # output-token weighting.
     assert stats.acceptance_length_percentiles.average == pytest.approx(stats.acceptance_length)
+
+
+def _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype):
+    """trtllm-bench model config with the NVIDIA-Nemotron-Nano-12B-v2 geometry."""
+    return NemotronHybridConfig(
+        name="nvidia/NVIDIA-Nemotron-Nano-12B-v2",
+        model_type="nemotron_h",
+        param_count=12_310_001_152,
+        hybrid_override_pattern="M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-",
+        num_hidden_layers=62,
+        num_attention_heads=40,
+        num_key_value_heads=8,
+        hidden_size=5120,
+        head_dim=128,
+        ssm_state_size=128,
+        conv_kernel=4,
+        mamba_num_heads=128,
+        mamba_head_dim=80,
+        n_groups=8,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
+
+
+def test_calc_engine_setting_treats_unset_ssm_cache_dtype_as_auto(monkeypatch):
+    """An unset mamba_ssm_cache_dtype is sized like "auto"."""
+    monkeypatch.setattr(heuristics, "get_device_memory", lambda: 80.0)
+
+    def engine_setting(mamba_ssm_cache_dtype):
+        return heuristics.calc_engine_setting(
+            _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype),
+            QuantConfig(),
+            tp_size=1,
+            pp_size=1,
+            target_input_len=128,
+            target_output_len=128,
+        )
+
+    auto_setting = engine_setting("auto")
+    assert engine_setting(None) == auto_setting
+    assert engine_setting("float32")[0] < auto_setting[0]
