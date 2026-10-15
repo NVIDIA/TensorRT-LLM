@@ -60,10 +60,10 @@ TEST_DB_DIR = "tests/integration/test_lists/test-db"
 #: under ``CATALOG_TESTS_DIR/models/<family>/<target>/``.
 MODEL_OPS_DIRNAME = "ops"
 
-# What a target is made of since the target layer: the core dispatches each
-# step to one of these two, chosen by ``_target.phase_of``.
+# What a target is made of: the core dispatches each step to one of these two,
+# chosen by its ``_select_target`` (decode when ``num_contexts == 0``).
 TARGET_CLASSES = ("PrefillTarget", "DecodeTarget")
-# The fields ``phase_of`` routes on; a decode target states them, never reads them.
+# The fields the core routes on; a decode target states them, never reads them.
 PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
 # Module-level names of a manifest written beside the weight table by hand.
 HAND_MANIFEST_NAMES = ("MANIFEST", "_manifest")
@@ -430,8 +430,8 @@ def _base_names(node: ast.ClassDef) -> set[str]:
 def _check_phase_targets(tree: ast.AST) -> list[Check]:
     """Both targets exist, each answers for its step, and decode never reads the phase back.
 
-    The core dispatches each step to ``PrefillTarget`` or ``DecodeTarget`` on
-    ``phase_of(attn_metadata)``; a core with one of them routes half its steps
+    The core dispatches each step to ``PrefillTarget`` or ``DecodeTarget`` in
+    ``_select_target(attn_metadata)``; a core with one of them routes half its steps
     into an AttributeError. Decode is routed to only when ``num_contexts == 0``,
     so a read of ``num_contexts`` / ``num_ctx_tokens`` inside it is a branch on
     a per-capture constant -- frozen at whatever the capturing batch carried.
@@ -544,7 +544,8 @@ def _check_weight_table(weights_py: Path) -> Check:
     return Check(
         name="target:weight-table",
         passed=not problems,
-        detail="; ".join(problems) or f"{tables[0].name} declares WEIGHTS; MODEL_WEIGHTS exposes it",
+        detail="; ".join(problems)
+        or f"{tables[0].name} declares WEIGHTS; MODEL_WEIGHTS exposes it",
     )
 
 

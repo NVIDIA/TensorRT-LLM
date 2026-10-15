@@ -41,6 +41,17 @@ RETIRED = (
     "isolation hook",
     "bench/accuracy.py",
     "bench/perf.py",
+    # The pre-merge modeling_v2 draft: an entry's op call is `__call__`, there
+    # is no bind layer, the catalog is its entry files, and a target's
+    # weights.py and modeling.py carry their own classes.
+    "raw_call",
+    "bind_const",
+    "bind_layered",
+    "index.yaml",
+    "index.d/",
+    "ModelWeights",
+    "phase_of",
+    "_target.py",
 )
 
 
@@ -142,9 +153,11 @@ def test_certification_is_three_state_in_the_smith_prompt():
 def test_the_smith_prompt_teaches_the_19977_entry_form():
     """An entry is an OpWrapper class with an executable contract, in one of two homes."""
     smith = DEFAULT_PROMPTS.smith
-    for member in ("`raw_call`", "`reference`", "`is_valid`", "`compare`", "`CELLS`", "`ARCHS`"):
+    for member in ("`__call__`", "`reference`", "`is_valid`", "`CELLS`", "`ARCHS`"):
         assert member in smith
-    assert "there is no `.md` beside it" in smith
+    for gone in ("raw_call", "bind_const", "`compare`", "index.yaml", "index.d"):
+        assert gone not in smith, gone
+    assert "one `OpWrapper` subclass per file" in smith
     assert "/ops/<category>/<name>.py" in smith
     assert "models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py" in (
         smith

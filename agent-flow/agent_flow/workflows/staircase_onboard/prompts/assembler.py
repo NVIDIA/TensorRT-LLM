@@ -40,15 +40,15 @@ and skipping the from-scratch flow.
   **computational semantics only**. The checkpoint was trained against it, so
   it is the ground truth of the math. Its op-by-op torch shape is never the
   shape of target code
-- the catalog: `index.yaml` lists the shared entries; each entry's `.py` is
-  its executable contract (`raw_call` is how to call it, `CELLS` and `ARCHS`
-  what is certified, `note` the rest). Ops only this target calls go in its
-  own `ops/<category>/`
+- the catalog: the shared entries are the files under `catalog/<category>/`;
+  each entry's `.py` is its executable contract (`__call__` is how to call it,
+  every argument explicit; `CELLS` and `ARCHS` what is certified, `note` the
+  rest). Ops only this target calls go in its own `ops/<category>/`
 - your skills' `references/`
 - existing targets — gate-verified exemplars of every pattern
 
 **Exemplar discipline: patterns, never values.** An exemplar shows the shape —
-the core and its two targets, where each binding is made, the weight table,
+the core and its two targets, what each call site passes, the weight table,
 the attention argument split. Every model-specific value is re-derived from
 *this* checkpoint. Targets carry no configuration asserts, so nothing in the
 exemplar will refuse your checkpoint for you: the derivation table is where
@@ -77,12 +77,13 @@ work is acceptable at all:
    changes the forward's structure) or read from `pretrained_config` where it
    is bound. A guard is owed only where routing cannot see the fact — a
    runtime combination a feature cannot serve.
-4. **Weights are declared once, in the weight table.** `weights.py` is a
-   `ModelWeights` subclass — one `W` row per role, `dims()` the only place a
-   width is derived, `MODEL_WEIGHTS` its instance; the core calls
-   `declare`, the shell's `load_weights` calls `load`. Flat
-   `nn.ParameterDict`, `torch.empty` only, HF `[out, in]` storage. Never a
-   hand-written manifest.
+4. **Weights are declared once, in the weight table.** `weights.py` holds a
+   `W` role class (shape, src, transform) and a table class — one `W` row per
+   role in `WEIGHTS: tuple[W, ...]`, `dims` the only place a width is derived,
+   `declare` / `manifest` / `load` the passes over it — and `MODEL_WEIGHTS`,
+   its module-level instance; the core calls `declare`, the causal-LM class's
+   `load_weights` calls `load`. Flat `nn.ParameterDict`, `torch.empty` only,
+   HF `[out, in]` storage. Never a hand-written manifest.
 5. **Load coverage holds in both directions** — every declared parameter
    filled, every checkpoint key consumed — with one explicit escape,
    `expected_unconsumed`, for weights this target deliberately does not
@@ -92,19 +93,23 @@ work is acceptable at all:
    forward that violates them is wrong the first time it is captured. No
    `.item()`, no `.cpu()`, no data-dependent host branching in the forward.
 7. **The core dispatches; `PrefillTarget` and `DecodeTarget` run the step.**
-   The core advances the step generation and routes on `phase_of(md)`; a
-   mixed batch is prefill's. Both targets are built in `post_load_weights`,
-   derive from `Target` directly and share no body. `DecodeTarget` states
+   The core, a `DecoderModel`, routes each step through
+   `_select_target(attn_metadata)` — decode when `num_contexts == 0` — so a
+   mixed batch is prefill's. Both targets are plain classes with no base,
+   built in `post_load_weights`, sharing no body; each defines `step_args(md)`
+   and `forward`, plus `_check_step_contract` gated by
+   `_router_index.step_contract_enabled()`. `DecodeTarget` states
    `num_contexts=0, num_ctx_tokens=0` and never reads either. Each forward is
    flat: one code path, branching only on metadata and per-capture constants.
-8. **Bind once; call with data.** Each target binds its own entry instances in
-   `__init__` (`bind_const`, `bind_layered(i, ...)`), rebinds per-step state
-   once at the top of `forward` — never inside the layer loop — and calls
-   with data tensors and `layer=i`, every call stating its outputs:
-   `out = op(in, out=buf, layer=i)`.
+   The causal-LM class is `ModelingV2<Name>(DecoderModelForCausalLM[...])`.
+8. **Every argument at the call site.** A target imports each entry's
+   module-level instance and passes weights, per-step state and config
+   scalars at the call site, every call. `step_args(md)` projects the step
+   state once at the top of `forward` — never inside the layer loop — and
+   every call states its outputs: `out = op(x, L.w, ..., **step)`.
 9. **Self-containment.** No code shared across targets; a target imports the
-   catalog, the framework and its own siblings only. Duplication between
-   targets is the architecture, not a smell.
+   catalog and its own siblings only. Duplication between targets is the
+   architecture, not a smell.
 10. **Every fixed size answers to an engine limit.** A constant that bounds
     rows, tokens, batch or slots, or that sizes a buffer, is derived from an
     engine argument at construction or declared `# capacity: <axis>` /
@@ -116,9 +121,8 @@ work is acceptable at all:
 
 Each target's `forward` records the **metadata** of every entry call it
 makes — shapes, dtypes, the constants passed — and the run writes it out.
-Bound values are not at the call site: record the call's own arguments at the
-call, and the per-step bindings (the `step_args` projection) when they are
-bound.
+Every value an entry receives is at its call site, the `step_args` projection
+included, so record each call's own arguments there.
 
 This exists for a class of value nothing else surfaces: the shapes the engine
 **varies at runtime**. Decode batch sizes, page sizes, feature flags. They are
@@ -203,7 +207,7 @@ it verifies first and resumes you. Either way nobody has to relay it.
 The skill specifies it in full. At minimum: the target path; the **derivation
 table** (each axis and what this model required, flagging every axis where
 this target differs from the exemplar you read); the **vocabulary audit** (each
-target's call list, each trtllm op mapped to its `index.yaml` path or its
+target's call list, each trtllm op mapped to its `catalog/` file or its
 `ops/` file, scoped to each `forward` plus the private methods it reaches);
 the **dump review** (which values the engine produced at runtime and where
 each sits against its entry's `CELLS`); the
@@ -224,7 +228,7 @@ disprove it.
 | "HF's forward does it op by op; transliterating that is safest" | HF defines the math, the catalog defines the vocabulary. The target is the fused form of HF's semantics, not a transcription of either reference. |
 | "The exemplar computes X, this config says Y — add an assert so it refuses the mismatch" | Targets carry no configuration asserts. Re-derive X for this checkpoint; if it changes the forward's structure, make it a routing criterion. |
 | "Prefill and decode do the same thing here; one shared base saves 200 lines" | The two targets share no body. Duplicate it — each must stay readable and changeable alone. |
-| "Bind the step state inside the layer loop, it is simpler" | Per-step state is rebound once at the top of `forward`; the loop carries data and `layer=i` only. |
+| "Project the step state inside the layer loop, it is simpler" | `step_args(md)` runs once at the top of `forward`; the loop passes that result on with each layer's data and weights. |
 | "Add `REQUIRED_TRTLLM_OPS` so a renamed op is caught early" | It is gone on purpose. `step_args` is the probe, and a renamed op fails at its call. |
 | "The exemplar's value is probably right here too" | Values are re-derived from this checkpoint. Always. |
 | "The accuracy gate is short by a point; the reference must be stale" | The anchor is read-only. Debug your assembly first; a shortfall that survives self-heal is a finding to report. |

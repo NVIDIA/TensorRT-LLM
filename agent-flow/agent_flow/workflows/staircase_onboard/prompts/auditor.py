@@ -14,19 +14,18 @@ memory of how this target was built — deliberately, so that nothing you
 conclude is inherited from the agents whose claims you are checking.
 
 Most of delivery is mechanical and already done: the orchestrator has verified
-in Python that the files exist, that `index.yaml` is in sync, that the
-target has its prefill and decode targets and its weight table, that every
-target-owned op has its test, that the target routes, that the accuracy
-anchor is present, and that the tests are registered. Those results are in
-your prompt.
+in Python that the files exist, that the target has its prefill and decode
+targets and its weight table, that every entry it imports has its test, that
+the target routes, that the accuracy anchor is present, and that the tests are
+registered. Those results are in your prompt.
 
 **You exist for the one check that code cannot do.**
 
 ## The check: the runtime-value dump against the certified columns
 
 The target's two forwards recorded the metadata of every entry call they
-made — shapes, dtypes, the constants passed, and the per-step bindings — at
-runtime. Each entry states what it is certified over in its `.py`: `CELLS`
+made — shapes, dtypes, the constants passed, and the `step_args` projection —
+at runtime. Each entry states what it is certified over in its `.py`: `CELLS`
 (each with a `spec` the entry's test interprets and a `why`), `ARCHS`, and a
 `note` for what is left. A "certified column" below means the cells on an
 architecture the entry lists. Deciding whether a dumped value falls inside
@@ -35,7 +34,7 @@ is prose. That is why a human-language reader does it and a script does not.
 
 For every distinct value in the dump:
 
-1. find the entry it was passed to — in `catalog/index.yaml`, or in the
+1. find the entry it was passed to — in `catalog/<category>/`, or in the
    target's own `ops/<category>/` for an op only this target calls
 2. read that entry's `CELLS` and `ARCHS` (and `note`) — specifically the cells
    certified on **this GPU architecture**
@@ -144,7 +143,7 @@ the full uncovered list if any), a `decision` of exactly `CLEAN` or
 |---|---|
 | "The gates passed, so the values must be fine" | Gates are blind to this. A value outside its certified column produces correct output right up until it does not. |
 | "There's a receipt, just for sm_100 not sm_103" | Receipts are per-architecture. Absent means unknown. |
-| "TARGET notes already record this as an open surface" | Recording a gap is not closing it. It is a blocker. |
+| "A design note already records this as an open surface" | Recording a gap is not closing it. It is a blocker. |
 | "Only one value is outside, and barely" | A certified column is a boundary, not a gradient. Inside or outside. |
 | "I'll check the constants in the source" | The constants were never the problem. Read the dump. |
 | "I described every gap carefully in the summary" | Nothing reads the summary. The `uncovered` list is what gets dispatched; prose is for the human reading the journal afterwards. |

@@ -43,29 +43,30 @@ ModelingV2 is in the TensorRT-LLM tree, not in a separate repo:
 
 | what | path |
 |---|---|
-| kernel catalog (shared) | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.py` |
-| catalog index | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` |
+| kernel catalog (shared) | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.py` — the catalog is its entry files |
+| entry base | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/_op.py` (`OpWrapper`, `Cell`, `Arch`) |
 | catalog GPU tests | `tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py` |
 | a target's own ops | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/ops/<category>/<name>.py` |
 | their GPU tests | `tests/unittest/_torch/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py` |
 | targets | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/{modeling,weights}.py` |
 | target-owned ops | `.../models/<family>/<ckpt>__<arch>__<parallel>/ops/<category>/<name>.py`, tested at `tests/unittest/_torch/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py` |
-| target framework | `tensorrt_llm/_torch/_experimental/modeling_v2/{_target,_weights}.py` (`Phase`/`Target`, `W`/`ModelWeights`) |
-| routing | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/routing.py` |
+| routing | `tensorrt_llm/_torch/_experimental/modeling_v2/_router_index.py` (`architectures[0]` -> family routing module), and `models/<family>/routing.py` (`route` returns the target class) |
+| source-level gates | `tests/unittest/_torch/modeling_v2/test_modeling_v2_{claims,routing,no_stale_claims,target_contract}.py` |
 | accuracy anchors | `tests/integration/defs/accuracy/references/<benchmark>.yaml` |
 | accuracy gates CI runs | `tests/integration/defs/accuracy/test_modeling_v2_*.py` |
 
 Two consequences worth holding onto:
 
 - **A catalog entry is one `OpWrapper` class, and it spans two trees.** The
-  class is the contract (`raw_call`, `reference`, `is_valid`, `compare`,
-  `CELLS`, `ARCHS`, `note`; see `catalog/_op.py`) — there is no `.md`. Its
-  GPU test lives in the tests tree, because that is where this repo's CI
-  collects from, and drives every cell. An op only one target calls lives in
-  that target's `ops/`; the shared catalog holds the rest, and a target
-  imports the catalog and its own `ops/`, nothing of another target's. A
-  certification is valid only if the run behind it post-dates the last write
-  to *every* file of its entry, so that check looks in both trees.
+  class is the contract (`__call__`, `reference`, `is_valid`, `CELLS`,
+  `ARCHS`, `note`; see `catalog/_op.py`), and the file ends in the one
+  module-level instance targets import. Its GPU test lives in the tests tree,
+  because that is where this repo's CI collects from, and drives every cell.
+  An op only one target calls lives in that target's `ops/`; the shared
+  catalog holds the rest, and a target imports the catalog and its own
+  `ops/`, nothing of another target's. A certification is valid only if the
+  run behind it post-dates the last write to *every* file of its entry, so
+  that check looks in both trees.
 - **Every test file is named `test_modeling_v2_*`** precisely so it cannot
   collide with the upstream test of the same op, and so the CI selector can
   match it exactly. Do not invent a different name.
@@ -83,21 +84,23 @@ drifting engine from a wrong answer into a loud failure.
 MODELING_V2_SWITCH = """\
 ## The modeling_v2 switch
 
-`TRTLLM_MODELING_V2` selects the modeling path: `off` (default) is today's
-behaviour byte for byte, `auto` uses a target when one matches and silently
-falls back when none does, `require` raises instead of falling back.
+The LLM-API argument `modeling_v2` selects the modeling path —
+`LLM(model, modeling_v2=...)`, or `modeling_v2: ...` in the options YAML:
+`off` (default) is today's behaviour byte for byte, `auto` uses a target when
+one matches and silently falls back when none does, `require` raises instead
+of falling back.
 
 **Anything you will attribute to modeling_v2 runs under `require`.** Under
 `auto`, a configuration that misses a target's routing criteria gets the
 built-in implementation — and a gate or a curve measured that way reads as
 modeling_v2's. It is the most expensive mistake available here.
 
-It must be exported **before the ranks start**, not merely before `LLM(...)`.
-Worker ranks receive the environment as it stood when MPI initialized, so a
-value set later reaches the driver and not them, and a driver resolving a
-modeling_v2 target while its workers resolve the built-in is the silent split
-the switch exists to prevent. The run's launch prefix already carries it; do
-not set it yourself.
+It is an argument rather than an environment variable so that it reaches
+every rank the way the rest of the arguments do; nothing in the engine reads
+an environment switch. The run's gates carry the mode as `TRTLLM_MODELING_V2`
+in their launch prefix and the gate harness hands it to the LLM constructor
+as `modeling_v2`, so a gate needs nothing from you. The variable alone selects
+nothing: a command you write yourself passes the argument.
 """
 
 # Reports are claims. This is the sentence the orchestrator is built around.
@@ -303,7 +306,7 @@ def source_embargo_block(paths: Sequence[str]) -> str:
     **The opening sentence splits on where the paths point**, because the
     two cases are not the same claim. An in-repo entry means the engine
     already ships this checkpoint, and running it is a matter of
-    ``TRTLLM_MODELING_V2=off``. An out-of-repo entry — a sibling vLLM or
+    ``modeling_v2=off``. An out-of-repo entry — a sibling vLLM or
     SGLang checkout on this filesystem — means another engine implements it,
     and running it means starting that engine as a black-box oracle. Saying
     "this repository" for the second case would be false, and a rule whose
@@ -345,7 +348,7 @@ def source_embargo_block(paths: Sequence[str]) -> str:
     if in_repo:
         running.append(
             "**Running the in-repository implementation is expected.** Under "
-            "`TRTLLM_MODELING_V2=off` the engine uses exactly that implementation, "
+            "`modeling_v2=off`, the LLM-API default, the engine uses exactly that implementation, "
             "which makes it this run's accuracy oracle: the same harness, the same "
             "workload, one variable. Measure against it freely."
         )

@@ -186,7 +186,7 @@ def test_an_embargo_names_every_path_and_permits_running_them():
     # Reading is forbidden; running is the point. A block that forbade both
     # would throw away the run's only accuracy oracle.
     assert "off limits to read" in block
-    assert "TRTLLM_MODELING_V2=off" in block
+    assert "`modeling_v2=off`" in block
 
 
 def test_no_embargo_adds_nothing():
@@ -215,7 +215,7 @@ def test_both_kinds_of_entry_each_get_their_own_premise_and_permission():
     )
     assert "already has an implementation in this repository" in block
     assert "another engine's checkout on this filesystem" in block
-    assert "TRTLLM_MODELING_V2=off" in block
+    assert "`modeling_v2=off`" in block
     assert "black-box oracle is expected" in block
 
 
@@ -627,9 +627,12 @@ def test_the_eval_gates_carry_the_declared_runtime_configuration(tmp_path):
 
 
 def test_the_accuracy_command_selects_the_target_through_the_llm_api(tmp_path):
-    """Nothing in the engine reads TRTLLM_MODELING_V2 any more: target selection is the
-    LLM-API argument `modeling_v2`, default "off". A gate that only exported the switch
-    served the built-in model and recorded the verdict as the target's."""
+    """The accuracy command hands the mode to the LLM API, not just to the environment.
+
+    Nothing in the engine reads TRTLLM_MODELING_V2: target selection is the LLM-API
+    argument `modeling_v2`, default "off". A gate that only exported the switch would
+    serve the built-in model and record the verdict as the target's.
+    """
     from dataclasses import replace
 
     import yaml
@@ -638,9 +641,15 @@ def test_the_accuracy_command_selects_the_target_through_the_llm_api(tmp_path):
 
     options = tmp_path / "llm_api.yaml"
     options.write_text("kv_cache_config: {dtype: fp8}\n", encoding="utf-8")
-    environment = resolve_environment({"environment": {"kind": "local", "python": "/py"}}, world_size=1)
+    environment = resolve_environment(
+        {"environment": {"kind": "local", "python": "/py"}}, world_size=1
+    )
     environment = replace(environment, env={**environment.env, MODELING_V2_ENV: "require"})
-    task = {"checkpoint_path": "/ckpt", "parallel": "tp1", "accuracy": {"llm_api_options": str(options)}}
+    task = {
+        "checkpoint_path": "/ckpt",
+        "parallel": "tp1",
+        "accuracy": {"llm_api_options": str(options)},
+    }
     joined = " ".join(eval_command(task, environment, "gsm8k"))
     used = joined.split('--extra_llm_api_options="', 1)[1].split('"', 1)[0]
     merged = yaml.safe_load(open(used, encoding="utf-8"))

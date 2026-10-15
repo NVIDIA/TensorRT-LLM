@@ -62,8 +62,8 @@ anyway. That changes what a useful review is:
   the HF reference, so a mapping that is all-green for a `tepN`/`depN` target
   and never mentions a reduce or a gather was not derived, it was assumed.
 - every step says which phase runs it (prefill, decode or both), and every
-  `call_sites` row names its target. The two targets bind and call their own
-  entries, and only decode's call sites are captured; a mapping with no phase
+  `call_sites` row names its target. Each target calls its entries from its
+  own body, and only decode's call sites are captured; a mapping with no phase
   cannot be checked against the capture grid.
 - an `entry` is either `catalog/<category>/<name>.py` or the target's own
   `ops/<category>/<name>.py` (a queue `target` likewise `<category>/<name>` or
@@ -82,7 +82,7 @@ anyway. That changes what a useful review is:
   `max_num_tokens` and `cuda_graph_config.max_batch_size` do not — they are
     tuning knobs. Batch composition and `num_contexts` do not — they move every
   step, and a target chosen from them would be chosen once and then be wrong
-  (the phase is chosen per step inside the target, by `phase_of`).
+  (the phase is chosen per step, by the core's `_select_target`).
 - every axis on which the forward's structure differs from the exemplar's is
   either pinned by those criteria or re-derived in the plan. Targets carry no
   configuration asserts, so an axis the fingerprint misses and the plan does

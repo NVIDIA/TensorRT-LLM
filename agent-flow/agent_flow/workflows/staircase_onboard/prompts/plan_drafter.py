@@ -64,18 +64,19 @@ reads below are not the place to save time.
    this structure needs, which attention backend serves this head geometry,
    is there an MLA path, what does the engine vary at runtime. Write down the
    *gaps* — what TensorRT-LLM does not support for this checkpoint today.
-4. **The catalog.** `catalog/index.yaml` lists the shared entries; an op one
-   existing target owns sits in that target's `ops/<category>/` and moves to
-   the catalog when a second target needs it. Each entry's `.py` decides
-   coverage: its `CELLS` on the architectures in `ARCHS`, and its `note`.
+4. **The catalog.** The shared entries are the files under
+   `catalog/<category>/`, one entry per file; an op one existing target owns
+   sits in that target's `ops/<category>/` and moves to the catalog when a
+   second target needs it. Each entry's `.py` decides coverage: its `CELLS` on
+   the architectures in `ARCHS`, and its `note`.
 
 ## The vocabulary mapping — do the judging here
 
 Walk the checkpoint's computation steps and record **this checkpoint's value
 on every axis** for each one, and which phase runs it — prefill, decode or
-both: the two targets bind their own entries, and a step only prefill runs
-(MLA's context path, a KV materialization) is never decode's to certify. Then
-map each step onto the catalog. Three states:
+both: each target calls its entries from its own body, and a step only
+prefill runs (MLA's context path, a KV materialization) is never decode's to
+certify. Then map each step onto the catalog. Three states:
 
 | state | meaning | action |
 |---|---|---|
@@ -167,7 +168,9 @@ a score, stop and say so. An anchor is never invented.**
   every axis on which this checkpoint's forward differs structurally from the
   exemplar's must be pinned here or it is pinned nowhere
 - the core's class name, which carries the family and the parallel strategy
-  (`<Family><Par>ModelingV2`), and the shell's synthetic name
+  (`<Family><Par>ModelingV2`), and the causal-LM class's, `ModelingV2<Name>`,
+  which carries every segment of the target directory and is what `route`
+  returns
 - the checkpoint's derived facts: geometry, quantization, tokenizer and chat
   template details, `layer_types` if hybrid
 - assembly units, in order: `core` first, then one per requested feature
@@ -219,7 +222,7 @@ Rules the schema enforces, so get them right the first time:
 - **the two chapters do not overlap.** An entry smith onboards is tested at
   this checkpoint's values by construction, so it never also needs verifying
 - `call_sites` lists every place the target will call the entry — naming
-  `PrefillTarget` or `DecodeTarget`, since each binds and calls its own — with the
+  `PrefillTarget` or `DecodeTarget`, since each calls its own — with the
   rows per request it passes at a captured step: 1 for a decode step,
   `1 + draft` at a speculative verify step, a fraction of that on a
   compressed path, the drafter's own width for a drafter call. `gathered:
@@ -268,7 +271,7 @@ what you wrote in **both** files and the counts by state, and a `decision`:
 | "No op in the inventory, so it's a ceiling" | The inventory cannot see FlashInfer's API or pybind bindings. Check the survey's FlashInfer list and the catalog too. A wrong ceiling costs a feature; a wrong verify costs one dispatch. |
 | "FlashInfer has it but no trtllm op wraps it, so I'll write a Triton kernel" | That is tier 3: the entry calls `flashinfer.<module>.<name>` directly. Writing a kernel the engine already ships is tier 5 for no reason. |
 | "I can compose this op from a few torch calls" | An op's math assembled from torch calls is always a vocabulary gap. Native torch is glue: layout, movement, allocation, lookup. |
-| "Prefill and decode run the same steps, so one mapping covers both" | Each target binds and calls its own entries. Mark each step's phase; a step only prefill runs is never decode's to certify, and a decode-only call site is the captured one. |
+| "Prefill and decode run the same steps, so one mapping covers both" | Each target calls its entries from its own body. Mark each step's phase; a step only prefill runs is never decode's to certify, and a decode-only call site is the captured one. |
 | "The anchor is probably around X" | Anchors come from a written source or from the user. Never invented. |
 | "The HF reference does it op by op; the plan should mirror that" | HF defines the math, the catalog defines the vocabulary. The target is the fused form of HF's semantics. |
 | "I'll mark everything depends_on the previous item to be safe" | Every spurious dependency serializes a batch that would have run concurrently. Order only what genuinely must be ordered. |

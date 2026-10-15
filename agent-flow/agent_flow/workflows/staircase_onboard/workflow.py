@@ -2736,8 +2736,10 @@ class StaircaseOnboardWorkflow:
                 # nothing.
                 units = assembly_units(self.task_data)
                 state.unit_index = units.index(added[0])
-            elif state.done and self.entry_stage == STAGE_TUNE and (
-                state.verdict == "delivered" or state.verdict.startswith("tune")
+            elif (
+                state.done
+                and self.entry_stage == STAGE_TUNE
+                and (state.verdict == "delivered" or state.verdict.startswith("tune"))
             ):
                 # An explicit `tune` is the operator's decision to spend more:
                 # re-enter at tune, keep the campaign's history, reset its misses.
@@ -3356,7 +3358,7 @@ class StaircaseOnboardWorkflow:
             )
         elif item.tier == TIER_KERNEL_LIBRARY:
             tier += (
-                "`raw_call` calls the FlashInfer callable directly — no trtllm op "
+                "The entry's `__call__` calls the FlashInfer callable directly — no trtllm op "
                 "wraps it. The FlashInfer API the survey found is in `surface.md` in "
                 "the workspace; certify it as the kernel source `flashinfer_api` "
                 "below says.\n"
@@ -3567,6 +3569,10 @@ def _same_tree(a: Path, b: Path) -> bool:
 
     if not b.is_dir():
         return False
-    files_a = sorted(p.relative_to(a) for p in a.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-    files_b = sorted(p.relative_to(b) for p in b.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    files_a = sorted(
+        p.relative_to(a) for p in a.rglob("*") if p.is_file() and "__pycache__" not in p.parts
+    )
+    files_b = sorted(
+        p.relative_to(b) for p in b.rglob("*") if p.is_file() and "__pycache__" not in p.parts
+    )
     return files_a == files_b and all(filecmp.cmp(a / f, b / f, shallow=False) for f in files_a)

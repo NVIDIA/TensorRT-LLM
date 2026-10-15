@@ -233,7 +233,7 @@ def test_a_flashinfer_dispatch_is_told_to_call_the_library_directly(tmp_path):
         QueueItem(n=1, mode="onboard", target="norm/gemma_rmsnorm", tier=TIER_KERNEL_LIBRARY)
     )
     assert f"tier {TIER_KERNEL_LIBRARY}" in prompt and "FlashInfer" in prompt
-    assert "`raw_call` calls the FlashInfer callable directly" in prompt
+    assert "`__call__` calls the FlashInfer callable directly" in prompt
     assert "you are writing it" not in prompt
 
 

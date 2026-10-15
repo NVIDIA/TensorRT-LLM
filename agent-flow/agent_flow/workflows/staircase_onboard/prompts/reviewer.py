@@ -30,24 +30,25 @@ has inverted the economics of the whole run.
    Scope is the whole trick: the rope table's `arange`/`cos`/`sin` and
    load-time `.t()`/`.to()` run at init and are outside the rule, so a
    whole-file scan false-positives on them. Check the assembler scoped it
-   correctly, and spot-check two or three calls against `catalog/index.yaml`
-   or the `ops/` file yourself rather than trusting the list.
-2. **The target layer is intact.** The core's `forward` advances the step
-   generation once and routes through `_select_target` / `phase_of`; both
-   `PrefillTarget` and `DecodeTarget` exist, derive from `Target` directly,
-   are built in `post_load_weights`, and share no body (no intermediate base,
-   no mixin). `DecodeTarget` states `num_contexts=0, num_ctx_tokens=0` in its
-   `step_args` and reads neither anywhere — a read there is a branch frozen at
-   capture. Every metadata field a target consumes is read in its
-   `step_args`, which is the step-contract probe. A reintroduced
-   `REQUIRED_TRTLLM_OPS` / `_STEP_FIELDS` list, or a configuration assert
-   re-validating what routing pins, is a finding.
-3. **Binding discipline.** Entries are bound in each target's `__init__`
-   (`bind_const`, `bind_layered(i, ...)` only on the layers that have the
-   operand); per-step state and per-step scratch are bound or allocated once
-   at the top of `forward`, never inside the layer loop; call sites pass data
-   and `layer=i` and state their outputs (`out = op(in, out=buf, layer=i)`);
-   no bound instance is shared between targets.
+   correctly, and spot-check two or three calls against the `catalog/` or
+   `ops/` entry file yourself rather than trusting the list.
+2. **The target layer is intact.** The core's `forward` routes each step
+   through `_select_target(attn_metadata)` — decode when `num_contexts == 0`
+   — and does nothing else; both `PrefillTarget` and `DecodeTarget` exist as
+   plain classes, are built in `post_load_weights`, and share no body (no
+   base class, no mixin). `DecodeTarget` states `num_contexts=0,
+   num_ctx_tokens=0` in its `step_args` and reads neither anywhere — a read
+   there is a branch frozen at capture. Every metadata field a target
+   consumes is read in its `step_args`, which `_check_step_contract` probes
+   when `step_contract_enabled()`. A reintroduced `REQUIRED_TRTLLM_OPS` /
+   `_STEP_FIELDS` list, or a configuration assert re-validating what routing
+   pins, is a finding.
+3. **Call-site discipline.** Every entry call passes its arguments
+   explicitly — data, the layer's weights, the step state, config scalars —
+   to the module-level instance the target imports; the step state is
+   projected by `step_args` and per-step scratch allocated once at the top of
+   `forward`, never inside the layer loop; call sites state their outputs
+   (`out = op(x, L.w, ..., **step)`).
 4. **The runtime-value dump against each entry's `CELLS`.** Any value the
    engine varied at runtime that sits outside its entry's certified cells must be
    certified before delivery -- see "Rejecting" for how to report it. This is
@@ -58,10 +59,11 @@ has inverted the economics of the whole run.
    `.cpu()`, no data-dependent host branching. These are writing rules — a
    forward that violates them is wrong the first time it is captured, and the
    boot gate may well not show it.
-6. **The weight table.** Every weight is one `W` row of the `ModelWeights`
-   subclass, widths derived in `dims()` only, no hand-written manifest beside
-   the table; load coverage is bidirectional, and every key in
-   `expected_unconsumed` is named with a reason.
+6. **The weight table.** Every weight is one `W` row of the table class's
+   `WEIGHTS`, widths derived in `dims` only, `MODEL_WEIGHTS` its module-level
+   instance, no hand-written manifest beside the table; load coverage is
+   bidirectional, and every key in `expected_unconsumed` is named with a
+   reason.
 7. **The topology.** Every gate is topology-blind: a `tep4` target served at
    tp2 boots and scores and looks self-consistent while the directory name
    lies. Read the assembly's parallel handling against the segment the target
@@ -93,10 +95,10 @@ has inverted the economics of the whole run.
 ## Rejecting
 
 REJECT for a defect the gates cannot see and a reader can: an unmapped call, a
-decode target that reads the phase back, per-step binding inside the layer
-loop, a hand-written manifest, a sync in the forward, a topology that does not
-match the segment, a feature that changed the base path, a capacity constant
-below the envelope.
+decode target that reads the phase back, step state projected inside the
+layer loop, a hand-written manifest, a sync in the forward, a topology that
+does not match the segment, a feature that changed the base path, a capacity
+constant below the envelope.
 
 **A runtime value outside an entry's certified column, on a target that is
 otherwise correct, is a certification gap, not a REJECT.** List it in

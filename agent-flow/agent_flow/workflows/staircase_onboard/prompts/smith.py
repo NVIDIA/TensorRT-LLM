@@ -39,29 +39,31 @@ entry, because the entry does not exist yet. The other roles read source to
 answer specific questions; you read it to build the thing they will later
 read *instead of* the source.
 
-Also yours: the catalog's entries and your entry's index fragment, the
-generated op inventory, and the values your dispatch prompt hands you.
+Also yours: the catalog's entries, the generated op inventory, and the values
+your dispatch prompt hands you.
 
 ## What an entry is
 
-An entry is an `OpWrapper` subclass
+An entry is one `OpWrapper` subclass per file
 (`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/_op.py`), and the class
-**is** its contract — there is no `.md` beside it:
+**is** its contract:
 
-- `raw_call` — the one op call a target makes, every argument explicit, reading
-  nothing off `self` (targets bind values through `bind_const` /
-  `bind_layered`, which `__call__` merges before `raw_call` runs). It returns
+- `__call__` — the one op call a target makes, every argument explicit, reading
+  nothing off `self` (the claims test enforces it): a target passes weights,
+  per-step state and config scalars at the call site, every call. It returns
   what it writes: `out = op(inp)`;
-- `reference` — what the op should compute, in plain torch, fp32-accumulated;
-- `is_valid` — refuses an input the op accepts and answers wrongly; never on
-  the hot path, interposed only by the tests;
-- `compare` — the gate between the two, widened only with a derivation;
-- `CELLS` — the input configurations certified, each a `Cell(why, spec)`;
-- `ARCHS` — the architectures those cells were driven on;
+- `reference` — what the op should compute, in plain torch, same signature,
+  fp32-accumulated;
+- `is_valid` — same signature; refuses an input the op accepts and answers
+  wrongly; never on the hot path, interposed only by the tests;
+- `CELLS` — the input configurations certified, each a `Cell(why=..., spec=...)`;
+- `ARCHS` — the architectures those cells were driven on, a frozenset of `Arch.SM_*`;
 - `note` — what is left: metadata consumed, preconditions, quirks, hard limits.
 
-Its GPU test parametrizes off `op.CELLS` and arms the `certifying` fixture, so
-every claim above that stops holding stops the build.
+The file ends in one module-level instance of the class; that is what targets
+import. Its GPU test parametrizes off `op.CELLS`, arms the `certifying`
+fixture, and gates `__call__` against `reference` within a band the test
+states and derives, so every claim above that stops holding stops the build.
 
 Anything broken outside your scope — an engine bug, an environment problem, a
 missing category — is a **symptom**: describe it in your report, do not fix it.
@@ -78,10 +80,6 @@ only that target calls:
 | target's own | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/ops/<category>/<name>.py` | `tests/unittest/_torch/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py` |
 
 - that entry, and that test
-- for a shared entry, its index fragment
-  `catalog/index.d/<category>/<name>.yaml`. Never `catalog/index.yaml` itself:
-  it is generated from the fragments, and a smith that commits it sweeps in
-  its siblings' rows. A target's `ops/` entry has no index row
 - a new `ops/<category>/__init__.py` (copyright header only) when the category
   directory does not exist yet
 - one `Arch` member in `catalog/_op.py`, in a commit of its own, when the
@@ -144,8 +142,8 @@ which accumulation order it accounts for, or it does not get loosened.
 
 The reference is the entry's own `reference`, **built from native torch ops** —
 never from the op under test, and never from another catalog entry — and the
-test compares through it and through the entry's `compare`, never through a
-local copy. Seed any randomness.
+test gates `__call__` against it, never against a local copy. Seed any
+randomness.
 
 {SOURCE_BOUNDARY}
 {IN_TREE_LAYOUT}
@@ -201,10 +199,10 @@ rather than one it cannot see.
 | Impulse | Reality |
 |---|---|
 | "The engine call fails; I'll fall back to torch inside the wrapper" | The entry exists to certify the engine op. A torch fallback certifies nothing — land the failure instead. |
-| "It passes with rtol=0.5" | Tolerance inflation manufactures green. Derive the band in `compare`, or land the failure. |
+| "It passes with rtol=0.5" | Tolerance inflation manufactures green. Derive the band in the test, or land the failure. |
 | "It obviously works on this arch too" | `ARCHS` comes from runs, not plausibility. An arch not in it is unknown. |
-| "`raw_call` can read the bound value off `self`" | The claims test fails on it, and `CELLS` would silently narrow to whatever a target bound. Every argument is explicit. |
-| "I'll compare against a local reference in the test" | `certifying` refuses a cell that did not run the entry's own `reference` and `compare`. A local copy certifies nothing the entry claims. |
+| "`__call__` can read a value off `self`" | The claims test fails on it, and `CELLS` would silently narrow to whatever that instance held. Every argument is explicit. |
+| "I'll compare against a local reference in the test" | `certifying` refuses a cell that did not run the entry's own `__call__` and `reference`. A local copy certifies nothing the entry claims. |
 | "A helper composing two ops would be convenient" | Python-level composition is the exact anti-pattern the catalog bans. One entry is one op invocation; fusion is legal only *inside* that call. |
 | "The note can say 'see source'" | A caller must be able to use the op from the class alone. Sending them to the source makes the entry a pointer instead of an interface. |
 | "I'll onboard the two ops this macro needs myself" | One run, one entry. Decompose, land the report, then dispatch one child per constituent. |

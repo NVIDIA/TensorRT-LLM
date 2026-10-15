@@ -97,7 +97,7 @@ MODE_OFF = "off"
 RUNTIME_VALUE_DUMP_ENV = "TRTLLM_MODELING_V2_VALUE_DUMP"
 
 #: Turns on each target's first-forward step-contract check
-#: (``Target._check_step_contract``, which calls the target's ``step_args``):
+#: (each target's ``_check_step_contract``, which calls its ``step_args``):
 #: a renamed metadata field then fails the gate loudly instead of computing a
 #: wrong answer. Off in a served engine; every gate and witness run sets it, as
 #: the in-tree modeling_v2 accuracy tests do.

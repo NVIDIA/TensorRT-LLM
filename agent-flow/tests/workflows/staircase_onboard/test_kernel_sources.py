@@ -97,16 +97,18 @@ def test_the_two_registration_planes_are_both_covered(sources):
 
 @in_checkout
 def test_attribution_resolves_real_catalog_ops_to_real_sources(sources):
-    """End to end against the ops the catalog actually wraps.
+    """End to end against the ops the catalog and the targets' ``ops/`` actually wrap.
 
     This is the join the smith phase depends on: an op name, discovered on
     the host, resolved to the provenance that decides its receipt.
     """
-    import yaml
-
-    index = REPO_ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml"
-    if not index.is_file():
-        pytest.skip("catalog index not present")
+    modeling_v2 = REPO_ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2"
+    entry_files = [
+        *modeling_v2.glob("catalog/*/*.py"),
+        *modeling_v2.glob("models/*/*/ops/*/*.py"),
+    ]
+    if not entry_files:
+        pytest.skip("no modeling_v2 catalog in this checkout")
 
     registrations = {}
     texts = {}
@@ -115,13 +117,16 @@ def test_attribution_resolves_real_catalog_ops_to_real_sources(sources):
         for name in re.findall(r'"trtllm::([a-zA-Z0-9_]+)', texts[py.stem]):
             registrations.setdefault(name, py.stem)
 
-    entries = yaml.safe_load(index.read_text(encoding="utf-8"))["entries"]
-    ops = [
-        e["impl"].rsplit(".", 1)[-1]
-        for e in entries
-        if str(e.get("impl", "")).startswith("torch.ops.trtllm.")
-    ]
-    assert ops, "no trtllm ops in the catalog index"
+    ops = sorted(
+        {
+            op
+            for py in entry_files
+            for op in re.findall(
+                r"torch\.ops\.trtllm\.([a-zA-Z0-9_]+)", py.read_text(encoding="utf-8")
+            )
+        }
+    )
+    assert ops, "no trtllm ops in the catalog entries"
 
     unresolved = []
     for op in ops:

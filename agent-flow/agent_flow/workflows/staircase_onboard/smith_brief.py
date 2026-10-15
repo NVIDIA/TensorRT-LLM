@@ -209,7 +209,7 @@ def integer_width_probes(widths: Iterable[int], *, reachable_rows: int | None) -
     if not widths:
         lines.append(
             "rows x row width: 2^31 / <row width> rows, for every row width this entry "
-            "addresses (the call sites declare none -- read them from the entry's raw_call "
+            "addresses (the call sites declare none -- read them from the entry's __call__ "
             "signature and its cells' specs)"
         )
     return lines

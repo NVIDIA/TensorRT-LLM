@@ -119,7 +119,7 @@ def test_without_declared_call_sites_the_brief_assumes_decode_and_verify(tmp_pat
     brief = smith_brief.render_smith_brief(_item("norm/rmsnorm"), steps=STEPS, plan=plan)
     assert "ASSUMED" in brief
     assert "| decode step | G |" in brief and "| speculative verify step | 6·G |" in brief
-    assert "read them from the entry's raw_call" in brief
+    assert "read them from the entry's __call__" in brief
 
 
 def test_malformed_call_sites_are_named(tmp_path):
