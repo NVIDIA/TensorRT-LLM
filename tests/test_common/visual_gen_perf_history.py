@@ -4,25 +4,34 @@
 
 from collections.abc import Mapping
 
-_GENERATION_TIMING_SOURCES = {
-    "openai-videos": "client_gen_latency",
-    "openai-images": "client_e2e_latency",
-    "openai-image-edits": "client_e2e_latency",
+_GENERATION_METRIC_PATHS = {
+    "openai-videos": "gen_latency",
+    "openai-images": "e2e_latency",
+    "openai-image-edits": "e2e_latency",
 }
 
 
-def get_generation_timing_source(backend: str) -> str:
-    """Return the generation metric's client timing source for a benchmark backend.
+def get_generation_metric_path(backend: str) -> str:
+    """Return the benchmark JSON object used for generation latency.
 
     Args:
         backend: The backend reported by the VisualGen benchmark.
 
     Raises:
-        ValueError: If the backend has no defined timing source.
+        ValueError: If the backend has no defined measurement path.
     """
-    if backend not in _GENERATION_TIMING_SOURCES:
+    if backend not in _GENERATION_METRIC_PATHS:
         raise ValueError(f"Unsupported VisualGen benchmark backend: {backend!r}")
-    return _GENERATION_TIMING_SOURCES[backend]
+    return _GENERATION_METRIC_PATHS[backend]
+
+
+def get_generation_timing_source(backend: str) -> str:
+    """Describe the client measurement selected by get_generation_metric_path.
+
+    Args:
+        backend: The backend reported by the VisualGen benchmark.
+    """
+    return f"client_{get_generation_metric_path(backend)}"
 
 
 def transform_visual_gen_history(record: Mapping[str, object]) -> dict[str, object] | None:
@@ -46,7 +55,8 @@ def transform_visual_gen_history(record: Mapping[str, object]) -> dict[str, obje
     if record.get("s_runtime") != "visual_gen":
         return dict(record)
     backend = record.get("s_backend")
-    expected_source = _GENERATION_TIMING_SOURCES.get(backend) if isinstance(backend, str) else None
-    if expected_source is None or record.get("s_generation_timing_source") != expected_source:
+    if not isinstance(backend, str) or backend not in _GENERATION_METRIC_PATHS:
+        return None
+    if record.get("s_generation_timing_source") != get_generation_timing_source(backend):
         return None
     return {key: value for key, value in record.items() if not key.startswith("d_baseline_")}

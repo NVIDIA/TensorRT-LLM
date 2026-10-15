@@ -8,6 +8,7 @@ import types
 from pathlib import Path
 
 import pytest
+from test_common import visual_gen_perf_history
 from test_common.visual_gen_perf_history import (
     get_generation_timing_source,
     transform_visual_gen_history,
@@ -18,6 +19,18 @@ _PERF_DIR = Path(__file__).resolve().parents[3] / "tests/integration/defs/perf"
 _CLIENT_COMMIT = "b" * 40
 _SERVER_COMMIT = "a" * 40
 _Modules = tuple[types.ModuleType, types.ModuleType, types.SimpleNamespace]
+
+
+def _benchmark_result(backend: str) -> dict:
+    def latency(value: float) -> dict:
+        return {"mean": value, "median": value, "percentiles": {"p90": value, "p99": value}}
+
+    return {
+        "backend": backend,
+        "request_throughput": 2,
+        "e2e_latency": latency(0.94),
+        "gen_latency": latency(0.8),
+    }
 
 
 def _row(commit: str, value: float, timestamp: str, **fields: object) -> dict:
@@ -352,25 +365,50 @@ def producer(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
 def test_producer_source_agrees_with_extracted_metrics_without_changing_match_keys(
     producer: types.ModuleType, backend: str, source: str, generation: float
 ) -> None:
-    def latency(value: float) -> dict:
-        return {"mean": value, "median": value, "percentiles": {"p90": value, "p99": value}}
-
     row = producer.build_visual_gen_db_entry(
         gpu_type="b200",
         model_name="flux2",
         server_name="flux2",
         server_config={},
         client_config={"backend": backend, "num_inference_steps": 50, "max_concurrency": 1},
-        result_data={
-            "backend": backend,
-            "request_throughput": 2,
-            "e2e_latency": latency(0.94),
-            "gen_latency": latency(0.8),
-        },
+        result_data=_benchmark_result(backend),
     )
     assert row["s_generation_timing_source"] == source
     assert row["d_median_generation"] == generation
     assert "s_generation_timing_source" not in producer.get_visual_gen_match_keys()
+
+
+@pytest.mark.parametrize(
+    ("backend", "new_path", "new_value"),
+    [
+        ("openai-videos", "e2e_latency", 0.94),
+        ("openai-images", "gen_latency", 0.8),
+        ("openai-image-edits", "gen_latency", 0.8),
+    ],
+)
+def test_one_path_change_updates_extraction_metadata_and_history_selection(
+    producer: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    new_path: str,
+    new_value: float,
+) -> None:
+    old = _client_row(0.9, "2026-10-14T00:00:00Z", s_backend=backend)
+    assert transform_visual_gen_history(old) == old
+    monkeypatch.setitem(visual_gen_perf_history._GENERATION_METRIC_PATHS, backend, new_path)
+    row = producer.build_visual_gen_db_entry(
+        gpu_type="b200",
+        model_name="test-model",
+        server_name="test-server",
+        server_config={},
+        client_config={"backend": backend, "num_inference_steps": 50, "max_concurrency": 1},
+        result_data=_benchmark_result(backend),
+    )
+    assert producer.result_metric_paths(backend)["d_median_generation"] == f"{new_path}.median"
+    assert row["d_median_generation"] == new_value
+    assert row["s_generation_timing_source"] == f"client_{new_path}"
+    assert transform_visual_gen_history(row) == row
+    assert transform_visual_gen_history(old) is None
 
 
 def test_producer_rejects_mismatched_result_backend(producer: types.ModuleType) -> None:
