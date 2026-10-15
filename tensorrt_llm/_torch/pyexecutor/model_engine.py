@@ -545,7 +545,9 @@ class PyTorchModelEngine(ModelEngine):
             mm_config = self.llm_args.multimodal_config
             setup_mm_encoder_cuda_graphs(
                 self.model,
-                mm_config.encoder_cuda_graph if mm_config is not None else None)
+                mm_config.encoder_cuda_graph if mm_config is not None else None,
+                max_num_tokens=(self.llm_args.encoder_max_num_tokens
+                                or self.max_num_tokens))
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)

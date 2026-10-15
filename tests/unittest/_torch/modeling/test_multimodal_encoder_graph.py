@@ -147,12 +147,18 @@ def _batched_frames_encoder(
     return {"features": features, "mask": mask}
 
 
-def _make_batched_frames_runner(device: torch.device) -> MultimodalEncoderGraphRunner[_ToyMetadata]:
+def _make_batched_frames_runner(
+    device: torch.device, *, automatic: bool = False
+) -> MultimodalEncoderGraphRunner[_ToyMetadata]:
     return MultimodalEncoderGraphRunner(
         encoder_fn=_batched_frames_encoder,
         metadata_provider=_ToyMetadataProvider(device),
         io_adapter=_BatchedFramesIOAdapter(),
-        config=MultimodalEncoderCudaGraphConfig(buckets=[(8, 2), (12, 2)]),
+        config=(
+            MultimodalEncoderCudaGraphConfig(max_batch_size=3, max_num_tokens=12)
+            if automatic
+            else MultimodalEncoderCudaGraphConfig(buckets=[(8, 2), (12, 2)])
+        ),
     )
 
 
@@ -361,6 +367,58 @@ def test_empty_buckets_rejected():
             output_specs={"y": 0},
             config=config,
         )
+
+
+@pytest.mark.cpu_only
+def test_automatic_buckets_cover_every_batch_with_bounded_layout_shapes() -> None:
+    runner = _make_batched_frames_runner(torch.device("cpu"), automatic=True)
+    assert runner._buckets == [EncoderGraphKey(12, batch) for batch in (1, 2, 3)]
+    for lengths in ([7], [5, 1], [4, 2, 1]):
+        bucket = runner._select_bucket(len(lengths), sum(lengths), lengths)
+        assert bucket is not None
+        assert bucket.total_tokens <= 12
+        assert bucket.total_tokens % bucket.num_contexts == 0
+    assert runner._select_bucket(4, 4, [1] * 4) is None
+    assert runner._select_bucket(2, 8, [7, 1]) is None
+
+
+@pytest.mark.cpu_only
+def test_automatic_buckets_include_intermediate_token_capacities() -> None:
+    buckets = _BatchedFramesIOAdapter().capture_buckets(3, 4096)
+    assert [bucket.total_tokens for bucket in buckets if bucket.num_contexts == 1] == [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+    ]
+    assert EncoderGraphKey(4096, 3) in buckets
+    assert all(bucket.total_tokens <= 4096 for bucket in buckets)
+    inputs = _BatchedFramesIOAdapter().allocate_inputs(
+        EncoderGraphKey(4096, 3), torch.device("cpu")
+    )
+    assert inputs["features"].shape == (3, 1365, 2)
+    assert _BatchedFramesIOAdapter().capture_buckets(8, 2) == [
+        EncoderGraphKey(2, 1),
+        EncoderGraphKey(2, 2),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_automatic_buckets_use_encoder_adapter_shape_rules() -> None:
+    class AlignedAdapter(_BatchedFramesIOAdapter):
+        def capture_buckets(
+            self, max_batch_size: int, max_num_tokens: int
+        ) -> list[EncoderGraphKey]:
+            return [EncoderGraphKey(8, 2)]
+
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=_batched_frames_encoder,
+        metadata_provider=_ToyMetadataProvider(torch.device("cpu")),
+        io_adapter=AlignedAdapter(),
+        config=MultimodalEncoderCudaGraphConfig(max_batch_size=2, max_num_tokens=12),
+    )
+    assert runner._buckets == [EncoderGraphKey(8, 2)]
 
 
 @pytest.mark.cpu_only
@@ -617,18 +675,23 @@ def cuda_device():
 
 
 @pytestmark_cuda
-def test_cuda_custom_io_adapter_replays_masked_downsampled_outputs(cuda_device) -> None:
-    runner = _make_batched_frames_runner(cuda_device)
+@pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
+def test_cuda_custom_io_adapter_replays_masked_downsampled_outputs(cuda_device, automatic) -> None:
+    runner = _make_batched_frames_runner(cuda_device, automatic=automatic)
     runner.capture_all(cuda_device)
-    for lengths, frames in [([4, 2], 4), ([3, 1], 3), ([1, 2], 2)]:
-        features = torch.arange(2 * frames * 2, dtype=torch.float32).reshape(2, frames, 2)
+    cases = [([4, 2], 4), ([3, 1], 3), ([1, 2], 2)]
+    if automatic:
+        cases += [([7], 7), ([4, 2, 1], 4), ([1, 1, 2], 2)]
+    for lengths, frames in cases:
+        batch = len(lengths)
+        features = torch.arange(batch * frames * 2, dtype=torch.float32).reshape(batch, frames, 2)
         mask = torch.arange(frames).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
         result = runner.maybe_run(
             seq_lengths=lengths,
             inputs={"features": features.to(cuda_device), "mask": mask.to(cuda_device)},
         )
         assert result is not None
-        expected = torch.zeros(2, (max(lengths) + 1) // 2, 2)
+        expected = torch.zeros(batch, (max(lengths) + 1) // 2, 2)
         for batch_idx, length in enumerate(lengths):
             for frame_idx in range(0, length, 2):
                 expected[batch_idx, frame_idx // 2] = features[batch_idx, frame_idx] + sum(lengths)
