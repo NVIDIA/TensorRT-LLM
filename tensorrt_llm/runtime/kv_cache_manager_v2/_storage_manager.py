@@ -123,8 +123,13 @@ class CacheLevelManager:
         """Compute pool size granularity for a given cache tier and quota."""
         match tier:
             case CacheTier.GPU_MEM:
+                # Mirrors CacheLevelManager::cacheTierGranularity: 2 MiB, doubled per power of
+                # two of the quota above 1 GiB, up to 256 MiB.
                 page_size = 2 << 20
-                return page_size << min(4, max(0, int(math.log(quota / (page_size * 512), 2))))
+                max_exponent = 7
+                return page_size << min(
+                    max_exponent, max(0, int(math.log(quota / (page_size * 512), 2)))
+                )
             case CacheTier.HOST_MEM:
                 return HostCacheLevelStorage.POOL_SIZE_GRANULARITY
             case CacheTier.DISK:

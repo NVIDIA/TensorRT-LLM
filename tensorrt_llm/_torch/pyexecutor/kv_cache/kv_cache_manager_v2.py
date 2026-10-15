@@ -1108,6 +1108,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+    # Layer-group id -> sliding window size, built on first use by
+    # _get_windowed_layer_group_sizes(). The window-crossing check reads it on every capacity
+    # growth, so it is declared on the class to exist without running __init__.
+    _windowed_layer_group_sizes: Optional[Dict[int, int]] = None
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -2397,14 +2401,22 @@ class KVCacheManagerV2(BaseResourceManager):
         Capacity grows monotonically within a request, so the condition below
         fires at most once per request per pool without extra bookkeeping.
 
-        Debug level only, and the guard runs before any of the strings or the
-        page-index scan are built, so a default run does no additional work.
+        Debug level only. This runs for every generation request on every
+        iteration, so the window comparison comes first: the log-level query
+        walks the caller's frames and is only made for the rare call that
+        actually crosses a window, before any message string or page-index
+        scan is built.
         """
-        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+        if new_capacity <= pre_capacity:
             return
+        debug_enabled = None
         for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
             if not (pre_capacity <= window_size < new_capacity):
                 continue
+            if debug_enabled is None:
+                debug_enabled = logger.is_debug_enabled()
+            if not debug_enabled:
+                return
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
                 f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "

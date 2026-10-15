@@ -317,6 +317,27 @@ class TestCacheLevelStorage(unittest.TestCase):
         for slot_count, min_slot in zip(slot_counts, min_slots):
             self.assertGreaterEqual(slot_count, min_slot)
 
+    def test_python_backend_gpu_granularity_grows_with_quota_up_to_256_mib(self) -> None:
+        # The pure-Python backend mirrors CacheLevelManager::cacheTierGranularity: 2 MiB,
+        # doubled per power of two of the quota above 1 GiB, capped at 256 MiB.
+        from importlib import import_module
+
+        storage_manager_module = import_module(StorageManager.__module__)
+        granularity = storage_manager_module.CacheLevelManager.cache_tier_granularity
+        mib, gib = 1 << 20, 1 << 30
+        cases = [
+            (512 * mib, 2 * mib),
+            (gib, 2 * mib),
+            (2 * gib, 4 * mib),
+            (16 * gib, 32 * mib),
+            (128 * gib, 256 * mib),
+            (151 * gib, 256 * mib),
+            (1024 * gib, 256 * mib),
+        ]
+        for quota, expected in cases:
+            with self.subTest(quota=quota):
+                self.assertEqual(granularity(CacheTier.GPU_MEM, quota), expected)
+
 
 def create_config(
     tokens_per_block: int,
