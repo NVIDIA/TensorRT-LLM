@@ -3184,7 +3184,18 @@ class SpecWorkerBase(nn.Module, ABC):
         # draft_kv_cache_manager is None if using two-engine speculative decoding
         # or not enabling separate draft KV cache.
         if draft_kv_cache_manager is None:
-            yield attn_metadata
+            # Draft workers that rewrite seq_lens/num_contexts in place (dynamic
+            # trees) leave the per-domain splits stale; without an explicit
+            # opt-in the draft sub-forward runs unpartitioned.
+            if (enable_draft_locality_domain_forkjoin or not getattr(
+                    attn_metadata, 'locality_domain_enabled', False)):
+                yield attn_metadata
+                return
+            attn_metadata.locality_domain_enabled = False
+            try:
+                yield attn_metadata
+            finally:
+                attn_metadata.locality_domain_enabled = True
             return
 
         from ..attention.backends.flashinfer import FlashInferAttentionMetadata

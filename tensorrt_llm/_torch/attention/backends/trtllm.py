@@ -330,6 +330,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Pre-allocated per-locality-domain workspaces.
     locality_domain_workspaces: Optional[List[torch.Tensor]] = None
     locality_domain_cuda_graph_workspaces: Optional[List[torch.Tensor]] = None
+    # Per-domain trtllm-gen tree mask buffers; entry 0 is None (domain 0 keeps
+    # spec_decoding_bl_tree_mask).
+    locality_domain_spec_decoding_bl_tree_masks: Optional[List[Optional[
+        torch.Tensor]]] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -1750,6 +1754,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
             )
 
+    def _ensure_locality_domain_spec_bl_tree_masks(self) -> None:
+        if not self.locality_domain_enabled or self.kv_cache_manager is None:
+            return
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        if num_locality_domains <= 1 or self.spec_decoding_bl_tree_mask is None:
+            return
+        masks = self.locality_domain_spec_decoding_bl_tree_masks
+        if (masks is None or len(masks) != num_locality_domains
+                or any(mask.shape != self.spec_decoding_bl_tree_mask.shape
+                       for mask in masks[1:])):
+            self.locality_domain_spec_decoding_bl_tree_masks = [None] + [
+                torch.empty_like(self.spec_decoding_bl_tree_mask)
+                for _ in range(num_locality_domains - 1)
+            ]
+
     def update_blackwell_first_sparse_mask_offset(self) -> None:
         """Fill gen slots [0:ng) with (kv_lens_cuda - seq_lens); in-place for CUDA graph."""
         nc = self.num_contexts
@@ -1846,10 +1865,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
                 self.spec_decoding_param_prepare_for_blackwell()
+                self._ensure_locality_domain_spec_bl_tree_masks()
             else:
                 self.spec_decoding_bl_tree_mask_offset = None
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
+                self.locality_domain_spec_decoding_bl_tree_masks = None
 
             cpp_query_len = 0
 
@@ -1990,7 +2011,6 @@ def _build_locality_domain_slices(metadata: TrtllmAttentionMetadata,
     ctx_token_splits = metadata.locality_domain_ctx_token_splits
     gen_token_splits = metadata.locality_domain_gen_token_splits
     total_ctx_tokens = sum(metadata.locality_domain_num_ctx_tokens)
-    sum(metadata.locality_domain_num_gen_tokens)
     if attention_input_type == AttentionInputType.generation_only:
         gen_token_splits, _ = _get_generation_only_token_splits(
             metadata, total_gen_tokens)
@@ -2183,8 +2203,42 @@ def _build_locality_domain_slices(metadata: TrtllmAttentionMetadata,
     }
 
 
+def _check_locality_domain_side_inputs(metadata, forward_args) -> None:
+    """Reject per-request inputs the partition path does not slice.
+
+    Everything listed here is indexed by batch row or by token inside the
+    kernels, so handing a domain the full-batch tensor would read another
+    domain's rows. Raising beats a silent full-batch fallback that hides the
+    missing locality.
+    """
+    unsupported = []
+    if metadata.beam_width != 1:
+        unsupported.append(f"beam_width={metadata.beam_width}")
+    if metadata.is_cross or forward_args.cross_kv is not None:
+        unsupported.append("cross attention")
+    if metadata.enable_helix:
+        unsupported.append("helix parallelism")
+    if forward_args.attention_mask_data is not None:
+        unsupported.append("custom attention mask data")
+    sparse = forward_args.sparse_runtime_params
+    if sparse is not None and sparse.sparse_attn_indices is not None:
+        unsupported.append("sparse attention indices")
+    if (forward_args.mrope_rotary_cos_sin is not None
+            and forward_args.attention_input_type != AttentionInputType.mixed):
+        unsupported.append("MRoPE outside the mixed attention input type")
+    if unsupported:
+        raise NotImplementedError(
+            "Locality domain fork-join attention does not support "
+            f"{', '.join(unsupported)}; disable enable_locality_domains for "
+            "this configuration.")
+
+
 def _locality_domain_attention_enabled(attn, metadata, forward_args) -> bool:
     """Whether this call should be split across locality domains."""
+    # The flag is the explicit opt-out: draft sub-forwards without their own
+    # per-domain layout clear it while the manager still reports two domains.
+    if not metadata.locality_domain_enabled:
+        return False
     # output_sf is deliberately not checked here: an NVFP4 output quantization
     # request that reaches this path is asserted on rather than silently run
     # unpartitioned.
@@ -2204,7 +2258,10 @@ def _locality_domain_attention_enabled(attn, metadata, forward_args) -> bool:
         return False
     if getattr(kv_cache_manager, "num_locality_domains", 1) <= 1:
         return False
-    return metadata.locality_domain_gen_req_splits is not None
+    if metadata.locality_domain_gen_req_splits is None:
+        return False
+    _check_locality_domain_side_inputs(metadata, forward_args)
+    return True
 
 
 def _resize_locality_domain_workspaces_from_domain0(metadata) -> None:
@@ -2227,6 +2284,129 @@ def _resize_locality_domain_workspaces_from_domain0(metadata) -> None:
             workspace.resize_(target_numel)
 
 
+_LOCALITY_DOMAIN_GEN_INDEXED_SPEC_FIELDS = (
+    "spec_decoding_generation_lengths",
+    "spec_decoding_packed_mask",
+    "spec_decoding_bl_tree_mask_offset",
+    "spec_bl_tree_first_sparse_mask_offset_kv",
+)
+
+
+def _locality_domain_mrope_overrides(forward_args, ld_slice, num_contexts,
+                                     num_q_rows):
+    """Slice the MRoPE inputs the way the kernels index them.
+
+    The context kernel reads cos/sin by batch-flat token row and the generation
+    kernels read position deltas by local generation batch index.
+    """
+    overrides = {}
+    cos_sin = forward_args.mrope_rotary_cos_sin
+    if cos_sin is not None:
+        ctx_start, ctx_end = ld_slice["ctx_token_start"], ld_slice[
+            "ctx_token_end"]
+        if ctx_end > ctx_start:
+            if num_q_rows <= 0 or cos_sin.numel() % num_q_rows != 0:
+                raise RuntimeError(
+                    f"mrope_rotary_cos_sin holds {cos_sin.numel()} values for "
+                    f"{num_q_rows} tokens; cannot slice it per locality domain")
+            per_token = cos_sin.numel() // num_q_rows
+            overrides["mrope_rotary_cos_sin"] = cos_sin.reshape(
+                -1)[ctx_start * per_token:ctx_end * per_token].view(1, -1)
+        else:
+            overrides["mrope_rotary_cos_sin"] = None
+    deltas = forward_args.mrope_position_deltas
+    if deltas is not None:
+        gen_start = ld_slice["gen_req_start"] - num_contexts
+        gen_end = ld_slice["gen_req_end"] - num_contexts
+        overrides["mrope_position_deltas"] = (deltas[gen_start:gen_end]
+                                              if gen_end > gen_start else None)
+    return overrides
+
+
+def _spans_tile(intervals, start, end) -> bool:
+    if any(a < 0 or b < a for a, b in intervals):
+        return False
+    spans = sorted((a, b) for a, b in intervals if b > a)
+    if not spans:
+        return start == end
+    if spans[0][0] != start or spans[-1][1] != end:
+        return False
+    return all(spans[i][1] == spans[i + 1][0] for i in range(len(spans) - 1))
+
+
+def _validate_locality_domain_coverage(metadata, prepared, attention_input_type,
+                                       num_q_rows, num_kv_rows,
+                                       dense_ctx_kv) -> None:
+    """Check on the host that the domain slices tile the live batch exactly.
+
+    Splits are built at prepare(); a draft rewrite that changes the layout
+    without a new prepare() would otherwise launch kernels over a subset of
+    the rows and leave the rest of the output unwritten. Python ints only, so
+    this never synchronizes.
+    """
+    slices = [prep["ld_slice"] for prep in prepared]
+
+    def spans(start_key, end_key):
+        return [(s[start_key], s[end_key]) for s in slices]
+
+    num_ctx = metadata.num_contexts
+    num_gen = metadata.num_generations
+    problems = []
+    batch_rows = metadata.kv_lens_runtime.shape[0]
+    if batch_rows != num_ctx + num_gen:
+        problems.append(f"runtime metadata has {batch_rows} rows for "
+                        f"{num_ctx} context + {num_gen} generation requests")
+    for s in slices:
+        if (s["num_ctx_tokens"] != s["ctx_token_end"] - s["ctx_token_start"]
+                or s["num_gen_tokens"]
+                != s["gen_token_end"] - s["gen_token_start"]):
+            problems.append(f"inconsistent token counts in slice {s}")
+    ctx_tokens = spans("ctx_token_start", "ctx_token_end")
+    gen_tokens = spans("gen_token_start", "gen_token_end")
+    ctx_reqs = spans("ctx_req_start", "ctx_req_end")
+    gen_reqs = spans("gen_req_start", "gen_req_end")
+    if attention_input_type == AttentionInputType.generation_only:
+        expected = [("generation tokens", gen_tokens, 0, num_q_rows),
+                    ("generation requests", gen_reqs, num_ctx,
+                     num_ctx + num_gen), ("context tokens", ctx_tokens, 0, 0)]
+    elif attention_input_type == AttentionInputType.context_only:
+        expected = [("context tokens", ctx_tokens, 0, num_q_rows),
+                    ("context requests", ctx_reqs, 0, num_ctx),
+                    ("generation tokens", gen_tokens, 0, 0)]
+        ctx_kv = spans("ctx_kv_token_start", "ctx_kv_token_end")
+        if dense_ctx_kv:
+            if num_kv_rows is not None:
+                expected.append(("context kv rows", ctx_kv, 0, num_kv_rows))
+        elif ctx_kv != ctx_tokens:
+            problems.append(f"context kv rows {ctx_kv} differ from context "
+                            f"tokens {ctx_tokens}")
+    else:
+        total_ctx_tokens = sum(metadata.locality_domain_num_ctx_tokens)
+        expected = [
+            ("context tokens", ctx_tokens, 0, total_ctx_tokens),
+            ("generation tokens", gen_tokens, total_ctx_tokens, num_q_rows),
+            ("context requests", ctx_reqs, 0, num_ctx),
+            ("generation requests", gen_reqs, num_ctx, num_ctx + num_gen)
+        ]
+    for label, intervals, start, end in expected:
+        if not _spans_tile(intervals, start, end):
+            problems.append(f"{label} {intervals} do not tile [{start}, {end})")
+    if problems:
+        raise RuntimeError(
+            "Locality domain attention slices do not cover the batch "
+            f"({attention_input_type.name}): " + "; ".join(problems))
+
+
+def _scatter_locality_domain_rows(dst, src, ld_slice, num_ctx_tokens,
+                                  num_gen_tokens) -> None:
+    if num_ctx_tokens > 0:
+        dst[ld_slice["ctx_token_start"]:ld_slice["ctx_token_end"]] = (
+            src[:num_ctx_tokens])
+    if num_gen_tokens > 0:
+        dst[ld_slice["gen_token_start"]:ld_slice["gen_token_end"]] = (
+            src[num_ctx_tokens:])
+
+
 @contextmanager
 def _locality_domain_metadata(metadata, ld_slice, locality_domain_id):
     """Point the shared metadata at one locality domain's rows for the duration.
@@ -2244,12 +2424,36 @@ def _locality_domain_metadata(metadata, ld_slice, locality_domain_id):
         "host_total_kv_lens": ld_slice["host_total_kv_lengths"],
         "kv_cache_block_offsets": ld_slice["block_offsets"],
         # pool pointers/mapping are read-only and identical for every domain.
-        "num_contexts": ld_slice["num_ctx_reqs"],
+        # The counts go on the private fields: the property setters call
+        # on_update(), which would recompute them from the full-batch seq_lens.
+        "_num_contexts": ld_slice["num_ctx_reqs"],
+        "_num_generations": ld_slice["num_gen_reqs"],
         "_num_ctx_tokens": ld_slice["num_ctx_tokens"],
+        "_num_tokens": ld_slice["num_tokens"],
         # Indexed by sequence over the whole batch, so it cannot describe a
         # single domain's rows.
         "block_ids_per_seq": None,
     }
+    if metadata.use_spec_decoding:
+        # The generation kernels index these by the local generation batch
+        # index, so each domain gets its own rows.
+        gen_start = ld_slice["gen_req_start"] - metadata.num_contexts
+        gen_end = ld_slice["gen_req_end"] - metadata.num_contexts
+        for name in _LOCALITY_DOMAIN_GEN_INDEXED_SPEC_FIELDS:
+            tensor = getattr(metadata, name, None)
+            if tensor is not None:
+                overrides[name] = tensor[gen_start:gen_end]
+        if metadata.spec_decoding_position_offsets is not None:
+            offsets = metadata.spec_decoding_position_offsets_for_cpp[
+                gen_start:gen_end]
+            overrides["spec_decoding_position_offsets"] = offsets
+            overrides["spec_decoding_position_offsets_cpp"] = offsets
+        # prepareCustomMask writes the trtllm-gen tree mask from offset 0 on
+        # every call, so concurrent domains cannot share one mask buffer.
+        masks = metadata.locality_domain_spec_decoding_bl_tree_masks
+        if (masks is not None and locality_domain_id < len(masks)
+                and masks[locality_domain_id] is not None):
+            overrides["spec_decoding_bl_tree_mask"] = masks[locality_domain_id]
     # Each domain needs its own scratch: the streams run concurrently, so a
     # shared workspace would be a data race. ``effective_workspace`` picks
     # between these two by ``is_cuda_graph``, so override both.
@@ -3163,6 +3367,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         it yields once per domain -- inputs sliced to that domain's rows, its own
         workspace and MLA state in place, and its stream current -- so the caller
         keeps a single dispatch site for both paths.
+
+        Generation rows are split by position (the runner's balanced half/half
+        split), not by the domain that owns their KV pages, so a row can run on
+        the other domain's stream; the result is still correct. Context rows
+        follow their owning domain when the runner could sort them.
         """
         if not _locality_domain_attention_enabled(self, metadata, forward_args):
             yield q, k, v, forward_args
@@ -3229,6 +3438,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 scatter_back = False
             ld_overrides = dict(output=ld_output,
                                 locality_domain_id=locality_domain_id)
+            # Written per token row by the kernel, so it needs the same
+            # view-or-copy treatment as the output.
+            softmax_stats = forward_args.softmax_stats_tensor
+            ld_softmax_stats = None
+            if softmax_stats is not None:
+                if scatter_back:
+                    ld_softmax_stats = softmax_stats.new_empty(
+                        (num_ctx_tokens + num_gen_tokens, ) +
+                        softmax_stats.shape[1:])
+                else:
+                    ld_softmax_stats = cat(softmax_stats)
+                ld_overrides["softmax_stats_tensor"] = ld_softmax_stats
+            ld_overrides.update(
+                _locality_domain_mrope_overrides(forward_args, ld_slice,
+                                                 metadata.num_contexts,
+                                                 q.shape[0]))
             for name in ("latent_cache", "q_pe"):
                 tensor = getattr(forward_args, name)
                 if tensor is not None:
@@ -3273,9 +3498,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                      k=cat_kv(k),
                      v=cat_kv(v),
                      ld_output=ld_output,
+                     ld_softmax_stats=ld_softmax_stats,
                      scatter_back=scatter_back,
                      num_ctx_tokens=num_ctx_tokens,
                      num_gen_tokens=num_gen_tokens))
+
+        _validate_locality_domain_coverage(
+            metadata, prepared, forward_args.attention_input_type, q.shape[0],
+            k.shape[0] if k is not None else None, dense_ctx_kv)
 
         two_stream = _LOCALITY_DOMAIN_TWO_STREAM
         if two_stream:
@@ -3295,15 +3525,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                             yield (prep["q"], prep["k"], prep["v"],
                                    prep["ld_args"])
                             if prep["scatter_back"]:
-                                n_ctx = prep["num_ctx_tokens"]
-                                if n_ctx > 0:
-                                    output[ld_slice["ctx_token_start"]:
-                                           ld_slice["ctx_token_end"]] = (
-                                               prep["ld_output"][:n_ctx])
-                                if prep["num_gen_tokens"] > 0:
-                                    output[ld_slice["gen_token_start"]:
-                                           ld_slice["gen_token_end"]] = (
-                                               prep["ld_output"][n_ctx:])
+                                _scatter_locality_domain_rows(
+                                    output, prep["ld_output"], ld_slice,
+                                    prep["num_ctx_tokens"],
+                                    prep["num_gen_tokens"])
+                                if prep["ld_softmax_stats"] is not None:
+                                    _scatter_locality_domain_rows(
+                                        forward_args.softmax_stats_tensor,
+                                        prep["ld_softmax_stats"], ld_slice,
+                                        prep["num_ctx_tokens"],
+                                        prep["num_gen_tokens"])
                             if locality_domain_id == 0:
                                 _resize_locality_domain_workspaces_from_domain0(
                                     metadata)
@@ -3705,8 +3936,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         # RoPE generation stays a single full-batch op; only the metadata the
         # per-domain FMHA calls consume is split.
-        if (metadata.kv_cache_manager is not None and getattr(
-                metadata.kv_cache_manager, "num_locality_domains", 1) > 1):
+        if (metadata.locality_domain_enabled
+                and metadata.kv_cache_manager is not None and getattr(
+                    metadata.kv_cache_manager, "num_locality_domains", 1) > 1):
+            if (metadata.locality_domain_gen_req_splits is None
+                    or metadata.locality_domain_gen_token_splits is None
+                    or metadata.locality_domain_num_gen_tokens is None
+                    or metadata.locality_domain_num_ctx_tokens is None):
+                raise RuntimeError(
+                    "locality domain MLA generation needs the per-domain "
+                    "splits that prepare() builds; they are missing")
             _prepare_locality_domain_mla_gen_state_from_full(
                 metadata,
                 cu_q_seqlens,
