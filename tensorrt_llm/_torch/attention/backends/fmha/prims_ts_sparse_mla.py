@@ -15,7 +15,7 @@
 
 """TRT-LLM FMHA adapter for the vendored PrimTS native sparse MLA kernels.
 
-Serves the DeepSeek-V4 generation phase on SM100/SM103 with the Blackwell
+Serves the DeepSeek-V4 generation phase on SM100 with the Blackwell
 task-scheduled two-source sparse MLA decode kernel
 (``BatchSparseMLADecodePagedTSWrapper``). The sliding-window pool is the
 primary source and, for compressing layers, the compressed pool is the extra
@@ -33,9 +33,11 @@ output in the group-major ``[G, T, (H/G)*512]`` layout with FP32 scales
 ``o_a_proj`` BMM consumes the attention output without a separate quant
 kernel.
 
-The library is enabled by default on SM100/SM103 and precedes the TRTLLM-Gen
+The library is enabled by default on SM100 and precedes the TRTLLM-Gen
 fallback for the DeepSeek-V4 generation phase; ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla``
 restores the previous library. The context phase stays on the fallback library.
+SM103 (B300/GB300) is admitted by the kernels' architecture guard but not yet
+signoff-qualified upstream, so it keeps the fallback for now.
 """
 
 from __future__ import annotations
@@ -212,8 +214,17 @@ class PrimsTSSparseMlaFmha(Fmha):
     @classmethod
     def _unavailable_reason(cls, attn: "TrtllmAttention") -> Optional[str]:
         sm = get_sm_version()
-        if sm not in (100, 103):
-            return f"requires SM100 or SM103, got SM{sm}."
+        if sm == 103:
+            # The vendored kernels admit SM103 through their architecture guard
+            # but flashinfer has only signed off accuracy and performance on
+            # SM100 (prims_ts/kernels/mla_decode/README.md). TRT-LLM L0 #64329
+            # hit an illegal memory access in the GB300 DeepSeek-V4-Pro perf
+            # sanity warmup (TP4/ADP, FP8 KV, MTP 3) that the same configuration
+            # at TP8 does not reproduce on B200, so B300/GB300 stay on the
+            # TRTLLM-Gen fallback until the kernels are qualified there.
+            return "SM103 is not yet qualified for the PrimTS sparse MLA kernels."
+        if sm != 100:
+            return f"requires SM100, got SM{sm}."
         if getattr(attn, "use_fp8_ds_mla", False) or getattr(attn, "kv_cache_dtype", "auto") == (
             "fp8_ds_mla"
         ):
