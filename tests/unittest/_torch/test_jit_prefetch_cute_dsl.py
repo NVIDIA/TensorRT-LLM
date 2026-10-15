@@ -278,6 +278,23 @@ def test_topk_export_is_what_the_op_runs(tmp_path):
         assert torch.equal(a, b)
 
 
+def test_topk_provider_finds_topk_inside_attention_backends():
+    """A sparse attention backend (a plain object, not an nn.Module) owns its
+    indexer and that indexer's TopK; the provider must find it there."""
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+
+    class Backend:  # like an AttentionBackend: not an nn.Module
+        def __init__(self):
+            self.indexer = torch.nn.Module()
+            self.indexer.top_k = TopK(512, decode_implementation=TopKImplementation.CUTE_DSL_RADIX)
+
+    model = torch.nn.Module()
+    model.layer = torch.nn.Module()
+    model.layer.attn = Backend()
+    provider = jcd.TopKProvider(model, max_num_tokens=64, max_seq_len=4096)
+    assert provider.cfgs == {("decode", 512)}
+
+
 def test_provider_plans_the_variant_the_op_keys_on():
     p = jcd.KdaPrefillProvider(torch.nn.Module())
     p.cfgs = [(H, True, True)]

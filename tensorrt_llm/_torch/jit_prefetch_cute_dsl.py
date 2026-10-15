@@ -585,6 +585,39 @@ class FlashInferNormProvider:
         return list(self.specs)
 
 
+def _modules_with_attention_backends(model) -> List[Any]:
+    """``model.modules()`` plus the modules owned by its attention backends.
+
+    An attention backend is a plain object, not an ``nn.Module``, and some
+    sparse backends build their indexer (and its ``TopK``) in the first
+    forward, so after warmup these are reachable only through the backend's
+    attributes (``attn``, ``mqa``, ``mha``, ``backend`` of the attention
+    modules, then the backend's ``indexer``).
+    """
+    import torch
+
+    if model is None:
+        return []
+    out, seen = [], set()
+
+    def add(mod):
+        for m in mod.modules():
+            if id(m) not in seen:
+                seen.add(id(m))
+                out.append(m)
+
+    add(model)
+    for mod in list(out):
+        for name in ("attn", "mqa", "mha", "backend", "attn_backend"):
+            backend = mod.__dict__.get(name)
+            if backend is None or isinstance(backend, torch.nn.Module):
+                continue
+            for value in list(vars(backend).values()):
+                if isinstance(value, torch.nn.Module):
+                    add(value)
+    return out
+
+
 # The loader the wrapped top-k ``_compile``s consult (None: compile in place).
 _topk_loader: Optional[Callable[[str], Optional[Callable]]] = None
 
@@ -697,7 +730,7 @@ class TopKProvider:
 
         self.cfgs = set()
         radix = TopKImplementation.CUTE_DSL_RADIX
-        for mod in model.modules() if model is not None else ():
+        for mod in _modules_with_attention_backends(model):
             if not isinstance(mod, TopK):
                 continue
             for phase, impl in (
