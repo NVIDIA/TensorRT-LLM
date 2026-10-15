@@ -154,12 +154,7 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_thread.start()
 
     def _new_stream(self):
-        # Non-blocking: a plain cudaStreamCreate() stream synchronizes implicitly with the legacy
-        # default stream, and the executor makes that stream wait on every model forward. Under the
-        # overlap scheduler a forward is almost always in flight, so each gather/scatter would queue
-        # behind a whole forward. No ordering against the default stream is needed here: the host
-        # has already synchronized on the KV writes before a send is dispatched, and syncs on this
-        # stream before a received request is scheduled.
+        # Non-blocking, so gather/scatter never queue behind a forward on the legacy default stream.
         return CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
 
     def _gather_blocking(self, src_addr: int, write_meta, total: int) -> None:
