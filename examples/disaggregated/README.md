@@ -473,7 +473,7 @@ To enable mixed precision serving, you will need:
 A quantized checkpoint can be created using `--kv_cache_qformat none`.
 
 ```bash
-python $MODELOPT_ROOT/examples/llm_ptq/hf_ptq.py \
+python $MODELOPT_ROOT/examples/hf_ptq/hf_ptq.py \
     --pyt_ckpt_path=meta-llama/Llama-3.1-8B-Instruct \
     --export_path=./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
     --sparsity_fmt=dense \
