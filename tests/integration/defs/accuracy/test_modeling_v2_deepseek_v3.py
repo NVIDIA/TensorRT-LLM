@@ -37,6 +37,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root
 from .accuracy_core import (
@@ -45,6 +46,7 @@ from .accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from .test_disaggregated_serving import launch_disaggregated_llm, run_accuracy_test
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -194,3 +196,50 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] {mode} acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(8)
+    def test_gsm8k_disagg(self, mocker):
+        """dep4 context server to dep4 generation server, KV planned by the target itself.
+
+        The target ships its own ``TransferPlanner``; both workers run it, so the
+        framework's planner_id handshake passes and every KV block moves by the
+        target's slot arithmetic rather than the generic pool matching. ``require``
+        goes into each server's config, since ``modeling_v2`` is an ``LLM`` argument.
+        """
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        transceiver = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        common = {
+            "modeling_v2": "require",
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "max_batch_size": 16,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "cache_transceiver_config": transceiver,
+            "kv_cache_config": {"free_gpu_memory_fraction": 0.6},
+        }
+        ctx_server_config = {**common, "disable_overlap_scheduler": True}
+        gen_server_config = {**common, "disable_overlap_scheduler": False}
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {"num_instances": 1},
+            "generation_servers": {"num_instances": 1},
+        }
+        with launch_disaggregated_llm(
+            disaggregated_server_config,
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            extra_env={MODELING_V2_VALIDATE_ENV: "1"},
+        ) as llm:
+            # The harness infers only the weight quantization from the path; the
+            # R1 reference entry is keyed on the FP8 KV cache as well.
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            run_accuracy_test(llm, self.MODEL_NAME, test_sets=["GSM8K"])

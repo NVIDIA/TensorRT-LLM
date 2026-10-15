@@ -26,7 +26,9 @@ import pytest
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.planner import CacheDescriber, LayerGroupRows
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -148,6 +150,7 @@ def _make_projection_sender() -> Sender:
         self_endpoint="tcp://decode:0",
         cp_size=1,
         cp_rank=0,
+        page_table=None,
     )
 
     extractor = MagicMock()
@@ -158,14 +161,27 @@ def _make_projection_sender() -> Sender:
             SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
         ],
     )
-    # extract(region_ids, layer_group_id, pool_idx) - the caller passes the
-    # layer-group and pool indices positionally, so swallow them.
-    extractor.extract.side_effect = lambda block_ids, *_, **__: SimpleNamespace(
-        memory=SimpleNamespace(
-            ptrs=np.asarray(block_ids, dtype=np.int64),
-            bytes_per_region=1,
-        )
-    )
+
+    class _SlotAddressedDescriber(CacheDescriber):
+        """One view per layer group; a row's address is its slot id, one byte long."""
+
+        def rows(self, page_table, slot_table_per_layer_group, excluded_views):
+            out = []
+            for lg_idx, table in enumerate(slot_table_per_layer_group):
+                table = np.asarray(table, dtype=np.int64)
+                held = np.flatnonzero(table >= 0)
+                out.append(
+                    LayerGroupRows(
+                        layer_group_index=lg_idx,
+                        view_index=0,
+                        kind=CacheKind.PAGED,
+                        block_ordinals=held,
+                        addresses=table[held],
+                        row_bytes=1,
+                        span_blocks=int(table.size),
+                    )
+                )
+            return out
 
     mapper = MagicMock()
     mapper.map.side_effect = lambda src_region, dst_region: SimpleNamespace(
@@ -174,20 +190,31 @@ def _make_projection_sender() -> Sender:
     )
 
     registrar = MagicMock()
-    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0)
+    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0, dp_rank=0, page_table=None)
     registrar.self_extractor = extractor
     registrar.get_peer_rank_info.return_value = peer_ri
-    registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
-    registrar.should_send_kv.return_value = True
-    registrar.get_pool_mapping.return_value = {
-        (0, 0): (0, 0),
-        (1, 0): (1, 0),
-    }
-    registrar.peer_extractor.return_value = extractor
-    registrar.get_kv_map.return_value = mapper
+
+    # The real planner's pair() over mocked pool matching / mappers, so the
+    # ordinal pairing under test is the production code path.
+    planner = DefaultTransferPlanner.__new__(DefaultTransferPlanner)
+    planner._self_ext_cache = extractor
+    planner._targets_cache = {}
+    planner.get_peer_overlap = MagicMock(
+        return_value=SimpleNamespace(ranks=[0], duplicate_head_factor=1, overlap_pp_size=1)
+    )
+    planner.should_send_pool = MagicMock(return_value=True)
+    planner.get_pool_mapping = MagicMock(
+        return_value={
+            (0, 0): (0, 0),
+            (1, 0): (1, 0),
+        }
+    )
+    planner.get_kv_map = MagicMock(return_value=mapper)
 
     sender = Sender.__new__(Sender)
     sender._registrar = registrar
+    sender._planner = planner
+    sender._describer = _SlotAddressedDescriber()
     return sender
 
 
@@ -302,7 +329,7 @@ def _projection_task_for(start_block: int, end_block: int) -> KVSendTask:
 def test_context_parallelism_is_refused_only_for_a_piece_short_of_the_prompt():
     """The guard only fires for a piece short of the whole prompt; a sole whole-prompt piece passes."""
     sender = _make_projection_sender()
-    sender._registrar.self_rank_info = SimpleNamespace(cp_size=2, cp_rank=0)
+    sender._registrar.self_rank_info = SimpleNamespace(cp_size=2, cp_rank=0, page_table=None)
 
     sender._build_kv_write_meta(_projection_task_for(0, 8), _make_projection_req_info())
     with pytest.raises(ValueError, match="context parallelism"):

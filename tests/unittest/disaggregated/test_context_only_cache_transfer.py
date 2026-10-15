@@ -13,6 +13,8 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.disaggregation.native.default_describer import DefaultCacheDescriber
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
@@ -160,21 +162,25 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
                 "generation", target, torch.cuda.current_device()
             ).to_bytes()
         )
-        registrar = PeerRegistrar(source_info, KVRegionExtractorV1(source))
+        source_extractor = KVRegionExtractorV1(source)
+        planner = DefaultTransferPlanner(source_info, source_extractor)
+        registrar = PeerRegistrar(source_info, source_extractor, planner)
         for info, dp_rank in ((source_info, source_dp_rank), (target_info, target_dp_rank)):
             assert info.instance_rank == info.tp_rank == info.dp_rank == (dp_rank or 0)
             assert info.tp_size == info.dp_size == (4 if dp_rank is not None else 1)
             assert info.tp_size_per_dp_group == 1
             assert info.attention.enable_attention_dp == (dp_rank is not None)
+        # The transfer worker stamps the planner on the rank info it publishes.
+        target_info.planner_id = DefaultTransferPlanner.planner_id
         registrar.register("generation", target_info.instance_rank, target_info)
-        assert registrar.get_peer_overlap(target_info, target_info.dp_rank).ranks == [
+        assert planner.get_peer_overlap(target_info, target_info.dp_rank).ranks == [
             target_info.instance_rank
         ]
-        receiver_registrar = PeerRegistrar(target_info, KVRegionExtractorV1(target))
-        assert receiver_registrar.get_peer_overlap(source_info, source_info.dp_rank).ranks == [
+        receiver_planner = DefaultTransferPlanner(target_info, KVRegionExtractorV1(target))
+        assert receiver_planner.get_peer_overlap(source_info, source_info.dp_rank).ranks == [
             source_info.instance_rank
         ]
-        pool_mapping = registrar.get_pool_mapping(target_info)
+        pool_mapping = planner.get_pool_mapping(target_info)
         matched_global_ids = set()
         for (src_group, src_view), (dst_group, dst_view) in pool_mapping.items():
             source_group = source_info.page_table.layer_groups[src_group]
@@ -206,6 +212,8 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         assert len(target_slice.excluded_pool_views) == 20
         sender = Sender.__new__(Sender)
         sender._registrar = registrar
+        sender._planner = planner
+        sender._describer = DefaultCacheDescriber()
         task = SimpleNamespace(
             _chunk=source_slice,
             _prompt_len=length,

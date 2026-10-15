@@ -148,7 +148,8 @@ def create_kv_cache_transceiver(
     kv_cache_manager: KVCacheManager,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
-    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+    model: Optional[object] = None,
 ) -> Optional["KvCacheTransceiver"]:
     resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
@@ -224,8 +225,15 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        # The model class may plan its own KV transfers (see
+        # DecoderModelForCausalLM.build_transfer_planner); anything without
+        # the hook gets the default planner.
+        planner_factory = getattr(model, "build_transfer_planner", None)
+        return KvCacheTransceiverV2(mapping,
+                                    dist,
+                                    kv_cache_manager,
+                                    cache_transceiver_config,
+                                    planner_factory=planner_factory)
 
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,

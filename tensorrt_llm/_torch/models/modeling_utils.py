@@ -801,6 +801,19 @@ class DecoderModelForCausalLM(nn.Module,
             None.
         """
 
+    def build_transfer_planner(self, kv_cache_manager, self_rank_info,
+                               self_extractor):
+        """The disaggregated KV transfer plan for this model on this rank.
+
+        A model whose cache layout the default planner does not understand
+        returns its own ``TransferPlanner`` here; the context and the
+        generation deployment of that model then run the same planner.
+        """
+        from tensorrt_llm._torch.disaggregation.native.default_planner import \
+            DefaultTransferPlanner
+
+        return DefaultTransferPlanner(self_rank_info, self_extractor)
+
     def post_load_weights(self) -> None:
         """Run the default staged post-load hook sequence.
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Golden tests for ``PeerRegistrar.get_pool_mapping``.
+"""Golden tests for ``DefaultTransferPlanner.get_pool_mapping``.
 
 Locks the current (pre-refactor) behavior of disagg pool matching across the
 representative scenarios that the refactor must keep working:
@@ -34,8 +34,8 @@ called out in the refactor commit message.
 import numpy as np
 import pytest
 
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
@@ -176,7 +176,7 @@ def _rank_info(
 
 def _registrar(self_pt, **kwargs):
     self_ri = _rank_info(name="self", page_table=self_pt, **kwargs)
-    return PeerRegistrar(self_ri, KVRegionExtractorV1(self_pt))
+    return DefaultTransferPlanner(self_ri, KVRegionExtractorV1(self_pt))
 
 
 def _kv_pool_view(pool_idx, local_layer_ids):
@@ -358,7 +358,7 @@ def test_skewed_buffer_entries_per_layer_raises():
     """
     view = _pool_view(0, [(0, "key"), (1, "key"), (1, "key"), (1, "key")])
     with pytest.raises(ValueError, match="not evenly distributed"):
-        PeerRegistrar._get_buffers_per_layer(view, layer_group_id=0, pool_idx=0)
+        DefaultTransferPlanner._get_buffers_per_layer(view, layer_group_id=0, pool_idx=0)
 
 
 def test_duplicate_global_layer_id_across_lgs_raises():

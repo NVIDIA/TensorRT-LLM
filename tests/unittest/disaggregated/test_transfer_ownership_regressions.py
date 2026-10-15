@@ -29,6 +29,7 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.planner import PeerTargets
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
 from tensorrt_llm._torch.disaggregation.native.transfer import (
@@ -586,10 +587,12 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
     receiver._bounce = _BounceProbe()
+    receiver._bounce.reserve = Mock(wraps=receiver._bounce.reserve)
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver_req = SimpleNamespace(
         unique_rid=rid,
+        block_ids_per_layer_groups=[],
         slice_id=0,
         bounce_dst_base=None,
         to_bytes=Mock(return_value=b"receiver-request"),
@@ -600,13 +603,19 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
         1: SimpleNamespace(ranks=[2, 3]),
     }
     receiver._registrar = SimpleNamespace(
-        get_peer_overlap=Mock(side_effect=lambda _peer, dp_rank: overlaps[dp_rank]),
-        self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(
             cp_size=1,
             instance_name="gen",
             instance_rank=0,
         ),
+    )
+    receiver._planner = SimpleNamespace(
+        targets=Mock(
+            side_effect=lambda _self_ri, _peer_ri, dp_rank: PeerTargets(
+                ranks=overlaps[dp_rank].ranks, uniform_writers=True
+            )
+        ),
+        receiver_payload_bytes=Mock(return_value=0),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
@@ -632,6 +641,8 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     session.dispatch_prepared_receive(task)
 
     assert task.expected_transfers == 2
+    # The broadcast union is never a uniform writer set: fan-in bounce must not be attempted.
+    receiver._bounce.reserve.assert_not_called()
     assert {call.args[0] for call in receiver._request_sender_data.call_args_list} == {
         f"tcp://sender-{rank}" for rank in range(4)
     }
@@ -684,6 +695,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     receiver._dealers = {}
     receiver_req = SimpleNamespace(
         unique_rid=rid,
+        block_ids_per_layer_groups=[],
         slice_id=0,
         mamba_state_index=None,
         bounce_dst_base=None,
@@ -696,9 +708,11 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         overlap_pp_size=1,
     )
     receiver._registrar = SimpleNamespace(
-        get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
+    )
+    receiver._planner = SimpleNamespace(
+        targets=Mock(return_value=PeerTargets(ranks=overlap.ranks, uniform_writers=True)),
+        receiver_payload_bytes=Mock(return_value=0),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
@@ -861,6 +875,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     receiver._build_recv_req_info = Mock(
         return_value=SimpleNamespace(
             unique_rid=rid,
+            block_ids_per_layer_groups=[],
             slice_id=0,
             mamba_state_index=None,
             bounce_dst_base=None,
@@ -868,10 +883,10 @@ def test_cancel_after_publication_cannot_overtake_request_data(
         )
     )
     overlap = SimpleNamespace(ranks=[0])
-    receiver._registrar = SimpleNamespace(
-        get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
-        self_rank_info=SimpleNamespace(cp_size=1),
+    receiver._registrar = SimpleNamespace(self_rank_info=SimpleNamespace(cp_size=1))
+    receiver._planner = SimpleNamespace(
+        targets=Mock(return_value=PeerTargets(ranks=overlap.ranks, uniform_writers=True)),
+        receiver_payload_bytes=Mock(return_value=0),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(

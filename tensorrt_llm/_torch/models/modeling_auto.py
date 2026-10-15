@@ -77,4 +77,10 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         with model_extra_attrs(extra_attrs):
             model = cls(config)
         model.extra_attrs = extra_attrs
+        # The user may name a KV transfer planner for this deployment (see
+        # disaggregation.planners). Bound here, where the config is known and
+        # before the transceiver asks for the hook, so neither the model nor
+        # the disaggregation code names the other.
+        from ..disaggregation.planners import bind_transfer_planner
+        bind_transfer_planner(model, config)
         return model

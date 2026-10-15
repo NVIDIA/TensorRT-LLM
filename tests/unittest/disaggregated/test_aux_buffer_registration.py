@@ -67,10 +67,9 @@ def _build_aux_write_meta(
     registrar = Mock()
     registrar.self_rank_info = SimpleNamespace(aux_meta=src_buffer.meta)
     registrar.get_peer_rank_info.return_value = peer_rank_info
-    registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     registrar.should_send_aux.return_value = True
     registrar.get_aux_transfer_layout.return_value = None
-    sender = SimpleNamespace(_registrar=registrar)
+    sender = SimpleNamespace(_registrar=registrar, _expected_transfers=lambda peer_ri: 1)
     task = SimpleNamespace(_perf_timer=None, _slot=src_slot, _unique_rid=7)
     req_info = SimpleNamespace(
         instance_name="peer", instance_rank=1, aux_slot=dst_slot, unique_rid=7

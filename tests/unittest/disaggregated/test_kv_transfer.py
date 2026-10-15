@@ -42,6 +42,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.disaggregation.native.default_planner as default_planner_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
@@ -1943,7 +1944,7 @@ def test_incompatible_peer_fails_only_affected_requests(
 ) -> None:
     """An incompatible context peer must fail only the requests targeting it.
 
-    When peer validation rejects a peer during first
+    When the planner rejects a peer during first
     registration, the receiver must (a) not raise out of receive() — the
     session fails through the normal transfer-error path (WaitResult.FAILED)
     with the diagnostic preserved; (b) cache the incompatibility so later
@@ -2017,7 +2018,9 @@ def test_incompatible_peer_fails_only_affected_requests(
 
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(transfer_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser))
+            mp.setattr(
+                default_planner_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser)
+            )
 
             # (a) First request to the incompatible peer: receive() must not
             # raise; the session fails with the diagnostic preserved.

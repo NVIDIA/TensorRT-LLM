@@ -346,6 +346,7 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp(
     """
     import torch
 
+    from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
     from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import ReplicatedMapper
     from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -362,7 +363,9 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp(
     try:
         ctx_extractor = KVRegionExtractorV1(ctx)
         ctx_ri = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
-        registrar = PeerRegistrar(ctx_ri, ctx_extractor)
+        registrar = PeerRegistrar(
+            ctx_ri, ctx_extractor, DefaultTransferPlanner(ctx_ri, ctx_extractor)
+        )
 
         # Fill ctx indexer pool with position-dependent bytes; zero gen pools.
         ctx_pool_tensor = ctx.impl.get_indexer_k_cache_pool()
@@ -381,12 +384,13 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp(
 
         for gen_pp_rank, gen in enumerate(gens):
             gen_ri = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
+            gen_ri.planner_id = DefaultTransferPlanner.planner_id
             registrar.register("gen", gen_ri.instance_rank, gen_ri)
-            mapping = registrar.get_pool_mapping(gen_ri)
+            mapping = registrar.planner.get_pool_mapping(gen_ri)
             # KV pool and indexer pool each match 1:1.
             assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
 
-            mapper = registrar.get_kv_map(gen_ri, (0, 1), (0, 1))
+            mapper = registrar.planner.get_kv_map(gen_ri, (0, 1), (0, 1))
             assert isinstance(mapper, ReplicatedMapper)
 
             gen_extractor = registrar.peer_extractor("gen", gen_ri.instance_rank)

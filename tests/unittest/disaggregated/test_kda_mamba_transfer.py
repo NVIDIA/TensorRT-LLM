@@ -55,6 +55,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
@@ -286,7 +287,9 @@ def test_kda_hetero_tp_sharded_accepted():
         MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
 
         # And via the registrar entry point used at runtime.
-        registrar = PeerRegistrar(ctx_ri, KVRegionExtractorV1(ctx_pt))
+        ctx_ext = KVRegionExtractorV1(ctx_pt)
+        registrar = PeerRegistrar(ctx_ri, ctx_ext, DefaultTransferPlanner(ctx_ri, ctx_ext))
+        gen_ri.planner_id = DefaultTransferPlanner.planner_id
         registrar.register("kda_gen", 1, gen_ri)
     finally:
         for mgr in ctx_mgrs + gen_mgrs:

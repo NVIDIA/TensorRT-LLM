@@ -35,6 +35,7 @@ from tensorrt_llm._utils import get_sm_version
 
 from ..conftest import llm_models_root
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from .test_disaggregated_serving import launch_disaggregated_llm, run_accuracy_test
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -87,3 +88,65 @@ class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(2)
+    def test_gsm8k_disagg(self, mocker):
+        """The same target on both sides of a disaggregated deployment.
+
+        Context server on one GPU, generation server on another, KV moved by
+        the NIXL Python transceiver. The target itself is unchanged: the context
+        server only ever builds prefill batches and the generation server only
+        decode batches, so each side settles on one of the two targets that the
+        aggregated case already alternates between.
+
+        ``modeling_v2`` is an ``LLM`` argument, so it goes into each server's
+        config: ``trtllm-serve`` reads its ``LLM`` arguments from a YAML the
+        harness writes. The validate switch is an environment variable and
+        travels through ``extra_env``.
+        """
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, {"scores_filter": "exact_match,flexible-extract"})
+        transceiver = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        kv_cache = {
+            "max_attention_window": [128, 32768],
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
+        }
+        ctx_server_config = {
+            "modeling_v2": "require",
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": transceiver,
+            "kv_cache_config": kv_cache,
+            "tensor_parallel_size": 1,
+        }
+        gen_server_config = {
+            "modeling_v2": "require",
+            "disable_overlap_scheduler": False,
+            "cache_transceiver_config": transceiver,
+            "kv_cache_config": kv_cache,
+            "tensor_parallel_size": 1,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {"num_instances": 1},
+            "generation_servers": {"num_instances": 1},
+        }
+        with launch_disaggregated_llm(
+            disaggregated_server_config,
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            extra_env={MODELING_V2_VALIDATE_ENV: "1"},
+        ) as llm:
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME,
+                test_sets=["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs},
+            )

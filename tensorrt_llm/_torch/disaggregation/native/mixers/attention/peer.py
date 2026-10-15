@@ -127,7 +127,7 @@ class ReplicatedMapper(IntactMapper):
     indexer K), so no head slicing applies. Layer selection under partial PP
     overlap happens through the per-layer offsets, and fan-in routing (one
     owning sender per destination) is decided upstream by
-    ``PeerRegistrar.should_send_pool``.
+    ``DefaultTransferPlanner.should_send_pool``.
     """
 
     def __init__(

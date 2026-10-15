@@ -16,11 +16,15 @@
 import numpy as np
 import pytest
 
-import tensorrt_llm._torch.disaggregation.native.peer as peer_module
+import tensorrt_llm._torch.disaggregation.native.default_planner as default_planner_module
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
+)
+from tensorrt_llm._torch.disaggregation.native.default_planner import (
+    DefaultTransferPlanner,
+    PeerOverlap,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     AttentionPolicy,
@@ -35,7 +39,7 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaHeadMatchMapper,
     MambaPolicy,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
@@ -183,6 +187,7 @@ def make_rankinfo(
         cp_size=cp_size,
         cp_rank=cp_rank,
         device_id=0,
+        planner_id=DefaultTransferPlanner.planner_id,
         layer_num_per_pp=layer_num_per_pp,
         self_endpoint="",
         transfer_engine_info=b"",
@@ -203,7 +208,9 @@ def make_rankinfo(
 def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
     pt = make_page_table()
     real_kv_extractor = KVRegionExtractorV1(pt)
-    reg = PeerRegistrar(self_ri, real_kv_extractor)
+    reg = PeerRegistrar(
+        self_ri, real_kv_extractor, DefaultTransferPlanner(self_ri, real_kv_extractor)
+    )
     if peer_ri.page_table is None:
         peer_ri = make_rankinfo(
             instance_name=peer_ri.instance_name,
@@ -250,7 +257,7 @@ def test_basic_overlap():
         layer_num_per_pp=[1, 1],
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-    overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, peer_dp_rank=0)
     assert overlap.overlap_pp_size == 2
     assert overlap.overlap_tp_size == 1
     assert overlap.ranks == [0, 1]
@@ -278,7 +285,7 @@ def test_no_overlap():
         layer_num_per_pp=[2],
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-    overlap = reg.get_peer_overlap(peer_ri, 0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_pp_size == 0
     assert overlap.ranks == []
 
@@ -307,7 +314,7 @@ def test_attention_free_stage_has_no_head_duplication(
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
 
-    overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, peer_dp_rank=0)
 
     assert overlap.duplicate_head_factor == 1
     assert overlap.peer_duplicate_head_factor == 1
@@ -336,7 +343,7 @@ def test_pp_ratio_peer_smaller():
         layer_num_per_pp=[3],
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-    overlap = reg.get_peer_overlap(peer_ri, 0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_pp_size > 0
     assert all(r >= 0 for r in overlap.ranks)
 
@@ -349,7 +356,7 @@ def test_tp_overlap():
         "peer", tp_size=4, tp_rank=0, pp_size=1, pp_rank=0, cp_size=1, cp_rank=0
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-    overlap = reg.get_peer_overlap(peer_ri, 0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_tp_size in [1, 2]
     assert all(isinstance(r, int) for r in overlap.ranks)
 
@@ -362,7 +369,7 @@ def test_cp_overlap():
         "peer", cp_size=4, cp_rank=0, pp_size=1, pp_rank=0, tp_size=1, tp_rank=0
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-    overlap = reg.get_peer_overlap(peer_ri, 0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_cp_size in [1, 2]
     assert all(isinstance(r, int) for r in overlap.ranks)
 
@@ -389,7 +396,7 @@ def test_multiple_overlap():
         layer_num_per_pp=[1, 1, 1, 1],
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-    overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+    overlap = reg.planner.get_peer_overlap(peer_ri, peer_dp_rank=0)
     expected_overlap = PeerOverlap(
         overlap_pp_size=2,
         overlap_tp_size=2,
@@ -404,7 +411,9 @@ def test_multiple_overlap():
 def _make_peer_registrar(self_rankinfo):
     pt = self_rankinfo.page_table if self_rankinfo.page_table else make_page_table()
     real_kv_extractor = KVRegionExtractorV1(pt)
-    reg = PeerRegistrar(self_rankinfo, real_kv_extractor)
+    reg = PeerRegistrar(
+        self_rankinfo, real_kv_extractor, DefaultTransferPlanner(self_rankinfo, real_kv_extractor)
+    )
     return reg
 
 
@@ -564,7 +573,7 @@ def test_peer_registrar_get_kv_map_identity():
         page_table=make_page_table(),
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     # Full contiguous overlap: one whole-region fragment per block.
     assert isinstance(mapper, IntactMapper)
     pair = mapper.map(
@@ -593,7 +602,7 @@ def test_peer_registrar_get_kv_map_head_match():
         page_table=peer_pt,
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     # Partial layer overlap with matching heads: a single shifted fragment.
     assert isinstance(mapper, IntactMapper)
     pair = mapper.map(
@@ -625,7 +634,7 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, HNDHeadMismatchMapper)
 
 
@@ -650,7 +659,7 @@ def test_peer_registrar_get_kv_map_uses_physical_offset_order():
         page_table=peer_pt,
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, IntactMapper)
     pair = mapper.map(
         SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=1024)),
@@ -684,7 +693,7 @@ def test_peer_registrar_get_kv_map_non_contiguous_overlap_splits_fragments():
         page_table=peer_pt,
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, IntactMapper)
     pairs = mapper.map(
         SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=1536)),
@@ -718,7 +727,7 @@ def test_peer_registrar_get_kv_map_merges_non_monotonic_contiguous_layout():
         page_table=peer_pt,
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, IntactMapper)
     pair = mapper.map(
         SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=1024)),
@@ -832,7 +841,7 @@ def test_replicated_mapper_ignores_kv_head_mismatch():
         layer_num_per_pp=[1],
         page_table=peer_pt,
     )
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, ReplicatedMapper)
 
 
@@ -867,7 +876,7 @@ def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
             layer_num_per_pp=[1],
         )
         reg = _make_peer_registrar(self_ri)
-        ownership.append(reg.should_send_pool(overlap, peer_ri, 0, 0))
+        ownership.append(reg.planner.should_send_pool(overlap, peer_ri, 0, 0))
 
     # ratio = self_tp(8) / peer_tp_per_dp(1) = 8: exactly one owner, at the
     # slot selected by the destination dp rank.
@@ -1043,7 +1052,7 @@ def test_get_buffers_per_layer_rejects_non_uniform_nhd_entries():
     )
 
     with pytest.raises(ValueError, match="layer_group=3, pool=4"):
-        PeerRegistrar._get_buffers_per_layer(
+        DefaultTransferPlanner._get_buffers_per_layer(
             pool_view,
             layer_group_id=3,
             pool_idx=4,
@@ -1071,7 +1080,7 @@ def test_non_uniform_view_geometry_rejected_for_all_kinds():
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
     with pytest.raises(ValueError, match="not uniform"):
-        reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+        reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
 
 
 def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
@@ -1095,7 +1104,7 @@ def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
     reg = _make_peer_registrar(self_ri)
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
 
     assert isinstance(mapper, HNDHeadMismatchMapper)
 
@@ -1147,7 +1156,7 @@ def test_peer_registrar_dispatches_nhd_mapper():
     reg = _make_peer_registrar(self_ri)
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
 
     assert isinstance(mapper, NHDHeadMismatchMapper)
 
@@ -1166,7 +1175,7 @@ def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
     )
     warnings = []
     monkeypatch.setattr(
-        peer_module.logger,
+        default_planner_module.logger,
         "warning_once",
         lambda *message, key: warnings.append((" ".join(map(str, message)), key)),
     )
@@ -1200,7 +1209,7 @@ def test_peer_registrar_nhd_head_match_uses_intact_mapper():
     reg = _make_peer_registrar(self_ri)
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
-    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    mapper = reg.planner.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, IntactMapper)
     assert not isinstance(mapper, NHDHeadMismatchMapper)
 
@@ -1311,8 +1320,8 @@ def _add_replicated_side_view(page_table, *, bytes_per_layer=8):
 
 def test_policy_dispatch_keys_on_cache_kind_only():
     reg = _make_peer_registrar(make_rankinfo(instance_name="local"))
-    assert isinstance(reg._get_policy(CacheKind.PAGED), AttentionPolicy)
-    assert isinstance(reg._get_policy(CacheKind.STATE), MambaPolicy)
+    assert isinstance(reg.planner._get_policy(CacheKind.PAGED), AttentionPolicy)
+    assert isinstance(reg.planner._get_policy(CacheKind.STATE), MambaPolicy)
 
 
 def test_mamba_replicated_side_view_elects_one_sender():
@@ -1334,8 +1343,8 @@ def test_mamba_replicated_side_view_elects_one_sender():
             instance_name="local", tp_size=2, tp_rank=tp_rank, page_table=self_pt
         )
         reg = _make_peer_registrar(self_ri)
-        conv_ownership.append(reg.should_send_pool(overlap, peer_ri, 1, 0))
-        side_ownership.append(reg.should_send_pool(overlap, peer_ri, 1, side_idx))
+        conv_ownership.append(reg.planner.should_send_pool(overlap, peer_ri, 1, 0))
+        side_ownership.append(reg.planner.should_send_pool(overlap, peer_ri, 1, side_idx))
 
     assert conv_ownership == [True, True]
     assert side_ownership == [True, False]
@@ -1355,9 +1364,9 @@ def test_mamba_replicated_side_view_copies_whole_layers_under_tp_mismatch():
     peer_ri = make_rankinfo(instance_name="peer", tp_size=1, page_table=peer_pt)
     reg = _make_peer_registrar(self_ri)
 
-    mapper = reg.get_kv_map(peer_ri, (1, self_side), (1, peer_side))
+    mapper = reg.planner.get_kv_map(peer_ri, (1, self_side), (1, peer_side))
     assert isinstance(mapper, MambaHeadMatchMapper)
-    conv_mapper = reg.get_kv_map(peer_ri, (1, 0), (1, 0))
+    conv_mapper = reg.planner.get_kv_map(peer_ri, (1, 0), (1, 0))
     assert isinstance(conv_mapper, ConvStateMismatchMapper)
 
 

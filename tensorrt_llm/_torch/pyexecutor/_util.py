@@ -4302,9 +4302,13 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+    kv_cache_transceiver = create_kv_cache_transceiver(mapping,
+                                                       dist,
+                                                       kv_cache_manager,
+                                                       attention_type,
+                                                       cache_transceiver_config,
+                                                       mamba_cache_manager,
+                                                       model=model_engine.model)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

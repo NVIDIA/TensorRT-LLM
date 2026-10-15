@@ -44,6 +44,13 @@ class RankInfo:
     cp_size: int = 1
     cp_rank: int = 0
     device_id: int = 0
+    # Which TransferPlanner class produced this rank's plan, and that planner's
+    # opaque self-description. The framework compares planner_id across peers;
+    # only the planner decodes planner_blob.
+    planner_id: str = ""
+    planner_blob: bytes = b""
+    # Which CacheDescriber class described this rank's rows; compared across peers too.
+    describer_id: str = ""
 
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None

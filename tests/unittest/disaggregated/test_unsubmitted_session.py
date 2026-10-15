@@ -61,7 +61,8 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
     sender._registrar.get_peer_rank_info.return_value = SimpleNamespace(
         instance_name="gen", instance_rank=0, dp_rank=0, self_endpoint="tcp://gen:1234"
     )
-    sender._registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
+    sender._planner = Mock()
+    sender._planner.targets.return_value = SimpleNamespace(ranks=[0], uniform_writers=True)
     return sender
 
 

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CacheReuseAdapter, the positional _create_chunk, and Sender ordinal pairing."""
+"""Tests for CacheReuseAdapter, the positional _create_chunk, and DefaultTransferPlanner row pairing."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -20,7 +20,9 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.transfer import Sender
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.disaggregation.base.planner import LayerGroupRows
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV1,
@@ -36,54 +38,74 @@ def _arr(values):
     return np.array(values, dtype=np.int64)
 
 
+def _rows(table) -> LayerGroupRows:
+    """Rows off a positional slot table (index == block ordinal, -1 == not held), addressed by slot."""
+    table = _arr(table)
+    held = np.flatnonzero(table >= 0)
+    return LayerGroupRows(
+        layer_group_index=0,
+        view_index=0,
+        kind=CacheKind.PAGED,
+        block_ordinals=held,
+        addresses=table[held],
+        row_bytes=1,
+        span_blocks=int(table.size),
+    )
+
+
+def _pair(src_table, dst_table, **kw):
+    """The slots paired by DefaultTransferPlanner._pair_rows, as (src slots, dst slots)."""
+    src, dst = _rows(src_table), _rows(dst_table)
+    src_sel, dst_sel = DefaultTransferPlanner._pair_rows(src, dst, **kw)
+    return src.addresses[src_sel], dst.addresses[dst_sel]
+
+
 # ---------------------------------------------------------------------------
-# Sender._pair_ordinals: the whole alignment protocol is one intersection.
+# DefaultTransferPlanner._pair_rows: the whole alignment protocol is one intersection.
 # ---------------------------------------------------------------------------
 
 
-class TestPairOrdinals:
-    """Both tables are positional (index == block ordinal, -1 == not held).
+class TestPairRows:
+    """Each side lists the ordinals it holds; a block moves only where both sides hold it.
 
-    The sender moves a block only where both sides hold it. Every previously
-    special-cased situation (SWA eviction, receiver prefix reuse, wider receiver
-    window, pipelined chunk bounds) is just a different hole pattern.
+    Every previously special-cased situation (SWA eviction, receiver prefix
+    reuse, wider receiver window, pipelined chunk bounds) is just a different
+    hole pattern.
     """
 
     def test_identity(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, 12]), _arr([20, 21, 22]))
+        src, dst = _pair(_arr([10, 11, 12]), _arr([20, 21, 22]))
         np.testing.assert_array_equal(src, [10, 11, 12])
         np.testing.assert_array_equal(dst, [20, 21, 22])
 
     def test_receiver_prefix_reuse_is_a_dst_hole(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
+        src, dst = _pair(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
     def test_sender_chunk_bounds_are_src_holes(self):
-        src, dst = Sender._pair_ordinals(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
+        src, dst = _pair(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
         np.testing.assert_array_equal(src, [11, 12])
         np.testing.assert_array_equal(dst, [21, 22])
 
     def test_holes_on_both_sides_take_the_intersection(self):
-        src, dst = Sender._pair_ordinals(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
+        src, dst = _pair(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
         np.testing.assert_array_equal(src, [12])
         np.testing.assert_array_equal(dst, [22])
 
     def test_no_overlap_is_empty(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, -1]), _arr([-1, -1, 22]))
+        src, dst = _pair(_arr([10, 11, -1]), _arr([-1, -1, 22]))
         assert src.size == 0
         assert dst.size == 0
 
     def test_dst_start_block_masks_the_head(self):
-        src, dst = Sender._pair_ordinals(
-            _arr([10, 11, 12, 13]), _arr([20, 21, 22, 23]), dst_start_block=2
-        )
+        src, dst = _pair(_arr([10, 11, 12, 13]), _arr([20, 21, 22, 23]), dst_start_block=2)
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
     def test_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="differ in length"):
-            Sender._pair_ordinals(_arr([10, 11]), _arr([20, 21, 22]))
+            _pair(_arr([10, 11]), _arr([20, 21, 22]))
 
     def test_sender_not_yet_evicted_but_receiver_has(self):
         # Regression (DeepSeek-V4 SWA, prompt_len == 2 blocks, window == 1
@@ -91,16 +113,25 @@ class TestPairOrdinals:
         # advanced, while gen pre-declared history_length=prompt_len and never
         # allocated ordinal 0. Pairing by ordinal copies X1 -> G1; the old
         # length-based suffix arithmetic copied X0 -> G1.
-        src, dst = Sender._pair_ordinals(_arr([100, 101]), _arr([-1, 201]))
+        src, dst = _pair(_arr([100, 101]), _arr([-1, 201]))
         np.testing.assert_array_equal(src, [101])
         np.testing.assert_array_equal(dst, [201])
 
     def test_receiver_with_wider_speculative_window(self):
         # Only gen runs spec decoding, so its SWA window keeps one more block.
         # That block has no source; it simply is not written.
-        src, dst = Sender._pair_ordinals(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
+        src, dst = _pair(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
+
+    def test_helix_receiver_holds_every_cp_size_th_ordinal(self):
+        # cp_size=2: receiver cp_rank=1 owns global ordinals 1, 3, 5 as its ordinals 0, 1, 2.
+        src, dst = _pair(_arr([10, 11, 12, 13, 14, 15]), _arr([20, -1, 22]), helix=(1, 2))
+        np.testing.assert_array_equal(src, [11, 15])
+        np.testing.assert_array_equal(dst, [20, 22])
+        # The strided span must still match the receiver's table.
+        with pytest.raises(ValueError, match="differ in length"):
+            _pair(_arr([10, 11, 12, 13, 14]), _arr([20, 21, 22]), helix=(1, 2))
 
 
 # ---------------------------------------------------------------------------

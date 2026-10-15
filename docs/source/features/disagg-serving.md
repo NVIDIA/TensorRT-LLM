@@ -380,6 +380,8 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
 
+* `TRTLLM_KV_TRANSFER_PLANNER`: Names a model-specific KV transfer planner by its `planner_id`, for example `trtllm.deepseek_mla_latent` for DeepSeek-V3 architectures under attention DP with no pipeline or context parallelism. Unset (the default), every model uses the generic transfer plan. The named planner checks at start-up that it supports the model architecture and parallel topology and fails with the reason otherwise. Context and generation servers must set the same value; the transceiver refuses to connect workers whose planners differ. Requires `transceiver_runtime: PYTHON`.
+
 * `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
