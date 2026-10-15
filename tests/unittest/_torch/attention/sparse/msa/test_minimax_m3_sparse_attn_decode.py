@@ -1440,6 +1440,7 @@ def _reference_sparse_p32_table(
     return pages, compact.flatten().to(torch.int32)
 
 
+@skip_not_sm100
 def test_trtllm_gen_sparse_p32_metadata_matches_reference():
     """The fused transform preserves page order, partial tails, and padding."""
     case = _make_nvfp4_inputs(
