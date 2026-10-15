@@ -748,6 +748,11 @@ def run_isolated_tests(
                     print(f"Isolated test {i + 1} ({test_name}) failed after rerun attempt")
                     rerun_failed = True
                     iso_failed += 1
+                elif Path(output_dir, "rerun", f"isolated_{i}", "rerun_0.txt").exists():
+                    print(
+                        f"Isolated test {i + 1} ({test_name}) failed and was not eligible for rerun"
+                    )
+                    iso_failed += 1
                 else:
                     iso_passed += 1
             except RuntimeError as e:
