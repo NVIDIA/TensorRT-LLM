@@ -9,6 +9,8 @@ mis-address.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -208,6 +210,15 @@ def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
         M.check_replay_state(HISTORY, 3, _t(SLOTS - 1, dtype=torch.int32), buf, _ssm())
     with pytest.raises(AssertionError, match="cache_buf_idx"):
         M.check_replay_state(HISTORY, 3, pnat, buf.to(torch.int64), _ssm())
+
+
+def test_replay_width_admits_only_the_managers_step_width() -> None:
+    replay = SimpleNamespace(width=3)
+    M.check_replay_width(None, 1)  # the legacy recurrence takes any width
+    M.check_replay_width(replay, 3)
+    for rows in (1, 2, 4):
+        with pytest.raises(AssertionError, match="step width 3"):
+            M.check_replay_width(replay, rows)
 
 
 def test_replay_history_rejects_missing_short_pool_and_wrong_geometry() -> None:

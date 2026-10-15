@@ -644,6 +644,18 @@ def check_replay_history(
     )
 
 
+def check_replay_width(replay, rows: int) -> None:
+    """Under the cached replay a single-row generation step cannot take the ordinary
+    recurrence: the pool row is a checkpoint whose pending history only the replay kernel
+    applies. The manager's step width is the one row count per sequence a step may carry."""
+    assert replay is None or rows == replay.width, (
+        f"the batch carries {rows} query rows per generation sequence and the GDN cached "
+        f"replay runs at step width {replay.width}; a runtime_draft_len of {rows - 1} (a "
+        "draft-length schedule, or skipped drafting) cannot run under it. Export "
+        "TRTLLM_USE_GDN_REPLAY=0 for variable draft lengths"
+    )
+
+
 def check_shared_selection(shared, slots, layer: int, block_topk: int) -> None:
     """IndexShare: the metadata's shared selection buffers have a row for `layer` and are
     `block_topk` wide."""
@@ -1594,8 +1606,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         views no eager step validated into the graph."""
         cm = md.kv_cache_manager
         assert not torch.cuda.is_current_stream_capturing(), (
-            f"the draft layer met KV cache manager {type(cm).__name__} for the first time "
-            "under CUDA graph capture; its views must be taken and checked by an eager step first"
+            f"the draft layer is not bound to KV cache manager {type(cm).__name__} (first use, "
+            "or the manager changed since its last bind) and CUDA graph capture is active; "
+            "an eager step must take and check its views first"
         )
         _require(
             cm,
@@ -2885,17 +2898,7 @@ class PrefillTarget:
                 f"predicted_tokens_per_seq {gen_p} is outside the 1..4 range "
                 f"attention/thop_attention certifies"
             )
-            # Under the cached replay a single-row generation step cannot take the
-            # ordinary recurrence: the pool row is a checkpoint whose pending history only
-            # the replay kernel applies. The manager's step width is the one row count a
-            # generation step may carry.
-            replay_state = core._bound.replay
-            assert replay_state is None or gen_p == replay_state.width, (
-                f"the batch carries {gen_p} query rows per generation sequence and the GDN "
-                f"cached replay runs at step width {replay_state.width}; a runtime_draft_len "
-                f"of {gen_p - 1} (a draft-length schedule, or skipped drafting) cannot run "
-                "under it. Export TRTLLM_USE_GDN_REPLAY=0 for variable draft lengths"
-            )
+            check_replay_width(core._bound.replay, gen_p)
         is_verify = spec_metadata is not None and num_decodes > 0 and gen_p > 1
         step["predicted_tokens_per_seq"] = gen_p
 
@@ -2988,7 +2991,6 @@ class PrefillTarget:
                 num_gens=num_decodes,
                 rows_per_gen=gen_p,
                 slots=si_d,
-                input_ids=input_ids[num_prefill_tokens:num_tokens],
                 request_indices=md.qsa_req_idx_per_token[num_prefill_tokens:num_tokens],
                 logical_positions=md.qsa_logical_positions[num_prefill_tokens:num_tokens],
                 block_table=md.qsa_block_table,
@@ -4080,15 +4082,7 @@ class DecodeTarget:
                 f"predicted_tokens_per_seq {gen_p} is outside the 1..4 range "
                 f"attention/thop_attention certifies"
             )
-            # Under the cached replay only the manager's step width is servable (see
-            # PrefillTarget.forward).
-            replay_state = core._bound.replay
-            assert replay_state is None or gen_p == replay_state.width, (
-                f"the batch carries {gen_p} query rows per generation sequence and the GDN "
-                f"cached replay runs at step width {replay_state.width}; a runtime_draft_len "
-                f"of {gen_p - 1} (a draft-length schedule, or skipped drafting) cannot run "
-                "under it. Export TRTLLM_USE_GDN_REPLAY=0 for variable draft lengths"
-            )
+            check_replay_width(core._bound.replay, gen_p)
         is_verify = spec_metadata is not None and batch > 0 and gen_p > 1
         step["predicted_tokens_per_seq"] = gen_p
 
@@ -4149,7 +4143,6 @@ class DecodeTarget:
                 num_gens=batch,
                 rows_per_gen=gen_p,
                 slots=si_all,
-                input_ids=input_ids,
                 request_indices=md.qsa_req_idx_per_token[:num_tokens],
                 logical_positions=md.qsa_logical_positions[:num_tokens],
                 block_table=md.qsa_block_table,
@@ -4986,7 +4979,6 @@ class SpeculativeRollback:
         num_gens: int,
         rows_per_gen: int,
         slots: torch.Tensor,
-        input_ids: torch.Tensor,
         request_indices: torch.Tensor,
         logical_positions: torch.Tensor,
         block_table: torch.Tensor,
@@ -4995,16 +4987,16 @@ class SpeculativeRollback:
         """Open a verify step's staging. The generation rows follow the `prefix_tokens`
         context rows as `num_gens` runs of `rows_per_gen`, so row `s * p + t` is ordinal `t`
         of generation request `s`. `slots` are those requests' recurrent slots;
-        `input_ids`, `request_indices` and `logical_positions` are the generation rows'
-        own. Each row's QSA slot is resolved here, as `qsa_paged_index_store` resolves it."""
+        `request_indices` and `logical_positions` are the generation rows' own. Each row's
+        QSA slot is resolved here, as `qsa_paged_index_store` resolves it."""
         n, p = num_gens, rows_per_gen
         assert n > 0 and p > 1, (
             f"a verify step stages generation requests carrying drafts; got {n} "
             f"requests of {p} rows"
         )
-        assert input_ids.shape[0] == n * p and logical_positions.shape[0] == n * p, (
+        assert logical_positions.shape[0] == n * p, (
             f"{n} generation requests of {p} rows are {n * p} rows; got "
-            f"{input_ids.shape[0]} ids and {logical_positions.shape[0]} positions"
+            f"{logical_positions.shape[0]} positions"
         )
         positions = logical_positions.to(torch.long)
         pages = block_table[request_indices.to(torch.long), positions // tokens_per_block]
@@ -5365,10 +5357,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
                 and mrope_ids.dim() == 3
                 and mrope_ids.shape[0] == _QSA_POSITION_AXES
             ), (
-                f"a media request needs the [{_QSA_POSITION_AXES}, 1, L] "
-                "mrope_config.mrope_position_ids from the input processor: it is the "
-                "only source of a vision span's coordinates, and without it the span "
-                "holds the text position on every axis; got "
+                f"a media request needs mrope_config.mrope_position_ids of shape "
+                f"[{_QSA_POSITION_AXES}, 1, L]; got "
                 f"{None if mrope_ids is None else tuple(mrope_ids.shape)}"
             )
             runtime = getattr(params, "multimodal_runtime", None)
