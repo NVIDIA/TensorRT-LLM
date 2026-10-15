@@ -60,12 +60,7 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import (
-    MsaIndexer,
-    cutedsl_score_runner,
-    prewarm_split_proxy_variants,
-    segmented_proxy_plan,
-)
+from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
 
 
 def _cache_device(meta) -> torch.device:
@@ -537,11 +532,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
-            )
-            prewarm_split_proxy_variants(
-                self._msa_index_kv_dtype(),
-                params.sharded_index_head_count(self.mapping),
-                int(kv_cache_manager.tokens_per_block),
             )
         self._msa_buffers_ready = True
 

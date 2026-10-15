@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_processor_count_for_device
 from tensorrt_llm._utils import async_tensor_h2d
 
 from .kernels.msa_utils import (
@@ -167,18 +168,14 @@ _PROXY_SPLIT_MIN_PREFIX = 4096
 _PROXY_MAX_KV_SPLITS = 16
 
 
-@functools.lru_cache(maxsize=1)
-def _num_sms() -> int:
-    return torch.cuda.get_device_properties().multi_processor_count
-
-
 def _proxy_kv_splits(qo_lens: list[int], qo_offsets: list[int], num_index_heads: int) -> int:
     """KV splits filling about one SM wave with these rows' segments, or 0 to plan them unsplit."""
     # If every row has <= 64 queries, segments select variants prewarm_split_proxy_variants skips.
     if max(qo_offsets) < _PROXY_SPLIT_MIN_PREFIX or max(qo_lens) <= 64:
         return 0
     num_segments = sum((n + _PROXY_SEGMENT_LEN - 1) // _PROXY_SEGMENT_LEN for n in qo_lens)
-    return min(_PROXY_MAX_KV_SPLITS, _num_sms() // (num_segments * num_index_heads))
+    num_sms = get_multi_processor_count_for_device(torch.cuda.current_device())
+    return min(_PROXY_MAX_KV_SPLITS, num_sms // (num_segments * num_index_heads))
 
 
 def _segmented_proxy_plan(

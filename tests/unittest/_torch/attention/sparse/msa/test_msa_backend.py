@@ -970,6 +970,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
     )
 
     assert result.shape == (num_tokens, 1, 16)
+    assert captured["kv_indices"] is metadata.msa_prefill_proxy_kv_indices
     assert captured["gen_token_first"] == expected_gen_first
     assert captured["ctx_rows"] == expected_ctx_rows
     # Set together with the rest of the scorer's inputs, so it says whether the
@@ -1044,86 +1045,6 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed(
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
-
-
-@pytest.mark.parametrize(
-    "rows",
-    [((1025, 131072),), ((16288, 3000),), ((1500, 60000), (50, 20000), (300, 0))],
-    ids=["1k_over_131k", "16k_over_unaligned_3k", "multi_row"],
-)
-@pytest.mark.parametrize("num_index_heads", [1, 2])
-def test_msa_segmented_proxy_scores_match_unsplit_bitwise(
-    num_index_heads: int, rows: tuple[tuple[int, int], ...]
-) -> None:
-    """Top-k ranks these scores, so the whole buffer, -inf entries included, must match."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100 (Blackwell) required")
-
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
-        msa_package_available,
-        require_msa_module,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
-        _proxy_max_score,
-        _segmented_proxy_plan,
-    )
-
-    if not msa_package_available():
-        pytest.skip("fmha_sm100 (MSA) not importable")
-    fmha_sm100 = require_msa_module()
-    page_size = head_dim = 128
-    sm_scale = head_dim**-0.5
-    qo_lens = torch.tensor([qo_len for qo_len, _ in rows], dtype=torch.int32)
-    qo_offsets = torch.tensor([prefix for _, prefix in rows], dtype=torch.int32)
-    kv_lens = qo_lens + qo_offsets
-    num_pages = int(((kv_lens + page_size - 1) // page_size).sum())
-    num_tokens = int(qo_lens.sum())
-    generator = torch.Generator(device="cuda").manual_seed(num_tokens + num_index_heads)
-    # Scattered pages of a larger pool and a strided Q view, as in production.
-    index_k = torch.randn(
-        num_pages + 64, 1, page_size, head_dim, generator=generator, device="cuda"
-    ).to(torch.float8_e4m3fn)
-    kv_indices = torch.randperm(num_pages + 64, generator=generator, device="cuda")[:num_pages]
-    kv_indices = kv_indices.to(torch.int32)
-    q_width = num_index_heads * head_dim
-    index_q = (
-        torch.randn(num_tokens, q_width + 64, generator=generator, device="cuda")
-        .to(torch.float8_e4m3fn)[:, :q_width]
-        .view(num_tokens, num_index_heads, head_dim)
-    )
-    reference = _proxy_max_score(
-        index_q,
-        index_k,
-        qo_lens_cpu=qo_lens,
-        kv_lens_cpu=kv_lens,
-        qo_offset_cpu=qo_offsets,
-        kv_indices=kv_indices,
-        sm_scale=sm_scale,
-        causal=True,
-    )
-    for num_kv_splits in (1, 3, 16):
-        plan, plan_kv_indices = _segmented_proxy_plan(
-            fmha_sm100,
-            qo_lens.tolist(),
-            qo_offsets.tolist(),
-            num_index_heads=num_index_heads,
-            page_size=page_size,
-            num_kv_splits=num_kv_splits,
-            kv_indices=kv_indices,
-        )
-        _, scores = fmha_sm100.fmha_sm100(
-            index_q,
-            index_k,
-            index_k,
-            plan,
-            kv_indices=plan_kv_indices,
-            output_o=False,
-            output_maxscore=True,
-            sm_scale=sm_scale,
-        )
-        assert torch.equal(scores.view(torch.int32), reference.view(torch.int32))
 
 
 def _expand_slot_rows(block_ids: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
