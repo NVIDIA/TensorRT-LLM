@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -108,6 +108,22 @@ protected:
         pageConfig2.setMemoryType(runtime::MemoryType::kGPU);
         mLoraCache = std::make_unique<LoraCache>(pageConfig, *mModelConfig, *mWorldConfig, *mManager);
         mLoraCache2 = std::make_unique<LoraCache>(pageConfig2, *mModelConfig, *mWorldConfig, *mManager);
+    }
+
+    void putSyntheticTask(LoraCache& cache, LoraCache::TaskIdType taskId, SizeType32 numPages)
+    {
+        // One rank-one module per page in a cache with one 64-element slot per page.
+        SizeType32 constexpr kWeightWidth = 64;
+        std::vector<int32_t> config;
+        for (SizeType32 i = 0; i < numPages; ++i)
+        {
+            config.insert(config.end(), {mModelConfig->getLoraModules().at(i).value(), 0, 1});
+        }
+        TensorPtr keys = ITensor::wrap(config, ITensor::makeShape({numPages, 3}));
+        TensorPtr weights = mManager->cpu(ITensor::makeShape({numPages, kWeightWidth}), tensorrt_llm::DataType::kFLOAT);
+        mManager->setZero(*weights);
+        ASSERT_EQ(cache.determineNumPages(keys), numPages);
+        cache.put(taskId, weights, keys);
     }
 
     std::shared_ptr<BufferManager> mManager;
@@ -370,6 +386,31 @@ TEST_F(LoraCacheTest, basicPutGet)
             ASSERT_FLOAT_EQ(p1[i], p2[i]);
         }
     }
+}
+
+TEST_F(LoraCacheTest, evictionPreservesCacheOnFailure)
+{
+    LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 4, 4, 1, 64, 1);
+    LoraCache cache(pageConfig, *mModelConfig, *mWorldConfig, *mManager);
+    putSyntheticTask(cache, 1, 2);
+    putSyntheticTask(cache, 2, 1);
+    cache.markTaskDone(2);
+
+    // One free page plus one evictable page cannot satisfy three pages.
+    EXPECT_THROW(putSyntheticTask(cache, 3, 3), LoraCacheFullException);
+    EXPECT_FALSE(cache.has(3));
+    EXPECT_TRUE(cache.isLoaded(1));
+    EXPECT_TRUE(cache.isLoaded(2));
+    EXPECT_TRUE(cache.isDone(2));
+    EXPECT_EQ(cache.determineNumPages(1), 2);
+    EXPECT_EQ(cache.determineNumPages(2), 1);
+
+    // Retry the same task ID: the last candidate now supplies exactly enough pages.
+    putSyntheticTask(cache, 3, 2);
+    EXPECT_TRUE(cache.isLoaded(3));
+    EXPECT_EQ(cache.determineNumPages(3), 2);
+    EXPECT_TRUE(cache.isLoaded(1));
+    EXPECT_FALSE(cache.has(2));
 }
 
 TEST_F(LoraCacheTest, splitTransposeCpu)

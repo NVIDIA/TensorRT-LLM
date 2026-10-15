@@ -216,7 +216,7 @@ def BOLT_CONSUME = "bolt_consume"
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = false
+def ENABLE_BOLT_PREMERGE_CONSUME = true
 // Version-controlled rollout switch for post-merge BOLT, same idiom as above.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
@@ -388,7 +388,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: artifactory.pdx.nvidia.com/docker-remote/alpine:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -567,7 +567,7 @@ def mergeWaiveList(pipeline, globalVars)
             targetBranchTOTCommit = json[0].sha
         }
         echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-        sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
+        sh "wget https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
         isGetTOTWaiveList = true
     } catch (InterruptedException e) {
         throw e
@@ -628,7 +628,7 @@ def mergeWaiveList(pipeline, globalVars)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
+    image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
@@ -770,7 +770,7 @@ def launchReleaseCheck(pipeline, globalVars)
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm.nvidia.com/docker/golang:1.23"
+    def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
@@ -1651,9 +1651,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/weight_sharing/",
-        "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
+        "tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py",
         "tensorrt_llm/_torch/visual_gen/modules/vae/",
-        "tensorrt_llm/_torch/visual_gen/modules/attention.py",
+        "tensorrt_llm/_torch/visual_gen/attention/attention.py",
         "tensorrt_llm/_torch/visual_gen/executor.py",
         "tensorrt_llm/_torch/visual_gen/mapping.py",
         "tensorrt_llm/_torch/visual_gen/pipeline.py",
@@ -2197,6 +2197,19 @@ def getCommonParameters()
     ]
 }
 
+def findCachedPLCSourceScanResult(commit) {
+    def plcJobUrl = "${trtllm_utils.resolveCurrentJenkinsBaseUrl(this)}/job/LLM/job/helpers/job/PLCScanningSetup"
+    def exitCode = sh(
+        script: "python3 ${LLM_ROOT}/jenkins/scripts/find_plc_build.py --commit ${commit} --jenkins-base ${plcJobUrl} > find_plc_build.json",
+        returnStatus: true
+    )
+    if (exitCode != 0) {
+        return null
+    }
+    def buildInfo = new JsonSlurper().parseText(readFile("find_plc_build.json"))
+    return [result: buildInfo.result, url: buildInfo.url]
+}
+
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
@@ -2320,28 +2333,46 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             repoUrlKey = "tensorrt_llm_internal"
                         }
                     }
-                    echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                    def logger = new Logger(pipeline)
                     try {
-                        def params = [
-                            string(name: 'ref', value: env.gitlabCommit),
-                            string(name: 'repoUrlKey', value: repoUrlKey),
-                            string(name: 'forkOwner', value: ''),
-                            string(name: 'postMergePipelineName', value: ''),
-                            string(name: 'postMergeBuildNumber', value: ''),
-                            string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
-                            string(name: 'runSourceCodeScanning', value: 'true'),
-                            string(name: 'runContainerScanning', value: 'false'),
-                            string(name: 'runSonarQube', value: 'false'),
-                        ]
-                        def logger = new Logger(pipeline)
-                        def handle = build(
-                            job: "/LLM/helpers/PLCScanningSetup",
-                            parameters: params,
-                            propagate: false
-                        )
-                        if (handle.result == "UNSTABLE" && !isNightlyRelease) {
+                        // find_plc_build.py only needs python3 + network access to Jenkins, but
+                        // the top-level pipeline agent (createKubernetesPodConfig("", "agent")) is
+                        // a bare alpine container with neither, so run the lookup in a "package"
+                        // pod instead (same image used by preparation()'s mergeWaiveList.py call).
+                        def cached
+                        def packageImage = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package"), "trt-llm", {
+                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                            cached = findCachedPLCSourceScanResult(env.gitlabCommit)
+                        })
+                        def handleResult
+                        if (cached) {
+                            echo "Commit ${env.gitlabCommit} unchanged since a prior PLC source-code scan; reusing its result: ${cached.result}"
+                            echo "Reused PLC scan pipeline: ${cached.url}"
+                            handleResult = cached.result
+                        } else {
+                            echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                            def params = [
+                                string(name: 'ref', value: env.gitlabCommit),
+                                string(name: 'repoUrlKey', value: repoUrlKey),
+                                string(name: 'forkOwner', value: ''),
+                                string(name: 'postMergePipelineName', value: ''),
+                                string(name: 'postMergeBuildNumber', value: ''),
+                                string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
+                                string(name: 'runSourceCodeScanning', value: 'true'),
+                                string(name: 'runContainerScanning', value: 'false'),
+                                string(name: 'runSonarQube', value: 'false'),
+                            ]
+                            def handle = build(
+                                job: "/LLM/helpers/PLCScanningSetup",
+                                parameters: params,
+                                propagate: false
+                            )
+                            handleResult = handle.result
+                        }
+                        if (handleResult == "UNSTABLE" && !isNightlyRelease) {
                             logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
-                        } else if (handle.result != "SUCCESS") {
+                        } else if (handleResult != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     } catch (InterruptedException e) {

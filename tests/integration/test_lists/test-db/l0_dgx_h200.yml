@@ -111,5 +111,6 @@ l0_dgx_h200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True]
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events
+  - unittest/_torch/modeling/test_modeling_gpt_oss.py::test_gpt_oss_xqa_kernel_selection
   - llmapi/test_llm_examples.py::test_llmapi_example_distributed_tp2
   - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"

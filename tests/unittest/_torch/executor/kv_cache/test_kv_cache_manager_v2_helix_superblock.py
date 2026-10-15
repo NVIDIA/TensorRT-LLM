@@ -233,6 +233,8 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         _has_cp_helix=True,
         # A draft manager never commits generation blocks.
         try_commit_generation_blocks=lambda request: None,
+        # No lender attached, so a resize has no one to tell.
+        _sharing=None,
     )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)

@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Literal,
-                    Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
+                    Literal, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -96,6 +96,7 @@ from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
+from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -118,12 +119,15 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, RankState, count_retiring_requests
+from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
+                                   count_retiring_requests)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
+
+    from tensorrt_llm.bindings import MpiProgressThread
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
 
@@ -193,6 +197,30 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
 # max_input_len truncation.
 _UNBOUNDED_PAUSE_MAX_INPUT_LEN = 0x7fffffff
+
+# Period of the native MPI progress thread that pipeline-parallel ranks run;
+# a value <= 0 disables the thread, and a value above the maximum is malformed.
+PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME = "TLLM_PP_MPI_PROGRESS_INTERVAL_US"
+DEFAULT_PP_MPI_PROGRESS_INTERVAL_US = 5000
+MAX_PP_MPI_PROGRESS_INTERVAL_US = 1_000_000
+
+
+def _resolve_pp_mpi_progress_interval_us() -> int:
+    raw = os.environ.get(PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME)
+    if raw is None:
+        return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
+    try:
+        interval_us = int(raw)
+    except ValueError:
+        interval_us = None
+    if interval_us is None or interval_us > MAX_PP_MPI_PROGRESS_INTERVAL_US:
+        logger.error(
+            f"Ignoring malformed {PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}="
+            f"{raw!r} (expected an integer up to "
+            f"{MAX_PP_MPI_PROGRESS_INTERVAL_US}); using "
+            f"{DEFAULT_PP_MPI_PROGRESS_INTERVAL_US} us.")
+        return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
+    return interval_us
 
 
 class _SleepWakeupTag(IntEnum):
@@ -660,6 +688,27 @@ class PyExecutor:
         self.enable_kv_cache_events = self.kv_cache_manager is not None and (
             self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
+        # Event routing also needs the sum of actual per-rank capacities after
+        # pool rebalance. Keep sampling internal unless GetLoad was enabled.
+        routing_load_enabled = (getattr(
+            self.llm_args, "_enable_routing_load", False) or getattr(
+                self.kv_cache_manager, "streaming_kv_events_enabled", False))
+        self._kv_load_tracker = KvLoadTracker(
+            self.kv_cache_manager,
+            int(self.dist.tp_rank) if self.enable_attention_dp else 0,
+            routing_load_enabled)
+        self._kv_cache_capacity = self._read_kv_cache_capacity()
+        self._openengine_discovery = {}
+        self._openengine_node_server = None
+        if self._kv_load_tracker.enabled:
+            initial_sample = self._kv_load_tracker.sample(
+                self._kv_cache_capacity, force=True)
+            if self.enable_attention_dp:
+                rank_loads = self.dist.tp_allgather(initial_sample)
+                if self.dist.rank == 0 and all(rank_loads):
+                    self._kv_load_tracker.snapshot = aggregate_load(rank_loads)
+            elif initial_sample:
+                self._kv_load_tracker.record_local(initial_sample)
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # Router Replay (R3): SharedRouteCache bound, derived once from the KV
         # pool token capacity on the first non-warmup step (0 = block reuse off,
@@ -1083,6 +1132,10 @@ class PyExecutor:
         self._pp_mpi_progress: Optional[MpiProgressPump] = None
         self._pp_mpi_progress_stop = threading.Event()
         self._pp_mpi_progress_quiesced = threading.Event()
+        self._mpi_progress_thread: Optional["MpiProgressThread"] = None
+        # The callable registered with atexit for that thread, kept so that
+        # shutdown can unregister it.
+        self._mpi_progress_thread_exit_hook: Optional[Callable[[], None]] = None
         # Secondary MPI communicator and listener thread for multi-rank
         # sleep/wakeup control messages.  Both are None until start_worker()
         # calls Dup() (a collective) on the main thread.
@@ -1449,6 +1502,10 @@ class PyExecutor:
                 error_delivered=self._event_loop_error_delivered,
             ) if crashed else None
             try:
+                node_server = getattr(self, "_openengine_node_server", None)
+                if node_server is not None:
+                    node_server.close()
+                    self._openengine_node_server = None
                 self._executor_loop_cleanup()
             finally:
                 if crashed:
@@ -1595,6 +1652,8 @@ class PyExecutor:
                             name="sleep_wakeup_listener_thread",
                         )
                         self._sleep_wakeup_listener_thread.start()
+                if self.dist.pp_size > 1 and not self._disable_mpi:
+                    self._start_mpi_progress_thread()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -1833,10 +1892,70 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
+    def _start_mpi_progress_thread(self) -> None:
+        """Start a native thread that keeps this rank's MPI sends moving.
+
+        Pipeline-parallel ranks post their schedule and sample-state messages
+        with isend and continue. A message large enough for the rendezvous
+        protocol completes only when this process enters MPI again; if the
+        executor thread meanwhile blocks in a native call that holds the GIL
+        (e.g. a lazy CUDA kernel load that waits for an in-flight NCCL
+        kernel), no thread of this process enters MPI, the next rank never
+        receives the message, and the pipeline deadlocks. The thread issues a
+        non-matching MPI_Iprobe every interval without taking the GIL.
+
+        Leaves ``_mpi_progress_thread`` None when the thread is disabled or
+        unavailable.
+        """
+        interval_us = _resolve_pp_mpi_progress_interval_us()
+        if interval_us <= 0:
+            logger.error(
+                f"{PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}={interval_us}: the "
+                f"pipeline-parallel MPI progress thread is disabled.")
+            return
+        from mpi4py import MPI
+
+        from tensorrt_llm.bindings import MpiProgressThread
+
+        if MPI.Query_thread() < MPI.THREAD_MULTIPLE:
+            logger.error(
+                "MPI does not provide MPI_THREAD_MULTIPLE; the "
+                "pipeline-parallel MPI progress thread stays off. A rank that "
+                "blocks in a GIL-holding native call while one of its sends "
+                "is in flight can then deadlock the pipeline.")
+            return
+        thread = MpiProgressThread(mpi_comm().py2f(), interval_us,
+                                   int(PPCommTag.MPI_PROGRESS_PROBE))
+        # Must stop before MPI_Finalize. mpi4py finalizes MPI from a
+        # Py_AtExit hook, which runs after all atexit handlers. Keep the
+        # registered callable: each `thread.stop` access creates a new bound
+        # method, which atexit.unregister would not match.
+        self._mpi_progress_thread = thread
+        self._mpi_progress_thread_exit_hook = thread.stop
+        atexit.register(self._mpi_progress_thread_exit_hook)
+        logger.info(f"Started the pipeline-parallel MPI progress thread "
+                    f"(interval {interval_us} us).")
+
+    def _stop_mpi_progress_thread(self) -> None:
+        """Stop the native MPI progress thread if it runs.
+
+        stop() waits only for a probe already in flight to return, and
+        MPI_Iprobe is non-blocking.
+        """
+        if self._mpi_progress_thread is not None:
+            self._mpi_progress_thread.stop()
+            atexit.unregister(self._mpi_progress_thread_exit_hook)
+            self._mpi_progress_thread = None
+            self._mpi_progress_thread_exit_hook = None
+
     def shutdown(self):
         """
         Signals the server to shutdown.
         """
+        node_server = getattr(self, "_openengine_node_server", None)
+        if node_server is not None:
+            node_server.close()
+            self._openengine_node_server = None
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         # Tear down any profile window an HTTP caller left open (i.e.
@@ -1852,9 +1971,11 @@ class PyExecutor:
             # Since the whole process will shutdown after this `shutdown` call,
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
-            # Stop the relay thread from probing while the hang detector
-            # aborts MPI. A probe already in flight is not interrupted.
+            # Stop the relay thread and the native progress thread from
+            # probing while the hang detector aborts MPI. A relay-thread probe
+            # already in flight is not interrupted.
             self._pp_mpi_progress_stop.set()
+            self._stop_mpi_progress_thread()
             return
         self.worker_thread.join()
         if self.kv_connector_manager is not None:
@@ -1868,6 +1989,7 @@ class PyExecutor:
             # pump tick, so acknowledge the quiesce here; otherwise the exit
             # hook would wait out its full timeout.
             self._pp_mpi_progress_quiesced.set()
+            self._stop_mpi_progress_thread()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
@@ -1950,6 +2072,13 @@ class PyExecutor:
     def fail_sleep_wakeup_transition(self) -> None:
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
+    def get_memory_status(self) -> dict[str, object]:
+        state, parked_tags = self.executor_request_queue.get_memory_status()
+        return {
+            "state": state.value,
+            "parked_tags": sorted(parked_tags),
+        }
+
     def get_request_admission_state(self) -> RequestAdmissionState:
         return self.executor_request_queue.get_admission_state()
 
@@ -1970,21 +2099,28 @@ class PyExecutor:
             self.stats = []
         return latest_stats
 
-    def get_kv_cache_capacity(self) -> dict:
+    def _read_kv_cache_capacity(self) -> dict:
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is None:
             return {}
 
-        kv_stats = kv_cache_manager.get_kv_cache_stats()
-        max_num_blocks = getattr(kv_stats, "max_num_blocks", 0)
-        tokens_per_block = getattr(kv_stats, "tokens_per_block", 0)
-
+        block_counts = getattr(type(kv_cache_manager),
+                               "get_primary_block_counts", None)
+        if callable(block_counts):
+            _, max_num_blocks = block_counts(kv_cache_manager)
+            tokens_per_block = kv_cache_manager.tokens_per_block
+        else:
+            kv_stats = kv_cache_manager.get_kv_cache_stats()
+            max_num_blocks = getattr(kv_stats, "max_num_blocks", 0)
+            tokens_per_block = getattr(kv_stats, "tokens_per_block", 0)
         if not max_num_blocks:
             max_num_blocks = getattr(kv_cache_manager, "blocks_in_primary_pool",
                                      0)
         if not max_num_blocks:
-            max_num_blocks = kv_cache_manager.get_max_resource_count()
+            resource_count = kv_cache_manager.get_max_resource_count()
+            max_num_blocks = (resource_count
+                              if isinstance(resource_count, int) else 0)
         if not tokens_per_block:
             tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", 0)
 
@@ -1993,11 +2129,31 @@ class PyExecutor:
 
         max_num_blocks = int(max_num_blocks)
         tokens_per_block = int(tokens_per_block)
-        return {
+        capacity = {
             "maxNumBlocks": max_num_blocks,
             "tokensPerBlock": tokens_per_block,
             "maxNumTokens": max_num_blocks * tokens_per_block,
         }
+        if getattr(kv_cache_manager, "streaming_kv_events_enabled",
+                   False) is True:
+            capacity["kvEventsEnabled"] = True
+        return capacity
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Return the latest scheduler-owned primary KV capacity."""
+        return self._kv_cache_capacity.copy()
+
+    def get_openengine_discovery(self) -> dict:
+        """Return immutable-at-startup OpenEngine node and publisher discovery."""
+        return self._openengine_discovery
+
+    def get_kv_cache_load(self) -> dict:
+        """Return the scheduler-owned KV load snapshot.
+
+        Control-plane callers can execute on RPC threads. They must never query
+        the single-threaded cache manager directly.
+        """
+        return self._kv_load_tracker.snapshot
 
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -3504,6 +3660,7 @@ class PyExecutor:
                             elif target_action == _SleepWakeupAction.SLEEP:
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
+                                self.invalidate_v1_prefix_cache_for_sleep(tags)
                                 release_with_tag(*tags)
                                 torch.cuda.synchronize()
                                 gc.collect()
@@ -5365,6 +5522,9 @@ class PyExecutor:
         if not remote_tail_adp:
             self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
 
+        # Rebalancing can change the number of primary blocks.
+        self._kv_cache_capacity = self._read_kv_cache_capacity()
+
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.
 
@@ -6505,6 +6665,10 @@ class PyExecutor:
             active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
         # 1. Gather rank states and calculate total_num_active_requests
+        load_sample = self._kv_load_tracker.begin_step(active_requests,
+                                                       self.enable_attention_dp,
+                                                       self._kv_cache_capacity)
+
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
             # because _pop_from_waiting_queue needs all_ranks_num_active_requests
@@ -6519,18 +6683,31 @@ class PyExecutor:
             # clear stats once every rank is aligned.
             iter_stats_payload = (self._adp_iter_stats.next_payload()
                                   if self.enable_iter_perf_stats else None)
+            if load_sample:
+                if iter_stats_payload is None:
+                    iter_stats_payload = RankIterStatsPayload()
+                iter_stats_payload.kv_used_blocks = load_sample["usedKvBlocks"]
+                iter_stats_payload.kv_total_blocks = load_sample[
+                    "totalKvBlocks"]
+                iter_stats_payload.kv_load_timestamp_ns = load_sample[
+                    "timestampUnixNanos"]
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)
                 all_rank_states = self.adp_router.gather_all_rank_states(
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
-                    forward_work=(len(context_ids), len(generation_ids)))
+                    forward_work=(len(context_ids), len(generation_ids)),
+                    include_kv_cache_load=self._kv_load_tracker.enabled)
                 self._select_remote_tail_phase(all_rank_states, context_ids,
                                                generation_ids)
             else:
                 all_rank_states = self.adp_router.gather_all_rank_states(
-                    active_requests, iter_stats_payload=iter_stats_payload)
+                    active_requests,
+                    iter_stats_payload=iter_stats_payload,
+                    include_kv_cache_load=self._kv_load_tracker.enabled)
+            if self._kv_load_tracker.enabled and self.dist.rank == 0:
+                self._kv_load_tracker.record_rank_states(all_rank_states)
             if self.enable_iter_perf_stats:
                 for record in self._adp_iter_stats.finalize(
                         all_rank_states, is_rank0=self.dist.rank == 0):
@@ -6594,6 +6771,8 @@ class PyExecutor:
             new_requests = new_requests_cur_rank
 
         # 7. Merge requests
+        if self._kv_load_tracker.enabled and new_requests:
+            self._kv_load_tracker.idle_sampled = False
         return merge_requests(new_requests,
                               cp_config=self.dist.cp_config,
                               cp_rank=self.dist.cp_rank,
@@ -9300,6 +9479,27 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
+
+    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
+        """Reject runtime-memory tags unsupported by the active KV manager."""
+        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
+            raise ValueError(
+                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
+                "its main pools are not managed by tagged virtual memory.")
+
+    def invalidate_v1_prefix_cache_for_sleep(
+            self, tags: List[ExecutorMemoryType]) -> None:
+        """Invalidate V1 reuse metadata before destructive KV-cache sleep."""
+        if (self._is_kv_manager_v2 or not self.enable_kv_cache_reuse
+                or ExecutorMemoryType.KV_CACHE not in tags):
+            return
+
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+
+        restore_mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
+        if restore_mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+            self.reset_prefix_cache()
 
     def invalidate_multimodal_encoder_cache(self) -> None:
         """Clear weight-derived MM outputs after request lifetimes quiesce."""

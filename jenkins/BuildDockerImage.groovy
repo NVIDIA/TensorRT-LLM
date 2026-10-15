@@ -192,7 +192,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     case "agent":
         containerConfig = """
                   - name: python3
-                    image: urm.nvidia.com/docker/python:3.12-slim
+                    image: artifactory.pdx.nvidia.com/docker-remote/python:3.12-slim
                     command: ['cat']
                     tty: true
                     resources:
@@ -999,7 +999,7 @@ pipeline {
     }
     environment {
         CCACHE_DIR="${CCACHE_DIR}"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // Picked up by docker/Makefile and handed to `docker buildx build` as a
         // BuildKit secret, which authenticates the github.com clones inside the
         // image build (docker/common/github_auth.sh).

@@ -36,7 +36,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
 
     FA4_AVAILABLE = _flash_attn_fwd is not None
 except ImportError:
@@ -743,6 +743,46 @@ def test_static_context_is_numerically_identical_to_uncached_path() -> None:
 
     torch.testing.assert_close(cached.sample, uncached.sample, rtol=0, atol=0)
     torch.testing.assert_close(cached.audio_sample, uncached.audio_sample, rtol=0, atol=0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("cached", [False, True], ids=["uncached", "cached_static_context"])
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("token_tags", [1, 0, 3, 0], "token_tags values must be one of"),
+        ("token_tags", [1, 0, -2, 0], "token_tags values must be one of"),
+        ("timestep_indices", [0, 1, 2, 0], "outside the timestep table"),
+        ("timestep_indices", [0, -1, 1, 0], "outside the timestep table"),
+        ("token_tags", [1, 0, 2], "token_tags and timestep_indices must match"),
+        ("timestep_indices", [0, 1, 1, 0, 0], "token_tags and timestep_indices must match"),
+    ],
+    ids=["tag_high", "tag_low", "timestep_high", "timestep_low", "tag_short", "timestep_long"],
+)
+def test_forward_rejects_invalid_layout_before_the_fused_adaln_gather(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, field: str, value: list[int], message: str
+) -> None:
+    """Both forward paths range-check the packed layout; the fused AdaLN kernels gather ``mod[idx]`` unchecked."""
+
+    def _unreachable_block(*args: object, **kwargs: object) -> torch.Tensor:
+        pytest.fail("a transformer block ran before the layout was validated")
+
+    monkeypatch.setattr(h3.MiniMaxH3TransformerBlock, "forward", _unreachable_block)
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
+    _initialize_weights(model)
+    inputs = _model_inputs("cuda")
+    if cached:
+        inputs |= {
+            "static_context": model.prepare_static_context(
+                inputs["encoder_hidden_states"], inputs["position_ids"]
+            ),
+            "encoder_hidden_states": None,
+            "position_ids": None,
+        }
+    inputs[field] = torch.tensor(value, device="cuda")
+
+    with pytest.raises(ValueError, match=message):
+        model(**inputs)
 
 
 @requires_cuda
