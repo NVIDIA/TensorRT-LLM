@@ -6583,6 +6583,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
+        // MiniMax-M3 AgentX aggregated (1h trace replay per case, 3 cases over 3 stages)
+        "GB300-4_GPUs-PyTorch-PerfSanity-AgentX-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity_agentx", 1, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-AgentX-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity_agentx", 2, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-AgentX-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity_agentx", 3, 3, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()

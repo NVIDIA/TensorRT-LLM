@@ -2581,6 +2581,11 @@ class AggrTestCmds(NamedTuple):
                     client_env = copy.deepcopy(os.environ)
                     if client_config:
                         client_env.update(client_config.to_env())
+                    # Keep aiperf's artifacts (its own logs included) with the
+                    # rest of the lane's output; ignored by other clients.
+                    client_env["TRTLLM_AGENTX_ARTIFACT_DIR"] = os.path.join(
+                        self.test_output_dir, f"agentx.{server_idx}.{client_idx}"
+                    )
                     output = _run_benchmark_with_log(
                         client_cmd_with_port,
                         client_env,

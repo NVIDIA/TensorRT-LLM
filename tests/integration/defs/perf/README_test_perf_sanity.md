@@ -146,6 +146,10 @@ config-parse time rather than silently falling through to the default client.
   `AGENTX_DURATION` seconds, so `dataset_file` names an `aiperf` dataset loader (fetched
   from HF), *not* a path — `get_dataset_dir` must not be applied to it.
 - `concurrency_list` is the whole-cluster total and is passed through un-multiplied.
+- Also supported for **aggregated** configs: set `benchmark_client: agentx` and `dataset_file` in a
+  `client_configs` entry (see `aggregated/gb300_minimax_m3_fp4_agentx_grace_blackwell.yaml`); `concurrency`
+  is the client concurrency against the single server. Spec-decoding lanes must pin the accepted length
+  via `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS` in `server_env_var`.
 - Tunables are passed through `client_env_var` (`AGENTX_MAX_CTX`, `AGENTX_DURATION`,
   `AGENTX_WARMUP_PER_LANE`). Artifacts land in
   `{test_output_dir}/agentx.{server_idx}.{client_idx}/concurrency_{N}/`.
