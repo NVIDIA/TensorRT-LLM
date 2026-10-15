@@ -43,19 +43,25 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
-    AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
     merge_attention_forward_args,
 )
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
-from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
+from .._vanilla_utils import (
+    VanillaRotaryEmbedding,
+    apply_mla_rope,
+    phase_bounds,
+    phase_is_generation,
+    phase_lens,
+    token_positions,
+)
 from ..inline_scale_kv import DIM_NOPE as _INLINE_SCALE_NOPE_DIM
 from ..inline_scale_kv import DIM_ROPE as _INLINE_SCALE_ROPE_DIM
 from ..inline_scale_kv import NUM_NOPE_TILES as _INLINE_SCALE_NUM_TILES
@@ -69,157 +75,6 @@ from .indexer import (
 )
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
-
-
-class DSAVanillaEmbedding(RotaryEmbedding):
-    """Apply pure-PyTorch RoPE to packed, token-major DSA tensors.
-
-    Targets share token positions but may have different head counts or layouts:
-    [T, H, R], [T, H * R], or [T, R] for a single head. Here T is the packed token
-    count and R is this object's head_dim. DSA callers pass only the positional
-    slices of Q/K, so R is the RoPE width, not the full attention/indexer width.
-    The inherited constructor builds the cos/sin table from the model's RoPE
-    configuration, including its frequency and scaling settings.
-
-    For each dimension pair (x1, x2), using the cached cosine c and sine s for
-    that token's position and that pair's frequency, the forward rotation is::
-
-        y1 = x1 * c - x2 * s
-        y2 = x2 * c + x1 * s
-
-    With standard RoPE, c = cos(position * frequency) and
-    s = sin(position * frequency). Applying these rotations to Q and K makes
-    their dot product depend on relative position. Neox layout pairs the first
-    and second halves of the rotated dimensions; interleaved layout pairs
-    adjacent dimensions. inverse=True reverses the signs of the sine terms.
-
-    RotaryEmbedding.forward can dispatch a Q/K pair to an in-place FlashInfer
-    kernel, and its PyTorch fallback interprets rank-three inputs as
-    [batch, sequence, features]. This wrapper explicitly adapts packed layouts
-    and calls the static apply_rotary_pos_emb helper instead. That helper uses
-    ordinary PyTorch operations without fused dispatch, so sharing its rotation
-    math and layout conventions keeps this reference independent of the fused
-    kernels without duplicating the equations.
-    """
-
-    def forward(
-        self, position_ids: torch.Tensor, targets: list[torch.Tensor]
-    ) -> list[torch.Tensor]:
-        """Rotate targets with shared positions, preserving each target's shape.
-
-        Args:
-            position_ids: Integer positions flattening to [T], one per packed
-                token. Positions can restart for each request in the batch.
-            targets: Floating-point Q/K slices with T leading rows and one or
-                more heads of width self.head_dim per row.
-
-        Returns:
-            Rotated tensors in input order, with each input's shape and dtype.
-            Inputs are not modified in place.
-        """
-        position_ids = position_ids.reshape(-1)
-        num_tokens = position_ids.numel()
-        if num_tokens == 0:
-            return targets
-
-        # Look up positions once for all targets; packed row indices need not
-        # equal token positions within their respective requests.
-        cos_sin = self.rotary_cos_sin[position_ids]
-        cos, sin = cos_sin[:, 0, :], cos_sin[:, 1, :]
-
-        def apply_rope(target: torch.Tensor) -> torch.Tensor:
-            original_shape = target.shape
-            if target.shape[0] != num_tokens:
-                raise ValueError(
-                    "Packed RoPE targets must have one leading row per position: "
-                    f"got target shape {tuple(target.shape)} and {num_tokens} positions"
-                )
-            # Normalize each layout to [T, H, R], then [1, H, T, R]. The helper
-            # broadcasts the position-dependent cos/sin values across heads;
-            # the leading singleton is a layout adapter, not a request count.
-            target = target.reshape(num_tokens, -1, self.head_dim)
-            target = target.transpose(0, 1).unsqueeze(0)
-            target = RotaryEmbedding.apply_rotary_pos_emb(
-                target,
-                cos.to(dtype=target.dtype).unsqueeze(0),
-                sin.to(dtype=target.dtype).unsqueeze(0),
-                is_neox=self.is_neox,
-                inverse=self.inverse,
-            )
-            return target.squeeze(0).transpose(0, 1).reshape(original_shape)
-
-        return [apply_rope(target) for target in targets]
-
-
-def _cached_lens(metadata: DSAtrtllmAttentionMetadata) -> list[int]:
-    """Return each request's KV length before this step's tokens are appended.
-
-    ``kv_lens_cuda`` holds every request's total KV length including this
-    step's tokens, so subtracting ``seq_lens`` (new tokens per request) leaves
-    the cached prefix. That value is the position of the request's first new
-    token, shared by RoPE positions, cache-append offsets and causal limits.
-    """
-    seq_lens = metadata.seq_lens.tolist()
-    kv_lens = metadata.kv_lens_cuda[: metadata.num_seqs].tolist()
-    return [kv_len - seq_len for kv_len, seq_len in zip(kv_lens, seq_lens, strict=True)]
-
-
-def _phase_bounds(
-    metadata: DSAtrtllmAttentionMetadata, is_generation: Optional[bool]
-) -> tuple[int, int, int, int]:
-    """Return (seq_start, seq_end, token_start, token_end) in the packed batch.
-
-    Bounds are half-open, with context requests/tokens before generation.
-    None selects the whole batch; False/True selects context/generation.
-    """
-    if is_generation is None:
-        return 0, metadata.num_seqs, 0, metadata.num_tokens
-    if is_generation:
-        return (
-            metadata.num_contexts,
-            metadata.num_seqs,
-            metadata.num_ctx_tokens,
-            metadata.num_tokens,
-        )
-    return 0, metadata.num_contexts, 0, metadata.num_ctx_tokens
-
-
-def _phase_lens(
-    metadata: DSAtrtllmAttentionMetadata, is_generation: Optional[bool]
-) -> tuple[int, int, list[int], list[int]]:
-    """Return (seq_start, seq_end, seq_lens, past_lens) for the selected requests.
-
-    ``seq_lens`` and ``past_lens`` hold the new and cached token counts of
-    requests ``seq_start`` through ``seq_end - 1``, in packed batch order.
-    """
-    seq_start, seq_end, _, _ = _phase_bounds(metadata, is_generation)
-    seq_lens = metadata.seq_lens.tolist()[seq_start:seq_end]
-    past_lens = _cached_lens(metadata)[seq_start:seq_end]
-    return seq_start, seq_end, seq_lens, past_lens
-
-
-def _token_positions(
-    seq_lens: list[int], past_lens: list[int], device: torch.device
-) -> torch.Tensor:
-    """Return int32 [sum(seq_lens)] absolute positions of the new tokens.
-
-    Request i contributes ``past_lens[i], ..., past_lens[i] + seq_lens[i] - 1``.
-    These positions select RoPE angles and bound causal TopK selections.
-    """
-    pieces = [
-        torch.arange(past, past + seq_len, dtype=torch.int32, device=device)
-        for seq_len, past in zip(seq_lens, past_lens, strict=True)
-    ]
-    return torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.int32, device=device)
-
-
-def _phase_is_generation(attention_input_type: AttentionInputType) -> bool:
-    """Map a DSA phase to ``is_generation``; DSA never runs a mixed batch at once."""
-    if attention_input_type == AttentionInputType.context_only:
-        return False
-    if attention_input_type == AttentionInputType.generation_only:
-        return True
-    raise ValueError("DSA requires a context-only or generation-only input")
 
 
 def _byte_rows(starts: torch.Tensor, width: int) -> torch.Tensor:
@@ -334,7 +189,7 @@ class DSAVanillaIndexer(nn.Module):
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
         )
-        self.rotary_emb = DSAVanillaEmbedding(
+        self.rotary_emb = VanillaRotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
             is_neox=not sparse_params.indexer_rope_interleave,
@@ -1020,7 +875,7 @@ class DSAVanillaIndexer(nn.Module):
             ).view(-1, self.n_heads, self.head_dim)
 
         num_contexts = metadata.num_contexts
-        seq_start, seq_end, seq_lens, past_lens = _phase_lens(metadata, is_generation)
+        seq_start, seq_end, seq_lens, past_lens = phase_lens(metadata, is_generation)
         if is_generation is None:
             cache_name = "indexer_topk_out_buffer"
         elif is_generation:
@@ -1278,7 +1133,7 @@ class DSAVanillaIndexer(nn.Module):
         Returns:
             int32 request-local TopK positions, as from :meth:`sparse_attn_indexer`.
         """
-        _, _, phase_start, phase_end = _phase_bounds(metadata, is_generation)
+        _, _, phase_start, phase_end = phase_bounds(metadata, is_generation)
 
         q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
         return self.sparse_attn_indexer(
@@ -1407,7 +1262,7 @@ class DSAVanillaAttention(VanillaAttention):
 
         # DSA backends own their MLA RoPE (support_fused_rope is True), so the
         # module never rotates externally -- build the table here.
-        self.rotary_emb = DSAVanillaEmbedding(
+        self.rotary_emb = VanillaRotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.qk_rope_head_dim,
             is_neox=pos_embd_params.is_neox,
@@ -1448,34 +1303,20 @@ class DSAVanillaAttention(VanillaAttention):
     ) -> None:
         """Rotate the RoPE parts of the absorbed query and latent rows in place.
 
-        Args:
-            fused_q: [T, num_heads * (kv_lora_rank + R)] absorbed query; the last
-                R columns of each head receive the rotated ``q_pe``.
-            q_pe: [T, num_heads, R] or [T, num_heads * R] unrotated query RoPE part.
-            latent_cache: [T, kv_lora_rank + R] latent rows; the trailing R
-                columns (k_pe) are rotated in place.
-            positions: [T] absolute token positions.
-            apply_q: Rotate the query side.
-            apply_k: Rotate the latent k_pe.
+        See :func:`apply_mla_rope` for the tensor layouts; this layer supplies
+        its RoPE table, head count and ``kv_lora_rank``.
         """
-        num_tokens = latent_cache.shape[0]
-        fused_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        targets = []
-        if apply_q:
-            if fused_q is None or q_pe is None:
-                raise ValueError("Q-side MLA RoPE requires fused_q and q_pe")
-            targets.append(q_pe.reshape(num_tokens, self.num_heads * self.qk_rope_head_dim))
-        if apply_k:
-            targets.append(latent_cache[..., self.kv_lora_rank :])
-
-        rotated = iter(self.rotary_emb(positions, targets))
-        if apply_q:
-            q_pe_rot = next(rotated)
-            fused_q.view(num_tokens, self.num_heads, fused_head_dim)[..., self.kv_lora_rank :] = (
-                q_pe_rot.view(num_tokens, self.num_heads, self.qk_rope_head_dim)
-            )
-        if apply_k:
-            latent_cache[..., self.kv_lora_rank :] = next(rotated)
+        apply_mla_rope(
+            self.rotary_emb,
+            fused_q,
+            q_pe,
+            latent_cache,
+            positions,
+            num_heads=self.num_heads,
+            kv_lora_rank=self.kv_lora_rank,
+            apply_q=apply_q,
+            apply_k=apply_k,
+        )
 
     def mla_rope_generation(
         self,
@@ -1542,8 +1383,8 @@ class DSAVanillaAttention(VanillaAttention):
                     ).to(latent_cache.dtype)
                 )
 
-        seq_start, seq_end, seq_lens, past_lens = _phase_lens(metadata, is_generation=True)
-        positions = _token_positions(seq_lens, past_lens, latent_cache.device)
+        seq_start, seq_end, seq_lens, past_lens = phase_lens(metadata, is_generation=True)
+        positions = token_positions(seq_lens, past_lens, latent_cache.device)
         self._apply_mla_rope(
             fused_q,
             q_pe,
@@ -1624,7 +1465,7 @@ class DSAVanillaAttention(VanillaAttention):
         calls this before running FlashMLA on the cache.
         """
         del kwargs
-        seq_start, seq_end, seq_lens, past_lens = _phase_lens(metadata, is_generation)
+        seq_start, seq_end, seq_lens, past_lens = phase_lens(metadata, is_generation)
         num_tokens = sum(seq_lens)
         q_view = q.view(
             num_tokens,
@@ -1633,7 +1474,7 @@ class DSAVanillaAttention(VanillaAttention):
         )
         q_pe = q_view[..., self.qk_nope_head_dim :]
         q_pe_rot, k_pe_rot = self.rotary_emb(
-            _token_positions(seq_lens, past_lens, q.device),
+            token_positions(seq_lens, past_lens, q.device),
             [q_pe, latent_cache[..., self.kv_lora_rank :]],
         )
         q_pe.copy_(q_pe_rot)
@@ -1673,8 +1514,8 @@ class DSAVanillaAttention(VanillaAttention):
         if sparse_backend_args.topk_indices is not None:
             return sparse_backend_args.topk_indices
 
-        is_generation = _phase_is_generation(forward_args.attention_input_type)
-        _, _, phase_start, phase_end = _phase_bounds(metadata, is_generation)
+        is_generation = phase_is_generation(forward_args.attention_input_type)
+        _, _, phase_start, phase_end = phase_bounds(metadata, is_generation)
         shared_topk_indices = metadata.shared_topk_indices
         if self.indexer is None:
             if shared_topk_indices is None:
@@ -1766,7 +1607,7 @@ class DSAVanillaAttention(VanillaAttention):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Select once and return both request-local and primary-pool TopK indices."""
         local_topk = self._select_local_topk(q, k, metadata, forward_args)
-        is_generation = _phase_is_generation(forward_args.attention_input_type)
+        is_generation = phase_is_generation(forward_args.attention_input_type)
         local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
         global_topk = self._local_topk_to_global(
             local_topk, metadata, local_layer_idx, is_generation
@@ -1989,7 +1830,7 @@ class DSAVanillaAttention(VanillaAttention):
         Returns:
             [T_phase, num_heads * kv_lora_rank] attention output in fused_q's dtype.
         """
-        seq_start, seq_end, phase_seq_lens, phase_past_tokens = _phase_lens(metadata, is_generation)
+        seq_start, seq_end, phase_seq_lens, phase_past_tokens = phase_lens(metadata, is_generation)
         num_phase_tokens = sum(phase_seq_lens)
         fused_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         expected_q_shape = (num_phase_tokens, self.num_heads * fused_head_dim)
@@ -2014,7 +1855,7 @@ class DSAVanillaAttention(VanillaAttention):
             raise ValueError("DSA top-k indices may only use -1 as padding")
         if torch.any(~valid_mask.any(dim=1)):
             raise ValueError("Every DSA query token must select at least one KV token")
-        causal_limits = _token_positions(phase_seq_lens, phase_past_tokens, topk_indices.device)
+        causal_limits = token_positions(phase_seq_lens, phase_past_tokens, topk_indices.device)
         if torch.any(valid_mask & (topk_indices > causal_limits.unsqueeze(1))):
             raise ValueError("DSA top-k index selects a future token")
 
@@ -2108,7 +1949,7 @@ class DSAVanillaAttention(VanillaAttention):
             raise ValueError("DSA Vanilla attention requires latent_cache")
         if k is not None or v is not None:
             raise ValueError("DSA Vanilla attention expects absorbed queries without K/V")
-        is_generation = _phase_is_generation(forward_args.attention_input_type)
+        is_generation = phase_is_generation(forward_args.attention_input_type)
 
         # Ordinary generation RoPE already ran via mla_rope_generation. Context
         # RoPE runs in the attention kernel, while fp8_ds_mla generation defers
@@ -2119,12 +1960,12 @@ class DSAVanillaAttention(VanillaAttention):
         if apply_deferred_rope and not forward_args.skip_mla_rope_generation:
             if forward_args.q_pe is None:
                 raise ValueError("DSA Vanilla fused RoPE requires forward_args.q_pe")
-            _, _, seq_lens, past_lens = _phase_lens(metadata, is_generation)
+            _, _, seq_lens, past_lens = phase_lens(metadata, is_generation)
             self._apply_mla_rope(
                 q,
                 forward_args.q_pe,
                 forward_args.latent_cache,
-                _token_positions(seq_lens, past_lens, q.device),
+                token_positions(seq_lens, past_lens, q.device),
             )
 
         # Ordinary generation reached here after mla_rope_generation already
@@ -2151,4 +1992,4 @@ class DSAVanillaAttention(VanillaAttention):
         )
 
 
-__all__ = ["DSAVanillaAttention", "DSAVanillaEmbedding", "DSAVanillaIndexer"]
+__all__ = ["DSAVanillaAttention", "DSAVanillaIndexer"]
