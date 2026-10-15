@@ -246,11 +246,12 @@ def test_rank_dead_while_idle_retires_pool(tmp_path):
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
+    rank1 = next(iter(pool_mod._POOLS.values()))._ranks[1].proc
     os.kill(first[1], signal.SIGKILL)
+    # Wait on what the pool checks: is_alive() reaps, so it turns False only
+    # once every thread of the rank has exited (a /proc "Z" can come earlier).
     deadline = time.monotonic() + _TIMEOUT
-    while (
-        not _pid_gone(first[1]) and next(iter(pool_mod._POOLS.values()))._ranks[1].proc.is_alive()
-    ):
+    while rank1.is_alive():
         assert time.monotonic() < deadline
         time.sleep(0.1)
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
