@@ -27,14 +27,10 @@ from .errors import MediaUnavailableError, UnsupportedFeatureError
 # output index and a scan of every generated token, so an unbounded list lets a
 # single request tax the event loop for the whole stream.
 _MAX_STOP_CONDITIONS = 64
-# Media decoding can retain both encoded and decoded image buffers. Keep one
-# request from scheduling an unbounded number of fetch/decode tasks or holding
-# an unbounded amount of image data while preserving practical multi-image use.
+# Bound per-request decode work and retained image data.
 _MAX_MEDIA_ITEMS = 64
 _MAX_CONCURRENT_MEDIA_LOADS = 8
-# Encoded bodies are separately bounded by the 64 MiB gRPC message limit and
-# the media loader's 200 MiB per-URL response limit. This cap covers expansion
-# during decode across the entire request.
+# Encoded inputs have separate gRPC and remote-loader caps.
 _MAX_TOTAL_DECODED_MEDIA_BYTES = 512 * 1024 * 1024
 _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
 _DETOKENIZE_EXTRA_KEY = "detokenize"
@@ -45,8 +41,6 @@ _MediaLoader = Callable[[generation_pb2.MediaItem, int], Awaitable[Any]]
 
 @dataclass(frozen=True)
 class _MediaHandler:
-    """One fully implemented OpenEngine media mapping path."""
-
     name: str
     loader_factory: Callable[[Any], _MediaLoader]
     decoded_bytes: Callable[[Any], int]
@@ -285,7 +279,6 @@ def _base_input_from_request(
 
 
 def _image_io_for_model(llm: Any) -> ImageMediaIO:
-    """Create image I/O using the loaded model's preferred decode format."""
     input_processor = getattr(llm, "input_processor", None)
     defaults = None
     if isinstance(input_processor, BaseMultimodalInputProcessor):
@@ -297,7 +290,6 @@ def _image_io_for_model(llm: Any) -> ImageMediaIO:
 async def _load_image_item(
     item: generation_pb2.MediaItem, image_io: ImageMediaIO, index: int
 ) -> Any:
-    """Resolve and decode one OpenEngine image item."""
     source = item.WhichOneof("source")
     if source is None:
         raise ValueError(f"media[{index}] must set exactly one source")
@@ -339,15 +331,13 @@ def _image_loader_factory(llm: Any) -> _MediaLoader:
 
 
 def _decoded_image_bytes(image: Any) -> int:
-    """Return retained bytes for a decoded image representation."""
     if isinstance(image, torch.Tensor):
         return image.numel() * image.element_size()
     if isinstance(image, np.ndarray):
         return image.nbytes
     if isinstance(image, Image.Image):
         return image.width * image.height * len(image.getbands())
-    # Custom model media types cannot be sized generically. The built-in image
-    # handler returns one of the representations above.
+    # ImageMediaIO currently returns only the representations above.
     return 0
 
 
@@ -359,7 +349,6 @@ _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
 
 
 def media_capabilities_for_model(llm: Any) -> MediaCapabilities:
-    """Resolve the loaded model against the request handlers in this module."""
     return resolve_media_capabilities(llm, {handler.name for handler in _MEDIA_HANDLERS.values()})
 
 
@@ -375,7 +364,7 @@ async def _input_from_request(
     llm: Any,
     media_capabilities: MediaCapabilities | None = None,
 ) -> str | dict[str, Any]:
-    """Build LLM API inputs, resolving media off the event loop."""
+    """Build LLM API inputs without blocking the event loop on media."""
     inputs = _base_input_from_request(request)
     if not request.media:
         return inputs
@@ -429,9 +418,7 @@ async def _input_from_request(
     try:
         decoded_media = await asyncio.gather(*tasks)
     except (Exception, asyncio.CancelledError):
-        # `gather` propagates the first failure without cancelling siblings.
-        # Explicitly stop any in-flight URL fetches/decodes before returning
-        # the request error so their memory and connections do not linger.
+        # gather leaves siblings running after the first failure.
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
