@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
@@ -85,6 +86,15 @@ class PreparedContext(BaseModel):
         return self.prompt_tokens_excluded_from_usage == 0 and not self.resolved_thinking
 
 
+class ReasoningParserKwargs(BaseModel):
+    """What a reasoning parser needs to agree with the renderer on the prompt it saw."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The effective chat template kwargs the prompt was rendered with.
+    chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RenderedRequest(BaseModel):
     """What a render route returns: the prompt token ids plus what a consumer needs to use them.
 
@@ -106,9 +116,23 @@ class RenderedRequest(BaseModel):
     schema_version: int = RENDERED_REQUEST_SCHEMA_VERSION
     # Which inference route the ``request`` body belongs to.
     kind: Literal["chat", "completion"] = "chat"
+    # Identifies this prepared request through the rest of the inference path.
+    request_id: str = Field(default_factory=lambda: f"render-{uuid.uuid4().hex}")
     token_ids: List[int]
-    # False when the ids must not be executed as is (a named tool_choice: the worker adds a
-    # forced tool-call prefix); the consumer lets the worker render.
+    model: Optional[str] = None
+    # Whether reasoning has already ended before the first generated token, read off the
+    # rendered prompt for the reasoning parser this renderer is configured with. None when
+    # there is no such parser or the prompt does not say: the executing side decides.
+    reasoning_ended: Optional[bool] = None
+    # Set when the renderer has a reasoning parser, so the worker-side parser agrees with
+    # the renderer on flags such as ``enable_thinking``.
+    reasoning_parser_kwargs: Optional[ReasoningParserKwargs] = None
+    # Copied from the request: a salted prefix cache changes the block hashes a router computes.
+    cache_salt: Optional[str] = None
+    # False when the ids must not be executed as is: a named tool_choice (the worker adds a
+    # forced tool-call prefix), or a prompt that carries decisions a request holding only ids
+    # would lose (reasoning mode, usage offset; see PreparedContext). The consumer lets the
+    # worker render.
     tokens_trusted: bool = True
     untrusted_reason: Optional[str] = None
     # The original request body.

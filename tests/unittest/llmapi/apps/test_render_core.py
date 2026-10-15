@@ -752,6 +752,11 @@ class TestRenderedRequest:
         with pytest.raises(ValidationError):
             RenderedRequest(token_ids=[1], surprise=True)
 
+    def test_an_unset_request_id_is_generated(self) -> None:
+        first, second = RenderedRequest(token_ids=[1]), RenderedRequest(token_ids=[1])
+
+        assert first.request_id != second.request_id
+
     def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
         with pytest.raises(ValidationError):
             RenderedRequest(fingerprint={"digest": "abc"}, token_ids=[1])
