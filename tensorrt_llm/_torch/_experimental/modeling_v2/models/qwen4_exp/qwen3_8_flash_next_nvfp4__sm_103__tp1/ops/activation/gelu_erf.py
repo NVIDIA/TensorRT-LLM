@@ -25,7 +25,7 @@ MERGER_WIDTH = 4608
 
 #: Rows the merger is asked for, `sum(t*h*w) / 4`: 64 is a 224x224 image
 #: (grid [1, 16, 16]), 140 a 336x448 one ([1, 20, 28]) -- not a multiple of
-#: any MoE tile size -- and 8192 the most a video call carries (32768 patch
+#: any MoE tile size -- and 8192 the most one tower call carries (32768 patch
 #: rows).
 MERGER_ROW_COUNTS = (1, 7, 64, 65, 140, 1024, 4096, 8192)
 

@@ -55,7 +55,7 @@ class LayerNorm(OpWrapper):
         )
         + (
             Cell(
-                why="vision norm at the video call ceiling, 32768 patch rows x 1152 bf16",
+                why="vision norm at the tower call ceiling, 32768 patch rows x 1152 bf16",
                 spec=dict(shape=(32768, WIDTH), dtype=torch.bfloat16),
             ),
         )

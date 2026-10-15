@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """qwen4_exp's multimodal splice runs the vision tower once per modality a request
-carries and puts the rows back in prompt order.
+carries and puts the rows back in prompt order; the tower itself runs a request's frames
+in calls of whole frames under a row ceiling.
 
 The tower is a stub whose rows name the item they came from, so the bookkeeping --
-modality dispatch, `mm_item_order`, the chunk slice, the per-call row ceiling -- runs on
-the CPU without the vision ops or an engine.
+modality dispatch, `mm_item_order`, the chunk slice, the frame grouping and the order of
+the concatenated calls -- runs on the CPU without the vision ops or an engine.
 """
 
 from __future__ import annotations
@@ -150,16 +151,121 @@ def test_a_chunk_without_placeholders_skips_the_tower():
     assert tower.calls == 0
 
 
-def test_the_video_call_ceiling_is_admitted_and_one_patch_past_it_is_refused():
-    side = M._VIDEO_CALL_MAX_PATCHES // 2 // 128
-    at_ceiling = [(2, 128, side)]
-    assert sum(t * h * w for t, h, w in at_ceiling) == M._VIDEO_CALL_MAX_PATCHES
-    assert len(_splice(_Tower(), _params(video=at_ceiling), M._VIDEO_CALL_MAX_PATCHES // 4)) == (
-        M._VIDEO_CALL_MAX_PATCHES // 4
+def _frames(grid):
+    """The item-by-item frame list a grid describes: one `(h, w)` per frame."""
+    return [(h, w) for t, h, w in grid for _ in range(t)]
+
+
+def _random_grid(gen):
+    return [
+        (int(torch.randint(1, 6, (1,), generator=gen)), 2 * h, 2 * w)
+        for h, w in torch.randint(
+            1, 5, (int(torch.randint(1, 6, (1,), generator=gen)), 2), generator=gen
+        ).tolist()
+    ]
+
+
+def test_frames_are_grouped_whole_and_in_order():
+    # 16-row frames, 32 rows to a call: one item's frames split across calls.
+    assert M._frame_calls([(5, 4, 4)], 32) == [[(2, 4, 4)], [(2, 4, 4)], [(1, 4, 4)]]
+    # A call takes the end of one item and the start of the next.
+    grid = [(1, 8, 4), (3, 4, 4), (1, 2, 2)]
+    assert M._frame_calls(grid, 48) == [[(1, 8, 4), (1, 4, 4)], [(2, 4, 4), (1, 2, 2)]]
+    assert M._frame_calls(grid, 1 << 20) == [grid]
+
+
+def test_a_call_is_filled_to_the_ceiling_and_never_past_it():
+    gen = torch.Generator().manual_seed(0)
+    for _ in range(200):
+        grid = _random_grid(gen)
+        cap = int(torch.randint(64, 300, (1,), generator=gen))
+        calls = M._frame_calls(grid, cap)
+        assert [f for call in calls for f in _frames(call)] == _frames(grid)
+        sizes = [sum(t * h * w for t, h, w in call) for call in calls]
+        assert all(0 < size <= cap for size in sizes)
+        # Greedy: the next call's first frame would not have fit.
+        for size, call in zip(sizes, calls[1:]):
+            h, w = _frames(call)[0]
+            assert size + h * w > cap
+
+
+def test_one_frame_past_the_ceiling_is_refused_and_one_at_it_is_not():
+    assert M._frame_calls([(2, 8, 8)], 64) == [[(1, 8, 8)], [(1, 8, 8)]]
+    with pytest.raises(AssertionError, match="one frame is 8x10 = 80 patch rows"):
+        M._frame_calls([(1, 4, 4), (3, 8, 10)], 64)
+
+
+PIXEL_WIDTH = 4
+
+
+def _tower(monkeypatch, cap):
+    """A `VisionTower` whose per-call body is a stub: merged row `j` of a call carries the
+    pixel value of the call's patch row `4 * j`, which `_pixels` set to the patch's
+    index in the request."""
+    monkeypatch.setattr(M, "_VISION_CALL_MAX_PATCHES", cap)
+    tower = object.__new__(M.VisionTower)
+    tower.core = SimpleNamespace(
+        w={"embed": torch.zeros(1)}, v_pixel_width=PIXEL_WIDTH, v_merge=MERGE
     )
-    past = [(2, 128, side), (1, 1, 1)]
-    with pytest.raises(AssertionError, match="certified up to"):
-        _splice(_Tower(), _params(video=past), M._VIDEO_CALL_MAX_PATCHES // 4)
+    tower.calls = []
+
+    def run(pixel_values, grid, grid_thw):
+        tower.calls.append((pixel_values, grid, grid_thw))
+        return pixel_values[:: MERGE * MERGE, :1].expand(-1, HIDDEN).clone()
+
+    tower._run = run
+    return tower
+
+
+def _pixels(grid):
+    patches = sum(t * h * w for t, h, w in grid)
+    return torch.arange(patches, dtype=torch.float32)[:, None].expand(-1, PIXEL_WIDTH).clone()
+
+
+def test_the_tower_calls_whole_frames_and_concatenates_their_rows_in_order(monkeypatch):
+    grid = [(1, 8, 4), (3, 4, 4), (2, 2, 6), (1, 2, 2)]
+    tower = _tower(monkeypatch, 48)
+    out = tower(_pixels(grid), torch.tensor(grid))
+    patches = sum(t * h * w for t, h, w in grid)
+    assert out[:, 0].tolist() == [float(4 * j) for j in range(patches // 4)]
+    assert [call[1] for call in tower.calls] == M._frame_calls(grid, 48)
+    start = 0
+    for pixel_values, call, grid_thw in tower.calls:
+        rows = sum(t * h * w for t, h, w in call)
+        assert pixel_values[:, 0].tolist() == [float(i) for i in range(start, start + rows)]
+        assert rows <= 48
+        assert grid_thw.tolist() == [list(row) for row in call]
+        assert grid_thw.dtype == torch.int64
+        start += rows
+    assert start == patches
+
+
+def test_a_request_under_the_ceiling_is_one_call(monkeypatch):
+    grid = [(2, 4, 4), (1, 4, 8)]
+    tower = _tower(monkeypatch, 64)
+    tower(_pixels(grid), torch.tensor(grid))
+    assert len(tower.calls) == 1
+    assert tower.calls[0][2].tolist() == [list(row) for row in grid]
+
+
+def test_a_request_past_the_old_whole_request_ceiling_is_served(monkeypatch):
+    # 33 temporal groups of 32x32 patches (66 frames of 512x512 pixels): 33792 rows, 1024
+    # rows past what a single call may carry.
+    ceiling = M._VISION_CALL_MAX_PATCHES
+    grid = [(33, 32, 32)]
+    tower = _tower(monkeypatch, ceiling)
+    out = tower(_pixels(grid), torch.tensor(grid))
+    assert [call[1] for call in tower.calls] == [[(32, 32, 32)], [(1, 32, 32)]]
+    assert out.shape[0] == 33 * 32 * 32 // 4
+    assert out[:, 0].tolist() == [float(4 * j) for j in range(out.shape[0])]
+
+
+def test_a_frame_past_the_ceiling_cannot_be_served(monkeypatch):
+    tower = _tower(monkeypatch, 64)
+    grid = [(1, 4, 4), (1, 10, 10)]
+    with pytest.raises(AssertionError, match="one frame is 10x10 = 100 patch rows"):
+        tower(_pixels(grid), torch.tensor(grid))
+    assert tower.calls == []
 
 
 def test_a_media_request_needs_the_processors_position_ids():

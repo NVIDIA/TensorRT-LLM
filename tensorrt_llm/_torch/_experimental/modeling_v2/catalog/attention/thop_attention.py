@@ -303,7 +303,7 @@ class ThopAttention(OpWrapper):
             "12544-row frame is the longest segment",
             spec=dict(_QWEN4_VISION, seg_lens=(12544, 9600)),
         ),
-        # A video call is one frame per frame group, at most 32768 rows per call.
+        # A vision-tower call is one frame per frame group, at most 32768 rows per call.
         Cell(
             why="video: 384 frame groups of 64 rows (8x8 patches), the untiled "
             "kernel's longest frame",

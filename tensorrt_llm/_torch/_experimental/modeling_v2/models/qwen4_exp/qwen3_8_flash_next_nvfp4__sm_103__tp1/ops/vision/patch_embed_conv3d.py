@@ -62,7 +62,7 @@ class PatchEmbedConv3d(OpWrapper):
         )
         + (
             Cell(
-                why="video call ceiling: 8192 tokens x merge 2x2 = 32768 patches bf16",
+                why="tower call ceiling: 8192 tokens x merge 2x2 = 32768 patches bf16",
                 spec=dict(num_patches=32768, dtype=torch.bfloat16),
             ),
         )
