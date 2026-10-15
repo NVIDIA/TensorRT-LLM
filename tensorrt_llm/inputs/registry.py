@@ -41,7 +41,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
-from .multimodal_data import serialize_item
+from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import create_prefix_token_cache
 from .tokenization import tokenize_prompt
 
@@ -1243,6 +1243,14 @@ def _get_single_mm_token_lengths(
     return num_mm_tokens
 
 
+def _cache_mm_embed_cumsum(multimodal_data: Dict[str, Any],
+                           embed_mask: torch.Tensor) -> None:
+    """Cache the int64 prefix sum of a flat CPU embedding mask without replacing existing data."""
+    if "multimodal_embed_mask_cumsum" not in multimodal_data:
+        multimodal_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
+            0, dtype=torch.int64)
+
+
 def maybe_compute_mm_embed_cumsum(
     prompt_token_ids: List[int],
     extra_processed_inputs: Optional[ExtraProcessedInputs],
@@ -1266,15 +1274,8 @@ def maybe_compute_mm_embed_cumsum(
     if mm_data is None:
         return
 
-    # Always backfill the bidirectional-MM gate first (cheap; instance attr
-    # falls through to class attr in Python). Must happen BEFORE the cumsum
-    # idempotency guard below, otherwise the path where
-    # `multimodal_hashing_process` already setdefault()ed the cumsum (without
-    # this flag) leaves scheduler_v2 reading mm_bidirectional_blocks=None and
-    # silently skipping align — which then trips
-    # get_attention_mask's `cached_token_lens == 0` assert on
-    # 26B/31B once an image block is split across chunks. Gemma4 sets this
-    # per-instance from text_config.use_bidirectional_attention.
+    # The scheduler needs the bidirectional-block flag even when hashing has
+    # already cached the cumsum. Propagate it before the idempotency check.
     mm_data.setdefault(
         "mm_bidirectional_blocks",
         bool(getattr(input_processor, "mm_bidirectional_blocks", False)),
@@ -1299,8 +1300,7 @@ def maybe_compute_mm_embed_cumsum(
         mm_special_token_ids=input_processor.get_mm_special_token_ids(),
     )
     # Cache the int64 cumsum; request-invariant, read once per chunk.
-    mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
-        0, dtype=torch.int64)
+    _cache_mm_embed_cumsum(mm_data, embed_mask)
 
 
 def create_input_processor_with_hash(
@@ -1414,9 +1414,7 @@ def create_input_processor_with_hash(
                 mm_token_ids=mm_ids,
                 mm_special_token_ids=mm_special_token_ids,
             )
-            extra_processed_inputs["multimodal_data"].setdefault(
-                "multimodal_embed_mask_cumsum",
-                embed_mask.cumsum(0, dtype=torch.int64))
+            _cache_mm_embed_cumsum(multimodal_data, embed_mask)
             start_positions, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
@@ -1475,13 +1473,11 @@ def create_input_processor_with_hash(
         # Any subset of the supported modalities is eligible for hashing.
         # ``None`` payloads are skipped so an empty bucket doesn't gate off
         # hashing for the modalities that are actually present.
-        _SUPPORTED_HASHING_MODALITIES = ('image', 'video', 'audio')
         modalities = [
             m for m, d in inputs.get('multi_modal_data', {}).items()
             if d is not None
         ]
-        if modalities and all(m in _SUPPORTED_HASHING_MODALITIES
-                              for m in modalities):
+        if modalities and all(m in MEDIA_MODALITIES for m in modalities):
             if input_processor.multimodal_hashing_supported is not None:
                 use_multimodal_hashing = input_processor.multimodal_hashing_supported
             else:
@@ -1551,7 +1547,7 @@ def create_input_processor_with_hash(
                                     "get_mm_encoder_item_metadata", None)
         has_raw_payload = any(
             isinstance(multimodal_data.get(modality), dict)
-            for modality in ("image", "video", "audio"))
+            for modality in MEDIA_MODALITIES)
         if not has_raw_payload or get_item_metadata is None:
             return prompt_token_ids, extra_processed_inputs
 
