@@ -300,6 +300,80 @@ def test_topk_provider_finds_topk_inside_attention_backends():
     assert provider.cfgs == {("decode", 512)}
 
 
+def test_csa2_publish_export_is_what_the_op_runs(tmp_path):
+    """CSA2 candidate publications compiled by the helper (no visible GPU)
+    from the provider's specs, and loaded by CSA2's glue-kernel launcher,
+    publish exactly what an in-process compile does, and the launcher
+    compiles nothing."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel as csa2
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+
+    block_size, topk_blocks = 8, 4
+    layout = CSA2Layout(
+        (1, 1),
+        (0,),
+        (0, 1),
+        0,
+        candidate_topk_blocks=topk_blocks,
+        candidate_block_size=block_size,
+        index_topk=32,
+    )
+    source = CSA2Indexer(layout, 0, 32, 128)
+    model = torch.nn.Module()
+    model.indexer = source
+    provider = jcd.Csa2PublishProvider(model, max_seq_len=1024)
+    assert provider.geometries == {(block_size, source.sparse_block)}
+    specs = provider.enumerate_specs()
+    replies = _helper_build(str(tmp_path / "aot"), specs)
+    assert all(r["ok"] for r in replies), [r for r in replies if not r["ok"]][:3]
+
+    def run():
+        g = torch.Generator(device="cuda").manual_seed(0)
+        outs = []
+        for rows, width, start in [(5, 101, 0), (3, 13, 1), (2, 1000, 3)]:
+            scores = torch.rand(rows + start, width, generator=g, device="cuda")[start:]
+            visible = torch.full((rows + start,), width, dtype=torch.int64, device="cuda")[start:]
+            published = min(topk_blocks, -(-width // block_size)) * block_size
+            out = torch.full((rows + start, published), -1, dtype=torch.int32, device="cuda")
+            ids = counts = None
+            sb = source.sparse_block
+            if sb:
+                ids = torch.zeros(rows + start, published // sb, dtype=torch.int32, device="cuda")
+                counts = torch.zeros(rows + start, dtype=torch.int32, device="cuda")
+                ids, counts = ids[start:], counts[start:]
+            assert csa2.publish_candidates_(
+                scores, visible, out[start:], topk_blocks, block_size, ids, counts, sb
+            )
+            outs.append(out.clone())
+        torch.cuda.synchronize()
+        return outs
+
+    saved = dict(csa2._COMPILED)
+    try:
+        csa2._COMPILED.clear()
+        csa2.csa2_loader = None
+        ref = run()
+        csa2._COMPILED.clear()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, str(tmp_path / "aot"))
+            loads.append((fn is not None, spec))
+            return fn
+
+        assert jcd.install_csa2_loader(loader)
+        got = run()
+    finally:
+        csa2.csa2_loader = None
+        csa2._COMPILED.clear()
+        csa2._COMPILED.update(saved)
+    missing = [spec for ok, spec in loads if not ok]
+    assert loads and not missing, f"publications not prefetched: {missing}"
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+
+
 def test_provider_plans_the_variant_the_op_keys_on():
     p = jcd.KdaPrefillProvider(torch.nn.Module())
     p.cfgs = [(H, True, True)]
