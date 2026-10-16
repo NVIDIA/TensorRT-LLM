@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     _resolve_checkpoint_io_policy,
     _timed_checkpoint_weight_session,
 )
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from tensorrt_llm.mapping import Mapping
 
@@ -208,7 +209,8 @@ def test_hf_reader_policy_error_shows_plain_values() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
-        ({"checkpoint_format": "MX"}, "checkpoint_format='HF'"),
+        # An enum format shows its plain value 'MX' in the reason, not the enum repr.
+        ({"checkpoint_format": CheckpointFormat.MX}, "checkpoint_format='HF' (received 'MX')"),
         ({"load_format": "dummy"}, "load_format='auto'"),
         ({"partial_model_loading": True}, "partial model loading"),
     ],

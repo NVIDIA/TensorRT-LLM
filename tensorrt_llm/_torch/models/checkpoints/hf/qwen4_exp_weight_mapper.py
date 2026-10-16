@@ -81,6 +81,7 @@ from tensorrt_llm._torch.modules.qwen4_exp.ple import Qwen4ExpPinnedHostEmbeddin
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 # Source namespace of the text core inside the composite multimodal checkpoint.
 _LM_PREFIX = "model.language_model."
@@ -188,8 +189,8 @@ def _normalize_moe_module_weights(
     return updated, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
 
 
-@register_mapper("HF", "Qwen4ExpForConditionalGeneration")
-@register_mapper("HF", "Qwen4ExpForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen4ExpForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Qwen4ExpForCausalLM")
 class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
     """Weight mapper for the Qwen4-Exp hybrid text core."""
 

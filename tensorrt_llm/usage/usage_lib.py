@@ -476,14 +476,15 @@ _FEATURES_DEFAULTS = {
 
 
 def _feature_enum_or_str(value: Any, default: str) -> str:
-    """Convert low-cardinality config enum/string values for telemetry."""
+    """Keep string values (including string enums); use names for other enums."""
     if value is None:
         return default
+    # String enums also satisfy isinstance(value, str).
+    if isinstance(value, str) and value:
+        return value
     name = getattr(value, "name", None)
     if isinstance(name, str) and name:
         return name
-    if isinstance(value, str) and value:
-        return value
     return default
 
 
