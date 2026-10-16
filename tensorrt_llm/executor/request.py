@@ -230,6 +230,19 @@ class GenerationRequest:
         # replaced prompt must not leave the old tokens behind in it.
         self._prompt_token_ids_i32 = None
 
+    @property
+    def num_prompt_tokens(self) -> int:
+        """Prompt length, read off the int32 buffer when the list was never built.
+
+        Metrics and tracing need only the length; going through
+        `prompt_token_ids` would materialize the O(ISL) list the buffer avoids.
+        """
+        ptids = self.__dict__.get("_prompt_token_ids")
+        if ptids is not None:
+            return len(ptids)
+        buf = self.__dict__.get("_prompt_token_ids_i32")
+        return 0 if buf is None else len(buf)
+
     @staticmethod
     def _enc_tokens(v):
         # flat list[int] -> (_I32, int32 bytes); leave None / list[list[int]] /
