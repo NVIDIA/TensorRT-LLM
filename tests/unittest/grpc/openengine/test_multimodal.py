@@ -18,6 +18,7 @@ from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.request_mapping as request_mapping  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
@@ -27,6 +28,15 @@ from tensorrt_llm.inputs.registry import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _ignore_synthetic_decoded_size(monkeypatch) -> None:
+    handler = request_mapping._MEDIA_HANDLERS[generation_pb2.MODALITY_IMAGE]
+    monkeypatch.setitem(
+        request_mapping._MEDIA_HANDLERS,
+        generation_pb2.MODALITY_IMAGE,
+        request_mapping._MediaHandler(handler.name, handler.loader_factory, lambda _decoded: 0),
+    )
 
 
 class _ImageConfig:
@@ -171,6 +181,19 @@ def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
     )
 
 
+def test_media_capabilities_are_hashable():
+    first = MediaCapabilities({"image": "<image_{}>"})
+    second = MediaCapabilities({"image": "<image_{}>"})
+
+    assert first == second
+    assert hash(first) == hash(second)
+
+
+def test_unknown_decoded_image_type_is_rejected():
+    with pytest.raises(TypeError, match="unsupported decoded image type"):
+        request_mapping._decoded_image_bytes(object())
+
+
 def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, monkeypatch):
     llm, _ = image_llm
     monkeypatch.setattr(
@@ -264,6 +287,7 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
             return f"decoded-bytes:{data.decode()}"
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    _ignore_synthetic_decoded_size(monkeypatch)
     request = generation_pb2.GenerateRequest(
         prompt="<image_1><image_2><image_3> describe",
         media=[
@@ -326,6 +350,7 @@ async def test_image_loading_has_a_bounded_concurrency(image_llm, monkeypatch):
                 type(self).active -= 1
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    _ignore_synthetic_decoded_size(monkeypatch)
     request = generation_pb2.GenerateRequest(
         prompt="images",
         media=[
@@ -453,6 +478,7 @@ async def test_image_mapping_supports_token_ids(image_llm, monkeypatch):
             return "decoded"
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    _ignore_synthetic_decoded_size(monkeypatch)
     request = generation_pb2.GenerateRequest(
         token_ids=generation_pb2.TokenIds(ids=[10, 20]),
         media=[
@@ -487,6 +513,7 @@ async def test_generate_submits_image_and_reports_expanded_prompt_usage(image_ll
             return "decoded"
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    _ignore_synthetic_decoded_size(monkeypatch)
     servicer = OpenEngineInferenceServicer(llm, model="image-model")
     request = generation_pb2.GenerateRequest(
         request_id="image-request",
