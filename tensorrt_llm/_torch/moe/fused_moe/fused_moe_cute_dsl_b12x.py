@@ -245,6 +245,10 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
                 f"CuteDslB12xFusedMoE does not support activation "
                 f"{p.activation}; supported: {supported}",
             )
+        if p.quant_algo == QuantAlgo.NVFP4:
+            eligibility = cls._check_build_capabilities(p, d)
+            if not eligibility.eligible:
+                return eligibility
         # The decode kernel ships in the FlashInfer wheel.
         if not d.env.has_dep(MoEDep.FLASHINFER):
             return _reject(
