@@ -49,6 +49,9 @@ class PostprocArgs:
     # by batch size. Sizes the emitted acceptance histogram so its length is a
     # function of configuration rather than of what a request happened to hit.
     spec_decode_num_spec_tokens: Optional[int] = None
+    image_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
 
 
 @dataclass(kw_only=True)
