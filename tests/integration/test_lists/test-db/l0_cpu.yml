@@ -30,6 +30,7 @@ l0_cpu:
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
+  - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
@@ -63,6 +64,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
@@ -214,6 +216,7 @@ l0_cpu:
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
   - unittest/llmapi/test_tokenizer_aliases.py
+  - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
   - unittest/metrics/test_collector.py

@@ -232,7 +232,7 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del k, v, phase
+        del k, v
         # A context phase served by the thop op with use_paged_context_fmha
         # enabled would silently corrupt the cached prefix wherever the fused
         # context kernel is absent. Raise rather than return False: no
@@ -243,6 +243,23 @@ class FallbackFmha(Fmha):
         # (``context_batch_size``), so the admitted result cannot be reused
         # for a context batch.
         if metadata.num_contexts > 0:
+            # Extra page sizes are supported by TRTLLM-Gen, not the thop
+            # paged-context kernel. Refuse before the kernel can read KV.
+            extra_page_sizes = getattr(
+                metadata.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
+            )
+            if (
+                extra_page_sizes
+                and phase != FmhaPhase.GENERATION
+                and metadata.use_paged_context_fmha
+                and metadata.tokens_per_block in extra_page_sizes
+            ):
+                raise RuntimeError(
+                    f"FallbackFmha cannot serve paged prefill with "
+                    f"{metadata.tokens_per_block}-token KV pages. "
+                    "Use a supported TRTLLM-Gen configuration or disable "
+                    "chunked prefill, KV reuse and speculative decoding."
+                )
             self._validate_paged_context_fmha(metadata)
         # A verify group may straddle a page boundary onto two CP ranks, so
         # its KV ownership is per-token. The fused thop path cannot express

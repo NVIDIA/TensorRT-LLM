@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -112,11 +112,11 @@ void printLogitsKeyInfo(ITensor const& tensor, std::string const& infoStr)
         BufferManager manager{streamPtr};
         host = manager.copyFrom(tensor, MemoryType::kCPU);
         streamPtr->synchronize();
-        hostData = bufferCast<T>(*host);
+        hostData = host->getBufferPtr<T>();
     }
     else
     {
-        hostData = bufferCast<T>(tensor);
+        hostData = tensor.getBufferPtr<T>();
     }
 
     std::stringstream ss;
@@ -169,10 +169,10 @@ bool tensorHasInvalid(ITensor const& tensor, BufferManager const& manager, std::
 {
     printLogitsKeyInfo<T>(tensor, infoStr);
     auto foundInvalid = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
-    auto foundInvalidPtr = bufferCast<int32_t>(*foundInvalid);
+    auto foundInvalidPtr = foundInvalid->getBufferPtr<int32_t>();
     foundInvalidPtr[0] = 0;
     auto const size = tensor.getSize();
-    invokeCheckTensorInvalidKernel(bufferCast<T>(tensor), size, foundInvalidPtr, manager.getStream().get());
+    invokeCheckTensorInvalidKernel(tensor.getBufferPtr<T>(), size, foundInvalidPtr, manager.getStream().get());
     manager.getStream().synchronize();
     return static_cast<bool>(foundInvalidPtr[0]);
 }
