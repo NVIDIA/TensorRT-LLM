@@ -2465,6 +2465,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                              forward_args)
 
             if fmha is None:
+                if (getattr(forward_args, "qk_fp8_per_tensor", False)
+                        or getattr(forward_args, "v_fp8_per_tensor", False)):
+                    raise RuntimeError(
+                        "The per-tensor FP8 attention recipe needs the PrimTS "
+                        "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
+                        "enabled or does not support this request.")
                 raise RuntimeError(
                     "No TRT-LLM attention FMHA library supports this request.")
             if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
