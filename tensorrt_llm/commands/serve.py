@@ -569,7 +569,9 @@ DEFAULT_NUM_SERVE_FRONTENDS = 8
 def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
                                          port: int, grpc: bool,
                                          report_addr: Optional[str],
-                                         enable_sleep_mode: bool) -> None:
+                                         enable_sleep_mode: bool,
+                                         metadata_server: bool,
+                                         disagg_cluster: bool) -> None:
     """Fall back to one frontend when the *default* count does not apply.
 
     The default is sized for the OpenAI HTTP server on the classic IPC
@@ -593,6 +595,12 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
         reason = "enable_resource_governor"
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
+    elif metadata_server or disagg_cluster:
+        # Every frontend registers the server under its own process identity
+        # (llm_id, DisaggClusterWorker id), which would list it once per
+        # frontend.
+        reason = ("--metadata_server_config_file"
+                  if metadata_server else "the disagg_cluster config")
     else:
         return
     logger.info(
@@ -1162,8 +1170,9 @@ def launch_visual_gen_server(
     "SO_REUSEPORT (classic IPC executor path only). The default applies to "
     "the OpenAI HTTP server and falls back to 1 for configurations that "
     "support a single frontend only (--port 0/--report_addr, "
-    "orchestrator_type, enable_resource_governor, --enable_sleep_mode) and "
-    "with --grpc; an explicit value is honored or fails instead.",
+    "orchestrator_type, enable_resource_governor, --enable_sleep_mode, "
+    "--metadata_server_config_file, a disagg cluster) and with --grpc; an "
+    "explicit value is honored or fails instead.",
     status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
@@ -1615,7 +1624,10 @@ def serve(
             port=port,
             grpc=grpc,
             report_addr=report_addr,
-            enable_sleep_mode=enable_sleep_mode)
+            enable_sleep_mode=enable_sleep_mode,
+            metadata_server=metadata_server_config_file is not None,
+            disagg_cluster=bool(
+                llm_args.get("disagg_cluster") or disagg_cluster_uri))
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
         # Preserve requested settings for failures before entering the LLM constructor.

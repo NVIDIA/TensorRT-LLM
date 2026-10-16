@@ -14,6 +14,28 @@ import yaml
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
+_NUM_FRONTENDS_FLAG = "--num_serve_frontends"
+
+
+def _picks_num_frontends(cli_args: List[str],
+                         extra_config: Optional[dict]) -> bool:
+    """Whether a test set num_serve_frontends itself (flag, --set or YAML)."""
+    if extra_config and "num_serve_frontends" in extra_config:
+        return True
+    for i, arg in enumerate(cli_args):
+        value = cli_args[i + 1] if i + 1 < len(cli_args) else ""
+        if arg == _NUM_FRONTENDS_FLAG or arg.startswith(_NUM_FRONTENDS_FLAG +
+                                                        "="):
+            return True
+        if (arg == "--set" and value.startswith("num_serve_frontends=")
+            ) or arg.startswith("--set=num_serve_frontends="):
+            return True
+        if arg in ("--config", "--extra_llm_api_options") and value:
+            with open(value) as f:
+                if "num_serve_frontends" in (yaml.safe_load(f) or {}):
+                    return True
+    return False
+
 
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
@@ -51,6 +73,11 @@ class RemoteOpenAIServer:
                 f.write(yaml.dump(extra_config))
                 self.extra_config_file = f.name
             args += ["--extra_llm_api_options", self.extra_config_file]
+        # trtllm-serve runs several HTTP frontend processes by default. Keep
+        # test servers at one -- per-process state (Responses store, /health),
+        # startup time and host memory -- unless a test picks the count.
+        if not _picks_num_frontends(cli_args or [], extra_config):
+            args += [_NUM_FRONTENDS_FLAG, "1"]
         launch_cmd = ["trtllm-serve"] + [model] + args
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
