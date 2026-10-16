@@ -44,6 +44,11 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
             model_loader=SimpleNamespace(
                 metrics={"total_model_loading_seconds": 1.5}),
         ),
+        draft_model_engine=SimpleNamespace(
+            metrics={"must_not_be_reported": 1.0},
+            model_loader=SimpleNamespace(
+                metrics={"total_model_loading_seconds": 0.75}),
+        ),
     )
 
     assert worker.get_startup_metrics() == {
@@ -58,6 +63,9 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
         },
         "model_loader": {
             "total_model_loading_seconds": 1.5
+        },
+        "draft_model_loader": {
+            "total_model_loading_seconds": 0.75
         },
     }
 

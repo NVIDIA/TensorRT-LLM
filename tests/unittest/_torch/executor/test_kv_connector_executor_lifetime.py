@@ -756,6 +756,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     executor._shutdown_sleep_wakeup_listeners = Mock()
     executor.worker_started = True
     executor.model_engine = None
+    executor.draft_model_engine = None
     executor.resource_manager = SimpleNamespace(resource_managers={"kv_cache": pools})
     executor.virtual_memory_pools = None
     executor.sampler = Mock()

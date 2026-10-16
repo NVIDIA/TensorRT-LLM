@@ -641,6 +641,7 @@ class TestMnnvlSleepWakeupCoordination:
 
         executor = object.__new__(PyExecutor)
         executor.model_engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
+        executor.draft_model_engine = None
 
         tags = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
         assert executor._mnnvl_checkpoint_resources(tags) == [resources[0]]

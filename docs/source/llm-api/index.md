@@ -171,6 +171,7 @@ The `model_loader` property contains timings for loading the main LLM weights, i
 `checkpoint_finalization_seconds` for checkpoint-session synchronization and cleanup after weight population.
 If a draft model is used, additional fields `draft_checkpoint_preparation_seconds`,
 `draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds` will appear.
+A `draft_model_loader` property appears when a user-provided drafter exposes a `draft_model_engine`.
 The `py_executor.model_engine_creation_seconds` timing includes the total `model_loader` timing.
 
 | Metric | Description |
