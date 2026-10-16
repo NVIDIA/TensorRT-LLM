@@ -269,6 +269,40 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_declared_qwen_fields_reuse_host_costs_for_device_grids():
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalEncoderItemMetadata,
+    )
+
+    class QwenModel(DummyMultimodalModel):
+        get_multimodal_field_layout = Qwen3VLModelBase.get_multimodal_field_layout
+
+    pixels = torch.arange(10, device="cuda").reshape(5, 2)
+    grids = torch.tensor([[1, 1, 2], [1, 1, 3]], device="cuda")
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": pixels, "image_grid_thw": grids},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                [("image", 1), ("image", 0)], [3, 2], [3, 2]
+            ),
+        }
+    )
+    model = QwenModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    with patch.object(
+        torch.Tensor, "tolist", side_effect=AssertionError("Device grids must not be read back")
+    ):
+        selected = model.build_multimodal_encoder_input(param, [1, 0])
+
+    torch.testing.assert_close(
+        selected.multimodal_data["image"]["pixel_values"], torch.cat([pixels[2:], pixels[:2]])
+    )
+    torch.testing.assert_close(selected.multimodal_data["image"]["image_grid_thw"], grids[[1, 0]])
+
+
 def test_encoder_cache_first_request_writes_per_item_entries():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),

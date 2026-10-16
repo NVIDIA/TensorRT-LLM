@@ -5,10 +5,12 @@
 `MultimodalEncoderItemMetadata` describes request items. `MultimodalParams`
 references processed payloads and the `MultimodalRuntimeData` view for the
 current forward. `MultimodalInput` carries the executor boundary representation.
+`MultimodalFieldLayout` describes item axes and packed ranges within payloads.
 Processor registration and encoder execution live outside this module.
 """
 
 from dataclasses import dataclass, field
+from itertools import accumulate
 from typing import (Any, Dict, List, NamedTuple, Optional, Sequence, Tuple,
                     Union, cast)
 
@@ -30,6 +32,82 @@ MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
 _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
+
+
+class MultimodalFieldLayout(NamedTuple):
+    """How items occupy one processed payload field.
+
+    ``item_axis`` identifies the item axis of a batched tensor, or is ``None``
+    for a value shared by every item. Lists and tuples have item axis zero.
+    ``item_lengths`` partitions a packed tensor along that axis, for example
+    patch counts for vision or frame counts for audio. Lengths are host-side
+    metadata, independent of the payload tensor's device.
+    """
+
+    item_axis: int | None = 0
+    item_lengths: tuple[int, ...] | None = None
+
+    def select(self, value: Any, item_indices: Sequence[int]) -> Any:
+        """Select items in the requested order, preserving tensor dtype/device.
+
+        Contiguous selections of a packed tensor return a view. Other tensor
+        selections copy only the selected items; shared values retain identity.
+        """
+        if self.item_axis is None or value is None:
+            return value
+        indices = list(item_indices)
+        if isinstance(value, torch.Tensor):
+            if self.item_lengths is None:
+                if self.item_axis == 0:
+                    return value[indices]
+                index: list[slice | list[int]] = [slice(None)] * value.ndim
+                index[self.item_axis] = indices
+                return value[tuple(index)]
+
+            offsets = list(accumulate(self.item_lengths, initial=0))
+            if offsets[-1] != value.shape[self.item_axis]:
+                raise ValueError(
+                    "Packed field size does not match its item lengths")
+            if not indices:
+                return value.narrow(self.item_axis, 0, 0)
+            if indices == list(range(indices[0], indices[0] + len(indices))):
+                start = offsets[indices[0]]
+                if self.item_axis == 0:
+                    return value[start:offsets[indices[-1] + 1]]
+                return value.narrow(self.item_axis, start,
+                                    offsets[indices[-1] + 1] - start)
+            if self.item_axis == 0:
+                pieces = [value[offsets[i]:offsets[i + 1]] for i in indices]
+            else:
+                pieces = [
+                    value.narrow(self.item_axis, offsets[i],
+                                 self.item_lengths[i]) for i in indices
+                ]
+            return torch.cat(pieces, dim=self.item_axis)
+
+        if (isinstance(value, (list, tuple)) and self.item_axis == 0
+                and self.item_lengths is None):
+            return type(value)(value[i] for i in indices)
+        raise TypeError(
+            "Item fields must be tensors or lists/tuples on item axis zero")
+
+
+def select_multimodal_fields(
+    modality_data: dict[str, Any],
+    field_layouts: dict[str, MultimodalFieldLayout],
+    item_indices: Sequence[int],
+) -> dict[str, Any]:
+    """Select declared fields; unlisted and shared fields pass through.
+
+    Optional fields absent from the payload are ignored. A model declares
+    every per-item field explicitly, so matching a tensor dimension to the
+    item count never changes a shared field's meaning.
+    """
+    selected = dict(modality_data)
+    for name, layout in field_layouts.items():
+        if name in modality_data:
+            selected[name] = layout.select(modality_data[name], item_indices)
+    return selected
 
 
 class MultimodalEncoderItemMetadata(NamedTuple):
