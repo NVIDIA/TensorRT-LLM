@@ -197,11 +197,48 @@ crash or reboot; a supervisor is optional. Stop before changing launch settings.
 The workdir must be empty on first use, owned by the current user, and outside a
 Git worktree. It holds a disposable SQLite cache, a bare source cache, process-lock
 and stop files, and isolated promotion worktrees. Runtime state is not committed.
-An existing workdir is bound to its operator and vendor configuration; use a
-different directory for another operator/vendor. Authentication is inherited
+An existing workdir is bound to its operator, vendor, and consumer base branch;
+use a different directory for another operator/vendor/base. Authentication is inherited
 from the launching environment and is not persisted in that state.
 
+### Different consumer base branches
+
+Each monitor handles one `--base-branch` (default `main`) and one
+`--canonical-branch`. Different consumer branches may use different canonical
+source branches: run separate instances with separate workdirs. Discovery,
+promotion provenance, follow-up PR targets, and migration checks are scoped to
+the consumer repository and base branch. Retargeting a tracked PR makes it
+ineligible for its old monitor; changing `--base-branch` requires a new workdir.
+
+For example, a main monitor can use `--base-branch main --canonical-branch
+consumer-dev-new`, while a release monitor uses `--base-branch release/1.3
+--canonical-branch consumer-dev`. These are independent opt-in launches;
+configuring one does not start the other. If both consumers later share one
+canonical source branch, serialize publication across them: separate workdir
+locks do not coordinate concurrent pushes to the same source branch.
+
 ### Switching canonical branches after a refresh
+
+Before opening a refresh PR, either stop the monitor for its target base branch
+until the refresh merges, or restart it with an explicit refresh target:
+
+```bash
+--canonical-branch consumer-dev \
+--refresh-branch consumer-dev-YYYYMMDD
+```
+
+`--refresh-branch` is repeatable and applies only to `--canonical-repo`. It tells
+the monitor that a PR pointing at that branch is a manual refresh, not a
+temporary-branch update requiring promotion metadata. The monitor does not
+promote it, skip its CI, or infer refresh targets from contributor metadata or
+branch naming conventions. Normal review and CI still apply to the refresh.
+The operator must audit these targets; do not list contributor temporary branches.
+The option does not authorize publishing to a new branch or start another monitor.
+Changing this policy on restart is allowed in the same workdir without migrating
+the canonical configuration. Reuse the policy after cache loss. If the monitor
+previously requested metadata changes on the open refresh PR, it updates its
+existing feedback and dismisses its obsolete automated review when authorized.
+If dismissal is forbidden, the comment asks an authorized maintainer to dismiss it.
 
 Keep the same workdir when a periodic source refresh introduces a new canonical
 branch. Stop the publishing process for the cutover, and wait for the consumer
@@ -217,10 +254,17 @@ refresh PR to merge. Relaunch with the same configuration except for:
 First omit `--publish`: migration only changes local configuration/cache state;
 this pass makes no remote writes. The bot verifies the merged base lock names
 the new canonical repository/branch and its pin is reachable from that branch.
-It refuses outstanding old-branch promotion PRs or unpublished promotion branches.
+It refuses outstanding old-branch promotion PRs or unpublished promotion branches
+for the same consumer repository and base branch. Promotions for other consumer
+bases do not block this migration; missing or malformed scope provenance still
+requires maintainer inspection.
 Finish those operations, or explicitly close superseded follow-up PRs after
 maintainer review; migration never deletes branches or redirects old promotions.
 Other operator/vendor identity changes still require a separate workdir.
+If the refresh has merged but the old monitor is still running, new updates based
+on a configured refresh target report a maintainer cutover action, not a request
+to promote the lock back to the old canonical branch. After migration, the
+`--refresh-branch` entry for the now-current canonical branch can be omitted.
 
 The configuration update and invalidation are one SQLite transaction. Old
 branch-dependent results are archived, while logs, source caches, promotion
@@ -246,7 +290,7 @@ same cutoff on every launch, including recovery. Historical updates belonging
 to another canonical branch, or superseded pins without a recoverable promotion,
 are not promoted or sent author feedback.
 
-Open PRs qualify only when they change the selected vendor's source commit
+Open PRs qualify for promotion only when they change the selected vendor's source commit
 relative to their Git merge base. A stale PR head after a canonical refresh is
 not itself a source update: changes only to other vendors or patch/digest fields
 do not require promotion metadata. Eligible updates are still checked against
@@ -360,6 +404,7 @@ rechecks automatically on later polls; no manual recheck comment is required.
 | Invalid upstream PR or resolution | Identifies the list entry, duplicated PR, source SHA, missing reason, or unlisted PR, and gives the correction. |
 | Unresolved attribution | Shows candidate PRs and similarity scores where applicable; explains how to correct the PR list/source pin or supply a targeted author assertion. |
 | Source-history or lock-selection problem | Explains the rebase or lock-file change and vendor regeneration needed. Rebase guidance identifies the canonical pin. Metadata edits alone cannot fix these failures. |
+| Same-commit temporary reference | If the PR redirects the source URL/branch but pins the current canonical commit, asks the author to restore the canonical URL/branch from its target base. Keep the commit, other lock fields, vendored files, and patch unchanged; no upstream-PR metadata is needed. |
 
 `unpaired_reason` is appropriate only when there genuinely is no paired upstream
 PR, not as a workaround for failed matching. The similarity threshold, matching
@@ -370,11 +415,19 @@ author-actionable problem. Waiting for a preceding promotion is identified as
 **maintainer action**, with a comment but no new change-request review. Unexpected
 API, authentication, network, and local-cache failures stay in operator logs and
 `status`; they do not post author-fix instructions or request changes. The bot
-deduplicates feedback, including after SQLite loss, and never submits `APPROVE`
-just because metadata is valid.
+deduplicates feedback, including after SQLite loss, updates its existing review
+body when the author-actionable problem changes, and never submits `APPROVE`
+just because metadata is valid. Same-commit reference checks compare the PR's
+own changes against its Git merge base; inherited references and explicitly
+configured refresh targets are not treated as unnecessary temporary redirects.
 
 After correction it dismisses only its own marked metadata reviews, when
-authorized. If dismissal is forbidden, an authorized human must dismiss the
+authorized. If an open PR no longer needs promotion, it also reconciles existing
+comments/reviews from GitHub, without requiring SQLite history. It updates the
+comment to explain that the previous request no longer applies, rather than
+claiming metadata validation succeeded. It posts no feedback on an ignored PR
+unless it already has a bot comment or an unresolved bot review to reconcile.
+If dismissal is forbidden, an authorized human must dismiss the
 review; the bot reports the failure rather than approving the code. If the
 authenticated account already has a manual approval/objection, the bot uses
 comments so it does not supersede that review. It likewise uses comments on the

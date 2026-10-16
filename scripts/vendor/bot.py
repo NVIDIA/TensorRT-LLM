@@ -193,7 +193,7 @@ def _pages(gh: promote.GitHub, endpoint: str) -> Iterator[dict]:
 
 
 class Monitor:
-    """One operator-configured vendor; run other vendors in separate workdirs."""
+    """One vendor/base-branch pair; run other pairs in separate workdirs."""
 
     def __init__(
         self,
@@ -207,6 +207,7 @@ class Monitor:
         self.actor = gh.get("user")["login"]
         self.prefix = f"repos/{gh.consumer_repo}"
         self.marker = f"<!-- vendor-bot:{gh.vendor_name} -->"
+        self.refresh_branches = frozenset(args.refresh_branch)
         settings = {
             "consumer_repo": gh.consumer_repo,
             "vendor": gh.vendor_name,
@@ -266,6 +267,9 @@ class Monitor:
                     "--migrate-canonical-branch-from and use the current canonical configuration."
                 )
         store.put("settings", settings)
+        # Refresh targets are an operator policy, not publication destinations.
+        # Changing them does not migrate the canonical branch or its provenance.
+        store.put("refresh_branches", sorted(self.refresh_branches))
         if store.get("since") is None:
             store.put(
                 "since",
@@ -343,6 +347,23 @@ class Monitor:
             )
             record = promote._record_from_message(message)
             if record.get("canonical_branch") != previous_branch:
+                continue
+            consumer_pr = record.get("consumer_pr")
+            consumer_base = record.get("consumer_base")
+            consumer = (
+                re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/[1-9][0-9]*", consumer_pr)
+                if isinstance(consumer_pr, str)
+                else None
+            )
+            if consumer is None or not isinstance(consumer_base, str) or not consumer_base:
+                raise ValueError(
+                    f"Missing or invalid consumer provenance on promotion branch {branch}; "
+                    "inspect its promotion commit before migrating."
+                )
+            if (
+                consumer.group(1).lower() != self.gh.consumer_repo.lower()
+                or consumer_base != self.gh.base_branch
+            ):
                 continue
             if record.get("vendor") != self.gh.vendor_name:
                 raise ValueError(f"Unexpected vendor provenance on promotion branch {branch}.")
@@ -424,9 +445,15 @@ class Monitor:
         self.store.put(f"problem:{number}", observation["reason"] if state == "blocked" else None)
 
     def _feedback(
-        self, pr: dict, problem: Diagnostic | None, *, attribution: dict[str, dict] | None = None
+        self,
+        pr: dict,
+        problem: Diagnostic | None,
+        *,
+        attribution: dict[str, dict] | None = None,
+        no_promotion: bool = False,
     ) -> None:
         number = pr["number"]
+        state = "blocked" if problem else "ignored" if no_promotion else "metadata_valid"
         message = (
             f"@{pr['user']['login']} — vendor promotion needs {problem.owner} action:\n\n{problem}"
             "\n\nThe bot will recheck automatically on a later poll."
@@ -434,6 +461,13 @@ class Monitor:
             else "Vendor promotion metadata and source attribution are valid. "
             "This is **not** a code-review approval. Promotion still requires the source PR to merge."
         )
+        if no_promotion:
+            message = (
+                f"This PR does not require vendor promotion for {field(self.gh.vendor_name)} "
+                "under this monitor's configuration. The previous promotion-metadata request "
+                "no longer applies; no upstream-PR metadata is required by this monitor. "
+                "This is **not** a code-review approval. Normal review and CI still apply."
+            )
         if attribution:
             details = metadata.similarity_feedback(attribution, self.gh.upstream_repo)
             if details:
@@ -446,13 +480,19 @@ class Monitor:
         if not self.args.publish:
             self._transition(
                 number,
-                "blocked" if problem else "metadata_valid",
+                state,
                 str(problem) if problem else "dry run; no feedback published",
             )
             return
         # Check immutable head and description immediately before feedback. A
         # concurrent author edit will be retried on the next poll.
         current = self.gh.get(f"{self.prefix}/pulls/{number}")
+        if current["base"]["ref"] != self.gh.base_branch:
+            self._transition(number, "ignored", "PR targets a different consumer base branch")
+            return
+        if no_promotion and current["state"] != "open":
+            self._transition(number, "ignored", "PR is no longer open")
+            return
         if current["head"]["sha"] != pr["head"]["sha"] or current.get("body") != pr.get("body"):
             self._transition(
                 number, "deferred", "source head or description changed; retry next poll"
@@ -466,33 +506,15 @@ class Monitor:
         ]
         if len(existing) > 1:
             raise ValueError("Multiple bot feedback comments; inspect before continuing.")
-        if existing:
-            if existing[0]["body"] != body and not (
-                not problem and existing[0]["body"] == body + dismissal_notice
-            ):
-                self.gh.api(
-                    f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                    method="PATCH",
-                    payload={"body": body},
-                )
-                _LOG.info("PR #%s: updated metadata feedback comment", number)
-        else:
-            self.gh.api(
-                f"{self.prefix}/issues/{number}/comments", method="POST", payload={"body": body}
-            )
-            _LOG.info("PR #%s: posted metadata feedback comment", number)
-        if current["state"] != "open" or current["user"]["login"] == self.actor:
-            self._transition(
-                number,
-                "blocked" if problem else "metadata_valid",
-                str(problem) if problem else "feedback reconciled; not a code-review approval",
-            )
-            return
-        reviews = [
-            item
-            for item in _pages(self.gh, f"{self.prefix}/pulls/{number}/reviews")
-            if item["user"]["login"] == self.actor
-        ]
+        reviews = (
+            [
+                item
+                for item in _pages(self.gh, f"{self.prefix}/pulls/{number}/reviews")
+                if item["user"]["login"] == self.actor
+            ]
+            if current["state"] == "open" and current["user"]["login"] != self.actor
+            else []
+        )
         automated = [
             item
             for item in reviews
@@ -504,20 +526,57 @@ class Monitor:
             if not item.get("body", "").startswith(self.marker)
             and item["state"] in ("APPROVED", "CHANGES_REQUESTED")
         ]
-        if problem and problem.owner == "author" and not automated and not manual:
-            self.gh.api(
-                f"{self.prefix}/pulls/{number}/reviews",
-                method="POST",
-                payload={
-                    "event": "REQUEST_CHANGES",
-                    "commit_id": pr["head"]["sha"],
-                    "body": (
-                        f"{self.marker}\n{problem.problem}\n\nSee the vendor-bot comment for "
-                        "the specific fix and the latest validation result."
-                    ),
-                },
+        if no_promotion and not existing and not automated:
+            self._transition(number, "ignored", "not a promotable update for this canonical vendor")
+            return
+        if existing:
+            if existing[0]["body"] != body and not (
+                not problem and existing[0]["body"] == body + dismissal_notice
+            ):
+                self.gh.api(
+                    f"{self.prefix}/issues/comments/{existing[0]['id']}",
+                    method="PATCH",
+                    payload={"body": body},
+                )
+                _LOG.info("PR #%s: updated metadata feedback comment", number)
+        else:
+            existing = [
+                self.gh.api(
+                    f"{self.prefix}/issues/{number}/comments", method="POST", payload={"body": body}
+                )
+            ]
+            _LOG.info("PR #%s: posted metadata feedback comment", number)
+        if current["state"] != "open" or current["user"]["login"] == self.actor:
+            self._transition(
+                number,
+                state,
+                str(problem) if problem else "feedback reconciled; not a code-review approval",
             )
-            _LOG.info("PR #%s: requested metadata changes", number)
+            return
+        if problem and problem.owner == "author":
+            review_body = (
+                f"{self.marker}\n{problem.problem}\n\nSee the vendor-bot comment for "
+                "the specific fix and the latest validation result."
+            )
+            for review in automated:
+                if review["body"] != review_body:
+                    self.gh.api(
+                        f"{self.prefix}/pulls/{number}/reviews/{review['id']}",
+                        method="PUT",
+                        payload={"body": review_body},
+                    )
+                    _LOG.info("PR #%s: updated metadata review %s", number, review["id"])
+            if not automated and not manual:
+                self.gh.api(
+                    f"{self.prefix}/pulls/{number}/reviews",
+                    method="POST",
+                    payload={
+                        "event": "REQUEST_CHANGES",
+                        "commit_id": pr["head"]["sha"],
+                        "body": review_body,
+                    },
+                )
+                _LOG.info("PR #%s: requested metadata changes", number)
         elif not problem:
             for review in automated:
                 # Never replace a metadata objection with APPROVE or dismiss a
@@ -536,7 +595,8 @@ class Monitor:
                     if "HTTP 403" not in str(error):
                         raise
                     _LOG.warning(
-                        "PR #%s: metadata is valid, but an authorized human must dismiss automated review %s.",
+                        "PR #%s: metadata review is resolved, but an authorized human "
+                        "must dismiss automated review %s.",
                         number,
                         review["id"],
                     )
@@ -558,7 +618,7 @@ class Monitor:
                 )
         self._transition(
             number,
-            "blocked" if problem else "metadata_valid",
+            state,
             str(problem) if problem else "feedback reconciled; not a code-review approval",
         )
 
@@ -591,7 +651,19 @@ class Monitor:
                 "regenerate the vendored snapshot if its source changed, and push the PR. "
                 "Editing the PR description will not fix a lock-file error.",
             ) from error
-        if previous.commit == reviewed.commit or not reviewed.branch:
+        canonical = (
+            promote._repo_name(previous.url).lower() == self.args.canonical_repo.lower()
+            and previous.branch == self.args.canonical_branch
+        )
+        target_is_canonical = promote._repo_name(
+            reviewed.url
+        ).lower() == self.args.canonical_repo.lower() and (
+            reviewed.branch == self.args.canonical_branch
+            or reviewed.branch in self.refresh_branches
+        )
+        if target_is_canonical:
+            return None  # Periodic refresh/direct canonical update: separate workflow.
+        if not reviewed.branch or (pr.get("merged") and previous.commit == reviewed.commit):
             return None  # Includes lock-only promotions and tag-only updates.
         if not pr.get("merged"):
             comparison = self.gh.compare(self.gh.consumer_repo, base, revision)
@@ -608,21 +680,42 @@ class Monitor:
                 raise RuntimeError(f"PR merge-base vendor lock is invalid: {error}") from error
             # Classify the PR's own changes, but retain the current canonical
             # pin as the baseline for source-history checks and promotion.
-            if name not in original or (
-                manage._validate_vendor(name, original[name]).commit == reviewed.commit
-            ):
+            if name not in original:
                 return None
-        canonical = (
-            promote._repo_name(previous.url).lower() == self.args.canonical_repo.lower()
-            and previous.branch == self.args.canonical_branch
-        )
-        target_is_canonical = (
-            promote._repo_name(reviewed.url).lower() == self.args.canonical_repo.lower()
-            and reviewed.branch == self.args.canonical_branch
-        )
-        if target_is_canonical:
-            return None  # Periodic refresh/direct canonical update: separate workflow.
+            original_vendor = manage._validate_vendor(name, original[name])
+            reference_changed = (
+                promote._repo_name(original_vendor.url).lower(),
+                original_vendor.branch,
+            ) != (promote._repo_name(reviewed.url).lower(), reviewed.branch)
+            if canonical and previous.commit == reviewed.commit and reference_changed:
+                raise Diagnostic(
+                    f"Temporary source reference adds no new vendor commit: "
+                    f"{field(reviewed.commit)} is already pinned on {field(self.gh.base_branch)}.",
+                    f"In `{promote._LOCK}` at `vendors.{name}`, restore `url` to "
+                    f"{field(previous.url)} and `branch` to {field(previous.branch)}. "
+                    "Change only these source-reference fields; keep the commit and other lock "
+                    "fields, vendored files, and patch unchanged. No upstream-PR metadata or "
+                    "vendor promotion is needed for this same-commit reference change.",
+                )
+            if original_vendor.commit == reviewed.commit:
+                return None
+        if previous.commit == reviewed.commit:
+            return None
         if not canonical:
+            if (
+                promote._repo_name(previous.url).lower() == self.args.canonical_repo.lower()
+                and previous.branch in self.refresh_branches
+            ):
+                raise Diagnostic(
+                    f"The base lock now uses refresh branch {field(previous.branch)}, but this "
+                    f"monitor still publishes to {field(self.args.canonical_branch)}.",
+                    "A maintainer must stop this monitor and migrate its workdir with "
+                    f"`--canonical-branch {previous.branch} "
+                    f"--migrate-canonical-branch-from {self.args.canonical_branch}`. "
+                    "Verify a dry run before resuming publication. Do not promote back to "
+                    "the old branch or change contributor metadata to bypass this cutover.",
+                    owner="maintainer",
+                )
             if pr.get("merged"):
                 return None  # Historical update belonging to another canonical branch.
             raise Diagnostic(
@@ -687,15 +780,21 @@ class Monitor:
             return
         self.progress.operation("inspecting", number)
         pr = self.gh.get(f"{self.prefix}/pulls/{number}")
+        if pr["base"]["ref"] != self.gh.base_branch:
+            self._transition(number, "ignored", "PR targets a different consumer base branch")
+            return
         if pr["state"] == "closed" and not pr.get("merged"):
             self._transition(number, "ignored", "closed without merging")
             return
         try:
             inputs = self._inputs(pr)
             if inputs is None:
-                self._transition(
-                    number, "ignored", "not a promotable update for this canonical vendor"
-                )
+                if pr["state"] == "open":
+                    self._feedback(pr, None, no_promotion=True)
+                else:
+                    self._transition(
+                        number, "ignored", "not a promotable update for this canonical vendor"
+                    )
                 return
             previous, reviewed = inputs
             self.progress.count("relevant")
@@ -977,9 +1076,15 @@ def _status(workdir: Path) -> dict:
             sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=1)
         ) as connection:
             rows = connection.execute(
-                "SELECT key, value FROM state WHERE key IN ('health', 'process', 'settings', 'migration')"
+                "SELECT key, value FROM state WHERE key IN "
+                "('health', 'process', 'settings', 'migration', 'refresh_branches')"
             ).fetchall()
         state = {key: json.loads(value) for key, value in rows}
+        refresh_branches = state.pop("refresh_branches", [])
+        if not isinstance(refresh_branches, list) or any(
+            not isinstance(branch, str) for branch in refresh_branches
+        ):
+            raise ValueError("Malformed refresh policy; expected a JSON list of branch names.")
         if any(not isinstance(value, dict) for value in state.values()):
             raise ValueError("Malformed status cache; expected JSON objects.")
         health, process = state.get("health", {}), state.get("process", {})
@@ -1002,6 +1107,8 @@ def _status(workdir: Path) -> dict:
             vendor=state.get("settings", {}).get("vendor"),
             canonical_repo=state.get("settings", {}).get("canonical_repo"),
             canonical_branch=state.get("settings", {}).get("canonical_branch"),
+            base_branch=state.get("settings", {}).get("base_branch"),
+            refresh_branches=refresh_branches,
             migration=state.get("migration"),
         )
         if not active:
@@ -1021,6 +1128,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--upstream-repo", required=True)
     run.add_argument("--canonical-repo", required=True)
     run.add_argument("--canonical-branch", required=True)
+    run.add_argument(
+        "--refresh-branch",
+        action="append",
+        default=[],
+        help=(
+            "Recognize this branch in --canonical-repo as a refresh target, not a temporary "
+            "source branch. Repeat for multiple targets; does not enable publication to them."
+        ),
+    )
     run.add_argument(
         "--migrate-canonical-branch-from",
         help="Explicitly migrate this stopped workdir from OLD_BRANCH after a merged refresh.",
@@ -1093,6 +1209,8 @@ def main(argv: list[str] | None = None) -> int:
         for name in (args.consumer_repo, args.upstream_repo, args.canonical_repo, args.fork):
             promote._repo_name(f"https://github.com/{name}")
         for branch in (args.canonical_branch, args.base_branch, args.upstream_branch):
+            promote._run(["git", "check-ref-format", f"refs/heads/{branch}"])
+        for branch in args.refresh_branch:
             promote._run(["git", "check-ref-format", f"refs/heads/{branch}"])
         if args.migrate_canonical_branch_from:
             promote._run(

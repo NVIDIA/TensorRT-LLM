@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -753,6 +754,10 @@ class FakeGitHub(p.GitHub):
             number = int(endpoint.split("/")[-2])
             self.reviews[number - 1]["state"] = "DISMISSED"
             return {}
+        if "/reviews/" in endpoint and method == "PUT":
+            number = int(endpoint.rsplit("/", 1)[1])
+            self.reviews[number - 1]["body"] = payload["body"]
+            return copy.deepcopy(self.reviews[number - 1])
         if "/reviews" in endpoint:
             if method == "GET":
                 return copy.deepcopy(self.reviews)
@@ -789,6 +794,7 @@ def monitor(tmp_path: Path):
     args = argparse.Namespace(
         canonical_repo="operator/library",
         canonical_branch="dev",
+        refresh_branch=[],
         migrate_canonical_branch_from=None,
         fork="operator/consumer",
         repo=tmp_path,
@@ -982,7 +988,14 @@ def test_branch_migration_checks_pending_promotions(
         monitor.gh, "optional", lambda endpoint: {"commit": {"message": "record"}}, raising=False
     )
     monkeypatch.setattr(
-        p, "_record_from_message", lambda message: {"vendor": "toy", "canonical_branch": "dev"}
+        p,
+        "_record_from_message",
+        lambda message: {
+            "vendor": "toy",
+            "canonical_branch": "dev",
+            "consumer_pr": "https://github.com/org/consumer/pull/7",
+            "consumer_base": "main",
+        },
     )
     if state == "closed":
         b.Monitor(args, monitor.gh, monitor.store)
@@ -990,6 +1003,79 @@ def test_branch_migration_checks_pending_promotions(
         with pytest.raises(ValueError, match="Unresolved old-branch promotion"):
             b.Monitor(args, monitor.gh, monitor.store)
         assert monitor.store.get("settings")["canonical_branch"] == "dev"
+    assert not monitor.gh.writes
+
+
+@pytest.mark.parametrize("base_branch", ["main", "release/1.3"])
+@pytest.mark.parametrize("other_scope", ["base", "repository"])
+@pytest.mark.parametrize("origin", ["local", "remote"])
+def test_branch_migration_ignores_promotions_for_other_consumers(
+    monitor: b.Monitor,
+    monkeypatch: pytest.MonkeyPatch,
+    base_branch: str,
+    other_scope: str,
+    origin: str,
+) -> None:
+    monitor.gh.base_branch = base_branch
+    other_base = "release/1.3" if base_branch == "main" else "main"
+    branch = "chore/toy-promote-7-aaaaaaaaaaaa"
+    record = {
+        "version": 1,
+        "vendor": "toy",
+        "canonical_branch": "dev",
+        "consumer_pr": "https://github.com/other/consumer/pull/7"
+        if other_scope == "repository"
+        else "https://github.com/org/consumer/pull/7",
+        "consumer_base": other_base if other_scope == "base" else base_branch,
+    }
+
+    def pages(gh, endpoint):
+        if endpoint.endswith("/branches"):
+            return iter(
+                [{"name": branch, "commit": {"sha": "a" * 40}}] if origin == "remote" else []
+            )
+        assert endpoint.endswith("/pulls?state=open"), endpoint
+        return iter([])
+
+    monkeypatch.setattr(b, "_pages", pages)
+    monkeypatch.setattr(
+        p, "_git", lambda *args: f"{branch} {'a' * 40}" if origin == "local" else ""
+    )
+    monkeypatch.setattr(
+        monitor.gh,
+        "optional",
+        lambda endpoint: {"commit": {"message": p._record_text(record)}},
+    )
+    monitor._check_pending_promotions("dev")
+    assert not monitor.gh.writes
+
+
+@pytest.mark.parametrize("field", ["consumer_pr", "consumer_base"])
+@pytest.mark.parametrize("value", [None, "", 123])
+def test_branch_migration_rejects_ambiguous_consumer_provenance(
+    monitor: b.Monitor,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    branch = "chore/toy-promote-7-aaaaaaaaaaaa"
+    record = {
+        "version": 1,
+        "vendor": "toy",
+        "canonical_branch": "dev",
+        "consumer_pr": "https://github.com/org/consumer/pull/7",
+        "consumer_base": "main",
+        field: value,
+    }
+    monkeypatch.setattr(b, "_pages", lambda *args: iter([]))
+    monkeypatch.setattr(p, "_git", lambda *args: f"{branch} {'a' * 40}")
+    monkeypatch.setattr(
+        monitor.gh,
+        "optional",
+        lambda endpoint: {"commit": {"message": p._record_text(record)}},
+    )
+    with pytest.raises(ValueError, match="Missing or invalid consumer provenance"):
+        monitor._check_pending_promotions("dev")
     assert not monitor.gh.writes
 
 
@@ -1171,6 +1257,268 @@ def test_refresh_source_update_uses_current_canonical_as_promotion_baseline(
     assert not monitor.gh.writes
 
 
+@pytest.fixture
+def refresh_candidate(monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch):
+    previous = _vendor("1" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("2" * 40, "https://github.com/operator/library.git", "dev-new")
+    locks = {"c" * 40: previous, "a" * 40: reviewed}
+    monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
+    monkeypatch.setattr(
+        p, "_lock_document_at", lambda gh, repo, sha: {"vendors": {"toy": locks[sha].to_mapping()}}
+    )
+    original_get = monitor.gh.get
+    monkeypatch.setattr(
+        monitor.gh,
+        "get",
+        lambda endpoint: {"parents": [{"sha": "c" * 40}]}
+        if endpoint.endswith("/commits/" + "a" * 40)
+        else original_get(endpoint),
+    )
+    return locks
+
+
+@pytest.mark.parametrize("base_branch", ["main", "release/1.3"])
+@pytest.mark.parametrize("redirect", ["repository", "branch", "both"])
+@pytest.mark.parametrize("caught_up", [False, True])
+def test_same_commit_reference_redirect_requests_canonical_lock_not_metadata(
+    monitor: b.Monitor, refresh_candidate, base_branch: str, redirect: str, caught_up: bool
+) -> None:
+    gh = monitor.gh
+    gh.base_branch = gh.pr["base"]["ref"] = base_branch
+    previous = refresh_candidate["c" * 40]
+    reviewed = dataclasses.replace(
+        previous,
+        url="https://github.com/author/library.git" if redirect != "branch" else previous.url,
+        branch="temporary" if redirect != "repository" else previous.branch,
+    )
+    refresh_candidate["a" * 40] = reviewed
+    if caught_up:
+        gh.merge_base_sha = "d" * 40
+        refresh_candidate["d" * 40] = dataclasses.replace(previous, commit="0" * 40)
+    gh.pr["body"] = "Invalid/missing promotion metadata must not obscure the lock fix."
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, gh, store)
+        restarted.inspect(7)
+        assert store.get("observation:7")["state"] == "blocked"
+    body = gh.comments[0]["body"]
+    assert "Temporary source reference adds no new vendor commit" in body
+    assert previous.commit in body and base_branch in body
+    assert p._LOCK in body and "vendors.toy" in body
+    assert previous.url in body and f"<code>{previous.branch}</code>" in body
+    assert "keep the commit and other lock fields, vendored files, and patch unchanged" in body
+    assert "No upstream-PR metadata" in body
+    assert "vendor-promotion:start" not in body
+    assert gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+    writes = copy.deepcopy(gh.writes)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(monitor.args, gh, store).inspect(7)
+    assert gh.writes == writes
+
+
+@pytest.mark.parametrize(
+    "case", ["canonical", "equivalent-url", "refresh", "inherited", "merged", "promotion"]
+)
+def test_same_commit_reference_non_redirects_do_not_request_changes(
+    monitor: b.Monitor, refresh_candidate, case: str
+) -> None:
+    previous = refresh_candidate["c" * 40]
+    reviewed = previous
+    if case == "equivalent-url":
+        reviewed = dataclasses.replace(previous, url="https://github.com/OPERATOR/library")
+    elif case == "refresh":
+        reviewed = dataclasses.replace(previous, branch="dev-new")
+        monitor.args.refresh_branch = ["dev-new"]
+    elif case in ("inherited", "merged"):
+        reviewed = dataclasses.replace(previous, url="https://github.com/author/library.git")
+        if case == "inherited":
+            monitor.gh.merge_base_sha = "d" * 40
+            refresh_candidate["d" * 40] = reviewed
+        else:
+            monitor.gh.pr.update(merged=True, state="closed", merge_commit_sha="a" * 40)
+    elif case == "promotion":
+        refresh_candidate["c" * 40] = dataclasses.replace(
+            previous, url="https://github.com/author/library.git", branch="temporary"
+        )
+    refresh_candidate["a" * 40] = reviewed
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(monitor.args, monitor.gh, store).inspect(7)
+        assert store.get("observation:7")["state"] == "ignored"
+    assert not monitor.gh.writes
+
+
+def test_same_commit_reference_reconciles_stale_feedback_then_clears_after_fix(
+    monitor: b.Monitor, refresh_candidate
+) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue("Source update is not a fast-forward."))
+    previous = refresh_candidate["c" * 40]
+    refresh_candidate["a" * 40] = dataclasses.replace(
+        previous, url="https://github.com/author/library.git", branch="temporary"
+    )
+    monitor.inspect(7)
+    assert len(gh.comments) == len(gh.reviews) == 1
+    assert all("adds no new vendor commit" in item["body"] for item in (*gh.comments, *gh.reviews))
+    assert "fast-forward" not in gh.reviews[0]["body"]
+    assert gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+    assert any(
+        method == "PUT" and endpoint.endswith("/reviews/1") for endpoint, method, _ in gh.writes
+    )
+    refresh_candidate["a" * 40] = previous
+    for _ in range(2):
+        with contextlib.closing(b.Store(":memory:")) as store:
+            b.Monitor(monitor.args, gh, store).inspect(7)
+            assert store.get("observation:7")["state"] == "ignored"
+            assert store.get("problem:7") is None
+    assert len(gh.comments) == len(gh.reviews) == 1
+    assert "does not require vendor promotion" in gh.comments[0]["body"]
+    assert "metadata and source attribution are valid" not in gh.comments[0]["body"]
+    assert gh.reviews[0]["state"] == "DISMISSED"
+    assert not any(payload.get("event") == "APPROVE" for _, _, payload in gh.writes)
+    writes = copy.deepcopy(gh.writes)
+    monitor.inspect(7)
+    assert gh.writes == writes
+
+
+@pytest.mark.parametrize("remaining", ["comment", "review", "both", "neither"])
+def test_ignored_pr_cleans_remote_feedback_without_sqlite(
+    monitor: b.Monitor, refresh_candidate, remaining: str
+) -> None:
+    monitor._feedback(monitor.gh.pr, _issue("Missing block"))
+    if remaining in ("review", "neither"):
+        monitor.gh.comments.clear()
+    if remaining in ("comment", "neither"):
+        monitor.gh.reviews.clear()
+    monitor.gh.writes.clear()
+    monitor.args.refresh_branch = ["dev-new"]
+    for _ in range(2):
+        with contextlib.closing(b.Store(":memory:")) as store:
+            b.Monitor(monitor.args, monitor.gh, store).inspect(7)
+            assert store.get("observation:7")["state"] == "ignored"
+    if remaining == "neither":
+        assert not monitor.gh.writes
+    else:
+        assert len(monitor.gh.comments) == 1
+        assert "no longer applies" in monitor.gh.comments[0]["body"]
+        assert "not** a code-review approval" in monitor.gh.comments[0]["body"]
+        assert all(review["state"] == "DISMISSED" for review in monitor.gh.reviews)
+        assert len(monitor.gh.writes) == (2 if remaining in ("review", "both") else 1)
+
+
+@pytest.mark.parametrize("existing", ["manual", "other-actor", "other-vendor"])
+def test_ignored_pr_preserves_unrelated_comments_and_reviews(
+    monitor: b.Monitor, refresh_candidate, existing: str
+) -> None:
+    actor = "human" if existing == "other-actor" else monitor.actor
+    body = (
+        "Manual review"
+        if existing == "manual"
+        else "<!-- vendor-bot:other -->\nOther vendor"
+        if existing == "other-vendor"
+        else f"{monitor.marker}\nAnother operator's feedback"
+    )
+    monitor.gh.comments.append({"id": 1, "user": {"login": actor}, "body": body})
+    monitor.gh.reviews.append(
+        {"id": 1, "user": {"login": actor}, "body": body, "state": "CHANGES_REQUESTED"}
+    )
+    monitor.args.refresh_branch = ["dev-new"]
+    b.Monitor(monitor.args, monitor.gh, monitor.store).inspect(7)
+    assert not monitor.gh.writes
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+
+
+@pytest.mark.parametrize("change", ["head", "body", "base", "closed", "dry-run"])
+def test_ignored_feedback_cleanup_respects_concurrent_changes_and_dry_run(
+    monitor: b.Monitor, change: str
+) -> None:
+    monitor._feedback(monitor.gh.pr, _issue("Missing block"))
+    snapshot = copy.deepcopy(monitor.gh.pr)
+    if change == "head":
+        monitor.gh.pr["head"]["sha"] = "b" * 40
+    elif change == "body":
+        monitor.gh.pr["body"] = "edited"
+    elif change == "base":
+        monitor.gh.pr["base"]["ref"] = "release/1.3"
+    elif change == "closed":
+        monitor.gh.pr["state"] = "closed"
+    else:
+        monitor.args.publish = False
+    writes = copy.deepcopy(monitor.gh.writes)
+    monitor._feedback(snapshot, None, no_promotion=True)
+    assert monitor.gh.writes == writes
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+
+
+@pytest.mark.parametrize("base_branch", ["main", "release/1.3"])
+@pytest.mark.parametrize("merged", [False, True])
+def test_explicit_refresh_target_never_requests_metadata_or_promotes(
+    monitor: b.Monitor, refresh_candidate, base_branch: str, merged: bool
+) -> None:
+    monitor.gh.base_branch = base_branch
+    monitor.gh.pr["base"]["ref"] = base_branch
+    monitor.gh.pr.update(merged=merged, merge_commit_sha="a" * 40)
+    monitor.args.refresh_branch = ["dev-new"]
+    for _ in range(2):
+        with contextlib.closing(b.Store(":memory:")) as store:
+            restarted = b.Monitor(monitor.args, monitor.gh, store)
+            restarted.inspect(7)
+            assert store.get("observation:7")["state"] == "ignored"
+            assert store.get("refresh_branches") == ["dev-new"]
+    assert not monitor.gh.writes
+
+
+@pytest.mark.parametrize("untrusted", ["branch", "repository"])
+def test_refresh_targets_are_explicit_and_repository_scoped(
+    monitor: b.Monitor, refresh_candidate, untrusted: str
+) -> None:
+    if untrusted == "repository":
+        monitor.args.refresh_branch = ["dev-new"]
+        refresh_candidate["a" * 40] = dataclasses.replace(
+            refresh_candidate["a" * 40], url="https://github.com/author/library.git"
+        )
+    restarted = b.Monitor(monitor.args, monitor.gh, monitor.store)
+    assert restarted._inputs(monitor.gh.pr) == (
+        refresh_candidate["c" * 40],
+        refresh_candidate["a" * 40],
+    )
+    restarted.inspect(7)
+    assert "vendor-promotion:start" in monitor.gh.comments[0]["body"]
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+
+
+def test_refresh_policy_can_change_without_migrating_workdir(
+    monitor: b.Monitor, refresh_candidate
+) -> None:
+    monitor.store.put("cursor", "preserved")
+    monitor.store.put("complete:8", "preserved")
+    for branches in (["dev-new", "dev-new"], []):
+        monitor.args.refresh_branch = branches
+        restarted = b.Monitor(monitor.args, monitor.gh, monitor.store)
+        assert (restarted._inputs(monitor.gh.pr) is None) == bool(branches)
+        assert monitor.store.get("settings")["canonical_branch"] == "dev"
+        assert monitor.store.get("cursor") == "preserved"
+        assert monitor.store.get("complete:8") == "preserved"
+        assert monitor.store.get("refresh_branches") == sorted(set(branches))
+        assert monitor.store.get("migration") is None
+    assert not monitor.gh.writes
+
+
+def test_updates_after_refresh_require_maintainer_cutover(
+    monitor: b.Monitor, refresh_candidate
+) -> None:
+    monitor.args.refresh_branch = ["dev-new"]
+    refresh_candidate["c" * 40] = refresh_candidate["a" * 40]
+    refresh_candidate["a" * 40] = _vendor(
+        "3" * 40, "https://github.com/author/library.git", "temporary"
+    )
+    restarted = b.Monitor(monitor.args, monitor.gh, monitor.store)
+    restarted.inspect(7)
+    comment = monitor.gh.comments[0]["body"]
+    assert "maintainer action" in comment
+    assert "--canonical-branch dev-new --migrate-canonical-branch-from dev" in comment
+    assert "Do not promote back" in comment
+    assert not monitor.gh.reviews
+
+
 def test_waiting_for_prior_promotion_is_maintainer_action_without_review(
     monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1319,6 +1667,84 @@ def test_discovery_and_persistent_operator_scope(monitor: b.Monitor) -> None:
     changed.canonical_repo = "different/library"
     with pytest.raises(ValueError, match="different operator"):
         b.Monitor(changed, monitor.gh, monitor.store)
+
+
+@pytest.mark.parametrize("base_branch", ["main", "release/1.3"])
+def test_monitors_discover_only_their_consumer_base(monitor: b.Monitor, base_branch: str) -> None:
+    monitor.gh.base_branch = base_branch
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, monitor.gh, store)
+        monitor.gh.pr["base"]["ref"] = "release/1.3" if base_branch == "main" else "main"
+        assert restarted._discover() == []
+        monitor.gh.pr["base"]["ref"] = base_branch
+        assert restarted._discover() == [7]
+    assert not monitor.gh.writes
+
+
+def test_workdir_cannot_change_consumer_base(monitor: b.Monitor) -> None:
+    monitor.gh.base_branch = "release/1.3"
+    with pytest.raises(ValueError, match="different operator/vendor configuration"):
+        b.Monitor(monitor.args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["base_branch"] == "main"
+
+
+@pytest.mark.parametrize("base_branch", ["main", "release/1.3"])
+def test_promotion_identity_and_followup_keep_consumer_base(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, base_branch: str
+) -> None:
+    gh = monitor.gh
+    gh.base_branch = base_branch
+    gh.pr.update(merged=True, merge_commit_sha="b" * 40)
+    gh.pr["base"]["ref"] = base_branch
+    previous = _vendor("1" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("2" * 40, "https://github.com/author/library.git", "temporary")
+    original_get = gh.get
+
+    def get(endpoint: str) -> dict:
+        if endpoint.endswith("/commits/" + "b" * 40):
+            return {"parents": [{"sha": "c" * 40}]}
+        if "/git/ref/heads/" in endpoint:
+            assert endpoint.endswith(f"/git/ref/heads/{base_branch}")
+            return {"object": {"sha": "d" * 40}}
+        return original_get(endpoint)
+
+    monkeypatch.setattr(gh, "get", get)
+    monkeypatch.setattr(
+        p, "_lock_at", lambda gh, repo, sha: previous if sha == "c" * 40 else reviewed
+    )
+    args = monitor._arguments(7, reviewed)
+    plan = p._plan_identity(args, gh)
+    assert plan.base_branch == plan.record["consumer_base"] == base_branch
+    assert plan.main_sha == "d" * 40
+
+    def followups(endpoint: str):
+        query = parse_qs(endpoint.split("?", 1)[1])
+        assert query["base"] == [base_branch]
+        assert query["head"] == [f"operator:{plan.branch}"]
+        return []
+
+    monkeypatch.setattr(gh, "api", followups)
+    assert p._find_followup(gh, plan) is None
+    assert not gh.writes
+
+
+def test_tracked_pr_retargeted_to_another_base_is_ignored(monitor: b.Monitor) -> None:
+    assert monitor._discover() == [7]
+    monitor.gh.pr["base"]["ref"] = "release/1.3"
+    monitor.inspect(7)
+    assert monitor.store.get("observation:7") == {
+        "state": "ignored",
+        "reason": "PR targets a different consumer base branch",
+    }
+    assert not monitor.gh.writes
+
+
+def test_feedback_rechecks_consumer_base_before_writing(monitor: b.Monitor) -> None:
+    inspected = copy.deepcopy(monitor.gh.pr)
+    monitor.gh.pr["base"]["ref"] = "release/1.3"
+    monitor._feedback(inspected, _issue())
+    assert monitor.store.get("observation:7")["state"] == "ignored"
+    assert not monitor.gh.writes
 
 
 def test_cold_discovery_backfills_old_merged_prs_and_honors_cutoff(
@@ -1515,11 +1941,17 @@ def test_monitor_reports_attribution_to_author_and_retries_after_correction(
     assert monitor.gh.reviews[0]["state"] == "DISMISSED"
 
 
+@pytest.mark.parametrize("no_promotion", [False, True])
+@pytest.mark.parametrize("comment_deleted", [False, True])
 def test_forbidden_dismissal_informs_author_without_approving(
     monitor: b.Monitor,
     monkeypatch: pytest.MonkeyPatch,
+    no_promotion: bool,
+    comment_deleted: bool,
 ) -> None:
     monitor._feedback(monitor.gh.pr, _issue("Missing block"))
+    if comment_deleted:
+        monitor.gh.comments.clear()
     original = monitor.gh.api
 
     def forbidden(endpoint, **kwargs):
@@ -1528,14 +1960,14 @@ def test_forbidden_dismissal_informs_author_without_approving(
         return original(endpoint, **kwargs)
 
     monkeypatch.setattr(monitor.gh, "api", forbidden)
-    monitor._feedback(monitor.gh.pr, None)
+    monitor._feedback(monitor.gh.pr, None, no_promotion=no_promotion)
     assert "lacks dismissal permission" in monitor.gh.comments[0]["body"]
     assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
     writes = len(monitor.gh.writes)
-    monitor._feedback(monitor.gh.pr, None)
+    monitor._feedback(monitor.gh.pr, None, no_promotion=no_promotion)
     assert len(monitor.gh.writes) == writes
     monkeypatch.setattr(monitor.gh, "api", original)
-    monitor._feedback(monitor.gh.pr, None)
+    monitor._feedback(monitor.gh.pr, None, no_promotion=no_promotion)
     assert "lacks dismissal permission" not in monitor.gh.comments[0]["body"]
     assert monitor.gh.reviews[0]["state"] == "DISMISSED"
 
@@ -1938,6 +2370,53 @@ def test_status_is_read_only_and_hides_stale_process_data(tmp_path: Path) -> Non
     assert state["operation"] is None and state["next_poll_at"] is None
     assert state["last_completed_poll"] == "previous"
     assert (workdir / b._STATE_FILE).read_bytes() == before
+
+
+def test_status_exposes_consumer_base_and_refresh_policy(monitor: b.Monitor) -> None:
+    monitor.args.refresh_branch = ["dev-new"]
+    b.Monitor(monitor.args, monitor.gh, monitor.store)
+    state = b._status(monitor.args.workdir)
+    assert state["base_branch"] == "main"
+    assert state["canonical_branch"] == "dev"
+    assert state["refresh_branches"] == ["dev-new"]
+    assert not state["running"]
+
+
+@pytest.mark.parametrize("policy", [{}, [123]])
+def test_status_rejects_malformed_refresh_policy(monitor: b.Monitor, policy: object) -> None:
+    monitor.store.put("refresh_branches", policy)
+    state = b._status(monitor.args.workdir)
+    assert not state["state_available"]
+    assert "Malformed refresh policy" in state["state_error"]
+
+
+def test_refresh_branch_cli_is_repeatable_and_rejects_invalid_refs(tmp_path: Path) -> None:
+    workdir = tmp_path / "unused-bot-state"
+    argv = [
+        "run",
+        "--workdir",
+        str(workdir),
+        "--vendor",
+        "toy",
+        "--upstream-repo",
+        "org/library",
+        "--canonical-repo",
+        "operator/library",
+        "--canonical-branch",
+        "dev",
+        "--fork",
+        "operator/consumer",
+        "--refresh-branch",
+        "dev-new",
+        "--refresh-branch",
+        "../invalid",
+        "--once",
+    ]
+    parsed = b._parser().parse_args(argv)
+    assert parsed.refresh_branch == ["dev-new", "../invalid"]
+    assert not parsed.publish and not parsed.daemon
+    assert b.main(argv) == 1
+    assert not workdir.exists()
 
 
 @pytest.mark.parametrize("malformed", [False, True])

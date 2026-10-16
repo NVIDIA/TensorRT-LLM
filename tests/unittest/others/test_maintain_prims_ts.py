@@ -339,6 +339,7 @@ class World(m.GitHub):
                 node_id="PR_test",
                 state="open",
                 merged=False,
+                user={"login": "maintainer"},
                 head={"sha": head},
                 base={"ref": "main"},
                 updated_at="2020-01-01T00:00:00Z",
@@ -1300,6 +1301,7 @@ def test_bot_recovers_publication_after_cache_loss(
     b._initialize_workdir(workdir)
     args = argparse.Namespace(
         migrate_canonical_branch_from=None,
+        refresh_branch=[],
         canonical_repo="maintainer/flashinfer",
         canonical_branch="trtllm-prims-ts-dev",
         fork="maintainer/TensorRT-LLM",
@@ -1491,6 +1493,7 @@ def test_recovery_rejects_changed_artifacts_without_writes(world: World, tamper:
 def test_bot_cold_recovery_dry_run_and_superseded_history(world: World) -> None:
     args = argparse.Namespace(
         migrate_canonical_branch_from=None,
+        refresh_branch=[],
         canonical_repo="maintainer/flashinfer",
         canonical_branch="trtllm-prims-ts-dev",
         fork="maintainer/TensorRT-LLM",

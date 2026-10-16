@@ -216,6 +216,13 @@ the new `--canonical-branch` plus `--migrate-canonical-branch-from OLD_BRANCH`.
 Start with `--once` without `--publish`; migration verifies the merged lock,
 blocks unresolved old promotions, and atomically archives branch-dependent cache
 results before rediscovery. Other identity changes still require another workdir.
+Each monitor handles one consumer base branch (`--base-branch`, default `main`);
+use separate workdirs for main and release monitors. Launching one never enables
+the other. Before a refresh PR, stop its monitor or restart with the explicitly
+audited `--refresh-branch NEW_BRANCH` in the configured canonical repository.
+This repeatable option excludes refresh PRs from promotion; it does not authorize
+publication to a new branch. After merge, the explicit migration is still required.
+Migration checks ignore promotion records for other consumer repositories/bases.
 After cache loss, use the new configuration without the migration flag.
 For monitoring, use INFO poll summaries/30-second active-operation heartbeats
 and `bot.py status --workdir ...`. Check the last poll outcome and next deadline;
