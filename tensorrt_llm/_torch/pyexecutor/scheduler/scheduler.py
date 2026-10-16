@@ -684,6 +684,8 @@ class MultimodalScheduler(RequestScheduler):
         bytes_per_encoder_embedding: int,
         retain_cache_entries: bool,
         context_chunk_unit_size: int | None = None,
+        prepare_context: Callable[[RequestList], None] | None = None,
+        release_unused_contexts: Callable[[RequestList], None] | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.max_batch_size = max_batch_size
@@ -694,6 +696,8 @@ class MultimodalScheduler(RequestScheduler):
         self.retain_cache_entries = retain_cache_entries
         # `None` when context chunking is disabled.
         self.context_chunk_unit_size = context_chunk_unit_size
+        self.prepare_context = prepare_context
+        self.release_unused_contexts = release_unused_contexts
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
             scheduler, "micro_batch_scheduler"
         )
@@ -962,6 +966,7 @@ class MultimodalScheduler(RequestScheduler):
         unit_size = self.context_chunk_unit_size
         if (
             request.is_first_context_chunk
+            and self.prepare_context is None
             and unit_size is not None
             and end + unit_size > request.prompt_len
         ):
@@ -991,7 +996,7 @@ class MultimodalScheduler(RequestScheduler):
             self._get_item_prompt_start(request, item_idx, begin),
             begin + request.context_chunk_size,
         )
-        if request.is_first_context_chunk:
+        if request.is_first_context_chunk and self.prepare_context is None:
             # See `_get_context_chunk_end`: keep a first chunk that KV cache V1
             # may still shift right from becoming the last chunk.
             limit = min(limit, request.prompt_len - unit_size)
@@ -1292,6 +1297,58 @@ class MultimodalScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.scheduler.capacity_scheduler.schedule_request(active_requests)
         )
+        if self.prepare_context is not None:
+            if self.context_chunk_unit_size is None:
+                held_bytes, held_keys = self._cache_claims(active_requests)
+                fitting_requests = self._holders_first(fitting_requests, held_bytes, held_keys)
+            encoder_requests, context_requests, generation_requests = (
+                self.scheduler.micro_batch_scheduler.schedule(
+                    fitting_requests, inflight_request_ids
+                )
+            )
+            if paused_requests:
+                # The executor frees paused V1 sequences after scheduling.
+                # Their pages are not available for new first-chunk claims yet.
+                context_requests = [
+                    request
+                    for request in context_requests
+                    if request.py_mm_encoder_state is None or not request.is_first_context_chunk
+                ]
+            # Claim the actual prefix before deciding which encoder outputs
+            # the chunk consumes, including any speculative recompute tail.
+            self.prepare_context(context_requests)
+            if self._selects_whole_requests(context_requests):
+                self._select_items(context_requests, step)
+                context_requests = [
+                    request
+                    for request in context_requests
+                    if self._is_ready_after_encoder_step(request, step)
+                ]
+                if self.prepares_future_items:
+                    self._select_future_items(
+                        active_requests,
+                        {request.request_id for request in paused_requests},
+                        step,
+                    )
+            else:
+                context_requests = self._select_items_for_context_chunks(
+                    context_requests,
+                    active_requests,
+                    {request.request_id for request in paused_requests},
+                    step,
+                )
+            assert self.release_unused_contexts is not None
+            self.release_unused_contexts(context_requests)
+            self.encoder_cache.ensure_capacity(step.output_bytes)
+            return SchedulerOutput(
+                encoder_requests=encoder_requests,
+                context_requests=context_requests,
+                generation_requests=generation_requests,
+                paused_requests=list(paused_requests),
+                fitting_disagg_gen_init_requests=list(fitting_disagg_gen_init_requests),
+                num_fitting_requests=len(fitting_requests),
+                scheduled_mm_encoder_items=step.selected or None,
+            )
         if self._selects_whole_requests(fitting_requests):
             self._select_items(fitting_requests, step)
             # Preserve the capacity scheduler's decisions while attaching the
@@ -1352,7 +1409,7 @@ class MultimodalEagerEncoderScheduler(MultimodalScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
-        if self.context_chunk_unit_size is not None:
+        if self.context_chunk_unit_size is not None or self.prepare_context is not None:
             return super().schedule_request(active_requests, inflight_request_ids)
 
         step = self._new_encoder_step()

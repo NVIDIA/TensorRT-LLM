@@ -3859,10 +3859,9 @@ class PyExecutor:
         revert that growth so it does not accumulate across skipped
         iterations and overflow the host page-index buffer.
 
-        Only applies to KV cache manager V2 + scheduler V2, because the V2
-        scheduler allocates KV cache capacity during scheduling, before the
-        can_queue check.  V1 allocates in prepare_resources() after the
-        can_queue check, so no revert is needed.
+        V1 multimodal contexts also claim their prefix during scheduling so
+        encoder selection sees the actual reuse. Release those unused claims
+        before retrying; V1 generation growth still happens after the vote.
         """
         if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
@@ -3873,6 +3872,8 @@ class PyExecutor:
                 self.kv_cache_manager.revert_allocate_generation(req)
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
+        elif getattr(self, "_mm_encoder_item_scheduling_enabled", False):
+            self.resource_manager.release_unused_mm_contexts([])
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""
@@ -4655,8 +4656,8 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     self._release_unused_connector_reservations()
+                    self._revert_gen_alloc(scheduled_batch)
                     if self._is_kv_manager_v2:
-                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -4671,6 +4672,10 @@ class PyExecutor:
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
+
+                if self._mm_encoder_item_scheduling_enabled:
+                    self.resource_manager.release_unused_mm_contexts(
+                        scheduled_batch.context_requests)
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
@@ -4702,9 +4707,6 @@ class PyExecutor:
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    if self._mm_encoder_item_scheduling_enabled:
-                        self._fail_mm_contexts_with_unready_outputs(
-                            scheduled_batch)
 
                 if self._kv_connector_moves_kv:
                     self.kv_connector_manager.handle_metadata()
@@ -5531,8 +5533,8 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     self._release_unused_connector_reservations()
+                    self._revert_gen_alloc(scheduled_batch)
                     if self._is_kv_manager_v2:
-                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -5543,6 +5545,10 @@ class PyExecutor:
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
+
+                if self._mm_encoder_item_scheduling_enabled:
+                    self.resource_manager.release_unused_mm_contexts(
+                        scheduled_batch.context_requests)
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
@@ -5591,9 +5597,6 @@ class PyExecutor:
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    if self._mm_encoder_item_scheduling_enabled:
-                        self._fail_mm_contexts_with_unready_outputs(
-                            scheduled_batch)
 
                 if self._kv_connector_moves_kv:
                     self.kv_connector_manager.handle_metadata()
@@ -7060,37 +7063,6 @@ class PyExecutor:
         ])
         scheduled_requests.scheduled_mm_encoder_items = None
 
-        self._handle_errors(error_msg,
-                            requests=failed_requests,
-                            charge_budget=False)
-
-    def _fail_mm_contexts_with_unready_outputs(
-            self, scheduled_requests: ScheduledRequests) -> None:
-        """Fail item-scheduled contexts whose final chunk uses an unready output.
-
-        The scheduler selects items for the chunk it expects to run, starting
-        after the estimated reusable KV prefix. KV cache V1 applies the actual
-        reuse while preparing resources; if less of the prefix is reused, the
-        chunk can start at an item that was never encoded. Fail only those
-        requests instead of the whole forward step.
-        """
-        failed_requests = [
-            request for request in scheduled_requests.context_requests
-            if not is_mm_context_chunk_ready(request,
-                                             request.context_current_position)
-        ]
-        if not failed_requests:
-            return
-        failed_request_ids = {request.request_id for request in failed_requests}
-        scheduled_requests.reset_context_requests([
-            request for request in scheduled_requests.context_requests
-            if request.request_id not in failed_request_ids
-        ])
-        error_msg = (
-            "Multimodal prefill chunk needs encoder outputs that were not "
-            "prepared because less of the KV cache prefix was reused than "
-            "scheduling estimated")
-        logger.error(f"{error_msg}: request_ids={sorted(failed_request_ids)}")
         self._handle_errors(error_msg,
                             requests=failed_requests,
                             charge_budget=False)

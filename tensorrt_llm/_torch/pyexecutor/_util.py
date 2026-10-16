@@ -4268,6 +4268,12 @@ def create_py_executor_instance(
             retain_cache_entries=model_engine.model.encoder_cache_active,
             context_chunk_unit_size=(ctx_chunk_config[1]
                                      if ctx_chunk_config is not None else None),
+            prepare_context=(resource_manager.prepare_mm_context_resources if
+                             not isinstance(kv_cache_manager, KVCacheManagerV2)
+                             else None),
+            release_unused_contexts=(
+                resource_manager.release_unused_mm_contexts if
+                not isinstance(kv_cache_manager, KVCacheManagerV2) else None),
         )
 
     config = model_engine.model.model_config.pretrained_config
