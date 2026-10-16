@@ -280,23 +280,21 @@ class LocalityDomainExecutionPlanner:
                 reason_if_disabled=f"locality domain MoE requires CuteDSL backend, got {moe_backend}",
             )
 
-        is_nvfp4 = (
-            quant_config is not None
-            and hasattr(quant_config, "quant_mode")
-            and quant_config.quant_mode.has_nvfp4()
+        # Select the kernel family from the final effective weight
+        # quantization, mirroring plan_linear. KV-cache-only quantization does
+        # not quantize MoE weights and is therefore eligible for the BF16 path.
+        layer_quant_mode = getattr(quant_config, "layer_quant_mode", None)
+        is_nvfp4 = layer_quant_mode is not None and layer_quant_mode.has_nvfp4()
+        has_weight_quant = layer_quant_mode is not None and layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True
         )
-        has_any_quant = (
-            quant_config is not None
-            and hasattr(quant_config, "quant_mode")
-            and quant_config.quant_mode.has_any_quant()
-        )
-        is_bf16 = not has_any_quant and dtype_activation == torch.bfloat16
+        is_bf16 = not has_weight_quant and dtype_activation == torch.bfloat16
 
         if is_nvfp4:
             op_name = "nvfp4_moe"
         elif is_bf16:
             op_name = "bf16_moe"
-        elif not has_any_quant:
+        elif not has_weight_quant:
             return PartitionPlan(
                 enabled=False,
                 reason_if_disabled=f"BF16 locality domain MoE requires bfloat16 activation, got {dtype_activation}",
