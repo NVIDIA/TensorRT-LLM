@@ -845,7 +845,8 @@ needs_dflash_trtllm_gen = pytest.mark.skipif(
 )
 
 GQA_PAGE = 32
-GQA_CTX_LENS = (40, 20)
+# Enough requests for a batch just above the decode-rows ceiling (32).
+GQA_CTX_LENS = (40, 20) * 17
 
 
 def _run_paged_block_decode(drafter, requests):
@@ -892,17 +893,23 @@ def _run_paged_block_decode(drafter, requests):
 @needs_dflash_trtllm_gen
 @pytest.mark.parametrize(
     "batch_size,rows_max_batch_size,kernel",
-    [(1, None, "decode_rows"), (2, None, "decode_rows"), (2, 1, "context")],
-    ids=["decode_rows_b1", "decode_rows_b2", "context"],
+    [
+        (1, None, "decode_rows"),
+        (2, None, "decode_rows"),
+        (32, None, "decode_rows"),
+        (33, None, "context"),
+        (2, 1, "context"),
+    ],
+    ids=["decode_rows_b1", "decode_rows_b2", "decode_rows_b32", "context_b33", "context_b2"],
 )
 def test_plain_dflash_trtllm_block_decode_matches_full_attention_reference(
     batch_size, rows_max_batch_size, kernel, monkeypatch
 ):
     """Both TRTLLM forms of the non-causal, unwindowed block attention match
     the eager reference: single-query decode rows up to the batch ceiling, one
-    context-FMHA call above it (forced here by lowering the ceiling). Counting
-    the kernel calls keeps a silent fallback from passing the parity check for
-    the wrong form."""
+    context-FMHA call above it (at batch 33, and at batch 2 with the ceiling
+    lowered to 1). Counting the kernel calls keeps a silent fallback from
+    passing the parity check for the wrong form."""
     from dataclasses import replace
 
     from tensorrt_llm._torch.models import modeling_dflash
