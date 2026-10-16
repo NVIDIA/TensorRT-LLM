@@ -73,6 +73,7 @@ def _kda_kernel(
     SD: cutlass.Constexpr,
     XB: cutlass.Constexpr,
     XT: cutlass.Constexpr,
+    CDT: cutlass.Constexpr,
     CSS: cutlass.Constexpr,
     CSC: cutlass.Constexpr,
     SSS: cutlass.Constexpr,
@@ -252,7 +253,7 @@ def _kda_kernel(
     # loads + 3 wide stores replace 3*T narrow loads + 3*T narrow stores, and
     # the wide loads land on lines the scalar conv loads above already pulled.
     gX8 = cute.make_tensor(pX + b * XB, cute.make_layout((T, C // 8, 8), stride=(XT, 8, 1)))
-    gCd8 = cute.make_tensor(pCd + b * (T * C), cute.make_layout((T, C // 8, 8), stride=(C, 8, 1)))
+    gCd8 = cute.make_tensor(pCd + b * (CDT * C), cute.make_layout((T, C // 8, 8), stride=(C, 8, 1)))
     cbuf = cute.make_rmem_tensor((8,), bf16)
     NGRP = 3 * T * (KD // 8)
     for itv in cutlass.range_constexpr((NGRP + 127) // 128):
@@ -590,6 +591,7 @@ def _launch(
     SD: cutlass.Constexpr,
     XB: cutlass.Constexpr,
     XT: cutlass.Constexpr,
+    CDT: cutlass.Constexpr,
     CSS: cutlass.Constexpr,
     CSC: cutlass.Constexpr,
     SSS: cutlass.Constexpr,
@@ -628,6 +630,7 @@ def _launch(
         SD,
         XB,
         XT,
+        CDT,
         CSS,
         CSC,
         SSS,
@@ -659,6 +662,7 @@ def kda_mtp_replay(
     dt_bias: torch.Tensor,
     output: torch.Tensor,
     candidate_x: torch.Tensor,
+    history_window: int | None = None,
 ) -> None:
     """Fuse Conv4 with one KDA MTP replay step.
 
@@ -669,7 +673,7 @@ def kda_mtp_replay(
     B = raw_x.shape[0]
     T = raw_x.shape[1]
     S, H, CAP, _ = history_k.shape
-    W = CAP - T
+    W = CAP - T if history_window is None else history_window
 
     if B == 0:
         return
@@ -678,6 +682,10 @@ def kda_mtp_replay(
         raise ValueError("KDA MTP replay requires 1 <= tokens_per_step <= 8")
     if W not in (16, 32):
         raise ValueError("KDA MTP replay requires a history window of 16 or 32")
+    if CAP < W + T:
+        raise ValueError(
+            "KDA MTP replay history capacity is smaller than window plus runtime width"
+        )
     if raw_x.shape != (B, T, C) or raw_x.dtype != torch.bfloat16:
         raise ValueError("raw_x must be BF16 with shape [batch, tokens, 3 * heads * 128]")
     if raw_x.stride(2) != 1:
@@ -729,8 +737,11 @@ def kda_mtp_replay(
         raise ValueError("output must be BF16 with shape [batch, tokens, heads, 128]")
     if not output.is_contiguous():
         raise ValueError("output must be contiguous")
-    if candidate_x.ndim != 3 or candidate_x.shape[1:] != (T, C):
-        raise ValueError("candidate_x must have shape [capacity, tokens, channels]")
+    if candidate_x.ndim != 3 or candidate_x.shape[1] < T or candidate_x.shape[2] != C:
+        raise ValueError(
+            "candidate_x must have shape [capacity, token_capacity, channels] "
+            "with token_capacity >= tokens_per_step"
+        )
     if candidate_x.shape[0] < B or candidate_x.dtype != torch.bfloat16:
         raise ValueError("candidate_x must be a sufficiently large BF16 capacity buffer")
     if not candidate_x.is_contiguous():
@@ -767,12 +778,30 @@ def kda_mtp_replay(
     sss = checkpoint.stride(0)
 
     xb, xt, _ = raw_x.stride()
+    candidate_token_capacity = candidate_x.shape[1]
     css, csc, _ = conv_state.stride()
     btb, btt, _ = raw_beta.stride()
 
     i64 = ((S - 1) * sss + H * KD * KD) >= 2**31
     device_index = output.device.index
-    key = (device_index, T, H, W, CAP, S, sd, xb, xt, css, csc, sss, btb, btt, i64)
+    key = (
+        device_index,
+        T,
+        H,
+        W,
+        CAP,
+        S,
+        sd,
+        xb,
+        xt,
+        candidate_token_capacity,
+        css,
+        csc,
+        sss,
+        btb,
+        btt,
+        i64,
+    )
     fn = _CACHE.get(key)
 
     f32 = cutlass.Float32
@@ -814,6 +843,7 @@ def kda_mtp_replay(
             sd,
             xb,
             xt,
+            candidate_token_capacity,
             css,
             csc,
             sss,

@@ -4421,6 +4421,7 @@ def _kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec):
             history_len=mgr.prev_num_accepted_tokens,
             output=output,
             candidate_x=mgr.intermediate_conv_states[layer_offset],
+            history_window=mgr.replay_history_size,
         )
         outputs.append(output)
     return torch.stack(outputs)
