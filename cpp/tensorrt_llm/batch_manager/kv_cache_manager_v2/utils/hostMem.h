@@ -38,17 +38,18 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // never moves. Physical memory is committed chunk by chunk on a worker thread,
 // and waitUsable() blocks until a given offset is backed.
 //
-// Which physical backing is used depends on the platform; see IHostMemBacking.
-// Neither backing calls cuMemHostRegister.
+// Address space that has not been committed yet is unreachable, so a reader
+// that runs ahead of the watermark faults rather than reading undefined bytes.
 // ---------------------------------------------------------------------------
 class HostMem
 {
 public:
-    //! Required alignment of every size passed to HostMem, and of the base
-    //! address it returns. Set by the coarsest backing: cuMemCreate rejects a
-    //! host allocation whose size is not a multiple of its granularity, which is
-    //! 2 MiB. Only the single-size constructor rounds up on the caller's behalf;
-    //! elsewhere a size that is not a multiple of this is a bug and is rejected.
+    //! Required alignment of every size passed to HostMem. Only the single-size
+    //! constructor rounds up on the caller's behalf; elsewhere a size that is
+    //! not a multiple of this is a bug and is rejected.
+    //!
+    //! The base is only page-aligned: registration takes any address, and the
+    //! mprotect and madvise calls round to pages themselves.
     static constexpr size_t kAlignment = kHostMemAlignment;
 
     //! Bytes committed per watermark advance. Large enough that the commit cost
@@ -56,7 +57,7 @@ public:
     //! range is released early.
     //!
     //! Unrelated to the unit memory is allocated and released in: this only sets
-    //! how often the fill publishes progress. See IHostMemBacking.
+    //! how often the fill publishes progress. See HostMemBacking.
     static constexpr size_t kFillChunkSize = 512ULL << 20; // 512 MB
 
     //! Reserves `vmSize` of address space and commits `initialSize` of it.
@@ -76,9 +77,8 @@ public:
     //! that hands out raw pointers without any further bookkeeping needs.
     //!
     //! Pass false only when every reader of this range calls waitUsable() with
-    //! the offset it is about to touch. On the VMM backing, address space that
-    //! has not been committed yet is unmapped, so reaching past the watermark
-    //! faults rather than merely reading undefined bytes.
+    //! the offset it is about to touch. Reaching past the watermark faults, so
+    //! a reader that skips it fails loudly rather than reading zeros.
     HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options = {}, bool waitForFill = true);
 
     //! Reserves exactly as much as it commits, for an allocation that never
@@ -141,7 +141,7 @@ private:
     void joinFill() noexcept;
     [[nodiscard]] size_t chunkCount() const noexcept;
 
-    std::unique_ptr<IHostMemBacking> mBacking;
+    HostMemBacking mBacking;
     MemAddress mAddr = 0;
     size_t mSize = 0;
     size_t mVmSize = 0;
@@ -170,11 +170,9 @@ private:
 // ---------------------------------------------------------------------------
 // Low-level wrappers used internally (also exposed for storage pool use).
 // ---------------------------------------------------------------------------
-//! Maps `size` bytes of address space, based at a multiple of `alignment`.
-//! `alignment` must be a power of two. Anything up to the page size adds
-//! nothing, mmap already aligning that far; coarser than that is carved out of
-//! a larger mapping, so it costs address space. Throws HostOOMError.
-MemAddress hostMmap(size_t size, size_t alignment = 1);
+//! Maps `size` bytes of address space, page-aligned, which is all mmap
+//! promises and all any caller needs. Throws HostOOMError.
+MemAddress hostMmap(size_t size);
 void hostMunmap(MemAddress ptr, size_t size) noexcept;
 void resizeFile(int fd, size_t newSize); // throws DiskOOMError
 

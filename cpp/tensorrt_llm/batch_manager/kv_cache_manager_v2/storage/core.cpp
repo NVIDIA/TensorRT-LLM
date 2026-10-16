@@ -371,13 +371,25 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
+//! The unit this pool's memory is registered and released in.
+//!
+//! A whole number of slots, because a slot must not straddle two units: each
+//! unit is a separate registration, the driver rejects a copy that crosses one,
+//! and every copy here is a whole slot. Nothing requires it to be a whole number
+//! of pages -- the backing rounds its madvise and mprotect calls instead.
+size_t hostCommitUnit(size_t tierUnit, size_t slotSize)
+{
+    return roundUp(std::max(tierUnit, slotSize), slotSize);
+}
+
 HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options)
     : SlotPoolBase(slotSize)
-    , mCommitUnit(options.commitUnit)
+    , mCommitUnit(hostCommitUnit(options.commitUnit, slotSize))
     // The pool does not wait for the fill: HostPoolGroup blocks per allocation
     // on only the range it hands out, so serving can start before the whole
     // tier is committed.
-    , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots), options, /*waitForFill=*/false)
+    , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
+          HostMemBackingOptions{mCommitUnit, options.allowRemoteNumaFallback}, /*waitForFill=*/false)
 {
 }
 

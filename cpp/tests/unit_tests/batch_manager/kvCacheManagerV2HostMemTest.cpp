@@ -184,11 +184,24 @@ TEST(KvCacheManagerV2HostMemTest, AllocationSupportsGpuRoundTrip)
 
     void* devicePtr = nullptr;
     ASSERT_EQ(cudaMalloc(&devicePtr, kSize), cudaSuccess);
-    ASSERT_EQ(
-        cudaMemcpy(devicePtr, reinterpret_cast<void*>(memory.address()), kSize, cudaMemcpyHostToDevice), cudaSuccess);
+    // A copy at a time, because the backing registers the range unit by unit and
+    // the driver rejects one that straddles two registrations.
+    size_t const unit = HostMem::kAlignment;
+    for (size_t offset = 0; offset < kSize; offset += unit)
+    {
+        ASSERT_EQ(cudaMemcpy(static_cast<unsigned char*>(devicePtr) + offset,
+                      reinterpret_cast<void*>(memory.address() + offset), unit, cudaMemcpyHostToDevice),
+            cudaSuccess)
+            << "offset " << offset;
+    }
     std::memset(reinterpret_cast<void*>(memory.address()), 0, kSize);
-    ASSERT_EQ(
-        cudaMemcpy(reinterpret_cast<void*>(memory.address()), devicePtr, kSize, cudaMemcpyDeviceToHost), cudaSuccess);
+    for (size_t offset = 0; offset < kSize; offset += unit)
+    {
+        ASSERT_EQ(cudaMemcpy(reinterpret_cast<void*>(memory.address() + offset),
+                      static_cast<unsigned char const*>(devicePtr) + offset, unit, cudaMemcpyDeviceToHost),
+            cudaSuccess)
+            << "offset " << offset;
+    }
 
     auto const* bytes = reinterpret_cast<unsigned char const*>(memory.address());
     EXPECT_TRUE(std::all_of(bytes, bytes + kSize, [](unsigned char value) { return value == 0x5A; }));
@@ -218,7 +231,6 @@ TEST(KvCacheManagerV2HostMemTest, SingleSizeConstructorRoundsUpToAlignment)
         HostMem memory(requested);
         size_t const expected = (requested + HostMem::kAlignment - 1) / HostMem::kAlignment * HostMem::kAlignment;
         EXPECT_EQ(memory.size(), expected);
-        EXPECT_EQ(memory.address() % HostMem::kAlignment, 0);
         std::memset(reinterpret_cast<void*>(memory.address()), 0xA5, memory.size());
     }
 }
@@ -422,25 +434,6 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
             *reinterpret_cast<unsigned char const*>(memory.address() + kSize - 1 - i), static_cast<unsigned char>(i))
             << "byte written by waiter " << i << " did not survive";
     }
-}
-
-//! mmap places a mapping wherever it likes, subject only to page alignment, so
-//! a stricter base has to be carved out of a larger one. The alignment asked
-//! for here is far coarser than anything the kernel would return by chance,
-//! which is what keeps this from passing on luck.
-TEST(KvCacheManagerV2HostMemTest, MmapHonoursRequestedAlignment)
-{
-    constexpr size_t kAlignment = size_t{1} << 30;
-    constexpr size_t kSize = size_t{4} << 20;
-
-    MemAddress const addr = hostMmap(kSize, kAlignment);
-    ASSERT_NE(addr, 0U);
-    EXPECT_EQ(addr % kAlignment, 0U) << "base " << reinterpret_cast<void*>(addr) << " is not aligned";
-
-    // The slack must be gone, not merely skipped: writing the whole span and
-    // unmapping exactly it would fail if either end were still mapped short.
-    std::memset(reinterpret_cast<void*>(addr), 0xA5, kSize);
-    hostMunmap(addr, kSize);
 }
 
 } // namespace

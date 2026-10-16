@@ -80,10 +80,8 @@ public:
     //! mbind in isolation: placement holds through first touch when mbind is
     //! unavailable, and through the range policy when it is.
     //!
-    //! Returns nullopt only where the question does not apply -- no libnuma, a
-    //! single NUMA node, or a platform whose selected backing is not mmap. The
-    //! VMM backing names its node to the driver, so there is no range policy to
-    //! inspect there.
+    //! Returns nullopt only where the question does not apply -- no libnuma, or
+    //! a single NUMA node.
     //!
     //! Uses the current device, so the caller selects which GPU the placement is
     //! relative to. A CUDA context must already exist on it: the backing

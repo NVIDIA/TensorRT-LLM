@@ -21,137 +21,121 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+//! Smallest unit the backing allocates in, and the alignment every size it is
+//! given must satisfy.
+inline constexpr size_t kHostMemAlignment = 2ULL << 20;
+
+struct HostMemBackingOptions
+{
+    //! Unit memory is registered and released in. Also the alignment every
+    //! commit and decommit bound must satisfy, and therefore how finely a resize
+    //! can give memory back.
+    //!
+    //! Each unit is a separate registration, so it must divide whatever ranges
+    //! are copied in one call: the driver rejects a copy that straddles two
+    //! registrations. It need not be a multiple of the page size -- registration
+    //! accepts any alignment, and the madvise and mprotect calls round to pages
+    //! themselves, outwards when they must cover the range and inwards when they
+    //! must not reach past it.
+    size_t commitUnit = kHostMemAlignment;
+
+    //! Whether a page may come from a NUMA node other than the one the GPU
+    //! attaches to, when the local node cannot satisfy it.
+    //!
+    //! Applied as MPOL_PREFERRED when true and MPOL_BIND when false. False caps
+    //! the tier at one node's memory, so a tier sized from total system memory
+    //! cannot be filled. It also requires that a memory policy be settable: a
+    //! container without CAP_SYS_NICE cannot apply MPOL_BIND, and construction
+    //! fails rather than silently running with first-touch placement, which
+    //! would take a remote page instead of refusing.
+    bool allowRemoteNumaFallback = true;
+};
+
 //! Physical backing for the host tier: reserve an address range once, then
-//! commit it in chunks.
+//! commit it a unit at a time.
 //!
 //! The base address returned by reserve() is fixed for the lifetime of the
 //! object. Growing and shrinking touch only the delta, so a resize costs
 //! O(delta) rather than O(total) and never invalidates a pointer the allocator
 //! above has handed out.
 //!
-//! Two implementations exist because the fastest route to host memory differs
-//! by platform:
+//! Pages are populated through the kernel's fault path (MADV_POPULATE_WRITE)
+//! and then handed to the driver with cuMemHostRegister. Allocating and zeroing
+//! in the kernel rather than inside cuMemCreate is what lets several processes
+//! fill at once: the driver serializes that work on a per-process lock, which on
+//! an 8-GPU node collapsed per-process fill throughput by roughly 5x and blocked
+//! unrelated CUDA calls on the same process for seconds at a time.
 //!
-//!   kMmap  Plain anonymous mmap with no cuMemHostRegister. Requires ATS, where
-//!          the GPU shares the CPU's page tables and reaches host memory at full
-//!          C2C bandwidth without the driver pinning anything.
-//!   kVmm   cuMemCreate(HOST_NUMA) mapped into a cuMemAddressReserve range.
-//!          Used where ATS is unavailable: the memory is driver-allocated and
-//!          device-mapped, so copies stay asynchronous without registration.
-//!
-//! Neither implementation calls cuMemHostRegister, which is why neither is
-//! subject to the 2 GiB-per-call pinning limit on Linux 6.11.
-class IHostMemBacking
+//! Registration happens in units rather than over the whole range so that a
+//! shrink can unregister exactly what it releases; a registration can only be
+//! dropped whole. Each unit stays far below the 2 GiB-per-call pinning limit on
+//! Linux 6.11.
+class HostMemBacking
 {
 public:
-    virtual ~IHostMemBacking() = default;
+    explicit HostMemBacking(HostMemBackingOptions const& options);
+    ~HostMemBacking();
 
-    IHostMemBacking(IHostMemBacking const&) = delete;
-    IHostMemBacking& operator=(IHostMemBacking const&) = delete;
-    IHostMemBacking(IHostMemBacking&&) = delete;
-    IHostMemBacking& operator=(IHostMemBacking&&) = delete;
+    HostMemBacking(HostMemBacking const&) = delete;
+    HostMemBacking& operator=(HostMemBacking const&) = delete;
+    HostMemBacking(HostMemBacking&&) = delete;
+    HostMemBacking& operator=(HostMemBacking&&) = delete;
 
-    //! Reserves `size` bytes of address space. No physical memory is committed
-    //! and no page is resident. Must be called exactly once, before any commit.
+    //! Reserves `size` bytes of address space, page-aligned as mmap returns it
+    //! and no coarser. No page is resident and none is reachable: the whole
+    //! range is PROT_NONE until commit() opens it, so a read that runs ahead of
+    //! the fill faults instead of returning zeros.
     //!
-    //! The address returned is a multiple of commitGranularity(), so an offset
-    //! that is a multiple of it names an address that is too.
-    [[nodiscard]] virtual MemAddress reserve(size_t size) = 0;
+    //! Must be called exactly once, before any commit.
+    [[nodiscard]] MemAddress reserve(size_t size);
 
     //! Makes [offset, offset + size) resident and reachable by both the CPU and
-    //! the GPU. `offset` and `size` must be multiples of commitGranularity().
-    //! Committing a range twice is not allowed.
-    //!
-    //! A backing that allocates physical memory splits the request into
-    //! commitGranularity()-sized allocations, so callers are free to commit in
-    //! whatever span suits them without coupling that span to the unit a later
-    //! decommit can release.
+    //! the GPU. Both bounds must be multiples of commitGranularity().
     //!
     //! Throws HostOOMError when the system cannot back the range; that is the
     //! expected failure and callers are required to handle it.
-    virtual void commit(size_t offset, size_t size) = 0;
+    void commit(size_t offset, size_t size);
 
-    //! Releases the physical backing of [offset, offset + size). The address
-    //! range stays reserved and may be committed again later.
-    //!
-    //! Both bounds must be multiples of commitGranularity(), which is what lets
-    //! this be exact: the backing allocates in units of that size, so a release
-    //! never has to split one.
-    virtual void decommit(size_t offset, size_t size) noexcept = 0;
+    //! Releases the physical backing of [offset, offset + size), which stays
+    //! reserved and may be committed again. Both bounds must be multiples of
+    //! commitGranularity().
+    void decommit(size_t offset, size_t size) noexcept;
 
     //! Releases everything, including the reservation. Idempotent.
-    virtual void destroy() noexcept = 0;
+    void destroy() noexcept;
 
-    //! The unit this backing allocates and releases in. Commit and decommit
-    //! offsets and sizes must be multiples of it.
-    //!
-    //! This is deliberately independent of how much the filler commits per
-    //! call: it sets how finely a later resize can give memory back.
-    [[nodiscard]] virtual size_t commitGranularity() const noexcept = 0;
+    //! The unit memory is populated, registered and released in.
+    [[nodiscard]] size_t commitGranularity() const noexcept
+    {
+        return mUnit;
+    }
 
-    //! Stable identifier for logging and for tests that assert which backing ran.
-    [[nodiscard]] virtual char const* name() const noexcept = 0;
+private:
+    void unregisterRange(size_t offset, size_t size) noexcept;
 
-protected:
-    IHostMemBacking() = default;
+    size_t mUnit = 0;
+    bool mAllowRemoteNumaFallback = true;
+    MemAddress mAddr = 0;
+    size_t mSize = 0;
+
+    //! Bytes actually mapped: mSize rounded up to a page, since a unit is a
+    //! whole number of slots and need not end on one.
+    size_t mMapped = 0;
+
+    //! Offsets of the units currently registered. A unit is registered exactly
+    //! when it is committed, so this is also what destroy() must undo.
+    std::map<size_t, size_t> mRegistered;
+
+    //! Captured in reserve(), which runs on the thread that owns the context.
+    //! cuMemHostRegister needs a current context and the fill worker only sets
+    //! the device, which leaves it without one.
+    void* mContext = nullptr;
 };
-
-enum class HostMemBackingKind : std::uint8_t
-{
-    kMmap,
-    kVmm,
-};
-
-//! Smallest unit any host backing allocates in: cuMemCreate rejects a host
-//! allocation whose size is not a multiple of this.
-inline constexpr size_t kHostMemAlignment = 2ULL << 20;
-
-struct HostMemBackingOptions
-{
-    //! Unit the backing allocates and releases in; see commitGranularity().
-    size_t commitUnit = kHostMemAlignment;
-
-    //! Whether a page may come from a NUMA node other than the one the GPU
-    //! attaches to, when the local node cannot satisfy it.
-    //!
-    //! Both backings honour this, by different means. The mmap backing sets
-    //! MPOL_PREFERRED or MPOL_BIND on the range; the VMM backing names the node
-    //! to the driver and, when a remote page is acceptable, retries an
-    //! exhausted allocation without naming one.
-    //!
-    //! False caps the tier at one node's memory, so a tier sized from total
-    //! system memory cannot be filled. It also requires that a memory policy be
-    //! settable: on the mmap backing, a container without CAP_SYS_NICE cannot
-    //! apply MPOL_BIND, and construction fails rather than silently running with
-    //! first-touch placement, which would take a remote page instead of
-    //! refusing.
-    bool allowRemoteNumaFallback = true;
-};
-
-//! Picks kMmap only when the GPU reaches pageable host memory through the CPU's
-//! page tables (ATS) *and* the link is coherent.
-//!
-//! Both conditions are required, not just ATS. Together they identify the
-//! platform class where mmap was measured to win: a coherent link is what makes
-//! BatchedPageCopier take its SM-kernel path, which reads host memory directly.
-//! Where the copy engine runs instead, VMM is the faster source.
-//!
-//! A caller that needs a specific backing names it to createHostMemBacking()
-//! rather than going through this.
-[[nodiscard]] HostMemBackingKind selectHostMemBackingKind();
-
-//! `options.commitUnit` becomes the backing's commitGranularity(), rounded up
-//! to whatever the platform requires. Larger units make the fill cheaper and a
-//! resize coarser.
-[[nodiscard]] std::unique_ptr<IHostMemBacking> createHostMemBacking(
-    HostMemBackingKind kind, HostMemBackingOptions const& options);
-
-//! Convenience overload using selectHostMemBackingKind().
-[[nodiscard]] std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingOptions const& options);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

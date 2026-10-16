@@ -34,18 +34,16 @@ namespace
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 
-//! Both backings must satisfy the same contract, so every case here runs
-//! against each of them regardless of which one this platform would select.
-class HostMemBackingTest : public ::testing::TestWithParam<HostMemBackingKind>
+class HostMemBackingTest : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-        // Forces primary context creation; the VMM backing queries the current
-        // device in its constructor.
+        // Forces primary context creation; reserve() captures the current
+        // context and refuses to run without one.
         ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
-        mBacking = createHostMemBacking(GetParam(), HostMemBackingOptions{kCommitUnit});
+        mBacking = std::make_unique<HostMemBacking>(HostMemBackingOptions{kCommitUnit});
         // Deliberately larger than the allocation unit, so the span a case
         // commits in differs from the unit the backing allocates in.
         mChunkSize = mBacking->commitGranularity() * kUnitsPerChunk;
@@ -56,7 +54,7 @@ protected:
     static constexpr size_t kUnitsPerChunk = 4;
     static constexpr size_t kNumChunks = 4;
 
-    std::unique_ptr<IHostMemBacking> mBacking;
+    std::unique_ptr<HostMemBacking> mBacking;
     size_t mChunkSize = 0;
     size_t mTotalSize = 0;
 };
@@ -85,7 +83,7 @@ bool verify(MemAddress base, size_t offset, size_t size, uint8_t salt)
     return true;
 }
 
-TEST_P(HostMemBackingTest, GranularityIsUsable)
+TEST_F(HostMemBackingTest, GranularityIsUsable)
 {
     size_t const granularity = mBacking->commitGranularity();
     EXPECT_GT(granularity, 0U);
@@ -94,23 +92,10 @@ TEST_P(HostMemBackingTest, GranularityIsUsable)
 
 //! Whether the backing still holds the memory at `addr`.
 //!
-//! The probe has to match the backing. munmap really removes the VMA, so
-//! /proc/self/maps answers for mmap; the VMM backing carves its range out of a
-//! driver reservation that stays listed there either way, so the driver has to be
-//! asked instead -- cuMemRetainAllocationHandle succeeds only while the address is
-//! mapped to an allocation, which is exactly what destroy() undoes.
-bool backingHoldsMemory(HostMemBackingKind kind, MemAddress addr)
+//! destroy() munmaps, and munmap really removes the VMA, so /proc/self/maps is
+//! the answer: an address still inside a listed range is still held.
+bool backingHoldsMemory(MemAddress addr)
 {
-    if (kind == HostMemBackingKind::kVmm)
-    {
-        CUmemGenericAllocationHandle handle{};
-        if (cuMemRetainAllocationHandle(&handle, reinterpret_cast<void*>(addr)) != CUDA_SUCCESS)
-        {
-            return false;
-        }
-        cuMemRelease(handle);
-        return true;
-    }
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line))
@@ -134,54 +119,36 @@ bool backingHoldsMemory(HostMemBackingKind kind, MemAddress addr)
 //! The ordinary path must give the memory back. Also the control for the case
 //! below: without it, retention there would pass whether or not anything is ever
 //! released.
-TEST_P(HostMemBackingTest, DestroyReleasesTheMemory)
+TEST_F(HostMemBackingTest, DestroyReleasesTheMemory)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
     mBacking->commit(0, mChunkSize);
-    ASSERT_TRUE(backingHoldsMemory(GetParam(), base)) << "nothing was held to begin with";
+    ASSERT_TRUE(backingHoldsMemory(base)) << "nothing was held to begin with";
 
     mBacking->destroy();
-    EXPECT_FALSE(backingHoldsMemory(GetParam(), base)) << "the memory outlived an ordinary destroy()";
+    EXPECT_FALSE(backingHoldsMemory(base)) << "the memory outlived an ordinary destroy()";
 }
 
 //! Teardown under poison skips the waits that let this range's CUDA consumers
 //! finish, so the memory has to outlive destroy() rather than be released under
 //! one. Deliberately strands it, which costs a tier only in a process whose cache
 //! is already permanently unusable.
-TEST_P(HostMemBackingTest, DestroyUnderPoisonKeepsTheMemory)
+TEST_F(HostMemBackingTest, DestroyUnderPoisonKeepsTheMemory)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
     mBacking->commit(0, mChunkSize);
-    ASSERT_TRUE(backingHoldsMemory(GetParam(), base)) << "nothing was held to begin with";
+    ASSERT_TRUE(backingHoldsMemory(base)) << "nothing was held to begin with";
 
     Poison::set("DestroyUnderPoisonKeepsTheMemory", "simulated invariant violation");
     ASSERT_TRUE(Poison::poisoned());
     mBacking->destroy();
-    EXPECT_TRUE(backingHoldsMemory(GetParam(), base)) << "the memory was released while KVCM2 was poisoned";
+    EXPECT_TRUE(backingHoldsMemory(base)) << "the memory was released while KVCM2 was poisoned";
     EXPECT_TRUE(takePoison().has_value());
 }
 
-//! Offsets handed to commit() are multiples of the granularity, so the base has
-//! to be one too for the addresses they name to be. cuMemAddressReserve aligns
-//! for the VMM backing; mmap does not, and the mmap backing aligns for itself.
-TEST_P(HostMemBackingTest, ReservationIsGranularityAligned)
-{
-    MemAddress const base = mBacking->reserve(mTotalSize);
-    ASSERT_NE(base, 0U);
-    EXPECT_EQ(base % mBacking->commitGranularity(), 0U)
-        << "base " << reinterpret_cast<void*>(base) << " is not a multiple of " << mBacking->commitGranularity();
-}
-
-//! The factory must hand back the backing that was asked for; every other case
-//! here is parametrized on that assumption.
-TEST_P(HostMemBackingTest, FactoryHonoursRequestedKind)
-{
-    EXPECT_STREQ(mBacking->name(), GetParam() == HostMemBackingKind::kMmap ? "mmap" : "vmm");
-}
-
-TEST_P(HostMemBackingTest, CommittedRangeIsReadableAndWritable)
+TEST_F(HostMemBackingTest, CommittedRangeIsReadableAndWritable)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
@@ -199,7 +166,7 @@ TEST_P(HostMemBackingTest, CommittedRangeIsReadableAndWritable)
 
 //! The base address must not move as chunks are committed: the allocator above
 //! hands out pointers derived from it before the fill has finished.
-TEST_P(HostMemBackingTest, BaseAddressIsStableAcrossCommits)
+TEST_F(HostMemBackingTest, BaseAddressIsStableAcrossCommits)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
@@ -215,7 +182,7 @@ TEST_P(HostMemBackingTest, BaseAddressIsStableAcrossCommits)
     }
 }
 
-TEST_P(HostMemBackingTest, DecommitFreesAndRecommitWorks)
+TEST_F(HostMemBackingTest, DecommitFreesAndRecommitWorks)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
@@ -240,7 +207,7 @@ TEST_P(HostMemBackingTest, DecommitFreesAndRecommitWorks)
 //! The span a caller commits in is independent of the unit the backing
 //! allocates in: a large commit must still be releasable piecewise, which is
 //! what lets a resize be finer than the fill's progress step.
-TEST_P(HostMemBackingTest, LargeCommitIsReleasablePiecewise)
+TEST_F(HostMemBackingTest, LargeCommitIsReleasablePiecewise)
 {
     size_t const unit = mBacking->commitGranularity();
     MemAddress const base = mBacking->reserve(mTotalSize);
@@ -262,7 +229,7 @@ TEST_P(HostMemBackingTest, LargeCommitIsReleasablePiecewise)
     EXPECT_TRUE(verify(base, 0, tail, 4)) << "recommit clobbered the retained range";
 }
 
-TEST_P(HostMemBackingTest, DestroyIsIdempotent)
+TEST_F(HostMemBackingTest, DestroyIsIdempotent)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
@@ -273,8 +240,34 @@ TEST_P(HostMemBackingTest, DestroyIsIdempotent)
     SUCCEED();
 }
 
+//! The driver rejects a copy whose host range spans two registrations. Nothing
+//! reports this at registration time -- it surfaces only when the copy is made --
+//! so it is pinned down here: it is the reason the commit unit is a whole number
+//! of slots, and a regression would otherwise show up as a failed eviction.
+TEST_F(HostMemBackingTest, CopyAcrossAUnitBoundaryIsRejected)
+{
+    MemAddress const base = mBacking->reserve(mTotalSize);
+    ASSERT_NE(base, 0U);
+    mBacking->commit(0, mChunkSize);
+    size_t const unit = mBacking->commitGranularity();
+    ASSERT_GE(mChunkSize, 2 * unit) << "a chunk must hold at least two units for this to mean anything";
+
+    void* deviceBuffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&deviceBuffer, 2 * unit), cudaSuccess);
+
+    // Wholly inside the first unit: accepted.
+    EXPECT_EQ(cudaMemcpy(deviceBuffer, reinterpret_cast<void const*>(base), unit, cudaMemcpyHostToDevice), cudaSuccess);
+    // Straddling the first boundary: rejected.
+    EXPECT_NE(cudaMemcpy(deviceBuffer, reinterpret_cast<void const*>(base + unit / 2), unit, cudaMemcpyHostToDevice),
+        cudaSuccess)
+        << "a copy spanning two registrations should not be accepted";
+    cudaGetLastError(); // clear the sticky error the rejected copy leaves
+
+    EXPECT_EQ(cudaFree(deviceBuffer), cudaSuccess);
+}
+
 //! The point of the whole exercise: the GPU must reach the committed range.
-TEST_P(HostMemBackingTest, GpuRoundTrip)
+TEST_F(HostMemBackingTest, GpuRoundTrip)
 {
     MemAddress const base = mBacking->reserve(mTotalSize);
     ASSERT_NE(base, 0U);
@@ -287,8 +280,17 @@ TEST_P(HostMemBackingTest, GpuRoundTrip)
     void* deviceBuffer = nullptr;
     ASSERT_EQ(cudaMalloc(&deviceBuffer, mTotalSize), cudaSuccess);
 
-    ASSERT_EQ(
-        cudaMemcpy(deviceBuffer, reinterpret_cast<void const*>(base), mTotalSize, cudaMemcpyHostToDevice), cudaSuccess);
+    // One copy per unit. Each unit is a separate registration and the driver
+    // rejects a copy that straddles two, which is why the pools size their unit
+    // to a whole number of slots: every copy they make is one slot.
+    size_t const unit = mBacking->commitGranularity();
+    for (size_t offset = 0; offset < mTotalSize; offset += unit)
+    {
+        ASSERT_EQ(cudaMemcpy(static_cast<uint8_t*>(deviceBuffer) + offset, reinterpret_cast<void const*>(base + offset),
+                      unit, cudaMemcpyHostToDevice),
+            cudaSuccess)
+            << "unit at offset " << offset;
+    }
 
     std::vector<uint8_t> readBack(mTotalSize, 0);
     ASSERT_EQ(cudaMemcpy(readBack.data(), deviceBuffer, mTotalSize, cudaMemcpyDeviceToHost), cudaSuccess);
@@ -299,10 +301,5 @@ TEST_P(HostMemBackingTest, GpuRoundTrip)
     }
     EXPECT_EQ(cudaFree(deviceBuffer), cudaSuccess);
 }
-
-INSTANTIATE_TEST_SUITE_P(AllBackings, HostMemBackingTest,
-    ::testing::Values(HostMemBackingKind::kMmap, HostMemBackingKind::kVmm),
-    [](::testing::TestParamInfo<HostMemBackingKind> const& info)
-    { return info.param == HostMemBackingKind::kMmap ? "Mmap" : "Vmm"; });
 
 } // namespace

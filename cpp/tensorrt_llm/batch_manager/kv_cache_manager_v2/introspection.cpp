@@ -205,13 +205,7 @@ std::optional<HostMemPlacement> KvCacheIntrospection::probeHostMemPlacement(size
 
     HostMemBackingOptions options;
     options.allowRemoteNumaFallback = allowRemoteNumaFallback;
-    auto backing = createHostMemBacking(options);
-    // The VMM backing names its node to the driver, so there is no range policy
-    // and no first-touch behaviour to observe.
-    if (std::strcmp(backing->name(), "mmap") != 0)
-    {
-        return std::nullopt;
-    }
+    auto backing = std::make_unique<HostMemBacking>(options);
 
     HostMemPlacement placement{};
     placement.gpuNumaNode = runtime::TopologyDetector::getInstance().getCurrentGpuNumaId();

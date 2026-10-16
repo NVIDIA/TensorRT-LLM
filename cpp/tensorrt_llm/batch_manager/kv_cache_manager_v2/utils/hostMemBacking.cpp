@@ -33,6 +33,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -49,6 +50,33 @@ namespace
 size_t commitAlignment()
 {
     return static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+}
+
+//! The pages [addr, addr + size) touches, widened to whole pages.
+//!
+//! For calls that must cover at least the range: populating or opening a few
+//! bytes either side is harmless, and a unit may start or end mid-page because
+//! units are sized in slots rather than pages.
+std::pair<MemAddress, size_t> pagesCovering(MemAddress addr, size_t size)
+{
+    size_t const page = commitAlignment();
+    MemAddress const begin = addr & ~static_cast<MemAddress>(page - 1);
+    MemAddress const end = roundUp(addr + size, page);
+    return {begin, static_cast<size_t>(end - begin)};
+}
+
+//! The pages wholly inside [addr, addr + size).
+//!
+//! For calls that must not reach past the range: a page shared with the
+//! neighbouring unit is left alone, because discarding or protecting it would
+//! take bytes that still belong to that unit. At most one page per boundary
+//! stays resident, which is the price of not corrupting the neighbour.
+std::pair<MemAddress, size_t> pagesWithin(MemAddress addr, size_t size)
+{
+    size_t const page = commitAlignment();
+    MemAddress const begin = roundUp(addr, page);
+    MemAddress const end = (addr + size) & ~static_cast<MemAddress>(page - 1);
+    return {begin, end > begin ? static_cast<size_t>(end - begin) : 0};
 }
 
 //! Places the pages of [addr, addr + size) on the NUMA node the current GPU
@@ -130,318 +158,177 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
         allowRemoteFallback ? "remote fallback allowed" : "strict");
 }
 
-// ---------------------------------------------------------------------------
-// mmap backing
-// ---------------------------------------------------------------------------
-class MmapHostMemBacking final : public IHostMemBacking
-{
-public:
-    explicit MmapHostMemBacking(HostMemBackingOptions const& options)
-        : mAlignment(std::max(options.commitUnit, commitAlignment()))
-        , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
-    {
-    }
-
-    ~MmapHostMemBacking() override
-    {
-        MmapHostMemBacking::destroy();
-    }
-
-    MemAddress reserve(size_t size) override
-    {
-        TLLM_CHECK_WITH_INFO(mAddr == 0, "HostMem backing reserved twice");
-        // Based at a multiple of the commit unit, matching what
-        // cuMemAddressReserve gives the VMM backing, so a committed sub-range
-        // starts at the same offset into a page either way.
-        mAddr = hostMmap(size, mAlignment);
-        mSize = size;
-        //! Applied once over the whole mapping. Per-chunk page-mode advice would
-        //! change VMA flags and split the mapping into one VMA per chunk.
-        hostMadvisePageMode(mAddr, mSize, hostUseThp());
-        bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
-        return mAddr;
-    }
-
-    void commit(size_t offset, size_t size) override
-    {
-        TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
-        hostPrefaultChunk(mAddr + offset, size);
-    }
-
-    void decommit(size_t offset, size_t size) noexcept override
-    {
-        if (mAddr == 0)
-        {
-            return;
-        }
-        TLLM_CHECK_DEBUG(offset + size <= mSize);
-        //! MADV_DONTNEED drops the pages without changing VMA flags, so unlike
-        //! mprotect it does not split the mapping.
-        ::madvise(reinterpret_cast<void*>(mAddr + offset), size, MADV_DONTNEED);
-    }
-
-    void destroy() noexcept override
-    {
-        if (mAddr == 0)
-        {
-            return;
-        }
-        // Skipped once KVCM2 is poisoned, as on the VMM backing: teardown then also skips the waits
-        // that let this range's CUDA consumers finish, and unmapping under one corrupts whatever is
-        // mapped there next. The range is kept instead, which costs a tier in a process whose cache
-        // is already permanently unusable.
-        KVCM2_POISON_ON_EXCEPT([&] { hostMunmap(mAddr, mSize); });
-        mAddr = 0;
-        mSize = 0;
-    }
-
-    [[nodiscard]] size_t commitGranularity() const noexcept override
-    {
-        return mAlignment;
-    }
-
-    [[nodiscard]] char const* name() const noexcept override
-    {
-        return "mmap";
-    }
-
-private:
-    MemAddress mAddr = 0;
-    size_t mSize = 0;
-    size_t const mAlignment;
-    bool const mAllowRemoteNumaFallback;
-};
-
-// ---------------------------------------------------------------------------
-// CUDA VMM backing
-// ---------------------------------------------------------------------------
-class VmmHostMemBacking final : public IHostMemBacking
-{
-public:
-    explicit VmmHostMemBacking(HostMemBackingOptions const& options)
-        : mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
-    {
-        CUdevice device{};
-        cuCheck(cuCtxGetDevice(&device));
-        mDevice = device;
-
-        int numaId = 0;
-        cuCheck(cuDeviceGetAttribute(&numaId, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device));
-        //! -1 means the platform reports no NUMA affinity for this device.
-        mNumaId = numaId >= 0 ? numaId : 0;
-
-        mProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        mProp.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-        mProp.location.id = mNumaId;
-        size_t required = 0;
-        cuCheck(cuMemGetAllocationGranularity(&required, &mProp, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-        // The driver's granularity is a floor; the caller's unit sets how finely
-        // a resize can release memory, traded against per-allocation cost.
-        mGranularity = std::max(roundUp(options.commitUnit, required), required);
-
-        mAccess[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-        mAccess[0].location.id = mNumaId;
-        mAccess[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        mAccess[1].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        mAccess[1].location.id = static_cast<int>(mDevice);
-        mAccess[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    }
-
-    ~VmmHostMemBacking() override
-    {
-        VmmHostMemBacking::destroy();
-    }
-
-    MemAddress reserve(size_t size) override
-    {
-        TLLM_CHECK_WITH_INFO(mAddr == 0, "HostMem backing reserved twice");
-        CUdeviceptr addr = 0;
-        cuCheck(cuMemAddressReserve(&addr, size, mGranularity, 0, 0));
-        mAddr = static_cast<MemAddress>(addr);
-        mSize = size;
-        return mAddr;
-    }
-
-    //! Split into granularity-sized allocations so that a later decommit can
-    //! release any granularity-aligned sub-range without having to split one.
-    void commit(size_t offset, size_t size) override
-    {
-        TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
-        TLLM_CHECK_DEBUG(offset % mGranularity == 0 && size % mGranularity == 0);
-
-        size_t committed = 0;
-        try
-        {
-            for (; committed < size; committed += mGranularity)
-            {
-                commitOne(offset + committed);
-            }
-            // Inside the try: a failure here would otherwise leave every granule
-            // above mapped until destroy(), and the caller treats a failed
-            // commit as having taken nothing.
-            //
-            // Access applies to a range, so it costs the same whether the range
-            // was one allocation or many.
-            cuCheck(cuMemSetAccess(static_cast<CUdeviceptr>(mAddr + offset), size, mAccess.data(), mAccess.size()));
-        }
-        catch (...)
-        {
-            decommit(offset, committed);
-            throw;
-        }
-    }
-
-    //! Exact, because every allocation is one granule and the bounds are
-    //! granule-aligned: no allocation ever straddles the released range.
-    void decommit(size_t offset, size_t size) noexcept override
-    {
-        TLLM_CHECK_DEBUG(offset % mGranularity == 0 && size % mGranularity == 0);
-        auto chunk = mChunks.lower_bound(offset);
-        KVCM2_POISON_ON_EXCEPT(
-            [&]
-            {
-                while (chunk != mChunks.end() && chunk->first < offset + size)
-                {
-                    cuCheck(cuMemUnmap(static_cast<CUdeviceptr>(mAddr + chunk->first), chunk->second.size));
-                    cuCheck(cuMemRelease(chunk->second.handle));
-                    chunk = mChunks.erase(chunk);
-                }
-            });
-    }
-
-    void destroy() noexcept override
-    {
-        if (mAddr == 0)
-        {
-            return;
-        }
-        KVCM2_POISON_ON_EXCEPT(
-            [&]
-            {
-                for (auto const& [offset, chunk] : mChunks)
-                {
-                    cuCheck(cuMemUnmap(static_cast<CUdeviceptr>(mAddr + offset), chunk.size));
-                    cuCheck(cuMemRelease(chunk.handle));
-                }
-                mChunks.clear();
-                cuCheck(cuMemAddressFree(static_cast<CUdeviceptr>(mAddr), mSize));
-            });
-        mAddr = 0;
-        mSize = 0;
-    }
-
-    [[nodiscard]] size_t commitGranularity() const noexcept override
-    {
-        return mGranularity;
-    }
-
-    [[nodiscard]] char const* name() const noexcept override
-    {
-        return "vmm";
-    }
-
-private:
-    void commitOne(size_t offset)
-    {
-        CUmemGenericAllocationHandle handle{};
-        CUresult created = cuMemCreate(&handle, mGranularity, &mProp, 0);
-        if (created == CUDA_ERROR_OUT_OF_MEMORY && mAllowRemoteNumaFallback)
-        {
-            // A named node is strict in the driver: os_alloc_pages_node() passes
-            // __GFP_THISNODE and additionally frees and fails any page the
-            // kernel returns from a different node, so cuMemCreate reports OOM
-            // rather than spilling. Honouring the flag therefore means retrying
-            // without naming a node and letting any of them serve it.
-            CUmemAllocationProp anyNode = mProp;
-            anyNode.location.type = CU_MEM_LOCATION_TYPE_HOST;
-            anyNode.location.id = 0;
-            created = cuMemCreate(&handle, mGranularity, &anyNode, 0);
-            if (created == CUDA_SUCCESS)
-            {
-                TLLM_LOG_WARNING(
-                    "KVCM2 host tier: NUMA node %d is exhausted; allocating from another node, which the GPU reaches "
-                    "more slowly. Set allow_remote_numa_fallback=false to fail instead.",
-                    mNumaId);
-            }
-        }
-        if (created == CUDA_ERROR_OUT_OF_MEMORY)
-        {
-            throw HostOOMError("cuMemCreate(HOST_NUMA) failed: out of memory");
-        }
-        cuCheck(created);
-
-        auto const base = static_cast<CUdeviceptr>(mAddr + offset);
-        try
-        {
-            cuCheck(cuMemMap(base, mGranularity, 0, handle, 0));
-        }
-        catch (...)
-        {
-            cuMemRelease(handle);
-            throw;
-        }
-        mChunks.emplace(offset, Chunk{mGranularity, handle});
-    }
-
-    struct Chunk
-    {
-        size_t size;
-        CUmemGenericAllocationHandle handle;
-    };
-
-    MemAddress mAddr = 0;
-    size_t mSize = 0;
-    size_t mGranularity = 0;
-    CUdevice mDevice = 0;
-    int mNumaId = 0;
-    bool mAllowRemoteNumaFallback = true;
-    CUmemAllocationProp mProp{};
-    std::array<CUmemAccessDesc, 2> mAccess{};
-    std::map<size_t, Chunk> mChunks;
-};
-
 } // namespace
 
-HostMemBackingKind selectHostMemBackingKind()
+HostMemBacking::HostMemBacking(HostMemBackingOptions const& options)
+    : mUnit(std::max(options.commitUnit, commitAlignment()))
+    , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
 {
-    static HostMemBackingKind const kind = []
-    {
-        //! The answer is cached, so a query made before a context exists would
-        //! fix the wrong backing for the process lifetime. Fail loudly instead
-        //! of guessing; every caller reaches here from HostMem construction,
-        //! which already requires a context.
-        CUdevice device{};
-        cuCheck(cuCtxGetDevice(&device));
-        int usesHostPageTables = 0;
-        int coherent = 0;
-        cuDeviceGetAttribute(
-            &usesHostPageTables, CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES, device);
-        cuDeviceGetAttribute(&coherent, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED, device);
-        auto const selected
-            = (usesHostPageTables != 0 && coherent != 0) ? HostMemBackingKind::kMmap : HostMemBackingKind::kVmm;
-        // Which route the host tier takes decides its bandwidth, so record it
-        // alongside the attributes that chose it: a host-tier performance report
-        // is not interpretable without knowing which one ran.
-        TLLM_LOG_INFO("KVCM2 host memory backing: %s (host page tables: %d, coherent link: %d)",
-            selected == HostMemBackingKind::kMmap ? "mmap" : "vmm", usesHostPageTables, coherent);
-        return selected;
-    }();
-    return kind;
 }
 
-std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingKind kind, HostMemBackingOptions const& options)
+HostMemBacking::~HostMemBacking()
 {
-    switch (kind)
+    HostMemBacking::destroy();
+}
+
+MemAddress HostMemBacking::reserve(size_t size)
+{
+    TLLM_CHECK_WITH_INFO(mAddr == 0, "HostMem backing reserved twice");
+    TLLM_CHECK_DEBUG(size % mUnit == 0);
+
+    // Captured here rather than in commit(): this runs on the thread that owns
+    // the context, while the fill worker only sets the device.
+    cuCheck(cuCtxGetCurrent(reinterpret_cast<CUcontext*>(&mContext)));
+    TLLM_CHECK_WITH_INFO(mContext != nullptr, "HostMemBacking::reserve needs a current CUDA context");
+
+    // No alignment is asked of the mapping. Unit boundaries line up with slot
+    // boundaries because slot 0 sits at the base and a unit is a whole number of
+    // slots, wherever the base happens to land; registration needs no alignment,
+    // and the madvise and mprotect calls round to pages themselves. The mapped
+    // length is page-rounded so the guard below covers whole pages.
+    mMapped = roundUp(size, commitAlignment());
+    mAddr = hostMmap(mMapped);
+    mSize = size;
+
+    //! Applied once over the whole mapping. Per-chunk page-mode advice would
+    //! change VMA flags and split the mapping into one VMA per chunk.
+    hostMadvisePageMode(mAddr, mSize, hostUseThp());
+    bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
+
+    // Nothing is reachable until commit() opens it, so a read that runs ahead
+    // of the fill faults rather than returning zeros from an untouched page.
+    // Costs one VMA and is independent of the size: with no resident pages
+    // there are no page tables to rewrite.
+    auto const [guardAddr, guardSize] = pagesCovering(mAddr, mSize);
+    if (::mprotect(reinterpret_cast<void*>(guardAddr), guardSize, PROT_NONE) != 0)
     {
-    case HostMemBackingKind::kMmap: return std::make_unique<MmapHostMemBacking>(options);
-    case HostMemBackingKind::kVmm: return std::make_unique<VmmHostMemBacking>(options);
+        hostMunmap(mAddr, mMapped);
+        mAddr = 0;
+        mSize = 0;
+        mMapped = 0;
+        throw HostOOMError(std::string("mprotect(PROT_NONE) failed: ") + std::strerror(errno));
     }
-    TLLM_THROW("Unknown HostMemBackingKind");
+    return mAddr;
 }
 
-std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingOptions const& options)
+void HostMemBacking::commit(size_t offset, size_t size)
 {
-    return createHostMemBacking(selectHostMemBackingKind(), options);
+    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
+    TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
+
+    // cuMemHostRegister needs a current context; the fill worker has only set
+    // the device, which does not give it one.
+    cuCheck(cuCtxSetCurrent(static_cast<CUcontext>(mContext)));
+
+    auto const [openAddr, openSize] = pagesCovering(mAddr + offset, size);
+    if (::mprotect(reinterpret_cast<void*>(openAddr), openSize, PROT_READ | PROT_WRITE) != 0)
+    {
+        throw HostOOMError(std::string("mprotect(PROT_READ|PROT_WRITE) failed: ") + std::strerror(errno));
+    }
+    // Allocating and zeroing through the kernel's fault path is the point of
+    // this backing: it scales across processes, where the driver serializes the
+    // same work on a per-process lock. One call for the whole range -- the unit
+    // only divides the registrations below.
+    hostPrefaultChunk(openAddr, openSize);
+
+    size_t committed = 0;
+    try
+    {
+        for (; committed < size; committed += mUnit)
+        {
+            MemAddress const unitAddr = mAddr + offset + committed;
+            CUresult const registered = cuMemHostRegister(
+                reinterpret_cast<void*>(unitAddr), mUnit, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
+            if (registered == CUDA_ERROR_OUT_OF_MEMORY)
+            {
+                throw HostOOMError("cuMemHostRegister failed: out of memory");
+            }
+            cuCheck(registered);
+            mRegistered.emplace(offset + committed, mUnit);
+        }
+    }
+    catch (...)
+    {
+        // The caller treats a failed commit as having taken nothing.
+        decommit(offset, committed);
+        auto const [closeAddr, closeSize] = pagesWithin(mAddr + offset + committed, size - committed);
+        if (closeSize != 0 && ::mprotect(reinterpret_cast<void*>(closeAddr), closeSize, PROT_NONE) != 0)
+        {
+            TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed while unwinding a commit, errno %d", errno);
+        }
+        throw;
+    }
+}
+
+void HostMemBacking::unregisterRange(size_t offset, size_t size) noexcept
+{
+    auto unit = mRegistered.lower_bound(offset);
+    while (unit != mRegistered.end() && unit->first < offset + size)
+    {
+        CUresult const result = cuMemHostUnregister(reinterpret_cast<void*>(mAddr + unit->first));
+        if (result != CUDA_SUCCESS)
+        {
+            char const* name = nullptr;
+            cuGetErrorName(result, &name);
+            // The driver and this object disagree about what is registered,
+            // which the pages below are about to be freed on the assumption of.
+            Poison::set("HostMemBacking::unregisterRange", name != nullptr ? name : "cuMemHostUnregister failed");
+        }
+        unit = mRegistered.erase(unit);
+    }
+}
+
+void HostMemBacking::decommit(size_t offset, size_t size) noexcept
+{
+    if (mAddr == 0 || size == 0)
+    {
+        return;
+    }
+    TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
+
+    // Order matters and nothing enforces it: registration does not hold the
+    // pages, so discarding them first destroys memory the GPU still has
+    // registered, with every call reporting success.
+    unregisterRange(offset, size);
+    auto const [dropAddr, dropSize] = pagesWithin(mAddr + offset, size);
+    if (dropSize == 0)
+    {
+        return;
+    }
+    //! MADV_DONTNEED drops the pages without changing VMA flags, so unlike
+    //! mprotect it does not split the mapping.
+    if (::madvise(reinterpret_cast<void*>(dropAddr), dropSize, MADV_DONTNEED) != 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: madvise(MADV_DONTNEED) failed with errno %d", errno);
+    }
+    // Back to unreachable, so a reader that outlives the shrink faults instead
+    // of silently re-faulting a zero page.
+    if (::mprotect(reinterpret_cast<void*>(dropAddr), dropSize, PROT_NONE) != 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed with errno %d", errno);
+    }
+}
+
+void HostMemBacking::destroy() noexcept
+{
+    if (mAddr == 0)
+    {
+        return;
+    }
+    // Skipped once KVCM2 is poisoned: teardown then also skips the waits that
+    // let this range's CUDA consumers finish, and unmapping under one corrupts
+    // whatever is mapped there next. The range is kept instead, which costs a
+    // tier in a process whose cache is already permanently unusable.
+    KVCM2_POISON_ON_EXCEPT(
+        [&]
+        {
+            unregisterRange(0, mSize);
+            hostMunmap(mAddr, mMapped);
+        });
+    mRegistered.clear();
+    mAddr = 0;
+    mSize = 0;
+    mMapped = 0;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
