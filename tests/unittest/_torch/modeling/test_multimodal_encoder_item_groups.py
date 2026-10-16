@@ -23,7 +23,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
-    MultimodalFieldLayout,
+    MultimodalItemPartition,
     MultimodalParams,
 )
 
@@ -49,10 +49,10 @@ class _GroupedEncoderModel(MultimodalModelMixin):
 
     supports_mm_encoder_item_scheduling = True
 
-    def get_multimodal_field_layout(self, param, modality):
+    def get_multimodal_item_partitions(self, param, modality):
         if modality == "audio":
-            return {"input_features": MultimodalFieldLayout()}
-        return Qwen3VLModelBase.get_multimodal_field_layout(self, param, modality)
+            return {"input_features": MultimodalItemPartition()}
+        return Qwen3VLModelBase.get_multimodal_item_partitions(self, param, modality)
 
     def __init__(self):
         self.encoder_calls: list[int] = []
@@ -164,12 +164,12 @@ def test_declared_qwen_layout_keeps_shared_fields(indices):
 
 def test_declared_audio_layout_selects_packed_frames_on_a_nonzero_axis():
     class PackedAudioModel(_GroupedEncoderModel):
-        def get_multimodal_field_layout(self, param, modality):
+        def get_multimodal_item_partitions(self, param, modality):
             return {
-                "features": MultimodalFieldLayout(item_axis=1, item_lengths=(2, 3, 1)),
-                "mask": MultimodalFieldLayout(item_lengths=(2, 3, 1)),
-                "frame_counts": MultimodalFieldLayout(),
-                "shared_stats": MultimodalFieldLayout(item_axis=None),
+                "features": MultimodalItemPartition(item_axis=1, item_lengths=(2, 3, 1)),
+                "mask": MultimodalItemPartition(item_lengths=(2, 3, 1)),
+                "frame_counts": MultimodalItemPartition(),
+                "shared_stats": MultimodalItemPartition(item_axis=None),
             }
 
     features = torch.arange(12).reshape(2, 6)
