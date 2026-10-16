@@ -194,7 +194,8 @@ class ServingRender:
                     kind="completion",
                     request_id=f"{request_id}-{index}",
                     token_ids=token_ids,
-                    request={**body, "prompt": token_ids},
+                    # The submitted request; a batch is split, so each item carries its own prompt.
+                    request={**body, "prompt": prompt},
                     **_request_fields(request),
                 )
             )
