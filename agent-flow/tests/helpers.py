@@ -79,6 +79,7 @@ class FakeBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict | None = None,
         cwd: Path | None = None,
+        required_tools: tuple[str, ...] = (),
     ):
         plan = self.plans[min(self.create_client_calls, len(self.plans) - 1)]
         self.create_client_calls += 1

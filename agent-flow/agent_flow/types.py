@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -26,6 +26,37 @@ class UsageInfo:
     context_percentage: float | None = None
     # Optional cumulative thread estimate; never add this to per-turn cost_usd.
     estimated_thread_cost_usd: float | None = None
+
+
+def merge_turn_usage(previous: UsageInfo | None, current: UsageInfo | None) -> UsageInfo | None:
+    """Sum per-SDK-turn accounting and keep the final context snapshot.
+
+    Backends normalize cumulative upstream counters to turn deltas before
+    yielding ResultEvent. Context occupancy is a snapshot, not an expense,
+    and must not be summed across turns.
+    """
+    if previous is None:
+        return current
+    if current is None:
+        return previous
+    additive = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens",
+        "total_tokens",
+        "cost_usd",
+        "num_turns",
+        "duration_ms",
+    )
+    totals = {}
+    for name in additive:
+        before, after = getattr(previous, name), getattr(current, name)
+        totals[name] = None if before is None and after is None else (before or 0) + (after or 0)
+    estimate = current.estimated_thread_cost_usd
+    if estimate is None:
+        estimate = previous.estimated_thread_cost_usd
+    return replace(current, **totals, estimated_thread_cost_usd=estimate)
 
 
 @dataclass

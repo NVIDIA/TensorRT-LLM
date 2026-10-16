@@ -12,6 +12,7 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import anyio
 import claude_agent_sdk
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -21,18 +22,23 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 from claude_agent_sdk.types import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     RateLimitEvent,
     ResultMessage,
     ServerToolUseBlock,
     SystemMessage,
     SystemPromptPreset,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolsPreset,
     ToolUseBlock,
 )
 
+from ..hooks import RequiredToolPolicy
 from ..tools import normalize_tool, tool_result_to_claude
 from ..types import (
     AgentTextEvent,
@@ -43,6 +49,7 @@ from ..types import (
     ThinkingEvent,
     ToolCallEvent,
     UsageInfo,
+    merge_turn_usage,
 )
 from .base import Backend, BackendClient, BackendEvent, ResultEvent
 
@@ -224,9 +231,42 @@ def _assistant_error_detail(message: AssistantMessage) -> str:
     return f" ({'; '.join(parts)})" if parts else ""
 
 
+# Delegated work that always reaches a terminal status and whose result the
+# parent still has to handle, as in the SDK's own ``DEFERRING_TASK_TYPES``.
+# Shells and monitors can run forever and are often just waiters.
+_DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+# How long a run that owes no further turn, and whose role has not called its
+# deliverable tools, waits on live shells and monitors before stopping them.
+_BACKGROUND_WAIT_CEILING_S = 3600.0
+# How long the CLI must stay quiet, with nothing owed and nothing live, before
+# the run counts as over.
+_SETTLE_S = 5.0
+
+
+def _track_task(live_tasks: dict[str, str | None], message: SystemMessage) -> None:
+    """Update the live background tasks (id to type) from one lifecycle message.
+
+    A task ends with a ``task_notification`` or with a terminal status in a
+    ``task_updated`` patch; not every task emits both. A subagent woken by its
+    own background shell is re-reported by ``task_started`` under its old id.
+    """
+    if isinstance(message, TaskStartedMessage):
+        live_tasks[message.task_id] = message.task_type
+    elif isinstance(message, TaskNotificationMessage):
+        live_tasks.pop(message.task_id, None)
+    elif isinstance(message, TaskUpdatedMessage) and message.status in TERMINAL_TASK_STATUSES:
+        live_tasks.pop(message.task_id, None)
+
+
+def _is_deferring(task_type: str | None) -> bool:
+    # A CLI that does not report the type gets the benefit of the doubt.
+    return task_type is None or task_type in _DEFERRING_TASK_TYPES
+
+
 class ClaudeCodeClient(BackendClient):
-    def __init__(self, sdk_client) -> None:
+    def __init__(self, sdk_client, required_tools: tuple[str, ...] = ()) -> None:
         self._client = sdk_client
+        self._required_tools = required_tools
         # Maps a subagent-spawning ToolUseBlock id (Agent/Task) to a
         # human-readable label (subagent_type or description). Child
         # messages reference it via ``parent_tool_use_id`` so we can
@@ -241,23 +281,74 @@ class ClaudeCodeClient(BackendClient):
     async def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
         got_result = False
         pending_result: ResultEvent | None = None
+        # ``None`` until the CLI reports a state; a CLI that never does ends
+        # the run at its first result, as ``receive_response`` would.
+        session_state: str | None = None
+        # A main-thread turn has started and its result has not arrived yet.
+        # Some CLIs report "idle" just before that result.
+        turn_open = False
+        # Background tasks started and not yet terminal, by id and type.
+        # "idle" ignores shells, even one a subagent started and whose
+        # completion wakes that subagent and then this session again.
+        live_tasks: dict[str, str | None] = {}
+        stopped_lingering = False
+        # The role's deliverable tools. Once they are called, a shell or
+        # monitor still running is a leftover waiter, not pending work.
+        delivery = RequiredToolPolicy(self._required_tools)
         try:
             await self._client.query(message)
-            async for sdk_message in self._client.receive_response():
+            messages = aiter(self._client.receive_messages())
+            while True:
+                idle = got_result and not turn_open and session_state in (None, "idle")
+                waiting_on_work = any(_is_deferring(kind) for kind in live_tasks.values())
+                delivered = bool(self._required_tools) and not delivery.missing
+                if idle and not live_tasks:
+                    if session_state is None:
+                        break
+                    # A finished shell wakes its subagent in the same instant;
+                    # end only once the CLI has stayed quiet.
+                    timeout = _SETTLE_S
+                elif idle and not waiting_on_work and not stopped_lingering:
+                    # Only shells and monitors are left. Before the role has
+                    # delivered they may be how it gets woken; after, they are
+                    # leftovers and are stopped now.
+                    timeout = 0 if delivered else _BACKGROUND_WAIT_CEILING_S
+                else:
+                    timeout = None
+                with anyio.move_on_after(timeout) as scope:
+                    sdk_message = await anext(messages, None)
+                if scope.cancelled_caught:
+                    if not live_tasks:
+                        break
+                    # Nothing is owed but shells or monitors that may never
+                    # finish. Stop them and keep reading until the CLI settles.
+                    stopped_lingering = True
+                    for task_id in list(live_tasks):
+                        await self._client.stop_task(task_id)
+                    messages = aiter(self._client.receive_messages())
+                    continue
+                if sdk_message is None:
+                    break
                 if isinstance(sdk_message, SystemMessage):
+                    _track_task(live_tasks, sdk_message)
                     if sdk_message.subtype == "init":
                         yield _session_init_event_from_data(sdk_message.data)
                     elif sdk_message.subtype == "compact_boundary":
                         yield _compact_boundary_event_from_data(sdk_message.data)
+                    elif sdk_message.subtype == "session_state_changed":
+                        session_state = sdk_message.data.get("state")
                 elif isinstance(sdk_message, RateLimitEvent):
                     yield _rate_limit_warning_from_event(sdk_message)
                 elif isinstance(sdk_message, AssistantMessage):
                     if sdk_message.error is not None:
+                        turn_open = True
                         raise RuntimeError(
                             f"Claude Code turn failed: {sdk_message.error}"
                             f"{_assistant_error_detail(sdk_message)}"
                         )
                     parent_id = sdk_message.parent_tool_use_id
+                    if parent_id is None:
+                        turn_open = True
                     label = self._resolve_label(parent_id)
                     for block in sdk_message.content:
                         if isinstance(block, ToolUseBlock):
@@ -265,13 +356,15 @@ class ClaudeCodeClient(BackendClient):
                                 self._subagent_labels[block.id] = _subagent_label_from_task_input(
                                     block.input
                                 )
-                            yield ToolCallEvent(
+                            event = ToolCallEvent(
                                 name=block.name,
                                 input=block.input,
                                 tool_use_id=block.id,
                                 parent_tool_use_id=parent_id,
                                 agent_label=label,
                             )
+                            delivery.record(event)
+                            yield event
                         elif isinstance(block, ServerToolUseBlock):
                             yield ServerToolCallEvent(
                                 name=block.name,
@@ -297,16 +390,31 @@ class ClaudeCodeClient(BackendClient):
                                     agent_label=label,
                                 )
                 elif isinstance(sdk_message, ResultMessage):
+                    # One result per turn. A background agent or workflow that
+                    # finishes later wakes the session for another turn, so
+                    # keep the latest text and sum the usage.
                     got_result = True
+                    turn_open = False
                     pending_result = ResultEvent(
                         text=sdk_message.result or "",
-                        usage=_usage_from_result_message(sdk_message),
+                        usage=merge_turn_usage(
+                            pending_result.usage if pending_result else None,
+                            _usage_from_result_message(sdk_message),
+                        ),
                         is_error=bool(sdk_message.is_error),
                         errors=list(sdk_message.errors or []),
                         permission_denials=list(sdk_message.permission_denials or []),
                     )
         except Exception:
-            if not got_result:
+            # Only an error after the run has settled is tolerated; one from a
+            # turn or background work still under way fails the request.
+            settled = (
+                got_result
+                and not turn_open
+                and session_state in (None, "idle")
+                and not any(_is_deferring(kind) for kind in live_tasks.values())
+            )
+            if not settled:
                 raise
 
         if pending_result is not None:
@@ -541,6 +649,7 @@ class ClaudeCodeBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        required_tools: tuple[str, ...] = (),
     ) -> AsyncIterator[BackendClient]:
         # External MCP server configs (e.g. ``{"knowledge-base": {"type":
         # "http", "url": ...}}``) are layered alongside the in-process
@@ -576,6 +685,9 @@ class ClaudeCodeBackend(Backend):
             cwd=work_dir,
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
+            # Surface the CLI's session state so a turn's result is not
+            # mistaken for the end of the run while background work is live.
+            env={"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
             hooks=hooks,
             disallowed_tools=[
                 *(disallowed_tools or []),
@@ -587,4 +699,4 @@ class ClaudeCodeBackend(Backend):
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
-            yield ClaudeCodeClient(sdk_client)
+            yield ClaudeCodeClient(sdk_client, required_tools)
