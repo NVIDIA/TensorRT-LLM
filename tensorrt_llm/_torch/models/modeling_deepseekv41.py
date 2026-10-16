@@ -1692,6 +1692,13 @@ def _v41_load_coverage(
     }
     parameters = {name: param for name, param in model.named_parameters() if included(name)}
     targets = set(parameters) | {name for name, _ in model.named_buffers() if included(name)}
+    # BF16 projections fold the grouped output scale into o_a_proj at load, so
+    # o_a_proj_scale stays a None buffer, which named_buffers() skips.
+    targets |= {
+        f"{name}.o_a_proj_scale"
+        for name, module in modules.items()
+        if isinstance(module, CSA2Attention) and module.projection_quantization == "bf16"
+    }
 
     def enclosing(name: str) -> List[str]:
         parts = name.split(".")

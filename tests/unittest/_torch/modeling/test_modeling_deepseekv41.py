@@ -26,7 +26,7 @@ import torch
 from _torch.attention.sparse.csa2._utils import _FakeMetadata
 from torch import nn
 from transformers import AutoConfig
-from utils.util import skip_blackwell_geforce, skip_pre_blackwell
+from utils.util import skip_blackwell_geforce, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.configs import deepseek_v41 as v41_config
@@ -1224,10 +1224,15 @@ def _audited_loader(model, weights, monkeypatch):
                 torch.empty(tuple(forwarded[key].shape), dtype=torch.float32, device="meta"),
                 requires_grad=False,
             )
-        # The grouped projection loader materializes this registered buffer;
+        # The native grouped projection loader materializes this registered buffer;
         # coverage runs after loading, while this fixture skips the numeric load.
+        # BF16 projections fold the scale into o_a_proj and leave the buffer None.
         scale_key = f"{name}.o_a_proj.weight_scale_inv"
-        if scale_key in forwarded and target.o_a_proj_scale is None:
+        if (
+            scale_key in forwarded
+            and target.o_a_proj_scale is None
+            and target.projection_quantization == "mxfp8"
+        ):
             target.o_a_proj_scale = torch.empty_like(forwarded[scale_key], device="meta")
     loader.assert_load_complete()
     return loader
@@ -1436,7 +1441,7 @@ def test_context_only_checkpoint_filter_preserves_default_full_load():
 # --------------------------------------------------------------------------- #
 
 
-@skip_pre_blackwell
+@skip_pre_hopper
 @requires_cuda
 @requires_release_checkpoint
 def test_release_census_closes_and_coverage_is_empty(
@@ -1821,6 +1826,56 @@ def test_csa2_loader_fuses_shared_compressor_value_then_gate():
     module.compressor.wkv_gate = None
     unexpected, _ = v41._v41_load_coverage(root, keys)
     assert unexpected == ["model.layers.0.self_attn.compressor.wkv_gate.weight"]
+
+
+@pytest.mark.parametrize("projection_quantization", ["bf16", "mxfp8"])
+def test_csa2_grouped_output_scale_passes_load_coverage(monkeypatch, projection_quantization):
+    monkeypatch.setattr(
+        v41,
+        "_dequantize_block32",
+        lambda weight, scale: (
+            weight.float() * scale.float().repeat_interleave(32, 0).repeat_interleave(32, 1)
+        ).bfloat16(),
+    )
+    native = projection_quantization == "mxfp8"
+    module = v41.DeepseekV41Attention.__new__(v41.DeepseekV41Attention)
+    torch.nn.Module.__init__(module)
+    module.o_a_proj = nn.Parameter(
+        torch.empty(1, 128, 128, dtype=torch.float8_e4m3fn if native else torch.bfloat16),
+        requires_grad=False,
+    )
+    module.register_buffer("o_a_proj_scale", None)
+    module.num_groups, module.o_lora_rank = 1, 128
+    module.mapping = Mapping()
+    module.projection_quantization = projection_quantization
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(128, 128, generator=generator).to(torch.float8_e4m3fn)
+    scale = torch.exp2(torch.randint(-4, 0, (4, 4), generator=generator).float())
+    remapped = v41._remap_deepseek_v41_checkpoint_keys(
+        {
+            "layers.0.attn.wo_a.weight": weight,
+            "layers.0.attn.wo_a.scale": scale.to(torch.float8_e8m0fnu),
+        },
+        num_hidden_layers=1,
+    )
+    prefix = "model.layers.0.self_attn."
+    keys = sorted(remapped)
+    assert keys == [prefix + "o_a_proj", prefix + "o_a_proj.weight_scale_inv"]
+    module.load_weights([{key.removeprefix(prefix): value for key, value in remapped.items()}])
+    if not native:
+        folded = remapped[keys[0]].float() * remapped[keys[1]].float()
+        torch.testing.assert_close(module.o_a_proj[0], folded.bfloat16(), atol=0, rtol=0)
+        assert module.o_a_proj_scale is None
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.self_attn = module
+    root.model.layers = torch.nn.ModuleList([layer])
+    assert v41._v41_load_coverage(root, keys) == ([], [])
+    if native:
+        module.o_a_proj_scale = None
+        unexpected, _ = v41._v41_load_coverage(root, keys)
+        assert unexpected == [keys[1]]
 
 
 @pytest.mark.parametrize("malformation", ["short", "transposed"])
