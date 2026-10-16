@@ -929,7 +929,7 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     """
     Get the appropriate draft length for the given batch size using binary search.
 
-    This is a standalone function that can be used by both the drafter (two-model path)
+    This is a standalone function that can be used by both drafters (e.g. NGram)
     and the model engine / spec workers (one-model path).
 
     New semantics: Keys represent specific batch sizes (transition points).

@@ -2227,10 +2227,9 @@ class DecoderRunner(ScheduledModelRunner):
         # branch's variants would spend warmup on graphs whose keys no batch can
         # ever produce.
         #
-        # The predicate is use_one_engine() rather than has_spec_decoder(): the
-        # two-model eagle3 / mtp_eagle modes also "have a spec decoder", but
-        # get_spec_decoder hands them a plain TorchSampler, so they belong on
-        # the TorchSampler branch and do need the FAST graphs.
+        # The predicate is use_one_engine(): the drafter-based modes (NGram,
+        # user-provided) get a plain TorchSampler from get_spec_decoder, so they
+        # belong on the TorchSampler branch and do need the FAST graphs.
         uses_own_spec_decoder = (
             self._config.spec_config is not None
             and self._config.spec_config.spec_dec_mode.use_one_engine()

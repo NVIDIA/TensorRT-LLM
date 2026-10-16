@@ -19,7 +19,7 @@ early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
 :class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
 sampling logic of its own beyond batching and orchestration: each feature
 (beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-two-model speculation, seeds) lives in its own module and is held here as a
+draft-token verification, seeds) lives in its own module and is held here as a
 handler, driven through ``setup_sampler_step`` / ``sample_async`` /
 ``update_requests``.
 """
