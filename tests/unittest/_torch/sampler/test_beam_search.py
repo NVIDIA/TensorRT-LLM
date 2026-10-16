@@ -2398,7 +2398,7 @@ def test_assemble_final_beams_matches_reference(seed, with_log_probs):
                   active_cum=active_cum,
                   cba_log_probs=cba_log_probs,
                   active_lp_path=active_lp_path)
-    tokens, cum, lps = _assemble_final_beams(**kwargs)
+    tokens, cum, lps = _assemble_final_beams(**kwargs)  # type: ignore
     ref_tokens, ref_cum, ref_lps = _reference_assemble_final_beams(**kwargs)
     torch.testing.assert_close(tokens, ref_tokens)
     torch.testing.assert_close(cum, ref_cum)
