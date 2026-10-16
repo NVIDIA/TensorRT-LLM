@@ -173,6 +173,9 @@ class WorkflowState:
     # HEAD it was created from (the reporter diffs ``base..HEAD``).
     campaign_git_branch: str = ""
     campaign_git_base_commit: str = ""
+    # True once the campaign accepts source changes that require rebuilding
+    # the native runtime bundled in its original wheel-installed SQSH.
+    has_accepted_native_changes: bool = False
 
     # Optimizer/evaluator batch item fields.  The scalar fields
     # above are populated only on a worker-local WorkflowState copy so the
@@ -244,6 +247,7 @@ def load_state(path: Path) -> WorkflowState:
         reuse_pending=bool(data.get("reuse_pending", False)),
         campaign_git_branch=str(data.get("campaign_git_branch", "") or ""),
         campaign_git_base_commit=str(data.get("campaign_git_base_commit", "") or ""),
+        has_accepted_native_changes=bool(data.get("has_accepted_native_changes", False)),
         item_worktree_path=str(data.get("item_worktree_path", "") or ""),
         item_branch=str(data.get("item_branch", "") or ""),
         item_base_commit=str(data.get("item_base_commit", "") or ""),
