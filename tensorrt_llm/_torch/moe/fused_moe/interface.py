@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import weakref
 from abc import abstractmethod
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union, final
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
@@ -232,6 +233,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
     # Set by callers that compose a ``FUSED_COMM`` backend's globally combined
     # routed output themselves; read through ``returns_global_routed_output``.
     accepts_global_routed_output: bool = False
+    # Set only inside ``load_balancer_overlap``; consumed by the next route.
+    _load_balancer_overlap_fn: Optional[Callable[[], None]] = None
 
     @property
     def returns_global_routed_output(self) -> bool:
@@ -699,26 +702,45 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     is_last_stage=is_last_call,
                     allreduce=self.allreduce)
 
+    @contextlib.contextmanager
+    def load_balancer_overlap(self,
+                              overlap_fn: Callable[[], None]) -> Iterator[None]:
+        """Run ``overlap_fn`` inside the next load-balancer route call.
+
+        A per-layer dynamic EPLB layer calls it after the copy stream has been
+        submitted and before the routes are returned, so independent
+        main-stream work such as shared experts overlaps planning and the
+        helper-weight copy. Only the first route call consumes it, and it is
+        cleared on every exit; if no route call consumes it, the caller still
+        owns that work. Every EP rank must install the same function.
+        """
+        if not callable(overlap_fn):
+            raise TypeError("overlap_fn must be callable")
+        self._load_balancer_overlap_fn = overlap_fn
+        try:
+            yield
+        finally:
+            self._load_balancer_overlap_fn = None
+
     def _load_balancer_route(self, token_selected_experts: torch.Tensor,
                              use_dp: bool) -> torch.Tensor:
         """Route tokens and enqueue a per-layer dynamic replica plan when enabled."""
         if not self.layer_load_balancer:
             return token_selected_experts
 
-        gap_hook = getattr(self, "_rebalance_plan_gap_hook", None)
-        if gap_hook is not None:
-            # The hook is one-shot: DeepSeekV4 falls back to ordinary shared
-            # expert execution if routing exits before consuming it.
-            self._rebalance_plan_gap_hook = None
-        route = self.layer_load_balancer.route
-        if gap_hook is not None:
-            return route(token_selected_experts, use_dp, gap_hook=gap_hook)
-        return route(token_selected_experts, use_dp)
+        overlap_fn = self._load_balancer_overlap_fn
+        if overlap_fn is None:
+            return self.layer_load_balancer.route(token_selected_experts,
+                                                  use_dp)
+        self._load_balancer_overlap_fn = None
+        return self.layer_load_balancer.route(token_selected_experts,
+                                              use_dp,
+                                              overlap_fn=overlap_fn)
 
     def _load_balancer_uses_replica_plan(self) -> bool:
         """Whether routing is produced by the per-layer dynamic device planner."""
-        return bool(self.layer_load_balancer and callable(
-            getattr(self.layer_load_balancer, "require_replica_plan", None)))
+        return bool(self.layer_load_balancer
+                    and self.layer_load_balancer.produces_replica_plan)
 
     def _load_balancer_replica_plan(self):
         """Return the plan produced by the most recent route, if this mode has one."""
@@ -730,11 +752,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         """Release a caller-owned plan after its last MAIN-stream consumer."""
         if plan is None or not self.layer_load_balancer:
             return
-        finish = getattr(self.layer_load_balancer, "finish_replica_plan", None)
-        if not callable(finish):
-            raise RuntimeError(
-                "an EPLB replica plan was produced without a finish method")
-        finish(plan)
+        self.layer_load_balancer.finish_replica_plan(plan)
 
     def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
         """Start CPU stage in load balancer."""

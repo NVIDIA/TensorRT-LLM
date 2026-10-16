@@ -16,11 +16,14 @@ from typing import Any, Callable, Optional, Sequence
 
 import torch
 
-from .moe_load_balancer import MoeLoadBalancer
+from .moe_load_balancer import BaseMoeLoadBalancer
 
 
 class PerLayerDynamicMoeLayerLoadBalancer:
     """Adapter between the common MoE routing seam and one replica planner."""
+
+    # ``route`` publishes a ``MoEReplicaPlan`` that the caller must finish.
+    produces_replica_plan = True
 
     def __init__(
         self,
@@ -159,9 +162,38 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self._scheduler_group = scheduler_group
         self.manager._register_runtime(self)
 
+    def allocate_arena(
+        self,
+        *,
+        bundle: Any,
+        ep_process_group: Any,
+        mapping: Any,
+        device: int,
+        layer_idx: Optional[int],
+    ) -> Any:
+        """Allocate this layer's H + S live-weight arena from model-owned resources.
+
+        Collective across the EP group: every rank calls it from the same point
+        of the backend's ``create_weights``, after the symmetric-buffer
+        rendezvous and before the kernel-plane Parameters are registered.
+        ``bundle`` is the quant method's live-weight plane spec.
+        """
+        from .mega_moe.rebalance_live_arena import allocate_rebalance_arena
+
+        return allocate_rebalance_arena(
+            home_experts=self.resident_experts_per_rank,
+            helper_slots=self.helper_slots_per_rank,
+            bundle=bundle,
+            ep_comm=self.manager.get_ep_comm(ep_process_group),
+            mapping=mapping,
+            provider=self.manager.create_arena_provider(),
+            device=int(device),
+            layer_idx=layer_idx,
+        )
+
     def bind_backend(self, backend: Any) -> None:
         """Build and own the producer after the backend's live aliases exist."""
-        arena = getattr(backend, "_rebalance_arena", None)
+        arena = backend.live_weight_arena
         if arena is None:
             raise RuntimeError("per-layer dynamic EPLB backend has no live arena")
         if self._arena is not None or self._scheduler_group is not None:
@@ -196,9 +228,20 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                 for plane in arena.tekit_alias_views:
                     for helper in range(int(arena.helper_slots)):
                         plane[home + helper].copy_(plane[helper % home], non_blocking=True)
-            backend._rebalance_autotune_helpers_initialized = True
 
-        scheduler_group = build_rebalance_slot_scheduler_group(backend)
+        # ``layer_idx`` is the backend's model layer index: shared-slot pools
+        # compare producers across ranks by it.
+        scheduler_group = build_rebalance_slot_scheduler_group(
+            arena=arena,
+            manager=self.manager,
+            mapping=backend.mapping,
+            ep_process_group=backend.ep_process_group,
+            home_experts=self.resident_experts_per_rank,
+            helper_slots=self.helper_slots_per_rank,
+            topk=self.top_k,
+            max_tokens_per_rank=backend.max_tokens_per_rank_capacity,
+            layer_idx=backend.layer_idx,
+        )
         self.bind_runtime(arena=arena, scheduler_group=scheduler_group)
         self._bound_backend_ref = backend_ref
 
@@ -211,30 +254,34 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         token_selected_experts: torch.Tensor,
         offset_by_ep_rank: bool = False,
         *,
-        gap_hook: Optional[Callable[[], None]] = None,
+        overlap_fn: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         """Submit HALO-Q/TMA and return its physical routes without a host wait.
 
-        A shared-expert hook runs after the copy stream is submitted but before
-        the physical routes are lent to the caller, preserving the intended
-        scheduler/copy overlap.
+        ``overlap_fn`` runs after the copy stream is submitted but before the
+        physical routes are lent to the caller, so independent main-stream work
+        such as shared experts overlaps planning and the helper-weight copy.
         """
         del offset_by_ep_rank  # HALO-Q consumes global logical expert IDs.
-        if gap_hook is not None and not callable(gap_hook):
-            raise TypeError("gap_hook must be callable")
+        if overlap_fn is not None and not callable(overlap_fn):
+            raise TypeError("overlap_fn must be callable")
         if self._scheduler_group is None or self._arena is None:
-            raise RuntimeError(f"dynamic EPLB layer {self.layer_idx} has no bound runtime")
+            raise RuntimeError(
+                f"per-layer dynamic EPLB layer {self.layer_idx} has no bound runtime"
+            )
         if self._pending_replica_plan is not None:
-            raise RuntimeError(f"dynamic EPLB layer {self.layer_idx} has an unfinished plan")
+            raise RuntimeError(
+                f"per-layer dynamic EPLB layer {self.layer_idx} has an unfinished plan"
+            )
 
-        if gap_hook is None:
+        if overlap_fn is None:
             physical, generation = self._scheduler_group.plan(
                 token_selected_experts, defer_wait=True
             )
         else:
             part = self._scheduler_group.plan_schedule(token_selected_experts)
             try:
-                gap_hook()
+                overlap_fn()
             except BaseException as error:  # noqa: BLE001
                 try:
                     self._scheduler_group.discard_plan(part)
@@ -248,7 +295,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                 if type(notes) is not list:
                     notes = []
                     error.__notes__ = notes
-                notes.append("Shared-expert hook failed after HALO-Q/TMA enqueue; " + cleanup_note)
+                notes.append("overlap_fn failed after HALO-Q/TMA enqueue; " + cleanup_note)
                 raise
             physical, generation = self._scheduler_group.plan_finish(part, defer_wait=True)
         generation = int(generation)
@@ -269,7 +316,9 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
     def require_replica_plan(self) -> Any:
         if self._pending_replica_plan is None:
-            raise RuntimeError(f"dynamic EPLB layer {self.layer_idx} has not produced a plan")
+            raise RuntimeError(
+                f"per-layer dynamic EPLB layer {self.layer_idx} has not produced a plan"
+            )
         return self._pending_replica_plan
 
     def finish_replica_plan(
@@ -280,7 +329,9 @@ class PerLayerDynamicMoeLayerLoadBalancer:
     ) -> None:
         pending = self._pending_replica_plan
         if pending is None:
-            raise RuntimeError(f"dynamic EPLB layer {self.layer_idx} has no plan to finish")
+            raise RuntimeError(
+                f"per-layer dynamic EPLB layer {self.layer_idx} has no plan to finish"
+            )
         if plan is not None and plan is not pending:
             raise RuntimeError("attempted to finish a different replica plan")
         assert self._scheduler_group is not None
@@ -308,7 +359,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self._bound_backend_ref = None
 
 
-class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
+class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
     """Model-level owner for per-layer dynamic EPLB layers and GPU resources."""
 
     def __init__(
@@ -318,10 +369,9 @@ class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
         ep_size: int,
         config: Any,
         mapping: Optional[Any] = None,
-        ep_process_group: Optional[Any] = None,
     ) -> None:
-        # Deliberately do not call MoeLoadBalancer.__init__: per-layer dynamic EPLB
-        # has no C++ standard-EPLB object and must not create an MPI split.
+        # Per-layer dynamic EPLB has no C++ standard-EPLB object and creates no
+        # MPI split; its EP communicator is resolved by the first MoE layer.
         if ep_size <= 1 or not 0 <= ep_rank < ep_size:
             raise ValueError(f"invalid EPLB EP rank/size: rank={ep_rank}, size={ep_size}")
         num_slots = int(config.num_slots)
@@ -335,15 +385,13 @@ class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
         self.ep_size = int(ep_size)
         self.config = config
         self.mapping = mapping
-        self.ep_process_group = ep_process_group
         self.num_slots = num_slots
         self.num_local_slots = num_slots // ep_size
         self.auxiliary_sms = int(getattr(config, "auxiliary_sms", 8))
         if self.auxiliary_sms <= 0:
             raise ValueError("auxiliary_sms must be positive")
 
-        # Compatibility state used by existing context/engine call sites.
-        self.layer_updates_per_iter = 1
+        # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None
         self.single_layer_load_balancers: list[PerLayerDynamicMoeLayerLoadBalancer] = []
         self.next_layer_repeated_count: Optional[int] = None
@@ -366,11 +414,15 @@ class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
         # a Python finalizer cannot safely enter EP collectives.
         pass
 
+    def __repr__(self) -> str:
+        return (
+            f"PerLayerDynamicMoeLoadBalancer(ep_rank={self.ep_rank}, "
+            f"ep_size={self.ep_size}, num_slots={self.num_slots}, "
+            f"auxiliary_sms={self.auxiliary_sms})"
+        )
+
     def is_static_routing(self) -> bool:
         return False
-
-    def is_dynamic_routing(self) -> bool:
-        return True
 
     def set_repeated_for_next_layer(self, repeated_count: int) -> None:
         if repeated_count <= 0:
@@ -452,16 +504,6 @@ class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
         assert layer._arena is not None
         self.adopt_arena_provider(layer._arena.provider)
 
-    def set_iter_info(
-        self,
-        enable_statistic: Optional[bool],
-        enable_update_weights: Optional[bool],
-    ) -> None:
-        if enable_statistic is not None:
-            self.enable_statistic = bool(enable_statistic)
-        if enable_update_weights is not None:
-            self.enable_update_weights = bool(enable_update_weights)
-
     def start_iter(self) -> None:
         if self.in_iter:
             raise RuntimeError("already in a MoE load-balancer iteration")
@@ -479,10 +521,6 @@ class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
             raise RuntimeError(f"unfinished replica plans at iteration end: {unfinished}")
         self.in_iter = False
         self.iter_id += 1
-
-    def set_warmup(self, value: bool) -> None:
-        """Keep production HALO-Q/TMA planning active during warmup."""
-        del value
 
     def register_weight_slots_after_to_cuda(self) -> None:
         # Live aliases are registered by the per-layer dynamic arena binder.
@@ -517,11 +555,11 @@ class PerLayerDynamicMoeLoadBalancer(MoeLoadBalancer):
             return True
 
         # Agree on local readiness before any rank starts destructive teardown.
-        # This also covers managers that failed before their first pool existed.
+        # Every MoE layer resolves the EP communicator in create_weights, and a
+        # rank whose model load failed never owns an engine that reaches this
+        # method, so the communicator exists on every EP rank or on none.
         local_safe = bool(local_safe and not self.in_iter)
         comm = self._ep_comm
-        if comm is None and self.ep_process_group is not None:
-            comm = self.get_ep_comm(self.ep_process_group)
         if comm is not None:
             states = comm.allgather(
                 {

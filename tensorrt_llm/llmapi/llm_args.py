@@ -1853,7 +1853,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 class _MoeLoadBalancerConfigBase(StrictBaseModel):
     """Common slot layout and expert-parallel runtime state for EPLB."""
 
-    num_slots: Optional[int] = None
+    num_slots: Optional[int] = Field(
+        default=None,
+        description=
+        "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots."
+    )
     _ep_rank: Optional[int] = PrivateAttr(default=None)
     _ep_size: Optional[int] = PrivateAttr(default=None)
 
@@ -1903,12 +1907,22 @@ class _MoeLoadBalancerConfigBase(StrictBaseModel):
 class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     """Configure the standard asynchronous EPLB implementation."""
 
-    mode: Literal["standard"] = "standard"
+    mode: Literal["standard"] = Field(
+        default="standard",
+        description=
+        "EPLB mode. `standard` is static EPLB when `layer_updates_per_iter` is 0 and online EPLB otherwise. Configs without `mode` use `standard`.",
+        status="prototype")
     initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
         default=None,
         repr=False,
+        description=
+        "Initial expert placement keyed by MoE layer index. Each value has `num_slots` entries, gives the expert ID held by each global slot, and covers every expert."
     )
-    layer_updates_per_iter: int = 0
+    layer_updates_per_iter: int = Field(
+        default=0,
+        description=
+        "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB."
+    )
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
@@ -1932,14 +1946,22 @@ class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
 class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     """Configure per-layer dynamic EPLB with Halo-Q scheduling."""
 
-    mode: Literal["per_layer_dynamic"] = "per_layer_dynamic"
-    num_slots: PositiveInt
+    mode: Literal["per_layer_dynamic"] = Field(
+        default="per_layer_dynamic",
+        description=
+        "EPLB mode. `per_layer_dynamic` replicates each MoE layer's hot experts into helper slots in every forward pass, planned from that layer's current routing.",
+        status="prototype")
+    num_slots: PositiveInt = Field(
+        description=
+        "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and greater than the number of experts. Each rank keeps its `num_experts / ep_size` resident experts and adds `(num_slots - num_experts) / ep_size` helper slots. Unlike standard EPLB, the helper slots are not per-layer replica weights: they are two shared helper banks that all MoE layers alternate between and refill in every forward pass.",
+        status="prototype")
     auxiliary_sms: int = Field(
         default=8,
         ge=8,
         le=128,
-        description="SM budget shared serially by HALO-Q and in-switch copy.",
-    )
+        description=
+        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the HALO-Q scheduler and the in-switch copy kernel, which run one after the other on the copy stream. Must be smaller than the device SM count.",
+        status="prototype")
 
     def validate_expert_capacity(self, num_experts: int) -> None:
         """Validate that every EP rank has at least one helper slot."""

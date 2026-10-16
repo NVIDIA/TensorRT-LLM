@@ -421,6 +421,7 @@ def test_mpi_worker_retries_symm_release_before_destroying_process_group():
         )
         worker = worker_cls()
         worker.doing_shutdown = False
+        worker.rpc_server = None
         worker.engine = engine
         worker.llm_args = SimpleNamespace(backend="pytorch")
         worker._handle_background_error = lambda: events.append("background")
@@ -501,6 +502,7 @@ def test_mpi_worker_peer_cleanup_failure_blocks_later_collectives():
         )
         worker = worker_cls()
         worker.doing_shutdown = False
+        worker.rpc_server = None
         worker.engine = engine
         worker.llm_args = SimpleNamespace(backend="pytorch")
         worker._handle_background_error = lambda: events.append("background")
@@ -563,6 +565,7 @@ def test_mpi_worker_background_error_keeps_shutdown_committed(monkeypatch):
     )
     worker = worker_cls()
     worker.doing_shutdown = False
+    worker.rpc_server = None
     worker.engine = SimpleNamespace(
         shutdown_all_ranks=True,
         can_enqueue_requests=lambda: False,

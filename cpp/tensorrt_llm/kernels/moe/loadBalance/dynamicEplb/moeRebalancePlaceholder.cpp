@@ -30,7 +30,7 @@ namespace kernels
 
 void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const&, cudaStream_t)
 {
-    TLLM_THROW("Dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
+    TLLM_THROW("Per-layer dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
 }
 
 } // namespace kernels
@@ -93,7 +93,7 @@ extern "C" char const* megamoe_tma_copy_error_string(int error)
 {
     if (error == static_cast<int>(cudaErrorNotSupported))
     {
-        return "Dynamic EPLB TMA requires CUDA 13.1+ and a requested SM100, SM103, or SM107 target";
+        return "Per-layer dynamic EPLB TMA requires CUDA 13.1+ and a requested SM100, SM103, or SM107 target";
     }
     return cudaGetErrorString(static_cast<cudaError_t>(error));
 }

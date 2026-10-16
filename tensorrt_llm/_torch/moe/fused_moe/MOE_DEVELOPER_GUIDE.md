@@ -886,6 +886,20 @@ set wrong has a test that catches it:
   rollback must release the scheduler, TMA bindings, shared-slot mappings,
   and fabric allocations collectively. Forward execution must not retain
   activation tensors after their consumer has been enqueued.
+- Per-layer dynamic EPLB reuses the EPLB seams. `maybe_create_moe_load_balancer`
+  builds `PerLayerDynamicMoeLoadBalancer`, which shares the
+  `BaseMoeLoadBalancer` lifecycle with `MoeLoadBalancer` (context entry,
+  `set_iter_info`, `start_iter`/`end_iter`, collective `shutdown`); warmup
+  reaches it only through `set_iter_info`. `add_layer` returns a
+  `PerLayerDynamicMoeLayerLoadBalancer` with `produces_replica_plan = True`:
+  `_load_balancer_route` plans, the backend reads `MoERunContext.replica_plan`,
+  and the scheduler finishes the plan after each chunk's `run_moe`. Model code
+  passes independent main-stream work such as shared experts through
+  `MoE.load_balancer_overlap(fn)`; the route runs it once, after submitting the
+  copy stream. The backend allocates its live-weight arena through the layer
+  handle's `allocate_arena` and exposes `live_weight_arena`,
+  `ep_process_group`, and `max_tokens_per_rank_capacity` to `bind_backend`
+  instead of private attributes.
 - Per-layer dynamic EPLB selects the fused shared FC12 kernel only when the routed
   backend declares per-layer dynamic support and the final projection
   quantization, hardware, and graph mode support that kernel. Other runs keep

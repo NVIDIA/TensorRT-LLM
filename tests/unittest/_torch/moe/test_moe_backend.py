@@ -17,7 +17,6 @@
 import collections
 import dataclasses
 import importlib
-import inspect
 import itertools
 import logging
 import os
@@ -2117,16 +2116,14 @@ def test_megamoe_rejects_expand_before_provider_allocation(monkeypatch):
     moe.ep_size = 2
     allocate_provider = MagicMock()
     moe._alloc_symm_provider = allocate_provider
-    create_arena_provider = MagicMock()
-    moe.layer_load_balancer = SimpleNamespace(
-        manager=SimpleNamespace(create_arena_provider=create_arena_provider)
-    )
+    allocate_arena = MagicMock()
+    moe.layer_load_balancer = SimpleNamespace(allocate_arena=allocate_arena)
 
     with pytest.raises(ValueError, match="expand_intermediate == 2"):
         moe.create_weights()
 
     allocate_provider.assert_not_called()
-    create_arena_provider.assert_not_called()
+    allocate_arena.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -2336,6 +2333,10 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     )
     moe._rebalance_slots_active = 2
     moe._rebalance_arena = arena
+    moe._ep_pg = object()
+    moe._maxt_buckets = [64, 128]
+    moe.mapping = SimpleNamespace(local_rank=0)
+    moe.layer_idx = 5
     moe.layer_load_balancer = layer
     builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
     monkeypatch.setattr(
@@ -2350,7 +2351,17 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     assert moe.quant_method.cache_derived_state.call_count == 2
     assert arena.assert_identity.call_count == 2
     assert moe.quant_method.assert_live_weight_aliases.call_count == 2
-    builder.assert_called_once_with(moe)
+    builder.assert_called_once_with(
+        arena=arena,
+        manager=manager,
+        mapping=moe.mapping,
+        ep_process_group=moe._ep_pg,
+        home_experts=4,
+        helper_slots=2,
+        topk=2,
+        max_tokens_per_rank=128,
+        layer_idx=5,
+    )
 
 
 @pytest.mark.cpu_only
@@ -2413,12 +2424,6 @@ def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
 
     assert lease.proved_generation == 1
     assert trace[-1] == "prove_reuse"
-
-
-@pytest.mark.cpu_only
-def test_rebalance_scheduler_group_requires_ep_process_group():
-    parameters = inspect.signature(RebalanceSlotSchedulerGroup.__init__).parameters
-    assert "ep_process_group" in parameters
 
 
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():

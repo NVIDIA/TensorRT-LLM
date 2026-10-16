@@ -419,47 +419,41 @@ class RebalanceSlotSchedulerGroup:
         self._finished_generation = self._generation
 
 
-def build_rebalance_slot_scheduler_group(backend: Any) -> RebalanceSlotSchedulerGroup:
-    """Build the layer's scheduler/copy group after its live arena exists."""
-    arena = getattr(backend, "_rebalance_arena", None)
-    if arena is None:
-        raise RuntimeError(
-            "MoE rebalance requires create_weights to allocate the live arena "
-            "before building the producer group."
-        )
-    home = getattr(backend, "_rebalance_home_experts", None)
-    if type(home) is not int or home <= 0:
-        raise RuntimeError(
-            f"MoE rebalance requires a positive resident expert count; got {home!r}."
-        )
-    layer_balancer = getattr(backend, "layer_load_balancer", None)
-    manager = getattr(layer_balancer, "manager", None)
-    get_copy_stream = getattr(manager, "get_copy_stream", None)
-    get_ep_comm = getattr(manager, "get_ep_comm", None)
-    if not callable(get_copy_stream) or not callable(get_ep_comm):
-        raise RuntimeError(
-            "per-layer dynamic EPLB scheduler requires model-owned stream and communicator"
-        )
+def build_rebalance_slot_scheduler_group(
+    *,
+    arena: Any,
+    manager: Any,
+    mapping: Any,
+    ep_process_group: Any,
+    home_experts: int,
+    helper_slots: int,
+    topk: int,
+    max_tokens_per_rank: int,
+    layer_idx: Optional[int],
+) -> RebalanceSlotSchedulerGroup:
+    """Build one layer's scheduler/copy group from its manager's resources.
+
+    The manager supplies the model-owned EP communicator, copy stream and
+    auxiliary SM budget; the communicator is resolved before the stream.
+    """
+    device = int(mapping.local_rank)
     return RebalanceSlotSchedulerGroup(
         arena=arena,
-        mapping=backend.mapping,
-        ep_comm=get_ep_comm(backend._ep_pg),
-        home_experts=home,
-        helper_slots=int(backend._rebalance_slots_active),
-        max_tokens_per_rank=int(backend._maxt_buckets[-1]),
-        topk=int(backend.routing_method.experts_per_token),
-        device=int(backend.mapping.local_rank),
-        copy_stream=get_copy_stream(int(backend.mapping.local_rank)),
+        mapping=mapping,
+        ep_comm=manager.get_ep_comm(ep_process_group),
+        home_experts=int(home_experts),
+        helper_slots=int(helper_slots),
+        max_tokens_per_rank=int(max_tokens_per_rank),
+        topk=int(topk),
+        device=device,
+        copy_stream=manager.get_copy_stream(device),
         auxiliary_sms=int(manager.auxiliary_sms),
-        layer_idx=getattr(backend, "layer_idx", None),
+        layer_idx=layer_idx,
     )
 
 
-def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
+def bind_live_weight_planes(quant_method: Any, module: Any, arena: Any) -> None:
     """Alias MegaMoE's seven live parameters onto its rebalance arena."""
-    arena = getattr(module, "_rebalance_arena", None)
-    if arena is None:
-        return
     expected_bundle = quant_method.live_weight_plane_spec(module)
     if expected_bundle != arena.bundle:
         raise RuntimeError("MoE rebalance arena does not match the quant-method plane spec")

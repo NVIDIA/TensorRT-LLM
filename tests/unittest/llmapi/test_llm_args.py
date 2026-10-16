@@ -401,7 +401,11 @@ class TestMoeConfigPerLayerDynamicEplb:
 
         config_path = tmp_path / "eplb.yaml"
         config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
-        monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES", raising=False)
+        # The code under test writes os.environ. Seed the key first so that
+        # monkeypatch records the caller's state and removes "4x" on teardown;
+        # delenv alone records nothing when the key is absent.
+        monkeypatch.setenv("CUDA_SCALE_LAUNCH_QUEUES", "")
+        monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES")
         monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
 
         config = MoeConfig(load_balancer=str(config_path))

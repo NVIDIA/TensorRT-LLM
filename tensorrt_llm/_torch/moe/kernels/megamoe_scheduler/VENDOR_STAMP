@@ -1,6 +1,0 @@
-upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy.git
-locked_commit: 4dc8616031b18dd948bdf11b49afe0d86be15e22
-project: MegaMoE HALO-Q scheduler and SAMI runtime
-original_authors: Jintao Peng <jintaop@nvidia.com>; Ethan Zhang
-license: Apache-2.0
-managed_by: 3rdparty/vendor_sources.lock.yaml

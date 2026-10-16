@@ -7,10 +7,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler import (
     RebalanceSlotSchedulerGroup,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    BaseMoeLoadBalancer,
+    MoeLoadBalancer,
     MoeLoadBalancerIterContext,
     get_moe_load_balancer,
     maybe_create_moe_load_balancer,
@@ -63,8 +66,12 @@ class _Arena:
 
 class _Backend:
     def __init__(self, arena):
-        self._rebalance_arena = arena
+        self.live_weight_arena = arena
         self.tactic_autotune = False
+        self.mapping = SimpleNamespace(local_rank=0)
+        self.ep_process_group = object()
+        self.max_tokens_per_rank_capacity = 256
+        self.layer_idx = 9
 
 
 class _Group:
@@ -156,7 +163,7 @@ def test_layer_produces_and_finishes_replica_plan():
     assert layer.replica_plan is None
 
 
-def test_gap_hook_runs_between_schedule_and_plan_finish():
+def test_overlap_fn_runs_between_schedule_and_plan_finish():
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     arena = _Arena()
@@ -164,13 +171,13 @@ def test_gap_hook_runs_between_schedule_and_plan_finish():
     layer.bind_runtime(arena=arena, scheduler_group=group)
 
     logical = torch.tensor([[0, 1]], dtype=torch.int32)
-    physical = layer.route(logical, gap_hook=lambda: group.events.append("hook"))
+    physical = layer.route(logical, overlap_fn=lambda: group.events.append("overlap"))
     torch.testing.assert_close(physical, logical + 4)
-    assert group.events == ["schedule", "hook", "finish"]
+    assert group.events == ["schedule", "overlap", "finish"]
     layer.finish_replica_plan()
 
 
-def test_gap_hook_failure_discards_generation_and_adds_context():
+def test_overlap_fn_failure_discards_generation_and_adds_context():
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     group = _Group()
@@ -180,10 +187,43 @@ def test_gap_hook_failure_discards_generation_and_adds_context():
         raise RuntimeError("shared expert failed")
 
     with pytest.raises(RuntimeError, match="shared expert failed") as caught:
-        layer.route(torch.tensor([[0, 1]], dtype=torch.int32), gap_hook=fail)
+        layer.route(torch.tensor([[0, 1]], dtype=torch.int32), overlap_fn=fail)
     assert group.events == ["schedule", "discard"]
     assert "safely released" in caught.value.__notes__[0]
     assert layer.replica_plan is None
+
+
+def test_load_balancer_overlap_is_consumed_once_and_always_cleared():
+    calls = []
+
+    class _Layer:
+        produces_replica_plan = True
+
+        def route(self, routes, offset_by_ep_rank, *, overlap_fn=None):
+            calls.append(overlap_fn)
+            return routes
+
+    moe = SimpleNamespace(layer_load_balancer=_Layer(), _load_balancer_overlap_fn=None)
+    routes = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    def overlap():
+        pass
+
+    with MoE.load_balancer_overlap(moe, overlap):
+        MoE._load_balancer_route(moe, routes, False)
+        MoE._load_balancer_route(moe, routes, False)
+    assert calls == [overlap, None]
+    assert moe._load_balancer_overlap_fn is None
+
+    with pytest.raises(RuntimeError, match="routed path failed"):
+        with MoE.load_balancer_overlap(moe, overlap):
+            raise RuntimeError("routed path failed")
+    assert moe._load_balancer_overlap_fn is None
+
+    with pytest.raises(TypeError, match="overlap_fn must be callable"):
+        with MoE.load_balancer_overlap(moe, None):
+            pass
+    assert MoE._load_balancer_uses_replica_plan(moe)
 
 
 def test_layer_disables_standard_host_migration_and_checks_geometry():
@@ -221,7 +261,19 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
     layer.bind_backend(backend)
     layer.bind_backend(backend)
 
-    builder.assert_called_once_with(backend)
+    # The group is built from the layer's geometry, the manager's resources and
+    # the backend's public facts; layer_idx stays the backend's model index.
+    builder.assert_called_once_with(
+        arena=arena,
+        manager=manager,
+        mapping=backend.mapping,
+        ep_process_group=backend.ep_process_group,
+        home_experts=4,
+        helper_slots=2,
+        topk=2,
+        max_tokens_per_rank=256,
+        layer_idx=9,
+    )
     assert layer._arena is arena
     assert layer._scheduler_group is group
 
@@ -245,11 +297,11 @@ def test_bind_backend_rejects_different_backend_or_arena_before_construction(
 
     with pytest.raises(RuntimeError, match="different backend"):
         layer.bind_backend(_Backend(arena))
-    backend._rebalance_arena = _Arena()
+    backend.live_weight_arena = _Arena()
     with pytest.raises(RuntimeError, match="changed its rebalance arena"):
         layer.bind_backend(backend)
 
-    builder.assert_called_once_with(backend)
+    builder.assert_called_once()
 
 
 def test_iteration_context_reuses_common_lifecycle():
@@ -340,6 +392,63 @@ def test_ep_communicator_is_model_owned(monkeypatch):
     assert first.validations == [(0, 4), (0, 4)]
     with pytest.raises(RuntimeError, match="cannot span EP ProcessGroups"):
         manager.get_ep_comm(object())
+
+
+def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_live_arena
+
+    manager = _manager()
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
+    order = []
+    process_group, comm, provider, arena = object(), object(), object(), object()
+
+    def get_ep_comm(group):
+        assert group is process_group
+        order.append("ep_comm")
+        return comm
+
+    def create_arena_provider():
+        order.append("provider")
+        return provider
+
+    monkeypatch.setattr(manager, "get_ep_comm", get_ep_comm)
+    monkeypatch.setattr(manager, "create_arena_provider", create_arena_provider)
+    allocate = MagicMock(return_value=arena)
+    monkeypatch.setattr(rebalance_live_arena, "allocate_rebalance_arena", allocate)
+    bundle, mapping = object(), object()
+
+    allocated = layer.allocate_arena(
+        bundle=bundle,
+        ep_process_group=process_group,
+        mapping=mapping,
+        device=1,
+        layer_idx=7,
+    )
+
+    assert allocated is arena
+    assert order == ["ep_comm", "provider"]
+    allocate.assert_called_once_with(
+        home_experts=4,
+        helper_slots=2,
+        bundle=bundle,
+        ep_comm=comm,
+        mapping=mapping,
+        provider=provider,
+        device=1,
+        layer_idx=7,
+    )
+
+
+def test_per_layer_dynamic_manager_shares_the_base_lifecycle_only():
+    manager = _manager()
+    assert isinstance(manager, BaseMoeLoadBalancer)
+    assert not isinstance(manager, MoeLoadBalancer)
+    assert manager.is_dynamic_routing()
+    assert repr(manager) == (
+        "PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, num_slots=24, auxiliary_sms=8)"
+    )
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
+    assert layer.produces_replica_plan
 
 
 def test_factory_selects_per_layer_dynamic_manager():

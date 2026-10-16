@@ -42,7 +42,7 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
@@ -270,7 +270,7 @@ class ModelEngine:
         model_weights_restore_mode,
     ) -> None:
         """Load the model, or take the given one, at the requested capacity."""
-        self.moe_load_balancer: MoeLoadBalancer | None = None
+        self.moe_load_balancer: BaseMoeLoadBalancer | None = None
         if model is None:
             lora_config: LoraConfig | None = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
@@ -289,7 +289,7 @@ class ModelEngine:
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
             )
-            if isinstance(moe_load_balancer, MoeLoadBalancer):
+            if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
@@ -936,9 +936,6 @@ class ModelEngine:
             self.moe_load_balancer.set_iter_info(
                 enable_statistic=not in_warmup, enable_update_weights=not in_warmup
             )
-            set_warmup = getattr(self.moe_load_balancer, "set_warmup", None)
-            if callable(set_warmup):
-                set_warmup(in_warmup)
 
     @contextmanager
     def warmup_scope(self) -> Iterator[None]:
