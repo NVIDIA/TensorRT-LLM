@@ -45,7 +45,6 @@ SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUDA_MAX_GRID_DIM_Z = 65_535
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
-_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
 # Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
 # The Blackwell act-fusion op accepts Optional[float] directly.
@@ -193,10 +192,12 @@ def _get_sm107_nvfp4_default_mma_config(
 
 @functools.lru_cache(maxsize=1)
 def _get_cutedsl_fc2_n_tile_size_override() -> Optional[int]:
-    value = os.environ.get(
-        _CUTEDSL_FC2_N_TILE_SIZE_ENV,
-        str(_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE),
-    )
+    """Return the FC2 N tile pinned by the user, or None to autotune over all of them.
+
+    Unset and ``0`` both autotune. ``128`` or ``256`` pins that tile for shapes
+    where it is known to win end to end.
+    """
+    value = os.environ.get(_CUTEDSL_FC2_N_TILE_SIZE_ENV, "0")
     if value == "0":
         return None
     valid_values = tuple(
@@ -14268,7 +14269,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             raise ValueError(
                                 f"bias must be a 1-D tensor of shape [N]={c_tensor.shape[-1]}, "
                                 f"got shape {tuple(bias.shape)}")
-                        c_tensor = c_tensor + bias
+                        c_tensor.add_(bias)
                     return c_tensor
                 elif locality_domain_half_gemm:
                     # c already written via stride — no copy needed
@@ -14517,106 +14518,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> torch.Tensor:
             return input.new_empty((input.shape[0], weight.shape[0]),
                                    dtype=torch.float8_e4m3fn)
-
-        @torch.library.custom_op(
-            "trtllm::cute_dsl_nvfp4_gemm_rubin",
-            mutates_args=(),
-            device_types="cuda",
-            schema=
-            "(Tensor input, Tensor weight, Tensor input_scale, Tensor weight_scale, Tensor alpha, "
-            "ScalarType output_dtype, bool to_userbuffers=False, bool use_tvm_ffi=True, "
-            "Tensor? output_tensor=None, SymInt partition_id=-1) -> Tensor?")
-        def cute_dsl_nvfp4_gemm_rubin(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            input_scale: torch.Tensor,
-            weight_scale: torch.Tensor,
-            alpha: torch.Tensor,
-            output_dtype: torch.dtype,
-            to_userbuffers: bool = False,
-            use_tvm_ffi: bool = True,
-            output_tensor: Optional[torch.Tensor] = None,
-            partition_id: int = -1,
-        ) -> Optional[torch.Tensor]:
-            """CuteDSL-based NVFP4 GEMM optimized for Rubin (SM107).
-
-            Args:
-                input: Activation tensor [m, k] in FP4 format (packed in uint8)
-                weight: Weight tensor [n, k] in FP4 format (packed in uint8)
-                input_scale: Activation scale factors
-                weight_scale: Weight scale factors
-                alpha: Scaling factor
-                output_tensor: Deprecated. Use cute_dsl_nvfp4_gemm_inplace_rubin for locality domain inplace mode.
-                output_dtype: Output data type (must be bfloat16)
-                to_userbuffers: Whether to allocate output from UserBuffers pool
-                use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
-                partition_id: Must be -1 for this non-mutating op.
-
-            Note:
-                This function is primarily used internally by nvfp4_gemm.
-                Direct usage is discouraged. Consider using nvfp4_gemm instead
-                for automatic backend selection with better performance.
-            """
-            # Validate SM version before attempting to use CuteDSL
-            if (sm_version := get_sm_version()) != 107:
-                raise ValueError(
-                    f"CuteDSL NVFP4 Rubin backend requires SM 107, but got SM {sm_version}. "
-                    f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
-                )
-
-            tuner = AutoTuner.get()
-
-            if output_tensor is None:
-                if partition_id != -1:
-                    raise ValueError(
-                        "partition_id must be -1 when output_tensor is not provided."
-                    )
-                runner = CuteDSLNVFP4RubinLinear(output_dtype, to_userbuffers,
-                                                 use_tvm_ffi)
-                inputs = [input, weight, input_scale, weight_scale, alpha]
-                _, best_tactic = tuner.choose_one(
-                    "trtllm::cute_dsl_nvfp4_gemm_rubin",
-                    [runner],
-                    runner.__class__.tuning_config,
-                    inputs,
-                )
-                return runner(inputs, tactic=best_tactic)
-            else:
-                raise ValueError(
-                    "output_tensor mode mutates its output and must use "
-                    "torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin instead."
-                )
-
-        @torch.library.register_fake("trtllm::cute_dsl_nvfp4_gemm_rubin")
-        def _(
-            mat_a: torch.Tensor,
-            mat_b: torch.Tensor,
-            input_scale: torch.Tensor,
-            weight_scale: torch.Tensor,
-            alpha: torch.Tensor,  # Match custom op signature
-            output_dtype: torch.dtype,
-            to_userbuffers: bool = False,
-            use_tvm_ffi: bool = True,
-            output_tensor: Optional[torch.Tensor] = None,
-            partition_id: int = -1,
-        ) -> Optional[torch.Tensor]:
-            # [m, k]
-            shape = list(mat_a.shape)
-            # [n, k]
-            shape[-1] = mat_b.shape[-2]
-            # output is fixed as bf16
-            ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
-            if output_tensor is None:
-                if partition_id != -1:
-                    raise ValueError(
-                        "partition_id must be -1 when output_tensor is not provided."
-                    )
-                return ret
-            else:
-                raise ValueError(
-                    "output_tensor mode mutates its output and must use "
-                    "torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin instead."
-                )
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_nvfp4_gemm_inplace_rubin",
