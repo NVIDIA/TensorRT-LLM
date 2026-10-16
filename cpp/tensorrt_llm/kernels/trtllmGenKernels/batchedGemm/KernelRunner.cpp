@@ -308,6 +308,17 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             continue;
         }
 
+        // Cubins combining split-K with the fine-grained protocol exist but fail to launch with
+        // CUDA_ERROR_INVALID_VALUE, so they are rejected here rather than at launch.
+        if (mOptions.fineGrainedProducer || mOptions.fineGrainedConsumerA || mOptions.fineGrainedConsumerB)
+        {
+            if (!acceptIf(options.mNumSlicesForSplitK == 1,
+                    fmtstr("split-K unsupported for fine-grained kernels (kernel: %d)", options.mNumSlicesForSplitK)))
+            {
+                continue;
+            }
+        }
+
         // Kernel passed all filters
         mPassingConfigIndices.push_back(i);
     }
