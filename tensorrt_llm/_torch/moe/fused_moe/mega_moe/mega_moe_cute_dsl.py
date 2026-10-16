@@ -279,7 +279,6 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
 # ``_to_cute``.
 
 
-# The launch path memoizes these dtype views without copying their storage.
 def _as_nvfp4(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.float4_e2m1fn_x2 else t.view(torch.float4_e2m1fn_x2)
 
@@ -652,7 +651,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._per_layer_dynamic_eplb_config = (
             load_balancer if getattr(load_balancer, "mode", None) == "per_layer_dynamic" else None
         )
-        self._rebalance_autotune_helpers_initialized = False
         self._rebalance_slots_active = 0
         if self._per_layer_dynamic_eplb_config is not None:
             ep_size = int(self.ep_size)
@@ -684,7 +682,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 self._quantize_reserved_sms = self._rebalance_reserved_sms
             else:
                 logger.warning_once(
-                    "fp4_quantize.sm_budget is unavailable; DynamicEPLB "
+                    "fp4_quantize.sm_budget is unavailable; per-layer dynamic EPLB "
                     "quantization will use the selected backend without SM control",
                     key="dynamic_eplb_quantize_without_sm_budget",
                 )
@@ -774,10 +772,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # scalar would reset the wrong buffer when buckets alternate).
         self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
         self._last_staged_T: Dict[int, int] = {}
-        # Cache immutable provider regions and dtype views, retaining their owners.
-        # Hits validate object identity; dtype views also detect storage rebinding.
-        self._regions_memo: Dict[int, Tuple] = {}
-        self._dtype_view_memo: Dict[Tuple, Tuple] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -800,6 +794,24 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"creation: expected H={recorded_home}, got H={resident_experts}."
             )
         return resident_experts + int(self._rebalance_slots_active)
+
+    # ------------------------------------------------------------------
+    # Facts the per-layer dynamic EPLB layer handle binds against
+    # ------------------------------------------------------------------
+    @property
+    def live_weight_arena(self):
+        """The H + S arena that the live kernel planes alias, or ``None``."""
+        return self._rebalance_arena
+
+    @property
+    def ep_process_group(self):
+        """The EP ProcessGroup resolved at construction, or ``None`` on one rank."""
+        return self._ep_pg
+
+    @property
+    def max_tokens_per_rank_capacity(self) -> int:
+        """The largest per-rank token count of any launch bucket."""
+        return int(self._maxt_buckets[-1])
 
     # ------------------------------------------------------------------
     # Topology
@@ -1105,26 +1117,21 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self._alloc_symm_provider()
         # Allocate the H + S arena before the quant method creates the seven
         # kernel-plane Parameters. Source/checkpoint Parameters remain H rows.
-        if self._rebalance_slots_active > 0 and getattr(self, "_rebalance_arena", None) is None:
-            # The hierarchical multicast arena: one multicast group per HALO
-            # level, rather than one per (source, destination) pair.
-            from .rebalance_live_arena import allocate_rebalance_arena
-
+        if self._rebalance_slots_active > 0 and self._rebalance_arena is None:
+            # The layer handle allocates the hierarchical multicast arena (one
+            # multicast group per HALO level, rather than one per source and
+            # destination pair) from model-owned resources.
             layer_balancer = getattr(self, "layer_load_balancer", None)
-            manager = getattr(layer_balancer, "manager", None)
-            create_provider = getattr(manager, "create_arena_provider", None)
-            if not callable(create_provider):
-                raise RuntimeError("per-layer dynamic EPLB requires a model-owned arena provider")
-            get_ep_comm = getattr(manager, "get_ep_comm", None)
-            if not callable(get_ep_comm):
-                raise RuntimeError("per-layer dynamic EPLB requires a model-owned EP communicator")
-            self._rebalance_arena = allocate_rebalance_arena(
-                home_experts=int(self._rebalance_home_experts),
-                helper_slots=int(self._rebalance_slots_active),
+            allocate_arena = getattr(layer_balancer, "allocate_arena", None)
+            if not callable(allocate_arena):
+                raise RuntimeError(
+                    "per-layer dynamic EPLB requires a layer load balancer that "
+                    "allocates the live-weight arena"
+                )
+            self._rebalance_arena = allocate_arena(
                 bundle=live_weight_plane_spec,
-                ep_comm=get_ep_comm(self._ep_pg),
+                ep_process_group=self._ep_pg,
                 mapping=self.mapping,
-                provider=create_provider(),
                 device=int(self.mapping.local_rank),
                 layer_idx=self.layer_idx,
             )
@@ -1133,7 +1140,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if self._rebalance_arena is not None:
             from .rebalance_slot_scheduler import bind_live_weight_planes
 
-            bind_live_weight_planes(self.quant_method, self)
+            bind_live_weight_planes(self.quant_method, self, self._rebalance_arena)
         # Step 4.
         self._weights_created = True
 
@@ -1630,33 +1637,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         cached[cache_key] = staging
         return staging
 
-    def _memo_regions(self, provider):
-        """Cache views of an immutable provider, retaining its identity and lifetime."""
-        key = id(provider)
-        hit = self._regions_memo.get(key)
-        # Retain the provider and check identity to prevent object-ID reuse.
-        if hit is not None and hit[0] is provider:
-            return hit[1]
-        regions = provider.get_regions()
-        self._regions_memo[key] = (provider, regions)
-        return regions
-
-    def _memo_dtype_view(self, t: torch.Tensor, caster) -> torch.Tensor:
-        """Cache dtype views while retaining the source tensor.
-
-        In-place helper-weight copies remain visible through these aliases.
-        Storage rebinding must invalidate the cached view even if identity matches.
-        """
-        key = (id(t), caster)
-        hit = self._dtype_view_memo.get(key)
-        # Check identity and data_ptr: assigning Parameter.data can replace storage
-        # without changing the object. These dtype views preserve shape and stride.
-        if hit is not None and hit[0] is t and hit[1].data_ptr() == t.data_ptr():
-            return hit[1]
-        v = caster(t)
-        self._dtype_view_memo[key] = (t, v)
-        return v
-
     def _acquire_buffers(
         self, *, top_k: int, hidden: int, device, output_dtype, launch_max_T: int
     ) -> _MegaMoeBuffers:
@@ -1708,7 +1688,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"{provider.num_topk} but run_moe called with "
                 f"top_k={top_k}; recreate the backend."
             )
-        regions = self._memo_regions(provider)
+        regions = provider.get_regions()
         return _MegaMoeBuffers(
             activation=regions.activation,
             activation_sf=regions.activation_sf,
@@ -1843,8 +1823,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if in_kernel_fc2_reduce and num_tokens > 0:
             combine_output[:num_tokens].zero_()
 
-        # Do not memoize scratch-provider regions: a strong reference would keep
-        # its multi-GiB allocation alive after profiling scratch is released.
         set_active_megamoe_profiling_scratch(
             scratch_provider.get_regions()
             if (scratch_provider is not None and world_size > 1)
@@ -1875,16 +1853,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._wait_rebalance_routes(replica_plan)
         try:
             torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
-                # Activations are per-forward allocations; only persistent weights
-                # belong in the strong-reference dtype-view memo.
                 activation=_as_nvfp4(activation),
                 activation_sf=_as_fp8_sf(activation_sf),
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
-                fc1_weight=self._memo_dtype_view(weight_view.fc1_weight, _as_nvfp4),
-                fc1_weight_sf=self._memo_dtype_view(weight_view.fc1_weight_sf, _as_fp8_sf),
-                fc2_weight=self._memo_dtype_view(weight_view.fc2_weight, _as_nvfp4),
-                fc2_weight_sf=self._memo_dtype_view(weight_view.fc2_weight_sf, _as_fp8_sf),
+                fc1_weight=_as_nvfp4(weight_view.fc1_weight),
+                fc1_weight_sf=_as_fp8_sf(weight_view.fc1_weight_sf),
+                fc2_weight=_as_nvfp4(weight_view.fc2_weight),
+                fc2_weight_sf=_as_fp8_sf(weight_view.fc2_weight_sf),
                 fc1_alpha=weight_view.fc31_alpha,
                 fc2_alpha=weight_view.fc2_alpha,
                 fc1_norm_const=weight_view.fc1_norm_const,

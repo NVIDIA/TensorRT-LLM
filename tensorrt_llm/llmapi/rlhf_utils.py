@@ -8,7 +8,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import serialization
@@ -211,7 +211,7 @@ class WorkerExtension:
                 logger.info("Finalize update weights")
                 self.finalize_weight_update()
                 moe_load_balancer = getattr(self.engine.model_engine, "moe_load_balancer", None)
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()

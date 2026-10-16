@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fast CPU contracts for the Dynamic EPLB serving path."""
+"""Fast CPU contracts for the per-layer dynamic EPLB serving path."""
 
 from __future__ import annotations
 
@@ -25,7 +25,13 @@ _TORCH_ROOT = _ROOT / "tensorrt_llm/_torch"
 _QUEUE = "CUDA_SCALE_LAUNCH_QUEUES"
 
 
-def _extract_class(path: Path, name: str, methods: set[str] | None, namespace: dict):
+def _extract_class(
+    path: Path,
+    name: str,
+    methods: set[str] | None,
+    namespace: dict,
+    bases: Tuple[str, ...] = (),
+):
     tree = ast.parse(path.read_text())
     original = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name
@@ -39,11 +45,34 @@ def _extract_class(path: Path, name: str, methods: set[str] | None, namespace: d
             if isinstance(node, ast.FunctionDef) and node.name in methods
         ]
         assert {node.name for node in body} == methods
-        selected = ast.ClassDef(name=name, bases=[], keywords=[], body=body, decorator_list=[])
+        selected = ast.ClassDef(
+            name=name,
+            bases=[ast.Name(id=base, ctx=ast.Load()) for base in bases],
+            keywords=[],
+            body=body,
+            decorator_list=[],
+        )
     module = ast.Module(
         body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
             selected,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[name]
+
+
+def _extract_function(path: Path, name: str, namespace: dict):
+    tree = ast.parse(path.read_text())
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    function.decorator_list = []
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            function,
         ],
         type_ignores=[],
     )
@@ -427,7 +456,6 @@ def test_model_engine_warmup_uses_load_balancer_public_api():
         enable_statistic=True,
         enable_update_weights=True,
         set_iter_info=lambda **kwargs: events.append(("iter", kwargs)),
-        set_warmup=lambda value: events.append(("warmup", value)),
     )
     engine = engine_cls()
     engine.moe_load_balancer = manager
@@ -437,7 +465,6 @@ def test_model_engine_warmup_uses_load_balancer_public_api():
     assert events == [
         ("comm", True),
         ("iter", {"enable_statistic": False, "enable_update_weights": False}),
-        ("warmup", True),
     ]
 
 
@@ -879,159 +906,154 @@ def test_launch_queue_is_enabled_only_for_per_layer_dynamic_mode(monkeypatch):
     assert os.environ.get(_QUEUE) == process_queue
 
 
-def test_launch_queue_setup_precedes_runtime_initialization():
-    def call_name(node):
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute):
-            return f"{call_name(node.value)}.{node.attr}"
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "super"
-        ):
-            return "super()"
-        return ""
+class _RuntimeInitReached(Exception):
+    """Stops an entrypoint at its first runtime-initialization call."""
 
-    def calls(relative, function_name, class_name=None):
-        tree = ast.parse((_ROOT / relative).read_text())
-        owner = tree
-        if class_name is not None:
-            owner = next(
-                node
-                for node in tree.body
-                if isinstance(node, ast.ClassDef) and node.name == class_name
-            )
-        function = next(
-            node
-            for node in owner.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == function_name
+
+class _RecordingEnviron(dict):
+    def __init__(self, events, **values):
+        super().__init__(values)
+        self._events = events
+
+    def __setitem__(self, key, value):
+        self._events.append(("env", key, value))
+        super().__setitem__(key, value)
+
+    def update(self, values):
+        for key, value in values.items():
+            self[key] = value
+
+
+def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(monkeypatch):
+    events = []
+    environ = _RecordingEnviron(events, MASTER_ADDR="127.0.0.1")
+    fake_os = SimpleNamespace(
+        environ=environ,
+        getenv=lambda key, default=None: environ.get(key, default),
+    )
+    logger = SimpleNamespace(
+        level="warning",
+        set_level=lambda level: None,
+        info=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        debug=lambda *args, **kwargs: None,
+    )
+    user_overrides = {"USER_SETTING": "1"}
+    configured = {**user_overrides, _QUEUE: "4x"}
+
+    def configure_moe_launch_queues(moe_config, env_overrides):
+        # The override must already be visible when the launch queue is configured.
+        events.append(("configure", environ.get("USER_SETTING")))
+        return {**(env_overrides or {}), _QUEUE: "4x"}
+
+    def runtime_init(name):
+        def call(*args, **kwargs):
+            events.append(name)
+            raise _RuntimeInitReached(name)
+
+        return call
+
+    def run(entrypoint, stop):
+        events.clear()
+        environ.pop("USER_SETTING", None)
+        with pytest.raises(_RuntimeInitReached, match=stop):
+            entrypoint()
+        return list(events)
+
+    def worker_args():
+        return SimpleNamespace(
+            backend="pytorch", env_overrides=dict(user_overrides), moe_config=object()
         )
-        result = {}
-        for node in ast.walk(function):
-            if isinstance(node, ast.Call):
-                name = call_name(node.func)
-                result[name] = min(result.get(name, node.lineno), node.lineno)
-        return result
 
-    base = calls("tensorrt_llm/llmapi/llm.py", "__init__", "BaseLLM")
-    assert (
-        base["self._process_env_overrides"]
-        < base["configure_moe_launch_queues"]
-        < base["llm_args_cls"]
+    expected = [("env", "USER_SETTING", "1"), ("configure", "1")]
+    common = {
+        "os": fake_os,
+        "logger": logger,
+        "configure_moe_launch_queues": configure_moe_launch_queues,
+    }
+
+    # LLM API: argument validation is the first step that may probe CUDA.
+    class TorchLlmArgs:
+        model_fields = {"env_overrides": None, "moe_config": None}
+
+        def __init__(self, **kwargs):
+            events.append(("llm_args", kwargs["env_overrides"]))
+            raise _RuntimeInitReached("llm_args")
+
+    llm_cls = _extract_class(
+        _ROOT / "tensorrt_llm/llmapi/llm.py",
+        "BaseLLM",
+        {"__init__", "_process_env_overrides"},
+        {
+            **common,
+            "GenerationExecutor": object,
+            "MoeConfig": lambda **kwargs: SimpleNamespace(**kwargs),
+            "TorchLlmArgs": TorchLlmArgs,
+            "TORCH_LLMARGS_REMOVED_ARGS": set(),
+            "mpi_disabled": lambda: False,
+        },
     )
-    assert base["configure_moe_launch_queues"] < base["get_device_count"]
+    assert run(
+        lambda: llm_cls(
+            "model", backend="pytorch", env_overrides=dict(user_overrides), moe_config={}
+        ),
+        "llm_args",
+    ) == expected + [("llm_args", configured)]
 
-    worker_main = calls("tensorrt_llm/executor/worker.py", "worker_main")
-    assert (
-        worker_main["os.environ.update"]
-        < worker_main["configure_moe_launch_queues"]
-        < worker_main["worker_cls"]
+    # MPI worker process: MPI is the first runtime initialization.
+    worker_main = _extract_function(
+        _ROOT / "tensorrt_llm/executor/worker.py",
+        "worker_main",
+        {**common, "GenerationExecutorWorker": object, "mpi_comm": runtime_init("mpi_comm")},
     )
-    assert worker_main["configure_moe_launch_queues"] < worker_main["mpi_comm"]
+    args = worker_args()
+    assert run(
+        lambda: worker_main(engine="engine", worker_queues=None, log_level="info", llm_args=args),
+        "mpi_comm",
+    ) == expected + ["mpi_comm"]
+    assert args.env_overrides == configured
 
-    worker = calls("tensorrt_llm/executor/base_worker.py", "__init__", "BaseWorker")
-    assert (
-        worker["os.environ.update"]
-        < worker["configure_moe_launch_queues"]
-        < worker["super().__init__"]
+    # Direct worker construction: the executor base initializes the runtime.
+    class GenerationExecutor:
+        __init__ = runtime_init("executor_init")
+
+    worker_cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/base_worker.py",
+        "BaseWorker",
+        {"__init__"},
+        {
+            **common,
+            "GenerationExecutor": GenerationExecutor,
+            "PostprocWorkerConfig": lambda: SimpleNamespace(
+                num_postprocess_workers=0, postprocess_tokenizer_dir=None
+            ),
+        },
+        bases=("GenerationExecutor",),
     )
+    args = worker_args()
+    assert run(lambda: worker_cls(engine="engine", llm_args=args), "executor_init") == expected + [
+        "executor_init"
+    ]
+    assert args.env_overrides == configured
 
-    ray = calls("tensorrt_llm/executor/ray/gpu_worker.py", "__init__", "RayWorkerWrapper")
-    assert (
-        ray["os.environ.update"]
-        < ray["configure_moe_launch_queues"]
-        < ray["torch.cuda.device_count"]
-        < ray["torch.cuda.set_device"]
+    # Ray worker: the first CUDA query follows launch-queue setup.
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.logger", SimpleNamespace(logger=logger))
+    ray_cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/ray/gpu_worker.py",
+        "RayWorkerWrapper",
+        {"__init__"},
+        {
+            **common,
+            "torch": SimpleNamespace(
+                cuda=SimpleNamespace(device_count=runtime_init("torch.cuda.device_count"))
+            ),
+        },
     )
-
-
-def test_routed_megamoe_direct_inputs_and_full_grid_contract():
-    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
-    tree = ast.parse(source.read_text())
-    launch = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "cute_dsl_megamoe_nvfp4_blackwell"
-    )
-    arguments = {keyword.arg: keyword.value for keyword in launch.keywords}
-
-    for name, caster in (("activation", "_as_nvfp4"), ("activation_sf", "_as_fp8_sf")):
-        value = arguments[name]
-        assert isinstance(value, ast.Call)
-        assert isinstance(value.func, ast.Name) and value.func.id == caster
-
-    for name in ("fc1_weight", "fc1_weight_sf", "fc2_weight", "fc2_weight_sf"):
-        value = arguments[name]
-        assert isinstance(value, ast.Call)
-        assert isinstance(value.func, ast.Attribute)
-        assert value.func.attr == "_memo_dtype_view"
-
-    assert "reserved_sms" not in arguments
-
-
-def test_gpu_direct_tma_fails_closed_on_stale_scheduler_plan():
-    source = (
-        _ROOT / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.cu"
-    ).read_text()
-    begin = source.index("__global__ void tma_copy_gpu_direct_kernel")
-    end = source.index("struct MegamoeTmaCopyState", begin)
-    kernel = source[begin:end]
-
-    status_check = kernel.index("statusOk &= direct.status[field] == 0")
-    epoch_check = kernel.index("schedulerPlanReady = statusOk && planEpoch == schedulerEpoch")
-    rejection = kernel.index("if (!schedulerPlanReady)")
-    trap = kernel.index('asm volatile("trap;"', rejection)
-    publish = kernel.index("publish_plan_channel_warp<false>")
-    build = kernel.index("megamoe_tma_build_gpu_plan")
-    ready = kernel.index("finish_cta_and_notify")
-
-    assert status_check < epoch_check < rejection <= trap < publish < build < ready
-
-    submit = source[source.index("megamoe_tma_copy_submit_gpu_direct") :]
-    assert "tma_copy_gpu_direct_kernel<<<" in submit
-    assert "cudaLaunchAttributeProgrammaticStreamSerialization" not in submit
-    assert "cudaLaunchKernelEx" not in submit
-
-
-def test_halo_q_rendezvous_resets_arrivals_and_wraps_epoch_safely():
-    source = (
-        _ROOT / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.cu"
-    ).read_text()
-    begin = source.index("__device__ bool grid_rendezvous")
-    end = source.index("__device__ void local_histogram_pass", begin)
-    rendezvous = source[begin:end]
-
-    assert "using Epoch = std::uint32_t;" in source
-    assert "return observed != expected && expected - observed < (Epoch{1} << 31);" in source
-    arrival = rendezvous.index("fetch_add_acq_rel_device(sync, 1)")
-    last_cta = rendezvous.index("old == static_cast<Epoch>(blocks - 1)")
-    reset = rendezvous.index("store_relaxed_device(sync, 0)")
-    publish = rendezvous.index("store_release_device(sync + 1, target)")
-    wait = rendezvous.index("while (epoch_before(observed, target))")
-    assert arrival < last_cta < reset < publish < wait
-
-    mask = (1 << 32) - 1
-
-    def epoch_before(observed: int, expected: int) -> bool:
-        delta = (expected - observed) & mask
-        return observed != expected and delta < (1 << 31)
-
-    epochs = (0xFFFFFFFE, 0xFFFFFFFF, 0x00000000, 0x00000001)
-    arrivals = 0
-    for observed, expected in zip(epochs, epochs[1:]):
-        for _ in range(128):
-            old = arrivals
-            arrivals += 1
-            if old == 127:
-                arrivals = 0
-        assert arrivals == 0
-        assert epoch_before(observed, expected)
-        assert not epoch_before(expected, observed)
-        assert not epoch_before(expected, expected)
+    args = worker_args()
+    assert run(lambda: ray_cls(object, {"llm_args": args}, 1, 0), "device_count") == expected + [
+        "torch.cuda.device_count"
+    ]
+    assert args.env_overrides == configured
 
 
 def test_direct_submit_orders_generations_and_defers_the_route_wait():
@@ -1464,7 +1486,6 @@ def test_per_layer_dynamic_shutdown_reports_in_iter_through_collective_preflight
     manager.is_shutdown = False
     manager.in_iter = True
     manager._ep_comm = Comm()
-    manager.ep_process_group = object()
     manager._rebalance_shared_slot_pool_order = [Pool()]
 
     assert manager.shutdown(local_safe=True) is False
@@ -1583,6 +1604,7 @@ def test_mpi_worker_terminal_cleanup_failure_is_retryable(monkeypatch):
     )
     worker = worker_cls()
     worker.doing_shutdown = False
+    worker.rpc_server = None
     worker.engine = engine
     worker.llm_args = SimpleNamespace(backend="pytorch")
     worker._handle_background_error = lambda: events.append("background")

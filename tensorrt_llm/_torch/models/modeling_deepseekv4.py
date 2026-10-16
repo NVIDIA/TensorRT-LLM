@@ -1980,11 +1980,10 @@ class DeepseekV4MoE(nn.Module):
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        # With helper slots enabled, the one-shot hook runs after MAIN has
-        # enqueued both HALO-Q and TMA copy on the shared high-priority stream.
-        # Shared experts then run on MAIN while helper weights are copied.
-        # Install identically across ranks and clear the hook on every exit.
-        _plan_gap_installed = False
+        # With per-layer dynamic EPLB, the route runs the shared experts after
+        # MAIN has enqueued both HALO-Q and the TMA copy on the high-priority
+        # copy stream, so they overlap planning and the helper-weight copy.
+        # Every rank installs the same function.
         if (
             self._per_layer_dynamic_eplb_enabled
             and self.shared_experts is not None
@@ -1992,25 +1991,14 @@ class DeepseekV4MoE(nn.Module):
         ):
             _shared_box = {}
 
-            def _plan_gap_shared():
+            def _overlap_shared():
                 # Shared-expert scaling must run at most once per forward.
                 if "out" not in _shared_box:
                     _shared_box["out"] = _compute_shared_output()
 
-            _experts = getattr(self, "experts", None)
-            if _experts is not None and hasattr(_experts, "__dict__"):
-                setattr(_experts, "_rebalance_plan_gap_hook", _plan_gap_shared)
-                _plan_gap_installed = True
-
-        if _plan_gap_installed:
-            try:
+            with self.experts.load_balancer_overlap(_overlap_shared):
                 routed_output = _compute_routed_output()
-            finally:
-                # Clear the hook even when the routed path exits early.
-                _e = getattr(self, "experts", None)
-                if _e is not None:
-                    setattr(_e, "_rebalance_plan_gap_hook", None)
-            # Compute shared experts here if the routed path skipped the hook.
+            # Compute shared experts here if the routed path did not run them.
             if "out" not in _shared_box:
                 _shared_box["out"] = _compute_shared_output()
             shared_output = _shared_box["out"]
