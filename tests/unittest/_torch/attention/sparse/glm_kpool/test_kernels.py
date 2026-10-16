@@ -457,8 +457,19 @@ def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
 @pytest.mark.skipif(
     get_sm_version() not in (100, 103), reason="native sparse MLA requires SM100/103"
 )
-@pytest.mark.parametrize("rows,width", [(1, 64), (8, 2052)])
-def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: int) -> None:
+@pytest.mark.parametrize(
+    "rows,width,heads,cache_dtype",
+    [
+        (1, 64, 16, torch.bfloat16),
+        (8, 2052, 16, torch.bfloat16),
+        (8, 2052, 16, torch.float8_e4m3fn),
+        (256, 128, 16, torch.float8_e4m3fn),
+        (64, 256, 64, torch.float8_e4m3fn),
+    ],
+)
+def test_native_sparse_decode_coalesced_rows_and_graph_replay(
+    rows: int, width: int, heads: int, cache_dtype: torch.dtype
+) -> None:
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
@@ -469,13 +480,15 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: 
     generator = torch.Generator(device="cuda").manual_seed(6810832)
     # Only the middle subpage belongs to this layer. Other subpages contain NaN
     # to expose wrong physical addressing instead of accidentally valid values.
-    storage = torch.full((32, 3, 32, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    storage = torch.full((32, 3, 32, 512), float("nan"), dtype=cache_dtype, device="cuda")
     latent = storage[:, 1]
     latent.copy_(
-        torch.randn(latent.shape, dtype=latent.dtype, device=latent.device, generator=generator)
+        torch.randn(latent.shape, dtype=torch.bfloat16, device=latent.device, generator=generator)
     )
     kv_rows, base, stride = latent_pool_rows(latent)
-    q_storage = torch.randn(rows, 32, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
+    q_storage = torch.randn(
+        rows, heads * 2, 512, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
     q = q_storage[:, ::2]
     indices_storage = torch.empty(rows, width + 7, dtype=torch.int32, device="cuda")
     indices = indices_storage[:, :width]
@@ -485,27 +498,40 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: 
     indices[:, ::5] = -1
     runner = GlmKpoolNativeDecode()
     metadata = SimpleNamespace(effective_workspace=torch.empty(0, dtype=torch.int8, device="cuda"))
-    runner.prepare_workspace(q, metadata)
+    runner.prepare_workspace(q, metadata, max_query_rows=max(rows, 8), query_dtype=cache_dtype)
     scale = 256**-0.5
-    runner(q, kv_rows, indices, scale, metadata)
+    fp8 = cache_dtype == torch.float8_e4m3fn
+    kv_scale = torch.tensor([0.75], device="cuda") if fp8 else 1.0
+    runner(q, kv_rows, indices, scale, metadata, kv_scale=kv_scale)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = runner(q, kv_rows, indices, scale, metadata)
+        actual = runner(q, kv_rows, indices, scale, metadata, kv_scale=kv_scale)
     for replay in range(3):
         q.copy_(torch.randn(q.shape, dtype=q.dtype, device=q.device, generator=generator))
+        if fp8 and replay == 2:
+            q[:, 0, 0] = 1024
+            q[:, 0, 1] = -1024
         indices.copy_(physical.roll(replay, dims=1))
         indices[:, replay::5] = -1
         if replay == 1:
             indices[-1] = -1
         graph.replay()
         valid = indices >= 0
-        selected = kv_rows[indices.clamp_min(0).long(), 0].float()
+        selected = kv_rows.float()[indices.clamp_min(0).long(), 0] * kv_scale
         selected.masked_fill_(~valid[:, :, None], 0)
-        logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
+        query = q.clamp(-448, 448).to(cache_dtype).float() if fp8 else q.float()
+        logits = torch.einsum("rhd,rkd->rhk", query, selected) * scale
         logits.masked_fill_(~valid[:, None, :], float("-inf"))
         probabilities = torch.nan_to_num(logits.softmax(dim=-1))
         expected = torch.einsum("rhk,rkd->rhd", probabilities, selected).to(q.dtype)
-        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+        if fp8:
+            # Match the FP8 sparse-MLA tests' energy-normalized error metric.
+            a, b = actual.float(), expected.float()
+            diff = (a - b).square().sum() / (a.square().sum() + b.square().sum())
+            assert diff < 1e-3
+            torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+        else:
+            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
 def test_pool_scores_offsets_beyond_int32() -> None:

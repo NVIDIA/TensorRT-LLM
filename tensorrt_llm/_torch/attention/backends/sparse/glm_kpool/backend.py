@@ -19,10 +19,10 @@ and indexer state, pool-key updates, and sparse attention kernels. Selection arr
 as global latent-cache row IDs in GlmKpoolBackendForwardArgs.topk_rows.
 
 Queries have no rotary component and are absorbed into the 512-wide latent
-space. Small TP generation batches use native TRTLLM-GEN query heads; other
-shapes use FlashMLA. FP8 cache rows are gathered and dequantized
-in bounded query chunks. Prepared GLM page tables and live TRTLLM lengths
-provide the same cache contract for prefill, decode and verification.
+space. TRTLLM-GEN serves supported FP8 cache shapes and small BF16 TP generation
+batches. Other shapes use FlashMLA, gathering and dequantizing FP8 cache rows
+in bounded query chunks when needed. Prepared GLM page tables and live TRTLLM
+lengths provide the same cache contract for prefill, decode and verification.
 """
 
 from __future__ import annotations
@@ -199,6 +199,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: score scale is unchanged.
         self.softmax_scale = float(self.qk_nope_head_dim) ** -0.5
         self._native_decode = GlmKpoolNativeDecode()
+        #: ``softmax_scale * kv_scale_quant_orig`` for the native FP8 kernel, computed
+        #: once outside CUDA graph capture (the KV scale is fixed after construction).
+        self._native_bmm1_scale: torch.Tensor | None = None
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -612,24 +615,47 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         kv_rows, _, _ = latent_pool_rows(state.latent_pool)
         num_query_tokens, num_query_heads, head_dim = q.shape
         num_cache_rows = kv_rows.shape[0]
+        native_fp8 = kv_rows.dtype == torch.float8_e4m3fn and num_query_heads in (16, 64)
         native_supported = (
             q.is_cuda
-            and q.dtype == kv_rows.dtype == torch.bfloat16
-            and (num_query_heads, head_dim) == (16, 512)
+            and q.dtype == torch.bfloat16
+            and (native_fp8 or (kv_rows.dtype == torch.bfloat16 and num_query_heads == 16))
+            and head_dim == 512
             and num_cache_rows % 32 == 0
             and get_sm_version() in (100, 103)
         )
         if native_supported:
-            # Reserve shared scratch and per-layer counters during prefill/profiling,
-            # even though only small generation batches use the native kernel.
+            # Reserve shared scratch and per-layer counters during prefill/profiling.
             # Deferring this allocation to decode would miss it in KV-cache sizing.
-            self._native_decode.prepare_workspace(q, metadata)
+            self._native_decode.prepare_workspace(
+                q,
+                metadata,
+                max_query_rows=max(metadata.max_num_tokens, num_query_tokens) if native_fp8 else 8,
+                query_dtype=kv_rows.dtype,
+            )
         if (
             native_supported
-            and input_type == AttentionInputType.generation_only
-            and 1 <= num_query_tokens <= 8
+            and num_query_tokens > 0
+            and (
+                native_fp8
+                or (input_type == AttentionInputType.generation_only and num_query_tokens <= 8)
+            )
         ):
-            out = self._native_decode(q, kv_rows, topk_rows, self.softmax_scale, metadata)
+            if (
+                native_fp8
+                and self._native_bmm1_scale is None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._native_bmm1_scale = self.kv_scale_quant_orig * self.softmax_scale
+            out = self._native_decode(
+                q,
+                kv_rows,
+                topk_rows,
+                self.softmax_scale,
+                metadata,
+                kv_scale=self.kv_scale_quant_orig if native_fp8 else 1.0,
+                bmm1_scale=self._native_bmm1_scale if native_fp8 else None,
+            )
         else:
             out = self._dispatch_sparse_core(q, kv_rows, topk_rows)
         return self._finalize_output(out, output)
