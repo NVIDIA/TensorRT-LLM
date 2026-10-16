@@ -170,6 +170,7 @@ class TestSessionReuse:
         assert first_session is second_session, (
             "Expected the same ClientSession object to be returned"
         )
+        assert isinstance(first_session.connector._resolver, media_io_module._ValidatingResolver)
 
     @pytest.mark.asyncio
     async def test_new_session_created_after_close(self):

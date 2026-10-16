@@ -20,8 +20,9 @@ without making real network connections.
 
 import asyncio
 import socket
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from tensorrt_llm.inputs.media_io import (
@@ -30,6 +31,7 @@ from tensorrt_llm.inputs.media_io import (
     _safe_aiohttp_get,
     _safe_request_get,
     _validate_url,
+    _ValidatingResolver,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -64,6 +66,35 @@ class _AsyncContent:
         if not self._chunks:
             return b""
         return self._chunks.pop(0)
+
+
+class _AiohttpErrorResponse:
+    headers = {}
+
+    def __init__(self, status):
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    def raise_for_status(self):
+        raise aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=self.status,
+            message="test status",
+        )
+
+
+class _AiohttpSession:
+    def __init__(self, response):
+        self._response = response
+
+    def get(self, url, **kwargs):
+        return self._response
 
 
 # ---------------------------------------------------------------------------
@@ -360,10 +391,30 @@ class TestSafeAiohttpGet:
                 pass
 
         with patch(
-            "tensorrt_llm.inputs.media_io.aiohttp.ClientSession", return_value=_FakeSession()
+            "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+            new=AsyncMock(return_value=_FakeSession()),
         ):
             with pytest.raises(MediaFetchError, match="fetch failed"):
                 self._run(_safe_aiohttp_get("http://example.com/file.bin"))
+
+    @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
+    def test_preserves_non_retryable_http_error(self, _):
+        with patch(
+            "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+            new=AsyncMock(return_value=_AiohttpSession(_AiohttpErrorResponse(404))),
+        ):
+            with pytest.raises(aiohttp.ClientResponseError) as error:
+                self._run(_safe_aiohttp_get("http://example.com/missing.jpg"))
+        assert error.value.status == 404
+
+    @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
+    def test_maps_retryable_http_error_to_fetch_error(self, _):
+        with patch(
+            "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+            new=AsyncMock(return_value=_AiohttpSession(_AiohttpErrorResponse(503))),
+        ):
+            with pytest.raises(MediaFetchError, match="HTTP 503"):
+                self._run(_safe_aiohttp_get("http://example.com/unavailable.jpg"))
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_reads_response_chunks_to_eof(self, _):
@@ -392,9 +443,15 @@ class TestSafeAiohttpGet:
                 pass
 
         with patch(
-            "tensorrt_llm.inputs.media_io.aiohttp.ClientSession", return_value=_FakeSession()
+            "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+            new=AsyncMock(return_value=_FakeSession()),
         ):
-            assert self._run(_safe_aiohttp_get("http://example.com/file.bin")) == b"abcd"
+            unsafe_session = MagicMock()
+            unsafe_session.get.side_effect = AssertionError("caller session must not be used")
+            assert (
+                self._run(_safe_aiohttp_get("http://example.com/file.bin", session=unsafe_session))
+                == b"abcd"
+            )
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_raises_after_too_many_redirects(self, _):
@@ -422,7 +479,8 @@ class TestSafeAiohttpGet:
                 pass
 
         with patch(
-            "tensorrt_llm.inputs.media_io.aiohttp.ClientSession", return_value=_FakeSession()
+            "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+            new=AsyncMock(return_value=_FakeSession()),
         ):
             with pytest.raises(RuntimeError, match="Too many redirects"):
                 self._run(_safe_aiohttp_get("http://example.com/image.jpg"))
@@ -455,7 +513,8 @@ class TestSafeAiohttpGet:
 
         with (
             patch(
-                "tensorrt_llm.inputs.media_io.aiohttp.ClientSession", return_value=_FakeSession()
+                "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+                new=AsyncMock(return_value=_FakeSession()),
             ),
             patch("tensorrt_llm.inputs.media_io._MAX_RESPONSE_BYTES", 3),
         ):
@@ -469,8 +528,20 @@ class TestSafeAiohttpGet:
                 "tensorrt_llm.inputs.media_io.socket.getaddrinfo",
                 return_value=_dns("169.254.169.254"),
             ),
-            patch("tensorrt_llm.inputs.media_io.aiohttp.ClientSession") as mock_session,
+            patch("tensorrt_llm.inputs.media_io._get_aiohttp_session") as mock_session,
         ):
             with pytest.raises(RuntimeError, match="non-public"):
                 self._run(_safe_aiohttp_get("http://169.254.169.254/latest/"))
             mock_session.assert_not_called()
+
+    def test_rejects_private_address_from_connection_resolver(self):
+        async def resolve():
+            resolver = _ValidatingResolver()
+            resolver._resolver.resolve = AsyncMock(return_value=[{"host": "169.254.169.254"}])
+            try:
+                await resolver.resolve("example.com", 80)
+            finally:
+                await resolver.close()
+
+        with pytest.raises(RuntimeError, match="non-public"):
+            self._run(resolve())
