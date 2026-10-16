@@ -97,7 +97,7 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
 
     auto const& srcVec = srcDescs.getDescs();
     auto const& dstVec = dstDescs.getDescs();
-    TLLM_CHECK_WITH_INFO(srcVec.size() == dstVec.size(), "BounceTransferPlan: src/dst desc count mismatch (%zu vs %zu)",
+    TLLM_CHECK_WITH_INFO(srcVec.size() == dstVec.size(), "BounceTransferPlan: src/dst desc count mismatch ({} vs {})",
         srcVec.size(), dstVec.size());
     TLLM_CHECK_WITH_INFO(maxChunkSizeBytes > 0 && maxDescsPerChunk > 0,
         "BounceTransferPlan: maxChunkSizeBytes/maxDescsPerChunk must be > 0");
@@ -105,7 +105,7 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     // scatter entry size, Posted.writeBytes), so a chunk must fit in 32 bits. Arena offsets are
     // 64-bit (arena may exceed 4 GiB) but a single staging chunk above 4 GiB is nonsensical.
     TLLM_CHECK_WITH_INFO(maxChunkSizeBytes <= std::numeric_limits<std::uint32_t>::max(),
-        "BounceTransferPlan: maxChunkSizeBytes (%zu) must be <= 4 GiB (chunk size is 32-bit on the wire)",
+        "BounceTransferPlan: maxChunkSizeBytes ({}) must be <= 4 GiB (chunk size is 32-bit on the wire)",
         maxChunkSizeBytes);
 
     if (srcVec.empty())
@@ -135,16 +135,16 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
         auto const& src = srcVec[i];
         auto const& dst = dstVec[i];
         std::size_t const len = src.getLen();
-        TLLM_CHECK_WITH_INFO(len == dst.getLen(), "BounceTransferPlan: src/dst len mismatch at idx %zu", i);
+        TLLM_CHECK_WITH_INFO(len == dst.getLen(), "BounceTransferPlan: src/dst len mismatch at idx {}", i);
         TLLM_CHECK_WITH_INFO(src.getDeviceId() == sourceDeviceId,
-            "BounceTransferPlan: mixed source device ids are unsupported (idx %zu has %u, expected %u)", i,
+            "BounceTransferPlan: mixed source device ids are unsupported (idx {} has {}, expected {})", i,
             src.getDeviceId(), sourceDeviceId);
         TLLM_CHECK_WITH_INFO(dst.getDeviceId() == destinationDeviceId,
-            "BounceTransferPlan: mixed destination device ids are unsupported (idx %zu has %u, expected %u)", i,
+            "BounceTransferPlan: mixed destination device ids are unsupported (idx {} has {}, expected {})", i,
             dst.getDeviceId(), destinationDeviceId);
         TLLM_CHECK_WITH_INFO(len <= maxChunkSizeBytes,
-            "BounceTransferPlan: single desc (%zu B) exceeds maxChunkSizeBytes (%zu B)", len, maxChunkSizeBytes);
-        TLLM_CHECK_WITH_INFO(len < (1ULL << 32U), "BounceTransferPlan: single desc (%zu B) exceeds 4 GiB", len);
+            "BounceTransferPlan: single desc ({} B) exceeds maxChunkSizeBytes ({} B)", len, maxChunkSizeBytes);
+        TLLM_CHECK_WITH_INFO(len < (1ULL << 32U), "BounceTransferPlan: single desc ({} B) exceeds 4 GiB", len);
 
         // A zero-length desc carries no data; skip it so it never forces an empty chunk.
         if (len == 0)

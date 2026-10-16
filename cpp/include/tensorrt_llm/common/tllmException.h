@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
+#include <source_location>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #define TLLM_THROW(...)                                                                                                \
     do                                                                                                                 \
@@ -33,14 +37,14 @@
     } while (0)
 
 #define TLLM_WRAP(ex)                                                                                                  \
-    NEW_TLLM_EXCEPTION("%s: %s", tensorrt_llm::common::TllmException::demangle(typeid(ex).name()).c_str(), ex.what())
+    NEW_TLLM_EXCEPTION("{}: {}", tensorrt_llm::common::TllmException::demangle(typeid(ex).name()), ex.what())
 
 #define NEW_TLLM_EXCEPTION(...)                                                                                        \
-    tensorrt_llm::common::TllmException(__FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str())
+    tensorrt_llm::common::TllmException(std::source_location::current(), std::format(__VA_ARGS__))
 
 #define TLLM_REQUEST_EXCEPTION(requestID, errorCode, ...)                                                              \
     tensorrt_llm::common::RequestSpecificException(                                                                    \
-        __FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str(), requestID, errorCode)
+        std::source_location::current(), std::format(__VA_ARGS__), requestID, errorCode)
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -65,7 +69,7 @@ class TllmException : public std::runtime_error
 public:
     static auto constexpr MAX_FRAMES = 128;
 
-    explicit TllmException(char const* file, std::size_t line, char const* msg);
+    explicit TllmException(std::source_location const& location, std::string_view msg);
 
     ~TllmException() noexcept override;
 
@@ -78,22 +82,25 @@ private:
     int mNbFrames;
 };
 
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, char const* info)
+//! Throw a TllmException for an assertion that failed at location.
+[[noreturn]] inline void throwRuntimeError(std::source_location const& location, std::string_view info)
 {
-    throw TllmException(
-        file, line, tensorrt_llm::common::fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info).c_str());
+    throw TllmException(location, std::format("[TensorRT-LLM][ERROR] Assertion failed: {}", info));
 }
 
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
+//! Throw a TllmException for an assertion that failed at location, describing it with a std::format message.
+template <typename... Args>
+[[noreturn]] void throwRuntimeError(
+    std::source_location const& location, std::format_string<Args...> format, Args&&... args)
 {
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
+    throwRuntimeError(location, std::format(format, std::forward<Args>(args)...));
 }
 
 class RequestSpecificException : public std::runtime_error
 {
 public:
     explicit RequestSpecificException(
-        std::string const& file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode);
+        std::source_location const& location, std::string_view msg, uint64_t requestID, RequestErrorCode errorCode);
 
     ~RequestSpecificException() noexcept override;
 

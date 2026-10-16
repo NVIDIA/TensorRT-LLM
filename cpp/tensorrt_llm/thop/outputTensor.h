@@ -68,7 +68,7 @@ inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> co
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_DEBUG("[allocate_output] getComm threw (MPI disabled?): %s; fallback to default", e.what());
+                TLLM_LOG_DEBUG("[allocate_output] getComm threw (MPI disabled?): {}; fallback to default", e.what());
             }
             if (commPtr && *commPtr != nullptr)
             {
@@ -81,7 +81,7 @@ inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> co
                 }
                 else
                 {
-                    TLLM_LOG_DEBUG("[allocate_output] NCCL window alloc failed; tensor_defined=%d buffer_valid=%d",
+                    TLLM_LOG_DEBUG("[allocate_output] NCCL window alloc failed; tensor_defined={} buffer_valid={}",
                         tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0);
                 }
             }

@@ -156,7 +156,7 @@ void printLogitsKeyInfo(ITensor const& tensor, std::string const& infoStr)
 
     ss << " avg: " << mAvg << ", min: " << mMin << ", max: " << mMax << std::endl;
 
-    TLLM_LOG_TRACE(ss.str());
+    TLLM_LOG_TRACE("{}", ss.str());
 }
 
 template void printLogitsKeyInfo<float>(ITensor const& tensor, std::string const& infoStr);

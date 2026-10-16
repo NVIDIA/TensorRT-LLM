@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1993-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 1993-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ constexpr static size_t getDTypeSize(tensorrt_llm::DataType type)
     case tensorrt_llm::DataType::kFP8: return 1;
     case tensorrt_llm::DataType::kINT4: TLLM_THROW("Cannot determine size of INT4 data type");
     case tensorrt_llm::DataType::kFP4: TLLM_THROW("Cannot determine size of FP4 data type");
-    default: TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+    default: TLLM_THROW("Unknown dtype {}", static_cast<int>(type));
     }
     return 0;
 }
@@ -62,7 +62,7 @@ constexpr static size_t getDTypeSizeInBits(tensorrt_llm::DataType type)
     case tensorrt_llm::DataType::kFP8: return 8;
     case tensorrt_llm::DataType::kINT4: [[fallthrough]];
     case tensorrt_llm::DataType::kFP4: return 4;
-    default: TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+    default: TLLM_THROW("Unknown dtype {}", static_cast<int>(type));
     }
     return 0;
 }

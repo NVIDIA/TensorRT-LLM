@@ -62,7 +62,7 @@ public:
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Failed to configure the default cold-page codec: %s", error.what());
+            TLLM_LOG_ERROR("Failed to configure the default cold-page codec: {}", error.what());
             return false;
         }
         catch (...)
@@ -98,7 +98,7 @@ public:
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Default cold-page encoding failed: %s", error.what());
+            TLLM_LOG_ERROR("Default cold-page encoding failed: {}", error.what());
             return false;
         }
         catch (...)
@@ -117,7 +117,7 @@ public:
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Default cold-page decoding failed: %s", error.what());
+            TLLM_LOG_ERROR("Default cold-page decoding failed: {}", error.what());
             return false;
         }
         catch (...)

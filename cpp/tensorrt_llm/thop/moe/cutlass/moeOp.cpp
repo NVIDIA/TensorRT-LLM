@@ -1318,11 +1318,11 @@ private:
             if (is_capturing)
             {
                 TLLM_LOG_DEBUG(
-                    "Allocating MoE workspace with %ld bytes size during cuda graph capture", total_workspace_size);
+                    "Allocating MoE workspace with {} bytes size during cuda graph capture", total_workspace_size);
             }
             else
             {
-                TLLM_LOG_DEBUG("MoE workspace size is not enough, increase the size from %ld bytes to %ld bytes",
+                TLLM_LOG_DEBUG("MoE workspace size is not enough, increase the size from {} bytes to {} bytes",
                     workspace_info.workspace.numel(), total_workspace_size);
             }
             // Release memory first to avoid OOM.

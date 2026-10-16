@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ NVMLWrapper::NVMLWrapper()
     auto loadRequired = [&](void* handle, char const* name) -> void*
     {
         void* sym = loadSym(handle, name);
-        TLLM_CHECK_WITH_INFO(sym != nullptr, "Required NVML symbol not found: %s", name);
+        TLLM_CHECK_WITH_INFO(sym != nullptr, "Required NVML symbol not found: {}", name);
         return sym;
     };
 

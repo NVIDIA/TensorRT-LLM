@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,9 +73,9 @@ std::pair<std::unordered_set<int32_t>, std::unordered_set<int32_t>> populateIter
         if (!profileIterIdxs.empty() || !stopIterIdxs.empty())
         {
             TLLM_LOG_WARNING(
-                "Using deprecated environment variable %s to specify cudaProfiler start and stop iterations. "
+                "Using deprecated environment variable {} to specify cudaProfiler start and stop iterations. "
                 "Please "
-                "use %s "
+                "use {} "
                 "instead.",
                 legacyEnvVarName.value().c_str(), envVarName.c_str());
         }

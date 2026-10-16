@@ -516,7 +516,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     for (auto reqIt = std::begin(activeRequests); reqIt != reqItEnd;)
     {
         auto const& req = *reqIt;
-        TLLM_LOG_DEBUG("MaxUtilizationScheduler: scheduling request ID %lu", req->mRequestId);
+        TLLM_LOG_DEBUG("MaxUtilizationScheduler: scheduling request ID {}", req->mRequestId);
 
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
         if (
@@ -524,7 +524,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             !req->isDisaggGenerationInitState() && !req->isDisaggGenerationTransmissionInProgress()
             && (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState())))
         {
-            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu cannot / should not be scheduled", req->mRequestId);
+            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID {} cannot / should not be scheduled", req->mRequestId);
             reqIt++;
             continue;
         }
@@ -576,7 +576,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             numScheduledPeftPages, seenTaskIds, summary);
         if (wasScheduled)
         {
-            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
+            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID {} -> start", req->mRequestId);
             // Register only now. The failure branch below pauses a started request and retries this
             // same request without advancing reqIt; registering at check time would put this
             // request's own firstNewBlock in the set and make it skip itself on that retry —
@@ -607,7 +607,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
                     crossKvCacheManager->schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
                 }
                 pausedRequests.emplace_back(*lastStartedReqIt);
-                TLLM_LOG_INFO("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
+                TLLM_LOG_INFO("MaxUtilizationScheduler: request ID {} -> pause", (*lastStartedReqIt)->mRequestId);
                 reqItEnd = std::next(lastStartedReqIt).base();
             }
             else
@@ -634,7 +634,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
         SizeType32 numRequiredPeftPages
             = (isNewTask && peftCacheManager) ? peftCacheManager->determineNumPages(req) : 0;
         TLLM_LOG_DEBUG(
-            "MaxUtilizationScheduler: request ID %lu required peft pages: %i", req->mRequestId, numRequiredPeftPages);
+            "MaxUtilizationScheduler: request ID {} required peft pages: {}", req->mRequestId, numRequiredPeftPages);
         bool fitsPeft
             = (peftCacheManager ? numRequiredPeftPages + numScheduledPeftPages <= peftCacheManager->getMaxDevicePages()
                                 : true);
@@ -682,7 +682,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
                 crossBlocksManager->updateScheduledBlocks(crossScheduledIfFits.value());
             }
             numScheduledPeftPages += numRequiredPeftPages;
-            TLLM_LOG_DEBUG("MaxUtilizationScheduler: scheduled peft pages: %i", numRequiredPeftPages);
+            TLLM_LOG_DEBUG("MaxUtilizationScheduler: scheduled peft pages: {}", numRequiredPeftPages);
             scheduledRequests.emplace_back(req);
             ++numAdmittedRequests;
             if (isNewTask)
@@ -770,7 +770,7 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
             {
                 throw std::runtime_error("Unsupported capacity scheduler policy");
             }
-            TLLM_LOG_DEBUG("[Summary] Capacity scheduler allows %d requests, pauses %d requests",
+            TLLM_LOG_DEBUG("[Summary] Capacity scheduler allows {} requests, pauses {} requests",
                 tmpFittingRequests.size(), pausedRequests.size());
 
             RequestVector fittingRequests;

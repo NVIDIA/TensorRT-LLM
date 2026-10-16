@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,14 +29,14 @@ ContextProgress::ContextProgress(int numLayers)
         mCudaEventsRecorded[i] = false;
         mCudaEvents.emplace_back(cudaEventBlockingSync | cudaEventDisableTiming);
     }
-    TLLM_LOG_DEBUG("ContextProgress created - expect %d layers", numLayers);
+    TLLM_LOG_DEBUG("ContextProgress created - expect {} layers", numLayers);
 }
 
 void ContextProgress::recordEvent(int layerIdx, cudaStream_t stream)
 {
     TLLM_CHECK(layerIdx < getNumLayers());
-    TLLM_CHECK_WITH_INFO(layerIdx == 0 || mCudaEventsRecorded[layerIdx - 1], "Layer %d is skipped", layerIdx - 1);
-    TLLM_CHECK_WITH_INFO(!mCudaEventsRecorded[layerIdx], "Layer %d is recorded twice", layerIdx);
+    TLLM_CHECK_WITH_INFO(layerIdx == 0 || mCudaEventsRecorded[layerIdx - 1], "Layer {} is skipped", layerIdx - 1);
+    TLLM_CHECK_WITH_INFO(!mCudaEventsRecorded[layerIdx], "Layer {} is recorded twice", layerIdx);
     TLLM_CUDA_CHECK(cudaEventRecord(mCudaEvents[layerIdx].get(), stream));
     mCudaEventsRecorded[layerIdx] = true;
     mConditionVariable.notify_all();

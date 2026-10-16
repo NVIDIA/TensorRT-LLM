@@ -61,7 +61,7 @@ void drainAfterProviderFailure(cudaStream_t stream) noexcept
     auto const status = cudaStreamSynchronize(stream);
     if (status != cudaSuccess)
     {
-        TLLM_LOG_ERROR("Cold-page provider rollback drain failed: %s", cudaGetErrorString(status));
+        TLLM_LOG_ERROR("Cold-page provider rollback drain failed: {}", cudaGetErrorString(status));
         std::terminate();
     }
 }
@@ -175,7 +175,7 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
     }
     catch (std::exception const& error)
     {
-        TLLM_LOG_ERROR("NativeColdPageCodec::configure rejected GPU layouts: %s", error.what());
+        TLLM_LOG_ERROR("NativeColdPageCodec::configure rejected GPU layouts: {}", error.what());
         return false;
     }
     catch (...)
@@ -238,7 +238,7 @@ bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr
         {
             drainAfterProviderFailure(stream);
         }
-        TLLM_LOG_ERROR("NativeColdPageCodec::encode failed before completion fencing: %s", error.what());
+        TLLM_LOG_ERROR("NativeColdPageCodec::encode failed before completion fencing: {}", error.what());
         return false;
     }
     catch (...)
@@ -281,7 +281,7 @@ bool NativeColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcB
         {
             drainAfterProviderFailure(stream);
         }
-        TLLM_LOG_ERROR("NativeColdPageCodec::decode failed before completion fencing: %s", error.what());
+        TLLM_LOG_ERROR("NativeColdPageCodec::decode failed before completion fencing: {}", error.what());
         return false;
     }
     catch (...)

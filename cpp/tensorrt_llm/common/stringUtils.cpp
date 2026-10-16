@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,8 @@
  */
 
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 
-#include <cerrno>
-#include <cstdarg>
-#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -28,35 +24,6 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace common
 {
-
-void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
-{
-    va_list args0;
-    va_copy(args0, args);
-
-    size_t constexpr init_size = 2048;
-    char fixed_buffer[init_size];
-    auto const size = std::vsnprintf(fixed_buffer, init_size, format, args0);
-    va_end(args0);
-
-    TLLM_CHECK_WITH_INFO(size >= 0, std::string(std::strerror(errno)));
-    if (size == 0)
-    {
-        return;
-    }
-
-    auto* memory = alloc(target, size);
-
-    if (static_cast<size_t>(size) < init_size)
-    {
-        std::memcpy(memory, fixed_buffer, size + 1);
-    }
-    else
-    {
-        auto const size2 = std::vsnprintf(memory, size + 1, format, args);
-        TLLM_CHECK_WITH_INFO(size2 == size, std::string(std::strerror(errno)));
-    }
-}
 
 std::unordered_set<std::string> str2set(std::string const& input, char delimiter)
 {

@@ -172,7 +172,7 @@ void run_skip_softmax_bf16_d256_causal_sm120(
         ? ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<256, true>>(bert_params, blp, stream)
         : ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<256, false>>(bert_params, blp, stream);
     TLLM_CHECK_WITH_INFO(
-        err == cudaSuccess, "run_skip_softmax_bf16_d256_causal_sm120 launch failed: %s", cudaGetErrorString(err));
+        err == cudaSuccess, "run_skip_softmax_bf16_d256_causal_sm120 launch failed: {}", cudaGetErrorString(err));
 }
 
 void run_skip_softmax_bf16_d128_causal_sm120(
@@ -191,7 +191,7 @@ void run_skip_softmax_bf16_d128_causal_sm120(
         ? ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<128, true>>(bert_params, blp, stream)
         : ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<128, false>>(bert_params, blp, stream);
     TLLM_CHECK_WITH_INFO(
-        err == cudaSuccess, "run_skip_softmax_bf16_d128_causal_sm120 launch failed: %s", cudaGetErrorString(err));
+        err == cudaSuccess, "run_skip_softmax_bf16_d128_causal_sm120 launch failed: {}", cudaGetErrorString(err));
 }
 
 } // namespace kernels

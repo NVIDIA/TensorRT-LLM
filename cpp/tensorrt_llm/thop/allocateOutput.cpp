@@ -78,7 +78,7 @@ std::tuple<at::Tensor, int64_t, int64_t> allocateOutputWithNcclWindowOp(at::Tens
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_DEBUG("[allocate_output_with_nccl_window] NCCL window alloc failed: %s", e.what());
+            TLLM_LOG_DEBUG("[allocate_output_with_nccl_window] NCCL window alloc failed: {}", e.what());
         }
     }
 #endif

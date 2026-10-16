@@ -236,7 +236,7 @@ void StreamingEventSink::recordDroppedEventUnlocked(char const* reason)
     int64_t const dropped = mStats.droppedEvents;
     if (dropped == 1 || (dropped & (dropped - 1)) == 0)
     {
-        TLLM_LOG_WARNING("Dropping streaming KV store event because %s; dropped_events=%" PRId64, reason, dropped);
+        TLLM_LOG_WARNING("Dropping streaming KV store event because {}; dropped_events={}", reason, dropped);
     }
 }
 

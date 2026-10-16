@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -694,30 +694,30 @@ TEST(Kernel_AllReduceFusion, Perf)
         if (rank == 0)
         {
             TLLM_LOG_INFO(
-                "token_num %-4d, hidden_dim %-4d, fusion kernel latency %4.4fus", token_num, hidden_dim, latency);
+                "token_num {:<4d}, hidden_dim {:<4d}, fusion kernel latency {:4.4f}us", token_num, hidden_dim, latency);
         }
         auto nccl_latency = runner.benchmark(&Runner::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
         if (rank == 0)
         {
-            TLLM_LOG_INFO("nccl allreduce latency %4.4fus", nccl_latency);
+            TLLM_LOG_INFO("nccl allreduce latency {:4.4f}us", nccl_latency);
         }
         auto residual_latency = runner.benchmark(&Runner::run_residual_add, warmup, iter, token_num, hidden_dim);
         if (rank == 0)
         {
-            TLLM_LOG_INFO("residual add latency %4.4fus", residual_latency);
+            TLLM_LOG_INFO("residual add latency {:4.4f}us", residual_latency);
         }
         auto rms_latency = runner.benchmark(&Runner::run_rms_norm, warmup, iter, token_num, hidden_dim);
         if (rank == 0)
         {
-            TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
+            TLLM_LOG_INFO("rms norm latency {:4.4f}us", rms_latency);
         }
         auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
         if (rank == 0)
         {
-            TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
+            TLLM_LOG_INFO("fp4 quant latency {:4.4f}us", quant_latency);
             auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
-            TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx", latency,
-                tot_latency, tot_latency / latency);
+            TLLM_LOG_INFO("fusion kernel latency {:4.4f}us, nccl + ops latency {:4.4f}us, total speedup {:2.4f}x",
+                latency, tot_latency, tot_latency / latency);
         }
     }
 }

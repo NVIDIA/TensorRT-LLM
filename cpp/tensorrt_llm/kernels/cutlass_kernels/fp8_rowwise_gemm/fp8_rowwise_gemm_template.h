@@ -5,7 +5,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ size_t typedFp8RowwiseGemmKernelLauncher(Gemm gemm, typename Gemm::Arguments arg
     void const* B, void const* C_bias, char* workspace, size_t workspaceBytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     using ElementT = typename Gemm::ElementA;
 
@@ -168,7 +168,7 @@ size_t genericFp8RowwiseGemmKernelLauncherSm89(void* D, void const* A, void cons
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     using ElementInput = cutlass::float_e4m3_t;
     using ElementOutput_ =
@@ -195,7 +195,7 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.stages)
     {
     case 2:
@@ -223,7 +223,7 @@ size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void con
     int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.tile_config_sm80)
     {
 
@@ -356,7 +356,7 @@ size_t genericFp8RowwiseGemmKernelLauncherSm90(void* D, void const* A, void cons
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using ElementInput = cutlass::float_e4m3_t;
@@ -391,7 +391,7 @@ size_t dispatchGemmConfigSm90(void* D, void const* A, void const* B, void const*
     int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
@@ -431,7 +431,7 @@ size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void con
     int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     constexpr int Ktile = 128 / sizeof(T);
     using _Ktile = Int<Ktile>;
     switch (gemmConfig.tile_config_sm90)
@@ -525,7 +525,7 @@ size_t genericFp8RowwiseGemmKernelLauncherSm100(void* D, void const* A, void con
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     using ElementInput = cutlass::float_e4m3_t;
     using ElementOutput_ =
@@ -554,7 +554,7 @@ size_t dispatchGemmConfigSm100(void* D, void const* A, void const* B, void const
     int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
@@ -594,7 +594,7 @@ size_t dispatchGemmToCutlassSm100(void* D, void const* A, void const* B, void co
     int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     constexpr int Ktile = 128 / sizeof(T);
     using _Ktile = Int<Ktile>;
     constexpr int Ktile256 = 256 / sizeof(T);
@@ -665,14 +665,14 @@ size_t dispatchGemmToCutlassSm100(void* D, void const* A, void const* B, void co
 template <typename T>
 CutlassFp8RowwiseGemmRunner<T>::CutlassFp8RowwiseGemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     mSm = tk::getSMVersion();
 }
 
 template <typename T>
 CutlassFp8RowwiseGemmRunner<T>::~CutlassFp8RowwiseGemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -680,7 +680,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     tk::QuantMode quantOption, int m, int n, int k, float const* scale_d0, float const* scale_d1,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 #ifndef PLACEHOLDER_KERNELS
     if (mSm == 90)
     {
@@ -712,7 +712,7 @@ void CutlassFp8RowwiseGemmRunner<T>::gemm(void* D, void const* A, void const* B,
     tk::QuantMode quantOption, int m, int n, int k, float const* scale_d0, float const* scale_d1,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     dispatchToArch(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes,
         stream, occupancy);
 }
@@ -809,7 +809,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
 template <typename T>
 size_t CutlassFp8RowwiseGemmRunner<T>::getWorkspaceSizeImpl(int const m, int const n, int const k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     size_t workspace_size = 0;
     auto gemmConfigs = CutlassFp8RowwiseGemmRunner<T>{}.getConfigs();
     for (auto const& gemmConfig : gemmConfigs)
@@ -833,7 +833,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::getWorkspaceSizeImpl(int const m, int con
 template <typename T>
 size_t CutlassFp8RowwiseGemmRunner<T>::getWorkspaceSize(int const m, int const n, int const k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     // Custom hash function for the MNK type
     using MNK = std::tuple<int, int, int>;

@@ -837,9 +837,9 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
         return;
     }
     TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
-        "NVFP4 MLA gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+        "NVFP4 MLA gather requires head_dim to be a positive multiple of 16, got {}", headDim);
     TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
-        "NVFP4 MLA gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
+        "NVFP4 MLA gather residual_dim must be a multiple of 16 in [0, head_dim], got {}", residualDim);
 
     int64_t const numPairs = static_cast<int64_t>(numRows) * topK;
     TLLM_CHECK_WITH_INFO(
@@ -928,9 +928,9 @@ void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_
         return;
     }
     TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
-        "NVFP4 MLA direct context gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+        "NVFP4 MLA direct context gather requires head_dim to be a positive multiple of 16, got {}", headDim);
     TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
-        "NVFP4 MLA direct context gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
+        "NVFP4 MLA direct context gather residual_dim must be a multiple of 16 in [0, head_dim], got {}", residualDim);
     TLLM_CHECK_WITH_INFO(numRequests > 0, "num_requests must be positive");
     int64_t const numPairs = static_cast<int64_t>(numQueryRows) * topK;
     TLLM_CHECK_WITH_INFO(
@@ -1011,9 +1011,9 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
         return;
     }
     TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
-        "NVFP4 MLA context gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+        "NVFP4 MLA context gather requires head_dim to be a positive multiple of 16, got {}", headDim);
     TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
-        "NVFP4 MLA context gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
+        "NVFP4 MLA context gather residual_dim must be a multiple of 16 in [0, head_dim], got {}", residualDim);
     TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "tokens_per_block must be positive");
     TLLM_CHECK_WITH_INFO(numRequests > 0, "num_requests must be positive");
     TLLM_CHECK_WITH_INFO(outputCapacity

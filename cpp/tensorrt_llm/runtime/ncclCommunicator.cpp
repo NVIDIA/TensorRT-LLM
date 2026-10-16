@@ -60,13 +60,13 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
     }
     if (result != ncclInProgress)
     {
-        TLLM_THROW("NCCL communicator initialization failed on rank %d of %d: %s.", rank, worldSize,
+        TLLM_THROW("NCCL communicator initialization failed on rank {} of {}: {}.", rank, worldSize,
             ncclGetErrorString(result));
     }
     if (comm == nullptr)
     {
         TLLM_THROW(
-            "NCCL communicator initialization is in progress on rank %d of %d but returned a null "
+            "NCCL communicator initialization is in progress on rank {} of {} but returned a null "
             "communicator.",
             rank, worldSize);
     }
@@ -78,7 +78,7 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
         result = ncclCommGetAsyncError(comm, &asyncResult);
         if (result != ncclSuccess)
         {
-            TLLM_THROW("NCCL communicator probe initialization failed while polling rank %d of %d: %s.", rank,
+            TLLM_THROW("NCCL communicator probe initialization failed while polling rank {} of {}: {}.", rank,
                 worldSize, ncclGetErrorString(result));
         }
         if (asyncResult == ncclSuccess)
@@ -88,15 +88,15 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
         }
         if (asyncResult != ncclInProgress)
         {
-            TLLM_THROW("NCCL communicator probe initialization failed asynchronously on rank %d of %d: %s.", rank,
+            TLLM_THROW("NCCL communicator probe initialization failed asynchronously on rank {} of {}: {}.", rank,
                 worldSize, ncclGetErrorString(asyncResult));
         }
         if (std::chrono::steady_clock::now() >= deadline)
         {
             TLLM_THROW(
-                "NCCL communicator probe initialization timed out after %d seconds on rank %d of %d in "
+                "NCCL communicator probe initialization timed out after {} seconds on rank {} of {} in "
                 "NcclCommunicator::createComm. This indicates NCCL init is hung. TensorRT-LLM will not retry "
-                "in-process. Set %s to adjust the timeout.",
+                "in-process. Set {} to adjust the timeout.",
                 timeoutSec, rank, worldSize, kNcclCommInitTimeoutEnv);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
@@ -117,7 +117,7 @@ ncclDataType_t toNcclType(tensorrt_llm::DataType dataType)
 #if ENABLE_BF16
     case tensorrt_llm::DataType::kBF16: return ncclBfloat16;
 #endif // ENABLE_BF16
-    default: TLLM_THROW("Unsupported data type: %d", static_cast<int>(dataType));
+    default: TLLM_THROW("Unsupported data type: {}", static_cast<int>(dataType));
     }
 }
 #endif // ENABLE_MULTI_DEVICE

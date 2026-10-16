@@ -265,7 +265,7 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
     else
     {
         TLLM_THROW(
-            "Cutlass gemm. Not instantiated for arch %d with stages set to %d", Arch::kMinComputeCapability, Stages);
+            "Cutlass gemm. Not instantiated for arch {} with stages set to {}", Arch::kMinComputeCapability, Stages);
     }
 }
 
@@ -286,7 +286,7 @@ void dispatchGemmConfig(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutp
     case 4:
         dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 4>(inputs, sm_count_);
         break;
-    default: TLLM_THROW("dispatchGemmConfig does not support stages %d", inputs.gemm_config.stages); break;
+    default: TLLM_THROW("dispatchGemmConfig does not support stages {}", inputs.gemm_config.stages); break;
     }
 }
 
@@ -307,7 +307,7 @@ void dispatchGemmConfig(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutp
     case 4:
         dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 4>(inputs, sm_count_);
         break;
-    default: TLLM_THROW("dispatchGemmConfig does not support stages %d", inputs.gemm_config.stages); break;
+    default: TLLM_THROW("dispatchGemmConfig does not support stages {}", inputs.gemm_config.stages); break;
     }
 }
 
@@ -762,7 +762,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             {
                 // Check the major version of the SM matches
                 TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version / 10 == sm_ / 10,
-                    "Using SM %d configuration for SM %d device", inputs.gemm_config.sm_version, sm_);
+                    "Using SM {} configuration for SM {} device", inputs.gemm_config.sm_version, sm_);
                 TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,
                     "Input biases and hopper input disagree if bias is enabled");
                 TLLM_CHECK_WITH_INFO(
@@ -810,7 +810,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                     case Fusion::NONE: return select_mxfpx_mode(std::integral_constant<Fusion, Fusion::NONE>{});
                     case Fusion::ACTIVATION:
                     case Fusion::GATED_ACTIVATION:
-                    default: TLLM_THROW("Unimplemented fusion %d requested", (int) hopper_inputs.fusion);
+                    default: TLLM_THROW("Unimplemented fusion {} requested", (int) hopper_inputs.fusion);
                     };
                 };
                 auto selected_func = select_function();
@@ -857,7 +857,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             }
             else
             {
-                TLLM_THROW("Invalid GEMM K size %d", (int) inputs.k);
+                TLLM_THROW("Invalid GEMM K size {}", (int) inputs.k);
             }
 #undef SM90_DISPATCH_MOE_MIXED_GEMM_TO_CUTLASS_SELECT_FINALIZE
             return;
@@ -886,7 +886,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             TLLM_CHECK_WITH_INFO(!inputs.gemm_config.is_tma_warp_specialized,
                 "GEMM config is for SM90 configuration, but this configuration is not valid for Hppper");
             TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == 80,
-                "Using SM %d configuration for SM80 fallback implementation", inputs.gemm_config.sm_version);
+                "Using SM {} configuration for SM80 fallback implementation", inputs.gemm_config.sm_version);
             if constexpr (use_fp8)
             {
                 cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89,
@@ -916,7 +916,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceS
     if (num_experts != num_experts_ || use_mxfp8_weight_scaling != use_mxfp8_weight_scaling_)
     {
         TLLM_LOG_TRACE(
-            "Calling getMaxWorkspaceSize() with a new (expert count, use_mxfp8_weight_scaling) (%d, %d) vs (%d, %d)",
+            "Calling getMaxWorkspaceSize() with a new (expert count, use_mxfp8_weight_scaling) ({}, {}) vs ({}, {})",
             num_experts, (int) use_mxfp8_weight_scaling, num_experts_, (int) use_mxfp8_weight_scaling_);
         num_experts_ = num_experts;
         use_mxfp8_weight_scaling_ = use_mxfp8_weight_scaling;
@@ -983,7 +983,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         }                                                                                                              \
         catch (tensorrt_llm::common::TllmException const& e)                                                           \
         {                                                                                                              \
-            TLLM_LOG_TRACE("Unsupported config skipped when calculating MOE workspace size %s", e.what());             \
+            TLLM_LOG_TRACE("Unsupported config skipped when calculating MOE workspace size {}", e.what());             \
         }                                                                                                              \
     } while (0)
 

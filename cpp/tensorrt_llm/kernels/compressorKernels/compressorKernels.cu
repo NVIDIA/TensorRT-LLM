@@ -731,12 +731,12 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     int32_t const* new_tokens_per_seq, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(compress_ratio == 2 || compress_ratio == 4 || compress_ratio == 128,
-        "pagedKvCompressLaunch only supports compress_ratio 2 (V4.1), 4 or 128, got %d", compress_ratio);
+        "pagedKvCompressLaunch only supports compress_ratio 2 (V4.1), 4 or 128, got {}", compress_ratio);
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
         "pagedKvCompressLaunch only supports bf16/fp32 kv_score and paged state");
     constexpr int kMinNextN = 1;
-    TLLM_CHECK_WITH_INFO(next_n >= kMinNextN, "pagedKvCompressLaunch requires next_n >= 1, got %d", next_n);
+    TLLM_CHECK_WITH_INFO(next_n >= kMinNextN, "pagedKvCompressLaunch requires next_n >= 1, got {}", next_n);
 
     // Compute HEAD_BLOCKS: mirrors the compile-time constant in the kernel.
     // VEC = max_vec if HEAD_DIM/max_vec >= 32, else HEAD_DIM/32.
@@ -799,7 +799,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     FOREACH_DECODE_CONFIG(TRY_LAUNCH)
 #undef TRY_LAUNCH
 
-    TLLM_THROW("pagedKvCompressLaunch: no matching instantiation for HD=%d, kv_eb=%d, state_eb=%d, CR=%d, NRW=%d",
+    TLLM_THROW("pagedKvCompressLaunch: no matching instantiation for HD={}, kv_eb={}, state_eb={}, CR={}, NRW={}",
         head_dim, kv_score_elem_bytes, state_elem_bytes, compress_ratio, num_red_warps);
 }
 
@@ -1268,7 +1268,7 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 {
     bool const overlap = (compress_ratio == 4);
     TLLM_CHECK_WITH_INFO(compress_ratio == 2 || compress_ratio == 4 || compress_ratio == 128,
-        "prefillReductionLaunch only supports compress_ratio 2 (V4.1), 4 or 128, got %d", compress_ratio);
+        "prefillReductionLaunch only supports compress_ratio 2 (V4.1), 4 or 128, got {}", compress_ratio);
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
         "prefillReductionLaunch only supports bf16/fp32 kv_score and paged state");
@@ -1978,31 +1978,31 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     }
 
     TLLM_CHECK_WITH_INFO(
-        cache_scale_type >= 0 && cache_scale_type <= 4, "Invalid cache_scale_type: %d", cache_scale_type);
+        cache_scale_type >= 0 && cache_scale_type <= 4, "Invalid cache_scale_type: {}", cache_scale_type);
     auto const cst = static_cast<CacheScaleType>(cache_scale_type);
     TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kNVFP4Blockwise || kv_cache_scale != nullptr,
         "NVFP4 COMPRESS cache requires a non-null scale buffer");
     TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kNVFP4Blockwise || head_dim == 512,
-        "NVFP4 COMPRESS cache requires head_dim=512, got %d", head_dim);
+        "NVFP4 COMPRESS cache requires head_dim=512, got {}", head_dim);
     TLLM_CHECK_WITH_INFO(cst == CacheScaleType::kNVFP4Blockwise || nvfp4_residual_dim == 0,
         "NVFP4 residual quantization requires NVFP4 cache storage");
     TLLM_CHECK_WITH_INFO(nvfp4_residual_dim == 0 || (nvfp4_residual_dim == 64 && rope_dim == 64),
-        "NVFP4 COMPRESS residual_dim must be 0 or rope_dim=64, got residual_dim=%d and rope_dim=%d", nvfp4_residual_dim,
+        "NVFP4 COMPRESS residual_dim must be 0 or rope_dim=64, got residual_dim={} and rope_dim={}", nvfp4_residual_dim,
         rope_dim);
     TLLM_CHECK_WITH_INFO(
         cst != CacheScaleType::kNVFP4Blockwise || (nvfp4_global_scale > 0.F && std::isfinite(nvfp4_global_scale)),
-        "NVFP4 COMPRESS cache requires a finite positive global scale, got %f", nvfp4_global_scale);
+        "NVFP4 COMPRESS cache requires a finite positive global scale, got {:f}", nvfp4_global_scale);
 
     bool const is_quantized_store = (cst != CacheScaleType::kNone);
     int const nthreads = compressorNthreads(head_dim, elem_bytes);
     int const smem_bytes = head_dim * sizeof(float);
     TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kMXFP4Blockwise || head_dim % 32 == 0,
-        "MXFP4 cache requires head_dim divisible by 32, got %d", head_dim);
+        "MXFP4 cache requires head_dim divisible by 32, got {}", head_dim);
     TLLM_CHECK_WITH_INFO(
         (cst != CacheScaleType::kMXFP4Blockwise && cst != CacheScaleType::kNVFP4Blockwise) || head_dim % 2 == 0,
-        "FP4 packed cache requires even head_dim, got %d", head_dim);
+        "FP4 packed cache requires even head_dim, got {}", head_dim);
     TLLM_CHECK_WITH_INFO(!is_quantized_store || elem_bytes == 2,
-        "Quantized cache modes require bf16 compressor output, got elem_bytes=%d", elem_bytes);
+        "Quantized cache modes require bf16 compressor output, got elem_bytes={}", elem_bytes);
 
     // Derive cache block stride (in bytes) and scale block count from the
     // scale type.  Each physical cache block stores tokens_per_block tokens:

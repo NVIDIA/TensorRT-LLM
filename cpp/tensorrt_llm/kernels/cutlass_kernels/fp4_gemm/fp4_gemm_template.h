@@ -63,7 +63,7 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm10x(T* D, void const* A, void const*
     int* occupancy = nullptr, void const* bias = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     switch (gemmConfig.cluster_shape)
     {
@@ -121,7 +121,7 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm10x(T* D, void const* A, void const* B, 
     int* occupancy = nullptr, void const* bias = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     // Several constraints:
     // Cta N should be one of 128/192/256.
     // M-mode size should be 128 or 256 for 2 CTA cluster MMA;
@@ -179,7 +179,7 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
     int* occupancy = nullptr, void const* bias = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     switch (gemmConfig.cluster_shape)
     {
@@ -202,8 +202,8 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B, 
     int* occupancy = nullptr, void const* bias = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("gemmConfig.tile_config_sm120: %d", gemmConfig.tile_config_sm120);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("gemmConfig.tile_config_sm120: {}", static_cast<int>(gemmConfig.tile_config_sm120));
 
     switch (gemmConfig.tile_config_sm120)
     {
@@ -244,7 +244,7 @@ size_t dispatchMXFP8xMXFP4GemmClusterShapeSm100(T* D, void const* A, void const*
     int* occupancy = nullptr, void const* bias = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     switch (gemmConfig.cluster_shape)
     {
@@ -287,7 +287,7 @@ size_t dispatchMXFP8xMXFP4GemmCTAShapeSm100(T* D, void const* A, void const* B, 
     int* occupancy = nullptr, void const* bias = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.tile_config_sm100)
     {
     case tkc::CutlassTileConfigSM100::CtaShape128x64x128B:
@@ -331,7 +331,7 @@ size_t dispatchMXFP8xMXFP8GemmClusterShapeSm100(T* D, void const* A, void const*
     int* occupancy = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     switch (gemmConfig.cluster_shape)
     {
@@ -374,7 +374,7 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm100(T* D, void const* A, void const* B, 
     int* occupancy = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.tile_config_sm100)
     {
     case tkc::CutlassTileConfigSM100::CtaShape128x64x128B:
@@ -415,7 +415,7 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm100(T* D, void const* A, void const* B, 
 template <typename T, FP4GemmType fp4GemmType>
 CutlassFp4GemmRunner<T, fp4GemmType>::CutlassFp4GemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     int device{-1};
     tk::check_cuda_error(cudaGetDevice(&device));
     mSm = tk::getSMVersion();
@@ -425,7 +425,7 @@ CutlassFp4GemmRunner<T, fp4GemmType>::CutlassFp4GemmRunner()
 template <typename T, FP4GemmType fp4GemmType>
 CutlassFp4GemmRunner<T, fp4GemmType>::~CutlassFp4GemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 }
 
 template <typename T, FP4GemmType fp4GemmType>
@@ -506,7 +506,7 @@ void CutlassFp4GemmRunner<T, fp4GemmType>::gemm(void* D, void const* A, void con
     tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
     void const* bias)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(reinterpret_cast<T*>(D), A, B, input_sf, weight_sf, global_sf,
         m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, /*occupancy=*/nullptr, bias);
 }
@@ -586,7 +586,7 @@ template <typename T, FP4GemmType fp4GemmType>
 size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSizeImpl(
     int const m, int const n, int const k, int const batch_count)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     size_t workspace_size = 0;
     auto gemmConfigs = CutlassFp4GemmRunner<T, fp4GemmType>{}.getConfigs();
     for (auto const& gemmConfig : gemmConfigs)
@@ -610,7 +610,7 @@ template <typename T, FP4GemmType fp4GemmType>
 size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSize(
     int const m, int const n, int const k, int const batch_count)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     // Custom hash function for the MNKB type
     using MNK = std::tuple<int, int, int, int>;

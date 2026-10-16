@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,14 +55,14 @@ std::pair<UBBufferPtr, UBBuffer> UserBuffersManager::allocate_userbuffers(int64_
             continue;
         }
         buffer.second = true;
-        TLLM_LOG_DEBUG("Reusing buffer %d", i);
+        TLLM_LOG_DEBUG("Reusing buffer {}", i);
         return std::make_pair(std::unique_ptr<void, UserBufferDeleter>(buffer.first.addr), buffer.first);
     }
 
     auto new_ub = tensorrt_llm::runtime::ub::ub_allocate(buffer_size_);
     TLLM_CHECK(!new_ub.invalid());
     buffers_.push_back({new_ub, true});
-    TLLM_LOG_DEBUG("Creating new buffer %d", static_cast<int>(buffers_.size() - 1));
+    TLLM_LOG_DEBUG("Creating new buffer {}", static_cast<int>(buffers_.size() - 1));
     return std::make_pair(std::unique_ptr<void, UserBufferDeleter>(new_ub.addr), new_ub);
 }
 
@@ -75,7 +75,7 @@ void UserBuffersManager::release_buffer(void* addr)
     TLLM_CHECK(buffer_iter != buffers_.end());
     TLLM_CHECK(buffer_iter->second);
     TLLM_CHECK(!buffer_iter->first.invalid());
-    TLLM_LOG_DEBUG("Releasing buffer %d", static_cast<int>(std::distance(buffers_.begin(), buffer_iter)));
+    TLLM_LOG_DEBUG("Releasing buffer {}", static_cast<int>(std::distance(buffers_.begin(), buffer_iter)));
     buffer_iter->second = false;
 }
 

@@ -396,7 +396,7 @@ std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWr
             return std::nullopt;
         }
         [[fallthrough]];
-    default: TLLM_THROW("Failed to retrieve global variable from cubin: error code %i.", static_cast<int32_t>(error));
+    default: TLLM_THROW("Failed to retrieve global variable from cubin: error code {}.", error);
     }
     return std::optional<T>{std::move(ret)};
 }

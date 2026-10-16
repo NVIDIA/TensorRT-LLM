@@ -716,7 +716,7 @@ struct DefaultRoutingLaunchConfig
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
+            TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);                      \
         }                                                                                                              \
     }(PolicyTraits<PreProc, PostProc>{})
 
@@ -747,7 +747,7 @@ struct DefaultRoutingLaunchConfig
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
+            TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);                      \
         }                                                                                                              \
     }(PolicyTraits<ExpertSelect, void>{})
 
@@ -837,7 +837,7 @@ inline void dispatchRoutingPolicy(Data const& data, Fn&& fn)
         && data.mPostprocessType == RoutingPostprocessType::None)
         fn(NoOpPreprocess{}, NoOpPostprocess{});
     else
-        TLLM_CHECK_WITH_INFO(false, "Unsupported routing policy combination: preprocess=%d, postprocess=%d",
+        TLLM_CHECK_WITH_INFO(false, "Unsupported routing policy combination: preprocess={}, postprocess={}",
             static_cast<int>(data.mPreprocessType), static_cast<int>(data.mPostprocessType));
 }
 

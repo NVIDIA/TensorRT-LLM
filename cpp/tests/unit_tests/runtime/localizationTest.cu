@@ -342,11 +342,11 @@ protected:
         // Bandwidth accounts for both read and write (2x data movement) on both streams.
         float bandwidth = (2.0 * 2.0 * sizeBytes / static_cast<double>(kGiB)) / (avgTime / 1000.0); // GB/s
 
-        TLLM_LOG_INFO("%s:", testName);
-        TLLM_LOG_INFO("  Allocation size per buffer: %.2f GiB", sizeBytes / static_cast<double>(kGiB));
-        TLLM_LOG_INFO("  Total time: %.2f ms", totalTime);
-        TLLM_LOG_INFO("  Average time per iteration: %.2f ms", avgTime);
-        TLLM_LOG_INFO("  Bandwidth: %.2f GB/s", bandwidth);
+        TLLM_LOG_INFO("{}:", testName);
+        TLLM_LOG_INFO("  Allocation size per buffer: {:.2f} GiB", sizeBytes / static_cast<double>(kGiB));
+        TLLM_LOG_INFO("  Total time: {:.2f} ms", totalTime);
+        TLLM_LOG_INFO("  Average time per iteration: {:.2f} ms", avgTime);
+        TLLM_LOG_INFO("  Bandwidth: {:.2f} GB/s", bandwidth);
     }
 };
 
@@ -476,10 +476,10 @@ TEST_F(LocalizationTest, DISABLED_PerformanceTestSingleStream20GB)
     float bandwidth = (2.0 * sizeBytes / static_cast<double>(kGiB)) / (avgTime / 1000.0); // GB/s
 
     TLLM_LOG_INFO("Performance Test 1 - Single Stream (20GB):");
-    TLLM_LOG_INFO("  Allocation size per buffer: %.2f GiB", sizeBytes / static_cast<double>(kGiB));
-    TLLM_LOG_INFO("  Total time: %.2f ms", totalTime);
-    TLLM_LOG_INFO("  Average time per iteration: %.2f ms", avgTime);
-    TLLM_LOG_INFO("  Bandwidth: %.2f GB/s", bandwidth);
+    TLLM_LOG_INFO("  Allocation size per buffer: {:.2f} GiB", sizeBytes / static_cast<double>(kGiB));
+    TLLM_LOG_INFO("  Total time: {:.2f} ms", totalTime);
+    TLLM_LOG_INFO("  Average time per iteration: {:.2f} ms", avgTime);
+    TLLM_LOG_INFO("  Bandwidth: {:.2f} GB/s", bandwidth);
 }
 
 // Performance Test 2: Dual streams, source and destination on the same LOCALITY_DOMAIN as stream

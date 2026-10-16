@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,7 +65,8 @@ static void cudaHostFuncTrampoline(void* userData)
     if (hostFuncUserData->freeUserData)
     {
         // If freeUserData is true, keep the ownership of the user data.
-        TLLM_LOG_DEBUG("Automatically freeing hostfunc user data %p", hostFuncUserData.get());
+        TLLM_LOG_DEBUG(
+            "Automatically freeing hostfunc user data {:p}", static_cast<void const*>(hostFuncUserData.get()));
     }
     else
     {
@@ -119,7 +120,7 @@ void freeHostFuncUserData(uintptr_t userDataPtr)
     // the user data is released when the unique_ptr is destroyed.
     auto hostFuncUserData = std::unique_ptr<HostFuncUserData>(reinterpret_cast<HostFuncUserData*>(userDataPtr));
 
-    TLLM_LOG_DEBUG("Manually freeing hostfunc user data %p", hostFuncUserData.get());
+    TLLM_LOG_DEBUG("Manually freeing hostfunc user data {:p}", static_cast<void const*>(hostFuncUserData.get()));
 }
 
 void initHostFuncBindings(nb::module_& m)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -220,9 +220,8 @@ public:
             // Use specified tactic
             algo_ptr = &cache.heuristics[tactic].algo;
             has_algo = true;
-            TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Using specified tactic %ld (out of %zu) for shape (m=%d, n=%d, k=%d)", tactic,
-                cache.heuristics.size(), m, n, k);
+            TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Using specified tactic {} (out of {}) for shape (m={}, n={}, k={})",
+                tactic, cache.heuristics.size(), m, n, k);
         }
         else if (tactic == -1 && !cache.heuristics.empty())
         {
@@ -231,7 +230,7 @@ public:
                 = cache.best_tactic < static_cast<int64_t>(cache.heuristics.size()) ? cache.best_tactic : 0;
             algo_ptr = &cache.heuristics[best_idx].algo;
             has_algo = true;
-            TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Using best tactic %ld (out of %zu) for shape (m=%d, n=%d, k=%d)",
+            TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Using best tactic {} (out of {}) for shape (m={}, n={}, k={})",
                 best_idx, cache.heuristics.size(), m, n, k);
         }
 
@@ -245,8 +244,8 @@ public:
         {
             // Fall back to default (no algorithm specified)
             TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
-                "for shape (m=%d, n=%d, k=%d)",
+                "CublasLtFP4GemmRunner: No valid algorithm found (tactic={}, available={}), falling back to default "
+                "for shape (m={}, n={}, k={})",
                 tactic, cache.heuristics.size(), m, n, k);
             cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha, bias);
         }
@@ -300,7 +299,7 @@ private:
         if (mAlgoCache.find(key) == mAlgoCache.end())
         {
             TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Cache miss for shape (m=%d, k=%d, n=%d, device=%d, dtype=%d), creating new "
+                "CublasLtFP4GemmRunner: Cache miss for shape (m={}, k={}, n={}, device={}, dtype={}), creating new "
                 "cache entry",
                 m, k, n, device.index(), static_cast<int>(mOutputDtype));
 
@@ -342,14 +341,13 @@ private:
                 }
             }
 
-            TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Found %zu valid algorithms for shape (m=%d, k=%d, n=%d) on device %d",
+            TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Found {} valid algorithms for shape (m={}, k={}, n={}) on device {}",
                 cache.heuristics.size(), m, k, n, device.index());
 
             if (cache.heuristics.empty())
             {
                 TLLM_LOG_WARNING(
-                    "CublasLtFP4GemmRunner: No valid cuBLASLt algorithms found for shape (m=%d, k=%d, n=%d), will fall "
+                    "CublasLtFP4GemmRunner: No valid cuBLASLt algorithms found for shape (m={}, k={}, n={}), will fall "
                     "back to default",
                     m, k, n);
             }
@@ -361,7 +359,7 @@ private:
         else
         {
             TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Cache hit for shape (m=%d, k=%d, n=%d, device=%d, dtype=%d), %zu algorithms "
+                "CublasLtFP4GemmRunner: Cache hit for shape (m={}, k={}, n={}, device={}, dtype={}), {} algorithms "
                 "available",
                 m, k, n, device.index(), static_cast<int>(mOutputDtype), mAlgoCache[key].heuristics.size());
         }

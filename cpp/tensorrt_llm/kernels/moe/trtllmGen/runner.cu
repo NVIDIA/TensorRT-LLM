@@ -285,7 +285,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         TLLM_CHECK_WITH_INFO(topK == 1, "For Llama routing method, must have topK == 1");
         if (nGroup > 0 || topkGroup > 0)
         {
-            TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
+            TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got {}/{}.", nGroup, topkGroup);
         }
         TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0, "Llama routing method does not support fusing shared expert");
 
@@ -407,7 +407,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method %s of enum %d",
+        TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method {} of enum {}",
             serializeMoeRoutingMethodType(routingMethodType).c_str(), (int) routingMethodType);
     }
 }

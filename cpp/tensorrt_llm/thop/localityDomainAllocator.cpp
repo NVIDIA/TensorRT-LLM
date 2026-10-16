@@ -36,7 +36,7 @@ void* localityDomainLocalizationAlloc(size_t size, int device, void* stream, int
 {
     try
     {
-        TLLM_LOG_DEBUG("localityDomainLocalizationAlloc: allocating %zu bytes memory for localityDomainId=%d", size,
+        TLLM_LOG_DEBUG("localityDomainLocalizationAlloc: allocating {} bytes memory for localityDomainId={}", size,
             localityDomainId);
         std::optional<at::cuda::CUDAGuard> deviceGuard;
         if (device >= 0)
@@ -64,7 +64,7 @@ void localityDomainLocalizationFree(void* ptr, size_t size, int device, void* st
     try
     {
         TLLM_LOG_DEBUG(
-            "localityDomainLocalizationFree: free %zu bytes memory for localityDomainId=%d", size, localityDomainId);
+            "localityDomainLocalizationFree: free {} bytes memory for localityDomainId={}", size, localityDomainId);
         std::optional<at::cuda::CUDAGuard> deviceGuard;
         if (device >= 0)
         {

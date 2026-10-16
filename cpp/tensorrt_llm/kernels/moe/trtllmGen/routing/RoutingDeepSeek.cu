@@ -534,11 +534,11 @@ void run(Data& data, void* stream)
 
     // After this point, input is mPtrScores (raw logits that need DeepSeek-specific routing).
     TLLM_CHECK_WITH_INFO(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
-    TLLM_CHECK_WITH_INFO(data.mNumExperts >= data.mTopK, "Routing kernel expects topK (%d) to be <= numExperts (%d)",
+    TLLM_CHECK_WITH_INFO(data.mNumExperts >= data.mTopK, "Routing kernel expects topK ({}) to be <= numExperts ({})",
         data.mTopK, data.mNumExperts);
     TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExpertCount,
-        "Routing kernel expects #experts %d  <= #threads %d", data.mNumExperts, MaxSupportedExpertCount);
-    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+        "Routing kernel expects #experts {}  <= #threads {}", data.mNumExperts, MaxSupportedExpertCount);
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= {}, got {}",
         MaxSupportedTopExperts, data.mTopK);
 
     if (data.mPtrExpandedIdxToPermutedIdx != nullptr || data.mPtrPermutedIdxToExpandedIdx != nullptr
@@ -550,19 +550,19 @@ void run(Data& data, void* stream)
     if (data.mNumExpertGroups > 1)
     {
         TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= MaxNumGroups,
-            "Routing kernel expects #expert groups %d to be <= max groups %d", data.mNumExpertGroups, MaxNumGroups);
+            "Routing kernel expects #expert groups {} to be <= max groups {}", data.mNumExpertGroups, MaxNumGroups);
         TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
-            "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
+            "Routing kernel expects #experts {} to be a multiple of #expert groups {}", data.mNumExperts,
             data.mNumExpertGroups);
         TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-            "Routing kernel expects #experts per group <= warp size (%d), got %d experts / %d groups = %d experts "
+            "Routing kernel expects #experts per group <= warp size ({}), got {} experts / {} groups = {} experts "
             "per group",
             WarpSize, data.mNumExperts, data.mNumExpertGroups, data.mNumExperts / data.mNumExpertGroups);
         TLLM_CHECK_WITH_INFO(data.mNumLimitedGroups <= MaxNumTopGroups,
-            "Routing kernel expects <= %d top groups, got %d", MaxNumTopGroups, data.mNumLimitedGroups);
+            "Routing kernel expects <= {} top groups, got {}", MaxNumTopGroups, data.mNumLimitedGroups);
 
         TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups,
-            "Routing kernel expects top groups %d to be limited by #expert groups %d", data.mNumLimitedGroups,
+            "Routing kernel expects top groups {} to be limited by #expert groups {}", data.mNumLimitedGroups,
             data.mNumExpertGroups);
     }
 
@@ -576,7 +576,7 @@ void run(Data& data, void* stream)
     static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
 
     TLLM_CHECK_WITH_INFO(data.mNumFusedSharedExperts <= WarpSize,
-        "Number of fused shared experts (%d) must be less than warp size (%d).", data.mNumFusedSharedExperts, WarpSize);
+        "Number of fused shared experts ({}) must be less than warp size ({}).", data.mNumFusedSharedExperts, WarpSize);
 
     // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked).
     // When fused shared experts are enabled, the main kernel also appends them (index mNumExperts + i, weight 1.0),

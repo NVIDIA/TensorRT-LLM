@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,7 +63,7 @@ protected:
         mNvml = tensorrt_llm::common::NVMLWrapper::getInstance();
         nvmlReturn_t nvmlResult = mNvml->nvmlInit();
         TLLM_CHECK_WITH_INFO(
-            nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", mNvml->nvmlErrorString(nvmlResult));
+            nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: {}", mNvml->nvmlErrorString(nvmlResult));
 
         if (!memoryInfoAvailable())
         {
@@ -101,7 +101,7 @@ protected:
         nvmlDevice_t device;
         auto nvmlResult = nvml->nvmlDeviceGetHandleByIndex(0, &device);
         TLLM_CHECK_WITH_INFO(
-            nvmlResult == NVML_SUCCESS, "Failed to get device handle: %s", nvml->nvmlErrorString(nvmlResult));
+            nvmlResult == NVML_SUCCESS, "Failed to get device handle: {}", nvml->nvmlErrorString(nvmlResult));
 
         // Get running processes
         unsigned int processCount = 1;
@@ -111,7 +111,7 @@ protected:
         {
             nvmlResult = nvml->nvmlDeviceGetComputeRunningProcesses(device, &processCount, processes.data());
             TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS || nvmlResult == NVML_ERROR_INSUFFICIENT_SIZE,
-                "Failed to get process count: %s", nvml->nvmlErrorString(nvmlResult));
+                "Failed to get process count: {}", nvml->nvmlErrorString(nvmlResult));
             processes.resize(processCount);
         }
 

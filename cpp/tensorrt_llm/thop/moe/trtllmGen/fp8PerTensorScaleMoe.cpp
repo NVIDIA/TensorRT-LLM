@@ -335,7 +335,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         catch (std::exception const& e)
         {
             TLLM_LOG_DEBUG(
-                "No valid FineGrained fp8 per-tensor config for tileN=%d: %s", (int) tile_tokens_dim, e.what());
+                "No valid FineGrained fp8 per-tensor config for tileN={}: {}", (int) tile_tokens_dim, e.what());
             moe_runner = nullptr;
         }
     }

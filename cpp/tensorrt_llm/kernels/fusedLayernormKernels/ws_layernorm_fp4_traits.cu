@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,11 +81,12 @@ void invokeWSLayerNormImpl(WarpSpecializedParam<GeneralFP4AddBiasResidualPreLaye
         {
             int waves = ((param.m + Traits::M_BLOCK - 1) / Traits::M_BLOCK + ctas - 1) / ctas;
             TLLM_LOG_DEBUG(
-                "Selected TILE_M = %d, N = %d, STAGE = %d, PERSISTENT_MODE = %d, LOW_LATENCY_MODE = %d, "
-                "HIGH_PRECISION_NORMED_OUTPUT = %d for param M = "
-                "%d, N = %d, num_sms = %d. (waves = %d)\n",
-                Traits::M_BLOCK, Traits::N_BLOCK, Traits::STAGES, Traits::PERSISTENT_MODE, Traits::LOW_LATENCY_MODE,
-                Traits::HIGH_PRECISION_NORMED_OUTPUT, param.m, param.n, ctas, waves);
+                "Selected TILE_M = {}, N = {}, STAGE = {}, PERSISTENT_MODE = {}, LOW_LATENCY_MODE = {}, "
+                "HIGH_PRECISION_NORMED_OUTPUT = {} for param M = "
+                "{}, N = {}, num_sms = {}. (waves = {})\n",
+                Traits::M_BLOCK, Traits::N_BLOCK, Traits::STAGES, static_cast<int>(Traits::PERSISTENT_MODE),
+                static_cast<int>(Traits::LOW_LATENCY_MODE), static_cast<int>(Traits::HIGH_PRECISION_NORMED_OUTPUT),
+                param.m, param.n, ctas, waves);
             printed = true;
         }
 

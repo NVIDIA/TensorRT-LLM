@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -186,10 +186,11 @@ void marlin_mm_moe_nvfp4(void const* A, void const* B, void* C, void* C_tmp, voi
     {
         TLLM_LOG_ERROR(
             "xuantengh debug error: kernel is MarlinDefault, cannot find corresponding instantiated kernel for threads "
-            "= %d, "
-            "thread_n_blocks = %d, thread_k_blocks = %d, m_block_size_8 = %d, group_blocks = %d, num_threads = %d, "
-            "stages = %d",
-            num_threads, thread_n_blocks, thread_k_blocks, m_block_size_8, group_blocks, num_threads, stages);
+            "= {}, "
+            "thread_n_blocks = {}, thread_k_blocks = {}, m_block_size_8 = {}, group_blocks = {}, num_threads = {}, "
+            "stages = {}",
+            num_threads, thread_n_blocks, thread_k_blocks, static_cast<int>(m_block_size_8), group_blocks, num_threads,
+            stages);
         return;
     }
 
@@ -254,7 +255,7 @@ void marlinNvfp4MoeGemmDispatcher(void const* A, void const* B, void* C, void* C
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(isMarlinNvfp4SmSupported(sm),
-        "Marlin NVFP4 MoE GEMM is only supported on Ada (SM89) and Hopper (SM90-99); current SM = %d", sm);
+        "Marlin NVFP4 MoE GEMM is only supported on Ada (SM89) and Hopper (SM90-99); current SM = {}", sm);
 
     int dev;
     cudaGetDevice(&dev);

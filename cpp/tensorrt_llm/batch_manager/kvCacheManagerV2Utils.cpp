@@ -46,7 +46,7 @@ bool loopedReadWrite(Func&& func, ssize_t size) noexcept
             {
                 continue; // Retry on interrupt
             }
-            TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(errno));
+            TLLM_LOG_ERROR("Disk read/write failed: {}\n", strerror(errno));
             return false;
         }
         count += bytes;
@@ -195,10 +195,10 @@ void IndexMapper::removeSequence(LlmRequest::RequestIdType requestId)
 at::Tensor IndexMapper::getCopyIndex(std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext,
     SizeType32 beamWidth, bool replicateBeamZero)
 {
-    TLLM_CHECK_WITH_INFO(beamWidth <= maxCopyBeamWidth_, "Requested beam width %d exceeds the copy-index capacity %d",
+    TLLM_CHECK_WITH_INFO(beamWidth <= maxCopyBeamWidth_, "Requested beam width {} exceeds the copy-index capacity {}",
         beamWidth, maxCopyBeamWidth_);
     TLLM_CHECK_WITH_INFO(replicateBeamZero || beamWidth <= maxBeamWidth_,
-        "Requested beam width %d exceeds the source page-table width %d", beamWidth, maxBeamWidth_);
+        "Requested beam width {} exceeds the source page-table width {}", beamWidth, maxBeamWidth_);
     int numSeqs = numContext + beamWidth * (requestIds.size() - numContext);
     SizeType32 batchSize = static_cast<SizeType32>(requestIds.size());
     SizeType32 idx = 0;
@@ -262,7 +262,7 @@ IndexMapper::IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     , maxCopyBeamWidth_(maxCopyBeamWidth == 0 ? maxBeamWidth : maxCopyBeamWidth)
 {
     TLLM_CHECK_WITH_INFO(maxCopyBeamWidth_ >= maxBeamWidth_,
-        "Copy-index beam width %d must be at least the source page-table beam width %d", maxCopyBeamWidth_,
+        "Copy-index beam width {} must be at least the source page-table beam width {}", maxCopyBeamWidth_,
         maxBeamWidth_);
     indexMap_.reserve(maxBatchSize);
     for (SizeType32 i = 0; i < maxBatchSize; i++)

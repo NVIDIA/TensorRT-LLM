@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ template <typename Gemm>
 size_t typedGemmGatedKernelLauncher(Gemm gemm, typename Gemm::Arguments args, void* D, void const* A, void const* B,
     void const* C_bias, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     using ElementT = typename Gemm::ElementA;
 
@@ -148,7 +148,7 @@ size_t genericGemmGatedKernelLauncherSm90(void* D, void const* A, void const* B,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using ElementT = typename TllmToCutlassTypeAdapter<T>::type;
@@ -176,7 +176,7 @@ size_t dispatchGemmConfigSm90(void* D, void const* A, void const* B, void const*
     int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemmConfig.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
@@ -216,7 +216,7 @@ size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void con
     int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     static_assert(std::is_same_v<T, __nv_fp8_e4m3>, "fusedGatedGemmSm90 only support FP8(e4m3)");
     constexpr int Ktile = 128 / sizeof(T);
     using _Ktile = Int<Ktile>;
@@ -275,14 +275,14 @@ size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void con
 template <typename T>
 CutlassFusedGatedGemmRunner<T>::CutlassFusedGatedGemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     mSm = tk::getSMVersion();
 }
 
 template <typename T>
 CutlassFusedGatedGemmRunner<T>::~CutlassFusedGatedGemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -290,7 +290,7 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     tk::QuantMode quantOption, int m, int n, int k, float scale_d0, float scale_d1, float scale_output,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
     {
 #ifndef PLACEHOLDER_KERNELS
@@ -322,7 +322,7 @@ void CutlassFusedGatedGemmRunner<T>::gemm(void* D, void const* A, void const* B,
     tk::QuantMode quantOption, int m, int n, int k, float scale_d0, float scale_d1, float scale_output,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     dispatchToArch(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);
 }
@@ -390,7 +390,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
 template <typename T>
 size_t CutlassFusedGatedGemmRunner<T>::getWorkspaceSizeImpl(int const m, int const n, int const k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     size_t workspace_size = 0;
     auto gemmConfigs = CutlassFusedGatedGemmRunner<T>{}.getConfigs();
     for (auto const& gemmConfig : gemmConfigs)
@@ -414,7 +414,7 @@ size_t CutlassFusedGatedGemmRunner<T>::getWorkspaceSizeImpl(int const m, int con
 template <typename T>
 size_t CutlassFusedGatedGemmRunner<T>::getWorkspaceSize(int const m, int const n, int const k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     // Custom hash function for the MNK type
     using MNK = std::tuple<int, int, int>;

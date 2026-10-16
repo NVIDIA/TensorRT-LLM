@@ -698,9 +698,9 @@ template <typename T>
 void invokeFusedGatedRMSNormQuant(FusedGatedRMSNormQuantParams<T> const& params, int multiProcessorCount)
 {
     TLLM_CHECK_WITH_INFO(
-        params.N % params.groupSize == 0, "N (%d) must be divisible by groupSize (%d)", params.N, params.groupSize);
+        params.N % params.groupSize == 0, "N ({}) must be divisible by groupSize ({})", params.N, params.groupSize);
     TLLM_CHECK_WITH_INFO(params.groupSize % ELTS_PER_THREAD == 0,
-        "groupSize (%d) must be divisible by ELTS_PER_THREAD (%d)", params.groupSize, ELTS_PER_THREAD);
+        "groupSize ({}) must be divisible by ELTS_PER_THREAD ({})", params.groupSize, ELTS_PER_THREAD);
 
     int const ngroups = params.N / params.groupSize;
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -259,15 +259,15 @@ public:
 
         auto status = gemm.can_implement(arguments);
         TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-            "This kernel is not supported. Last CUDA error is: %s", cutlassGetStatusString(status));
+            "This kernel is not supported. Last CUDA error is: {}", cutlassGetStatusString(status));
 
         status = gemm.initialize(arguments, nullptr, stream);
         TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-            "Failed to initialize the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
+            "Failed to initialize the CUTLASS kernel. Last CUDA error is: {}", cutlassGetStatusString(status));
 
         status = gemm.run(stream);
         TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-            "Failed to run the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
+            "Failed to run the CUTLASS kernel. Last CUDA error is: {}", cutlassGetStatusString(status));
 
         return 0;
     }

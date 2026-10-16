@@ -142,7 +142,7 @@ KvCacheManager::~KvCacheManager()
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
 {
     TLLM_CHECK_WITH_INFO(mLivingKvCaches.empty(),
-        "%s with %zu KV cache(s) still open; close them (or drain the engine) first", api, mLivingKvCaches.size());
+        "{} with {} KV cache(s) still open; close them (or drain the engine) first", api, mLivingKvCaches.size());
 }
 
 void KvCacheManager::shutdown()
@@ -475,7 +475,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_WARNING("Failed to resize cache level %d to %zu: %s", level.value(), quota, e.what());
+        TLLM_LOG_WARNING("Failed to resize cache level {} to {}: {}", level.value(), quota, e.what());
         return false;
     }
 }

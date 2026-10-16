@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,12 +71,12 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
                 if (rc)
                 {
                     TLLM_LOG_ERROR(
-                        "Failed to get transfer status for batch %lu, task %zu: error code %d", mBatchId, index, rc);
+                        "Failed to get transfer status for batch {}, task {}: error code {}", mBatchId, index, rc);
                 }
                 else
                 {
-                    TLLM_LOG_ERROR(
-                        "Transfer failed for batch %lu, task %zu: status %d", mBatchId, index, status.status);
+                    TLLM_LOG_ERROR("Transfer failed for batch {}, task {}: status {}", mBatchId, index,
+                        static_cast<int>(status.status));
                 }
             }
             else if (status.status != STATUS_COMPLETED)
@@ -96,7 +96,7 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
         {
             freeBatchID(mEngine, mBatchId);
             mBatchFreed = true;
-            TLLM_LOG_DEBUG("Batch ID %lu freed in wait()", mBatchId);
+            TLLM_LOG_DEBUG("Batch ID {} freed in wait()", mBatchId);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             return TransferState::kSUCCESS;
         }
@@ -139,16 +139,17 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
             if (rc)
             {
                 TLLM_LOG_ERROR(
-                    "Failed to get transfer status for batch %lu, task %zu: error code %d", mBatchId, index, rc);
+                    "Failed to get transfer status for batch {}, task {}: error code {}", mBatchId, index, rc);
             }
             else
             {
-                TLLM_LOG_ERROR("Transfer failed for batch %lu, task %zu: status %d", mBatchId, index, status.status);
+                TLLM_LOG_ERROR("Transfer failed for batch {}, task {}: status {}", mBatchId, index,
+                    static_cast<int>(status.status));
             }
         }
         else if (status.status == STATUS_PENDING || status.status == STATUS_WAITING)
         {
-            TLLM_LOG_DEBUG("Transfer is pending for batch %lu, task %zu", mBatchId, index);
+            TLLM_LOG_DEBUG("Transfer is pending for batch {}, task {}", mBatchId, index);
             return false;
         }
     }
@@ -159,10 +160,10 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
         // where the same batchId could be used to post multiple transfer.
         freeBatchID(mEngine, mBatchId);
         mBatchFreed = true;
-        TLLM_LOG_DEBUG("Batch ID %lu freed, future calls will return true directly", mBatchId);
+        TLLM_LOG_DEBUG("Batch ID {} freed, future calls will return true directly", mBatchId);
     }
     // Currently, we cannot distinguish between failed and completed from return value.
-    TLLM_LOG_DEBUG("Transfer is completed for batch %lu", mBatchId);
+    TLLM_LOG_DEBUG("Transfer is completed for batch {}", mBatchId);
     return true;
 }
 
@@ -361,7 +362,7 @@ void MooncakeTransferAgent::registerMemory(RegisterDescs const& descs)
 
         int err = registerLocalMemory(mEngine, reinterpret_cast<void*>(desc.getAddr()), desc.getLen(), "*", 1);
 
-        TLLM_CHECK_WITH_INFO(err == 0, "registerLocalMemory failed, addr: %p, len: %lu",
+        TLLM_CHECK_WITH_INFO(err == 0, "registerLocalMemory failed, addr: {:p}, len: {}",
             reinterpret_cast<void*>(desc.getAddr()), desc.getLen());
 
         auto mooncakeDesc = std::make_shared<MooncakeMemoryDesc>(desc);
@@ -387,7 +388,7 @@ void MooncakeTransferAgent::deregisterMemory(RegisterDescs const& descs)
             int err = unregisterLocalMemory(mEngine, reinterpret_cast<void*>(desc.getAddr()));
 
             TLLM_CHECK_WITH_INFO(
-                err == 0, "unregisterLocalMemory failed, addr: %p", reinterpret_cast<void*>(desc.getAddr()));
+                err == 0, "unregisterLocalMemory failed, addr: {:p}", reinterpret_cast<void*>(desc.getAddr()));
 
             mMemRegInfo.erase(desc.getAddr());
         }
@@ -405,14 +406,14 @@ void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc c
 void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "MooncakeTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
+        "MooncakeTransferAgent::loadRemoteAgent loadRemoteAgent to {} remoteagent name: {}", connectionInfo.c_str(),
         name.c_str());
 
     std::lock_guard<std::mutex> lock(mMutex);
     auto segmentId = openSegment(mEngine, connectionInfo.c_str());
 
     TLLM_CHECK_WITH_INFO(
-        segmentId >= 0, "loadRemoteAgent openSegment failed, connectionInfo: %s", connectionInfo.c_str());
+        segmentId >= 0, "loadRemoteAgent openSegment failed, connectionInfo: {}", connectionInfo.c_str());
 
     mConnectedAgents[name].segmentId = segmentId;
 }
@@ -479,7 +480,7 @@ ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
         if (it == mConnectedAgents.end())
         {
             std::string error = "Remote agent " + remoteName + "not found";
-            TLLM_THROW(error);
+            TLLM_THROW("{}", error);
         }
 
         auto const& agentInfo = it->second;
@@ -519,7 +520,7 @@ ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
         rc = submitTransfer(mEngine, batchId, transferRequests.data(), requestCount);
     }
 
-    TLLM_CHECK_WITH_INFO(rc == 0, "submitTransfer failed with status: %d", rc);
+    TLLM_CHECK_WITH_INFO(rc == 0, "submitTransfer failed with status: {}", rc);
 
     return std::make_unique<MooncakeTransferStatus>(mEngine, batchId, requestCount);
 }
@@ -534,7 +535,7 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
 
         if (it == mConnectedAgents.end())
         {
-            TLLM_LOG_WARNING("Remote agent %s not found", name.c_str());
+            TLLM_LOG_WARNING("Remote agent {} not found", name.c_str());
             return;
         }
 
@@ -547,12 +548,12 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
     std::string encoded = MooncakeBase64Helper::encode(syncMessage);
     notifyMsg.msg = const_cast<char*>(encoded.c_str());
 
-    TLLM_LOG_DEBUG("MooncakeTransferAgent::notifySyncMessage notifyMsg.name: %s, notifyMsg.msg: %s", notifyMsg.name,
+    TLLM_LOG_DEBUG("MooncakeTransferAgent::notifySyncMessage notifyMsg.name: {}, notifyMsg.msg: {}", notifyMsg.name,
         notifyMsg.msg);
 
     int ret = genNotifyInEngine(mEngine, segmentId, notifyMsg);
 
-    TLLM_CHECK_WITH_INFO(ret == 0, "genNotifyInEngine failed with status: %d", ret);
+    TLLM_CHECK_WITH_INFO(ret == 0, "genNotifyInEngine failed with status: {}", ret);
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> MooncakeTransferAgent::getNotifiedSyncMessages()
@@ -562,20 +563,20 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
 
     notify_msg_t* notifyMsgs = getNotifsFromEngine(mEngine, &size);
 
-    TLLM_CHECK_WITH_INFO(size >= 0, "getNotifsFromEngine returned negative size: %d", size);
+    TLLM_CHECK_WITH_INFO(size >= 0, "getNotifsFromEngine returned negative size: {}", size);
 
     for (int i = 0; i < size; i++)
     {
         if (notifyMsgs[i].msg == nullptr)
         {
-            TLLM_LOG_WARNING("Message pointer is null for: %s", notifyMsgs[i].name);
+            TLLM_LOG_WARNING("Message pointer is null for: {}", notifyMsgs[i].name);
             continue;
         }
 
         std::string decoded = MooncakeBase64Helper::decodeToString(notifyMsgs[i].msg);
         notifs[notifyMsgs[i].name].emplace_back(std::move(decoded));
 
-        TLLM_LOG_DEBUG("MooncakeTransferAgent::getNotifiedSyncMessages getNotifsFromEngine: %s, %s", notifyMsgs[i].name,
+        TLLM_LOG_DEBUG("MooncakeTransferAgent::getNotifiedSyncMessages getNotifsFromEngine: {}, {}", notifyMsgs[i].name,
             notifyMsgs[i].msg);
     }
 

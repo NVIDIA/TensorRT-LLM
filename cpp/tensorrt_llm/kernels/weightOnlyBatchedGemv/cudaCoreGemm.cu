@@ -320,11 +320,11 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
     if (!dispatched)
     {
         TLLM_LOG_DEBUG(
-            "tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher failed to dispatch: inputType=%d, "
-            "outputType=%d, "
-            "m=%d, "
-            "n=%d, k=%d",
-            params.inputType, params.outputType, params.m, params.n, params.k);
+            "tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher failed to dispatch: inputType={}, "
+            "outputType={}, "
+            "m={}, "
+            "n={}, k={}",
+            static_cast<int>(params.inputType), static_cast<int>(params.outputType), params.m, params.n, params.k);
     }
     return dispatched;
 }

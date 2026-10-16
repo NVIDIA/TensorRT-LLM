@@ -208,7 +208,7 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define SHOULD_NOT_USE(message)                                                                                        \
-    TLLM_LOG_DEBUG(message);                                                                                           \
+    TLLM_LOG_DEBUG("{}", message);                                                                                     \
     return false;
 
 bool XqaDispatcher::shouldUse(XQAParams const& params)
@@ -317,7 +317,7 @@ bool XqaDispatcher::isSupported()
 
         if (!isSupported)
         {
-            TLLM_LOG_WARNING("TRTLLLM-Gen kernels are not selected: " + info);
+            TLLM_LOG_WARNING("{}", "TRTLLLM-Gen kernels are not selected: " + info);
             return false;
         }
     }

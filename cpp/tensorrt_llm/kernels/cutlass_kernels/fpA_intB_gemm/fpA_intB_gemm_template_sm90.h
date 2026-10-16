@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,7 +50,7 @@ void sm90_dispatch_epilogue_schedules(ActivationType const* A, WeightType const*
     cudaStream_t stream, int* occupancy = nullptr)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemm_config.epilogue_schedule)
     {
     case tkc::EpilogueScheduleType::AUTO:
@@ -119,7 +119,7 @@ void sm90_dispatch_mainloop_schedules(ActivationType const* A, WeightType const*
     int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     constexpr bool tile_shapes_supported = are_tile_shapes_supported<CTAShape, ClusterShape>();
 
@@ -157,7 +157,7 @@ void sm90_dispatch_gemm_config(ActivationType const* A, WeightType const* B, Sca
     int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     switch (gemm_config.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
@@ -194,7 +194,7 @@ void sm90_dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B,
     int k, int const group_size, char* workspace, size_t workspace_bytes, tkc::CutlassGemmConfig gemm_config,
     cudaStream_t stream, int* occupancy = nullptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     // Note that SIMT configs are omitted here since they are not supported for fpA_intB.
     // We also only instantiate configs here where threadblockShapeM == warpShapeM since those usually perform the best
     // for mixed type gemms.

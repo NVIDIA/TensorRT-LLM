@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ public:
     {
         pointer event;
         TLLM_CUDA_CHECK(::cudaEventCreate(&event, flags));
-        TLLM_LOG_TRACE("Created event %p", event);
+        TLLM_LOG_TRACE("Created event {:p}", static_cast<void const*>(event));
         bool constexpr ownsEvent{true};
         mEvent = EventPtr{event, Deleter{ownsEvent}};
     }
@@ -85,7 +85,7 @@ private:
             if (mOwnsEvent && event != nullptr)
             {
                 TLLM_CUDA_CHECK(::cudaEventDestroy(event));
-                TLLM_LOG_TRACE("Destroyed event %p", event);
+                TLLM_LOG_TRACE("Destroyed event {:p}", static_cast<void const*>(event));
             }
         }
 

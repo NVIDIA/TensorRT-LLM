@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,10 +71,10 @@ void AgentTreeNode::insertRequest(LlmRequestPtr const& request)
         auto it = mTypeToChild.find(nodeType);
         if (it == mTypeToChild.end())
         {
-            TLLM_LOG_WARNING("Node type %d not found in children at level %d — routing to Chatbot",
+            TLLM_LOG_WARNING("Node type {} not found in children at level {} — routing to Chatbot",
                 static_cast<SizeType32>(nodeType), nextLevel);
             it = mTypeToChild.find(NodeType::kCHATBOT);
-            TLLM_CHECK_WITH_INFO(it != mTypeToChild.end(), "Chatbot fallback node not found at level %d", nextLevel);
+            TLLM_CHECK_WITH_INFO(it != mTypeToChild.end(), "Chatbot fallback node not found at level {}", nextLevel);
         }
 
         it->second->insertRequest(request);
@@ -353,7 +353,7 @@ RequestVector sortAndTruncateRequestsByAgentTree(
     if (sortedRequests.size() > static_cast<size_t>(availableSlots))
     {
         sortedRequests.resize(availableSlots);
-        TLLM_LOG_DEBUG("sortAndTruncateRequestsByAgentTree: Limited to %d requests (maxRequests=%d, reserved=%d)",
+        TLLM_LOG_DEBUG("sortAndTruncateRequestsByAgentTree: Limited to {} requests (maxRequests={}, reserved={})",
             availableSlots, maxRequests, reservedCount);
     }
 
@@ -376,7 +376,7 @@ NodeType getNodeType(LlmRequestPtr const& request, SizeType32 level)
     auto nodeType = tryStringToNodeType(typeStr);
     if (!nodeType.has_value())
     {
-        TLLM_LOG_WARNING("Unknown agent hierarchy name '%s' at level %d — treating as Chatbot", typeStr.c_str(), level);
+        TLLM_LOG_WARNING("Unknown agent hierarchy name '{}' at level {} — treating as Chatbot", typeStr.c_str(), level);
         return NodeType::kCHATBOT;
     }
     return nodeType.value();

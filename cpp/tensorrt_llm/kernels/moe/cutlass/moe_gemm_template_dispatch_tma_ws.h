@@ -413,8 +413,8 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
         else                                                                                                           \
         {                                                                                                              \
             TLLM_THROW(                                                                                                \
-                "%s\nUnsupported tile (%d, %d, %d) and cluster (%d, %d, %d) shape combination for arch %d.\nConfig "   \
-                "was %s",                                                                                              \
+                "{}\nUnsupported tile ({}, {}, {}) and cluster ({}, {}, {}) shape combination for arch {}.\nConfig "   \
+                "was {}",                                                                                              \
                 __PRETTY_FUNCTION__, (int) cute::get<0>(TileShape{}), (int) cute::get<1>(TileShape{}),                 \
                 (int) cute::get<2>(TileShape{}), M, N, K, (int) Arch::kMinComputeCapability,                           \
                 gemm_config.toString().c_str());                                                                       \
@@ -428,7 +428,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
         SHAPE_CASE(2, 2, 1)
 
 #undef SHAPE_CASE
-    default: TLLM_THROW("Unsupported cluster shape config %d for MoE gemm.", (int) gemm_config.cluster_shape);
+    default: TLLM_THROW("Unsupported cluster shape config {} for MoE gemm.", (int) gemm_config.cluster_shape);
     }
 }
 
@@ -458,7 +458,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
         TLLM_THROW("GEMM config should have already been set by heuristic.");                                          \
         break;                                                                                                         \
     default:                                                                                                           \
-        TLLM_THROW("Unsupported tile shape config %d for MoE gemm.", (int) gemm_config.tile_config_sm##SMVERSION);     \
+        TLLM_THROW("Unsupported tile shape config {} for MoE gemm.", (int) gemm_config.tile_config_sm##SMVERSION);     \
         break;
 
     if (gemm_config.sm_version == 90)
@@ -537,7 +537,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
     }
     else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121)
     {
-        TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__, (int) gemm_config.tile_config_sm120);
+        TLLM_LOG_TRACE("At {}, SM120 config={}", __PRETTY_FUNCTION__, (int) gemm_config.tile_config_sm120);
         if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
         {
             switch (gemm_config.tile_config_sm120)

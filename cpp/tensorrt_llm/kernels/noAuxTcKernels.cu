@@ -357,7 +357,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     else
     {
         TLLM_CHECK_WITH_INFO(false,
-            "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, topk_group=%ld, topk=%ld). "
+            "invokeNoAuxTc: unsupported configuration (n_group={}, num_experts={}, topk_group={}, topk={}). "
             "Please use original pytorch implementation.",
             n_group, num_experts, topk_group, topk);
     }

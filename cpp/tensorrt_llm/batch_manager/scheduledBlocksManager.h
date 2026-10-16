@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -99,7 +99,7 @@ public:
             auto const required
                 = mKvCacheManager.getNeededBlocksOneStep(req, mTwoStepsLookAhead, windowSize, cachedSummary);
 
-            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu required blocks %i for %i window size",
+            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID {} required blocks {} for {} window size",
                 req.mRequestId, required, windowSize);
 
             auto const scheduledTotal = numScheduled + required;
@@ -120,7 +120,7 @@ public:
         for (auto const& [windowSize, blocksIfScheduled] : numBlocksIfScheduled)
         {
             TLLM_LOG_DEBUG(
-                "MaxUtilizationScheduler: scheduled blocks %i for window size %i", blocksIfScheduled, windowSize);
+                "MaxUtilizationScheduler: scheduled blocks {} for window size {}", blocksIfScheduled, windowSize);
             mNumScheduledBlocks.at(windowSize) = blocksIfScheduled;
         }
     }

@@ -53,7 +53,7 @@ bool cleanupNoThrow(char const* resource, Cleanup cleanup) noexcept
     {
         try
         {
-            TLLM_LOG_WARNING("Failed to release %s during McastDeviceMemory cleanup: %s", resource, error.what());
+            TLLM_LOG_WARNING("Failed to release {} during McastDeviceMemory cleanup: {}", resource, error.what());
         }
         catch (...)
         {
@@ -65,7 +65,7 @@ bool cleanupNoThrow(char const* resource, Cleanup cleanup) noexcept
     {
         try
         {
-            TLLM_LOG_WARNING("Failed to release %s during McastDeviceMemory cleanup", resource);
+            TLLM_LOG_WARNING("Failed to release {} during McastDeviceMemory cleanup", resource);
         }
         catch (...)
         {
@@ -123,22 +123,22 @@ void runCollectivePhase(McastGroupComm& comm, char const* phase, Action action, 
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("[McastDeviceMemory] %s failed on group rank %d: %s", phase, comm.getRank(), error.what());
+            TLLM_LOG_ERROR("[McastDeviceMemory] {} failed on group rank {}: {}", phase, comm.getRank(), error.what());
         }
         catch (...)
         {
-            TLLM_LOG_ERROR("[McastDeviceMemory] %s failed on group rank %d", phase, comm.getRank());
+            TLLM_LOG_ERROR("[McastDeviceMemory] {} failed on group rank {}", phase, comm.getRank());
         }
     }
     if (failureIsTerminal)
     {
         TLLM_THROW(
-            "[McastDeviceMemory] %s failed on one or more ranks; the object is unusable and the process must be "
+            "[McastDeviceMemory] {} failed on one or more ranks; the object is unusable and the process must be "
             "torn down.",
             phase);
     }
     TLLM_THROW(
-        "[McastDeviceMemory] %s failed on one or more ranks before restore mutation; the object remains "
+        "[McastDeviceMemory] {} failed on one or more ranks before restore mutation; the object remains "
         "unmapped and the caller may retry with a valid communicator.",
         phase);
 }
@@ -175,11 +175,11 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
     // allocate for a different number of peers) and would deadlock the collectives below.
     TLLM_CHECK_WITH_INFO(mGroupComm != nullptr, "[McastDeviceMemory] group communicator must not be null.");
     TLLM_CHECK_WITH_INFO(mGroupComm->getSize() == mGroupSize,
-        "[McastDeviceMemory] group communicator size (%u) does not match the requested group size (%u). Under a "
+        "[McastDeviceMemory] group communicator size ({}) does not match the requested group size ({}). Under a "
         "non-MPI orchestrator this usually means the process group passed in does not cover the TP group.",
         mGroupComm->getSize(), mGroupSize);
     TLLM_CHECK_WITH_INFO(mGroupComm->getRank() == mGroupRank,
-        "[McastDeviceMemory] group communicator rank (%u) does not match the requested group rank (%u).",
+        "[McastDeviceMemory] group communicator rank ({}) does not match the requested group rank ({}).",
         mGroupComm->getRank(), mGroupRank);
 
     // Retained so checkpointRestore() can confirm a replacement backend covers the same processes.
@@ -210,9 +210,10 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
 
     TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] World Rank: %d, Group Rank: %u, Group size: %u, isMultiNode: %d, "
-        "device_idx: %d, Signal pad offset: %zu",
-        mGroupComm->getWorldRank(), mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+        "[McastDeviceMemory] World Rank: {}, Group Rank: {}, Group size: {}, isMultiNode: {}, "
+        "device_idx: {}, Signal pad offset: {}",
+        mGroupComm->getWorldRank(), mGroupRank, mGroupSize, static_cast<int>(mIsMNNvlink), mDeviceIdx,
+        mSignalPadOffset);
 
     if (mIsMNNvlink)
     {

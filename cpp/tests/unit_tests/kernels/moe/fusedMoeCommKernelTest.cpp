@@ -74,7 +74,7 @@ protected:
         case 4: return CUDA_R_32F;
         case 8: return CUDA_R_64F;
         case 16: return CUDA_C_64F;
-        default: TLLM_THROW("Unsupported element size: %d", elementSize);
+        default: TLLM_THROW("Unsupported element size: {}", elementSize);
         };
     }
 

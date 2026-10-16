@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,12 +33,15 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_types.h>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
@@ -128,28 +131,27 @@ static char const* _cudaGetErrorEnum(cublasStatus_t error)
 }
 
 template <typename T>
-void check(T ptr, char const* const func, char const* const file, int const line)
+void check(T ptr, char const* const func, std::source_location const& location)
 {
     if (ptr)
     {
-        throw TllmException(file, line,
-            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
+        throw TllmException(
+            location, std::format("[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr)));
     }
 }
 
 template <typename T>
 void checkEx(
-    T ptr, std::initializer_list<T> const& validReturns, char const* const func, char const* const file, int const line)
+    T ptr, std::initializer_list<T> const& validReturns, char const* const func, std::source_location const& location)
 {
     if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
-        throw TllmException(file, line,
-            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
+        throw TllmException(
+            location, std::format("[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr)));
     }
 }
 
-#define check_cuda_error(val) check((val), #val, __FILE__, __LINE__)
-#define check_cuda_error_2(val, file, line) check((val), #val, file, line)
+#define check_cuda_error(val) check((val), #val, std::source_location::current())
 
 inline bool isCapturing(cudaStream_t stream)
 {
@@ -179,16 +181,16 @@ inline bool doCheckError(cudaStream_t stream)
     return doCheckIfNotCapturing && !isCapturing(stream);
 }
 
-inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
+inline void syncAndCheck(cudaStream_t stream, std::source_location const& location)
 {
     if (doCheckError(stream))
     {
         cudaStreamSynchronize(stream);
-        check(cudaGetLastError(), "cudaGetLastError", file, line);
+        check(cudaGetLastError(), "cudaGetLastError", location);
     }
 }
 
-#define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, __FILE__, __LINE__)
+#define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, std::source_location::current())
 
 #define PRINT_FUNC_NAME_()                                                                                             \
     do                                                                                                                 \
@@ -361,7 +363,7 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)
         freeSysMem = memInfo.ullAvailPhys;
 #endif // WIN32
 
-        TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+        TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory {:.2f} GB, available memory {:.2f} GB",
             ((double) totalSysMem / 1e9), ((double) freeSysMem / 1e9));
         return {freeSysMem, totalSysMem};
     }
@@ -369,7 +371,7 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)
     size_t free = 0;
     size_t total = 0;
     check_cuda_error(cudaMemGetInfo(&free, &total));
-    TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+    TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory {:.2f} GB, available memory {:.2f} GB",
         ((double) total / 1e9), ((double) free / 1e9));
     return {free, total};
 }
@@ -462,7 +464,7 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
 {
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("%s is an nullptr, skip!", name.c_str());
+        TLLM_LOG_WARNING("{} is an nullptr, skip!", name.c_str());
         return;
     }
     cudaDeviceSynchronize();
@@ -470,7 +472,7 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
 
     bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
     size_t sizeInByte = sizeof(T) * nElement;
-    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nElement=%d, sizeInByte=%lu\n", ptr,
+    TLLM_LOG_TRACE("addr={:p}, location={}, sizeof(T)={}, nElement={}, sizeInByte={}\n", static_cast<void const*>(ptr),
         (isDevicePtr ? "Device" : "Host"), sizeof(T), nElement, sizeInByte);
     T* tmp = const_cast<T*>(ptr);
     std::vector<T> tmpVec; // For device pointer
@@ -518,9 +520,10 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
     float avg = sum / nElement;
     float std = sqrtf(sqrSum / nElement - avg * avg);
 
-    TLLM_LOG_INFO("%s", name.c_str());
-    TLLM_LOG_INFO("size=%u, nInf=%zu, nNaN=%zu, nZero=%zu", nElement, nInf, nNaN, nZero);
-    TLLM_LOG_INFO("avg=%f, absSum: %f, std=%f, max=%f, min=%f, sad=%f", avg, absSum, std, allMax, allMin, allSad);
+    TLLM_LOG_INFO("{}", name.c_str());
+    TLLM_LOG_INFO("size={}, nInf={}, nNaN={}, nZero={}", nElement, nInf, nNaN, nZero);
+    TLLM_LOG_INFO(
+        "avg={:f}, absSum: {:f}, std={:f}, max={:f}, min={:f}, sad={:f}", avg, absSum, std, allMax, allMin, allSad);
 
     if (bPrintElement)
     {
@@ -539,7 +542,7 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
                 ss << (float) tmp[i] << ", ";
             }
         }
-        TLLM_LOG_INFO("%s", ss.str().c_str());
+        TLLM_LOG_INFO("{}", ss.str().c_str());
     }
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());
@@ -727,8 +730,8 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
 
     bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
     size_t sizeInByte = sizeof(T) * nRow * nStride;
-    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr,
-        (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
+    TLLM_LOG_TRACE("addr={:p}, location={}, sizeof(T)={}, nRow={}, nStride={}, sizeInByte={}\n",
+        static_cast<void const*>(ptr), (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
     if (isDevicePtr)
     {
         std::vector<T> tmpVec;
@@ -1410,13 +1413,35 @@ DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 
 TRTLLM_NAMESPACE_END
 
+//! Format CUDA runtime errors by name, e.g. "cudaErrorInvalidValue"; width and alignment apply to the name.
+template <>
+struct std::formatter<cudaError_t> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(cudaError_t const error, Context& context) const
+    {
+        return std::formatter<std::string_view>::format(cudaGetErrorName(error), context);
+    }
+};
+
+//! Format cuBLAS statuses by name, e.g. "CUBLAS_STATUS_NOT_INITIALIZED".
+template <>
+struct std::formatter<cublasStatus_t> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(cublasStatus_t const status, Context& context) const
+    {
+        return std::formatter<std::string_view>::format(cublasGetStatusName(status), context);
+    }
+};
+
 /*
  * Macros compliant with TensorRT coding conventions
  */
 #define TLLM_CUDA_CHECK(stat)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                                \
+        tensorrt_llm::common::check((stat), #stat, std::source_location::current());                                   \
     } while (0)
 
 // We use singleton memory pool and the order of destructors depends on the compiler implementation. We find that the
@@ -1426,7 +1451,8 @@ TRTLLM_NAMESPACE_END
 #define TLLM_CUDA_CHECK_FREE_RESOURCE(stat)                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
+        tensorrt_llm::common::checkEx(                                                                                 \
+            (stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, std::source_location::current());                  \
     } while (0)
 
 // Warn-only variant: log a warning on failure but do not throw or abort.
@@ -1438,6 +1464,6 @@ TRTLLM_NAMESPACE_END
         if (TLLM_UNLIKELY(_tllm_cuda_warn_err != cudaSuccess))                                                         \
         {                                                                                                              \
             TLLM_LOG_WARNING(                                                                                          \
-                "CUDA error in %s (%s:%d): %s", #stat, __FILE__, __LINE__, cudaGetErrorString(_tllm_cuda_warn_err));   \
+                "CUDA error in {} ({}:{}): {}", #stat, __FILE__, __LINE__, cudaGetErrorString(_tllm_cuda_warn_err));   \
         }                                                                                                              \
     } while (0)

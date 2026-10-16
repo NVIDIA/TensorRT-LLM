@@ -188,7 +188,7 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
                                                        : CU_TENSOR_MAP_SWIZZLE_NONE;
     CUresult rc = cuTensorMapEncodeTiled(&tm, dtype, 2, base, gmemDims, gmemStrides, smemDims, elemStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TLLM_CHECK_WITH_INFO(rc == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed (%d)", static_cast<int>(rc));
+    TLLM_CHECK_WITH_INFO(rc == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed ({})", rc);
     return tm;
 }
 
@@ -339,7 +339,7 @@ static FusedRoutFn fhcInstanceIfSupported()
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u for hidden_size=%u", KS, Hidden);
+        TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits={} for hidden_size={}", KS, Hidden);
         return nullptr;
     }
 }
@@ -368,7 +368,7 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 64: return fhcInstanceIfSupported<Hidden, 64>();
     case 106: return fhcInstanceIfSupported<Hidden, 106>();
     case 112: return fhcInstanceIfSupported<Hidden, 112>();
-    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u", ks); return nullptr;
+    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits={}", ks); return nullptr;
     }
 }
 
@@ -416,9 +416,9 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
 
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
     TLLM_CHECK_WITH_INFO(hidden_size == static_cast<int>(Hidden),
-        "mhcFusedHcLaunch: dispatched Hidden=%u but got hidden_size=%d", Hidden, hidden_size);
+        "mhcFusedHcLaunch: dispatched Hidden={} but got hidden_size={}", Hidden, hidden_size);
     TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
-        "mhcFusedHcLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
+        "mhcFusedHcLaunch: hc_mult={} not supported (only {})", hc_mult, FHC_HC_MULT);
 
     constexpr uint32_t SHAPE_K = FHC_HC_MULT * Hidden;
 
@@ -495,7 +495,7 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
         return;
 
     TLLM_CHECK_WITH_INFO(isSupportedFhcHiddenRuntime(hidden_size),
-        "mhcFusedHcLaunch: unsupported hidden_size=%d; supported hidden sizes are 4096, 5120 and 7168", hidden_size);
+        "mhcFusedHcLaunch: unsupported hidden_size={}; supported hidden sizes are 4096, 5120 and 7168", hidden_size);
 
     switch (hidden_size)
     {
@@ -567,7 +567,7 @@ static FmaKsplitFn pickFhcFma(int tile_n, int ks)
     FHCFMA_CASE(12, 1);
     FHCFMA_CASE(24, 1);
 #undef FHCFMA_CASE
-    TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaLaunch: unsupported (tile_n=%d, ks=%d)", tile_n, ks);
+    TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaLaunch: unsupported (tile_n={}, ks={})", tile_n, ks);
     return nullptr;
 }
 
@@ -583,11 +583,11 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
         return;
 
     TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
-        "mhcFusedHcFmaLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
+        "mhcFusedHcFmaLaunch: hc_mult={} not supported (only {})", hc_mult, FHC_HC_MULT);
     TLLM_CHECK_WITH_INFO(hidden_size % static_cast<int>(FHC_BLOCK_K) == 0,
-        "mhc fused-HC FMA path requires hidden_size to be divisible by %u, got %d", FHC_BLOCK_K, hidden_size);
+        "mhc fused-HC FMA path requires hidden_size to be divisible by {}, got {}", FHC_BLOCK_K, hidden_size);
     TLLM_CHECK_WITH_INFO(
-        FHC_SHAPE_N % tile_n == 0, "mhcFusedHcFmaLaunch: SHAPE_N=%u not divisible by tile_n=%d", FHC_SHAPE_N, tile_n);
+        FHC_SHAPE_N % tile_n == 0, "mhcFusedHcFmaLaunch: SHAPE_N={} not divisible by tile_n={}", FHC_SHAPE_N, tile_n);
 
     int const K = hc_mult * hidden_size;
     int const N = static_cast<int>(FHC_SHAPE_N);
@@ -650,7 +650,7 @@ static FusedAllInOneFn fhcAllInOneInstanceIfSupported()
     else
     {
         TLLM_CHECK_WITH_INFO(
-            false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u for hidden_size=%u", KS, Hidden);
+            false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits={} for hidden_size={}", KS, Hidden);
         return nullptr;
     }
 }
@@ -679,7 +679,7 @@ static FusedAllInOneFn pickFhcAllInOne(uint32_t ks)
     case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64, kFuseNorm, kLaggedPre>();
     case 106: return fhcAllInOneInstanceIfSupported<Hidden, 106, kFuseNorm, kLaggedPre>();
     case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112, kFuseNorm, kLaggedPre>();
-    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u", ks); return nullptr;
+    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits={}", ks); return nullptr;
     }
 }
 
@@ -697,9 +697,9 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
 
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
     TLLM_CHECK_WITH_INFO(hidden_size == static_cast<int>(Hidden),
-        "mhcFusedHcAllInOneLaunch: dispatched Hidden=%u but got hidden_size=%d", Hidden, hidden_size);
+        "mhcFusedHcAllInOneLaunch: dispatched Hidden={} but got hidden_size={}", Hidden, hidden_size);
     TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
-        "mhcFusedHcAllInOneLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
+        "mhcFusedHcAllInOneLaunch: hc_mult={} not supported (only {})", hc_mult, FHC_HC_MULT);
 
     constexpr uint32_t SHAPE_K = FHC_HC_MULT * Hidden;
 
@@ -780,7 +780,7 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
         return;
 
     TLLM_CHECK_WITH_INFO(isSupportedFhcHiddenRuntime(hidden_size),
-        "mhcFusedHcAllInOneLaunch: unsupported hidden_size=%d; supported hidden sizes are 4096, 5120 and 7168",
+        "mhcFusedHcAllInOneLaunch: unsupported hidden_size={}; supported hidden sizes are 4096, 5120 and 7168",
         hidden_size);
 
     switch (hidden_size)
@@ -894,7 +894,7 @@ static FmaAllInOneFn pickFhcFmaAllInOne(int tile_n, int ks, int tile_m)
     FHC_FMA_AIO_CASE(24, 1, 4);
 #undef FHC_FMA_AIO_CASE
     TLLM_CHECK_WITH_INFO(
-        false, "mhcFusedHcFmaAllInOneLaunch: unsupported (tile_n=%d, ks=%d, tile_m=%d)", tile_n, ks, tile_m);
+        false, "mhcFusedHcFmaAllInOneLaunch: unsupported (tile_n={}, ks={}, tile_m={})", tile_n, ks, tile_m);
     return nullptr;
 }
 
@@ -910,11 +910,11 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
         return;
 
     TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
-        "mhcFusedHcFmaAllInOneLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
+        "mhcFusedHcFmaAllInOneLaunch: hc_mult={} not supported (only {})", hc_mult, FHC_HC_MULT);
     TLLM_CHECK_WITH_INFO(hidden_size % static_cast<int>(FHC_BLOCK_K) == 0,
-        "mhc fused-HC FMA path requires hidden_size to be divisible by %u, got %d", FHC_BLOCK_K, hidden_size);
+        "mhc fused-HC FMA path requires hidden_size to be divisible by {}, got {}", FHC_BLOCK_K, hidden_size);
     TLLM_CHECK_WITH_INFO(FHC_SHAPE_N % tile_n == 0,
-        "mhcFusedHcFmaAllInOneLaunch: SHAPE_N=%u not divisible by tile_n=%d", FHC_SHAPE_N, tile_n);
+        "mhcFusedHcFmaAllInOneLaunch: SHAPE_N={} not divisible by tile_n={}", FHC_SHAPE_N, tile_n);
 
     int const K = hc_mult * hidden_size;
     int const N = static_cast<int>(FHC_SHAPE_N);

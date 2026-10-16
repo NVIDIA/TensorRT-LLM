@@ -1772,7 +1772,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
             && params.kv_norm_weight != nullptr && params.meta.kv_lora_rank == 448;
         TLLM_CHECK_WITH_INFO(params.fuse_kv_norm_in_rope == useFusedKvNorm,
             "MLA Context: fused kv-norm requested but preconditions not met "
-            "(absorption_mode=%d, kv_norm_weight=%p, kv_lora_rank=%d, expected 448)",
+            "(absorption_mode={}, kv_norm_weight={:p}, kv_lora_rank={}, expected 448)",
             static_cast<int>(params.absorption_mode), params.kv_norm_weight, params.meta.kv_lora_rank);
         auto const* kv_norm_w = static_cast<T const*>(params.kv_norm_weight);
 
@@ -1859,9 +1859,10 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                 dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
-                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: ({}, {}, {}), threads_per_block: {}, "
+                    "total_kv_len: {}, acc_q_len: {}, absorption_mode: {}",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len,
+                    static_cast<int>(params.absorption_mode));
 
                 quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
                     <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
@@ -1878,9 +1879,10 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                 dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
-                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: ({}, {}, {}), threads_per_block: {}, "
+                    "total_kv_len: {}, acc_q_len: {}, absorption_mode: {}",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len,
+                    static_cast<int>(params.absorption_mode));
 
                 quantizeCopyInputToFp8Kernel<T, threads_per_block, 448, 64, 512, true>
                     <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
@@ -1902,9 +1904,10 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
             TLLM_LOG_DEBUG(
-                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: ({}, {}, {}), threads_per_block: {}, "
+                "total_kv_len: {}, acc_q_len: {}, absorption_mode: {}",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len,
+                static_cast<int>(params.absorption_mode));
 
             quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
                 <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
@@ -1989,7 +1992,7 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
     // template constants, so kv_lora_rank must actually match.
     TLLM_CHECK_WITH_INFO(!params.meta.rope_append && params.meta.kv_lora_rank == 448,
         "Fused generation kv-norm requires the DSv4 latent layout (rope_append=false, kv_lora_rank=448), got "
-        "rope_append=%d, kv_lora_rank=%d",
+        "rope_append={}, kv_lora_rank={}",
         static_cast<int>(params.meta.rope_append), params.meta.kv_lora_rank);
     TLLM_CHECK_WITH_INFO(params.kv_norm_weight != nullptr, "Fused generation kv-norm requires kv_norm_weight.");
     TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
@@ -2020,7 +2023,7 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
     // `seq_len` is 1 + MTP depth, a power of two in every shipping config. Pass a
     // shift so the kernel replaces two emulated 32-bit divides per row with
     // shift/mask; other depths keep the divide.
-    TLLM_CHECK_WITH_INFO(seq_len > 0, "MLA fused kv-norm: seq_len must be positive, got %d", seq_len);
+    TLLM_CHECK_WITH_INFO(seq_len > 0, "MLA fused kv-norm: seq_len must be positive, got {}", seq_len);
     uint32_t const seq_len_u = static_cast<uint32_t>(seq_len);
     bool const seq_len_pow2 = (seq_len_u & (seq_len_u - 1u)) == 0u;
     uint32_t seq_len_shift = 0u;
@@ -2085,9 +2088,9 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
 {
     using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<TCache>;
     // {seq_len / token_per_block, batch_size, head_num}
-    TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora_size should be equal to %d", KT::kLoraSize);
-    TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope_size should be equal to %d", KT::kRopeSize);
-    TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora_size should be equal to {}", KT::kLoraSize);
+    TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope_size should be equal to {}", KT::kRopeSize);
+    TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to {}", KT::kHeadSize);
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_input_seq_len, KT::kTokenPerBlock)), num_contexts, 1);
     loadPagedKVCacheForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(
         compressed_kv_ptr, k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, max_input_seq_len, kv_scale_quant_orig_ptr);
@@ -2100,8 +2103,8 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_
     int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(max_input_uncached_seq_len, 32)), num_requests, head_num + 1 + 8);
-    TLLM_CHECK_WITH_INFO(lora_size == 512 || lora_size == 448, "lora_size should be equal to %d or %d", 512, 448);
-    TLLM_CHECK_WITH_INFO(rope_size == 64, "rope_size should be equal to %d", 64);
+    TLLM_CHECK_WITH_INFO(lora_size == 512 || lora_size == 448, "lora_size should be equal to {} or {}", 512, 448);
+    TLLM_CHECK_WITH_INFO(rope_size == 64, "rope_size should be equal to {}", 64);
     if (lora_size == 512)
     {
         applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache,

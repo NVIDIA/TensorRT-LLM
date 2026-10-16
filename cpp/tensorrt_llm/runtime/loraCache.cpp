@@ -58,9 +58,9 @@ LoraCachePageManager::LoraCachePageManager(LoraCachePageManagerConfig const& con
 
 void LoraCachePageManager::initialize(BufferManager const& bufferManager)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
 
-    TLLM_LOG_DEBUG("pageConfig: " + to_string(mConfig));
+    TLLM_LOG_DEBUG("{}", "pageConfig: " + to_string(mConfig));
 
     std::size_t pageIdx = 0;
     while (pageIdx < static_cast<size_t>(mConfig.getTotalNumPages()))
@@ -79,13 +79,13 @@ void LoraCachePageManager::initialize(BufferManager const& bufferManager)
     }
     mIsPageFree.assign(pageIdx, 1);
 
-    TLLM_LOG_DEBUG("%s allocated %d blocks and %d pages", __PRETTY_FUNCTION__, mPageBlocks.size(), pageIdx);
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} allocated {} blocks and {} pages", __PRETTY_FUNCTION__, mPageBlocks.size(), pageIdx);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 std::optional<std::vector<std::size_t>> LoraCachePageManager::claimPages(SizeType32 numPages)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     if (numPages <= static_cast<SizeType32>(mFreePageIds.size()))
     {
         std::vector<std::size_t> outputPages{};
@@ -99,7 +99,7 @@ std::optional<std::vector<std::size_t>> LoraCachePageManager::claimPages(SizeTyp
         }
         return std::make_optional(std::move(outputPages));
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
     return std::nullopt;
 }
 
@@ -149,7 +149,7 @@ ITensor::SharedPtr LoraCachePageManager::mutablePagePtr(std::size_t pageIdx)
 
 void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr sourceConfig, bool load)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
 
     auto taskValuePtr = [&]() -> std::optional<TaskValuePtr>
     {
@@ -157,7 +157,7 @@ void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr source
         if (kVALUE_STATUS_MISSING != getStatus(taskId))
         {
             bumpTaskInProgress(taskId);
-            TLLM_LOG_DEBUG("%s return nullopt", __PRETTY_FUNCTION__);
+            TLLM_LOG_DEBUG("{} return nullopt", __PRETTY_FUNCTION__);
             return std::nullopt;
         }
 
@@ -165,12 +165,12 @@ void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr source
         TaskValuePtr cacheV = std::make_shared<TaskValue>(std::vector<std::size_t>{}, TaskLayerModuleConfigListPtr(),
             mInProgressTasks.begin(), true, false, false, true);
         mCacheMap.try_emplace(taskId, std::move(cacheV));
-        TLLM_LOG_DEBUG("%s return mCacheMap.at(taskId)", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("{} return mCacheMap.at(taskId)", __PRETTY_FUNCTION__);
         return mCacheMap.at(taskId);
     }();
     if (!taskValuePtr)
     {
-        TLLM_LOG_DEBUG("%s return", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("{} return", __PRETTY_FUNCTION__);
         return;
     }
     auto taskValue = taskValuePtr.value();
@@ -219,12 +219,12 @@ void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr source
     {
         markTaskDone(taskId);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 void LoraCache::loadWeights(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr sourceConfig)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     auto taskValuePtr = [&]() -> std::optional<TaskValuePtr>
     {
         std::lock_guard<std::mutex> cacheLock(mCacheMutex);
@@ -273,12 +273,12 @@ void LoraCache::loadWeights(TaskIdType taskId, TensorPtr sourceWeights, TensorPt
     {
         markTaskDone(taskId);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 void LoraCache::loadWeights(TaskValue& taskValue, TensorPtr weights, TensorPtr config)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     std::vector<TensorPtr> pagePtrs{};
     pagePtrs.reserve(taskValue.pageIds.size());
     for (auto id : taskValue.pageIds)
@@ -293,14 +293,14 @@ void LoraCache::loadWeights(TaskValue& taskValue, TensorPtr weights, TensorPtr c
         taskValue.loadInProgress = false;
         taskValue.loaded = true;
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
 {
     TLLM_LOG_DEBUG(
-        "%s start, mPagedManagerConfig: %s", __PRETTY_FUNCTION__, runtime::to_string(mPageManagerConfig).c_str());
-    TLLM_LOG_DEBUG("trying to claim " + std::to_string(numPages));
+        "{} start, mPagedManagerConfig: {}", __PRETTY_FUNCTION__, runtime::to_string(mPageManagerConfig).c_str());
+    TLLM_LOG_DEBUG("{}", "trying to claim " + std::to_string(numPages));
     std::lock_guard<std::mutex> pageLock(mPagesMutex);
     auto const availablePages = mCachePageManager->numAvailablePages();
     if (numPages <= availablePages)
@@ -327,25 +327,25 @@ std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
         throw LoraCacheFullException("Cache is full. There are not enough pages in done tasks to evict");
     }
 
-    TLLM_LOG_DEBUG("evicting " + std::to_string(taskIdsToEvict.size()));
+    TLLM_LOG_DEBUG("{}", "evicting " + std::to_string(taskIdsToEvict.size()));
     for (size_t i = 0; i < taskIdsToEvict.size(); ++i)
     {
 
-        TLLM_LOG_DEBUG("evicting taskId" + std::to_string(taskIdsToEvict.at(i)));
+        TLLM_LOG_DEBUG("{}", "evicting taskId" + std::to_string(taskIdsToEvict.at(i)));
         mDoneTasks.pop_back();
         mCacheMap.erase(taskIdsToEvict.at(i));
     }
     mCachePageManager->releasePages(pageIdsToEvict);
     auto pageIds = mCachePageManager->claimPages(numPages);
     TLLM_CHECK(pageIds.has_value());
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
     return pageIds.value();
 }
 
 void LoraCache::markTaskDone(TaskIdType taskId)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("markTaskDone " + std::to_string(taskId));
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", "markTaskDone " + std::to_string(taskId));
     std::lock_guard<std::mutex> lock(mCacheMutex);
     if (mCacheMap.find(taskId) == mCacheMap.end())
     {
@@ -365,12 +365,12 @@ void LoraCache::markTaskDone(TaskIdType taskId)
         }
     }
     taskValue.done = true;
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 void LoraCache::markAllDone()
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     std::lock_guard<std::mutex> lock(mCacheMutex);
     for (auto it = mInProgressTasks.rbegin(), nit = it; it != mInProgressTasks.rend(); it = nit)
     {
@@ -388,7 +388,7 @@ void LoraCache::markAllDone()
         }
         taskValue.done = true;
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 std::vector<LoraCache::TaskLayerModuleConfig> const& LoraCache::get(TaskIdType taskId)
@@ -453,7 +453,7 @@ SizeType32 LoraCache::determineNumPages(TaskIdType taskId) const
 
 SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
     auto const localNumLayers
         = mModelConfig.getNbLoraLayers(mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
     auto const firstLayerId
@@ -484,7 +484,7 @@ SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
             currSlot += numSlots;
         }
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
     return currPage + 1;
 }
 
@@ -575,7 +575,7 @@ void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, Si
 
 void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeType32 tpSize, SizeType32 tpRank)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
 
     switch (input.getDataType())
     {
@@ -592,7 +592,7 @@ void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeTyp
     default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
     }
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr sourceWeights, TensorPtr sourceConfig,
@@ -600,11 +600,11 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     std::unordered_map<SizeType32, LoraModule> moduleIdToModule, BufferManager const& manager,
     std::vector<TensorPtr> const& pages, std::vector<std::size_t> const& pageIds)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK_WITH_INFO(!pages.empty(), "empty pages");
     TLLM_CHECK_WITH_INFO(sourceWeights->getDataType() == pages.front()->getDataType(),
-        "Expected LoRA weights dtype %s to match cache dtype %s", sourceWeights->getDataTypeName(),
+        "Expected LoRA weights dtype {} to match cache dtype {}", sourceWeights->getDataTypeName(),
         pages.front()->getDataTypeName());
 
     TensorPtr weights = sourceWeights->getShape().nbDims == 2
@@ -764,7 +764,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
         copyFn();
     }
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
     return pageLocations;
 }
 
@@ -813,8 +813,8 @@ std::map<size_t, std::pair<size_t, SizeType32>> LoraCache::copyTaskMapPages(Task
 
 void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDone)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("copyTask " + std::to_string(taskId));
+    TLLM_LOG_DEBUG("{} start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", "copyTask " + std::to_string(taskId));
 
     TLLM_CHECK_WITH_INFO(deviceCache.mPageManagerConfig.getMemoryType() == runtime::MemoryType::kGPU
             && !deviceCache.mDeviceBufferManagers.empty(),
@@ -905,8 +905,9 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
         auto const newPageId = newPagePair.first;
         auto const copySize = newPagePair.second * mPageManagerConfig.getPageWidth();
         auto const copyShape = ITensor::makeShape({copySize});
-        TLLM_LOG_DEBUG("copy page (task " + std::to_string(taskId) + ") " + std::to_string(oldPageId) + " -> "
-            + std::to_string(newPageId) + " size: " + std::to_string(copySize));
+        TLLM_LOG_DEBUG("{}",
+            "copy page (task " + std::to_string(taskId) + ") " + std::to_string(oldPageId) + " -> "
+                + std::to_string(newPageId) + " size: " + std::to_string(copySize));
         TensorPtr oldPagePtr = mCachePageManager->mutablePagePtr(oldPageId);
         TensorPtr newPagePtr = deviceCache.mCachePageManager->mutablePagePtr(newPageId);
         TensorPtr source
@@ -946,7 +947,7 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
     {
         markTaskDone(taskId);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{} stop", __PRETTY_FUNCTION__);
 }
 
 ITensor::SharedConstPtr LoraCache::getPagePtr(size_t pageId) const

@@ -242,7 +242,7 @@ struct MHARunnerFixedParams
             attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
             break;
         default:
-            TLLM_THROW("AttentionMaskType %d cannot be mapped to ContextAttentionMaskType", static_cast<int>(maskType));
+            TLLM_THROW("AttentionMaskType {} cannot be mapped to ContextAttentionMaskType", static_cast<int>(maskType));
         }
         return *this;
     }

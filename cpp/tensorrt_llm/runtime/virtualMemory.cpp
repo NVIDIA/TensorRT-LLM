@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #include "bufferManager.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 
+#include <format>
 #include <forward_list>
 #include <shared_mutex>
 
@@ -49,7 +50,8 @@ ScopeGuard(bool const&, T) -> ScopeGuard<T>;
 
 void CUDAVirtualMemoryChunk::materialize()
 {
-    TLLM_CHECK_WITH_INFO(status() == RELEASED, "virtual memory not in RELEASED status, is: %d", status());
+    TLLM_CHECK_WITH_INFO(
+        status() == RELEASED, "virtual memory not in RELEASED status, is: {}", static_cast<int>(status()));
     mHandle = mCreator->create();
 
     // Track the number of configurators ran, so release can correctly teardown.
@@ -61,7 +63,8 @@ void CUDAVirtualMemoryChunk::materialize()
 }
 
 template <typename Callable, typename... Args>
-static bool safe_invoke_helper(std::exception_ptr& ep, char const* msg, Callable&& f, Args&&... args) noexcept
+static bool safe_invoke_helper(
+    std::exception_ptr& ep, std::format_string<char const*> msg, Callable&& f, Args&&... args) noexcept
 {
     try
     {
@@ -89,7 +92,7 @@ static bool safe_invoke_helper(std::exception_ptr& ep, char const* msg, Callable
 void CUDAVirtualMemoryChunk::_release(bool destructing)
 {
     TLLM_CHECK_WITH_INFO(status() == MATERIALIZED || (status() == ERRORED && mState != INVALID_STATE),
-        "virtual memory is in status %d which cannot be released", status());
+        "virtual memory is in status {} which cannot be released", static_cast<int>(status()));
     size_t const count = mConfigurators.size();
     size_t const start = count - mState;
 
@@ -98,7 +101,7 @@ void CUDAVirtualMemoryChunk::_release(bool destructing)
     // Never early returns on exceptions. The last exception will be rethrown, and
     // previous ones will be logged.
     std::exception_ptr ePtr{};
-    auto const* msg = "Multiple exceptions thrown during release. The previous exception is: %s";
+    constexpr auto const* msg = "Multiple exceptions thrown during release. The previous exception is: {}";
     for (size_t i = start; i < count; ++i)
     {
         safe_invoke_helper(
@@ -144,7 +147,7 @@ void OffloadConfigurator::teardown(CUmemGenericAllocationHandle, bool destructin
         {
         case MemoryType::kCPU: mBackedStorage = BufferManager::cpu(mSize, tensorrt_llm::DataType::kINT8); break;
         case MemoryType::kPINNED: mBackedStorage = BufferManager::pinned(mSize, tensorrt_llm::DataType::kINT8); break;
-        default: TLLM_THROW("Unknown memory type: %d", static_cast<int32_t>(mBackType));
+        default: TLLM_THROW("Unknown memory type: {}", static_cast<int32_t>(mBackType));
         }
     }
     // We have to synchronize here, or the memory may be unmapped before the copy operation.
@@ -162,7 +165,7 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string tag, CUDAVirtua
     std::unique_lock lock(mMutex);
     auto [memIt, created] = mMemories.try_emplace(handle, Entry{});
     TLLM_CHECK_WITH_INFO(
-        created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+        created, "CudaVirtualMemoryManager: handle 0x{:016x} already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
     auto const entryIt = mEntries.emplace(std::move(tag), memIt);
@@ -183,7 +186,7 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string tag, CUDAVirtua
             {std::move(creator), std::move(configurators)},
         });
     TLLM_CHECK_WITH_INFO(
-        created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+        created, "CudaVirtualMemoryManager: handle 0x{:016x} already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
     auto const entryIt = mEntries.emplace(std::move(tag), memIt);
@@ -255,7 +258,7 @@ size_t CudaVirtualMemoryManager::releaseWithTag(std::string const& tag)
         if (memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED)
         {
             if (!safe_invoke_helper(ePtr,
-                    "Multiple exceptions thrown during releaseWithTag. The previous exception is: %s",
+                    "Multiple exceptions thrown during releaseWithTag. The previous exception is: {}",
                     &CUDAVirtualMemoryChunk::release, &memory))
             {
                 addBadHandle(handle);
@@ -309,7 +312,7 @@ size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
             {
                 addBadHandle(handle);
                 unsafeRemove(handle);
-                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithTag: %s", e.what());
+                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithTag: {}", e.what());
             }
         }
 

@@ -111,7 +111,7 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
         return {};
     }
     TLLM_CHECK_WITH_INFO(
-        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
+        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize={} > {}=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;
     auto const vecEnd = vec.begin() + usableSize;
     for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
@@ -178,7 +178,7 @@ struct LinearAttentionMetadata
         // Allocate the last full block for maximum reuse opportunity.
         if (saveLastSnapshot && (currentBlockEndTokenIdx / tokensPerBlock == promptLen / tokensPerBlock))
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: saveLastSnapshot",
+            TLLM_LOG_DEBUG("Allocating recurrent states for block {}, reason: saveLastSnapshot",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
             return true;
         }
@@ -186,7 +186,7 @@ struct LinearAttentionMetadata
         // Allocate the block that contains the end of the current sequence to save the final state.
         if (currentBlockEndTokenIdx >= promptLen && currentBlockEndTokenIdx < promptLen + tokensPerBlock)
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: end of sequence",
+            TLLM_LOG_DEBUG("Allocating recurrent states for block {}, reason: end of sequence",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
             return true;
         }
@@ -195,7 +195,7 @@ struct LinearAttentionMetadata
         // initialization.
         if ((statesSnapshotInterval > 0) && (currentBlockEndTokenIdx % statesSnapshotInterval == 0))
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: statesSnapshotInterval",
+            TLLM_LOG_DEBUG("Allocating recurrent states for block {}, reason: statesSnapshotInterval",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
             return true;
         }
@@ -290,10 +290,10 @@ struct WindowSizeMetadata
 
     std::string toString()
     {
-        return tensorrt_llm::common::fmtstr(
-            "WindowSizeMetadata{ .allottedPrimaryBlocks=%d, .allottedSecondaryBlocks=%d, .absolutePoolsOffset=%d, "
-            ".numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, .maxNumBlocks=%d, "
-            ".windowSize=%d, .isSWA=%d }",
+        return std::format(
+            "WindowSizeMetadata{{ .allottedPrimaryBlocks={}, .allottedSecondaryBlocks={}, .absolutePoolsOffset={}, "
+            ".numPools={}, .maxTokenNum={}, .maxBlocksPerSeq={}, .maxNumBlocks={}, "
+            ".windowSize={}, .isSWA={} }}",
             allottedPrimaryBlocks, allottedSecondaryBlocks, absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq,
             maxNumBlocks, windowSize, isSWA);
     }
@@ -654,7 +654,7 @@ public:
     {
         auto it = mNumFrontBlocksRemovedPerWindow.find(windowSize);
         TLLM_CHECK_WITH_INFO(it != mNumFrontBlocksRemovedPerWindow.end(),
-            "GenerationRequest::getNumFrontBlocksRemoved: windowSize=%d not registered for request %lu", windowSize,
+            "GenerationRequest::getNumFrontBlocksRemoved: windowSize={} not registered for request {}", windowSize,
             static_cast<unsigned long>(mRequestId));
         return it->second;
     }

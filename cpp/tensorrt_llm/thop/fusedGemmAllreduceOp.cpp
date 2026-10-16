@@ -161,13 +161,13 @@ public:
         {
             std::stringstream ss;
             ss << "Please set TRTLLM_GEMM_ALLREDUCE_WORKSPACE_SIZE to at least " << requiredSize << " bytes";
-            TLLM_THROW("%s", ss.str().c_str());
+            TLLM_THROW("{}", ss.str().c_str());
         }
 
         auto handle = mHandles[key];
         if (handle == nullptr)
         {
-            TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
+            TLLM_LOG_DEBUG("Creating allreduce workspace for {}", key.toString().c_str());
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;
@@ -243,7 +243,7 @@ public:
         }
         else
         {
-            TLLM_THROW("Unsupported output dtype: %s", torch::toString(outputDtype));
+            TLLM_THROW("Unsupported output dtype: {}", torch::toString(outputDtype));
         }
 
         mConfigs = mRunner->getSupportedLaunchConfigs();

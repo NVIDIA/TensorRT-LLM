@@ -81,7 +81,7 @@ bool TllmGenFmhaRunner::isSupported(TllmGenFmhaRunnerParams const& runnerParams)
     if (mKernel == nullptr)
     {
         TLLM_LOG_WARNING(
-            "TRTLLM-GEN: mKernel is null. No kernels available for dtypeQ=%d, dtypeK=%d, dtypeV=%d, dtypeOut=%d, SM=%d",
+            "TRTLLM-GEN: mKernel is null. No kernels available for dtypeQ={}, dtypeK={}, dtypeV={}, dtypeOut={}, SM={}",
             static_cast<int>(mDtypeQ), static_cast<int>(mDtypeK), static_cast<int>(mDtypeV),
             static_cast<int>(mDtypeOut), mSM);
         return false;

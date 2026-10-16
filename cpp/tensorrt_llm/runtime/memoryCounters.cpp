@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,9 @@
 
 #include "tensorrt_llm/runtime/memoryCounters.h"
 
-#include "tensorrt_llm/common/stringUtils.h"
-
 #include <array>
 #include <cmath>
-
-namespace tc = tensorrt_llm::common;
+#include <format>
 
 namespace
 {
@@ -37,8 +34,7 @@ std::string doubleBytesToString(double bytes, int precision)
         bytes /= 1024.0;
         ++unitIdx;
     }
-    auto const format = "%." + std::to_string(precision) + "f %s";
-    return tc::fmtstr(format.c_str(), bytes, kByteUnits[unitIdx]);
+    return std::format("{:.{}f} {}", bytes, precision, kByteUnits[unitIdx]);
 }
 
 } // namespace
@@ -57,7 +53,7 @@ std::string MemoryCounters::bytesToString(DiffType bytes, int precision)
 
 std::string MemoryCounters::toString() const
 {
-    return tensorrt_llm::common::fmtstr("[MemUsage] GPU %s, CPU %s, Pinned %s", bytesToString(this->getGpu()).c_str(),
+    return std::format("[MemUsage] GPU {}, CPU {}, Pinned {}", bytesToString(this->getGpu()).c_str(),
         bytesToString(this->getCpu()).c_str(), bytesToString(this->getPinned()).c_str());
 }
 

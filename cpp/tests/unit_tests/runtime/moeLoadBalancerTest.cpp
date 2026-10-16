@@ -593,7 +593,7 @@ protected:
             if (!param.iterConfigs[iter].statisticEnabled && param.iterConfigs[iter].updateWeightsEnabled)
             {
                 TLLM_CHECK_WITH_INFO(false,
-                    "Invalid configuration at iteration %d: statistics disabled but updates enabled. "
+                    "Invalid configuration at iteration {}: statistics disabled but updates enabled. "
                     "When statistics are disabled, updates must also be disabled.",
                     iter);
             }

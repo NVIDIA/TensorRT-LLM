@@ -55,7 +55,7 @@
         if (TLLM_UNLIKELY(_tllm_nccl_warn_r != ncclSuccess))                                                           \
         {                                                                                                              \
             TLLM_LOG_WARNING(                                                                                          \
-                "NCCL error in %s (%s:%d): %s", #cmd, __FILE__, __LINE__, ncclGetErrorString(_tllm_nccl_warn_r));      \
+                "NCCL error in {} ({}:{}): {}", #cmd, __FILE__, __LINE__, ncclGetErrorString(_tllm_nccl_warn_r));      \
         }                                                                                                              \
     } while (0)
 
@@ -390,7 +390,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: {}", e.what());
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 

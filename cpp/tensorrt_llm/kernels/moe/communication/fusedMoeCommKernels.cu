@@ -1157,7 +1157,7 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
     int warpRecvShmSize = params.recvCommMeta.getSingleShmSize();
     int warpShmSize = warpSendShmSize;
     int epSize = params.worldInfo.epInfo.epSize;
-    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
+    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize({}) not same as warpRecvShmSize({})",
         warpSendShmSize, warpRecvShmSize);
     int maxGroupCountPerCta = std::min(params.worldInfo.epInfo.epSize, FusedMoeCommunicator::MAX_GROUP_COUNT_PER_BLOCK);
     static int maxDynamicShmSize = fused_moe_impl::computeMoeAlltoallMaxDynamicSharedMemorySize();
@@ -1209,7 +1209,7 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
         }
     }
     TLLM_CHECK_WITH_INFO(
-        groupCountPerCta >= 1, "computed groupCount=%d, warpShmSize=%d", groupCountPerCta, warpShmSize);
+        groupCountPerCta >= 1, "computed groupCount={}, warpShmSize={}", groupCountPerCta, warpShmSize);
     int ctaPerChannel = (epSize + groupCountPerCta - 1) / groupCountPerCta;
     groupCountPerCta = (epSize + ctaPerChannel - 1) / ctaPerChannel;
     int totalDynamicShmSize = warpShmSize * groupCountPerCta;
@@ -1439,7 +1439,7 @@ void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo co
     int warpSendShmSize = sendCommMeta.getSingleShmSize();
     int warpRecvShmSize = recvCommMeta.getSingleShmSize();
     int warpShmSize = warpSendShmSize;
-    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
+    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize({}) not same as warpRecvShmSize({})",
         warpSendShmSize, warpRecvShmSize);
     dim3 blockDim(WARP_SIZE * warpsPerBlock, 1, 1);
     dim3 gridDim((tokenCount + warpsPerBlock - 1) / warpsPerBlock, 1, 1);
@@ -1502,7 +1502,7 @@ void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFie
     int warpSendShmSize = sendCommMeta.getSingleShmSize();
     int warpRecvShmSize = recvCommMeta.getSingleShmSize();
     int warpShmSize = warpSendShmSize;
-    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
+    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize({}) not same as warpRecvShmSize({})",
         warpSendShmSize, warpRecvShmSize);
     dim3 blockDim(WARP_SIZE * warpsPerBlock, 1, 1);
     dim3 gridDim(1, 2, blockChannelCount);

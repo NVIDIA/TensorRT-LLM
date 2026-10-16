@@ -1470,12 +1470,12 @@ void launchSmallTokenBlockKernel(Data const& data, uint32_t numThreadsHist, void
     int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
     TLLM_CHECK_WITH_INFO(dispatchedMaxExperts <= SmallTokenKernelDispatchMaxNumExperts
             && data.mNumTokens <= getSmallTokenKernelMaxNumTokens(dispatchedMaxExperts),
-        "small-token routing kernel expects a tier <= %d experts and at most min(%d, warps in the tier) tokens, "
-        "got tier %d with %d tokens",
+        "small-token routing kernel expects a tier <= {} experts and at most min({}, warps in the tier) tokens, "
+        "got tier {} with {} tokens",
         SmallTokenKernelDispatchMaxNumExperts, SmallTokenKernelMaxNumTokens, dispatchedMaxExperts, data.mNumTokens);
     // The packed block scans keep the padded row count in 20 bits: <= 256 selected pairs x tile.
     TLLM_CHECK_WITH_INFO(data.mTileTokensDim >= 1 && data.mTileTokensDim <= 4096,
-        "small-token routing kernel expects 1 <= tileTokensDim <= 4096, got %d", data.mTileTokensDim);
+        "small-token routing kernel expects 1 <= tileTokensDim <= 4096, got {}", data.mTileTokensDim);
     LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesSmallTokenKernel, 1, numThreadsHist,
         /*smemSize=*/0, // No dynamic smem
         stream);
@@ -1671,7 +1671,7 @@ void launchClusterKernelForTier(Data const& data, void* stream)
     }
     else
     {
-        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput={}, dtypeInput={}",
             static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));
     }
 }
@@ -1688,7 +1688,7 @@ void launchClusterKernelForPolicy(Data const& data, void* stream)
         });
     if (!dispatched)
     {
-        TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+        TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);
     }
 }
 
@@ -1907,7 +1907,7 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
                 });
             if (!dispatched)
             {
-                TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+                TLLM_LOG_ERROR("No tier covers numExperts={} topK={}", data.mNumExperts, data.mTopK);
             }
         });
 }
@@ -1959,7 +1959,7 @@ void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHi
     }
     else
     {
-        TLLM_LOG_ERROR("Coop kernel does not support numExperts > %d", NumExperts1024Experts);
+        TLLM_LOG_ERROR("Coop kernel does not support numExperts > {}", NumExperts1024Experts);
     }
 }
 
@@ -2071,10 +2071,10 @@ void run(Data const& data, void* stream)
 {
     TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
         "Routing kernel requires at least one input parameter");
-    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= {}, got {}",
         MaxSupportedTopExperts, data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
-        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
+        "Routing kernel expects #experts {} to be no more than {}", data.mNumExperts, MaxSupportedExperts);
 
     // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
     // delegate to the shared post-topK pipeline which handles all path selection

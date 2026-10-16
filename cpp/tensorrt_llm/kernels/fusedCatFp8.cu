@@ -184,21 +184,21 @@ void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 c
         return;
     }
 
-    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatFp8: head_dim must be 128, got %d", head_dim);
-    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim, "fusedCatFp8: pe_dim (%d) + nope_dim (%d) != head_dim (%d)",
+    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatFp8: head_dim must be 128, got {}", head_dim);
+    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim, "fusedCatFp8: pe_dim ({}) + nope_dim ({}) != head_dim ({})",
         pe_dim, nope_dim, head_dim);
     TLLM_CHECK_WITH_INFO((head_dim & (head_dim - 1)) == 0, "fusedCatFp8: head_dim must be power of 2");
     TLLM_CHECK_WITH_INFO(pe_dim % ELEMS_PER_THREAD == 0,
-        "fusedCatFp8: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
+        "fusedCatFp8: pe_dim ({}) must be a multiple of {} for vectorized access", pe_dim, ELEMS_PER_THREAD);
     TLLM_CHECK_WITH_INFO(
-        pe_row_stride >= pe_dim, "fusedCatFp8: pe_row_stride (%d) must be >= pe_dim (%d)", pe_row_stride, pe_dim);
-    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp8: nope_row_stride (%d) must be >= nope_dim (%d)",
+        pe_row_stride >= pe_dim, "fusedCatFp8: pe_row_stride ({}) must be >= pe_dim ({})", pe_row_stride, pe_dim);
+    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp8: nope_row_stride ({}) must be >= nope_dim ({})",
         nope_row_stride, nope_dim);
     TLLM_CHECK_WITH_INFO(pe_row_stride % ELEMS_PER_THREAD == 0,
-        "fusedCatFp8: pe_row_stride (%d) must be a multiple of %d for aligned vectorized access", pe_row_stride,
+        "fusedCatFp8: pe_row_stride ({}) must be a multiple of {} for aligned vectorized access", pe_row_stride,
         ELEMS_PER_THREAD);
     TLLM_CHECK_WITH_INFO(nope_row_stride % ELEMS_PER_THREAD == 0,
-        "fusedCatFp8: nope_row_stride (%d) must be a multiple of %d for aligned vectorized access", nope_row_stride,
+        "fusedCatFp8: nope_row_stride ({}) must be a multiple of {} for aligned vectorized access", nope_row_stride,
         ELEMS_PER_THREAD);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;

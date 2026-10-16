@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -585,7 +585,7 @@ void GroupRMSNormBaseKernel(GroupRMSParams<n>& params)
         TLLM_CHECK_WITH_INFO(
             params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
         TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
-            "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
+            "Input[{}] dimension {} is not divisible by {} (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
             i, params.input_last_dims[i], kPackedSize);
         // Make rounded_input_dims[i] a multiple of 32 * kPackedSize
@@ -682,7 +682,7 @@ void GroupRMSNormKernelLargeBatch(GroupRMSParams<n>& params)
         TLLM_CHECK_WITH_INFO(
             params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
         TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
-            "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
+            "Input[{}] dimension {} is not divisible by {} (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
             i, params.input_last_dims[i], kPackedSize);
     }
@@ -792,7 +792,7 @@ bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_r
     if (!found_match)
     {
         TLLM_LOG_INFO(
-            "GroupRMSNorm: Failed to find heuristic for GPU compute capability %d. Falling back to the base kernel.",
+            "GroupRMSNorm: Failed to find heuristic for GPU compute capability {}. Falling back to the base kernel.",
             sm_major);
     }
     return true;

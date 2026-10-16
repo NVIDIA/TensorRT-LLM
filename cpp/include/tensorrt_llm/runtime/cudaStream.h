@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ public:
     {
         cudaStream_t stream;
         TLLM_CUDA_CHECK(::cudaStreamCreateWithPriority(&stream, flags, priority));
-        TLLM_LOG_TRACE("Created stream %p", stream);
+        TLLM_LOG_TRACE("Created stream {:p}", static_cast<void const*>(stream));
         bool constexpr ownsStream{true};
         mStream = StreamPtr{stream, Deleter{ownsStream}};
     }
@@ -126,7 +126,7 @@ private:
             if (mOwnsStream && stream != nullptr)
             {
                 TLLM_CUDA_CHECK(::cudaStreamDestroy(stream));
-                TLLM_LOG_TRACE("Destroyed stream %p", stream);
+                TLLM_LOG_TRACE("Destroyed stream {:p}", static_cast<void const*>(stream));
             }
         }
 

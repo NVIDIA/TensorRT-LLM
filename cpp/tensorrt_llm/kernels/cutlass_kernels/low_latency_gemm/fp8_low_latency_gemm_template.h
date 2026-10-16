@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ size_t genericFp8LowLatencyGemmKernelLauncherSm90(__nv_fp8_e4m3 const* A, __nv_f
     float beta, T const* C, T* D, int m, int n, int k, int b, float pdl_overlap_ratio, float prefetch_ratio,
     ConfigType config, char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using namespace cute;
@@ -276,7 +276,7 @@ size_t dispatchLowLatencyGemmClusterShapeSm90(__nv_fp8_e4m3 const* A, __nv_fp8_e
     T const* C, T* D, int m, int n, int k, int b, float pdl_overlap_ratio, float prefetch_ratio, ConfigType gemmConfig,
     char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     using namespace cute;
 
     switch (gemmConfig.cutlass_gemm_config.cluster_shape)
@@ -311,7 +311,7 @@ size_t dispatchLowLatencyGemmToCutlassSm90(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3
     void const* C, void* D, int m, int n, int k, float pdl_overlap_ratio, float prefetch_ratio, ConfigType gemmConfig,
     char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 
     using namespace cute;
 
@@ -390,7 +390,7 @@ size_t dispatchLowLatencyGemmToCutlassSm90(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3
 template <typename T>
 CutlassLowLatencyFp8GemmRunner<T>::CutlassLowLatencyFp8GemmRunner()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     mSm = tk::getSMVersion();
 }
 
@@ -400,7 +400,7 @@ size_t CutlassLowLatencyFp8GemmRunner<T>::dispatchToArch(__nv_fp8_e4m3 const* A,
     ConfigType gemmConfig, char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
 #ifndef PLACEHOLDER_KERNELS
     if (mSm == 90)
     {
@@ -424,7 +424,7 @@ void CutlassLowLatencyFp8GemmRunner<T>::gemm(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
     void* D, int m, int n, int k, float pdl_overlap_ratio, float prefetch_ratio, ConfigType gemmConfig,
     char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     dispatchToArch(static_cast<__nv_fp8_e4m3 const*>(A), static_cast<__nv_fp8_e4m3 const*>(B), alpha, beta,
         static_cast<T const*>(C), static_cast<T*>(D), m, n, k, pdl_overlap_ratio, prefetch_ratio, gemmConfig,
         workspacePtr, workspaceBytes, stream);
@@ -434,7 +434,7 @@ void CutlassLowLatencyFp8GemmRunner<T>::gemm(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
 template <typename T>
 size_t CutlassLowLatencyFp8GemmRunner<T>::getWorkspaceSizeImpl(int const m, int const n, int const k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     size_t workspace_size = 0;
     auto gemmConfigs = CutlassLowLatencyFp8GemmRunner<T>{}.getConfigs();
     for (auto const& gemmConfig : gemmConfigs)
@@ -462,7 +462,7 @@ template <typename T>
 size_t CutlassLowLatencyFp8GemmRunner<T>::getWorkspaceSize(int const m, int const n, int const k)
 {
 
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("{}", __PRETTY_FUNCTION__);
     // Custom hash function for the MNK type
     using MNK = std::tuple<int, int, int>;
 

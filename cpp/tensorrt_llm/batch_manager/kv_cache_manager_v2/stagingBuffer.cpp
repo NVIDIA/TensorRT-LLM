@@ -67,7 +67,7 @@ void DeviceDeleter::operator()(std::byte* ptr) const noexcept
             char const* errorString = nullptr;
             cuGetErrorString(result, &errorString);
             TLLM_LOG_ERROR(
-                "Failed to free staging-buffer device memory: %s", errorString != nullptr ? errorString : "unknown");
+                "Failed to free staging-buffer device memory: {}", errorString != nullptr ? errorString : "unknown");
         }
     }
 }
@@ -322,8 +322,8 @@ StagingBufferRange* StagingBufferManager::reserve(
     }
 
     TLLM_CHECK_WITH_INFO(false,
-        "StagingBufferManager has no contiguous retired range satisfying the request: minSize=%zu, maxSize=%zu, "
-        "totalSize=%zu",
+        "StagingBufferManager has no contiguous retired range satisfying the request: minSize={}, maxSize={}, "
+        "totalSize={}",
         minSize, maxSize, mSize);
     return nullptr;
 }

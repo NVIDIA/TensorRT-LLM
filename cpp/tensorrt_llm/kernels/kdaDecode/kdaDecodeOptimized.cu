@@ -742,7 +742,7 @@ void dispatchKdaDecodeOptimizedHeads(KdaDecodeParams const& params, cudaStream_t
     case 48: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 48, kUpdateConvCache>(params, stream))); break;
     case 64: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 64, kUpdateConvCache>(params, stream))); break;
     case 96: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 96, kUpdateConvCache>(params, stream))); break;
-    default: TLLM_CHECK_WITH_INFO(false, "Optimized KDA decode does not support numHeads=%d", params.numHeads);
+    default: TLLM_CHECK_WITH_INFO(false, "Optimized KDA decode does not support numHeads={}", params.numHeads);
     }
 }
 

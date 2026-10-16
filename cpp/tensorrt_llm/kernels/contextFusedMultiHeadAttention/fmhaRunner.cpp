@@ -746,7 +746,7 @@ bool FusedMHARunnerV2::isFmhaSupported()
     if (!is_supported)
     {
         std::string msg = "FMHA Kernel doesn't exist for mFixedParams:\n" + mFixedParams.convertToStrOutput();
-        TLLM_LOG_WARNING("%s\n", msg.c_str());
+        TLLM_LOG_WARNING("{}\n", msg.c_str());
     }
     return is_supported;
 }

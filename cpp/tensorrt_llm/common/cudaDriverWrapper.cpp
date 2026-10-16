@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include <cuda.h>
 
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 
@@ -43,24 +44,35 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
+namespace
+{
+
+//! The wrapper published by getInstance() for getInstanceIfLoaded().
+std::atomic<std::weak_ptr<CUDADriverWrapper>>& loadedInstance()
+{
+    static std::atomic<std::weak_ptr<CUDADriverWrapper>> instance;
+    return instance;
+}
+
+} // namespace
+
 std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
 {
-    static std::mutex mutex;
-    static std::weak_ptr<CUDADriverWrapper> instance;
-    std::shared_ptr<CUDADriverWrapper> result = instance.lock();
-    if (result)
-    {
-        return result;
-    }
+    auto& loaded = loadedInstance();
+    static std::shared_ptr<CUDADriverWrapper> instance;
+    static std::once_flag flag;
+    std::call_once(flag,
+        [&loaded]
+        {
+            instance = std::shared_ptr<CUDADriverWrapper>(new CUDADriverWrapper());
+            loaded.store(instance);
+        });
+    return instance;
+}
 
-    std::lock_guard<std::mutex> const lock(mutex);
-    result = instance.lock();
-    if (!result)
-    {
-        result = std::shared_ptr<CUDADriverWrapper>(new CUDADriverWrapper());
-        instance = result;
-    }
-    return result;
+std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstanceIfLoaded()
+{
+    return loadedInstance().load().lock();
 }
 
 CUDADriverWrapper::CUDADriverWrapper()
@@ -268,7 +280,7 @@ CUresult CUDADriverWrapper::cuLaunchKernelEx(
     CUlaunchConfig const* config, CUfunction f, void** kernelParams, void** extra) const
 {
 
-    TLLM_LOG_DEBUG("Launch config: %s", stringify_launch_config(*config).c_str());
+    TLLM_LOG_DEBUG("Launch config: {}", stringify_launch_config(*config).c_str());
     TLLM_CHECK_DEBUG_WITH_INFO(
         (extra != nullptr) != (kernelParams != nullptr), "Exactly one of 'extra' and 'kernelParams' should be set.");
     return (*_cuLaunchKernelEx)(config, f, kernelParams, extra);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -175,7 +175,7 @@ void const* getCommSessionHandle();
         ncclResult_t r = cmd;                                                                                          \
         if (TLLM_UNLIKELY(r != ncclSuccess))                                                                           \
         {                                                                                                              \
-            TLLM_THROW("Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r));                  \
+            TLLM_THROW("Failed, NCCL error {}:{} '{}'\n", __FILE__, __LINE__, ncclGetErrorString(r));                  \
         }                                                                                                              \
     } while (0)
 
@@ -298,7 +298,7 @@ TRTLLM_NAMESPACE_END
         nvmlReturn_t r = cmd;                                                                                          \
         if (TLLM_UNLIKELY(r != NVML_SUCCESS))                                                                          \
         {                                                                                                              \
-            TLLM_THROW("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__,                                          \
+            TLLM_THROW("Failed, NVML error {}:{} '{}'\n", __FILE__, __LINE__,                                          \
                 tensorrt_llm::common::NVMLWrapper::getInstance()->nvmlErrorString(r));                                 \
         }                                                                                                              \
     } while (0)

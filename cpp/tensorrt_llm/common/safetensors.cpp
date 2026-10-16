@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ static DataType convertDataTypeStrToEnum(std::string const& str)
         return DataType::kBF16;
     if (str == "F8_E4M3")
         return DataType::kFP8;
-    TLLM_THROW("Unsupported data type: " + str);
+    TLLM_THROW("Unsupported data type: {}", str);
 }
 
 class SafeTensorArray : public INdArray
@@ -118,7 +118,7 @@ public:
     {
         if (!mFs->is_open())
         {
-            TLLM_THROW("Failed to open file: " + std::string(filename));
+            TLLM_THROW("Failed to open file: {}", filename);
         }
         mFs->read(reinterpret_cast<char*>(&mJsonSize), sizeof(mJsonSize));
         std::vector<char> jsonBuffer(mJsonSize);
@@ -159,7 +159,7 @@ public:
                 static_cast<int64_t>(value["data_offsets"][0]) + offset,
                 static_cast<int64_t>(value["data_offsets"][1]) + offset);
         }
-        TLLM_THROW("Tensor not found: " + std::string(name));
+        TLLM_THROW("Tensor not found: {}", name);
     }
 };
 

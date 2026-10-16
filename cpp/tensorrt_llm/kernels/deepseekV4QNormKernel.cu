@@ -153,7 +153,7 @@ template <typename T>
 void dispatchDeepseekV4QNorm(
     void const* input, void* output, int totalRows, int headDim, float eps, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(headDim == 512, "deepseek_v4_q_norm only supports head_dim=512, got %d", headDim);
+    TLLM_CHECK_WITH_INFO(headDim == 512, "deepseek_v4_q_norm only supports head_dim=512, got {}", headDim);
 
     dim3 const block(kThreadsPerBlock);
     dim3 const grid((totalRows + kWarpsPerBlock - 1) / kWarpsPerBlock);
@@ -427,10 +427,10 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
     bool applyNorm, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
     int const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(headDim == 512, "deepseekV4QNormFused only supports head_dim=512, got %d", headDim);
-    TLLM_CHECK_WITH_INFO(nopeDim == 448, "deepseekV4QNormFused only supports nope_dim=448, got %d", nopeDim);
+    TLLM_CHECK_WITH_INFO(headDim == 512, "deepseekV4QNormFused only supports head_dim=512, got {}", headDim);
+    TLLM_CHECK_WITH_INFO(nopeDim == 448, "deepseekV4QNormFused only supports nope_dim=448, got {}", nopeDim);
     TLLM_CHECK_WITH_INFO(quantQNopeRowStrideBytes >= nopeDim,
-        "quantQNopeRowStrideBytes (%d) must be at least nope_dim (%d)", quantQNopeRowStrideBytes, nopeDim);
+        "quantQNopeRowStrideBytes ({}) must be at least nope_dim ({})", quantQNopeRowStrideBytes, nopeDim);
 
     dim3 const block(kThreadsPerBlock);
     dim3 const grid((totalRows + kWarpsPerBlock - 1) / kWarpsPerBlock);

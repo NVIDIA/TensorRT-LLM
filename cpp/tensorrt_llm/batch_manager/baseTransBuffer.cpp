@@ -117,11 +117,12 @@ BaseTransBufferManager::BaseTransBufferManager(
     mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
 
     TLLM_LOG_INFO(
-        "BaseTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
-        "mSendBufferCount:%ld, mTransferBufferSize:%ld, mPreAllocBufferSize:%ld, mOnlyUseDynamicBuffer:%d, "
-        "mUseFabricMemory:%d, mDataType:%d",
+        "BaseTransBufferManager: mMaxNumTokens:{}, mRecvBufferCount:{}, "
+        "mSendBufferCount:{}, mTransferBufferSize:{}, mPreAllocBufferSize:{}, mOnlyUseDynamicBuffer:{}, "
+        "mUseFabricMemory:{}, mDataType:{}",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
-        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, static_cast<int>(mDataType));
+        mPreAllocBufferSize, static_cast<int>(mOnlyUseDynamicBuffer), static_cast<int>(mUseFabricMemory),
+        static_cast<int>(mDataType));
 
     allocateBuffer();
 }
@@ -230,16 +231,16 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBuff
                     runtime::ITensor::makeShape({static_cast<int64_t>(requestedNumberOfElements[i])}), mDataType));
             }
         }
-        TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
+        TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:{}", bufferCoverTargetNum);
         if (bufferCoverTargetNum < static_cast<size_t>(targetNum))
         {
             TLLM_LOG_WARNING(
-                "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:%d < targetNum:%d, may use dynamic "
+                "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:{} < targetNum:{}, may use dynamic "
                 "buffer which will fail with NIXL backend. It is recommended to set "
                 "cacheTransceiverConfig.MaxTokensInBuffer (cache_transceiver_config.max_tokens_in_buffer in config "
                 "YAML file) to a value greater than the maximum ISL of the processed requests. Otherwise, performance "
-                "may be degraded or transfer may fail.  requestedNumberOfElements.size():%ld, "
-                "mNumberOfElements:%ld, requestedNumberOfElements[0]:%ld",
+                "may be degraded or transfer may fail.  requestedNumberOfElements.size():{}, "
+                "mNumberOfElements:{}, requestedNumberOfElements[0]:{}",
                 bufferCoverTargetNum, targetNum, requestedNumberOfElements.size(), mNumberOfElements,
                 requestedNumberOfElements[0]);
         }
@@ -323,7 +324,7 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
     if (onlyUseDynamicBuffer)
     {
         TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
-            "Cannot assign dynamic cache transfer buffer kind=%s because the transfer buffer pool is poisoned",
+            "Cannot assign dynamic cache transfer buffer kind={} because the transfer buffer pool is poisoned",
             bufferKindName(getBufferKind()));
         return std::nullopt;
     }
@@ -354,7 +355,7 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
         TLLM_THROW("Cache transfer buffer acquisition cancelled");
     }
     TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
-        "Cannot assign cache transfer buffer kind=%s because the transfer buffer pool is poisoned",
+        "Cannot assign cache transfer buffer kind={} because the transfer buffer pool is poisoned",
         bufferKindName(getBufferKind()));
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
@@ -387,7 +388,7 @@ void BaseTransBufferManager::freeBufferIndex(
             std::scoped_lock lk(resource.mBuffersMutex);
             if (resource.mBufferIndexFlag[bufferId.value()] == 2)
             {
-                TLLM_LOG_ERROR("Refusing to free poisoned cache transfer buffer kind=%s index=%d",
+                TLLM_LOG_ERROR("Refusing to free poisoned cache transfer buffer kind={} index={}",
                     bufferKindName(getBufferKind()), bufferId.value());
                 return;
             }
@@ -405,7 +406,7 @@ void BaseTransBufferManager::poisonBufferIndex(ConcurrenceResource& resource, st
 
     if (onlyUseDynamicBuffer)
     {
-        TLLM_LOG_ERROR("Poisoned dynamic %s cache transfer buffer kind=%s; process restart is required", direction,
+        TLLM_LOG_ERROR("Poisoned dynamic {} cache transfer buffer kind={}; process restart is required", direction,
             bufferKindName(getBufferKind()));
         resource.mBuffersCV.notify_all();
         return;
@@ -424,17 +425,17 @@ void BaseTransBufferManager::poisonBufferIndex(ConcurrenceResource& resource, st
                 }
             }
         }
-        TLLM_LOG_ERROR("Poisoned %s cache transfer buffer kind=%s index=%d; process restart is required", direction,
+        TLLM_LOG_ERROR("Poisoned {} cache transfer buffer kind={} index={}; process restart is required", direction,
             bufferKindName(getBufferKind()), bufferId.value_or(-1));
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_ERROR("Exception while poisoning %s cache transfer buffer kind=%s index=%d: %s", direction,
+        TLLM_LOG_ERROR("Exception while poisoning {} cache transfer buffer kind={} index={}: {}", direction,
             bufferKindName(getBufferKind()), bufferId.value_or(-1), e.what());
     }
     catch (...)
     {
-        TLLM_LOG_ERROR("Unknown exception while poisoning %s cache transfer buffer kind=%s index=%d", direction,
+        TLLM_LOG_ERROR("Unknown exception while poisoning {} cache transfer buffer kind={} index={}", direction,
             bufferKindName(getBufferKind()), bufferId.value_or(-1));
     }
     resource.mBuffersCV.notify_all();

@@ -683,7 +683,7 @@ public:
     /// @brief Erases all previous generated tokens, only leaving the prompt.
     void clearGeneratedTokens()
     {
-        TLLM_LOG_DEBUG("Clearing generated tokens for request %ld with promptlen %d", mRequestId, mPromptLen);
+        TLLM_LOG_DEBUG("Clearing generated tokens for request {} with promptlen {}", mRequestId, mPromptLen);
         for (auto& beam : mTokens)
         {
             beam.resize(mPromptLen);
@@ -694,7 +694,7 @@ public:
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {
-        TLLM_LOG_DEBUG("Setting generated tokens for request %ld", mRequestId);
+        TLLM_LOG_DEBUG("Setting generated tokens for request {}", mRequestId);
         assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.getBeamWidth()));
 
         for (size_t beamId = 0; beamId < generatedBeamTokens.size(); ++beamId)
@@ -717,9 +717,9 @@ public:
     {
         TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot change numReturnSequences.");
         TLLM_CHECK_WITH_INFO(
-            numReturnSequences > 0, "numReturnSequences should be a positive integer, got %d.", numReturnSequences);
+            numReturnSequences > 0, "numReturnSequences should be a positive integer, got {}.", numReturnSequences);
         TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
-            "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
+            "Cannot set numReturnSequences {} smaller than the number {} of child requests that have already created.",
             numReturnSequences, mChildRequests.size());
         mSamplingConfig.setNumReturnSequences(numReturnSequences);
         mSequenceFinalVec->resize(numReturnSequences);
@@ -801,7 +801,7 @@ public:
             // generation-only requests, it could result in no KV cache being available, causing requests to remain
             // unscheduled indefinitely. We just issue a warning here.
             TLLM_LOG_WARNING(
-                "Pausing generation-only request, request_id: %lu, changes it to context init state, which may degrade "
+                "Pausing generation-only request, request_id: {}, changes it to context init state, which may degrade "
                 "performance.",
                 mRequestId);
         }
@@ -990,7 +990,7 @@ public:
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         // Add debug log for prepopulatedPromptLen
-        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i (promptLen=%i).", mRequestId,
+        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request {} to {} (promptLen={}).", mRequestId,
             prepopulatedPromptLen, getPromptLen());
 
         auto const promptLen = getPromptLen();
@@ -998,7 +998,7 @@ public:
         // This check is make sure prepopulated prompt length (tokens already cached in KV cache) is less than prompt
         // length (total tokens in the prompt)
         TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
-            "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
+            "Invalid state: prepopulatedPromptLen ({}) >= promptLen ({}) for request {}", prepopulatedPromptLen,
             promptLen, mRequestId);
 
         auto& prePromptLen = mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
@@ -1072,9 +1072,9 @@ public:
     void discardDraftTokens(SizeType32 numTokensToDiscard)
     {
         TLLM_CHECK_WITH_INFO(
-            numTokensToDiscard > 0, "Can only discard a positive amount of draft tokens, got %d", numTokensToDiscard);
+            numTokensToDiscard > 0, "Can only discard a positive amount of draft tokens, got {}", numTokensToDiscard);
         TLLM_CHECK_WITH_INFO(numTokensToDiscard <= getNumDraftTokens(),
-            "Can't discard more draft tokens (%d) than exists (%d).", numTokensToDiscard, getNumDraftTokens());
+            "Can't discard more draft tokens ({}) than exists ({}).", numTokensToDiscard, getNumDraftTokens());
         mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
     }
 
@@ -1259,7 +1259,7 @@ public:
             auto const& outputTensorName = outputTensor.first;
             auto const dataType = getTensorDataType(outputTensorName);
             auto shape = getTensorShape(outputTensorName);
-            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
+            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '{}' must be dynamic",
                 outputTensorName.c_str());
             shape.d[0] = mPromptLen;
             auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
@@ -1270,7 +1270,7 @@ public:
             auto const& outputTensorName = outputTensor.first;
             auto const dataType = getTensorDataType(outputTensorName);
             auto shape = getTensorShape(outputTensorName);
-            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
+            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '{}' must be dynamic",
                 outputTensorName.c_str());
             shape.d[0] = mMaxNewTokens;
             shape = runtime::ITensor::unsqueeze(shape, 0);
@@ -1282,7 +1282,8 @@ public:
 
     void setState(LlmRequestState state)
     {
-        TLLM_LOG_DEBUG("Set request %lu from state %d to %d", mRequestId, mState, state);
+        TLLM_LOG_DEBUG(
+            "Set request {} from state {} to {}", mRequestId, static_cast<int>(mState), static_cast<int>(state));
         mState = state;
     }
 
@@ -1423,7 +1424,7 @@ public:
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");
-        TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
+        TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context ({}) can't be negative.", size);
         auto& contextChunkSize = mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
         contextChunkSize = std::min(size, getContextRemainingLength());
     }
@@ -1647,12 +1648,12 @@ public:
     {
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
-            TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
+            TLLM_LOG_DEBUG("Request {} finished by timeout after {:f} sec", mRequestId,
                 std::chrono::duration<float>(getSteadyClockNow() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
-            TLLM_LOG_DEBUG("Request %ld finished by cancel", mRequestId);
+            TLLM_LOG_DEBUG("Request {} finished by cancel", mRequestId);
         }
 
         for (int beam = 0; beam < mSamplingConfig.getBeamWidth(); ++beam)
@@ -1916,7 +1917,7 @@ private:
         {
             if (mInputTokenExtraIds.value()->size() != inputTokens.size())
             {
-                TLLM_THROW("inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
+                TLLM_THROW("inputTokenExtraIds vector size ({}) must be the same as input token vector size ({}).",
                     mInputTokenExtraIds.value()->size(), inputTokens.size());
             }
             std::transform(inputTokens.cbegin(), inputTokens.cend(), mInputTokenExtraIds.value()->cbegin(),
@@ -1955,7 +1956,7 @@ private:
                 = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with "
                   "prompt "
                   "tuning enabled.";
-            TLLM_THROW(errStr);
+            TLLM_THROW("{}", errStr);
         }
 
         setReturnLogProbs(outputLogProbs);

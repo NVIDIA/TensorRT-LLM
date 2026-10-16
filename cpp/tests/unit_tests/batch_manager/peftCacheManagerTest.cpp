@@ -300,8 +300,8 @@ TEST_F(PeftCacheManagerTest, putGet)
         auto values = valuesWeekPtr;
         for (size_t i = 0; i < values.size(); ++i)
         {
-            TLLM_LOG_DEBUG("actual:   " + to_string(values.at(i)));
-            TLLM_LOG_DEBUG("expected: " + to_string(expectedValues.at(i)));
+            TLLM_LOG_DEBUG("{}", "actual:   " + to_string(values.at(i)));
+            TLLM_LOG_DEBUG("{}", "expected: " + to_string(expectedValues.at(i)));
             EXPECT_EQ(expectedValues.at(i), values.at(i));
             auto v = values.at(i);
             cudaPointerAttributes attrs;

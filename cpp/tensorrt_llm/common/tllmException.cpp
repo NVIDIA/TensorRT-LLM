@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
-#include <cinttypes>
 #include <cstdlib>
 #if !defined(_MSC_VER)
 #include <cxxabi.h>
@@ -39,17 +38,18 @@ int constexpr VOID_PTR_SZ = 2 + sizeof(void*) * 2;
 
 #if !defined(_MSC_VER)
 
-TllmException::TllmException(char const* file, std::size_t line, char const* msg)
+TllmException::TllmException(std::source_location const& location, std::string_view msg)
     : std::runtime_error{""}
 {
     mNbFrames = backtrace(mCallstack.data(), MAX_FRAMES);
     auto const trace = getTrace();
-    std::runtime_error::operator=(std::runtime_error{fmtstr("%s (%s:%zu)\n%s", msg, file, line, trace.c_str())});
+    std::runtime_error::operator=(
+        std::runtime_error{std::format("{} ({}:{})\n{}", msg, location.file_name(), location.line(), trace)});
 }
 #else
-TllmException::TllmException(char const* file, std::size_t line, char const* msg)
+TllmException::TllmException(std::source_location const& location, std::string_view msg)
     : mNbFrames{}
-    , std::runtime_error{fmtstr("%s (%s:%zu)", msg, file, line)}
+    , std::runtime_error{std::format("{} ({}:{})", msg, location.file_name(), location.line())}
 {
 }
 #endif
@@ -75,12 +75,12 @@ std::string TllmException::getTrace() const
         if (dladdr(mCallstack[i], &info) && info.dli_sname)
         {
             auto const clearName = demangle(info.dli_sname);
-            buf << fmtstr("%-3d %*p %s + %zd", i, VOID_PTR_SZ, mCallstack[i], clearName.c_str(),
+            buf << std::format("{:<3d} {:>{}p} {} + {}", i, mCallstack[i], VOID_PTR_SZ, clearName,
                 static_cast<char*>(mCallstack[i]) - static_cast<char*>(info.dli_saddr));
         }
         else
         {
-            buf << fmtstr("%-3d %*p %s", i, VOID_PTR_SZ, mCallstack[i], trace.get()[i]);
+            buf << std::format("{:<3d} {:>{}p} {}", i, mCallstack[i], VOID_PTR_SZ, trace.get()[i]);
         }
         if (i < mNbFrames - 1)
             buf << std::endl;
@@ -111,9 +111,9 @@ std::string TllmException::demangle(char const* name)
 }
 
 RequestSpecificException::RequestSpecificException(
-    std::string const& file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode)
-    : std::runtime_error{fmtstr("%s (Request ID: %" PRIu64 ", Error Code: %u) (%s:%zu)", msg, requestID,
-        static_cast<uint32_t>(errorCode), file.c_str(), line)}
+    std::source_location const& location, std::string_view msg, uint64_t requestID, RequestErrorCode errorCode)
+    : std::runtime_error{std::format("{} (Request ID: {}, Error Code: {}) ({}:{})", msg, requestID,
+        static_cast<uint32_t>(errorCode), location.file_name(), location.line())}
     , mRequestID{requestID}
     , mErrorCode{errorCode}
 {
