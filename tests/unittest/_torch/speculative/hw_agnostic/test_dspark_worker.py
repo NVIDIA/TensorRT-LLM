@@ -169,7 +169,7 @@ def test_worker_graph_bucket_uses_full_seq_slot_pool():
         max_draft_len=5,
         tokens_per_gen_step=6,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
-        target_layer_ids=[],
+        target_layer_ids=[0],
         # The embedded form is the one served by DSv4DSparkWorker and its
         # DSparkSpecMetadata; the standalone form routes to DFlash metadata.
         draft_is_embedded_in_target=True,
