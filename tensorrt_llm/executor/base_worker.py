@@ -1153,12 +1153,8 @@ class BaseWorker(GenerationExecutor):
 
         startup_metrics = {}
         executor_metrics = dict(getattr(self.engine, "metrics", {}))
-        for model_engine_stage in (
-                "initial_model_engine",
-                "final_model_engine",
-                "initial_draft_model_engine",
-                "final_draft_model_engine",
-        ):
+        for model_engine_stage in ("initial_model_engine",
+                                   "final_model_engine"):
             model_engine_metrics = executor_metrics.pop(model_engine_stage,
                                                         None)
             if model_engine_metrics is not None:

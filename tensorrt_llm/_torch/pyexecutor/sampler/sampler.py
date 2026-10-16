@@ -19,9 +19,8 @@ early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
 :class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
 sampling logic of its own beyond batching and orchestration: each feature
 (beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-two-model speculation, seeds) lives in its own module and is held here as a
-handler, driven through ``setup_sampler_step`` / ``sample_async`` /
-``update_requests``.
+seeds) lives in its own module and is held here as a handler, driven through
+``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
 """
 
 import sys
@@ -73,7 +72,6 @@ from .sampler_features import (
     SamplerEvent,
     _PackedStepIndexer,
     _UnpackedStepIndexer,
-    apply_d2t,
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
@@ -84,7 +82,6 @@ from .sampling_resolution import SamplingMode, SlotSamplingParams
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 from .top_p_decay import TopPDecayHandler
-from .two_model_spec_dec import TwoModelSpecDecHandler
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -705,8 +702,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
 
-        self._two_model_spec_dec = TwoModelSpecDecHandler(self)
-
         self._async_worker_init(args.enable_async_worker)
 
         # The speculative path bypasses _copy_to_host, so it cannot coexist
@@ -739,22 +734,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             copy_to_host=self._copy_to_host,
             make_side_stream_copier=self._make_side_stream_copier,
         )
-
-    @staticmethod
-    def _is_draft_batch(requests: list[LlmRequest]) -> bool:
-        """Whether this batch belongs to the draft model.
-
-        Batches are homogeneous by construction: a drafter builds all-draft
-        batches for its sample_async/update_requests calls on this shared
-        sampler, and PyExecutor's batches are all-target. The pending-steps
-        accounting relies on this to skip draft batches wholesale; assert it so
-        a mixed batch fails loudly instead of silently corrupting the counters.
-        """
-        is_draft: bool = requests[0].py_is_draft
-        assert all(r.py_is_draft == is_draft for r in requests), (
-            "sampler batch must be homogeneous (all-draft or all-target)"
-        )
-        return is_draft
 
     @property
     def _use_beam_search(self) -> bool:
@@ -835,15 +814,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         ``_forward_step`` has returned, so sampling in-graph would read unmasked
         logits and emit a token they were meant to forbid, while their output is
         discarded. Any future post-forward logits mutator belongs here too.
-
-        Draft requests are excluded as well: the draft engine registers neither
-        hook yet shares this sampler, so a draft batch must not be served from
-        state staged for its target.
         """
-        return (
-            request.py_guided_decoding_params is not None
-            or bool(getattr(request, "py_logits_post_processors", None))
-            or bool(getattr(request, "py_is_draft", False))
+        return request.py_guided_decoding_params is not None or bool(
+            getattr(request, "py_logits_post_processors", None)
         )
 
     def get_sample_type(self, requests: list[LlmRequest]) -> SampleType:
@@ -1055,7 +1028,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         logits_cuda = model_outputs["logits"]
-        d2t = model_outputs.get("d2t", None)
 
         # Staging runs after the batch is settled, so the staged width has to
         # equal the rows the forward produced. A mismatch means an unexpected
@@ -1073,13 +1045,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
         dest_indices = dest_indices[: self._in_graph_rows]
 
-        self._fast_sample_in_graph(logits_cuda, dest_indices, d2t)
+        self._fast_sample_in_graph(logits_cuda, dest_indices)
 
     def _fast_sample_in_graph(
         self,
         logits_cuda: torch.Tensor,
         dest_indices: torch.Tensor,
-        d2t: torch.Tensor | None,
     ) -> None:
         """Sample the fast tier from the staged per-row params.
 
@@ -1104,8 +1075,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seed=params.seed[:num_rows],
             offset=params.offset[:num_rows],
         )
-        if d2t is not None:
-            next_tokens = next_tokens + d2t[next_tokens]
         scatter_new_tokens(next_tokens, self.store.new_tokens, dest_indices, self.max_beam_width)
 
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
@@ -1209,6 +1178,46 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return True
         return False
 
+    def _process_draft_tokens(
+        self,
+        request: LlmRequest,
+        new_tokens_list: list[list[list[int]]],
+        finish_reasons: FinishReasonsList,
+    ) -> int:
+        """Add the target's tokens up to the first rejected draft token.
+
+        Only drafter-based speculation (NGram, user-provided) attaches draft tokens
+        to requests sampled here; a draft token is accepted while it matches the
+        token the target sampled at the same position.
+
+        Returns the number of accepted draft tokens.
+        """
+        new_token = add_token(request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
+        if (
+            self.finish_if_reason(request, finish_reasons, step=0, beam_idx=DEFAULT_BEAM_IDX)
+            or get_draft_token_length(request) == 0
+        ):
+            return 0
+        force_accept = self._force_num_accepted_tokens != 0
+        draft_tokens = (
+            request.py_draft_tokens[: self._force_num_accepted_tokens]
+            if force_accept
+            else request.py_draft_tokens
+        )
+        num_accepted = 0
+        for draft_token in draft_tokens:
+            if not force_accept and draft_token != new_token:
+                break
+            num_accepted += 1
+            new_token = add_token(
+                request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=num_accepted
+            )
+            if self.finish_if_reason(
+                request, finish_reasons, step=num_accepted, beam_idx=DEFAULT_BEAM_IDX
+            ):
+                break
+        return num_accepted
+
     @classmethod
     def _collect_new_requests_for_setup(
         cls, scheduled_requests: ScheduledRequests
@@ -1219,7 +1228,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         context_new_requests = [
             request
             for request in scheduled_requests.context_requests_last_chunk
-            if not request.is_finished and not request.py_is_draft
+            if not request.is_finished
         ]
         adp_dummy_generation_requests = [
             request
@@ -1356,7 +1365,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if not state.requests:
             return
 
-        if self._track_pending_steps and not self._is_draft_batch(state.requests):
+        if self._track_pending_steps:
             for req in state.requests:
                 slot = req.py_seq_slot
                 if slot is not None and self._pending_steps[slot] > 0:
@@ -1523,7 +1532,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 processed = 1
                 num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
-                num_accepted = self._two_model_spec_dec.process_draft_tokens(
+                num_accepted = self._process_draft_tokens(
                     req,
                     new_tokens_list=new_tokens_list,
                     finish_reasons=finish_reasons,
@@ -1627,11 +1636,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
-        # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by a drafter's prepare_draft_tokens(), for the draft model. In the former
-        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-        #     latter case, there is always only 1 token per request because draft
-        #     tokens are sampled one-by-one.
+        # NB: There are 1 + get_draft_token_length(request) tokens per request.
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
@@ -1641,9 +1646,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # update_requests. Must happen before _process_requests, which
             # reads the counters for bad-words staleness.
             for r in scheduled_requests.context_requests:
-                if not r.py_is_draft:
-                    assert r.py_seq_slot is not None
-                    self._pending_steps[r.py_seq_slot] = 0
+                assert r.py_seq_slot is not None
+                self._pending_steps[r.py_seq_slot] = 0
 
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.
@@ -1662,7 +1666,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_context_logits_prefix_sum,
         )
 
-        if self._track_pending_steps and requests and not self._is_draft_batch(requests):
+        if self._track_pending_steps and requests:
             for r in requests:
                 assert r.py_seq_slot is not None
                 self._pending_steps[r.py_seq_slot] += 1
@@ -1676,17 +1680,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if requests:
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
-            # Prepare stop word handling
-            # Draft requests need to be ignored for stop word handling as they never set up
-            # their buffers in the store.
-            # Assume that either all requests are drafts or none are drafts
-            is_draft_batch = requests[0].py_is_draft
             if not single_step_greedy:
                 assert seq_lens_host is not None
                 assert seq_lens_cuda is not None
                 finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
                     seq_slots_host=seq_slots_host,
-                    is_draft_batch=is_draft_batch,
                     seq_slots_cuda=seq_slots_cuda,
                     seq_lens_cuda=seq_lens_cuda,
                     new_tokens_cuda=new_tokens,
@@ -1823,7 +1821,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         logits_cuda: torch.Tensor,
         requests: list[LlmRequest],
-        model_outputs: dict[str, Any],
         *,
         logits_cuda_indexer: _PackedStepIndexer,
         req_num_generated_tokens: torch.Tensor,
@@ -1842,11 +1839,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         seq_slots_list = seq_slots.tolist()
         groups = self._group_requests(requests, seq_slots_list)
-        # NB: "d2t" maps sampled draft-vocab tokens into the target vocab; the
-        #     probs of a non-greedy sampler would still be over the draft vocab.
-        needs_d2t = "d2t" in model_outputs
-        if needs_d2t and any(group.mode is not SamplingMode.GREEDY for group in groups):
-            raise ValueError("d2t does not yet support non-greedy sampling")
 
         # Tensors for collecting sampling results (in batch ordering)
         batch_req_indices = torch.empty((len(requests),), dtype=torch.int32)
@@ -2060,14 +2052,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     torch.tensor(reqs_indices_needing_raw_logprobs, dtype=torch.int64)
                 ].to(device=cuda_device, non_blocking=True)
 
-        # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
-        #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
-        #     is the target vocab, whereas the output logits correspond to the draft
-        #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
-        #     they currently need to be handled within TorchSampler.
-        if needs_d2t:
-            apply_d2t(batch_next_tokens_cuda_int, model_outputs)
-
         return _BatchedSamplingResult(
             req_indices=batch_req_indices,
             next_tokens_cuda_int=batch_next_tokens_cuda_int,
@@ -2140,10 +2124,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Length-based bans (min_length) add it back to recover the real generated
         length. Unlike the suffix-rule staleness this needs no device-side
         lookup, so it is not restricted to the single-step / single-beam case.
-        Returns None when the overlap scheduler is off, on a draft batch, or
-        when nothing is pending, so callers can skip the correction entirely.
+        Returns None when the overlap scheduler is off or when nothing is
+        pending, so callers can skip the correction entirely.
         """
-        if not self._track_pending_steps or self._is_draft_batch(requests):
+        if not self._track_pending_steps:
             return None
         pending = [
             self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
@@ -2160,9 +2144,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         speculative decoding or beam search the missing history cannot be
         recovered, so bans are matched against the lagging host history and may
         be enforced one step late (warned once). Returns None when the overlap
-        scheduler is off, on a draft batch, or when nothing is pending.
+        scheduler is off or when nothing is pending.
         """
-        if not self._track_pending_steps or self._is_draft_batch(requests):
+        if not self._track_pending_steps:
             return None
         pending = [
             self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
@@ -2331,7 +2315,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             and self.max_beam_width == 1
             and scheduled_requests.num_context_requests == 0
             and len(generation_requests) <= raw_logits_cuda.shape[0]
-            and model_outputs.get("d2t") is None
             and all(
                 not request.is_dummy and get_draft_token_length(request) == 0
                 for request in generation_requests
@@ -2362,17 +2345,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #
         # Staging happened before the forward, so verify the staged buffers
         # really describe this batch: a forward that was skipped, repeated or
-        # replaced (context-only steps, draft batches, eager fallbacks) would
+        # replaced (context-only steps, eager fallbacks) would
         # otherwise be sampled against another batch's destinations.
         if self._current_sample_type is not SampleType.FULL:
             live_requests = [request for request in generation_requests if not request.is_dummy]
             staged_matches_batch = (
                 self._in_graph_staged
                 and self._in_graph_dest_indices is not None
-                # A draft request reuses its target's py_request_id, so the id
-                # list alone cannot tell a drafter batch from the target batch
-                # that staged it.
-                and not any(request.py_is_draft for request in live_requests)
                 and [request.py_request_id for request in live_requests]
                 == self._in_graph_request_ids
             )
@@ -2427,11 +2406,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if single_step_greedy
                     else new_tokens_cuda
                 )
-                # Consumption is one-shot. The id list is not a unique key for a
-                # batch -- a draft request reuses its target's py_request_id and
-                # the drafter shares this sampler -- so leaving the state staged
-                # would let a later drafter step with the same ids be served
-                # these tokens as draft tokens. The next forward restages.
+                # Consumption is one-shot; the next forward restages.
                 self._consume_in_graph_staging()
                 return (
                     live_requests,
@@ -2470,7 +2445,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda,
                 seq_slots_cuda,
                 self.max_beam_width,
-                None,
             )
             new_tokens_host = self._copy_to_host(next_tokens)
             return (
@@ -2536,9 +2510,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams=(
                 beam_search_store.predecessor_beams if beam_search_store is not None else None
             ),
-            # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
-            # anyway, so short-circuit rather than index into it.
-            is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
         )
 
         has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)
@@ -2594,16 +2565,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda.device, non_blocking=True
             )
 
-            # Get d2t tensor if present
-            d2t = model_outputs.get("d2t", None)
-
-            # Run compiled kernel for argmax, d2t application, and scatter
+            # Run compiled kernel for argmax and scatter
             fast_greedy_sample_kernel(
                 logits_cuda,
                 new_tokens_cuda,
                 batch_dest_indices_cuda,
                 self.max_beam_width,
-                d2t,
             )
 
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
@@ -2630,7 +2597,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             sampling_requests,
-            model_outputs,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=sampling_requests_metadata.req_offsets,
             seq_slots=seq_slots_host,

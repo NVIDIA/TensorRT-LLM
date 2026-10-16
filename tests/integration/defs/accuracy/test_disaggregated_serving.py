@@ -1262,8 +1262,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
     @pytest.mark.skip_less_device(8)
-    # Two-model eagle3 (eagle3_one_model=False) is being removed (#18721),
-    # so only the one-model path is covered here.
     @parametrize_with_ids("overlap_scheduler", [True, False])
     # Dual TP4 120B-model startup (weights + Eagle3 draft checkpoint loaded
     # on both ctx and gen servers) plus a full, unmocked GSM8K eval (1319
