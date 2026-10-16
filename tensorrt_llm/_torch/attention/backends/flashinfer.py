@@ -45,8 +45,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
-from .mixed_precision_kv_view import (MixedPrecisionKVView,
-                                      create_mixed_precision_kv_views)
+from .mixed_precision_kv_view import MixedPrecisionKVView
 from .utils import check_page_table, log_attention_failure_context
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
@@ -1084,7 +1083,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.mixed_precision_kv_views = create_mixed_precision_kv_views(self)
+        self.mixed_precision_kv_views = None
+        if callable(
+                getattr(self.kv_cache_manager, "get_mixed_precision_buffers",
+                        None)):
+            self.mixed_precision_kv_views = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:

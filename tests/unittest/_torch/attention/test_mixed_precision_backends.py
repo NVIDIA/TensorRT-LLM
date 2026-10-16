@@ -15,7 +15,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import encode_high_precision_kv
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -98,7 +97,9 @@ def test_optimized_two_pool_prefill_and_decode(
         **({"flashinfer_backend": "trtllm-gen"} if fp8_input else {}),
     )
     selection_cache = attention._fmha_manager if backend is TrtllmAttention else None
-    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    history_scale = torch.full(
+        (1,), 1 / 6 if high_dtype == DataType.FP8 else 1, dtype=torch.float32, device="cuda"
+    )
     module = SimpleNamespace(
         attn=attention,
         mapping=manager.mapping,
@@ -126,8 +127,11 @@ def test_optimized_two_pool_prefill_and_decode(
             kv_layout=kv_layout,
             runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
         )
+        assert metadata.mixed_precision_kv_views == {}
         metadata.prepare()
-        assert metadata.mixed_precision_kv_views[0].pool.dtype == high_torch_dtype
+        view = metadata.mixed_precision_kv_views[0]
+        assert view.pool.dtype == high_torch_dtype
+        assert view.metadata.mixed_precision_kv_views is None
         q, k, v = [
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
         ]
@@ -152,6 +156,7 @@ def test_optimized_two_pool_prefill_and_decode(
         output = run()
         if not context and high_dtype == DataType.BF16:
             reference = output.clone()
+            eager_metadata = metadata
             metadata = metadata.create_cuda_graph_metadata(batch, buffers=Buffers())
             metadata.prepare()
             run()
@@ -164,6 +169,21 @@ def test_optimized_two_pool_prefill_and_decode(
             for tensor in inputs:
                 if tensor is not None:
                     tensor.copy_(tensor.flip(0))
+            other_metadata = eager_metadata.create_cuda_graph_metadata(batch, buffers=Buffers())
+            other_metadata.prepare()
+            view = metadata.mixed_precision_kv_views[0]
+            other_view = other_metadata.mixed_precision_kv_views[0]
+            assert other_view is not view
+            for tensor, other_tensor in (
+                (view.page_tables, other_view.page_tables),
+                (view.lengths, other_view.lengths),
+                (view.cu_new_tokens, other_view.cu_new_tokens),
+            ):
+                assert tensor.untyped_storage().data_ptr() == (
+                    other_tensor.untyped_storage().data_ptr()
+                )
+            # Another graph's preparation changed the shared tables; refresh before replay.
+            metadata.prepare()
             graph.replay()
             torch.testing.assert_close(output, reference.flip(0), atol=0.01, rtol=0.02)
             decode_graph = (metadata, graph, output, run)
@@ -249,13 +269,14 @@ def test_optimized_two_pool_prefill_and_decode(
             reference = []
             for role, tensor in enumerate((key, value)):
                 original = tensor[row].view(-1, heads, width)
-                high_values = original.to(high_torch_dtype).to(compute_dtype)
+                native_high_values = original.to(high_torch_dtype)
+                high_values = native_high_values.to(compute_dtype)
                 packed, scale_bytes = torch.ops.trtllm.fp4_quantize(
-                    high_values.contiguous(), scale, 16, False, False
+                    native_high_values.contiguous(), history_scale.reciprocal(), 16, False, False
                 )
                 scale_bytes = scale_bytes.view(length + 1, heads, width // 16)
                 low = (
-                    _reference_dequant(packed, scale_bytes, scale)
+                    _reference_dequant(packed, scale_bytes, history_scale)
                     .to(compute_dtype)
                     .to(high_torch_dtype)
                     .to(compute_dtype)
@@ -278,8 +299,8 @@ def test_optimized_two_pool_prefill_and_decode(
                     if high_ids[ordinal] >= 0:
                         expected[position] = high_values[position]
                         torch.testing.assert_close(
-                            high[high_ids[ordinal], role, offset].to(compute_dtype),
-                            high_values[position],
+                            high[high_ids[ordinal], role, offset].view(torch.uint8),
+                            native_high_values[position].view(torch.uint8),
                             rtol=0,
                             atol=0,
                         )
@@ -314,6 +335,20 @@ def test_optimized_two_pool_prefill_and_decode(
             metadata.prepare()
             graph.replay()
             replayed = captured_output.clone()
+            ordinal, offset = divmod(length, block)
+            for row, history_ids in enumerate(all_history_ids):
+                # The next replay appends the same K/V at the updated sequence length.
+                for pool, page_id in (
+                    (history, history_ids[ordinal]),
+                    (scales, all_scale_ids[row][ordinal]),
+                    (high, all_high_ids[row][ordinal]),
+                ):
+                    torch.testing.assert_close(
+                        pool[page_id, :, offset + 1].view(torch.uint8),
+                        pool[page_id, :, offset].view(torch.uint8),
+                        rtol=0,
+                        atol=0,
+                    )
             eager = run()
             torch.testing.assert_close(replayed, eager, atol=0.01, rtol=0.02)
     finally:
@@ -356,15 +391,23 @@ def test_nvfp4_conversion_kernels(dtype, width):
     torch.testing.assert_close(decoded.float(), expected.float(), rtol=0, atol=0)
 
 
-def test_high_fp8_uses_native_saturating_conversion():
+def test_nvfp4_conversion_from_native_fp8():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    values = torch.linspace(-1000, 1000, 128, device="cuda").view(2, 64)
-    expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-        values, torch.ones(1, device="cuda", dtype=torch.float32)
+    from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
+
+    values = torch.linspace(-448, 448, 128, device="cuda").view(2, 64).to(torch.float8_e4m3fn)
+    quant_scale = torch.full((1,), 6.0, device="cuda", dtype=torch.float32)
+    history_scale = quant_scale.reciprocal()
+    packed, scales = torch.ops.trtllm.fp4_quantize(values, quant_scale, 16, False, False)
+    scales = scales.view(2, 4)
+    decoded = torch.empty(values.shape, device="cuda", dtype=torch.bfloat16)
+    get_fp4_kv_dequantization_module().nvfp4_kv_dequant(packed, scales, history_scale, decoded)
+    expected = _reference_dequant(packed, scales, history_scale).to(decoded.dtype)
+    torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        decoded.float()[[0, 1], [0, 63]], values.float()[[0, 1], [0, 63]], rtol=0, atol=0
     )
-    actual = encode_high_precision_kv(values, torch.float8_e4m3fn)
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
 
 
 def test_mixed_precision_public_options():

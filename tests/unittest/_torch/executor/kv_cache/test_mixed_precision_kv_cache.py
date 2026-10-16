@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Local GPU QA for the unchanged native full-history + SWA reuse contract."""
+"""Local GPU QA for mixed-precision KV allocation, reuse and transfer."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -76,7 +76,7 @@ def test_extra_pool_uses_existing_dtype_layout(manager):
 
 
 @pytest.mark.parametrize("dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
-def test_native_swa_and_shared_kv_keep_original_storage(dtype):
+def test_mixed_precision_preserves_native_and_shared_kv_storage(dtype):
     """Only the ordinary full-history layer receives low/high KV pools."""
     config = KvCacheConfig(
         max_tokens=65536,

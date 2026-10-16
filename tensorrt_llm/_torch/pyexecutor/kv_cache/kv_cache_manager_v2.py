@@ -6760,7 +6760,7 @@ class _MixedPrecisionLayerKind(IntEnum):
 
 
 class MixedPrecisionKVCacheManager(KVCacheManagerV2):
-    """Dense KV prototype using the existing full-history and SWA lifecycles.
+    """Mixed-precision KV using native full-history and sliding-window lifecycles.
 
     ``first_n`` is the sink length; ``last_n`` counts previously written tokens.
     Both pools use native page granularity, allocation, migration, eviction and
@@ -6810,6 +6810,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                         first_shared - 1 - source_types[::-1].index(layer_type)
                     )
         self._staging_bytes = 0
+        self.mixed_precision_workspace_elements = 0
         self._staging_buffer: torch.Tensor | None = None
         self._staging_stream: int | None = None
         from ...memory_buffer_utils import Buffers
@@ -6898,20 +6899,22 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
 
         if not self.high_layers:
             return config
-        # Bound one layer's staging storage by the NVFP4 conversion workspace dtype.
+        # Layers share one native KV view and bounded codec workspaces.
         pages = self.max_batch_size * math.ceil(self.max_seq_len / self.tokens_per_block)
         elements = pages * largest_page
-        self._staging_bytes = elements * torch.empty((), dtype=self.conversion_dtype).element_size()
-        # Workspaces retain their peak allocations across prefill and decode.
-        high_bytes = get_size_in_bytes(elements, self.high_dtype)
+        self.mixed_precision_workspace_elements = elements
+        self._staging_bytes = get_size_in_bytes(elements, self.high_dtype)
         low_bytes = get_size_in_bytes(
             elements, self.low_dtype
         ) + self.calculate_scaling_factor_size_bytes(elements, 16, DataType.FP8)
-        reserve = 2 * self._staging_bytes + 2 * high_bytes + 2 * low_bytes
-        if self.high_dtype == DataType.FP8:
-            reserve += self._staging_bytes + high_bytes
-        # Four flat token addresses plus source-selection indices, and the paged table.
-        reserve += self.max_batch_size * self.max_seq_len * 5 * 8 + pages * self.kv_factor * 4
+        restored_bytes = elements * torch.empty((), dtype=self.conversion_dtype).element_size()
+        reserve = 2 * self._staging_bytes + restored_bytes + 2 * low_bytes
+        # Page tables are per layer; lengths are shared by the batch. No token/head indices.
+        reserve += len(self.high_layers) * 3 * pages * 4
+        reserve += (3 * self.max_batch_size + 1) * 4
+        # TRTLLM uses at most 64 tokens per staging page and two offsets even for MLA.
+        view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 64))
+        reserve += len(self.high_layers) * self.max_batch_size * 2 * view_pages * 4
         tiers = []
         for tier in config.cache_tiers:
             if isinstance(tier, GpuCacheTierConfig):

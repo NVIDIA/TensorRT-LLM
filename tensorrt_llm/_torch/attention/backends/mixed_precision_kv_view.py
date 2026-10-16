@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare one ordinary paged cache for optimized mixed-precision Attention.
 
-The native manager owns both REQUIRED history and SWA/sink pages. Metadata
-preparation reserves the current batch's buffers, one layer at a time. The
-backend writes new, post-RoPE K/V into that staging cache; writeback then stores
-both representations without quantizing the high copy through the low copy.
+The low pool stores every token and participates in native cache reuse. The
+high pool retains native KV for the configured prefix and tail. Attention reads
+and writes its usual KV dtype; GPU paged copies connect it to the two pools.
 """
 
 import copy
 from dataclasses import replace
+from itertools import accumulate
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,19 +17,12 @@ import torch
 from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 
-from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from .interface import AttentionMetadata
+from .mixed_precision_kv_kernel import gather_history, gather_new, restore_view, scatter_new
 
 if TYPE_CHECKING:
     from .flashinfer import FlashInferAttentionMetadata
     from .trtllm import TrtllmAttentionMetadata
-
-
-def create_mixed_precision_kv_views(
-    metadata: AttentionMetadata,
-) -> "dict[int, MixedPrecisionKVView] | None":
-    """Create per-layer views only for a mixed-precision cache manager."""
-    return {} if isinstance(metadata.kv_cache_manager, MixedPrecisionKVCacheManager) else None
 
 
 def get_mixed_precision_kv_view(
@@ -38,16 +31,6 @@ def get_mixed_precision_kv_view(
     """Return the optional mixed-precision view for this layer."""
     views = getattr(metadata, "mixed_precision_kv_views", None)
     return None if views is None else views.get(layer_idx)
-
-
-def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Convert restored history to the native KV storage format."""
-    if dtype == torch.float8_e4m3fn and values.dtype != dtype:
-        values, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-            values.contiguous(), torch.ones(1, dtype=torch.float32, device=values.device)
-        )
-        return values
-    return values.to(dtype)
 
 
 class MixedPrecisionKVView:
@@ -101,10 +84,16 @@ class MixedPrecisionKVView:
         shape = [self.page_starts[-1], *self.high.shape[1:]]
         shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
         self.pool = manager.get_staging_buffer(shape, self.high.dtype)
-        self.history_scale = torch.ones(1, dtype=torch.float32, device=self.pool.device)
+        # The direct FP8 codec uses a fixed factor of six for native FP8 values.
+        fp8 = self.pool.dtype == torch.float8_e4m3fn
+        self.history_scale = torch.full(
+            (1,), 1 / 6 if fp8 else 1.0, dtype=torch.float32, device=self.pool.device
+        )
+        self.quant_scale = torch.full(
+            (1,), 6.0 if fp8 else 1.0, dtype=torch.float32, device=self.pool.device
+        )
         self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
-        self._indices: dict[str, torch.Tensor] = {}
         self.metadata = None
 
     def update(
@@ -120,59 +109,72 @@ class MixedPrecisionKVView:
         self.page_counts = [
             (n + self.tokens_per_block - 1) // self.tokens_per_block for n in lengths
         ]
-        tables = (history_ids, scale_ids, high_ids)
-        cached = self._locations([0] * len(lengths), cached_lengths, tables)
-        new = self._locations(cached_lengths, lengths, tables)
-        low = cached[:, cached[3] < 0]
-        high = cached[:, cached[3] >= 0]
-        capacity = len(lengths) * self.max_seq_len if metadata.is_cuda_graph else None
-        for name, pool, tokens, source, size in (
-            ("read_low", self.history, low[1], True, capacity),
-            ("read_scales", self.scales, low[2], True, capacity),
-            ("restore_low", self.pool, low[0], False, capacity),
-            ("read_high", self.high, high[3], True, capacity),
-            ("restore_high", self.pool, high[0], False, capacity),
-            ("read_new", self.pool, new[0], True, None),
-            ("write_low", self.history, new[1], False, None),
-            ("write_scales", self.scales, new[2], False, None),
-            ("write_high", self.high, new[3], False, None),
-        ):
-            indices = self._row_indices(pool, tokens)
-            rows_per_token = self.kv_factor * self.high.shape[2 if self.layout == "HND" else 3]
-            count = size * rows_per_token if size is not None else indices.numel()
-            host = torch.full(
-                (count,), 0 if source else -1, dtype=torch.int64, pin_memory=prefer_pinned()
-            )
-            host[: indices.numel()] = indices.clamp_min(0) if source else indices
-            if name not in self._indices:
-                self._indices[name] = torch.empty(count, dtype=torch.int64, device=self.pool.device)
-            self._indices[name].copy_(host, non_blocking=True)
-
-        # Reuse the existing workspace owner; layers execute sequentially.
+        batch = len(lengths)
         buffers = manager.mixed_precision_buffers
-
-        def workspace(name, rows, width, dtype):
-            return buffers.get_buffer((rows, width), dtype, name, metadata.is_cuda_graph)
-
+        max_pages = (self.max_seq_len + self.block_size - 1) // self.block_size
+        tables = torch.full(
+            (3, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        for role, rows in enumerate((history_ids, scale_ids, high_ids)):
+            for row, pages in enumerate(rows):
+                count = (lengths[row] + self.block_size - 1) // self.block_size
+                if role < 2 and (len(pages) < count or any(page < 0 for page in pages[:count])):
+                    raise ValueError("Mixed-precision primary KV and scales must cover every token")
+                count = min(len(pages), max_pages)
+                tables[role, row, :count] = torch.tensor(pages[:count], dtype=torch.int32)
+        self.page_tables = buffers.get_buffer(
+            (3, manager.max_batch_size, max_pages),
+            torch.int32,
+            f"mixed_page_tables_{layer_idx}",
+            metadata.is_cuda_graph,
+        )[:, :batch]
+        self.page_tables.copy_(tables, non_blocking=True)
+        self.lengths = buffers.get_buffer(
+            (2, manager.max_batch_size), torch.int32, "mixed_lengths", metadata.is_cuda_graph
+        )[:, :batch]
+        self.lengths.copy_(
+            maybe_pin_memory(torch.tensor([cached_lengths, lengths], dtype=torch.int32)),
+            non_blocking=True,
+        )
+        new_lengths = metadata.seq_lens.tolist()
+        cu_new_tokens = list(accumulate(new_lengths, initial=0))
+        self.cu_new_tokens = buffers.get_buffer(
+            (manager.max_batch_size + 1,),
+            torch.int32,
+            "mixed_cu_new_tokens",
+            metadata.is_cuda_graph,
+        )[: batch + 1]
+        self.cu_new_tokens.copy_(
+            maybe_pin_memory(torch.tensor(cu_new_tokens, dtype=torch.int32)), non_blocking=True
+        )
+        self.history_capacity = (
+            self.max_seq_len if metadata.is_cuda_graph else max(cached_lengths, default=0)
+        )
+        self.max_new_tokens_per_request = max(new_lengths, default=0)
+        rows_per_token = self.kv_factor * self.high.shape[2 if self.layout == "HND" else 3]
         width = self.high.shape[-1]
-        low_rows = self._indices["read_low"].numel()
-        high_rows = self._indices["read_high"].numel()
-        new_rows = self._indices["read_new"].numel()
-        self.read_low = workspace("mixed_read_low", low_rows, width // 2, torch.uint8)
-        self.read_scales = workspace("mixed_read_scales", low_rows, width // 16, torch.uint8)
-        # The NVFP4 codec accepts FP16/BF16 buffers. Attention still sees the native KV dtype.
+        history_rows = batch * self.history_capacity * rows_per_token
+        new_rows = cu_new_tokens[-1] * rows_per_token
+
+        # Reserve the largest layer once so captures share stable workspace addresses.
+        def workspace(name, rows, divisor, dtype):
+            storage = buffers.get_buffer(
+                (manager.mixed_precision_workspace_elements // divisor,),
+                dtype,
+                name,
+                metadata.is_cuda_graph,
+            )
+            return storage[: rows * (width // divisor)].view(rows, width // divisor)
+
+        self.read_low = workspace("mixed_read_low", history_rows, 2, torch.uint8)
+        self.read_scales = workspace("mixed_read_scales", history_rows, 16, torch.uint8)
         self.restored_low = workspace(
-            "mixed_restored_low", low_rows, width, manager.conversion_dtype
+            "mixed_restored_low", history_rows, 1, manager.conversion_dtype
         )
-        self.read_high = workspace("mixed_read_high", high_rows, width, self.high.dtype)
-        self.new_values = workspace("mixed_new", new_rows, width, self.pool.dtype)
-        self.new_low_input = (
-            self.new_values
-            if self.pool.dtype == manager.conversion_dtype
-            else workspace("mixed_new_low_input", new_rows, width, manager.conversion_dtype)
-        )
-        self.new_low = workspace("mixed_new_low", new_rows, width // 2, torch.uint8)
-        self.new_scales = workspace("mixed_new_scales", new_rows, width // 16, torch.uint8)
+        self.new_low_input = workspace("mixed_new_input", new_rows, 1, self.pool.dtype)
+        if self.pool.dtype != torch.float8_e4m3fn:
+            self.new_low = workspace("mixed_new_low", new_rows, 2, torch.uint8)
+            self.new_scales = workspace("mixed_new_scales", new_rows, 16, torch.uint8)
 
         from .flashinfer import FlashInferAttentionMetadata
 
@@ -195,27 +197,42 @@ class MixedPrecisionKVView:
             self.metadata.kv_layout = self.layout
             self.metadata.use_paged_context_fmha = True
             offsets = self.block_offsets()
-            if "block_offsets" not in self._indices:
-                self._indices["block_offsets"] = torch.empty_like(offsets, device=self.pool.device)
-            self._indices["block_offsets"].copy_(offsets, non_blocking=True)
-            self.metadata.kv_cache_block_offsets = self._indices["block_offsets"]
+            self.kv_cache_block_offsets = buffers.get_buffer(
+                (1, manager.max_batch_size, 2, self.max_blocks_per_seq),
+                torch.int32,
+                f"mixed_block_offsets_{layer_idx}",
+                metadata.is_cuda_graph,
+            )[:, : len(lengths)]
+            self.kv_cache_block_offsets.copy_(offsets, non_blocking=True)
+            self.metadata.kv_cache_block_offsets = self.kv_cache_block_offsets
         self.metadata.mixed_precision_kv_views = None
 
     def materialize(self) -> None:
         from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
 
-        self.pool.zero_()
         if self.read_low.numel():
-            self._gather(self.history, "read_low", self.read_low)
-            self._gather(self.scales, "read_scales", self.read_scales)
+            gather_history(
+                self.history,
+                self.scales,
+                self.page_tables,
+                self.lengths,
+                self.read_low,
+                self.read_scales,
+                self.history_capacity,
+                self.layout,
+            )
             get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
                 self.read_low, self.read_scales, self.history_scale, self.restored_low
             )
-            restored = encode_high_precision_kv(self.restored_low, self.pool.dtype)
-            self._scatter(self.pool, "restore_low", restored)
-        if self.read_high.numel():
-            self._gather(self.high, "read_high", self.read_high)
-            self._scatter(self.pool, "restore_high", self.read_high)
+        restore_view(
+            self.high,
+            self.pool,
+            self.page_tables,
+            self.lengths,
+            self.restored_low,
+            self.history_capacity,
+            self.layout,
+        )
 
     @property
     def dtype(self) -> DataType:
@@ -251,66 +268,6 @@ class MixedPrecisionKVView:
             pin_memory=prefer_pinned(),
         )
 
-    def _locations(
-        self,
-        begins: list[int],
-        ends: list[int],
-        page_tables: tuple[list[list[int]], list[list[int]], list[list[int]]],
-    ) -> torch.Tensor:
-        """Map logical tokens to flat token indices in each native pool."""
-        tables = []
-        for row, (begin, end, history, scales, high) in enumerate(zip(begins, ends, *page_tables)):
-            if end > min(len(history), len(scales)) * self.block_size:
-                raise ValueError("Mixed-precision history does not cover the requested KV length")
-            positions = torch.arange(begin, end)
-            ordinals = positions // self.block_size
-            history_pages = torch.tensor(history, dtype=torch.int64)[ordinals]
-            scale_pages = torch.tensor(scales, dtype=torch.int64)[ordinals]
-            if torch.any(history_pages < 0) or torch.any(scale_pages < 0):
-                raise ValueError(
-                    "Mixed-precision Attention requires existing NVFP4 data and scales"
-                )
-            high_pages = torch.tensor(high + [-1] * (len(history) - len(high)), dtype=torch.int64)
-            offsets = positions % self.block_size
-            tables.append(
-                torch.stack(
-                    (
-                        self.page_starts[row] * self.tokens_per_block + positions,
-                        history_pages * self.block_size + offsets,
-                        scale_pages * self.block_size + offsets,
-                        high_pages[ordinals] * self.block_size + offsets,
-                    )
-                )
-            )
-        table = torch.cat(tables, dim=1) if tables else torch.empty((4, 0), dtype=torch.int64)
-        return table
-
-    def _row_indices(self, pool: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-        """Prepare physical head-row addresses on the host, outside Attention."""
-        token_axis, head_axis = (3, 2) if self.layout == "HND" else (2, 3)
-        kv = torch.arange(pool.shape[1])[None, :, None]
-        head = torch.arange(pool.shape[head_axis])[None, None, :]
-        addresses = (
-            (tokens // pool.shape[token_axis])[:, None, None] * pool.stride(0)
-            + (tokens % pool.shape[token_axis])[:, None, None] * pool.stride(token_axis)
-            + kv * pool.stride(1)
-            + head * pool.stride(head_axis)
-        ) // pool.shape[-1]
-        return addresses.masked_fill(tokens[:, None, None] < 0, -1).flatten()
-
-    @staticmethod
-    def _rows(pool: torch.Tensor) -> torch.Tensor:
-        width = pool.shape[-1]
-        return pool.as_strided((pool.numel() // width, width), (width, 1)).view(torch.uint8)
-
-    def _gather(self, pool: torch.Tensor, name: str, output: torch.Tensor) -> None:
-        torch.index_select(self._rows(pool), 0, self._indices[name], out=output.view(torch.uint8))
-
-    def _scatter(self, pool: torch.Tensor, name: str, values: torch.Tensor) -> None:
-        from .sparse.csa2.kernel import scatter_packed_rows
-
-        scatter_packed_rows(self._rows(pool), self._indices[name], values.view(torch.uint8))
-
     def block_offsets(self) -> torch.Tensor:
         width = (self.max_seq_len + self.tokens_per_block - 1) // self.tokens_per_block
         ordinals = torch.arange(width, dtype=torch.int32)
@@ -321,16 +278,39 @@ class MixedPrecisionKVView:
         return maybe_pin_memory(offsets.masked_fill(~valid[:, None], -1).unsqueeze(0))
 
     def writeback(self) -> None:
-        """Publish only newly computed tokens; never overwrite shared history."""
+        """Write every new token to the primary pool and its retained high page."""
         from flashinfer.quantization.fp4_quantization import get_fp4_kv_quantization_module
 
-        if not self.new_values.numel():
+        if not self.new_low_input.numel():
             return
-        self._gather(self.pool, "read_new", self.new_values)
-        self.new_low_input.copy_(self.new_values)
-        get_fp4_kv_quantization_module().nvfp4_kv_quant(
-            self.new_low_input, self.history_scale, self.new_low, self.new_scales
+        gather_new(
+            self.pool,
+            self.high,
+            self.page_tables,
+            self.lengths,
+            self.cu_new_tokens,
+            self.new_low_input,
+            self.max_new_tokens_per_request,
+            self.layout,
         )
-        self._scatter(self.history, "write_low", self.new_low)
-        self._scatter(self.scales, "write_scales", self.new_scales)
-        self._scatter(self.high, "write_high", self.new_values)
+        if self.pool.dtype == torch.float8_e4m3fn:
+            new_low, new_scales = torch.ops.trtllm.fp4_quantize(
+                self.new_low_input, self.quant_scale, 16, False, False
+            )
+            new_scales = new_scales.view(self.new_low_input.shape[0], -1)
+        else:
+            new_low, new_scales = self.new_low, self.new_scales
+            get_fp4_kv_quantization_module().nvfp4_kv_quant(
+                self.new_low_input, self.history_scale, new_low, new_scales
+            )
+        scatter_new(
+            self.history,
+            self.scales,
+            self.page_tables,
+            self.lengths,
+            self.cu_new_tokens,
+            new_low,
+            new_scales,
+            self.max_new_tokens_per_request,
+            self.layout,
+        )
