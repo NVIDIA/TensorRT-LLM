@@ -6850,6 +6850,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             ):
                 continue
             layer_id = int(layer.layer_id)
+            if self.low_dtype == DataType.NVFP4 and self.head_dim_per_layer[layer_id] % 16:
+                raise ValueError("NVFP4 mixed-precision KV requires head_dim divisible by 16")
             elements_per_page = (
                 self.tokens_per_block
                 * self.num_kv_heads_per_layer[layer_id]
