@@ -481,6 +481,30 @@ def test_no_more_than_max_parallel_workers_run(tmp_path, tmp_git_repo):
     assert workers.max_running == 2
 
 
+def test_free_slots_go_to_the_most_urgent_ready_task_first(tmp_path, tmp_git_repo):
+    # Listed perf first, then feature, then accuracy; one slot.
+    graph = (
+        "  - id: p\n    type: perf\n"
+        "  - id: f\n    type: new_op\n"
+        "  - id: a\n    type: new_op\n    priority: accuracy\n"
+        "  - id: land\n    type: merge\n    kind: merge\n    isolation: shared\n"
+        "    depends_on: [p, f, a]\n"
+    )
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _plan_path(prompt).write_text(_plan_text(graph))
+        else:
+            _finish_when_ready(prompt)
+
+    workers = _Workers()
+    workflow = _workflow(
+        tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=workers), max_parallel=1
+    )
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert workers.order == ["a", "f", "p", "land"]
+
+
 def test_an_invalid_plan_is_sent_back_until_it_validates(tmp_path, tmp_git_repo):
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:

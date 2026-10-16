@@ -87,8 +87,10 @@ A node's `type` is its primary tag; `tags: [...]` adds more. Each tag adds a
 block to the worker's system prompt (`prompts/tags.py`).
 
 A node's optional `priority` (`accuracy` > `feature` > `perf`) is its claim on
-shared GPUs; the orchestrator publishes it in `gpu_priorities.json` for a GPU
-pool to serve. Left out, the first `e2e_accuracy` gate built on a `target`
+worker slots and shared GPUs: a free slot goes to the ready task of the most
+urgent class (plan order breaks ties), and the orchestrator publishes the
+classes in `gpu_priorities.json` for a GPU pool to serve. A running task is
+never stopped to make room. Left out, the first `e2e_accuracy` gate built on a `target`
 task (one with no such gate upstream) and everything upstream of it are
 `accuracy`, other `perf`-tagged tasks are `perf`, and the rest are `feature`. Changing it never re-runs a task.
 

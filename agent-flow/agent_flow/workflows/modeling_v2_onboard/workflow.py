@@ -56,7 +56,7 @@ from .files import (
     read_inbox,
 )
 from .node_runner import Agent, AgentFactory, make_run_task
-from .plan import PlanError, PlanSpec, parse_plan
+from .plan import PRIORITIES, PlanError, PlanSpec, parse_plan
 from .prompts import (
     build_planner_system_prompt,
     initial_plan_prompt,
@@ -292,9 +292,18 @@ class ModelingV2OnboardWorkflow:
         return all(tasks.get(dep) == NodeState.DONE for dep in node.depends_on)
 
     def _ready(self) -> list[Node]:
-        """Tasks that can start now but have no worker yet, resumed ones first."""
+        """Tasks that can start now but have no worker yet.
+
+        Resumed tasks come first, then by priority class, then in plan order.
+        """
         nodes = [n for n in self._plan.graph.nodes if self._startable(n)]
-        return sorted(nodes, key=lambda n: self._state.tasks[n.id] != NodeState.RUNNING)
+        return sorted(
+            nodes,
+            key=lambda n: (
+                self._state.tasks[n.id] != NodeState.RUNNING,
+                PRIORITIES.index(self._plan.priorities[n.id]),
+            ),
+        )
 
     def _dispatch(self) -> None:
         """Start ready tasks until every worker slot is taken."""

@@ -274,13 +274,16 @@ work of kind 1.
 - **Give parallel tasks disjoint edits.** Two tasks rewriting the same part
   of `modeling.py` leave a conflict for their merge task. Give each its own
   entry file and its own call site, and say so in the task sections.
-- **GPUs go to the most urgent work first.** Workers share a pool of GPUs,
-  which serves waiting tasks by `priority`: `accuracy` (everything on the
+- **Slots and GPUs go to the most urgent work first.** A free worker slot
+  goes to the ready task with the most urgent `priority`, and workers share
+  a pool of GPUs, which serves waiting tasks the same way: `accuracy` (everything on the
   way to the first whole-model accuracy result: missing entries, module
   checks, assembling the target, the first gate) before `feature` (further
   capabilities and their checks) before `perf`, and keeps a few GPUs that
   `perf` work may not take. Set each task's `priority` by what it unblocks,
-  not by its tag: a `new_op` the first target needs is `accuracy`.
+  not by its tag: a `new_op` the first target needs is `accuracy`. A running
+  task keeps its slot, so a long `perf` task holds one until it ends; the
+  order of tasks in the graph only breaks ties within a class.
 - **Everything still reaches the final task.** Feature and performance
   branches join the main line through `merge` tasks, and an `e2e_accuracy`
   task on the joined code runs after the last of them, before the final task.
