@@ -15,11 +15,13 @@ from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
     MultimodalEncoderItemMetadata,
+    MultimodalFieldLayout,
     MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
+    select_multimodal_fields,
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
@@ -28,6 +30,78 @@ from tensorrt_llm.inputs.registry import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize("indices", [[2, 0], [1, 1, 0], []])
+def test_field_layout_selects_tensor_item_axis(axis: int, indices: list[int]) -> None:
+    values = torch.arange(9).reshape(3, 3)
+    selected = MultimodalFieldLayout(item_axis=axis).select(values, indices)
+    expected = torch.index_select(values, axis, torch.tensor(indices, dtype=torch.long))
+    torch.testing.assert_close(selected, expected)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("indices", [[2, 0], [1, 2], [1, 1, 0], []])
+def test_field_layout_selects_packed_items_and_preserves_contiguous_views(
+    axis: int, indices: list[int]
+) -> None:
+    values = torch.arange(12).reshape(6, 2)
+    if axis == 1:
+        values = values.T
+    layout = MultimodalFieldLayout(item_axis=axis, item_lengths=(2, 3, 1))
+
+    selected = layout.select(values, indices)
+
+    items = torch.split(values, (2, 3, 1), dim=axis)
+    expected = (
+        torch.cat([items[i] for i in indices], dim=axis) if indices else values.narrow(axis, 0, 0)
+    )
+    torch.testing.assert_close(selected, expected)
+    if indices in ([1, 2], []):
+        assert selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+    else:
+        assert selected.untyped_storage().data_ptr() != values.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("sequence_type", [list, tuple])
+def test_field_layout_selects_item_sequences(sequence_type) -> None:
+    values = sequence_type(["a", "b", "c"])
+    assert MultimodalFieldLayout().select(values, [2, 0]) == sequence_type(["c", "a"])
+
+
+def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -> None:
+    shared = torch.arange(3)
+    unlisted = ["a", "b", "c"]
+    data = {
+        "frames": torch.arange(6).reshape(3, 2),
+        "shared": shared,
+        "other": unlisted,
+        "nullable_mask": None,
+    }
+
+    selected = select_multimodal_fields(
+        data,
+        {
+            "frames": MultimodalFieldLayout(),
+            "shared": MultimodalFieldLayout(item_axis=None),
+            "optional_mask": MultimodalFieldLayout(),
+            "nullable_mask": MultimodalFieldLayout(),
+        },
+        [2, 0],
+    )
+
+    torch.testing.assert_close(selected["frames"], data["frames"][[2, 0]])
+    assert selected["shared"] is shared
+    assert selected["other"] is unlisted
+    assert "optional_mask" not in selected
+    assert selected["nullable_mask"] is None
+    assert data["frames"].shape == (3, 2)
+
+
+def test_packed_field_layout_rejects_inconsistent_lengths() -> None:
+    with pytest.raises(ValueError, match="Packed field size"):
+        MultimodalFieldLayout(item_lengths=(2, 3)).select(torch.zeros(4, 2), [0])
 
 
 def test_media_modalities_match_io_and_validation_contract() -> None:

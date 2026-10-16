@@ -48,7 +48,7 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...inputs.multimodal import MultimodalParams
+from ...inputs.multimodal import MultimodalFieldLayout, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
@@ -959,66 +959,31 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 )
         return partition
 
-    def build_multimodal_encoder_input(
+    def get_multimodal_field_layout(
         self,
         param: MultimodalParams,
-        item_indices: Sequence[int],
-        modality: Optional[str] = None,
-    ) -> MultimodalParams:
-        """Build a Gemma4 image, video, or audio input containing selected items.
-
-        The generic implementation recognizes item-major images through a parallel `image_sizes`
-        field and item-major audio through the `input_features` key. Gemma4 instead provides
-        fixed-size `pixel_values` without `image_sizes`, uses `audio_features`, and flattens the
-        frames of every video into dim 0.
-
-        Partial encoder-cache hits and encoder item scheduling therefore need this override to slice
-        those tensors, together with their per-item position, length, and mask fields.
-        """
-        if modality is None:
-            modality = self._encoder_cache_modality(param)
-        if modality == "video":
-            return self._build_video_encoder_input(param, item_indices)
-        # Delegate unexpected modalities to the generic validation so they fail instead of
-        # returning an incorrectly unsliced input.
+        modality: str,
+    ) -> dict[str, MultimodalFieldLayout] | None:
+        """Declare Gemma4's item-major image and audio fields."""
         if modality not in ("image", "audio"):
-            return super().build_multimodal_encoder_input(param, item_indices, modality=modality)
+            return None
         input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
-
         modality_data = param.multimodal_data[modality]
-        if not isinstance(modality_data, dict):
-            raise TypeError(
-                f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
-            )
-
-        item_count = len(param.multimodal_data.get("multimodal_embedding_lengths") or ())
+        item_refs, _ = param.get_item_layout()
+        item_count = sum(item_modality == modality for item_modality, _ in item_refs)
         input_tensor = modality_data.get(input_key)
-        # Only slice dim 0 after confirming it is the per-item axis declared by the cache metadata.
-        # Let the generic implementation handle any other recognized layout, or reject an
-        # inconsistent Gemma4 payload.
         if (
             not isinstance(input_tensor, torch.Tensor)
             or input_tensor.dim() == 0
             or input_tensor.shape[0] != item_count
         ):
-            return super().build_multimodal_encoder_input(param, item_indices, modality=modality)
-
-        indices = list(item_indices)
-        sliced = {input_key: input_tensor[indices]}
-        sliced = {
-            **modality_data,
-            **sliced,
-            **self._slice_per_item_sibling_fields(
-                modality_data, item_count, indices, sliced.keys()
-            ),
-        }
-        residual_input = (
-            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
+            return None
+        fields = (
+            ("pixel_values", "image_position_ids", "image_seq_lens")
+            if modality == "image"
+            else ("audio_features", "audio_features_mask")
         )
-        return MultimodalParams(
-            multimodal_data={**param.multimodal_data, modality: sliced},
-            multimodal_input=residual_input,
-        )
+        return {name: MultimodalFieldLayout() for name in fields}
 
     @staticmethod
     def _build_video_encoder_input(
