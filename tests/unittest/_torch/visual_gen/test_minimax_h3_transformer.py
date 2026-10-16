@@ -419,6 +419,84 @@ def _reference_rotary_emb(
     )
 
 
+@requires_cuda
+def test_rope_dispatch_compiles_fullgraph():
+    hidden_states = torch.randn((1, 17, 2, 128), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((17, 96), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    compiled = torch.compile(h3.apply_minimax_h3_rotary_emb, fullgraph=True)
+    # Inductor fuses the products and the add into FP32 with one rounding, so the compiled
+    # result differs from the eager reference by BF16 rounding noise only.
+    torch.testing.assert_close(
+        compiled(hidden_states, cos, sin),
+        _reference_rotary_emb(hidden_states, cos, sin),
+        rtol=2**-6,
+        atol=2**-6,
+    )
+
+
+@requires_cuda
+def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
+    """The fused QK-norm + RoPE kernel is selected by the attention instance's flag.
+
+    The same tiny model runs with the flag on (kernel observed) and off (eager norm + RoPE);
+    the kernel computes in FP32 with one rounding where eager rounds at every step, so the
+    outputs agree to BF16 rounding noise rather than bit for bit.
+    """
+    inputs = _model_inputs("cuda")
+    calls = []
+    fused = h3.apply_minimax_h3_qk_norm_rope_bf16
+
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return fused(*args, **kwargs)
+
+    monkeypatch.setattr(h3, "apply_minimax_h3_qk_norm_rope_bf16", tracked)
+    outputs = {}
+    for fuse in (True, False):
+        torch.manual_seed(0)
+        # The kernel needs head_dim 128 and a rotary width that is a multiple of 32
+        # (rope_freq_dim 16 gives the checkpoint's 96), not _TINY_CONFIG's 8 and 6.
+        config = _make_model_config(
+            num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+        )
+        model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
+        _initialize_weights(model, scale=0.1)
+        model.requires_grad_(False)
+        attentions = [m for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
+        assert attentions and all(m.fuse_qk_norm_rope for m in attentions)
+        for attention in attentions:
+            attention.fuse_qk_norm_rope = fuse
+        before = len(calls)
+        with torch.inference_mode():
+            outputs[fuse] = model(**inputs)
+        if fuse:
+            assert len(calls) > before
+        else:
+            assert len(calls) == before
+
+    torch.testing.assert_close(outputs[True].sample, outputs[False].sample, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(
+        outputs[True].audio_sample, outputs[False].audio_sample, rtol=2e-2, atol=2e-3
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
+def test_rope_preserves_autograd_fallback(grad_input):
+    hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((7, 6), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    target = {"hidden_states": hidden_states, "cos": cos, "sin": sin}[grad_input]
+    target.requires_grad_(True)
+    actual = h3.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
+    expected = _reference_rotary_emb(hidden_states, cos, sin)
+    (actual_grad,) = torch.autograd.grad(actual.sum(), target)
+    (expected_grad,) = torch.autograd.grad(expected.sum(), target)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_grad, expected_grad)
+
+
 def _reference_rope(
     module: nn.Module,
     position_ids: torch.Tensor,
