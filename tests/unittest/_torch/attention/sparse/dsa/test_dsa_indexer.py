@@ -25,6 +25,7 @@ This file tests:
 import builtins
 import functools
 import random
+from collections.abc import Callable
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -4755,7 +4756,14 @@ def test_indexer_topk_multi_request_with_different_cache(
         )
 
 
-def _mla_prefill_reuse_case(monkeypatch):
+def _mla_prefill_reuse_case(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> tuple[
+    Callable[[int, Mapping | None], tuple[DSAtrtllmAttentionMetadata, torch.Tensor]],
+    list[int],
+    list[int],
+    int,
+]:
     """Build a reuse-hit MLA chunked-prefill batch; return a runner over it.
 
     Four context requests bring few new tokens each on top of long cached
@@ -4775,6 +4783,7 @@ def _mla_prefill_reuse_case(monkeypatch):
     total_tokens = sum(seq_lens)
 
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4824,7 +4833,9 @@ def _mla_prefill_reuse_case(monkeypatch):
     q_fp8 = q.to(torch.float8_e4m3fn)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
-    def run(elem_budget, mapping=None):
+    def run(
+        elem_budget: int, mapping: Mapping | None
+    ) -> tuple[DSAtrtllmAttentionMetadata, torch.Tensor]:
         monkeypatch.setattr(dsa_indexer, "_INDEXER_PACKED_LOGITS_ELEM_BUDGET", elem_budget)
         metadata = _create_mock_metadata(
             request_ids,
@@ -4853,7 +4864,9 @@ def _mla_prefill_reuse_case(monkeypatch):
 
 
 @skip_pre_hopper
-def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
+def test_indexer_mla_prefill_groups_requests_by_logits_budget(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Grouping reuse-hit requests into separate chunks must not change top-k.
 
     Under MLA chunked prefill, packing every context request into one indexer
@@ -4863,9 +4876,9 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
     splits such batches; each query row still scores only its own request's
     window, so the selected indices must match the packed run.
     """
-    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(monkeypatch)
-    packed_metadata, topk_packed = run(1 << 62)
-    split_metadata, topk_split = run(0)
+    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(request, monkeypatch)
+    packed_metadata, topk_packed = run(1 << 62, None)
+    split_metadata, topk_split = run(0, None)
     packed_chunks = packed_metadata.indexer_prefill_chunks
     split_chunks = split_metadata.indexer_prefill_chunks
 
@@ -4885,7 +4898,9 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
 
 @skip_pre_hopper
 @pytest.mark.parametrize("tp_size", [2, 4])
-def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
+def test_indexer_mla_prefill_tp_split_matches_unsplit(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tp_size: int
+) -> None:
     """Splitting a grouped MLA prefill batch across TP ranks must not change top-k.
 
     Each emulated rank plans chunks for its share of the context queries only,
@@ -4893,13 +4908,13 @@ def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
     rows once. Concatenating the gathered shares must reproduce the top-k of
     the unsplit run.
     """
-    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(monkeypatch)
+    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(request, monkeypatch)
     # Pairs of requests fit the budget. With TP2 the second rank's share holds
     # a cut request followed by two whole ones grouped into one chunk; with TP4
     # every share is too short to hold two whole requests.
     elem_budget = 600 * 8000
     request_bounds = [sum(seq_lens[:i]) for i in range(1, len(seq_lens))]
-    _, topk_unsplit = run(elem_budget)
+    _, topk_unsplit = run(elem_budget, None)
 
     monkeypatch.setattr(dsa_indexer, "_prefill_q_split_threshold", lambda metadata: 1)
     gathered = []
