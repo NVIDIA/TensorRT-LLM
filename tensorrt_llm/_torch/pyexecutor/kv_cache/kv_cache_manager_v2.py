@@ -19,7 +19,6 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
-from functools import cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -3097,29 +3096,6 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
-
-    def _mixed_precision_kv_layouts(
-        self, config: KVCacheManagerConfigPy
-    ) -> dict[int, "MixedPrecisionKVLayout"]:
-        """Describe Attention values, excluding scales, indexers and recurrent state."""
-        layouts = {}
-        for layer in config.layers:
-            if not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None:
-                continue
-            roles = tuple(
-                buffer.role
-                for buffer in layer.buffers
-                if buffer.role in (Role.KEY, Role.VALUE) and buffer.size
-            )
-            if roles:
-                local = int(layer.layer_id)
-                layouts[local] = MixedPrecisionKVLayout(
-                    roles,
-                    self.tokens_per_block,
-                    self.num_kv_heads_per_layer[local],
-                    self.head_dim_per_layer[local],
-                )
-        return layouts
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -6769,17 +6745,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self._sharing._on_reset()
 
 
-class MixedPrecisionKVLayout(NamedTuple):
-    """Unquantized values in one logical block; compressed rows may span several tokens."""
-
-    roles: tuple[DataRole, ...]
-    rows_per_block: int
-    num_heads: int
-    head_dim: int
-
-
 class MixedPrecisionKVCacheManager(KVCacheManagerV2):
-    """Internal eager prototype using existing full-history and SWA lifecycles.
+    """Dense K/V prototype using the existing full-history and SWA lifecycles.
 
     ``first_n`` is the sink length; ``last_n`` counts previously written tokens.
     Counts are block aligned. Both pools use native allocation, migration,
@@ -6788,18 +6755,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
     ``high_low_pool_ratio`` splits each original KV group's byte budget without
     changing the shares assigned to other groups. None keeps native pool sizing.
     """
-
-    @classmethod
-    @cache
-    def for_manager(
-        cls, manager_cls: type[KVCacheManagerV2]
-    ) -> type["MixedPrecisionKVCacheManager"]:
-        """Keep the model's existing manager and add native SWA storage for its KV."""
-        if manager_cls is KVCacheManagerV2:
-            return cls
-        if not issubclass(manager_cls, KVCacheManagerV2):
-            raise TypeError("Mixed precision requires a KVCacheManagerV2 subclass")
-        return type(f"MixedPrecision{manager_cls.__name__}", (cls, manager_cls), {})
 
     def __init__(
         self,
@@ -6827,27 +6782,26 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         ):
             raise ValueError("high_low_pool_ratio must be a finite positive byte ratio")
         self.high_layers: dict[int, int] = {}
-        self.high_layouts: dict[int, MixedPrecisionKVLayout] = {}
         self._staging_bytes = 0
         self._staging_buffer: torch.Tensor | None = None
         self._staging_stream: int | None = None
         super().__init__(*args, dtype=low_dtype, **kwargs)
-        if self.kv_factor == 2:
-            for layer in self.high_layers:
-                key = self.impl.get_mem_pool_base_address(
-                    layer, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
-                )
-                value = self.impl.get_mem_pool_base_address(
-                    layer, Role.VALUE_BLOCK_SCALE, PageIndexMode.SHARED
-                )
-                if key + self.impl.get_page_stride(layer, Role.KEY_BLOCK_SCALE) != value:
-                    raise ValueError("Mixed-precision KV requires adjacent K/V block-scale pages")
+        for layer in self.high_layers:
+            key = self.impl.get_mem_pool_base_address(
+                layer, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+            )
+            value = self.impl.get_mem_pool_base_address(
+                layer, Role.VALUE_BLOCK_SCALE, PageIndexMode.SHARED
+            )
+            if key + self.impl.get_page_stride(layer, Role.KEY_BLOCK_SCALE) != value:
+                raise ValueError("Mixed-precision KV requires adjacent K/V block-scale pages")
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         config = super()._build_cache_config(config)
-        # Model managers can remove empty layers and remap their local indices.
-        # Complete that step before assigning IDs to the extra SWA layers.
+        # Assign extra SWA IDs after the native removal of empty layers.
         config = super()._remove_zero_size_buffers(config)
+        if self.kv_factor != 2:
+            raise NotImplementedError("Mixed precision currently supports dense K/V only")
         if any(n < 0 or n % self.tokens_per_block for n in (self.first_n, self.last_n)):
             raise ValueError("First/Last counts must be nonnegative multiples of tokens_per_block")
         if not (self.first_n or self.last_n):
@@ -6872,15 +6826,22 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         layers = list(config.layers)
         next_id = max(int(layer.layer_id) for layer in layers) + 1
         largest_page = 0
-        self.high_layouts = self._mixed_precision_kv_layouts(config)
-        for layer_id, layout in self.high_layouts.items():
-            elements_per_page = layout.rows_per_block * layout.num_heads * layout.head_dim
+        for layer in config.layers:
+            # Native SWA and recurrent-state pools keep their existing lifecycles.
+            if not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None:
+                continue
+            layer_id = int(layer.layer_id)
+            elements_per_page = (
+                self.tokens_per_block
+                * self.num_kv_heads_per_layer[layer_id]
+                * self.head_dim_per_layer[layer_id]
+            )
             buffers = [
                 BufferConfig(
                     role=role,
                     size=get_size_in_bytes(elements_per_page, self.high_dtype),
                 )
-                for role in layout.roles
+                for role in (Role.KEY, Role.VALUE)
             ]
             self.high_layers[layer_id] = next_id
             layers.append(
@@ -6894,10 +6855,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                 )
             )
             next_id += 1
-            largest_page = max(
-                largest_page,
-                len(layout.roles) * elements_per_page,
-            )
+            largest_page = max(largest_page, 2 * elements_per_page)
 
         if not self.high_layers:
             raise NotImplementedError("This manager has no full-history Attention KV buffers")
@@ -7013,28 +6971,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             )
             buffers.append((view, indices))
         return buffers[0], buffers[1]
-
-    def get_high_precision_rows(
-        self, layer_id: int, role: DataRole, request_ids: list[int]
-    ) -> tuple[torch.Tensor, list[list[int]]]:
-        """Read one KV role using the model's row geometry and native SWA page table."""
-        layout = self.high_layouts[layer_id]
-        high_id = self.high_layers[layer_id]
-        address = self.impl.get_mem_pool_base_address(high_id, role, PageIndexMode.SHARED)
-        shape = [
-            self.impl.get_page_index_upper_bound(high_id, role),
-            layout.rows_per_block,
-            layout.num_heads,
-            layout.head_dim,
-        ]
-        view = convert_to_torch_tensor(TensorWrapper(address, self.high_dtype, shape))
-        indices = self._get_batch_cache_indices_by_pool_id(
-            request_ids,
-            pool_id=int(self.impl.get_layer_group_id(high_id)),
-            index_scale=int(self.impl.get_page_index_converter(high_id, role).scale),
-            is_kv_aggregate=False,
-        )
-        return view, indices
 
     def get_staging_buffer(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
         """Share a bounded Attention workspace between layers on one stream."""

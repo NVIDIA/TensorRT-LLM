@@ -3,13 +3,11 @@
 """Local GPU QA for the unchanged native full-history + SWA reuse contract."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.kv_cache_conversion import encode_high_precision_kv
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     MixedPrecisionKVCacheManager,
@@ -78,28 +76,35 @@ def test_extra_pool_uses_existing_dtype_layout(manager):
 
 
 @pytest.mark.parametrize("manager", ["per_request"], indirect=True)
-def test_recurrent_state_layout_is_unchanged(manager):
-    state = kv.SsmLayerConfig(
-        layer_id=1,
-        buffers=[
-            kv.BufferConfig(role=kv.DataRole("ssm_state"), size=1024),
-            kv.BufferConfig(role=kv.DataRole("conv_state"), size=256),
-        ],
-    )
+@pytest.mark.parametrize(
+    "state",
+    [
+        kv.SsmLayerConfig(
+            layer_id=1,
+            buffers=[
+                kv.BufferConfig(role=kv.DataRole("ssm_state"), size=1024),
+                kv.BufferConfig(role=kv.DataRole("conv_state"), size=256),
+            ],
+        ),
+        kv.AttentionLayerConfig(
+            layer_id=1,
+            buffers=[kv.BufferConfig(role=role, size=1024) for role in (Role.KEY, Role.VALUE)],
+            sliding_window_size=513,
+        ),
+    ],
+    ids=("recurrent", "native_swa"),
+)
+def test_native_state_layout_is_unchanged(manager, state):
     config = manager.kv_cache_manager_py_config
     with patch.object(manager, "high_layers", {}), patch.object(manager, "high_low_pool_ratio", 1):
         configured = manager._build_cache_config(
             replace(config, layers=[config.layers[0], state], initial_pool_ratio=[0.5, 0.5])
         )
         retained = configured.layers[1]
-        assert isinstance(retained, kv.SsmLayerConfig)
-        assert retained.layer_id == state.layer_id
-        assert [(buffer.role, buffer.size) for buffer in retained.buffers] == [
-            (buffer.role, buffer.size) for buffer in state.buffers
-        ]
+        assert retained == state
         assert manager.high_layers == {0: 2}
         assert len(configured.layers) == 3
-        # Original KV:SSM=1:1, then high:low=1:1 within KV, never three equal shares.
+        # Split the full-history KV budget without changing the native state's share.
         assert configured.initial_pool_ratio == pytest.approx([0.25, 0.5, 0.25])
 
 
@@ -186,128 +191,3 @@ def test_short_sequence_uses_high_values_for_every_page(manager):
         assert all(page >= 0 for page in cache.get_base_page_indices(group))
     finally:
         cache.close()
-
-
-@pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
-def test_dsa_manager_layout_and_high_precision_rows(high_dtype):
-    """Exercise native allocation and row selection, not full model inference."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
-    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-
-    kwargs = dict(
-        kv_cache_config=KvCacheConfig(
-            max_gpu_total_bytes=128 << 20,
-            host_cache_size=0,
-            enable_block_reuse=True,
-            enable_swa_scratch_reuse=False,
-            block_reuse_config={"policy": "per_request"},
-        ),
-        kv_cache_type=CacheType.SELFKONLY,
-        num_kv_heads=1,
-        tokens_per_block=128,
-        max_seq_len=1024,
-        max_batch_size=2,
-        max_num_tokens=1024,
-        mapping=Mapping(),
-        num_layers=1,
-        head_dim=576,
-        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
-        pretrained_config=SimpleNamespace(qk_rope_head_dim=64, num_hidden_layers=1),
-    )
-
-    def layout(layers):
-        return [
-            (
-                int(layer.layer_id),
-                [(buffer.role, buffer.size, buffer.is_sparse) for buffer in layer.buffers],
-                layer.sliding_window_size,
-                layer.num_sink_tokens,
-                layer.reuse_policy,
-            )
-            for layer in layers
-        ]
-
-    reference = DSACacheManagerV2(dtype=DataType.NVFP4, **kwargs)
-    try:
-        original = layout(reference.kv_cache_manager_py_config.layers)
-    finally:
-        reference.shutdown()
-
-    mixed_cls = MixedPrecisionKVCacheManager.for_manager(DSACacheManagerV2)
-    manager = mixed_cls(
-        dtype=high_dtype,
-        low_dtype=DataType.NVFP4,
-        compute_dtype=torch.bfloat16,
-        first_n=128,
-        last_n=128,
-        **kwargs,
-    )
-
-    def row_locations(layer_id, role, rows):
-        pool, tables = manager.get_high_precision_rows(layer_id, role, [0])
-        blocks = rows // pool.shape[1]
-        pages = torch.tensor(tables[0], device="cuda")[blocks.clamp(0, len(tables[0]) - 1)]
-        valid = (rows >= 0) & (blocks < len(tables[0])) & (pages >= 0)
-        return pool, pages, rows % pool.shape[1], valid
-
-    cache = None
-    try:
-        assert isinstance(manager, DSACacheManagerV2)
-        assert mixed_cls.prepare_context_cache is DSACacheManagerV2.prepare_context_cache
-        configured = manager.kv_cache_manager_py_config.layers
-        assert layout(configured[: len(original)]) == original
-        assert len(manager.high_layouts) == 1
-        cache = manager.impl.create_kv_cache(None, [])
-        assert cache.resume(torch.cuda.current_stream().cuda_stream) and cache.resize(640)
-        manager.kv_cache_map[0] = cache
-        written = []
-        for layer_id, spec in manager.high_layouts.items():
-            assert spec.roles == (Role.KEY,)
-            assert spec.rows_per_block == 128
-            assert spec.head_dim == 576
-            high_id = manager.high_layers[layer_id]
-            high = configured[high_id]
-            assert high.reuse_policy == kv.AttentionReusePolicy.REQUIRED
-            assert high.num_sink_tokens == 128 and high.sliding_window_size == 129
-            for buffer in high.buffers:
-                assert buffer.size == get_size_in_bytes(
-                    spec.rows_per_block * spec.num_heads * spec.head_dim, high_dtype
-                )
-                pool, tables = manager.get_high_precision_rows(layer_id, buffer.role, [0])
-                assert pool.shape[1:] == (spec.rows_per_block, spec.num_heads, spec.head_dim)
-                assert len(tables[0]) == 5
-                assert all(0 <= index < pool.shape[0] for index in tables[0])
-                count = 5 * spec.rows_per_block
-                rows = torch.arange(count + 2, device="cuda")
-                rows[-2:] = -1  # Padded compressor/index rows must never access a page.
-                values = (
-                    (torch.arange(rows.numel() * spec.head_dim, device="cuda") % 31 / 4)
-                    .to(torch.bfloat16)
-                    .view(-1, 1, spec.head_dim)
-                )
-                pool, pages, offsets, valid = row_locations(layer_id, buffer.role, rows)
-                encoded = encode_high_precision_kv(values[valid], pool.dtype)
-                pool.view(torch.uint8)[pages[valid], offsets[valid]] = encoded.view(torch.uint8)
-                written.append((layer_id, buffer.role, rows, values))
-
-        cache.commit(list(range(640)))
-        cache.suspend()
-        assert cache.resume(torch.cuda.current_stream().cuda_stream, is_decoding=True)
-        for layer_id, role, rows, values in written:
-            pool, pages, offsets, valid = row_locations(layer_id, role, rows)
-            output = torch.full_like(values, -1)
-            output[valid] = (
-                pool.view(torch.uint8)[pages[valid], offsets[valid]]
-                .view(pool.dtype)
-                .to(output.dtype)
-            )
-            block_rows = manager.high_layouts[layer_id].rows_per_block
-            retained = (rows >= 0) & ((rows < block_rows) | (rows >= 4 * block_rows))
-            expected = torch.full_like(values, -1)
-            expected[retained] = values[retained].to(pool.dtype).to(values.dtype)
-            torch.testing.assert_close(output, expected, atol=0, rtol=0)
-    finally:
-        manager.kv_cache_map.pop(0, None)
-        if cache is not None:
-            cache.close()
-        manager.shutdown()
