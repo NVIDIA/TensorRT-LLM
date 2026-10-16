@@ -1497,7 +1497,8 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
         setattr(config.visual_gen_mapping, field, value)
         if field != "ulysses_size":
             config.visual_gen_mapping.world_size *= value
-    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+    expected_error = "DiT tensor parallelism" if field == "tp_size" else "pure Ulysses"
+    with pytest.raises(NotImplementedError, match=expected_error):
         MiniMaxH3Pipeline(config)
 
 
