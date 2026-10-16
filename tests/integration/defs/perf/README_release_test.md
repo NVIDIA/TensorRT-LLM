@@ -106,7 +106,6 @@ if self._config.backend == "pytorch":
 
 1. **llm_perf_core.yml** - Release performance test; the former `llm_perf_full.yml`, `llm_perf_cluster.yml` and `llm_perf_sanity.yml` were merged into it
    - [test_lists/qa/llm_perf_core.yml](../../test_lists/qa/llm_perf_core.yml)
-   - [Single-node model priorities and replacement decisions](README_model_priorities.md)
 2. **llm_perf_disagg.yml** - Disaggregated serving performance test
    - [test_lists/qa/llm_perf_disagg.yml](../../test_lists/qa/llm_perf_disagg.yml)
 3. **llm_perf_multinode.yml** - Multi-node performance test
