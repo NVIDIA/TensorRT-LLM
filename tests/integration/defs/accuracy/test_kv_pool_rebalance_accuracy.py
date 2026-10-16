@@ -23,7 +23,11 @@ Run as:
       tests/integration/defs/accuracy/test_kv_pool_rebalance_accuracy.py
 """
 
+import threading
+
 import pytest
+import torch._inductor.config as inductor_config
+from torch._inductor.async_compile import shutdown_compile_workers
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
@@ -57,6 +61,22 @@ def _inject_pool_ratio_mismatch(llm: LLM, *, skew: float = 2.0) -> None:
     executor._rebalance_check_interval = 1
     kv_cache_manager = executor.kv_cache_manager
     _introspection.force_rebalance_precondition(kv_cache_manager.impl, skew=skew)
+
+
+def _shutdown_inductor_compile_workers() -> None:
+    """Stop Inductor's compile-worker pool and wait for its threads to exit.
+
+    The sampler's logprob fusions are ``torch.compile``d, so the first request
+    with ``logprobs`` lazily starts Inductor's process-global compile pool.
+    With the PyExecutor in-process, that pool's daemon threads would otherwise
+    outlive the test and trip the integration suite's thread-leak check.
+    """
+    shutdown_compile_workers()
+    # The pool's health monitor and quiesce timer only notice the shutdown at
+    # their next poll; the timer polls every quiesce_async_compile_time / 2.
+    for thread in threading.enumerate():
+        if thread.name.startswith("InductorSubproc") or thread.name == "subproc_worker_timer":
+            thread.join(timeout=inductor_config.quiesce_async_compile_time)
 
 
 # --------------------------------------------------------------------------- #
@@ -232,13 +252,18 @@ class TestKvPoolRebalanceAccuracy:
         # can reach .engine on the client side.
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
-        baseline = _generate_tokens(
-            model_path=self.MODEL_PATH, disable_overlap=disable_overlap, enable_rebalance=False
-        )
+        # pytest-threadleak checks before fixture teardown, so the compile pool
+        # has to be shut down inside the test body.
+        try:
+            baseline = _generate_tokens(
+                model_path=self.MODEL_PATH, disable_overlap=disable_overlap, enable_rebalance=False
+            )
 
-        treated = _generate_tokens(
-            model_path=self.MODEL_PATH, disable_overlap=disable_overlap, enable_rebalance=True
-        )
+            treated = _generate_tokens(
+                model_path=self.MODEL_PATH, disable_overlap=disable_overlap, enable_rebalance=True
+            )
+        finally:
+            _shutdown_inductor_compile_workers()
 
         assert len(baseline) == len(treated) == len(_PROMPTS)
         for i, (b, t) in enumerate(zip(baseline, treated)):
