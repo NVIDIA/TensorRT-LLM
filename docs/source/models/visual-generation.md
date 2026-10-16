@@ -405,6 +405,54 @@ SLURM, launch the VisualGen rank group with `srun --kill-on-bad-exit=1`; without
 this option, surviving ranks can continue running and retain GPU memory after a
 peer or the coordinator exits.
 
+## Experimental Features
+
+### Sleep/Wake for VisualGen Models (currently supported for MiniMax H3)
+
+Sleep/wake lets a worker switch between large checkpoints on one GPU without
+keeping every model's weights on the device or repeatedly loading checkpoints
+from disk. An idle MiniMax-H3 pipeline backs its persistent GPU allocations in
+host RAM and releases their GPU memory. Wake restores them at their original
+addresses without reloading or requantizing the checkpoint.
+
+This feature is disabled by default and available only through the internal,
+single-GPU H3 pipeline. Support for other VisualGen models may be added in the
+future. It is not exposed through public `VisualGen`, HTTP, or Dynamo controls.
+Enable it explicitly during loading:
+
+```python
+pipeline = PipelineLoader(args).load(sleep_restore_mode="PINNED")
+pipeline.sleep()
+pipeline.wake_up()
+```
+
+`CPU` uses pageable host backing; `PINNED` uses pinned host backing. Host backups
+remain allocated after wake and are reused on later sleeps. Budget host RAM for
+each instance's captured allocation pool, which can include cached loading and
+quantization buffers in addition to weights. This is process-local offload:
+the process, CUDA context, host memory, and node must remain alive.
+
+Sleep rejects new generation and waits for the active call to finish before
+releasing memory. Sleep/wake transitions are serialized per instance; overlapping
+generation calls are rejected rather than queued. A failed transition prevents
+further generation and requires restarting the worker. Callers manage external
+request queues and must not access model tensors directly during transitions.
+Warmup and inference allocations are outside the captured pool; live outputs and
+the CUDA context remain on the GPU, so sleep does not reduce GPU usage to zero.
+
+Sleep/wake requires `world_size=1`. H3 already rejects CUDA graphs, CPU stage
+offload, and cache acceleration; sleep additionally rejects runtime LoRA because
+that combination has not been validated. Other pipelines retain their ordinary
+loading behavior and reject explicit sleep requests unless they implement the
+internal loading hook and generation coordination.
+
+Validation covers lifecycle and allocator regressions, unchanged default loading
+for tiny Wan/FLUX checkpoints, and checkpoint-backed H3 restoration of video,
+audio, and parameter addresses. Full-model sleep coverage is FP8 text-to-video/audio
+with pinned backing; keyframe-conditioned, Ref2VA, and non-FP8 sleep configurations remain
+unvalidated. The checkpoint-backed regression is
+`tests/integration/defs/visual_gen/test_minimax_h3_sleep.py`.
+
 ## Developer Guide
 
 ### Architecture Overview
