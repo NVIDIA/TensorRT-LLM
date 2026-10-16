@@ -2624,11 +2624,8 @@ class DisaggTestCmds(NamedTuple):
     def _hostnames_dir(self, server_idx: int) -> str:
         """Directory the disagg tasks exchange bound addresses through.
 
-        Scoped by SLURM job id so a rerun never reads the previous run's files:
-        test_output_dir is derived from the test case name alone and is created
-        with exist_ok=True, so it is reused across runs. The step id is
-        deliberately excluded -- each role runs as a separate srun step within
-        one job, and they must all agree on this path.
+        Reused across runs; slurm_launch_draft.sh clears it before each attempt.
+        The step id is excluded so all roles (separate srun steps) agree on it.
         """
         run_id = os.environ.get("SLURM_JOB_ID", "local")
         return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
@@ -3091,11 +3088,7 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
-                # _hostnames_dir is scoped by job, so a new job never sees an
-                # older one's files, but a retry within the same job and the
-                # same server_idx would. Drop the previous attempt's address
-                # first, or the BENCHMARK task connects to a dead port. This
-                # task owns the file exclusively, so removing it here is safe.
+                # Drop a stale address from a retry so BENCHMARK never sees a dead port.
                 disagg_addr_path = self._disagg_server_addr_file(server_idx)
                 if os.path.exists(disagg_addr_path):
                     os.remove(disagg_addr_path)
