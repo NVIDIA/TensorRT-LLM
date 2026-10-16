@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 from unittest.mock import AsyncMock
 
@@ -1330,6 +1332,9 @@ class TestFirstGenLogitsSerializeRoundtrip:
 def generation_first_stream_service():
     service = _make_service("generation_first")
     service._ctx_client = AsyncMock()
+    service._ctx_client.send_request.return_value = _make_completion_response(
+        "", finish_reason="length"
+    )
     service._gen_client = AsyncMock()
     service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
     service._check_gen_only_disagg = AsyncMock(return_value=False)
@@ -1432,3 +1437,188 @@ async def test_gen_first_close_after_chunk_closes_running_stream(generation_firs
     await response.aclose()
 
     assert gen_closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize("failed_role", ["ctx", "gen"])
+async def test_gen_first_failure_drains_nonstream_sibling(
+    generation_first_stream_service: OpenAIDisaggregatedService,
+    error_type: type[BaseException],
+    failed_role: str,
+) -> None:
+    """Either leg failing must promptly close the other pending HTTP request."""
+    service = generation_first_stream_service
+    sibling_started, sibling_closed = asyncio.Event(), asyncio.Event()
+    sibling_tasks = []
+    error = error_type("worker interrupted")
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        await sibling_started.wait()
+        raise error
+
+    async def pending(*args: Any, **kwargs: Any) -> None:
+        sibling_tasks.append(asyncio.current_task())
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_closed.set()
+
+    clients = {"ctx": service._ctx_client, "gen": service._gen_client}
+    clients[failed_role].send_request.side_effect = fail
+    clients["gen" if failed_role == "ctx" else "ctx"].send_request.side_effect = pending
+    try:
+        with pytest.raises(error_type) as raised:
+            await asyncio.wait_for(
+                service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello")),
+                timeout=2,
+            )
+        assert raised.value is error
+        assert sibling_closed.is_set()
+        assert all(task.done() for task in sibling_tasks)
+    finally:
+        for task in sibling_tasks:
+            task.cancel()
+        await asyncio.gather(*sibling_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gen_finishes_first", [False, True])
+async def test_gen_first_cancelled_context_is_terminal_nonstream(
+    generation_first_stream_service: OpenAIDisaggregatedService, gen_finishes_first: bool
+) -> None:
+    """A returned CTX cancellation must not wait for or report paired GEN success."""
+    service = generation_first_stream_service
+    gen_started, gen_closed = asyncio.Event(), asyncio.Event()
+    cancelled = _make_completion_response("", finish_reason="cancelled")
+    gen_response = _make_completion_response("gen", finish_reason="stop")
+    hooks = mock.Mock()
+
+    async def gen(*args: Any, **kwargs: Any) -> CompletionResponse:
+        gen_started.set()
+        try:
+            if not gen_finishes_first:
+                await asyncio.Event().wait()
+            hooks.on_resp_done("gen:9000", args[0], gen_response)
+            return gen_response
+        finally:
+            gen_closed.set()
+
+    async def ctx(*args: Any, **kwargs: Any) -> CompletionResponse:
+        await gen_started.wait()
+        return cancelled
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.side_effect = gen
+    request = CompletionRequest(model="test-model", prompt="hello")
+    response = await asyncio.wait_for(service._send_disagg_request(request, hooks), timeout=2)
+
+    assert response is cancelled
+    assert response.choices[0].finish_reason == "cancelled"
+    assert "disaggregated_params" not in response.choices[0].model_dump()
+    assert gen_closed.is_set()
+    if gen_finishes_first:
+        hooks.on_resp_done.assert_called_once_with("gen:9000", request, gen_response)
+    else:
+        hooks.on_resp_done.assert_not_called()
+    service._gen_router.finish_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gen_started_first", [False, True])
+async def test_gen_first_cancelled_context_closes_stream(
+    generation_first_stream_service: OpenAIDisaggregatedService, gen_started_first: bool
+) -> None:
+    """Do not expose buffered GEN chunks after CTX returns cancellation."""
+    service = generation_first_stream_service
+    gen_started, gen_closed = asyncio.Event(), asyncio.Event()
+    cancelled = _make_completion_response("", finish_reason="cancelled")
+    hooks = mock.Mock()
+
+    async def chunks() -> AsyncGenerator[bytes, None]:
+        try:
+            gen_started.set()
+            yield b'data: "must not escape"\n\n'
+            await asyncio.Event().wait()
+        finally:
+            gen_closed.set()
+
+    async def ctx(*args: Any, **kwargs: Any) -> CompletionResponse:
+        if gen_started_first:
+            await gen_started.wait()
+        return cancelled
+
+    gen_response = chunks() if gen_started_first else AsyncMock()
+    if not gen_started_first:
+        gen_response.__aiter__.side_effect = AssertionError("GEN must not start")
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.return_value = gen_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    response = await asyncio.wait_for(service._send_disagg_request(request, hooks), timeout=2)
+    try:
+        assert await asyncio.wait_for(response.__anext__(), timeout=2) == b"data: [DONE]\n\n"
+        with pytest.raises(StopAsyncIteration):
+            await response.__anext__()
+    finally:
+        await response.aclose()
+    if gen_started_first:
+        assert gen_closed.is_set()
+    else:
+        gen_response.__aiter__.assert_not_called()
+        gen_response.aclose.assert_awaited_once_with()
+    hooks.on_resp_done.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_caller_cancellation_drains_both_nonstream_requests(
+    generation_first_stream_service: OpenAIDisaggregatedService,
+) -> None:
+    """Caller cancellation cannot leave either worker HTTP task behind."""
+    service = generation_first_stream_service
+    started = [asyncio.Event(), asyncio.Event()]
+    closed = [asyncio.Event(), asyncio.Event()]
+
+    async def pending(index: int) -> None:
+        started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed[index].set()
+
+    async def ctx(*args: Any, **kwargs: Any) -> None:
+        await pending(0)
+
+    async def gen(*args: Any, **kwargs: Any) -> None:
+        await pending(1)
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.side_effect = gen
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+    )
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), timeout=2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    assert all(event.is_set() for event in closed)
+
+
+@pytest.mark.asyncio
+async def test_gen_only_stream_keeps_caller_ownership(
+    generation_first_stream_service: OpenAIDisaggregatedService,
+) -> None:
+    """GEN-only requests keep their lazy stream and do not acquire a CTX task."""
+    service = generation_first_stream_service
+    service._check_gen_only_disagg.return_value = True
+    gen_response = AsyncMock()
+    service._gen_client.send_request.return_value = gen_response
+    response = await service._send_disagg_request(
+        CompletionRequest(model="test-model", prompt="hello", stream=True)
+    )
+    assert response is gen_response
+    service._ctx_client.send_request.assert_not_awaited()
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_not_awaited()
