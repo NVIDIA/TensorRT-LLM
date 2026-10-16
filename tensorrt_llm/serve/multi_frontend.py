@@ -56,7 +56,27 @@ FORWARDED_ROUTES = (
     ("DELETE", "/v1/messages/batches/{rest:path}"),
 )
 
-_FORWARDED_REQUEST_HEADERS = ("content-type", "accept", "authorization")
+# Request headers not replayed to the launcher: hop-by-hop headers (RFC 9110,
+# section 7.6.1) and the framing/encoding headers aiohttp manages itself for
+# the replayed request (the body it hands back is already decoded). Everything
+# else arrives as the client sent it: x-trtllm-msgpack selects the body codec,
+# and auth headers feed the --middleware the launcher runs again.
+_NOT_FORWARDED_REQUEST_HEADERS = frozenset(
+    (
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "expect",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -100,9 +120,11 @@ class LauncherForwarder:
         target = request.url.path
         if request.url.query:
             target = f"{target}?{request.url.query}"
-        headers = {
-            k: v for k, v in request.headers.items() if k.lower() in _FORWARDED_REQUEST_HEADERS
-        }
+        headers = [
+            (k, v)
+            for k, v in request.headers.items()
+            if k.lower() not in _NOT_FORWARDED_REQUEST_HEADERS
+        ]
         body = await request.body()
         try:
             session = await self._get_session()
@@ -178,6 +200,12 @@ class AttachedFrontendWatchdog:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
+        # The launcher builds its own server, and starts listening, only after
+        # every attached frontend reported ready, so /health failures count
+        # only once it has answered. A launcher that dies before that is
+        # caught by the parent check, and one that fails its startup
+        # terminates its attached frontends itself.
+        launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:
             await asyncio.sleep(self._ppid_interval)
@@ -189,7 +217,10 @@ class AttachedFrontendWatchdog:
             next_health = loop.time() + self._health_interval
             status = await self._forwarder.get_status("/health")
             if status == 200:
+                launcher_answered = True
                 failures = 0
+                continue
+            if not launcher_answered:
                 continue
             failures += 1
             if failures >= self._health_failures:

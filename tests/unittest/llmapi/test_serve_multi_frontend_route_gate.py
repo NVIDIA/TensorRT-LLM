@@ -73,10 +73,20 @@ PER_FRONTEND_SAFE = {
         "/steady_clock_offset",
     ): "known limitation: calibrates the answering frontend only (documented)",
     # RL control requires AsyncLLM, which is not the classic IPC executor path
-    # multi-frontend mode runs on; the two never coexist.
-    ("POST", "/release_memory"): "AsyncLLM-only; never registered together with attached frontends",
-    ("POST", "/resume_memory"): "AsyncLLM-only; never registered together with attached frontends",
+    # multi-frontend mode runs on, and runtime control (--enable_sleep_mode)
+    # requires num_serve_frontends=1; neither coexists with attached frontends.
+    (
+        "POST",
+        "/release_memory",
+    ): "RL / runtime control only; never coexists with attached frontends",
+    ("POST", "/resume_memory"): "RL / runtime control only; never coexists with attached frontends",
     ("POST", "/update_weights"): "AsyncLLM-only; never registered together with attached frontends",
+    ("GET", "/memory_status"): "runtime control requires num_serve_frontends=1",
+    # FastAPI's generated schema and docs pages: static, identical everywhere.
+    ("GET", "/openapi.json"): "generated from the route table, identical in every frontend",
+    ("GET", "/docs"): "static page over /openapi.json",
+    ("GET", "/docs/oauth2-redirect"): "static page",
+    ("GET", "/redoc"): "static page over /openapi.json",
 }
 
 
@@ -89,7 +99,10 @@ def _llm_server_routes() -> list[tuple[str, str]]:
         args=SimpleNamespace(return_perf_metrics=False),
     )
     server.use_harmony = False
+    # Mutually exclusive in OpenAIServer.__init__; enabling both here only
+    # enumerates every route either of them adds.
     server._enable_rl_control_endpoints = True
+    server._enable_runtime_control_endpoints = True
     server.resource_governor = None
     server.register_routes()
     return sorted(
@@ -101,13 +114,15 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     )
 
 
-def _forwarding_app() -> FastAPI:
-    app = FastAPI()
+async def _stub():
+    return {}
 
-    async def _stub():
-        return {}
 
-    for method, path in FORWARDED_ROUTES:
+def _forwarding_app(routes=FORWARDED_ROUTES) -> FastAPI:
+    # Without FastAPI's generated /docs, /openapi.json, ... routes, which would
+    # otherwise "match" the same routes of the server under test.
+    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    for method, path in routes:
         app.add_api_route(path, _stub, methods=[method])
     return app
 
@@ -147,17 +162,9 @@ def test_every_llm_route_is_classified() -> None:
 def test_every_forwarded_route_exists() -> None:
     """A renamed route must not leave a dangling forwarding template."""
     registered = _llm_server_routes()
-    reg_app = FastAPI()
-
-    async def _stub():
-        return {}
-
-    for method, path in registered:
-        reg_app.add_api_route(path, _stub, methods=[method])
     for method, template in FORWARDED_ROUTES:
-        probe = template.replace("{rest:path}", "x/cancel")
-        scope = {"type": "http", "method": method, "path": probe, "path_params": {}}
-        assert any(route.matches(scope)[0] == Match.FULL for route in reg_app.routes), (
+        app = _forwarding_app([(method, template)])
+        assert any(_is_forwarded(app, m, path) for m, path in registered), (
             f"FORWARDED_ROUTES entry {method} {template} matches no registered route"
         )
 
