@@ -3635,8 +3635,9 @@ class OpenAIServer(_VideoRoutesMixin):
         render_fingerprint = getattr(self, "_render_fingerprint", None)
         if render_fingerprint is None:
             try:
-                render_fingerprint = RenderResources.from_server(
-                    self).fingerprint()
+                # Hashing the vocabulary takes a moment; keep the event loop free.
+                render_fingerprint = await asyncio.to_thread(
+                    lambda: RenderResources.from_server(self).fingerprint())
                 self._render_fingerprint = render_fingerprint
             except Exception:
                 logger.warning("Could not compute the rendering fingerprint:\n"

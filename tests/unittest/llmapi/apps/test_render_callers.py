@@ -430,6 +430,36 @@ class TestCoordinatorFrontendWriteBack:
         assert request.prompt_token_ids is None
 
 
+class TestServerInfoFingerprint:
+    @pytest.mark.asyncio
+    async def test_the_first_call_hashes_off_the_event_loop(self, monkeypatch) -> None:
+        import asyncio
+        import json
+
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        where = []
+
+        class Resources:
+            def fingerprint(self):
+                try:
+                    asyncio.get_running_loop()
+                    where.append("event loop")
+                except RuntimeError:
+                    where.append("worker thread")
+                return {"digest": "d"}
+
+        monkeypatch.setattr(RenderResources, "from_server", classmethod(lambda cls, s: Resources()))
+        server = object.__new__(OpenAIServer)
+        server.generator = SimpleNamespace(disaggregated_params=None, args=None)
+
+        first = json.loads((await server.get_server_info()).body)
+        second = json.loads((await server.get_server_info()).body)
+
+        assert first["render_fingerprint"] == second["render_fingerprint"] == {"digest": "d"}
+        assert where == ["worker thread"]  # computed once, then cached
+
+
 class TestCountTokens:
     def _client(self, tokenizer, chat_template=None, use_harmony=False):
         from fastapi import FastAPI
