@@ -140,7 +140,9 @@ class BaseWorker(GenerationExecutor):
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         # Maps adapter ID to (canonical path, checkpoint source).
         self._lora_adapter_identities: dict[str, tuple[str, str]] = {}
-        self._lora_adapter_lock = Lock()
+        # Weak values avoid retaining locks for failed, one-off adapter IDs.
+        self._lora_adapter_locks = weakref.WeakValueDictionary()
+        self._lora_adapter_locks_lock = Lock()
         self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
@@ -331,16 +333,32 @@ class BaseWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
         """Returns True if the adapter was loaded by this call, False if it was already loaded"""
         adapter_id = str(lora_request.adapter_id)
-        with self._lora_adapter_lock:
-            identity = (str(Path(lora_request.path).resolve())
-                        if lora_request.path else "", lora_request.ckpt_source)
+        with self._lora_adapter_locks_lock:
+            adapter_lock = self._lora_adapter_locks.get(adapter_id)
+            if adapter_lock is None:
+                adapter_lock = Lock()
+                self._lora_adapter_locks[adapter_id] = adapter_lock
+
+        with adapter_lock:
+            previous = self._lora_adapter_identities.get(adapter_id)
+            identity = (lora_request.path, lora_request.ckpt_source)
             # An empty path retains the trusted API's ID-only cache lookup.
             if lora_request.path:
-                previous = self._lora_adapter_identities.get(adapter_id)
+                same_source = (previous is not None
+                               and previous[1] == lora_request.ckpt_source)
+                if previous is None or (same_source and previous != identity):
+                    # Preserve path-alias support while avoiding filesystem
+                    # access for the common exact-identity reuse case.
+                    identity = (str(Path(lora_request.path).resolve()),
+                                lora_request.ckpt_source)
                 if previous is not None and previous != identity:
+                    logger.warning(
+                        "Rejecting conflicting LoRA adapter identity for ID %s: "
+                        "existing=%r, requested=%r", adapter_id, previous,
+                        identity)
                     raise ValueError(
-                        "LoRA adapter ID is already bound to a different "
-                        "path or checkpoint source; use a new ID.")
+                        f"LoRA adapter ID {adapter_id} is already bound to a "
+                        "different path or checkpoint source; use a new ID.")
             loaded = False
             try:
                 newly_loaded_uids = self._lora_manager.load_from_ckpt(
