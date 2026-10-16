@@ -1337,6 +1337,7 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._retired_rids = {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
@@ -1659,6 +1660,100 @@ def test_late_request_data_to_terminal_sender_settles_aux(
         sender._save_peer_req_info.assert_not_called()
     session._claim_unsubmitted_aux_failures_locked.assert_called_once_with((info,))
     sender._send_failed_result_to_receiver.assert_called_once_with(info, include_aux=True)
+
+
+def _make_sender_with_cleared_session(rid: int) -> transfer_mod.Sender:
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
+    sender._sessions_lock, sender._sessions = threading.Lock(), {rid: object()}
+    sender._retired_rids = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests, sender._peer_requests_timestamps = {}, {}
+    sender._save_peer_req_info = Mock()
+    sender._send_failed_result_to_receiver = Mock()
+    sender.clear_session(rid)
+    return sender
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("retried", [False, True])
+def test_request_data_for_a_cleared_session_is_failed_not_parked(retried: bool) -> None:
+    """A REQUEST_DATA for an already cleared session is answered FAILED.
+
+    The context side can clear its session (e.g. its transfer timed out while
+    the request waited in the generation queue) before the peer asks. Parking
+    that REQUEST_DATA as an early generation-first request leaves the peer's
+    receive TRANSFERRING forever, pinning its KV pages and batch slot
+    (nvbugs/6621362). A retried generation request carries a fresh unique_rid
+    but still names the context session by sender_req_id.
+    """
+    rid = 109
+    sender = _make_sender_with_cleared_session(rid)
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid + 1000 if retried else rid,
+        slice_id=0,
+    )
+
+    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+
+    sender._save_peer_req_info.assert_not_called()
+    sender._send_failed_result_to_receiver.assert_called_once_with(info)
+
+
+@pytest.mark.cpu_only
+def test_request_data_for_a_session_not_yet_created_is_still_parked() -> None:
+    """An early generation-first REQUEST_DATA is still parked.
+
+    Generation-first peers ask before the context session exists; that
+    REQUEST_DATA must keep being saved for setup_session to pick up.
+    """
+    sender = _make_sender_with_cleared_session(109)
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=110,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=110,
+    )
+
+    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+
+    sender._save_peer_req_info.assert_called_once_with(info)
+    sender._send_failed_result_to_receiver.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_asked", [False, True])
+def test_context_send_waits_for_peer_until_every_peer_rank_asked(peer_asked: bool) -> None:
+    rid = 111
+    asked = Mock(return_value=peer_asked)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._transfer_worker = SimpleNamespace(has_all_peer_req_infos_for_send=asked)
+    request = SimpleNamespace(
+        py_request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+    )
+
+    assert transceiver.context_transfer_is_waiting_for_peer(request) is not peer_asked
+    asked.assert_called_once_with(rid)
+
+
+@pytest.mark.cpu_only
+def test_cleared_session_marker_expires(monkeypatch) -> None:
+    sender = _make_sender_with_cleared_session(109)
+    assert set(sender._retired_rids) == {109}
+    now = transfer_mod.time.monotonic()
+    monkeypatch.setattr(
+        transfer_mod.time, "monotonic", lambda: now + transfer_mod.Sender._RETIRED_SESSION_TTL_S + 1
+    )
+
+    sender.sweep_stale_req_infos()
+
+    assert sender._retired_rids == {}
 
 
 @pytest.mark.cpu_only

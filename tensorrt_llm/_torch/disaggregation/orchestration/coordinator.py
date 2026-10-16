@@ -31,6 +31,13 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
+# How long, in multiples of kv_transfer_timeout_ms, a context send may wait for
+# its generation peer to ask for the data before its transfer clock starts
+# counting regardless. The peer's request can queue behind a full generation
+# batch for a while, but a peer that never asks must stay reclaimable.
+_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER = 3
+
+
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
     return os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
@@ -228,6 +235,8 @@ class DisaggTransferCoordinator:
             return
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
+        if not self.inflight_cancel_active():
+            self._cancel_stalled_gen_receives()
         # Gen-transfer status performs cross-rank consensus internally. Enter
         # it symmetrically; ranks with no ready local future contribute an
         # empty ready set.
@@ -268,12 +277,36 @@ class DisaggTransferCoordinator:
 
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
-        # context side.
+        # context side. While the peer has not asked for the data yet, the
+        # clock is moved along so it measures the transfer, not the peer's
+        # queueing delay.
+        now = time.monotonic()
         for req in self._transfers.requests_in_transfer().values():
+            if self._context_send_awaits_peer(req, now, timeout_ms):
+                req.py_kv_transfer_start_time = now
+                continue
             flag_if_timed_out(req, "context")
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_timed_out(req, "generation")
+
+    def _context_send_awaits_peer(self, req: LlmRequest, now: float, timeout_ms: int) -> bool:
+        """Whether a context send may keep moving its transfer clock.
+
+        The send is posted when the context finishes, but nothing is written
+        until the generation peer asks, and under load that request can sit in
+        the generation queue for longer than the transfer timeout. Expiring
+        then gives up on transfers that never got to run, and the peer later
+        finds no data. A peer that never asks must still be reclaimed, since
+        this deadline is the only thing that ends such a send, so the wait is
+        capped at ``_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER`` times the timeout.
+        """
+        peer_wait_start = getattr(req, "py_kv_transfer_peer_wait_start", None)
+        if peer_wait_start is None or req.py_kv_transfer_start_time is None:
+            return False
+        if (now - peer_wait_start) * 1000 > timeout_ms * _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER:
+            return False
+        return self._transceiver.context_transfer_is_waiting_for_peer(req)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -522,6 +555,7 @@ class DisaggTransferCoordinator:
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
                     req.py_kv_transfer_start_time = time.monotonic()
+                    req.py_kv_transfer_peer_wait_start = req.py_kv_transfer_start_time
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE
@@ -775,6 +809,40 @@ class DisaggTransferCoordinator:
                     f"{request.py_request_id}; waiting for C++ transfer status "
                     "to report final cleanup"
                 )
+
+    @nvtx_range("cancel_stalled_gen_receives")
+    def _cancel_stalled_gen_receives(self) -> None:
+        """Act on generation receive timeouts without waiting for a forward pass.
+
+        Without in-flight cancellation, the executor's response pass is what
+        cancels a timed-out receive, and it runs only after a forward step. A
+        generation worker whose every slot holds a stalled receive schedules
+        nothing, never reaches that pass, and so stops admitting requests for
+        good. Cancel such receives here instead: the reap below fails one once
+        its session reports the cancel, and one the cancel already released is
+        failed directly, as the response pass would.
+        """
+        timed_out = [
+            req
+            for req in self._registry.active_requests()
+            if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_timed_out
+        ]
+        if not timed_out:
+            return
+        # A user cancellation is settled by the cancel path. Under multi-rank
+        # ADP a released request stays active until the synced drain; do not
+        # fail it twice.
+        user_canceled_ids = set(self._registry.canceled_request_ids())
+        pending_ids = {id(req) for req in self._pending_timed_out_requests}
+        released = [
+            req
+            for req in timed_out
+            if self._vote_id(req) not in user_canceled_ids
+            and id(req) not in pending_ids
+            and self.request_cancellation(req)
+        ]
+        if released:
+            self.fail_timed_out(released)
 
     @nvtx_range("check_gen_transfer_errors_consensus")
     def _check_gen_transfer_errors_consensus(self) -> None:
