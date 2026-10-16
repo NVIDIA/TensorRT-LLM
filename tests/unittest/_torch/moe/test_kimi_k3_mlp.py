@@ -802,6 +802,62 @@ def _run_kimi_k3_moe_multi_rank_worker(attention_dp):
             os.environ["TRTLLM_FORCE_COMM_METHOD"] = previous_comm_method
 
 
+@requires_cuda
+@pytest.mark.parametrize(
+    "case, num_tokens, expected",
+    [
+        ("eligible", 1, True),
+        ("eligible", 16, True),
+        ("eligible", 17, False),
+        ("non_linear_down", 1, False),
+        ("other_backend", 1, False),
+    ],
+)
+def test_kimi_k3_router_down_fusion_gate(
+    monkeypatch: pytest.MonkeyPatch, case: str, num_tokens: int, expected: bool
+) -> None:
+    """``_can_fuse_router_down`` admits only the validated router + latent
+    down-projection fusion: 1..16 tokens, a bias-free BF16 ``nn.Linear`` down
+    projection (FP8 conversion replaces it), and MEGAMOE_CUTEDSL with fused
+    communication on SM107."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    monkeypatch.setattr(modeling_kimi_linear, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", False)
+    device = torch.device("cuda")
+    hidden_size, latent_size, num_experts = 7168, 3584, 896
+
+    class _Fp8ConvertedDown(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(latent_size, hidden_size, device=device, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            self.bias = None
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(
+        weight=torch.empty(num_experts, hidden_size, device=device, dtype=torch.bfloat16)
+    )
+    if case == "non_linear_down":
+        runtime.routed_expert_down_proj = _Fp8ConvertedDown()
+    else:
+        runtime.routed_expert_down_proj = nn.Linear(
+            hidden_size, latent_size, bias=False, device=device, dtype=torch.bfloat16
+        )
+    runtime.routed_experts = SimpleNamespace(
+        use_dp=False,
+        parallel_size=8,
+        moe_backend="CUTEDSL" if case == "other_backend" else "MEGAMOE_CUTEDSL",
+        backend=SimpleNamespace(scheduler_kind=modeling_kimi_linear.MoESchedulerKind.FUSED_COMM),
+    )
+    hidden_states = torch.empty(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
+
+    assert runtime._can_fuse_router_down(hidden_states) is expected
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
