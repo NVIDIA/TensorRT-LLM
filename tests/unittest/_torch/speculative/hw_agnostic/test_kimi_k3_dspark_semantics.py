@@ -955,8 +955,16 @@ def test_plain_dflash_trtllm_block_decode_matches_full_attention_reference(
     assert calls[kernel] == TINY["num_hidden_layers"] and sum(calls.values()) == calls[kernel], (
         f"batch {batch_size} took the wrong attention form: {calls}"
     )
-    diff = (out - expected).abs().max().item()
-    assert diff < 0.02, f"TRTLLM {kernel} parity failed: max abs diff {diff}"
+    # The bf16 max-abs error grows with the number of outputs compared, so
+    # bound the relative L2 error and allow a few bf16 ulps in the tail. A
+    # wrong page, mask or request index shows up as O(1) errors and still fails.
+    err = out - expected
+    diff = err.abs().max().item()
+    rel_l2 = (err.norm() / expected.norm()).item()
+    assert diff < 0.0625 and rel_l2 < 1e-2, (
+        f"TRTLLM {kernel} parity failed at batch {batch_size}: "
+        f"max abs diff {diff}, relative L2 {rel_l2}, max |expected| {expected.abs().max().item()}"
+    )
 
 
 # ---------------------------------------------------------------------------
