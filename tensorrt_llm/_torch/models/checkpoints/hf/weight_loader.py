@@ -46,6 +46,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
                                  local_mpi_comm, local_mpi_rank, local_mpi_size,
                                  mpi_comm, mpi_disabled)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -102,10 +103,10 @@ class _CheckpointIOStatus:
     fallback_reason: str | None = None
 
 
-@register_checkpoint_weight_loader("MX")
-@register_checkpoint_weight_loader("mistral")
-@register_checkpoint_weight_loader("mistral_large_3")
-@register_checkpoint_weight_loader("HF")
+@register_checkpoint_weight_loader(CheckpointFormat.MX)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL_LARGE_3)
+@register_checkpoint_weight_loader(CheckpointFormat.HF)
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.

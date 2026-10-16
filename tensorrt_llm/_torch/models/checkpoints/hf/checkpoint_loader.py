@@ -20,11 +20,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.config_loader import \
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
     HfWeightLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.mapping import Mapping
 
 
-@register_checkpoint_loader("HF")
+@register_checkpoint_loader(CheckpointFormat.HF)
 class HfCheckpointLoader(BaseCheckpointLoader):
 
     def __init__(self,
@@ -41,7 +42,7 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         else:
             self._config_loader = config_loader
         self._weight_mapper = weight_mapper
-        self._checkpoint_format = "HF"
+        self._checkpoint_format = CheckpointFormat.HF
 
     def cleanup(self) -> None:
         # Clean up weight mapper first as it may hold model references
@@ -140,5 +141,5 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         return self._config_loader
 
     @property
-    def checkpoint_format(self) -> str:
+    def checkpoint_format(self) -> CheckpointFormat:
         return self._checkpoint_format

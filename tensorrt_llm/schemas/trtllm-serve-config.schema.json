@@ -556,6 +556,17 @@
       "title": "CapacitySchedulerPolicy",
       "type": "string"
     },
+    "CheckpointFormat": {
+      "description": "Built-in checkpoint loader formats. Custom registrations can use strings.",
+      "enum": [
+        "HF",
+        "MX",
+        "mistral",
+        "mistral_large_3"
+      ],
+      "title": "CheckpointFormat",
+      "type": "string"
+    },
     "CheckpointIOPolicy": {
       "description": "Strategy for reading checkpoint weights and transferring them to GPU.",
       "enum": [
@@ -6500,6 +6511,9 @@
     "checkpoint_format": {
       "anyOf": [
         {
+          "$ref": "#/$defs/CheckpointFormat"
+        },
+        {
           "type": "string"
         },
         {
@@ -6507,8 +6521,11 @@
         }
       ],
       "default": null,
-      "description": "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+      "description": "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
       "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      },
       "title": "Checkpoint Format"
     },
     "checkpoint_io_policy": {

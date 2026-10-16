@@ -31,6 +31,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
@@ -2050,8 +2051,8 @@ class _TorchLLM(BaseLLM):
         # "consumes packed tokens" wording would only confuse there.
         if (config is None or not self._is_encoder_decoder_model()
                 or self.args.model_kwargs is not None
-                or self.args.checkpoint_loader is not None
-                or self.args.checkpoint_format not in (None, "HF")):
+                or self.args.checkpoint_loader is not None or
+                self.args.checkpoint_format not in (None, CheckpointFormat.HF)):
             return
         bucket_config_error = validate_token_encoder_bucket_config(
             config.num_tokens, config.seq_lens)
