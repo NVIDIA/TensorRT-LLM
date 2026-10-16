@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Small-batch BF16 sparse MLA with native TP-local query heads."""
+"""Native sparse MLA for FP8 KV and small-batch BF16 generation."""
 
 from __future__ import annotations
 
@@ -26,14 +26,23 @@ class GlmKpoolNativeDecode:
         self._counter: torch.Tensor | None = None
         self._workspace_size: int | None = None
 
-    def prepare_workspace(self, q: torch.Tensor, metadata: TrtllmAttentionMetadata) -> None:
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        *,
+        max_query_rows: int = 8,
+        query_dtype: torch.dtype | None = None,
+    ) -> None:
         from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
         from ...fmha.flashinfer_trtllm_gen import _get_generation_workspace_layout
 
         capturing = torch.cuda.is_current_stream_capturing()
         if self._workspace_size is None:
-            layout = _get_generation_workspace_layout(q.dtype, 1, 1, 16, 512, 1, 0)
+            layout = _get_generation_workspace_layout(
+                query_dtype or q.dtype, max_query_rows, max_query_rows, q.shape[1], 512, 1, 0
+            )
             self._workspace_size = int(layout["trtllm_gen_workspace_size"])
         workspace = metadata.effective_workspace
         if workspace is None:
@@ -44,13 +53,13 @@ class GlmKpoolNativeDecode:
             workspace.resize_(
                 (self._workspace_size + workspace.element_size() - 1) // workspace.element_size()
             )
-        if self._counter is None:
+        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        size = get_trtllm_gen_multi_ctas_kv_counter_bytes(max_query_rows, q.shape[1], sm_count)
+        if self._counter is None or self._counter.numel() < size:
             if capturing:
                 raise RuntimeError(
                     "glm_kpool native decode counters must be allocated before capture"
                 )
-            sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-            size = get_trtllm_gen_multi_ctas_kv_counter_bytes(8, 16, sm_count)
             # TRTLLM-GEN resets its counters after each invocation.
             self._counter = torch.zeros(size, dtype=torch.uint8, device=q.device)
 
@@ -61,12 +70,22 @@ class GlmKpoolNativeDecode:
         topk_rows: torch.Tensor,
         scale: float,
         metadata: TrtllmAttentionMetadata,
+        *,
+        kv_scale: float | torch.Tensor = 1.0,
+        bmm1_scale: float | torch.Tensor | None = None,
     ) -> torch.Tensor:
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
         packed, lengths, nonempty = compact_sparse_rows(topk_rows)
+        fp8 = kv_rows.dtype == torch.float8_e4m3fn
+        if fp8:
+            # Saturating conversion keeps finite query outliers representable in FP8.
+            bound = torch.finfo(kv_rows.dtype).max
+            query = q.clamp(min=-bound, max=bound).to(kv_rows.dtype)
+        else:
+            query = q
         output = trtllm_batch_decode_with_kv_cache_mla(
-            query=q.unsqueeze(1),
+            query=query.unsqueeze(1),
             kv_cache=kv_rows.view(-1, 1, 32, 512),
             workspace_buffer=metadata.effective_workspace.view(torch.uint8),
             qk_nope_head_dim=256,
@@ -76,10 +95,12 @@ class GlmKpoolNativeDecode:
             seq_lens=lengths,
             max_seq_len=packed.shape[1],
             sparse_mla_top_k=packed.shape[1],
-            bmm1_scale=scale,
+            bmm1_scale=scale * kv_scale if bmm1_scale is None else bmm1_scale,
+            bmm2_scale=kv_scale,
             backend="trtllm-gen",
             sparse_mla_top_k_lens=lengths,
             multi_ctas_kv_counter_buffer=self._counter,
+            use_fp16_softmax=False if fp8 else None,
         ).squeeze(1)
         # Empty (padded) requests use a dummy selection to keep the kernel's
         # length positive; discard that output, matching FlashMLA's empty row.
