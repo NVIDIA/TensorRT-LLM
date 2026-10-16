@@ -12,7 +12,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### API Changes
 
-- <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, the `insertRequestInOrder(std::deque<RequestWithId>&, RequestWithId&&)` overload, and the unused `orchestratorUtils.h` message types have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available.
+- <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, the `insertRequestInOrder(std::deque<RequestWithId>&, RequestWithId&&)` overload, and the unused `orchestratorUtils.h` message types have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available. Executor factory and worker constructors no longer accept the unused `engine` and `batched_logits_processor` arguments; callers should omit them and continue passing model configuration through `llm_args` and `hf_model_dir`. The unused `kRequestWithIdNumReq`, `kRequestWithIdVecSize`, and `kRequestWithIdPacked` MPI tag names have also been removed; values 15–17 are retired and surviving tag values are unchanged.
 
 ### Fixed Issues
 

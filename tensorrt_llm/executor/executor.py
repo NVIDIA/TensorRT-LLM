@@ -34,8 +34,7 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (enable_llm_debug,
                             enable_worker_single_process_for_tp1, logger_debug,
                             print_colored)
-from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
-                               SamplingParams)
+from ..sampling_params import LogprobParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
@@ -557,8 +556,6 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine: Path,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
@@ -618,8 +615,6 @@ class GenerationExecutor(ABC):
                 is_llm_executor=is_llm_executor)
 
         worker_kwargs = {
-            "engine": engine,
-            "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
             "tokenizer": tokenizer,
             "llm_args": llm_args,

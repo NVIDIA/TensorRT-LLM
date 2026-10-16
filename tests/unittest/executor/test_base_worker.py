@@ -80,10 +80,15 @@ def test_generation_logprobs_do_not_recompute_logits(monkeypatch):
         pytest.fail("Generation logprobs must come from the sampler")
 
     monkeypatch.setattr(base_worker, "compute_logprobs", unexpected_compute)
-    generation_result = SimpleNamespace(_logprob_params=LogprobParams())
+    generation_result = SimpleNamespace(
+        _logprob_params=None,
+        clear_logprob_params=lambda: delattr(generation_result,
+                                             "_logprob_params"))
     worker = SimpleNamespace(_results={1: generation_result})
-    response = SimpleNamespace(client_id=1)
+    response = SimpleNamespace(client_id=1,
+                               result=SimpleNamespace(is_final=True))
     assert base_worker._get_logprobs(worker, response) is None
+    assert not hasattr(generation_result, "_logprob_params")
 
 
 @pytest.mark.cpu_only
@@ -224,7 +229,6 @@ class FakeWorker(BaseWorker):
             enable_iter_perf_stats=True,
         )
         super().__init__(
-            engine=engine,
             llm_args=llm_args,
             hf_model_dir=engine,
         )

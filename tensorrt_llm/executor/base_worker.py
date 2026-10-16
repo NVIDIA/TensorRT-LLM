@@ -40,7 +40,7 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..runtime import ModelConfig
-from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
@@ -91,8 +91,6 @@ class BaseWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine: Path,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         hf_model_dir: Optional[Path] = None,
@@ -1611,9 +1609,6 @@ def _get_logprobs(worker, response: LlmResponse) -> Optional[LogProbsResult]:
         if logprob_params.drop_context_logits:
             response.clear_context_logits()
         return logprobs_result
-
-    if logprob_params:
-        return None
 
     if response.result.is_final:
         generation_result.clear_logprob_params()
