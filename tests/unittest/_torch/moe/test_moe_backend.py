@@ -2274,6 +2274,90 @@ def test_fused_comm_output_stays_global_when_nobody_reduces_it_again(overrides: 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("accepts_global_routed_output", [False, True])
+def test_fused_comm_forward_returns_what_the_caller_reduces(
+    monkeypatch: pytest.MonkeyPatch, accepts_global_routed_output: bool
+) -> None:
+    """``forward`` itself must hand back a rank partial under TEP, not only the
+    helper; multi-chunk outputs are concatenated before the conversion."""
+    tp_size = 4
+    x = torch.randn(5, 16, dtype=torch.bfloat16)
+    router_logits = torch.randn(5, 8)
+    global_output = torch.randn(5, 16, dtype=torch.bfloat16)
+    outputs = []
+    for rank in range(tp_size):
+        scheduler = _fused_comm_scheduler(
+            rank=rank,
+            tp_size=tp_size,
+            accepts_global_routed_output=accepts_global_routed_output,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_strip_adp_padding",
+            lambda x, rl, ids, counts: (x, rl, ids, [x.shape[0]], 0, False),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_compute_chunk_layout",
+            lambda x, rl, counts, ep_rank: (
+                2,
+                list(x.split([3, 2])),
+                list(rl.split([3, 2])),
+                [[3, 2]],
+            ),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_chunks",
+            lambda *args, **kwargs: list(global_output.clone().split([3, 2])),
+        )
+        outputs.append(
+            scheduler.forward(
+                x,
+                router_logits,
+                do_finalize=True,
+                output_dtype=torch.bfloat16,
+                all_rank_num_tokens=None,
+                use_dp_padding=None,
+                input_ids=None,
+            )
+        )
+
+    assert torch.equal(outputs[0], global_output)
+    for output in outputs[1:]:
+        if accepts_global_routed_output:
+            assert torch.equal(output, global_output)
+        else:
+            assert not output.any()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "scheduler_kind, accepts_global_routed_output, expected",
+    [
+        (MoESchedulerKind.FUSED_COMM, True, True),
+        (MoESchedulerKind.FUSED_COMM, False, False),
+        (MoESchedulerKind.EXTERNAL_COMM, True, False),
+        (MoESchedulerKind.EXTERNAL_COMM, False, False),
+    ],
+)
+def test_configurable_moe_reports_global_routed_output_only_when_opted_in(
+    scheduler_kind: MoESchedulerKind, accepts_global_routed_output: bool, expected: bool
+) -> None:
+    """Callers decide whether to skip their routed all-reduce from this
+    property, so it must agree with what ``FusedCommMoEScheduler`` returns."""
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    # The class-level default is what ``FusedCommMoEScheduler`` reads when a
+    # caller does not pass the flag.
+    assert moe.accepts_global_routed_output is False
+    moe.accepts_global_routed_output = accepts_global_routed_output
+    moe.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+
+    assert moe.returns_global_routed_output is expected
+    assert MoE.returns_global_routed_output.fget(moe) is False
+
+
+@pytest.mark.cpu_only
 def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
     moe = _make_megamoe_cutedsl_for_ctor_test(
         activation=SwigluBiasActivation(

@@ -519,7 +519,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         # TEP (attention TP + MoE EP) needs no gate here: the fused kernel
         # returns a globally combined routed output, and FusedCommMoEScheduler
-        # hands it to callers that reduce externally as a rank partial.
+        # hands it to callers that reduce externally as a rank partial. It is
+        # correct but not cheap: every TP rank dispatches the same replicated
+        # tokens, so expert compute runs parallel_size times (the reason
+        # MegaMoEDeepGemm rejects TEP). validate_configurable_moe warns once.
         # ADP wider than EP would need an outer allgather + reducescatter
         # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:
@@ -795,6 +798,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if moe.moe_max_num_tokens <= 0:
             raise ValueError(
                 f"MegaMoECuteDsl requires moe_max_num_tokens > 0; got {moe.moe_max_num_tokens}."
+            )
+        if not moe.use_dp and moe.parallel_size > 1:
+            logger.warning_once(
+                f"MegaMoECuteDsl under attention TP (TEP, tp_size="
+                f"{moe.parallel_size}) dispatches the same tokens from every TP "
+                f"rank, so expert compute is repeated {moe.parallel_size} times. "
+                "Prefer enable_attention_dp=True for throughput.",
+                key="megamoe_cutedsl_tep_redundant_compute",
             )
         # Dynamic EPLB is intentionally allowed: the quant method
         # registers mega-format derived parameters alongside the raw

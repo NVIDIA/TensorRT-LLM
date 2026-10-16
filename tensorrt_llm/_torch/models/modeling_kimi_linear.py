@@ -122,7 +122,6 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
-from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -1169,8 +1168,8 @@ class KimiK3MoERuntime(nn.Module):
             # Kimi owns the latent reduction so it can order that collective
             # after the shared expert's auxiliary-stream reduction.
             reduce_results=False,
-            # ``_reduce_routed_output`` skips that reduction for FUSED_COMM
-            # backends, so their routed output must stay global on every rank.
+            # Lets a FUSED_COMM backend return its globally combined routed
+            # output; ``_reduce_routed_output`` then skips that reduction.
             accepts_global_routed_output=True,
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
@@ -1234,8 +1233,7 @@ class KimiK3MoERuntime(nn.Module):
         # all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
         self._reduce_routed_output = (
-            use_shared_tp
-            and self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
+            use_shared_tp and not self.routed_experts.returns_global_routed_output
         )
         if self._reduce_routed_output and self.routed_experts.all_reduce is None:
             raise RuntimeError(

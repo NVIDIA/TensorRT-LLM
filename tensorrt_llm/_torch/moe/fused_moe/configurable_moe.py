@@ -442,6 +442,16 @@ class ConfigurableMoE(MoE):
         return self.backend._supports_load_balancer()
 
     @property
+    def returns_global_routed_output(self) -> bool:
+        """True only for a ``FUSED_COMM`` backend whose caller opted in with
+        ``accepts_global_routed_output``; ``FusedCommMoEScheduler`` otherwise
+        hands back a rank partial under attention TP."""
+        return (
+            self.accepts_global_routed_output
+            and self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
+
+    @property
     def num_fused_shared_expert(self) -> int:
         """Expose the backend's fused-shared-expert count so model code (e.g.
         DeepseekV3 post_load_weights / shared-expert TP sizing) sees it through
