@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU binding contracts for real, backend-neutral lifecycle primitives.
+"""CPU contracts for shared arbitration and its native ownership binding.
 
-This adapter-shaped fixture is not an RI-02 implementation or profile
-qualification. Only manager holds, backend status, and already committed logical
-outcomes are doubles; admission, evidence tracking, and retirement are production
-code. Allocation release remains the caller's responsibility after access ends.
+The native fixture is not a backend-neutral adapter or profile qualification.
+Only manager holds and backend status are doubles; native ownership, logical
+outcomes, and shared retirement use production code. Allocation release remains
+the caller's responsibility after access ends.
 """
 
 import gc
@@ -28,17 +28,20 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
-    PhysicalOperationState,
-    ReceiveOperationOwner,
-    SendOperationOwner,
-    TransferNotSubmittedError,
-)
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.lifecycle.retirement import (
     QuiescenceFatalEvent,
     RetirementDeadline,
     RetirementWatchdog,
 )
+from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    PhysicalOperationState,
+    ReceiveOperationOwner,
+    SendOperationOwner,
+    TransferNotSubmittedError,
+)
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -62,8 +65,8 @@ class _Status:
         return self.result
 
 
-class _Binding:
-    """Compose shared ownership with opaque caller-owned resources and outcomes."""
+class _NativeBinding:
+    """Bind native operation ownership to shared deadline arbitration."""
 
     def __init__(self) -> None:
         """Create an unpublished source binding without starting a worker thread."""
@@ -73,17 +76,15 @@ class _Binding:
         self.retirement = self.watchdog.create_owner(4, "send", 5.0)
         self.sender = SendOperationOwner(self.retirement)
         self.manager_hold = _Root()
-        # Fixture-owned committed metadata, not a replacement logical arbiter.
-        self.logical_outcome = object()
 
 
 @pytest.fixture
-def binding() -> _Binding:
-    """Provide a small non-native caller of the shared implementation."""
-    return _Binding()
+def binding() -> _NativeBinding:
+    """Provide native owners without starting transport worker threads."""
+    return _NativeBinding()
 
 
-def test_native_compatibility_names_are_shared_classes() -> None:
+def test_native_compatibility_names_preserve_class_identity() -> None:
     """Compatibility imports must not fork state or exception identities."""
     from tensorrt_llm._torch.disaggregation.native import retirement, transfer
 
@@ -93,6 +94,7 @@ def test_native_compatibility_names_are_shared_classes() -> None:
     assert transfer._ReceiveOperationOwner is ReceiveOperationOwner
     assert transfer._PhysicalOperationState is PhysicalOperationState
     assert transfer._TransferNotSubmittedError is TransferNotSubmittedError
+    assert transfer.SendOperationOwner is SendOperationOwner
     assert {state.value for state in PhysicalOperationState} == {
         "ADMITTED",
         "SUBMITTING",
@@ -103,7 +105,28 @@ def test_native_compatibility_names_are_shared_classes() -> None:
     }
 
 
-def test_multi_owner_exposure_waits_for_local_completion(binding: _Binding) -> None:
+def test_shared_arbitration_retains_opaque_claims_until_each_settles() -> None:
+    """The shared arbiter needs claim identities, not native ownership types."""
+    watchdog = RetirementWatchdog(Mock(), clock=Mock(return_value=10.0))
+    retirement = watchdog.create_owner(4, "receive", 5.0)
+    source, destination = _Root(), _Root()
+    source_ref, destination_ref = weakref.ref(source), weakref.ref(destination)
+    assert retirement.expose(source, destination)
+    retirement.complete_pieces()
+    del source, destination
+    gc.collect()
+    assert source_ref() is not None and destination_ref() is not None
+    assert retirement.settle(source_ref())
+    assert source_ref() is None
+    assert not retirement.is_complete
+    assert retirement.settle(destination_ref())
+    assert destination_ref() is None
+    assert retirement.is_complete
+    assert retirement.close() and retirement.close()
+    watchdog.stop()
+
+
+def test_multi_owner_exposure_waits_for_local_completion(binding: _NativeBinding) -> None:
     """KV, AUX, and manager holds survive partial and duplicate remote evidence."""
     binding.retirement.close()
     retirement = binding.watchdog.create_owner(5, "receive", 5.0)
@@ -135,7 +158,9 @@ def test_multi_owner_exposure_waits_for_local_completion(binding: _Binding) -> N
 
 
 @pytest.mark.parametrize("rejected", [False, True])
-def test_never_submitted_operation_retires_idempotently(binding: _Binding, rejected: bool) -> None:
+def test_never_submitted_operation_retires_idempotently(
+    binding: _NativeBinding, rejected: bool
+) -> None:
     """Skipping submission and closed admission both establish no-access proof."""
     sender = binding.sender
     assert sender.begin_physical_operation(7)
@@ -155,15 +180,22 @@ def test_never_submitted_operation_retires_idempotently(binding: _Binding, rejec
 
 @pytest.mark.parametrize("evidence", [False, 1, RuntimeError("query failed")])
 def test_late_exact_done_retires_without_changing_logical_outcome(
-    binding: _Binding, evidence: object
+    binding: _NativeBinding, evidence: object
 ) -> None:
     """Only literal DONE on the retained status ends ambiguous physical access."""
-    sender, status, request = binding.sender, _Status(evidence), _Root()
+    sender = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=4))
+    sender.bind_logical_outcomes(transfer_mod._LogicalOutcomes(binding.retirement))
+    status, request = _Status(evidence), _Root()
     request_ref, status_ref = weakref.ref(request), weakref.ref(status)
-    committed = binding.logical_outcome
     assert sender.begin_physical_operation(7)
     sender.begin_backend_submission(7, request)
     sender.record_backend_submission(7, status)
+    failure = RuntimeError("original failure")
+    sender.fail(failure)
+    committed = sender.logical_outcome
+    assert committed is not None
+    assert committed.status is SessionStatus.ERROR
+    assert committed.reason == "original failure"
     sender.mark_physical_operation_in_doubt(7)
     sender.mark_physical_operation_in_doubt(7)
     del request
@@ -171,7 +203,7 @@ def test_late_exact_done_retires_without_changing_logical_outcome(
     assert request_ref() is not None
     assert not sender.poll_in_doubt_physical_operation(7)
     assert not sender.resources_drained
-    assert binding.logical_outcome is committed
+    assert sender.logical_outcome is committed
     status.result = True
     binding.clock.return_value = 14.999
     assert sender.poll_in_doubt_physical_operation(7)
@@ -179,7 +211,9 @@ def test_late_exact_done_retires_without_changing_logical_outcome(
     assert sender.retire_backend_done_physical_operation(7)
     assert not sender.poll_in_doubt_physical_operation(7)
     assert status.queries == 2
-    assert binding.logical_outcome is committed
+    assert sender.logical_outcome is committed
+    assert sender.status is transfer_mod.TaskStatus.ERROR
+    assert sender._exception is failure
     del status
     gc.collect()
     assert request_ref() is None and status_ref() is None
@@ -188,7 +222,9 @@ def test_late_exact_done_retires_without_changing_logical_outcome(
 
 
 @pytest.mark.parametrize("has_status", [False, True])
-def test_exact_expiry_contains_and_retains_all_roots(binding: _Binding, has_status: bool) -> None:
+def test_exact_expiry_contains_and_retains_all_roots(
+    binding: _NativeBinding, has_status: bool
+) -> None:
     """Missing handles and exact-boundary DONE both retain roots after fatal expiry."""
     sender, request, status = binding.sender, _Root(), _Status()
     request_ref, hold_ref = weakref.ref(request), weakref.ref(binding.manager_hold)
@@ -228,7 +264,7 @@ def test_exact_expiry_contains_and_retains_all_roots(binding: _Binding, has_stat
         watchdog.stop()
 
 
-def test_receive_ambiguity_requires_explicit_settlement(binding: _Binding) -> None:
+def test_receive_ambiguity_requires_explicit_settlement(binding: _NativeBinding) -> None:
     """An ordinary failed result cannot substitute for access-end evidence."""
     owner = ReceiveOperationOwner(binding.retirement)
     assert binding.retirement.expose(owner, binding.manager_hold)

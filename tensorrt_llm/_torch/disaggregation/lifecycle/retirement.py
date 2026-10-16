@@ -34,6 +34,8 @@ class RetirementDeadline:
         request_id: int,
         direction: Literal["send", "receive"],
         timeout_s: float,
+        *,
+        grace_s: float | None = None,
     ) -> None:
         """Initialize an unpublished owner without starting either clock.
 
@@ -41,14 +43,22 @@ class RetirementDeadline:
             controller: Shared, backend-free watchdog and admission arbiter.
             request_id: Request identity within this worker.
             direction: Whether this session owns source or destination memory.
-            timeout_s: Request timeout and subsequent quiescence grace duration.
+            timeout_s: Finite positive transfer safety budget from first exposure,
+                not the overall inference-request deadline.
+            grace_s: Finite positive quiescence grace from the first drain trigger.
+                Defaults to timeout_s when omitted or None.
         """
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("retirement requires a finite positive transfer timeout")
+        if grace_s is None:
+            grace_s = timeout_s
+        if not math.isfinite(grace_s) or grace_s <= 0:
+            raise ValueError("retirement requires a finite positive quiescence grace")
         self.controller = controller
         self.request_id = request_id
         self.direction = direction
         self.timeout_s = timeout_s
+        self.grace_s = grace_s
         self._request_deadline: float | None = None
         self._drain_started: float | None = None
         self._reason = ""
@@ -207,7 +217,7 @@ class RetirementDeadline:
                 if self._timeout_outcome is not None:
                     self._timeout_outcome()
         if self._claims and self._drain_started is not None:
-            deadline = self._drain_started + self.timeout_s
+            deadline = self._drain_started + self.grace_s
             if now >= deadline:
                 self.controller.fatal = QuiescenceFatalEvent(
                     self.request_id,
@@ -247,14 +257,20 @@ class RetirementWatchdog:
         self._thread: threading.Thread | None = None
 
     def create_owner(
-        self, request_id: int, direction: Literal["send", "receive"], timeout_s: float
+        self,
+        request_id: int,
+        direction: Literal["send", "receive"],
+        timeout_s: float,
+        *,
+        grace_s: float | None = None,
     ) -> RetirementDeadline:
         """Register one session before it becomes visible to transfer workers.
 
         Args:
             request_id: Session's request identity.
             direction: Source or destination ownership role.
-            timeout_s: Finite positive request and quiescence timeout.
+            timeout_s: Finite positive transfer safety budget from first exposure.
+            grace_s: Finite positive quiescence grace; defaults to timeout_s.
 
         Returns:
             The session's ownership/deadline arbiter.
@@ -265,7 +281,7 @@ class RetirementWatchdog:
         with self.lock:
             if self.fatal is not None or self._admission_closed or self._stopped.is_set():
                 raise RuntimeError("KV retirement admission is closed")
-            owner = RetirementDeadline(self, request_id, direction, timeout_s)
+            owner = RetirementDeadline(self, request_id, direction, timeout_s, grace_s=grace_s)
             self._owners.add(owner)
             return owner
 
@@ -308,6 +324,17 @@ class RetirementWatchdog:
         with self.lock:
             return self._admission_closed
 
+    @property
+    def has_retained_owners(self) -> bool:
+        """Observe tracked owners or fatal retention without progressing or releasing them.
+
+        Settled owners remain tracked until closed. This snapshot neither closes
+        admission nor authorizes resource teardown; use stop() for atomic shutdown
+        of the watchdog after all owners have safely closed.
+        """
+        with self.lock:
+            return bool(self._owners) or self.fatal is not None
+
     def stop(self) -> None:
         """Stop progress only after every owner has safely closed.
 
@@ -315,7 +342,7 @@ class RetirementWatchdog:
             RuntimeError: Ownership remains tracked, including fatal quarantine.
         """
         with self.lock:
-            if self._owners or self.fatal is not None:
+            if self.has_retained_owners:
                 raise RuntimeError("cannot stop KV retirement with retained owners")
             self._stopped.set()
             self.wake.set()
@@ -329,7 +356,7 @@ class RetirementWatchdog:
             RuntimeError: A session still owns resources or fatal expiry won.
         """
         with self.lock:
-            if self._owners or self.fatal is not None:
+            if self.has_retained_owners:
                 raise RuntimeError("KV retirement still retains resources; teardown refused")
 
     def _run(self) -> None:

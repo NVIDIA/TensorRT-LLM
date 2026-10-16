@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Internal lifecycle enforcement; no public resource or transfer API."""
+"""Internal deadline and retirement arbitration; no public transfer API."""
