@@ -34,6 +34,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -398,6 +399,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
+        self._initialize_moe_workspace_reclaimer()
 
     @property
     def max_beam_width(self) -> int:
@@ -512,6 +514,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
+        self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
@@ -945,6 +948,19 @@ class DecoderRunner(ScheduledModelRunner):
         maybe_bolt_clear_counters()
 
         self._freeze_eager_workspace_floor()
+
+    def _initialize_moe_workspace_reclaimer(self) -> None:
+        """Create the native workspace owner for this runner's lifetime."""
+        self._moe_workspace_reclaimer = None
+        if (
+            os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
+            and not self._config.is_spec_decode
+            and self.mapping.cp_size == 1
+            and self._eager_workspace_reclaim_supported
+            and self._torch_compile_backend is None
+            and self.breakable_cuda_graph_runner is None
+        ):
+            self._moe_workspace_reclaimer = CutlassWorkspaceReclaimer()
 
     def _freeze_eager_workspace_floor(self) -> None:
         if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
@@ -5064,7 +5080,11 @@ class DecoderRunner(ScheduledModelRunner):
             and isinstance(metadata, TrtllmAttentionMetadata)
             else contextlib.nullcontext()
         )
-        with reclaim_scope:
+        moe_reclaimer = self._moe_workspace_reclaimer
+        moe_scope = contextlib.nullcontext()
+        if moe_reclaimer is not None:
+            moe_scope = moe_reclaimer.forward(warmup=is_dummy, num_tokens=metadata.num_tokens)
+        with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
     @nvtx_range("_forward_step")

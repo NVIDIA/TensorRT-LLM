@@ -76,6 +76,7 @@ extensions = [
     'llmapi_config_telemetry',
     'trtllm_config_selector',
     'trtllm_schema_assets',
+    'trtllm_moe_dashboard',
 ]
 
 if HAS_CPP_XML:
