@@ -497,15 +497,30 @@ class CuteDslMlaFmha(PhasedFmha):
         # failure. That makes this a correctness carve-out rather than a perf
         # tradeoff, so it is decided here instead of being folded into
         # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
-        # Deliberately narrow: single-token H=96 is already a measured table
-        # entry and still goes through the gate, and non-helix multi-token
-        # H=96 keeps falling back exactly as it does today. Helix with
-        # seq_len_q > 1 implies _helix_spec_tokens_valid -- the helix block
-        # above returns False otherwise.
+        # Single-token H=96 is already a measured table entry and still goes
+        # through the gate. Helix with seq_len_q > 1 implies
+        # _helix_spec_tokens_valid -- the helix block above returns False
+        # otherwise.
         helix_h96_verify_group = (
             attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
         )
-        if not helix_h96_verify_group:
+        # The same failure without Helix: an FP8-KV multi-token verify group
+        # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
+        # is not in the FP8 perf table, and on SM100/SM103 the next library is
+        # FlashInfer TRTLLM-Gen, which rejects these head counts. The kernel
+        # packs (token, head) rows into 128-row M tiles, so any H <= 128 with a
+        # linear-chain causal verify is valid (can_implement below still has the
+        # final say). SM107 is left out on purpose: TRTLLM-Gen FMHA is
+        # unavailable there and such a request already reaches the default
+        # TRTLLM path.
+        fp8_wide_head_verify_group = (
+            64 < attn.num_heads < 128
+            and seq_len_q > 1
+            and meta.helix_position_offsets is None
+            and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
+            and get_sm_version() in (100, 103)
+        )
+        if not (helix_h96_verify_group or fp8_wide_head_verify_group):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
