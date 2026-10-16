@@ -10,9 +10,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import grpc
-import numpy as np
-import torch
-from PIL import Image
 
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError
@@ -30,7 +27,8 @@ _MAX_STOP_CONDITIONS = 64
 # Bound per-request decode work and retained image data.
 _MAX_MEDIA_ITEMS = 64
 _MAX_CONCURRENT_MEDIA_LOADS = 8
-# Encoded inputs have separate gRPC and remote-loader caps.
+# Checked after each decode; concurrency bounds peak overshoot. Encoded inputs
+# have separate gRPC and remote-loader caps.
 _MAX_TOTAL_DECODED_MEDIA_BYTES = 512 * 1024 * 1024
 _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
 _DETOKENIZE_EXTRA_KEY = "detokenize"
@@ -331,14 +329,17 @@ def _image_loader_factory(llm: Any) -> _MediaLoader:
 
 
 def _decoded_image_bytes(image: Any) -> int:
+    import numpy as np
+    import torch
+    from PIL import Image
+
     if isinstance(image, torch.Tensor):
         return image.numel() * image.element_size()
     if isinstance(image, np.ndarray):
         return image.nbytes
     if isinstance(image, Image.Image):
         return image.width * image.height * len(image.getbands())
-    # ImageMediaIO currently returns only the representations above.
-    return 0
+    raise TypeError(f"unsupported decoded image type: {type(image).__name__}")
 
 
 _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
@@ -376,7 +377,8 @@ async def _input_from_request(
         )
 
     capabilities = media_capabilities or media_capabilities_for_model(llm)
-    if not capabilities.modalities:
+    modalities = capabilities.modalities
+    if not modalities:
         raise UnsupportedFeatureError("media input is not supported by the loaded model")
 
     resolved_handlers: list[_MediaHandler] = []
@@ -384,16 +386,19 @@ async def _input_from_request(
         if item.modality == generation_pb2.MODALITY_UNSPECIFIED:
             raise ValueError(f"media[{index}].modality must be set")
         handler = _MEDIA_HANDLERS.get(item.modality)
-        if handler is None or handler.name not in capabilities.modalities:
+        if handler is None or handler.name not in modalities:
             modality = _modality_name(item.modality)
-            supported_text = ", ".join(sorted(capabilities.modalities)) or "none"
+            supported_text = ", ".join(sorted(modalities)) or "none"
             raise UnsupportedFeatureError(
                 f"multimodal modality '{modality}' is not supported by the loaded model; "
                 f"supported modalities: {supported_text}"
             )
         resolved_handlers.append(handler)
 
-    loaders = {handler.name: handler.loader_factory(llm) for handler in set(resolved_handlers)}
+    loaders: dict[str, _MediaLoader] = {}
+    for handler in resolved_handlers:
+        if handler.name not in loaders:
+            loaders[handler.name] = handler.loader_factory(llm)
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEDIA_LOADS)
     decoded_bytes = 0
 

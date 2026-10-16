@@ -34,6 +34,9 @@ class MediaCapabilities:
             self, "placeholder_templates", MappingProxyType(dict(self.placeholder_templates))
         )
 
+    def __hash__(self) -> int:
+        return hash(frozenset(self.placeholder_templates.items()))
+
     @property
     def modalities(self) -> frozenset[str]:
         """Modalities supported by both the model and request mapper."""
