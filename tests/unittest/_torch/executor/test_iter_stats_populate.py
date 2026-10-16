@@ -201,6 +201,10 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     # child Mock for attribute access (always truthy when called), which would
     # classify every request as dummy and zero out all per-request aggregates.
     fake._is_stats_dummy_request = PyExecutor._is_stats_dummy_request
+    fake._completed_deferred_recompute_pauses = 0
+    fake._take_deferred_recompute_pauses = types.MethodType(
+        PyExecutor._take_deferred_recompute_pauses, fake
+    )
     return fake
 
 
@@ -566,6 +570,30 @@ def test_full_mixed_iteration():
     assert ifb.num_queued_ctx_tokens == 256 + 512 + 1024
     assert ifb.num_paused_requests == 2
     assert ifb.num_paused_kv_tokens == 400 + 900
+
+
+@pytest.mark.parametrize("has_batch_snapshot", [False, True])
+def test_deferred_pauses_are_consumed_only_without_a_batch_snapshot(has_batch_snapshot):
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
+    fake = _build_fake_self([], None)
+    fake._completed_deferred_recompute_pauses = 2
+    snapshot = ScheduledBatchStats(num_paused_requests=5) if has_batch_snapshot else None
+
+    with patch(f"{__name__}._build_fake_self", return_value=fake):
+        first = _invoke_update_iter_stats(
+            _StubScheduledBatch(paused_reqs=[_StubRequest(num_tokens=300)]),
+            [],
+            num_ctx_tokens=0,
+            scheduled_batch_stats=snapshot,
+        )
+        second = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
+        third = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
+
+    assert first.inflight_batching_stats.num_paused_requests == (5 if has_batch_snapshot else 3)
+    assert second.inflight_batching_stats.num_paused_requests == (2 if has_batch_snapshot else 0)
+    assert third.inflight_batching_stats.num_paused_requests == 0
+    assert fake._completed_deferred_recompute_pauses == 0
 
 
 def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():

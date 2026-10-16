@@ -3926,13 +3926,9 @@ class TestMixedOrdering:
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [1]
 
-    def test_multiple_gen_after_gen_fail(self):
-        """Gen failure: req0 fails, evicts tail victims, then self-evicts.
-
-        When req0 can't allocate, eviction evicts req2 and req1 (both
-        started gen requests found backwards from tail). Still fails,
-        so req0 self-evicts. All 3 paused.
-        """
+    @pytest.mark.parametrize("enable_recompute_pause", [False, True])
+    def test_multiple_gen_after_gen_fail(self, enable_recompute_pause):
+        """Failed allocation suspends tail victims, then optionally recomputes them."""
 
         def selective_gen_alloc(req):
             # req0 always fails, req1 and req2 succeed
@@ -3942,13 +3938,24 @@ class TestMixedOrdering:
             try_allocate_generation_fn=selective_gen_alloc,
             can_evict=True,
         )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched = make_scheduler(
+            mgr, max_num_tokens=1000, enable_recompute_pause=enable_recompute_pause
+        )
         reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
         out = sched.schedule_request(reqs, set())
-        # req0 fails alloc → evicts req2 (tail), then req1 → still fails
-        # → req0 self-evicts. All 3 are paused.
+
         assert len(out.generation_requests) == 0
-        assert set(ids(out.paused_requests)) == {0, 1, 2}
+        assert [call.args[0].request_id for call in mgr.suspend_request.call_args_list] == [2, 1, 0]
+        if enable_recompute_pause:
+            # Tail victims need a fresh prefill after destructive release;
+            # req0 is only suspended and retains its secondary-tier cache.
+            assert ids(out.paused_requests) == [0]
+            assert ids(out.recompute_paused_requests) == [2, 1]
+            assert [call.args[0].request_id for call in mgr.free_resources.call_args_list] == [2, 1]
+        else:
+            assert set(ids(out.paused_requests)) == {0, 1, 2}
+            assert out.recompute_paused_requests == []
+            mgr.free_resources.assert_not_called()
 
     def test_secondary_tier_recompute_pause_multiple_victims(self):
         """Evicted victims are recompute-paused before self-evict when eviction is supported."""
