@@ -109,12 +109,7 @@ class NcclEP(Communication):
 
     def set_quant_config(self, quant_config: Optional[QuantConfig]) -> None:
         """Apply a layer's resolved format before allocating its communication context."""
-        # Resolve from authoritative fields: QuantConfig's cached properties
-        # may describe an earlier value after an in-place configuration edit.
-        quant_mode = QuantMode.from_quant_algo(
-            quant_config.quant_algo if quant_config is not None else None,
-            quant_config.kv_cache_quant_algo if quant_config is not None else None,
-        )
+        quant_mode = quant_config.layer_quant_mode if quant_config is not None else QuantMode(0)
         has_fp8 = quant_mode.has_fp8_qdq()
         has_nvfp4 = quant_mode.has_nvfp4()
         mode = (
@@ -124,19 +119,24 @@ class NcclEP(Communication):
             if has_fp8
             else _TransportMode.BF16
         )
-        if self._ctx is not None and mode != self._transport_mode:
-            raise RuntimeError(
-                "Cannot change NCCL-EP transport format after context initialization."
-            )
+        fallback_reason = None
         if has_fp8 or has_nvfp4:
             from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_supports_version
 
             if not nccl_ep_supports_version("0.2"):
-                raise RuntimeError("NCCL-EP quantized dispatch requires libnccl_ep >= 0.2.")
+                fallback_reason = "quantized dispatch requires libnccl_ep >= 0.2"
         if has_nvfp4 and self.hidden_size % 256 != 0:
+            fallback_reason = "NVFP4 dispatch requires hidden_size divisible by 256"
+        if fallback_reason is not None:
+            mode = _TransportMode.BF16
+        if self._ctx is not None and mode != self._transport_mode:
             raise RuntimeError(
-                "NCCL-EP NVFP4 dispatch requires hidden_size divisible by 256 "
-                "for 16-byte token and scale rows."
+                "Cannot change NCCL-EP transport format after context initialization."
+            )
+        if fallback_reason is not None:
+            logger.warning(
+                f"NCCL-EP {fallback_reason}; falling back to BF16 transport "
+                "with quantization after dispatch."
             )
         self._transport_mode = mode
 
