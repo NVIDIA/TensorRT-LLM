@@ -378,6 +378,39 @@ def _make_transport(
     )
 
 
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+def test_transport_streams_do_not_sync_with_default_stream(monkeypatch):
+    """Bounce gather/scatter streams must be non-blocking.
+
+    The executor makes the legacy default stream wait on every forward, so a blocking stream
+    would queue each gather and scatter behind the in-flight forward.
+    """
+    created = []
+
+    def create_with_flags(flags):
+        created.append(flags)
+        return btr.cudart.cudaError_t.cudaSuccess, 0x1000 + len(created)
+
+    def create_blocking():
+        raise AssertionError("bounce streams must not be created with cudaStreamCreate()")
+
+    monkeypatch.setattr(btr.cudart, "cudaStreamCreateWithFlags", create_with_flags)
+    monkeypatch.setattr(btr.cudart, "cudaStreamCreate", create_blocking)
+    monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
+    monkeypatch.setattr(btr.VmmBounceTransport, "_scatter_loop", lambda self: None)
+    transport = btr.VmmBounceTransport(
+        SimpleNamespace(register_memory=lambda d: None),
+        device_id=0,
+        capacity_bytes=1 << 30,
+        phys_chunk_size=32 * _MIB,
+        block_bytes_per_group=[64],
+    )
+    transport._scatter_thread.join(timeout=5)
+
+    assert created == [btr.cudart.cudaStreamNonBlocking] * 2
+    assert {transport._send_stream, transport._scatter_stream} == {0x1001, 0x1002}
+
+
 def _recv_req(block_counts, rid=1, slice_id=0):
     # Positional block tables: `n` held slots followed by one -1 hole, which
     # the reserve sizing must not count.
