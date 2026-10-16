@@ -945,7 +945,7 @@ def _varlen_launcher(
             static_k=static_k,
             static_npad=npad
             if (
-                k == 2048
+                k in (1024, 2048)
                 or small_k_resident
                 or (k == 1024 and plan_free["tpl"][0] == 512 and plan_free["tpl"][1] >= 5)
                 or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
@@ -954,15 +954,9 @@ def _varlen_launcher(
             and sm_version in (100, 103)
             else None,
             dense_bracket=k <= 512,
-            bracket_sample_lanes=32
-            if k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048
-            else 1,
+            bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8192 else 1,
             warp_rank=(
-                (
-                    (k == 2048 and num_rows <= num_sms)
-                    or small_k_resident
-                    or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
-                )
+                ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
                 and n_kernel > k
                 and sm_version in (100, 103)
             ),
