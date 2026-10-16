@@ -16,8 +16,14 @@
 
 Routes a request-level ``reasoning_effort`` to the MuseSpark chat template and
 normalizes every serve-derived effort onto the levels the template accepts.
-Structured-output placement is the generic path: the constraint applies as a
-raw grammar from the first generated token, with no model-specific trigger.
+
+Structured output takes the generic reasoning-parser placement. This extension
+is registered by model type only, so no hook is keyed by the ``musespark``
+reasoning parser, and ``_response_format_to_guided_decoding_params`` wraps the
+constraint in a structural tag: a forced private reasoning message, opened by
+``MuseSparkReasoningParser.reasoning_start`` and closed by ``reasoning_end``,
+then the constraint on the answer message. Reasoning tokens therefore count
+toward ``max_tokens`` before any constrained output.
 """
 
 from typing import Optional
