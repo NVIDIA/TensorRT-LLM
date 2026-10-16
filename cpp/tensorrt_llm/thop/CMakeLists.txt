@@ -151,7 +151,8 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
-  denseFp8FmhaOp.cpp)
+  denseFp8FmhaOp.cpp
+  fusedDiTQKNormRopeFp8Op.cpp)
 # denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
 # target carries the compile definitions those headers need to match the
 # library's struct layouts.
