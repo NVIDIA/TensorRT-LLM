@@ -1573,5 +1573,42 @@ def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, 
         )
         assert b12x_rejection.reason is expected
         assert "USING_OSS_CUTLASS_MOE_GEMM=ON" in b12x_rejection.detail
+        assert "CuteDslB12xFusedMoE" in b12x_rejection.detail
+        assert b12x_rejection.detail.startswith("NVFP4 prefill routes through CUTLASS:")
     else:
         assert impl_class_for(report) is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+def test_b12x_lora_rejection_is_build_independent(is_oss):
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+
+    verdict = CuteDslB12xFusedMoE.can_implement(
+        MoEProblem(quant=canonical_quant(QuantAlgo.NVFP4), dtype_act=torch.bfloat16),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            moe_lora_enabled=True,
+            env=MoEEnvironment(sm=120, oss_cutlass_moe=is_oss, available_deps=(MoEDep.FLASHINFER,)),
+        ),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.LORA_UNSUPPORTED
+    assert verdict.detail == "CuteDslB12xFusedMoE does not fuse routed-expert LoRA"
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4, None])
+@pytest.mark.parametrize("num_tokens", [63, 64, 65])
+def test_b12x_cutlass_prefill_routing(quant_algo, num_tokens):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+
+    backend = CuteDslB12xFusedMoE.__new__(CuteDslB12xFusedMoE)
+    torch.nn.Module.__init__(backend)
+    backend.quant_config = SimpleNamespace(quant_algo=quant_algo) if quant_algo else None
+    expected = quant_algo == QuantAlgo.NVFP4 and num_tokens >= 64
+    assert backend._route_to_cutlass(torch.empty(num_tokens, 1)) is expected
