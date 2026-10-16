@@ -86,7 +86,8 @@ class MixedPrecisionKVView:
         )
         history_ids = manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
         cached_lengths = metadata.kv_cache_params.num_cached_tokens_per_seq
-        lengths = [a + b for a, b in zip(cached_lengths, metadata.seq_lens.tolist())]
+        seq_lens = metadata.seq_lens.tolist()
+        lengths = [a + b for a, b in zip(cached_lengths, seq_lens)]
         self.page_counts = [
             (n + self.tokens_per_block - 1) // self.tokens_per_block for n in lengths
         ]
@@ -117,7 +118,7 @@ class MixedPrecisionKVView:
             maybe_pin_memory(torch.tensor([cached_lengths, lengths], dtype=torch.int32)),
             non_blocking=True,
         )
-        self.max_new_tokens_per_request = max(metadata.seq_lens.tolist(), default=0)
+        self.max_new_tokens_per_request = max(seq_lens, default=0)
 
         from .flashinfer import FlashInferAttentionMetadata
 
@@ -140,14 +141,14 @@ class MixedPrecisionKVView:
             self.metadata.kv_layout = self.layout
             self.metadata.use_paged_context_fmha = True
             offsets = self.block_offsets()
-            self.kv_cache_block_offsets = buffers.get_buffer(
+            block_offsets = buffers.get_buffer(
                 (1, manager.max_batch_size, 2, self.max_blocks_per_seq),
                 torch.int32,
                 f"mixed_block_offsets_{layer_idx}",
                 metadata.is_cuda_graph,
             )[:, : len(lengths)]
-            self.kv_cache_block_offsets.copy_(offsets, non_blocking=True)
-            self.metadata.kv_cache_block_offsets = self.kv_cache_block_offsets
+            block_offsets.copy_(offsets, non_blocking=True)
+            self.metadata.kv_cache_block_offsets = block_offsets
         self.metadata.mixed_precision_kv_views = None
 
     def materialize(self) -> None:
@@ -194,8 +195,7 @@ class MixedPrecisionKVView:
         )
 
     def block_offsets(self) -> torch.Tensor:
-        width = (self.max_seq_len + self.tokens_per_block - 1) // self.tokens_per_block
-        ordinals = torch.arange(width, dtype=torch.int32)
+        ordinals = torch.arange(self.max_blocks_per_seq, dtype=torch.int32)
         pages = torch.tensor(self.page_starts[:-1], dtype=torch.int32)[:, None] + ordinals
         kv_factor = self.pool.shape[1]
         offsets = torch.stack((kv_factor * pages, kv_factor * pages + kv_factor - 1), dim=1)

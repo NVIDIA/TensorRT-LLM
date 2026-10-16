@@ -67,7 +67,7 @@ class _PagedMixedPrecisionKV:
         position = token
         if cutlass.const_expr(self.write):
             position += lengths[0, request]
-        if token < self.capacity and position < pages_per_request * pool.shape[2]:
+        if token < self.capacity:
             view_page = request * pages_per_request + position // pool.shape[2]
             view_row = pool[view_page, kv, position % pool.shape[2], head, None]
             view_tile = cute.local_tile(view_row, (16,), (group,))
@@ -76,45 +76,34 @@ class _PagedMixedPrecisionKV:
             valid = position < lengths[0, request]
             if cutlass.const_expr(self.write):
                 valid = position < lengths[1, request]
-            if valid and page < tables.shape[2]:
+            if valid:
                 low_page = cutlass.Int64(tables[0, request, page])
                 scale_page = cutlass.Int64(tables[1, request, page])
                 high_page = cutlass.Int64(tables[2, request, page])
                 if cutlass.const_expr(self.write):
-                    if (
-                        low_page >= 0
-                        and low_page < history.shape[0]
-                        and scale_page >= 0
-                        and scale_page < scales.shape[0]
-                    ):
-                        if cutlass.const_expr(pool.element_type == cutlass.Float16):
-                            scale, packed = process_nvfp4_block_half(
-                                view_row, cutlass.Int32(group * 16), cutlass.Float32(1.0)
-                            )
-                        elif cutlass.const_expr(pool.element_type == cutlass.BFloat16):
-                            scale, packed = process_nvfp4_block_bfloat(
-                                view_row, cutlass.Int32(group * 16), cutlass.Float32(1.0)
-                            )
-                        else:
-                            scale, packed = process_nvfp4_block_fp8(
-                                view_row, cutlass.Int32(group * 16), cutlass.Float32(6.0)
-                            )
-                        low_row = history[low_page, kv, offset, head, None]
-                        st_global_u64(get_ptr_as_int64(low_row, cutlass.Int32(group * 8)), packed)
-                        scales[scale_page, kv, offset, head, group] = scale
-                    if high_page >= 0 and high_page < high.shape[0]:
+                    if cutlass.const_expr(pool.element_type == cutlass.Float16):
+                        scale, packed = process_nvfp4_block_half(
+                            view_row, cutlass.Int32(group * 16), cutlass.Float32(1.0)
+                        )
+                    elif cutlass.const_expr(pool.element_type == cutlass.BFloat16):
+                        scale, packed = process_nvfp4_block_bfloat(
+                            view_row, cutlass.Int32(group * 16), cutlass.Float32(1.0)
+                        )
+                    else:
+                        scale, packed = process_nvfp4_block_fp8(
+                            view_row, cutlass.Int32(group * 16), cutlass.Float32(6.0)
+                        )
+                    low_row = history[low_page, kv, offset, head, None]
+                    st_global_u64(get_ptr_as_int64(low_row, cutlass.Int32(group * 8)), packed)
+                    scales[scale_page, kv, offset, head, group] = scale
+                    if high_page >= 0:
                         high_row = high[high_page, kv, offset, head, None]
                         _copy_native(view_tile, cute.local_tile(high_row, (16,), (group,)))
                 else:
-                    if high_page >= 0 and high_page < high.shape[0]:
+                    if high_page >= 0:
                         high_row = high[high_page, kv, offset, head, None]
                         _copy_native(cute.local_tile(high_row, (16,), (group,)), view_tile)
-                    elif (
-                        low_page >= 0
-                        and low_page < history.shape[0]
-                        and scale_page >= 0
-                        and scale_page < scales.shape[0]
-                    ):
+                    else:
                         low_row = history[low_page, kv, offset, head, None]
                         packed = cute.make_rmem_tensor((8,), cutlass.Uint8)
                         cute.autovec_copy(cute.local_tile(low_row, (8,), (group,)), packed)
@@ -136,8 +125,6 @@ class _PagedMixedPrecisionKV:
                         restored = cute.make_rmem_tensor((16,), pool.element_type)
                         restored.store(values.to(pool.element_type))
                         cute.autovec_copy(restored, view_tile)
-                    else:
-                        cute.recast_tensor(view_tile, cutlass.Uint8).fill(0)
             elif cutlass.const_expr(not self.write):
                 cute.recast_tensor(view_tile, cutlass.Uint8).fill(0)
 
@@ -188,6 +175,7 @@ def materialize_mixed_precision_kv(
     Pools are 5D HND/NHD views; the native view may use a different page size.
     CUDA int32 page_tables[3, B, P] contains independent low/scale/high page IDs
     (missing high pages are -1); lengths[2, B] contains cached/total lengths.
+    The manager supplies valid page IDs and lengths within the view capacity.
     NVFP4 global scale is 6 for FP8 native KV and 1 for FP16/BF16.
     """
     block_size = pool.shape[3 if layout == "HND" else 2]

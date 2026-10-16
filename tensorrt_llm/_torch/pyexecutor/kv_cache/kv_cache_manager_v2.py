@@ -6781,8 +6781,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         high_low_pool_ratio: float | None = None,
         **kwargs,
     ) -> None:
-        if kwargs.get("cold_page_codec_provider") is not None:
-            raise NotImplementedError("Mixed-precision cold-page compression is not supported yet")
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.first_n = first_n
@@ -6790,10 +6788,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         self.high_dtype = dtype
         self.low_dtype = low_dtype
         self.high_low_pool_ratio = high_low_pool_ratio
-        if high_low_pool_ratio is not None and (
-            not math.isfinite(high_low_pool_ratio) or high_low_pool_ratio <= 0
-        ):
-            raise ValueError("high_low_pool_ratio must be a finite positive byte ratio")
         self.high_layers: dict[int, int] = {}
         self._shared_kv_layers: set[int] = set()
         config = kwargs.get("pretrained_config")
@@ -6827,27 +6821,18 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                     raise ValueError("Mixed-precision KV requires adjacent K/V block-scale pages")
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        config = super()._build_cache_config(config)
         # Assign extra SWA IDs after the native removal of empty layers.
         config = super()._remove_zero_size_buffers(config)
         if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
             raise NotImplementedError(
                 "Mixed precision currently supports dense self Attention only"
             )
-        if self.first_n < 0 or self.last_n < 0:
-            raise ValueError("First/Last counts must be nonnegative")
-        if self.max_beam_width != 1 or self.max_draft_len or self.mapping.cp_size != 1:
-            raise NotImplementedError(
-                "Mixed precision requires single-beam, non-speculative execution with CP=1"
-            )
+        if self.mapping.cp_size != 1:
+            raise NotImplementedError("Mixed precision requires CP=1")
         if config.enable_swa_scratch_reuse:
             raise NotImplementedError("Mixed-precision staging requires ordinary SWA page tables")
-        if self.low_dtype != DataType.NVFP4 or self.high_dtype not in (
-            DataType.HALF,
-            DataType.BF16,
-            DataType.FP8,
-        ):
-            raise ValueError("Mixed precision requires NVFP4 history and FP16/BF16/FP8 high KV")
+        if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
+            raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
         layers = list(config.layers)
         next_id = max(int(layer.layer_id) for layer in layers) + 1
         if self.first_n or self.last_n:

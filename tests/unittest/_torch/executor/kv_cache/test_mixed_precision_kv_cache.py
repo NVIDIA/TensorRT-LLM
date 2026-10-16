@@ -65,14 +65,13 @@ def manager(request):
     indirect=True,
 )
 def test_extra_pool_uses_existing_dtype_layout(manager):
-    """Allocation coverage, not a claim that every dtype has an Attention reader."""
+    """High pages use the configured native KV dtype without block scales."""
     high = manager.kv_cache_manager_py_config.layers[1]
     for buffer in high.buffers:
         expected = get_size_in_bytes(2 * 64 * 128, manager.high_dtype)
         assert buffer.size == expected
         assert manager.impl.get_page_stride(high.layer_id, buffer.role) >= expected
-    has_scales = any(buffer.role == Role.KEY_BLOCK_SCALE for buffer in high.buffers)
-    assert has_scales == (manager.high_dtype == DataType.NVFP4)
+    assert all(buffer.role in (Role.KEY, Role.VALUE) for buffer in high.buffers)
 
 
 @pytest.mark.parametrize("dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
