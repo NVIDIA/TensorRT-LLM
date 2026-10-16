@@ -4907,13 +4907,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "First tokens retained at the KV dtype when mixed precision is enabled. "
-        "Must be a multiple of tokens_per_block.")
+        "Accepts any nonnegative count; retention follows native page granularity."
+    )
     last_n: NonNegativeInt = Field(
         default=256,
         status="prototype",
         description=
         "Recent tokens retained at the KV dtype when mixed precision is enabled. "
-        "Must be a multiple of tokens_per_block.")
+        "Accepts any nonnegative count; retention follows native page granularity."
+    )
     high_low_pool_ratio: Optional[PositiveFloat] = Field(
         default=None,
         status="prototype",

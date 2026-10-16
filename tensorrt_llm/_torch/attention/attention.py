@@ -21,6 +21,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
                                                is_in_breakable_cuda_graph)
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    MixedPrecisionKVCacheManager
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
 from .backends import (AttentionForwardArgs, AttentionMetadata,
@@ -28,7 +30,8 @@ from .backends import (AttentionForwardArgs, AttentionMetadata,
 from .backends.interface import (AttentionMask, CustomAttentionMask,
                                  PositionalEmbeddingParams,
                                  PredefinedAttentionMask)
-from .backends.mixed_precision_kv_view import configure_attention
+from .backends.mixed_precision_kv_view import \
+    configure_mixed_precision_attention
 from .backends.sparse.hooks import get_sparse_attention_hooks
 from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
@@ -881,8 +884,10 @@ class Attention(nn.Module):
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
         # Attention is treated as mixed request by default.
-        if self.layer_idx in attn_metadata.mixed_precision_kv_views:
-            configure_attention(self.attn)
+        if (isinstance(attn_metadata.kv_cache_manager,
+                       MixedPrecisionKVCacheManager)
+                and self.layer_idx in attn_metadata.mixed_precision_kv_views):
+            configure_mixed_precision_attention(self.attn)
         return self.attn.create_output(
             q,
             is_quantize_output=self._use_quantize_output(),
@@ -988,12 +993,15 @@ class Attention(nn.Module):
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
 
-        attention_kv = attn_metadata.mixed_precision_kv_views.get(
-            self.attn.layer_idx)
-        if attention_kv is not None:
-            attention_kv.prepare(self.attn,
-                                 history_dequant_scale=kv_scale_quant_orig)
-            attn_metadata = attention_kv.metadata
+        mixed_precision_kv_view = None
+        if isinstance(attn_metadata.kv_cache_manager,
+                      MixedPrecisionKVCacheManager):
+            mixed_precision_kv_view = attn_metadata.mixed_precision_kv_views.get(
+                self.attn.layer_idx)
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.prepare(
+                self.attn, history_dequant_scale=kv_scale_quant_orig)
+            attn_metadata = mixed_precision_kv_view.metadata
             kv_scale_orig_quant = kv_scale_quant_orig = None
         attn_output = self.attn.forward(
             q,
@@ -1016,8 +1024,8 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
             ))
-        if attention_kv is not None:
-            attention_kv.writeback()
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.writeback()
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output

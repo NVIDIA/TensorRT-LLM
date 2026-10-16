@@ -49,8 +49,8 @@ def manager(request):
         low_dtype=history_dtype,
         compute_dtype=torch.bfloat16,
         high_low_pool_ratio=1 / 3,
-        first_n=128,
-        last_n=128,
+        first_n=1,
+        last_n=65,
     )
     yield manager
     manager.shutdown()
@@ -203,8 +203,8 @@ def test_pool_ratio_splits_native_groups_not_individual_layers(manager):
 def test_native_common_reuse_and_window_retention(manager):
     config = manager.kv_cache_manager_py_config
     assert [layer.reuse_policy for layer in config.layers] == [kv.AttentionReusePolicy.REQUIRED] * 2
-    assert config.layers[1].num_sink_tokens == 128
-    assert config.layers[1].sliding_window_size == 129
+    assert config.layers[1].num_sink_tokens == 1
+    assert config.layers[1].sliding_window_size == 66
     assert (
         MixedPrecisionKVCacheManager.prepare_context_cache is KVCacheManagerV2.prepare_context_cache
     )
@@ -223,7 +223,7 @@ def test_native_common_reuse_and_window_retention(manager):
         assert source.resume(stream) and source.resize(len(tokens))
         source.commit(tokens)
         source.suspend()
-        # Native SWA discards middle working mappings, but keeps sink and tail.
+        # The one-token sink and 65-token tail retain their full native pages.
         high_group = native.get_layer_group_id(manager.high_layers[0])
         assert source.resume(stream, is_decoding=True)
         pages = list(source.get_base_page_indices(high_group))

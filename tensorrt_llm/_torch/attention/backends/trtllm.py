@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
+    from .mixed_precision_kv_view import MixedPrecisionKVView
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
@@ -139,6 +140,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
+    mixed_precision_kv_views: dict[int, "MixedPrecisionKVView"] = field(
+        init=False, default_factory=dict, repr=False, compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -370,6 +373,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.mixed_precision_kv_views = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)

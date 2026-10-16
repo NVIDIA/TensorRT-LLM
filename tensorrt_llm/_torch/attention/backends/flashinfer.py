@@ -20,7 +20,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, NewType, Optional, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Dict, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -32,6 +32,9 @@ import numpy as np
 import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from .mixed_precision_kv_view import MixedPrecisionKVView
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
@@ -330,6 +333,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _logical_kv_lens: torch.Tensor = field(init=False, repr=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+    mixed_precision_kv_views: dict[int, "MixedPrecisionKVView"] = field(
+        init=False, default_factory=dict, repr=False, compare=False)
 
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
@@ -1082,6 +1087,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.mixed_precision_kv_views = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:

@@ -6754,11 +6754,16 @@ class KVCacheManagerV2(BaseResourceManager):
             self._sharing._on_reset()
 
 
+class _MixedPrecisionLayerKind(IntEnum):
+    PRIMARY = 0
+    HIGH_PRECISION = 1
+
+
 class MixedPrecisionKVCacheManager(KVCacheManagerV2):
     """Dense KV prototype using the existing full-history and SWA lifecycles.
 
     ``first_n`` is the sink length; ``last_n`` counts previously written tokens.
-    Counts are block aligned. Both pools use native allocation, migration,
+    Retention follows native page granularity. Both pools use native allocation, migration,
     eviction and REQUIRED reuse; the window does not change the Attention mask.
     ``dtype`` keeps its usual meaning for native layers and the high copy;
     ``low_dtype`` applies only to unshared, full-history dense K/V layers.
@@ -6868,8 +6873,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             raise NotImplementedError(
                 "Mixed precision currently supports dense self Attention only"
             )
-        if any(n < 0 or n % self.tokens_per_block for n in (self.first_n, self.last_n)):
-            raise ValueError("First/Last counts must be nonnegative multiples of tokens_per_block")
+        if self.first_n < 0 or self.last_n < 0:
+            raise ValueError("First/Last counts must be nonnegative")
         if self.max_beam_width != 1 or self.max_draft_len or self.mapping.cp_size != 1:
             raise NotImplementedError(
                 "Mixed precision requires single-beam, non-speculative execution with CP=1"
@@ -6884,8 +6889,11 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             raise ValueError("Mixed precision requires NVFP4 history and FP16/BF16/FP8 high KV")
         layers = list(config.layers)
         next_id = max(int(layer.layer_id) for layer in layers) + 1
-        # Pool transfer IDs are fixed at construction, independently of PP placement.
-        self._disagg_layer_ids = {local: 2 * model for local, model in enumerate(self.pp_layers)}
+        if self.first_n or self.last_n:
+            self._layer_attn_to_layer_id = {
+                (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
+                for local, model in enumerate(self.pp_layers)
+            }
         largest_page = 0
         for layer in config.layers:
             # Native SWA and recurrent-state pools keep their existing lifecycles.
@@ -6910,7 +6918,9 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                 if role in (Role.KEY, Role.VALUE)
             ]
             self.high_layers[layer_id] = next_id
-            self._disagg_layer_ids[next_id] = self._disagg_layer_ids[layer_id] + 1
+            self._layer_attn_to_layer_id[
+                self.pp_layers[layer_id], _MixedPrecisionLayerKind.HIGH_PRECISION
+            ] = LayerId(next_id)
             layers.append(
                 AttentionLayerConfig(
                     layer_id=next_id,

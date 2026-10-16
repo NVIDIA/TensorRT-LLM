@@ -37,6 +37,7 @@ from ..modules.linear import Linear, TensorParallelMode, is_static_nvfp4_input_e
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from ..utils import (
     AuxStreamType,
     Fp4QuantizedTensor,
@@ -60,7 +61,10 @@ from .backends import (
     TrtllmAttentionMetadata,
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
-from .backends.mixed_precision_kv_view import MixedPrecisionKVView, configure_attention
+from .backends.mixed_precision_kv_view import (
+    MixedPrecisionKVView,
+    configure_mixed_precision_attention,
+)
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import append_mla_latent_cache, create_attention
 from .rotary_embedding import RotaryEmbedding
@@ -968,11 +972,13 @@ class MLA(nn.Module):
             )
             return
 
-        attention_kv = attn_metadata.mixed_precision_kv_views.get(self.layer_idx)
-        if attention_kv is not None:
-            attention_kv.prepare(self.mqa)
-            configure_attention(self.mha)
-            attn_metadata = attention_kv.metadata
+        mixed_precision_kv_view = None
+        if isinstance(attn_metadata.kv_cache_manager, MixedPrecisionKVCacheManager):
+            mixed_precision_kv_view = attn_metadata.mixed_precision_kv_views.get(self.layer_idx)
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.prepare(self.mqa)
+            configure_mixed_precision_attention(self.mha)
+            attn_metadata = mixed_precision_kv_view.metadata
             if self.rotary_emb is None:
                 self.rotary_emb = RotaryEmbedding(
                     self.pos_embd_params.rope,
@@ -988,8 +994,8 @@ class MLA(nn.Module):
             attn_output[0],
             latent_cache_gen=latent_cache_gen,
         )
-        if attention_kv is not None:
-            attention_kv.writeback()
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.writeback()
 
     def _forward_impl(
         self,

@@ -18,10 +18,12 @@ from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned, torch_dtype_to_
 from tensorrt_llm.bindings import DataType
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.interface import AttentionBackend, AttentionMetadata
+    from .flashinfer import FlashInferAttentionMetadata
+    from .interface import AttentionBackend
+    from .trtllm import TrtllmAttentionMetadata
 
 
-def configure_attention(attention: "AttentionBackend") -> None:
+def configure_mixed_precision_attention(attention: "AttentionBackend") -> None:
     """Bind an eligible layer's backend to its FP16/BF16 staging cache."""
     from .trtllm import TrtllmAttention
 
@@ -58,7 +60,7 @@ class MixedPrecisionKVView:
     ) -> None:
         from .trtllm import TrtllmAttention
 
-        configure_attention(attention)
+        configure_mixed_precision_attention(attention)
         if history_dequant_scale is None and isinstance(attention, TrtllmAttention):
             history_dequant_scale = attention.kv_scale_quant_orig
         if history_dequant_scale is not None:
@@ -66,7 +68,9 @@ class MixedPrecisionKVView:
         self.materialize()
 
     @classmethod
-    def prepare_batch(cls, metadata: "AttentionMetadata") -> None:
+    def prepare_batch(
+        cls, metadata: "TrtllmAttentionMetadata | FlashInferAttentionMetadata"
+    ) -> None:
         """Update addresses and native Attention plans before capture or replay."""
         manager = metadata.kv_cache_manager
         for layer_idx, local in manager.layer_offsets.items():
@@ -80,7 +84,7 @@ class MixedPrecisionKVView:
 
     def __init__(
         self,
-        metadata: "AttentionMetadata",
+        metadata: "TrtllmAttentionMetadata | FlashInferAttentionMetadata",
         layer_idx: int,
     ) -> None:
         from .trtllm import TrtllmAttentionMetadata
@@ -117,7 +121,9 @@ class MixedPrecisionKVView:
         self._indices: dict[str, torch.Tensor] = {}
         self.metadata = None
 
-    def update(self, metadata: "AttentionMetadata", layer_idx: int) -> None:
+    def update(
+        self, metadata: "TrtllmAttentionMetadata | FlashInferAttentionMetadata", layer_idx: int
+    ) -> None:
         manager = metadata.kv_cache_manager
         (_, high_ids), (_, scale_ids) = manager.get_mixed_precision_buffers(
             layer_idx, metadata.request_ids, metadata.kv_layout
