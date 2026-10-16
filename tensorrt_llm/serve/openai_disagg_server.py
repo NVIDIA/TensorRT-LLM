@@ -333,7 +333,8 @@ class OpenAIDisaggServer:
             router, role, self._req_timeout_secs, max_retries,
             disagg_id_generator=disagg_id_generator,
             request_perf_metrics=self._collect_perf_metrics,
-            internal_disagg_auth_key=self._config.internal_request_auth_key)
+            internal_disagg_auth_key=self._config.internal_request_auth_key,
+            bounded_replay_on_generation=self._config.bounded_replay_on_generation)
         return client
 
     def register_routes(self):

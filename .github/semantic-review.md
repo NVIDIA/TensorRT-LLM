@@ -3,6 +3,16 @@
 
 # Semantic conflict review
 
+**Disabled:** The workflow has no scheduled or comment triggers, and its discovery
+and publication jobs are unconditionally skipped, including on manual dispatch
+and reruns using this configuration. It no longer sends CodeRabbit requests as
+`trtllm-agent`, processes replies, or tidies discussion comments. CodeRabbit
+automatic chat replies are disabled separately in `.coderabbit.yaml`; humans
+can still explicitly mention CodeRabbit. Its review/chat instructions also tell
+it to ignore automated reviewers and avoid tagging them or learning from them.
+
+The sections below describe the retained implementation for historical reference.
+
 The workflow asks CodeRabbit to inspect the combined behavior of a PR and its
 target branch. It publishes a commit status named
 **Semantic conflict with target branch / PR #N** on the requested head commit.

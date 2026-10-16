@@ -166,6 +166,46 @@ def test_mtp_slot_pool_survives_a_full_overlap_turnover():
     assert all(0 <= slot < POOL + 1 for slot in retiring + incoming)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MTP hidden-state pools are CUDA tensors")
+def test_mtp_prepare_resources_reuses_a_preallocated_dummy_slot():
+    """A slot registered by ``add_dummy_requests`` must be reused, not re-added.
+
+    The attention-DP idle-rank dummy registers its slot via
+    ``add_dummy_requests``, then the same request flows through
+    ``prepare_resources`` as an ordinary first-context-chunk request.
+    ``SlotManager.add_slot`` only tolerates a duplicate add for the
+    CUDA-graph dummy id, so a regression that drops the reuse guard in
+    ``prepare_resources`` crashes on any other preallocated id.
+    """
+    mgr = MTPHiddenStatesManager(
+        _mtp_config(), torch.float16, hidden_size=8, max_num_requests=R, num_seq_slots=POOL
+    )
+
+    dummy_id = 0
+    mgr.add_dummy_requests([dummy_id])
+    preallocated_slot = mgr.slot_manager.get_slot(dummy_id)
+
+    scheduled_batch = types.SimpleNamespace(
+        context_requests=[
+            types.SimpleNamespace(request_id=dummy_id, is_first_context_chunk=True),
+        ]
+    )
+    mgr.prepare_resources(scheduled_batch)
+
+    assert mgr.slot_manager.get_slot(dummy_id) == preallocated_slot
+
+    other_id = 1
+    scheduled_batch = types.SimpleNamespace(
+        context_requests=[
+            types.SimpleNamespace(request_id=other_id, is_first_context_chunk=True),
+        ]
+    )
+    mgr.prepare_resources(scheduled_batch)
+
+    assert mgr.slot_manager.get_slot(other_id) is not None
+    assert mgr.slot_manager.get_slot(other_id) != preallocated_slot
+
+
 # ---------------------------------------------------------------------------
 # Resource managers. The plumbing is per-branch, so the AST guard below makes
 # forgetting a branch a test failure rather than a runtime IndexError.
@@ -353,6 +393,52 @@ def test_eagle3_keeps_the_max_seq_len_floor():
     )
 
     assert mgr.slot_manager.max_num_requests == 1024 + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Eagle3 hidden states are CUDA tensors")
+def test_eagle3_prepare_resources_reuses_a_preallocated_dummy_slot():
+    """A slot registered by ``add_dummy_requests`` must be reused, not re-added.
+
+    The attention-DP idle-rank dummy registers its slot via
+    ``add_dummy_requests``, then the same request flows through
+    ``prepare_resources`` as an ordinary first-context-chunk request.
+    ``SlotManager.add_slot`` only tolerates a duplicate add for the
+    CUDA-graph dummy id, so a regression that drops the reuse guard in
+    ``prepare_resources`` crashes on any other preallocated id.
+    """
+    mgr = Eagle3ResourceManager(
+        _eagle_config(),
+        torch.float16,
+        hidden_size=8,
+        max_num_requests=R,
+        max_seq_len=4,
+        max_num_tokens=64,
+        num_seq_slots=POOL,
+    )
+
+    dummy_id = 0
+    mgr.add_dummy_requests([dummy_id])
+    preallocated_slot = mgr.slot_manager.get_slot(dummy_id)
+
+    scheduled_batch = types.SimpleNamespace(
+        context_requests=[
+            types.SimpleNamespace(request_id=dummy_id, is_first_context_chunk=True),
+        ]
+    )
+    mgr.prepare_resources(scheduled_batch)
+
+    assert mgr.slot_manager.get_slot(dummy_id) == preallocated_slot
+
+    other_id = 1
+    scheduled_batch = types.SimpleNamespace(
+        context_requests=[
+            types.SimpleNamespace(request_id=other_id, is_first_context_chunk=True),
+        ]
+    )
+    mgr.prepare_resources(scheduled_batch)
+
+    assert mgr.slot_manager.get_slot(other_id) is not None
+    assert mgr.slot_manager.get_slot(other_id) != preallocated_slot
 
 
 def _sa_manager(num_seq_slots, **config_kwargs):

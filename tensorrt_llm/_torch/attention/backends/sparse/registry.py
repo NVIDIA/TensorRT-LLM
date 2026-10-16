@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 # function: they pull in ``trtllm`` and ``resource_manager``, which import
 # ``interface`` and would otherwise form an import cycle when this package is
 # loaded.
+# The cycle runs through ``backends`` alone: the ``tensorrt_llm._torch.attention``
+# package root resolves its exports lazily and takes no part in it, so these
+# imports have to stay local regardless of how the package root exports names.
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -30,6 +33,10 @@ def get_sparse_attn_kv_cache_manager(
     from .qsa import QSAMambaHybridCacheManagerV2
     from .rocket import RocketKVCacheManager
 
+    if sparse_attention_config.algorithm == "csa2":
+        from .csa2.cache_manager import CSA2CacheManager
+
+        return CSA2CacheManager
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
@@ -93,6 +100,10 @@ def get_trtllm_sparse_attn_attention_backend(
     from .qsa import QSATrtllmAttention
     from .rocket import RocketTrtllmAttention
 
+    if sparse_params.algorithm == "csa2":
+        from .csa2.backend import get_csa2_backend
+
+        return get_csa2_backend(sparse_params)
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_params.algorithm == "qsa":

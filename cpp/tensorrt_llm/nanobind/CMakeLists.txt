@@ -25,7 +25,6 @@ set(SRCS
     userbuffers/bindings.cpp
     thop/bindings.cpp
     visual_gen/coordinatorWatchdog.cpp
-    ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)

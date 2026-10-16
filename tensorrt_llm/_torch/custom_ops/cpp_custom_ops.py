@@ -377,7 +377,8 @@ def _register_fake():
           index_topk,
           compress_ratio=1,
           radix_aux_indices=None,
-          radix_aux_logits=None):
+          radix_aux_logits=None,
+          row_kv_lens=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -516,6 +517,8 @@ def _register_fake():
         topk: int,
         route_scale: float,
         is_hash: bool,
+        image_mask: Optional[torch.Tensor] = None,
+        vision_bias: Optional[torch.Tensor] = None,
     ) -> None:
         # In-place operation, no return value.
         pass
@@ -762,13 +765,11 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_a2a_initialize")
     def _(
         workspace: torch.Tensor,
+        metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
-        max_num_tokens_per_rank: int,
-        eplb_stats_num_experts: Optional[int] = None,
-        can_use_cft_counted_writes: bool = False,
-    ) -> torch.Tensor:
-        return torch.empty((10, ), dtype=torch.int64, device="cpu")
+    ) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::moe_a2a_sanitize_expert_ids")
     def _(
@@ -783,10 +784,10 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,
+        metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
         runtime_max_tokens_per_rank: int,
-        combine_payload_offset: int,
         out_dtype: torch.dtype,
         hidden_size: int,
     ) -> torch.Tensor:
@@ -942,6 +943,20 @@ def _register_fake():
         min_ps: torch.Tensor,
     ) -> torch.Tensor:
         return logits.new_empty(logits.shape, dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::chain_speculative_sampling")
+    def _(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_draft = draft_token_ids.shape
+        return (
+            draft_token_ids.new_empty((batch_size, num_draft + 1)),
+            draft_token_ids.new_empty((batch_size, )),
+        )
 
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")

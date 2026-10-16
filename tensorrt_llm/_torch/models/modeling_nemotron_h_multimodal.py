@@ -26,6 +26,7 @@ from einops import rearrange as einops_rearrange
 from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
     DisaggPrefillMultimodalInputs,
     MultimodalParams,
@@ -1125,7 +1126,20 @@ class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
                 )
                 for p in multimodal_params
             ]
-            embeds, _ = super(NemotronHMultimodalEncoder, self).forward(views)
+            embeds, retained_counts = super(NemotronHMultimodalEncoder, self).forward(views)
+            if retained_counts is not None:
+                for param, counts in zip(multimodal_params, retained_counts, strict=True):
+                    if counts is None:
+                        continue
+                    tubelet_lengths = [
+                        math.ceil(size[0] / self.video_temporal_patch_size)
+                        for size in param.multimodal_data["video"]["video_size"]
+                    ]
+                    # Per-item counts travel with the embedding they describe.
+                    param.multimodal_data["multimodal_embedding_metadata"] = [
+                        {"retained_token_counts": item.tolist()}
+                        for item in counts.split(tubelet_lengths)
+                    ]
             return torch.cat(embeds, dim=0)
 
         pack = lambda params: {"multimodal_params": params}  # noqa: E731
@@ -2519,12 +2533,54 @@ class NemotronHMultimodalInputProcessor(
             prompt_token_ids = self.tokenizer.encode(text_prompt, add_special_tokens=False)
         prompt_token_ids = list(prompt_token_ids)
 
-        expanded_ids, _ = self.expand_prompt_token_ids_for_mm(
+        expanded_ids, updates = self.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
             num_mm_tokens,
             hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
             mm_data=mm_data,
         )
+
+        if modalities[0] == "video":
+            retained_counts = [
+                handle.get("metadata", {}).get("retained_token_counts") for handle in mm_handles
+            ]
+            if self.video_pruning_rate > 0:
+                videos = mm_data["video"]
+                if not isinstance(videos, list):
+                    videos = [videos]
+                counts = []
+                for video, item_counts, embedding_length in zip(
+                    videos, retained_counts, multimodal_embedding_lengths, strict=True
+                ):
+                    frames = getattr(video, "frames", video)
+                    num_tubelets = math.ceil(len(frames) / self.video_temporal_patch_size)
+                    if (
+                        not isinstance(item_counts, list)
+                        or len(item_counts) != num_tubelets
+                        or any(type(count) is not int or count < 0 for count in item_counts)
+                        or sum(item_counts) != embedding_length
+                    ):
+                        raise ValueError(
+                            "EVS handoff requires non-negative retained_token_counts per tubelet "
+                            "whose sum matches the embedding length."
+                        )
+                    counts.extend(item_counts)
+                if updates is None or "video" not in updates:
+                    raise ValueError("EVS handoff requires the video placeholder layout.")
+                evs_ids = updates["video"]["evs_ids"].tolist()
+                if evs_ids.count(self.video_context_token_id) != len(counts):
+                    raise ValueError(
+                        "EVS handoff tubelet counts do not match the video placeholders."
+                    )
+                expanded_ids = []
+                count_iter = iter(counts)
+                for token_id in evs_ids:
+                    if token_id == self.video_context_token_id:
+                        expanded_ids.extend([self.img_context_token_id] * next(count_iter))
+                    else:
+                        expanded_ids.append(token_id)
+            elif any(counts is not None for counts in retained_counts):
+                raise ValueError("EVS must be enabled on both encoder and prefill workers.")
 
         input_ids_tensor = _as_cpu_tensor(expanded_ids)
         mm_mask, embed_mask, special_mask = _compute_mm_masks(
@@ -2928,6 +2984,19 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # `infer_max_seq_len` and `set_guided_decoder` through this property,
         # and its base implementation raises.
         return self.llm
+
+    @property
+    def draft_config(self) -> Optional[ModelConfig]:
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self) -> Optional[torch.nn.Module]:
+        return self.llm.draft_model
+
+    def load_draft_weights(
+        self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None
+    ) -> None:
+        self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -3418,23 +3487,9 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                 )
             # E/P prefill: encoder already ran; use attached embeddings.
             else:
-                # Attached-embedding params drop the raw bucket keys and only
-                # keep the legacy `modality_type` tag as a modality hint, so
-                # detection here uses that tag rather than a bucket-key check
-                # (which works for the raw path above but is always None here).
-                if self.video_pruning_rate > 0 and any(
-                    param.has_content() and param.multimodal_data.get("modality_type") == "video"
-                    for param in ctx_params
-                ):
-                    # TODO(TRTLLM-12534): Carry EVS retained-token counts through
-                    # encoder handoff before enabling video pruning for E/P.
-                    raise ValueError(
-                        "EVS video pruning is not supported with attached "
-                        "multimodal embeddings yet."
-                    )
                 mm_embedding = get_attached_multimodal_embeddings(ctx_params)
             # Adjust input_ids in videos if EVS is applied.
-            if self.video_pruning_rate > 0:
+            if self.video_pruning_rate > 0 and raw_ctx_params:
                 # `merge_evs_mm_embeds` reads the legacy `modality_type` tag,
                 # which the input processor only emits for single-modality
                 # requests. Mixed-modality + EVS would additionally need
@@ -3447,7 +3502,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                         p.multimodal_data.get(m) is not None for m in ("image", "video", "audio")
                     )
                     > 1
-                    for p in ctx_params
+                    for p in raw_ctx_params
                 ):
                     raise ValueError(
                         "EVS video pruning is not supported for mixed-modality "
@@ -3456,16 +3511,17 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                 # Retrieve per-video count stashed by `_encode_vision`.
                 num_tokens_in_videos = [
                     param.multimodal_data.get("num_tokens_in_video")
-                    for param in ctx_params
+                    for param in raw_ctx_params
                     if param.has_content()
                 ]
                 input_ids = self.merge_evs_mm_embeds(
                     num_tokens_in_videos,
-                    multimodal_params=ctx_params,
+                    multimodal_params=raw_ctx_params,
                     input_ids=input_ids,
                 )
                 evs_layout_updated = any(
-                    param.multimodal_data.get("modality_type") == "video" for param in ctx_params
+                    param.multimodal_data.get("modality_type") == "video"
+                    for param in raw_ctx_params
                 )
 
             mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)

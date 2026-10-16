@@ -22,12 +22,12 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
     FluxJointAttnMLPProj,
     FluxJointQKVMLPProj,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.quantization.mode import QuantAlgo
 

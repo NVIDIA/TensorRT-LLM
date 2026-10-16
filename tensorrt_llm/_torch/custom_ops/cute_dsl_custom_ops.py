@@ -42,9 +42,9 @@ except ImportError:
 
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
+_CUDA_MAX_GRID_DIM_Z = 65_535
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
-_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
 # Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
 # The Blackwell act-fusion op accepts Optional[float] directly.
@@ -141,6 +141,10 @@ def _validate_16_byte_aligned_dense_tensor(tensor: torch.Tensor,
 
 
 def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
+    if math.isnan(swiglu_limit_scalar):
+        raise ValueError(
+            "swiglu_limit_scalar must not be NaN; pass a negative value or "
+            "+inf to disable the clamp.")
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
@@ -188,10 +192,12 @@ def _get_sm107_nvfp4_default_mma_config(
 
 @functools.lru_cache(maxsize=1)
 def _get_cutedsl_fc2_n_tile_size_override() -> Optional[int]:
-    value = os.environ.get(
-        _CUTEDSL_FC2_N_TILE_SIZE_ENV,
-        str(_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE),
-    )
+    """Return the FC2 N tile pinned by the user, or None to autotune over all of them.
+
+    Unset and ``0`` both autotune. ``128`` or ``256`` pins that tile for shapes
+    where it is known to win end to end.
+    """
+    value = os.environ.get(_CUTEDSL_FC2_N_TILE_SIZE_ENV, "0")
     if value == "0":
         return None
     valid_values = tuple(
@@ -328,7 +334,10 @@ class GroupedGemmInputsHelper:
         else:
             num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank)
 
-        num_tokens_on_curr_rank = min(num_tokens * self.top_k,
+        # A token can select each local expert at most once.
+        max_num_tokens_on_curr_rank = num_tokens * min(self.top_k,
+                                                       self.num_local_experts)
+        num_tokens_on_curr_rank = min(max_num_tokens_on_curr_rank,
                                       num_tokens_on_curr_rank)
 
         base, remainder = divmod(num_tokens_on_curr_rank,
@@ -342,43 +351,91 @@ class GroupedGemmInputsHelper:
     def generate_token_selected_experts(
             self, num_tokens: int,
             num_tokens_per_expert: List[int]) -> torch.Tensor:
-        """Balanced random based on rejection sampling.
-        """
-        token_selected_experts = -torch.ones(
-            num_tokens, self.top_k, dtype=torch.int32)
-        num_selected_experts = torch.zeros(num_tokens, dtype=torch.int32)
+        """Generate a random rank-local routing assignment."""
+        if len(num_tokens_per_expert) != self.num_local_experts:
+            raise ValueError(
+                f"Expected {self.num_local_experts} token counts, got "
+                f"{len(num_tokens_per_expert)}")
+        if any(num_tokens_j < 0 or num_tokens_j > num_tokens
+               for num_tokens_j in num_tokens_per_expert):
+            raise ValueError("Each expert token count must be between zero and "
+                             f"num_tokens ({num_tokens})")
 
-        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-            torch.manual_seed(self.seed)
-            selection_orders = [
-                torch.randperm(num_tokens)
-                for _ in range(self.num_local_experts)
-            ]
+        num_assignments = sum(num_tokens_per_expert)
+        max_num_assignments = num_tokens * min(self.top_k,
+                                               self.num_local_experts)
+        if num_assignments > max_num_assignments:
+            raise ValueError(
+                f"Requested {num_assignments} token-expert assignments, "
+                f"but rank-local capacity is {max_num_assignments}")
 
-        for j, num_tokens_j in enumerate(num_tokens_per_expert):
-            selection_order_j = selection_orders[j].tolist()
-            prioritized = torch.nonzero(num_selected_experts <= (
-                self.top_k - (self.num_experts - j))).squeeze(-1).tolist()
-            if len(prioritized) > 0:
-                selection_order_j = prioritized + [
-                    i for i in selection_order_j if i not in prioritized
-                ]
-            for i in selection_order_j:
-                if num_selected_experts[i] < self.top_k:
-                    token_selected_experts[
-                        i,
-                        num_selected_experts[i]] = j + self.local_expert_offset
-                    num_selected_experts[i] += 1
-                    num_tokens_j -= 1
-                    if num_tokens_j <= 0:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.seed)
+        experts_per_token = [[] for _ in range(num_tokens)]
+        for local_expert_idx, num_tokens_j in enumerate(num_tokens_per_expert):
+            if num_tokens_j == 0:
+                continue
+            selected_tokens = torch.randperm(
+                num_tokens, generator=generator,
+                device="cpu")[:num_tokens_j].tolist()
+            for token_idx in selected_tokens:
+                experts_per_token[token_idx].append(local_expert_idx)
+
+        # Independent expert sampling preserves realistic per-token occupancy.
+        # Move overflow edges to underloaded tokens without changing the
+        # requested per-expert histogram.
+        repair_order = torch.randperm(num_tokens,
+                                      generator=generator,
+                                      device="cpu").tolist()
+        overloaded_tokens = [
+            token_idx for token_idx in repair_order
+            if len(experts_per_token[token_idx]) > self.top_k
+        ]
+        underloaded_tokens = [
+            token_idx for token_idx in repair_order
+            if len(experts_per_token[token_idx]) < self.top_k
+        ]
+        next_underloaded = 0
+        for overloaded_token in overloaded_tokens:
+            source_experts = experts_per_token[overloaded_token]
+            while len(source_experts) > self.top_k:
+                while (next_underloaded < len(underloaded_tokens) and len(
+                        experts_per_token[underloaded_tokens[next_underloaded]])
+                       == self.top_k):
+                    next_underloaded += 1
+                if next_underloaded == len(underloaded_tokens):
+                    raise RuntimeError(
+                        "Unable to repair a valid rank-local routing assignment"
+                    )
+
+                target_experts = experts_per_token[
+                    underloaded_tokens[next_underloaded]]
+                target_expert_set = set(target_experts)
+                for source_pos, local_expert_idx in enumerate(source_experts):
+                    if local_expert_idx not in target_expert_set:
+                        target_experts.append(local_expert_idx)
+                        del source_experts[source_pos]
                         break
+                else:
+                    raise RuntimeError(
+                        "Unable to move an overflowing expert assignment")
 
-        assert ((token_selected_experts
-                 >= 0).sum(dim=-1) == num_selected_experts).all().item()
+        assert sum(len(experts)
+                   for experts in experts_per_token) == num_assignments
+        assert all(len(experts) <= self.top_k for experts in experts_per_token)
+        assert all(
+            len(experts) == len(set(experts)) for experts in experts_per_token)
+        token_selected_experts = torch.tensor(
+            [[
+                local_expert_idx + self.local_expert_offset
+                for local_expert_idx in experts
+            ] + [-1] * (self.top_k - len(experts))
+             for experts in experts_per_token],
+            dtype=torch.int32,
+            device="cpu").view(num_tokens, self.top_k)
+
         if self.num_local_experts == self.num_experts:
-            assert (num_selected_experts == self.top_k).all().item()
-        else:
-            assert (num_selected_experts <= self.top_k).all().item()
+            assert (token_selected_experts >= 0).all().item()
         return token_selected_experts
 
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -553,6 +610,51 @@ def get_dense_gemm_approximate_cta_nums(
     clustered_ctas_m = pad_up(ceil_div(M, tile_m), cluster_m)
     clustered_ctas_n = pad_up(ceil_div(N, tile_n), cluster_n)
     return clustered_ctas_m * clustered_ctas_n
+
+
+def _clc_raster_n_has_launchable_grid(
+    m: int,
+    n: int,
+    batch_size: int,
+    mma_tiler_mn: Tuple[int, int],
+    use_2cta_instrs: bool,
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a CLC raster-N launch fits CUDA's grid-Z limit.
+
+    ``batch_size`` is the L extent of the launch, i.e. it already includes the
+    split-K factor.
+    """
+    cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
+    num_ctas = get_dense_gemm_approximate_cta_nums(
+        m, n, (cta_tile_m, mma_tiler_mn[1]), cluster_shape_mn)
+    num_clusters = (num_ctas * batch_size) // math.prod(cluster_shape_mn)
+    return num_clusters <= _CUDA_MAX_GRID_DIM_Z
+
+
+def _launchable_raster_order(
+    scheduler_mode: str,
+    raster_order: str,
+    m: int,
+    n: int,
+    batch_size: int,
+    mma_tiler_mn: Tuple[int, int],
+    use_2cta_instrs: bool,
+    cluster_shape_mn: Tuple[int, int],
+) -> str:
+    """Return the raster order to launch with for this problem shape.
+
+    The AutoTuner reuses a tactic across a token bucket, so a CLC raster-N
+    tactic validated for the bucket's M can exceed CUDA's grid-Z limit for a
+    larger M in the same bucket. Fall back to raster-M, which the grid-Z
+    filter in get_valid_tactics keeps, instead of failing the launch.
+    """
+    if (scheduler_mode == "clc_dynamic"
+            and raster_order == "n" and not _clc_raster_n_has_launchable_grid(
+                m, n, batch_size, mma_tiler_mn, use_2cta_instrs,
+                cluster_shape_mn)):
+        return "m"
+    return raster_order
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -10381,6 +10483,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_tensor, b_tensor, c_tensor = inputs
             batch_size, m, k = a_tensor.shape
             n = b_tensor.shape[1]
+            locality_domain_id = get_current_locality_domain()
+            if locality_domain_id is not None:
+                assert locality_domain_id in (0, 1)
+                assert tuple(c_tensor.shape) == (batch_size, m, 2 * n)
+                c_tensor = c_tensor[:, :, locality_domain_id *
+                                    n:(locality_domain_id + 1) * n]
 
             # C is passed as [M, N, B]; from_dlpack captures the real strides so
             # non-contiguous views are written by TMA without a copy.
@@ -10508,6 +10616,264 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream=stream,
                 )
 
+    def _validate_cute_dsl_bf16_bmm_locality_domain_inputs(
+        input: torch.Tensor,
+        weight_0: torch.Tensor,
+        weight_1: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        tensors = (input, weight_0, weight_1, output)
+        if any(tensor.dim() != 3 for tensor in tensors):
+            raise ValueError(
+                "locality domain BF16 BMM input, weight shards, and output must be 3-D, "
+                f"got shapes {[tuple(tensor.shape) for tensor in tensors]}.")
+        if input.dtype != torch.bfloat16:
+            raise ValueError(
+                "locality domain BF16 BMM input must have dtype bfloat16, "
+                f"got {input.dtype}.")
+        if weight_0.dtype != torch.bfloat16 or weight_1.dtype != torch.bfloat16:
+            raise ValueError(
+                "locality domain BF16 BMM weight shards must have dtype bfloat16, "
+                f"got {weight_0.dtype} and {weight_1.dtype}.")
+        if output.dtype != torch.bfloat16:
+            raise ValueError(
+                "locality domain BF16 BMM output must have dtype bfloat16, "
+                f"got {output.dtype}.")
+        if weight_0.shape != weight_1.shape:
+            raise ValueError(
+                "locality domain BF16 BMM weight shards must have identical shapes, "
+                f"got {tuple(weight_0.shape)} and {tuple(weight_1.shape)}.")
+        if input.shape[0] != weight_0.shape[0]:
+            raise ValueError(
+                "locality domain BF16 BMM input and weight shards must have the same "
+                f"batch size, got {input.shape[0]} and {weight_0.shape[0]}.")
+        if input.shape[2] != weight_0.shape[2]:
+            raise ValueError(
+                "locality domain BF16 BMM input and weight shards must have the same K "
+                f"dimension, got {input.shape[2]} and {weight_0.shape[2]}.")
+        alignment_elements = 16 // input.element_size()
+        if (input.shape[2] % alignment_elements != 0
+                or weight_0.shape[1] % alignment_elements != 0):
+            raise ValueError(
+                "locality domain BF16 BMM K and per-shard N dimensions must be "
+                f"multiples of {alignment_elements} for 16-byte alignment, "
+                f"got K={input.shape[2]} and N={weight_0.shape[1]}.")
+        expected_output_shape = (
+            input.shape[0],
+            input.shape[1],
+            weight_0.shape[1] + weight_1.shape[1],
+        )
+        if output.shape != expected_output_shape:
+            raise ValueError(
+                "locality domain BF16 BMM output shape must be [B, M, N0 + N1], "
+                f"expected {expected_output_shape}, got {tuple(output.shape)}.")
+        if any(tensor.device != input.device for tensor in tensors[1:]):
+            raise ValueError(
+                "locality domain BF16 BMM input, weight shards, and output must be on "
+                f"the same device, got {[tensor.device for tensor in tensors]}."
+            )
+        for tensor_name, tensor in zip(
+            ("input", "weight_0", "weight_1", "output"), tensors):
+            _validate_16_byte_aligned_dense_tensor(tensor, tensor_name)
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_bf16_bmm_locality_domain_inplace_rubin",
+        mutates_args=("output", ),
+        device_types="cuda",
+        schema="(Tensor input, Tensor weight_0, Tensor weight_1, "
+        "Tensor(a!) output, bool use_tvm_ffi=True) -> ()",
+    )
+    @_with_input_cuda_device
+    def cute_dsl_bf16_bmm_locality_domain_inplace_rubin(
+        input: torch.Tensor,
+        weight_0: torch.Tensor,
+        weight_1: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """Tune and launch both Rubin locality domain BF16 BMM partitions.
+
+        Call once before the first CUDA graph capture to initialize locality domain
+        resources and compile the selected partition-local artifacts.
+        """
+        if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                "CuteDSL BF16 BMM Rubin only supports SM107 with "
+                "nvidia-cutlass-dsl with SM107 support.")
+        _validate_cute_dsl_bf16_bmm_locality_domain_inputs(
+            input, weight_0, weight_1, output)
+
+        runtime = LocalityDomainRuntime(num_partitions=2)
+        op_runner = CuteDSLBf16RubinBmmRunner(use_tvm_ffi=use_tvm_ffi)
+        inputs = [input, weight_0, output]
+
+        def launch_partition(
+            partition_id: int,
+            partition_inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            weight = partition_inputs[1] if partition_id == 0 else weight_1
+            op_runner(
+                [partition_inputs[0], weight, partition_inputs[2]],
+                tactic=tactic,
+            )
+
+        runner, best_tactic = tune_locality_domain_concurrent(
+            "trtllm::cute_dsl_bf16_bmm_locality_domain_inplace_rubin",
+            op_runner,
+            runtime,
+            2,
+            launch_partition,
+            inputs,
+            op_runner.__class__.tuning_config,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_bf16_bmm_locality_domain_inplace_rubin")
+    def _(
+        input: torch.Tensor,
+        weight_0: torch.Tensor,
+        weight_1: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        return None
+
+    def _validate_cute_dsl_bf16_gemm_locality_domain_inputs(
+        input: torch.Tensor,
+        weight_0: torch.Tensor,
+        weight_1: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        tensors = (input, weight_0, weight_1, output)
+        if any(tensor.dim() != 2 for tensor in tensors):
+            raise ValueError(
+                "locality domain BF16 GEMM input, weight shards, and output must be 2-D, "
+                f"got shapes {[tuple(tensor.shape) for tensor in tensors]}.")
+        if input.dtype != torch.bfloat16:
+            raise ValueError(
+                "locality domain BF16 GEMM input must have dtype bfloat16, "
+                f"got {input.dtype}.")
+        if weight_0.dtype != torch.bfloat16 or weight_1.dtype != torch.bfloat16:
+            raise ValueError(
+                "locality domain BF16 GEMM weight shards must have dtype bfloat16, "
+                f"got {weight_0.dtype} and {weight_1.dtype}.")
+        if output.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(
+                "locality domain BF16 GEMM output must have dtype bfloat16 or float32, "
+                f"got {output.dtype}.")
+        if weight_0.shape != weight_1.shape:
+            raise ValueError(
+                "locality domain BF16 GEMM weight shards must have identical shapes, "
+                f"got {tuple(weight_0.shape)} and {tuple(weight_1.shape)}.")
+        if input.shape[1] != weight_0.shape[1]:
+            raise ValueError(
+                "locality domain BF16 GEMM input and weight shards must have the same K "
+                f"dimension, got {input.shape[1]} and {weight_0.shape[1]}.")
+        k_alignment_elements = 16 // input.element_size()
+        n_alignment_elements = 16 // output.element_size()
+        if (input.shape[1] % k_alignment_elements != 0
+                or weight_0.shape[0] % n_alignment_elements != 0):
+            raise ValueError(
+                "locality domain BF16 GEMM K and per-shard N dimensions must be "
+                "multiples of their respective 16-byte alignments "
+                f"(K: {k_alignment_elements}, N: {n_alignment_elements}), "
+                f"got K={input.shape[1]} and N={weight_0.shape[0]}.")
+        expected_output_shape = (
+            input.shape[0],
+            weight_0.shape[0] + weight_1.shape[0],
+        )
+        if output.shape != expected_output_shape:
+            raise ValueError(
+                "locality domain BF16 GEMM output shape must be [M, N0 + N1], "
+                f"expected {expected_output_shape}, got {tuple(output.shape)}.")
+        if any(tensor.device != input.device for tensor in tensors[1:]):
+            raise ValueError(
+                "locality domain BF16 GEMM input, weight shards, and output must be on "
+                f"the same device, got {[tensor.device for tensor in tensors]}."
+            )
+        for tensor_name, tensor in (
+            ("input", input),
+            ("weight_0", weight_0),
+            ("weight_1", weight_1),
+        ):
+            # The GEMM runner canonicalizes non-contiguous A/B tensors. A
+            # contiguous view is reused directly and must honor its declared
+            # 16-byte pointer alignment.
+            if tensor.is_contiguous() and tensor.data_ptr() % 16 != 0:
+                raise ValueError(
+                    f"{tensor_name} data pointer must be 16-byte aligned, got "
+                    f"data_ptr={tensor.data_ptr()}.")
+        _validate_16_byte_aligned_dense_tensor(output, "output")
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_bf16_gemm_locality_domain_inplace_rubin",
+        mutates_args=("output", ),
+        device_types="cuda",
+        schema="(Tensor input, Tensor weight_0, Tensor weight_1, "
+        "Tensor(a!) output, bool use_tvm_ffi=True) -> ()",
+    )
+    @_with_input_cuda_device
+    def cute_dsl_bf16_gemm_locality_domain_inplace_rubin(
+        input: torch.Tensor,
+        weight_0: torch.Tensor,
+        weight_1: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """Tune and launch both Rubin locality domain BF16 GEMM partitions.
+
+        Call once before the first CUDA graph capture to initialize locality domain
+        resources and compile the selected partition-local artifacts.
+        """
+        if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                "CuteDSL BF16 GEMM Rubin only supports SM107 with "
+                "nvidia-cutlass-dsl with SM107 support.")
+        _validate_cute_dsl_bf16_gemm_locality_domain_inputs(
+            input, weight_0, weight_1, output)
+
+        runtime = LocalityDomainRuntime(num_partitions=2)
+        op_runner = CuteDSLBf16RubinGemmRunner(use_tvm_ffi=use_tvm_ffi,
+                                               output_dtype=output.dtype)
+        inputs = [input, weight_0, output]
+
+        def launch_partition(
+            partition_id: int,
+            partition_inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            weight = partition_inputs[1] if partition_id == 0 else weight_1
+            op_runner(
+                [partition_inputs[0], weight, partition_inputs[2]],
+                tactic=tactic,
+            )
+
+        runner, best_tactic = tune_locality_domain_concurrent(
+            "trtllm::cute_dsl_bf16_gemm_locality_domain_inplace_rubin",
+            op_runner,
+            runtime,
+            2,
+            launch_partition,
+            inputs,
+            op_runner.__class__.tuning_config,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_bf16_gemm_locality_domain_inplace_rubin")
+    def _(
+        input: torch.Tensor,
+        weight_0: torch.Tensor,
+        weight_1: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        return None
+
     @torch.library.custom_op("trtllm::cute_dsl_bf16_bmm_rubin",
                              mutates_args=("output", ),
                              device_types="cuda")
@@ -10631,14 +10997,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a_tensor.shape
             n = b_tensor.shape[0]
             batch_size = 1
-            if split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
+            locality_domain_id = get_current_locality_domain()
+            if locality_domain_id is not None:
+                assert locality_domain_id in (0, 1)
+                assert tuple(c_tensor.shape) == (m, 2 * n)
+                c_tensor = c_tensor[:, locality_domain_id *
+                                    n:(locality_domain_id + 1) * n]
+            elif split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
                 raise RuntimeError(
                     "BF16 split-K GEMM requires an [M, N] output, got "
                     f"output.shape={tuple(c_tensor.shape)}, expected={(m, n)}.")
 
             a_tensor = a_tensor.contiguous()
             b_tensor = b_tensor.contiguous()
-            c_needs_copy = not c_tensor.is_contiguous()
+            c_needs_copy = locality_domain_id is None and not c_tensor.is_contiguous(
+            )
             c_buf = torch.empty_like(c_tensor) if c_needs_copy else c_tensor
 
             a_batched = a_tensor.unsqueeze(0)  # [1, M, K]
@@ -11650,6 +12023,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @staticmethod
         def get_default_split_kv(B: int, S: int, max_active_blocks: int) -> int:
+            # S is the number of packed 128-row query tiles per request.
             max_split_kv = 32
             blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
             split_kv = min(blocks_per_batch, max_split_kv)
@@ -11696,7 +12070,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # A later capture with a bigger workspace would resize it, so the
             # bound covers every batch size up-front."""
             max_active_blocks = cls._get_max_active_blocks()
-            return (2 * H * (max_active_blocks // 2) * (D + 1) *
+            # Each query tile reserves 128 rows, including its masked tail.
+            # For split_kv > 1, the occupancy heuristic bounds
+            # B * num_q_tiles * split_kv by max_active_blocks / 2 at a tuning
+            # bucket. Runtime batches below the next bucket can use up to
+            # twice that space. split_kv == 1 does not use this workspace.
+            return (2 * max(H, 128) * (max_active_blocks // 2) * (D + 1) *
                     acc_dtype.width // 8)
 
         @classmethod
@@ -11753,7 +12132,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples; AutoTuner picks
             one and passes it to ``forward`` as ``tactic``.
             """
-            if get_sm_version() not in (100, 103):
+            if get_sm_version() not in (100, 103, 107):
                 return []
             q_latent, q_rope, _c_latent, _c_rope, _page_table, cache_seqs, \
                 o, *_rest = inputs
@@ -11771,8 +12150,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ((128, 128), (128, 256)),
             ]
             max_active_blocks = self._get_max_active_blocks()
+            num_q_tiles = ceil_div(h * seq_len_q, 128)
             split_candidates = self.get_split_kv_candidates(
-                batch_size, seq_len_q, max_active_blocks)
+                batch_size, num_q_tiles, max_active_blocks)
             persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
@@ -11962,9 +12342,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
             bucketed_batch_size = last_positive_power_of_2(batch_size)
+            num_q_tiles = ceil_div(self.num_heads * self.seq_len_q, 128)
             split_kv = self.get_default_split_kv(bucketed_batch_size,
-                                                 self.seq_len_q,
-                                                 max_active_blocks)
+                                                 num_q_tiles, max_active_blocks)
             is_persistent = self.get_default_is_persistent(bucketed_batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
@@ -11995,6 +12375,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[8] (softmax_stats): Optional contiguous float32 tensor
                         of shape (B * S_q, H, 2). The kernel writes an equivalent
                         softmax (max, sum) pair for Helix reduction.
+                    inputs[9] (kv_bounds): Optional contiguous int32 per-query
+                        local KV bounds of shape (B * S_q,).
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional softmax_scale and output_scale values.
@@ -12121,12 +12503,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._CLUSTER_SHAPE_MNK[0] * self._CLUSTER_SHAPE_MNK[1] *
                     self._CLUSTER_SHAPE_MNK[2])
 
-                # Fold seq_len_q into the head dimension when the head count
-                # alone does not fill the MMA M tile (num_heads < M) and there
-                # is more than one query token (MTP / spec-decode).
-                fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
-                           and seq_len_q > 1)
-
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
@@ -12140,7 +12516,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._IS_VAR_SPLIT_KV,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
-                    fold_sq=fold_sq,
+                    reducer_max_splits=32,
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
@@ -12198,6 +12574,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     split_kv,
                     cache_seqs_ct,
                     kv_bounds_ct,
+                    None,  # cum_seq_lens_q: this path uses fixed query lengths
                     block_split_kvs_ct,
                     cutlass.Float32(softmax_scale),
                     cutlass.Float32(output_scale),
@@ -12237,6 +12614,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 split_kv,
                 cache_seqs,
                 kv_bounds,
+                None,  # cum_seq_lens_q: this path uses fixed query lengths
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
@@ -12271,15 +12649,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
     ) -> None:
-        """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
+        """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103/SM107).
 
         kv_bounds: helix speculative verify groups -- per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
         """
-        if (sm_version := get_sm_version()) not in (100, 103):
+        if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
-                f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "
-                f"SM 103, got SM {sm_version}")
+                f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100, "
+                f"SM 103 or SM 107, got SM {sm_version}")
 
         # split_kv and is_persistent are chosen per shape by the runner's
         # AutoTuner (the 3rd/4th tactic elements), NOT at the op boundary.
@@ -12359,15 +12737,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
     ) -> None:
-        """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
+        """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103/SM107).
 
         kv_bounds: helix speculative verify groups — per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
         """
-        if (sm_version := get_sm_version()) not in (100, 103):
+        if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
-                f"trtllm::cute_dsl_mla_decode_fp16_blackwell requires SM 100 "
-                f"or SM 103, got SM {sm_version}")
+                f"trtllm::cute_dsl_mla_decode_fp16_blackwell requires SM 100, "
+                f"SM 103 or SM 107, got SM {sm_version}")
 
         if q_latent.dtype == torch.float16:
             in_dtype = cutlass.Float16
@@ -13355,6 +13733,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 split_k,
                         ):
                             for scheduler_mode in self.scheduler_mode_candidates:
+                                # CUDA caps grid Z at 65535; CLC raster-N
+                                # tactics beyond that cannot launch.
+                                if (scheduler_mode == "clc_dynamic"
+                                        and raster_order == "n" and
+                                        not _clc_raster_n_has_launchable_grid(
+                                            kernel_m,
+                                            kernel_n,
+                                            batch_size * split_k,
+                                            mma_tiler_mnk[:2],
+                                            mma_inst_m == 256,
+                                            cluster_shape_mn,
+                                        )):
+                                    continue
                                 valid_tactics.append(
                                     ("base", mma_tiler_mnk, mma_inst_shape,
                                      cluster_shape_mn, swap_ab, use_prefetch,
@@ -13683,6 +14074,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_b_ptr = b_ptr
                     kernel_b_sf_ptr = b_sf_ptr
 
+                if kernel_variant == "base":
+                    launch_raster_order = _launchable_raster_order(
+                        scheduler_mode,
+                        raster_order,
+                        kernel_m,
+                        kernel_n,
+                        split_k,
+                        mma_tiler_mnk[:2],
+                        mma_inst_shape[0] == 256,
+                        cluster_shape_mn,
+                    )
+                    if launch_raster_order != raster_order:
+                        logger.debug(
+                            f"CuteDSL SM107: CLC raster-N exceeds the grid-Z "
+                            f"limit for M={kernel_m}, N={kernel_n}, "
+                            f"split_k={split_k}; using raster-M.")
+                        raster_order = launch_raster_order
+
                 # The wrapper entry points declare m/n/k, all scale-tile
                 # counts (sf_m/sf_n/sf_k) and c_ld as dynamic cutlass.Int64
                 # runtime arguments, so the compiled artifact is independent
@@ -13860,7 +14269,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             raise ValueError(
                                 f"bias must be a 1-D tensor of shape [N]={c_tensor.shape[-1]}, "
                                 f"got shape {tuple(bias.shape)}")
-                        c_tensor = c_tensor + bias
+                        c_tensor.add_(bias)
                     return c_tensor
                 elif locality_domain_half_gemm:
                     # c already written via stride — no copy needed
@@ -14775,16 +15184,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuning_config_cache = dict()
 
             def __init__(
-                    self,
-                    num_experts: int,
-                    top_k: int,
-                    num_local_experts: int,
-                    local_expert_offset: int,
-                    tile_size: int,
-                    scaling_vector_size: int = 16,
-                    activation_type: ActivationType = ActivationType.Swiglu,
-                    situ_beta: Optional[float] = None,
-                    situ_linear_beta: Optional[float] = None):
+                self,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                scaling_vector_size: int = 16,
+                activation_type: ActivationType = ActivationType.Swiglu,
+                situ_beta: Optional[float] = None,
+                situ_linear_beta: Optional[float] = None,
+                swiglu_limit_scalar: float = float("inf")):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -14796,6 +15206,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type)
                 self.situ_beta = situ_beta
                 self.situ_linear_beta = situ_linear_beta
+                # Trace-time constant folded into the kernel; part of unique_id
+                # and the kernel cache key so clamped / unclamped kernels never
+                # share a compilation or a tuning result.
+                self.swiglu_limit = _canonicalize_swiglu_limit_scalar(
+                    swiglu_limit_scalar)
                 self.is_gated = is_gated_activation(self.activation_type)
 
                 if (sm_version := get_sm_version()) != 107:
@@ -14819,6 +15234,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     int(self.activation_type),
                     self.situ_beta,
                     self.situ_linear_beta,
+                    self.swiglu_limit,
                 )
 
             def get_valid_tactics(
@@ -15122,7 +15538,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, a_path,
                              int(self.activation_type), self.situ_beta,
-                             self.situ_linear_beta, max_active_clusters)
+                             self.situ_linear_beta, self.swiglu_limit,
+                             max_active_clusters)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -15137,6 +15554,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         activation_type=self.activation_type,
                         situ_beta=self.situ_beta,
                         situ_linear_beta=self.situ_linear_beta,
+                        swiglu_limit=self.swiglu_limit,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -15215,6 +15633,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: ActivationType,
             situ_beta: float,
             situ_linear_beta: float,
+            swiglu_limit_scalar: float,
             precomputed_tactic: Optional[str],
             tuner_key: str,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -15243,6 +15662,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 activation_type=activation_type,
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
+                    swiglu_limit_scalar),
             )
             inputs = [
                 input, weight, input_scale, weight_scale, alpha,
@@ -15284,6 +15705,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt scaling_vector_size=16, SymInt partition_id=-1, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
             "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "float swiglu_limit_scalar=-1.0, "
             "str? precomputed_tactic=None) -> (Tensor?, Tensor?)",
             device_types="cuda")
         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -15309,6 +15731,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             precomputed_tactic: Optional[str] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -15319,7 +15742,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size, output_tensor, output_sf_tensor,
                 scaling_vector_size, partition_id,
                 ActivationType(activation_type), situ_beta, situ_linear_beta,
-                precomputed_tactic,
+                swiglu_limit_scalar, precomputed_tactic,
                 "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
 
         @torch.library.register_fake(
@@ -15347,6 +15770,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             precomputed_tactic: Optional[str] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             m = permuted_idx_to_expanded_idx.size(0)
@@ -15379,7 +15803,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt tile_size, Tensor(a!) output_tensor, "
             "Tensor(b!) output_sf_tensor, SymInt scaling_vector_size=16, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
-            "float situ_beta=-1.0, float situ_linear_beta=-1.0) -> ()",
+            "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "float swiglu_limit_scalar=-1.0) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
             input: torch.Tensor,
@@ -15405,6 +15830,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         ) -> None:
             """Tune and launch both Rubin locality domain NVFP4 MoE FC1 partitions.
 
@@ -15448,6 +15874,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type=ActivationType(activation_type),
                     situ_beta=_canonicalize_situ_beta(situ_beta),
                     situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                    swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
+                        swiglu_limit_scalar),
                 ))
             inputs = [
                 input,
@@ -15495,6 +15923,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type=activation_type,
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
+                    swiglu_limit_scalar=swiglu_limit_scalar,
                     precomputed_tactic=repr(tactic),
                 )
 
@@ -15536,6 +15965,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         ) -> None:
             return None
 

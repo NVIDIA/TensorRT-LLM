@@ -7,16 +7,18 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_padding_params,
     get_top_level_model,
+    make_scheduled_inputs,
     prepare_multimodal_indices,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
@@ -55,7 +57,12 @@ def test_get_all_rank_num_tokens_uses_tp_collective() -> None:
     mapping = SimpleNamespace(has_cp_helix=lambda: False)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -72,7 +79,12 @@ def test_get_all_rank_num_tokens_reports_post_reduce_scatter_helix_count() -> No
     mapping = SimpleNamespace(cp_size=2, has_cp_helix=lambda: True)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -131,26 +143,6 @@ def test_attention_dp_padding_uses_all_rank_context_and_token_counts(
     )
 
 
-def test_set_spec_metadata_all_rank_counts_for_one_model() -> None:
-    mode = SimpleNamespace(
-        is_mtp_eagle_one_model=Mock(return_value=True),
-        is_eagle3_one_model=Mock(return_value=False),
-    )
-    spec_metadata = SimpleNamespace(spec_dec_mode=mode)
-
-    set_spec_metadata_all_rank_num_tokens(
-        spec_metadata,
-        [8, 9],
-        [2, 3],
-        [1, 2],
-    )
-
-    assert spec_metadata.all_rank_num_tokens == [8, 9]
-    assert spec_metadata.all_rank_num_seqs == [2, 3]
-    assert spec_metadata.all_rank_num_gens == [1, 2]
-    assert spec_metadata.subseq_all_rank_num_tokens == [2, 3]
-
-
 def test_position_offset_helpers_preserve_identity_and_unwrap_models() -> None:
     position_ids = [0, 1]
     model_without_offset = SimpleNamespace()
@@ -205,3 +197,26 @@ def test_ship_multimodal_indices_copies_and_extends_text_indices(
     else:
         arange.assert_not_called()
         cat.assert_not_called()
+
+
+@pytest.mark.parametrize("returns_context_logits", [False, True])
+def test_make_scheduled_inputs_gathers_context_logits_from_context_requests(
+    returns_context_logits: bool,
+) -> None:
+    batch = ScheduledRequests()
+    batch.context_requests_chunking = [SimpleNamespace(py_return_context_logits=False)]
+    batch.context_requests_last_chunk = [
+        SimpleNamespace(py_return_context_logits=returns_context_logits)
+    ]
+    batch.generation_requests = [SimpleNamespace(py_return_context_logits=True)]
+    new_tensors_device = object()
+
+    inputs = make_scheduled_inputs(
+        batch, new_tensors_device, None, enable_spec_decode=True, runtime_draft_len=3
+    )
+
+    assert inputs.batch is batch
+    assert inputs.new_tensors_device is new_tensors_device
+    assert inputs.cache_indirection_buffer is None
+    assert inputs.gather_context_logits is returns_context_logits
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 3)

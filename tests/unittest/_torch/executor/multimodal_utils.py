@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     MultimodalEncoderRequestState,
     initialize_multimodal_encoder_request,
 )
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
 from tensorrt_llm.inputs.registry import (
@@ -33,14 +34,18 @@ def bare_mm_item_scheduler(
 ) -> MultimodalItemScheduler:
     """A scheduler with no budget resolution -- the engine only builds one when item
     scheduling is engaged, so these tests skip `create()` and exercise the item path."""
+    if model._multimodal_encoder_cache is None:
+        model._multimodal_encoder_cache = TensorLRUCache(1 << 20)
     return MultimodalItemScheduler(model=model, input_processor=input_processor)
 
 
-def make_llm_request(request_id: int, multimodal_data: dict[str, Any] | None = None) -> LlmRequest:
+def make_llm_request(
+    request_id: int, multimodal_data: dict[str, Any] | None = None, *, prompt_len: int = 3
+) -> LlmRequest:
     return LlmRequest(
         request_id=request_id,
         max_new_tokens=1,
-        input_tokens=[1, 2, 3],
+        input_tokens=list(range(1, prompt_len + 1)),
         sampling_config=SamplingConfig(),
         is_streaming=False,
         py_multimodal_data=multimodal_data,
@@ -54,14 +59,21 @@ def record_output(
     hidden: int = 1,
     fill: float = 0.0,
 ) -> None:
-    """Write one item the way the encoder step does, sized from its declaration."""
-    state.record(
-        item_idx,
-        torch.full((state.embedding_lengths[item_idx], hidden), fill),
-    )
+    """Mark one item ready without materializing an output tensor."""
+    del hidden, fill
+    state.item_ready[item_idx] = True
 
 
-def make_mm_request(request_id: int, costs: list[int], *, ready: Sequence[int] = ()) -> LlmRequest:
+def make_mm_request(
+    request_id: int,
+    costs: list[int],
+    *,
+    ready: Sequence[int] = (),
+    embedding_lengths: Sequence[int] | None = None,
+    prompt_len: int = 3,
+) -> LlmRequest:
+    if embedding_lengths is None:
+        embedding_lengths = [1] * len(costs)
     request = make_llm_request(
         request_id,
         multimodal_data={
@@ -69,10 +81,11 @@ def make_mm_request(request_id: int, costs: list[int], *, ready: Sequence[int] =
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
                 item_refs=[("image", item_idx) for item_idx in range(len(costs))],
                 encoder_token_lengths=costs,
-                output_embedding_lengths=[1] * len(costs),
+                output_embedding_lengths=list(embedding_lengths),
             ),
-            "multimodal_embedding_lengths": [1] * len(costs),
+            "multimodal_embedding_lengths": list(embedding_lengths),
         },
+        prompt_len=prompt_len,
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
     for item_idx in ready:

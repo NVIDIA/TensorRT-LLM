@@ -70,6 +70,11 @@ def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
 
 
+def drop_optional_pages(kv_cache: Any, end: int, groups: list[int] | None = None) -> None:
+    """Test-only eviction injection, preserving other groups and live readers."""
+    _cpp().drop_optional_pages(kv_cache, end, groups)
+
+
 def make_test_block(
     manager: Any,
     tokens: Any,
@@ -104,6 +109,30 @@ def event_manager_add_stored_block(event_manager: Any, block: Any) -> None:
 def event_manager_add_stored_life_cycle(event_manager: Any, block: Any, life_cycle_id: int) -> None:
     """Derive and enqueue one lifecycle stored event from a real test block."""
     _cpp().event_manager_add_stored_life_cycle(event_manager, block, life_cycle_id)
+
+
+def streaming_event_sink_add_stored_block(event_sink: Any, block: Any) -> None:
+    """Feed a real test block to the native streaming sink."""
+    _cpp().streaming_event_sink_add_stored_block(event_sink, block)
+
+
+def streaming_event_sink_add_stored_life_cycle(
+    event_sink: Any, block: Any, life_cycle_id: int
+) -> None:
+    """Feed one lifecycle of a real test block to the native streaming sink."""
+    _cpp().streaming_event_sink_add_stored_life_cycle(event_sink, block, life_cycle_id)
+
+
+def streaming_event_sink_add_removed_block(event_sink: Any, block: Any) -> None:
+    """Remove a real test block from the native streaming sink."""
+    _cpp().streaming_event_sink_add_removed_block(event_sink, block)
+
+
+def streaming_event_sink_add_removed_life_cycle(
+    event_sink: Any, block: Any, life_cycle_id: int
+) -> None:
+    """Remove one lifecycle of a real test block from the native streaming sink."""
+    _cpp().streaming_event_sink_add_removed_life_cycle(event_sink, block, life_cycle_id)
 
 
 def active_page_stats(kv_cache: Any) -> tuple[list[int], list[int]]:
