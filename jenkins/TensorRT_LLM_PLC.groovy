@@ -672,7 +672,7 @@ pipeline {
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
         choice(name: 'scanMode', choices: ['monitor','release','pre_merge'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
         booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
-        booleanParam(name: 'runContainerOssScanning', defaultValue: true, description: 'Run Container License Scanning (Pulse container scan)')
+        booleanParam(name: 'runContainerOssScanning', defaultValue: true, description: 'Run Container OSS Scanning (Pulse container scan)')
         booleanParam(name: 'runContainerMalwareScanning', defaultValue: true, description: 'Run Container Malware Scanning (Pulse container scan)')
         booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
@@ -719,7 +719,7 @@ pipeline {
                         }
                     }
                 }
-                stage("Container Licenses Scanning") {
+                stage("Container OSS Scanning") {
                     when {
                         expression { return params.runContainerOssScanning }
                     }
