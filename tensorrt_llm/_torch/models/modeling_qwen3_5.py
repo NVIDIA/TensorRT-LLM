@@ -552,9 +552,9 @@ def _normalize_qwen35_quant_config_dict(
     scales -- provided the checkpoint uses 16-element scale blocks. 32-element
     dense weight-only exports (``group_size=32``) stay on the W4A16
     dequantization path because the W4A4 GEMMs cannot consume them. MoE expert
-    entries with 32-element blocks are rejected before promotion. Dense MLP keys are
-    additionally re-pathed to the doubled ``.mlp.mlp.`` form to match the
-    ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
+    entries with 32-element blocks are rejected before promotion. Dense MLP keys of
+    every quant algorithm are re-pathed to the doubled ``.mlp.mlp.`` form to match
+    the ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
     their original algorithm.
 
     Mutates ``quant_config_dict`` in place (model_config is frozen).
@@ -643,10 +643,7 @@ def _normalize_qwen35_quant_config_dict(
             # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
             # consume the checkpoint's packed FP4 weights and static input scales.
             dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
-            if dense_mlp_match and cfg.quant_algo in (
-                QuantAlgo.W4A16_NVFP4,
-                QuantAlgo.NVFP4,
-            ):
+            if dense_mlp_match:
                 if (
                     convert_to_nvfp4
                     and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
