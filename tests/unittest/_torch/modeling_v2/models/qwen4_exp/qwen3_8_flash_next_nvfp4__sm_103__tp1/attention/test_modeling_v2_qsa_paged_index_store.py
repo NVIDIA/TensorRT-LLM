@@ -53,6 +53,28 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(as_int)
 
 
+def _shared_page_planes(spec, extras: dict):
+    """The NVFP4-KV pool's side planes: each physical page holds the `layers`
+    index-K pages and then the position page, so the index cache (the last
+    role) and the position cache are strided views of one byte allocation.
+    Every role holds `KEY_FILL` and the position page `POS_FILL`; the other
+    roles are recorded for the untouched check."""
+    layers, tpb, hkv, head_dim, axes, pages = (
+        spec[k] for k in ("layers", "tokens_per_block", "hkv", "head_dim", "axes", "pages")
+    )
+    index_bytes = tpb * hkv * head_dim * 2
+    page = torch.empty(pages, layers * index_bytes + tpb * axes * 4, dtype=torch.uint8, device=DEV)
+    page[:, : layers * index_bytes].view(torch.bfloat16).fill_(KEY_FILL)
+    page[:, layers * index_bytes :].view(torch.int32).fill_(POS_FILL)
+    index_cache = page[:, (layers - 1) * index_bytes : layers * index_bytes].view(torch.bfloat16)
+    index_cache = index_cache.view(pages, tpb, hkv, head_dim)
+    position_cache = page[:, layers * index_bytes :].view(torch.int32).view(pages, tpb, axes)
+    assert index_cache.stride() == (spec["page_stride"], hkv * head_dim, head_dim, 1)
+    assert position_cache.stride() == spec["position_strides"]
+    extras["roles"] = page[:, : (layers - 1) * index_bytes]
+    return index_cache, position_cache
+
+
 def _build(spec, seed: int):
     """Real planes, table and rows for one cell; returns the op's kwargs and extras."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -112,7 +134,10 @@ def _build(spec, seed: int):
         coords = coords.contiguous()
 
     extras = {}
-    if spec["cache_layout"] == "role_view":
+    position_cache = None
+    if spec["cache_layout"] == "shared_page":
+        index_cache, position_cache = _shared_page_planes(spec, extras)
+    elif spec["cache_layout"] == "role_view":
         pool = torch.full((pages, 2, tpb, hkv, head_dim), KEY_FILL, device=DEV).to(torch.bfloat16)
         index_cache = pool[:, 0]
         extras["neighbour"] = (pool[:, 1], pool[:, 1].clone())
@@ -121,7 +146,8 @@ def _build(spec, seed: int):
         index_cache = torch.full((pages, tpb, hkv, head_dim), KEY_FILL, device=DEV).to(
             torch.bfloat16
         )
-    position_cache = torch.full((pages, tpb, axes), POS_FILL, dtype=torch.int32, device=DEV)
+    if position_cache is None:
+        position_cache = torch.full((pages, tpb, axes), POS_FILL, dtype=torch.int32, device=DEV)
     args = dict(
         token_k=token_k,
         position_coordinates=coords,
@@ -147,6 +173,11 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     if "neighbour" in extras:
         view, saved = extras["neighbour"]
         assert torch.equal(_bits(view), _bits(saved)), "the neighbouring role moved"
+    if "roles" in extras:
+        fill = int(_bits(torch.tensor([KEY_FILL], dtype=torch.bfloat16))[0])
+        assert bool((extras["roles"].view(torch.int16) == fill).all()), (
+            "another index-K role of the shared page moved"
+        )
     if cell.spec["axes"] > 3:
         assert torch.equal(out[1][..., 3:], before[..., 3:]), "axes past the coordinates moved"
     if cell.spec["coords_layout"] == "stride0":

@@ -122,6 +122,18 @@ class QsaPagedIndexStore(OpWrapper):
             spec=_spec(((0, 1), (31, 1), (32, 1), (33, 1)), pages=8, cache_layout="role_view"),
         ),
         Cell(
+            why="NVFP4-KV side planes: index and position planes as strided views of one "
+            "per-slot buffer holding 12 index-K pages and the position page",
+            spec=_spec(
+                ((0, 1), (31, 1), (32, 1), (33, 40)),
+                pages=8,
+                cache_layout="shared_page",
+                layers=12,
+                page_stride=49344,
+                position_strides=(24672, 3, 1),
+            ),
+        ),
+        Cell(
             why="block table as a column slice of a wider one",
             spec=_spec(((0, 1), (1, 1), (32, 1), (33, 1)), pages=8, table_layout="column_slice"),
         ),
@@ -163,6 +175,13 @@ class QsaPagedIndexStore(OpWrapper):
       - duplicate destinations both store, unordered;
       - coordinates wider than the plane's dtype wrap (int64 `2^31 + 5`
         stores as -2147483643); floats truncate toward zero.
+    Under an NVFP4 KV pool the QSA cache manager packs each page's index-K
+    roles and then its position page into one per-slot buffer, so both planes
+    are strided views of one allocation: the trunk's index plane is
+    `[pages, 32, 1, 128]` at page stride 49344 (12 x 4096 + 192) with the
+    position plane `[pages, 32, 3]` at (24672, 3, 1); the cell checks that the
+    other index-K roles of each page survive the call.
+
     Loud rejections are torch's own: a 1-D table, a position plane narrower
     than the coordinates, mixed devices, non-index metadata dtypes.
     `rows == 0` leaves both planes unchanged.

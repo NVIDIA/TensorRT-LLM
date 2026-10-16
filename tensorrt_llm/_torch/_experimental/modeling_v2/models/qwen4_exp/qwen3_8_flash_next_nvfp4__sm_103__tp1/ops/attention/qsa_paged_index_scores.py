@@ -71,6 +71,12 @@ _FREE_PAGING = tuple(
 )
 
 
+#: The same plane under an NVFP4 KV pool: the QSA position page joins each physical
+#: page after the index buffers (`page_pad` elements), so the trunk's view is
+#: `[pages, 32, 1, 128]` at page stride 12 x 4096 + 192 = 49344.
+_TRUNK_POOL_NVFP4 = dict(pool_buffers=12, page_pad=192)
+
+
 class QsaPagedIndexScores(OpWrapper):
     """Score every causally visible compressed block of each query row.
 
@@ -106,6 +112,34 @@ class QsaPagedIndexScores(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
+        # ---- the NVFP4-pool plane: page stride 49344, a kernel of its own ----
+        Cell(
+            why="NVFP4 trunk plane, page stride 49344: decode MTP 4 requests x 2 rows",
+            spec=_spec(
+                layout="decode",
+                gen_positions=(7000, 5000, 4200, 2100),
+                rows_per_request=2,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+                **_TRUNK_POOL_NVFP4,
+            ),
+        ),
+        Cell(
+            why="NVFP4 trunk plane, page stride 49344: prefill 300 rows from 0",
+            spec=_spec(
+                layout="capture",
+                lengths=(300,),
+                slots=8,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=True,
+                branch="query_tile",
+                **_TRUNK_POOL_NVFP4,
+            ),
+        ),
         # ---- the target's call shapes: [*, 260] table, 2080 columns -------
         Cell(
             why="decode: 1 row deep in history, [32, 260] table, visible-only",

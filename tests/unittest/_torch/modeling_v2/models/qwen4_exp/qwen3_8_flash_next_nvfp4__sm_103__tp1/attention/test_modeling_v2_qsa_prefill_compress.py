@@ -58,6 +58,7 @@ DEV = "cuda"
 ROTARY_DIM = 64
 THETA = 1.0e7
 MAX_POSITIONS = 16384
+SENTINEL = 0x3C3C
 
 
 def _cos_sin() -> torch.Tensor:
@@ -115,6 +116,24 @@ def _build(spec, seed: int):
         pool[pages:] = index_cache
         index_cache = pool[pages:]
         extras["neighbour"] = (pool[:pages], pool[:pages].clone())
+    elif spec["layout"] == "shared_page":
+        # An NVFP4 pool's page: `roles` index pages, then the position page. The other
+        # index roles hold a sentinel and must survive, as must the position page.
+        roles = spec["roles"]
+        index_bytes = tpb * head_dim * 2
+        page = torch.empty(pages, roles * index_bytes + tpb * 3 * 4, dtype=torch.uint8, device=DEV)
+        others = page[:, : (roles - 1) * index_bytes].view(torch.int16)
+        others.fill_(SENTINEL)
+        shared_index = page[:, (roles - 1) * index_bytes : roles * index_bytes]
+        shared_index = shared_index.view(torch.bfloat16).view(pages, tpb, 1, head_dim)
+        shared_position = page[:, roles * index_bytes :].view(torch.int32).view(pages, tpb, 3)
+        shared_index.copy_(index_cache)
+        shared_position.copy_(position_cache)
+        assert shared_index.stride(0) == roles * tpb * head_dim + tpb * 3 * 2
+        assert shared_position.stride() == (roles * tpb * head_dim // 2 + tpb * 3, 3, 1)
+        index_cache, position_cache = shared_index, shared_position
+        extras["neighbour"] = (others, others.clone())
+        extras["position_page"] = (position_cache, position_cache.clone())
     elif spec["layout"] == "head_dim_strided":
         wide = torch.randn(pages, tpb, 1, 2 * head_dim, device=DEV).to(torch.bfloat16)
         wide[..., ::2] = index_cache
@@ -158,6 +177,9 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     if "neighbour" in extras:
         view, saved = extras["neighbour"]
         assert torch.equal(view, saved), "wrote outside the strided view"
+    if "position_page" in extras:
+        view, saved = extras["position_page"]
+        assert torch.equal(view, saved), "wrote into the position page"
 
 
 def _scene(seed: int, **overrides):

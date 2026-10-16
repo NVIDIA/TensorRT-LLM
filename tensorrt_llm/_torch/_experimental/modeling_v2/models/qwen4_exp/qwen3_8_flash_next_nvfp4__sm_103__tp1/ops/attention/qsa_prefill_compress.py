@@ -154,6 +154,18 @@ class QsaPrefillCompress(OpWrapper):
             why="index cache with a head-dim stride of 2",
             spec=_old(((0, 64),), pages=2, layout="head_dim_strided"),
         ),
+        # Under an NVFP4 KV pool the position page shares each physical page with the index
+        # pages, so both caches are strided views of one allocation: index page stride
+        # 12 x 4096 + 192 = 49344 on the trunk (4288 on the draft), position strides
+        # (24672, 3, 1) (2144, 3, 1).
+        Cell(
+            why="NVFP4 trunk planes: 12 index roles and the position page share each page",
+            spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=12),
+        ),
+        Cell(
+            why="NVFP4 draft planes: one index role and the position page share each page",
+            spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=1),
+        ),
         Cell(
             why="every row twice: two rows per anchor in one launch",
             spec=_old(((0, 64),) * 2, pages=4, duplicate=True),
@@ -194,6 +206,11 @@ class QsaPrefillCompress(OpWrapper):
     rows reduce mRoPE to plain RoPE bit for bit. Plain `@triton.jit`, no
     autotune; CUDA-graph capturable at a fixed row count (captured at 128 rows
     and at 256, 32 MTP7 verify blocks).
+
+    Under an NVFP4 KV pool both caches are strided views of one per-slot
+    allocation (each physical page holds the index roles, then the position
+    page); the cells check the other index roles and the position page
+    untouched.
 
     The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
     reference's: every cell is bitwise the reference but the 32-block MTP7 one, where
