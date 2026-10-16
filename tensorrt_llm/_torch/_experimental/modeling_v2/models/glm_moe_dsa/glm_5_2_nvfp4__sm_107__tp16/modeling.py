@@ -314,7 +314,6 @@ class DecodeTarget:
         self._bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
         self._bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
         self._unit_scale = torch.ones(1, dtype=torch.float32, device=device)
-        self._kv_pool = None
 
         moe_layers = [layer for layer in layers if not isinstance(layer.mlp, GatedMLP)]
         # One exchange workspace per router call site: its launches must run in stream order.
@@ -1006,8 +1005,8 @@ class DecodeTarget:
         cos_sin = mqa.rotary_cos_sin
         kv_lens = attn_metadata.kv_lens_cuda_runtime
         local_layer = mqa.get_local_layer_idx(attn_metadata)
-        if self._kv_pool is None:
-            self._kv_pool = manager.get_unique_primary_pool()
+        # Asked per step: the executor re-creates the cache manager after its memory profiling.
+        kv_pool = manager.get_unique_primary_pool()
         reuses_selection = pool_rows is not None or positions is not None
         own_indexer = sharded and indexer is not None and not reuses_selection
 
@@ -1084,7 +1083,7 @@ class DecodeTarget:
             if pool_rows is not None:
                 sparse_mla_flash_decode(
                     q_heads,
-                    self._kv_pool,
+                    kv_pool,
                     pool_rows,
                     kv_lens,
                     self._bmm1_scale,
@@ -1098,7 +1097,7 @@ class DecodeTarget:
             page_index_scale, layer_offset = manager.get_primary_pool_page_index_params(local_layer)
             sparse_mla_flash_decode(
                 q_heads,
-                self._kv_pool,
+                kv_pool,
                 self._hist_buffers["topk"][:num_tokens] if positions is None else positions,
                 kv_lens,
                 self._bmm1_scale,
@@ -1143,7 +1142,7 @@ class DecodeTarget:
         )
         sparse_mla_flash_decode(
             q_heads,
-            self._kv_pool,
+            kv_pool,
             indices,
             kv_lens,
             self._bmm1_scale,
