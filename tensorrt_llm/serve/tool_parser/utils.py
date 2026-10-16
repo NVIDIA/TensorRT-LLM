@@ -9,14 +9,16 @@ from partial_json_parser.core.options import Allow
 
 
 def find_common_prefix(s1: str, s2: str) -> str:
-    prefix = ""
-    min_length = min(len(s1), len(s2))
-    for i in range(0, min_length):
-        if s1[i] == s2[i]:
-            prefix += s1[i]
+    # Binary search on slice comparisons, which run in C, instead of building
+    # the prefix one character at a time. Invariant: s1[:low] == s2[:low].
+    low, high = 0, min(len(s1), len(s2))
+    while low < high:
+        mid = (low + high + 1) // 2
+        if s1[low:mid] == s2[low:mid]:
+            low = mid
         else:
-            break
-    return prefix
+            high = mid - 1
+    return s1[:low]
 
 
 def partial_json_loads(input_str: str, flags: Allow) -> tuple[Any, int]:
