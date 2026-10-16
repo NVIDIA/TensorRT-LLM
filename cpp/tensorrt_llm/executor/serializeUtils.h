@@ -35,6 +35,18 @@
 namespace tensorrt_llm::executor::serialize_utils
 {
 
+inline constexpr size_t kMaxZeroWidthContainerElements = 1ULL << 20;
+
+template <typename T>
+inline constexpr bool isZeroWidthSerialized = false;
+
+template <typename T, size_t N>
+inline constexpr bool isZeroWidthSerialized<std::array<T, N>> = N == 0 || isZeroWidthSerialized<T>;
+
+template <typename First, typename Second>
+inline constexpr bool isZeroWidthSerialized<std::pair<First, Second>>
+    = isZeroWidthSerialized<First> && isZeroWidthSerialized<Second>;
+
 template <typename CharT, typename TraitsT = std::char_traits<CharT>>
 class VectorWrapBuf : public std::basic_streambuf<CharT, TraitsT>
 {
@@ -630,6 +642,11 @@ T deserialize(std::istream& is)
 
         T container;
         TLLM_CHECK_WITH_INFO(size <= container.max_size(), "Invalid serialized container size");
+        if constexpr (isZeroWidthSerialized<typename ValueType<T>::type>)
+        {
+            TLLM_CHECK_WITH_INFO(
+                size <= kMaxZeroWidthContainerElements, "Invalid zero-width serialized container size");
+        }
         for (size_t i = 0; i < size; ++i)
         {
             auto element = deserialize<typename ValueType<T>::type>(is);

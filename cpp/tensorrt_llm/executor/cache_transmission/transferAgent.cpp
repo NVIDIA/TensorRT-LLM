@@ -30,6 +30,11 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
+namespace
+{
+constexpr size_t kMaxSerializedAgentDescBytes = 1ULL * 1024 * 1024;
+}
+
 void promoteHostLibraryToGlobalScope()
 {
     static std::once_flag once;
@@ -113,6 +118,8 @@ std::string AgentDesc::serialize() const
 AgentDesc AgentDesc::deserialize(std::string const& data)
 {
     namespace su = executor::serialize_utils;
+    TLLM_CHECK_WITH_INFO(
+        data.size() <= kMaxSerializedAgentDescBytes, "Serialized agent descriptor exceeds the maximum size");
     std::istringstream is(data);
     auto backendAgentDesc = su::deserialize<std::string>(is);
     auto numRegions = su::deserialize<size_t>(is);

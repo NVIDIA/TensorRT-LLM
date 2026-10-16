@@ -75,6 +75,8 @@ auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectio
 namespace
 {
 
+constexpr size_t kMaxSerializedNotificationBytes = 64ULL * 1024 * 1024;
+
 bool isValidBufferKind(uint8_t kind)
 {
     switch (static_cast<batch_manager::BufferKind>(kind))
@@ -535,10 +537,12 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
             auto notifIt = notifs.begin();
             while (notifIt != notifs.end())
             {
-                std::stringstream ss(*notifIt);
                 std::optional<NotificationInfo> notificationStorage;
                 try
                 {
+                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedNotificationBytes,
+                        "Serialized agent notification exceeds the maximum size");
+                    std::stringstream ss(*notifIt);
                     notificationStorage.emplace(NotificationInfo::deserialize(ss));
                 }
                 catch (std::exception const& e)
@@ -856,10 +860,12 @@ bool AgentConnectionManager::waitForNotification(
             auto notifIt = notifs.begin();
             while (notifIt != notifs.end())
             {
-                std::stringstream ss(*notifIt);
                 std::optional<NotificationInfo> notificationStorage;
                 try
                 {
+                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedNotificationBytes,
+                        "Serialized agent notification exceeds the maximum size");
+                    std::stringstream ss(*notifIt);
                     notificationStorage.emplace(NotificationInfo::deserialize(ss));
                 }
                 catch (std::exception const& e)

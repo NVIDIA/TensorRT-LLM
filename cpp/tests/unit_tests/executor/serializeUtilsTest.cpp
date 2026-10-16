@@ -82,9 +82,15 @@ TEST(SerializeUtilsTest, RejectTruncatedDiscriminators)
 TEST(SerializeUtilsTest, ZeroSizeArrayRoundtrip)
 {
     using EmptyArray = std::array<int, 0>;
+    using EmptyPair = std::pair<EmptyArray, EmptyArray>;
     std::istringstream empty;
     EXPECT_EQ(su::deserialize<EmptyArray>(empty), EmptyArray{});
     std::vector<EmptyArray> const original(3);
+    std::ostringstream malformed;
+    su::serialize(su::kMaxZeroWidthContainerElements + 1, malformed);
+    std::istringstream malformedInput(malformed.str());
+    EXPECT_THROW(su::deserialize<std::vector<EmptyPair>>(malformedInput), tensorrt_llm::common::TllmException);
+
     std::ostringstream os;
     su::serialize(original, os);
     std::istringstream is(os.str());
@@ -94,6 +100,8 @@ TEST(SerializeUtilsTest, ZeroSizeArrayRoundtrip)
 TEST(SerializeUtilsTest, RejectMalformedAgentDescLengths)
 {
     using texec::kv_cache::AgentDesc;
+    EXPECT_THROW(AgentDesc::deserialize(std::string((1U << 20) + 1, '\0')), tensorrt_llm::common::TllmException);
+
     for (auto const count : {size_t{1} << 32, std::numeric_limits<size_t>::max()})
     {
         std::ostringstream os;
