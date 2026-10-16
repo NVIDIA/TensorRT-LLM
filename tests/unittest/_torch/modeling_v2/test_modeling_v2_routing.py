@@ -107,6 +107,34 @@ def _model_config(pretrained_config, spec_config=None, **mapping_kwargs):
 _NGRAM = NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)
 
 
+def _qwen4_exp_config(**vision_overrides):
+    """The shape Qwen3.8-Flash-Next-NVFP4's normalized composite config declares."""
+    text = PretrainedConfig(
+        num_hidden_layers=48,
+        hidden_size=2560,
+        num_experts=512,
+        num_attention_heads=24,
+        linear_num_value_heads=48,
+        vocab_size=248320,
+    )
+    vision = dict(
+        depth=27,
+        hidden_size=1152,
+        num_heads=16,
+        spatial_merge_size=2,
+        out_hidden_size=2560,
+        num_position_embeddings=2304,
+        deepstack_visual_indexes=[],
+        hidden_act="gelu_pytorch_tanh",
+    )
+    vision.update(vision_overrides)
+    return PretrainedConfig(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config=text,
+        vision_config=PretrainedConfig(**vision),
+    )
+
+
 _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
 
 
@@ -250,3 +278,63 @@ def test_r1_dep4_with_vanilla_mtp_does_not_match():
         modeling_v2_resolve(config, _llm_args("require"))
     with pytest.raises(ValueError, match="MTP"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
+
+_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling."
+
+
+@pytest.mark.parametrize(
+    "spec_config",
+    [None, MTPDecodingConfig(max_draft_len=1), MTPDecodingConfig(max_draft_len=3)],
+    ids=["no-spec", "mtp1", "mtp3"],
+)
+def test_qwen4_exp_tp1_matches(spec_config):
+    config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
+    target = modeling_v2_resolve(config, _llm_args("require"))
+    assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
+
+
+def _mtp(max_draft_len=3, **attributes):
+    """An MTP config with fields the engine fills in after load set directly: the
+    constructor remaps or recomputes them, so passing them would test nothing."""
+    config = MTPDecodingConfig(max_draft_len=max_draft_len)
+    for name, value in attributes.items():
+        setattr(config, name, value)
+    return config
+
+
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        _NGRAM,
+        MTPDecodingConfig(max_draft_len=4),
+        MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+        _mtp(max_total_draft_tokens=5),
+        _mtp(num_nextn_predict_layers=2),
+    ],
+    ids=[
+        "ngram",
+        "draft4",
+        "vanilla-mtp",
+        "max-total-draft",
+        "two-predictors",
+    ],
+)
+def test_qwen4_exp_unsupported_speculation_falls_back(spec_config):
+    """The target asserts each of these at construction; route must decline first."""
+    config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_qwen4_exp_deepstack_vision_tower_does_not_match():
+    config = _model_config(_qwen4_exp_config(deepstack_visual_indexes=[5, 11, 17]))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+def test_qwen4_exp_on_two_ranks_does_not_match():
+    config = _model_config(_qwen4_exp_config(), world_size=2, tp_size=2)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None

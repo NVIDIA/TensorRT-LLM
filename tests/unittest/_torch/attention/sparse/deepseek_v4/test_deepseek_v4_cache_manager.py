@@ -232,6 +232,7 @@ def _history_case(
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.conversation_manager = None
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     cache = _HistoryCache(tokens_per_block, manager._stream.cuda_stream)
     manager.kv_cache_map = {20: cache}
     request = SimpleNamespace(

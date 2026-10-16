@@ -392,7 +392,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+    def is_environment_available(cls) -> bool:
+        """Check dependencies and architecture before constructing an attention layer."""
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -410,6 +411,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             logger.debug(
                 f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
             )
+            return False
+
+        return True
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not cls.is_environment_available():
             return False
 
         has_skip_softmax = isinstance(attn.sparse_params, SkipSoftmaxParams)
@@ -603,11 +611,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and attn.head_dim != 512
             and not has_q_only
             and meta.num_generations == 0
+            and not (
+                meta.use_paged_context_fmha
+                and meta.tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK
+            )
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
             # Let the FMHA selector choose the fallback implementation. H512
-            # and Q-only cached-KV requests cannot use that fallback.
+            # and Q-only cached-KV requests cannot use that fallback. Neither
+            # can paged prefill with model-specific page sizes such as M3's 128.
             # Keep mixed batches on FlashInfer: the monolithic fallback also
             # switches decoding to C++ kernels that generation-only warmup
             # does not cover, causing first-use JIT stalls (NVBug 6716104).

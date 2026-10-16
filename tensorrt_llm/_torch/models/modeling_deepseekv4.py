@@ -1714,8 +1714,12 @@ class DeepseekV4MoE(nn.Module):
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
+            # The dtype lets AUTO route a multi-node TP group to MNNVL AllReduce;
+            # without it the reduction always takes the NCCL path.
             self.allreduce = AllReduce(
-                mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=config.torch_dtype,
             )
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
@@ -1962,8 +1966,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         )
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
 
         self.hc_ffn = self._make_mhc()
 
@@ -1984,8 +1986,11 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             )
             self.moe_allreduce = MoEAllReduce(self.mapping)
 
-        has_tp = mapping.has_tp()
-        self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
+        # The attention output projection (o_b_proj) completes the TP reduction
+        # itself, so the tensor mHC hands to the MoE block is already replicated
+        # across TP ranks. A pre-MoE all-reduce would only scale it by tp_size
+        # ahead of an RMSNorm that cancels the scale, so none is issued.
+        self.fusion_config.PRE_MOE_FUSION = False
         # DeepSeek-V4 applies the next RMSNorm after mHC post_mapping and the
         # next layer's mHC pre_mapping. Fusing the post-MoE all-reduce with the
         # next RMSNorm would normalize the raw MoE output before mHC post_mapping,
