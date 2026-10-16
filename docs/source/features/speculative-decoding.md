@@ -83,7 +83,7 @@ Dynamic tree mode is currently **not supported** for models that use sliding win
 ### NGram
 
 ```{warning}
-NGram speculative decoding is deprecated and will be removed in January 2027. Use [standalone Suffix Automaton](#suffix-automaton-sa-enhancement) speculative decoding (`SADecodingConfig`) instead.
+NGram speculative decoding is deprecated and will be removed in January 2027. Use standalone Suffix Automaton speculative decoding (`SADecodingConfig`) instead.
 ```
 
 The NGram method is an implementation of [this Prompt Lookup Decoding algorithm](https://github.com/apoorvumang/prompt-lookup-decoding).
