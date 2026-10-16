@@ -232,7 +232,14 @@ def test_graph_runner_captures_widths_and_replays_updated_rows(monkeypatch):
     runner.is_warmup_only = False
     runner.capture(key, forward, inputs)
     assert {k.beam_execution_width for k in runner.graphs} == {0, 2, 4}
-    for width in (2, 4, 0, 2):
+    eager_inputs = make_inputs(2, 5)
+    eager_ids, eager_positions = eager_inputs["input_ids"], eager_inputs["position_ids"]
+    for step, width in enumerate((2, 4, 0, 2)):
+        eager_count = (1 + step % 2) * 5
+        eager_inputs["attn_metadata"].seq_lens = torch.ones(eager_count, dtype=torch.int32)
+        eager_inputs["input_ids"] = eager_ids[:eager_count]
+        eager_inputs["position_ids"] = eager_positions[:, :eager_count]
+        runner.beam_compaction.prepare_inputs(eager_inputs, 2)
         inputs["input_ids"].add_(7)
         inputs["position_ids"].add_(1)
         inputs["attn_metadata"].kv_lens_cuda.add_(3)
@@ -294,3 +301,64 @@ def test_metadata_host_indices_ignore_default_device():
     assert view.row_indices_cpu.device.type == "cpu"
     assert view.metadata.seq_lens.device.type == "cpu"
     assert view.row_indices.is_cuda
+
+
+@pytest.mark.parametrize("capacity,width", [(5, 2), (5, 4), (500, 20), (500, 300)])
+def test_eager_cache_releases_previous_batch_views(capacity: int, width: int) -> None:
+    """Changing batch size releases obsolete views and keeps active rows correct."""
+    inputs = make_inputs(3, capacity)
+    source = inputs["attn_metadata"]
+    input_ids, position_ids = inputs["input_ids"], inputs["position_ids"]
+    compaction = BeamCompaction(capacity, (width,))
+    previous_view = previous_buffer = None
+    for batch in (1, 2, 3, 1, 3, 2):
+        count = batch * capacity
+        source.seq_lens = torch.ones(count, dtype=torch.int32)
+        source.request_ids = list(range(batch))
+        source.kv_lens.add_(1)
+        source.kv_lens_cuda.add_(1)
+        inputs["input_ids"] = input_ids[:count]
+        inputs["position_ids"] = position_ids[:, :count]
+        compaction.prepare_inputs(inputs, width)
+        view = inputs["beam_compaction"]
+        if previous_view is not None:
+            assert previous_view() is None
+            assert previous_buffer() is None
+        assert len(compaction._views) == 1
+        assert view.batch_size == batch
+        pointer = view.metadata.kv_lens_cuda.data_ptr()
+        compaction.prepare_inputs(inputs, width)
+        assert inputs["beam_compaction"] is view
+        assert view.metadata.kv_lens_cuda.data_ptr() == pointer
+        actual = forward(inputs).reshape(batch, capacity, 2)
+        expected = fake_forward(**inputs).reshape(batch, capacity, 2)
+        torch.testing.assert_close(actual[:, :width], expected[:, :width], rtol=0, atol=0)
+        assert torch.isneginf(actual[:, width:]).all()
+        previous_view = weakref.ref(view)
+        previous_buffer = weakref.ref(view.metadata.kv_lens_cuda)
+        del view
+
+
+@pytest.mark.parametrize("graph_enabled", [False, True])
+def test_eager_cache_keeps_other_sources_and_widths(graph_enabled: bool) -> None:
+    """Eviction is isolated from other widths and eager or CUDA graph sources."""
+    inputs = make_inputs(3, 5)
+    other_inputs = make_inputs(2, 5)
+    other_inputs["attn_metadata"].is_cuda_graph = graph_enabled
+    compaction = BeamCompaction(5, (2, 4))
+    compaction.prepare_inputs(inputs, 4)
+    wide = inputs["beam_compaction"]
+    compaction.prepare_inputs(other_inputs, 2)
+    other = other_inputs["beam_compaction"]
+    other_pointer = other.metadata.kv_lens_cuda.data_ptr()
+    compaction.prepare_inputs(inputs, 2)
+    inputs["attn_metadata"].seq_lens = torch.ones(5, dtype=torch.int32)
+    inputs["input_ids"] = inputs["input_ids"][:5]
+    inputs["position_ids"] = inputs["position_ids"][:, :5]
+    compaction.prepare_inputs(inputs, 2)
+    assert len(compaction._views) == 3
+    assert wide in compaction._views.values()
+    assert other in compaction._views.values()
+    compaction.prepare_inputs(other_inputs, 2)
+    assert other_inputs["beam_compaction"] is other
+    assert other.metadata.kv_lens_cuda.data_ptr() == other_pointer

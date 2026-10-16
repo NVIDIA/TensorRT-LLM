@@ -189,6 +189,12 @@ class BeamCompaction:
         source = inputs["attn_metadata"]
         key = (id(source), source.num_seqs, width)
         if key not in self._views:
+            if not source.is_cuda_graph:
+                # Eager views only need the latest batch shape for each width.
+                # CUDA graph views retain stable buffers for replay.
+                for cached_key in tuple(self._views):
+                    if cached_key[0] == id(source) and cached_key[2] == width:
+                        del self._views[cached_key]
             self._views[key] = CompactBeamView(source, width, self.capacity)
         view = self._views[key]
         view.update()
