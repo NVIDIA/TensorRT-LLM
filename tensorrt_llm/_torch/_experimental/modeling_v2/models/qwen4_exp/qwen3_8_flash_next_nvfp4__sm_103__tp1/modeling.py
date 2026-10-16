@@ -456,8 +456,8 @@ _GDN_REPLAY_HISTORY = 16
 
 #: The most query rows a verify step carries per generation request, `max_draft_len + 1`.
 #: It reaches `thop_attention` as `predicted_tokens_per_seq` and the cached replay as its step
-#: width `T`; the replay kernel asserts `T <= 8` and the engine falls back to the legacy
-#: per-step states above it.
+#: width `T`; the replay kernel asserts `T <= 8`, and above it the engine would verify with the
+#: legacy per-step states, which this target refuses past `_MAX_LEGACY_VERIFY_WIDTH` rows.
 _MAX_VERIFY_WIDTH = 8
 
 #: The same bound on the legacy verify path (`TRTLLM_USE_GDN_REPLAY=0`): the entries only it

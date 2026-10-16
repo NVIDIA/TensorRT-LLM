@@ -24,9 +24,10 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
-#: Largest conv-pool slot count the cache manager was seen to allocate for this
-#: checkpoint (10 .. 461 over twelve runtime-value dumps). The verify path hands
-#: the whole pool over unsliced.
+#: A conv-pool slot count of a full-size engine run. The kernel addresses a slot by its
+#: index alone, so a pool of another size (a bf16 recurrent pool holds more slots in the
+#: same memory, and the conv pool shares its slot space) takes the same path. The verify
+#: path hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
 #: The engine's `max_num_sequences`: the snapshot buffer's row count.
 ENGINE_SNAPSHOT_ROWS = 32
