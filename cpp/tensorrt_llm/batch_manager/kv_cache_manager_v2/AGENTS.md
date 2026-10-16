@@ -176,8 +176,15 @@ Eviction controller
 `- prioritized LRU lists (strong ownership of droppable Pages)
 ```
 
-- Follow the existing `SharedPtr`/`WeakPtr` conventions in `utils/sharedPtr.h`.
-  Treat every ownership edge as intentional; do not replace weak edges with
+- Avoid shared ownership unless it is needed; prefer values, `std::unique_ptr`,
+  or documented raw observers. When it is needed, prefer the non-atomic
+  `SharedPtr`/`WeakPtr` in `utils/sharedPtr.h` over `std::shared_ptr`: atomic
+  refcounts are costly on ARM (Grace). `SharedPtr` is fine across threads when
+  the manager's API lock serializes every copy and release. Reserve
+  `std::shared_ptr` for process-wide resources or references released outside
+  that lock (for example, from Python). This overrides the generic `shared_ptr`
+  advice in `CODING_GUIDELINES.md`.
+- Treat every ownership edge as intentional; do not replace weak edges with
   strong ones merely to simplify access.
 - `KvCache` keeps its `KvCacheManager` alive. The manager's registry of living
   caches must not create the reverse strong-reference cycle.
