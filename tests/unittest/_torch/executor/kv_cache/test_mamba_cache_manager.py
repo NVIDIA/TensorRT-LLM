@@ -307,9 +307,6 @@ def _kimi_model_config() -> SimpleNamespace:
         sparse_attention_config=None,
         spec_config=None,
         get_num_mamba_layers=lambda: 2,
-        # get_kv_cache_manager_cls reads the mapping and spec config (helix check).
-        mapping=None,
-        spec_config=None,
     )
 
 
