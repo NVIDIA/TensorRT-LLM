@@ -372,17 +372,22 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
         )
 
 
-def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
-    name = "model.language_model.layers.0.mlp.gate_proj"
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN])
+def test_qwen35_dense_vl_normalizes_fp8_mlp_paths(quant_algo: QuantAlgo) -> None:
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(num_hidden_layers=64),
-        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.FP8)},
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        },
     )
 
     _normalize_qwen35_quant_config_dict(model_config)
 
     assert model_config.quant_config_dict == {
-        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+        f"model.layers.0.mlp.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+        for proj in ("gate_proj", "up_proj", "down_proj")
     }
 
 
