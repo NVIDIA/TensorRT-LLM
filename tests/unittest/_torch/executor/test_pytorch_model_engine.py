@@ -89,12 +89,11 @@ class TestCachedKvTokenLogging(unittest.TestCase):
         self.assertEqual(self.engine.iter_states['cached_kv_tokens_per_req'],
                          expected)
 
-    def test_mtp_padding_before_first_draft_and_generation(self) -> None:
-        # Input packing is context, extend (including padding), first draft, gen.
-        self.check_counts([10, 100, 7, 200, 300],
+    def test_mtp_padding_before_generation(self) -> None:
+        # Input packing is context, extend (including padding), gen.
+        self.check_counts([10, 100, 7, 300],
                           (([self.real], 1), ([self.real, self.padding], 1),
-                           ([self.real], 1), ([self.real], 1)),
-                          [10, 100, 200, 300], 7)
+                           ([self.real], 1)), [10, 100, 300], 7)
 
     def test_beams_preserved_after_context_and_padding(self) -> None:
         self.check_counts([10, 100, 101, 7, 7, 200, 201],
@@ -297,7 +296,6 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_prompt_len=prompt_len,
         py_beam_width=1,
         py_draft_tokens=[],
-        py_is_first_draft=False,
         is_context_only_request=False,
         is_generation_only_request=False,
         py_disaggregated_params=None,
@@ -420,8 +418,7 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
                                                ordinary_capture: bool,
                                                eligible: bool) -> None:
     """Exercise both the regular forward and ordinary-graph capture callbacks."""
-    key = KeyType(batch_size=1, draft_len=0,
-                  is_first_draft=False) if ordinary_capture else None
+    key = KeyType(batch_size=1, draft_len=0) if ordinary_capture else None
     engine, graph_runner, resources, _, outputs = _make_forward_only_engine(key)
     eager = torch.nn.Identity()
     compiled = torch.nn.Identity()
@@ -613,7 +610,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             ("cursor_prompt_mismatch", "py_prompt_len", 5),
             ("beam", "py_beam_width", 2),
             ("draft", "py_draft_tokens", [9]),
-            ("first_draft", "py_is_first_draft", True),
             ("context_only", "is_context_only_request", True),
             ("disaggregated", "py_disaggregated_params", object()),
             ("multimodal", "py_multimodal_data", {}),
@@ -659,7 +655,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         cases = (
             ("beam", "py_beam_width", 2),
             ("draft", "py_draft_tokens", [9]),
-            ("first_draft", "py_is_first_draft", True),
             ("disaggregated", "py_disaggregated_params", object()),
         )
         for name, attribute, value in cases:
@@ -846,7 +841,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             key,
             KeyType(batch_size=1,
                     draft_len=0,
-                    is_first_draft=False,
                     short_seq_len_mode=True,
                     num_encoder_tokens=0))
 
@@ -899,7 +893,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         key = KeyType(batch_size=2,
                       draft_len=0,
-                      is_first_draft=False,
                       num_contexts=1,
                       context_query_len=1,
                       num_encoder_tokens=7)
@@ -951,11 +944,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         )
         model_dtype_key = KeyType(batch_size=1,
                                   draft_len=0,
-                                  is_first_draft=False,
                                   peft_cache_data_type=torch.bfloat16)
         fp8_key = KeyType(batch_size=1,
                           draft_len=0,
-                          is_first_draft=False,
                           peft_cache_data_type=torch.float8_e4m3fn)
         runner.get_graph_key.return_value = fp8_key
         runner.graph_metadata = {model_dtype_key: object()}
@@ -997,10 +988,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         self.assertEqual(
             key,
-            KeyType(batch_size=1,
-                    draft_len=0,
-                    is_first_draft=False,
-                    use_lora_graph=True),
+            KeyType(batch_size=1, draft_len=0, use_lora_graph=True),
         )
 
     def test_lora_graph_variant_selection(self) -> None:
@@ -1033,7 +1021,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         )
         key = KeyType(batch_size=1,
                       draft_len=0,
-                      is_first_draft=False,
                       short_seq_len_mode=True,
                       num_encoder_tokens=0)
         graph_attn_metadata = object()
@@ -1070,7 +1057,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                          (graph_attn_metadata, graph_spec_metadata, key))
 
     def test_forward_commits_candidate_only_on_graph_hit(self) -> None:
-        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=2, draft_len=0)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         context = _make_request_stub(1)
@@ -1133,7 +1120,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             batch, outputs)
 
     def test_ced_final_context_cannot_promote_to_decode_graph(self) -> None:
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         engine, runner, resource_manager, metadata, outputs = \
             _make_forward_only_engine(key, private_decoder=True)
         engine.model.model = SimpleNamespace(ced_kv_precompute=True,
@@ -1156,7 +1143,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:
-        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=2, draft_len=0)
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
@@ -1264,7 +1251,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.replay.assert_not_called()
 
     def test_forward_allows_guided_context_logits_on_graph_hit(self) -> None:
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         engine._runner.guided_decoder = Mock()
@@ -1349,7 +1336,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine._runner._forward_step.assert_called_once()
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         generation = _make_request_stub(2)
         batch = ScheduledRequests()
@@ -1371,7 +1358,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                          frozenset())
 
     def test_generation_lora_request_selects_lora_graph(self) -> None:
-        key = (1, 0, False, False, True, True)
+        key = (1, 0, False, True, True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         engine._runner._lora = SimpleNamespace(cuda_graph_manager=object())
         engine._runner._config.cuda_graph_specialize_lora = True
@@ -2221,9 +2208,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         runner = model_engine.cuda_graph_runner
         # Simulate a spec-decode capture: graphs keyed (batch_size, draft_len,
-        # is_first_draft, short_seq_len_mode, is_all_greedy_sample) exist only
-        # for draft_len 2.
-        runner.graphs[(8, 2, False, False, True)] = Mock()
+        # short_seq_len_mode, is_all_greedy_sample) exist only for draft_len 2.
+        runner.graphs[(8, 2, False, True)] = Mock()
         try:
             runner.preallocate_padding_dummies(resource_manager)
 
@@ -3087,7 +3073,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
         return metadata
 
     def test_scope_requires_selected_ordinary_decode_graph(self):
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         cases = (
             "ordinary",
             "ordinary_overlap",
@@ -3140,7 +3126,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
 
     def test_forward_scopes_proof_to_prepare_for_capture_replay_and_fallback(
             self):
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         for mode in ("warmup", "capture", "replay", "fallback",
                      "prepare_error"):
             with self.subTest(mode=mode):

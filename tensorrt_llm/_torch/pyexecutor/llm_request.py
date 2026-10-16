@@ -859,7 +859,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
             seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
-            is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
@@ -982,8 +981,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_additional_outputs = additional_outputs
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
-        # Whether the request is for the first forward of the draft model.
-        self.py_is_first_draft = is_first_draft
         self.d2t = None
         self.py_disable_speculative_decoding = False
 
