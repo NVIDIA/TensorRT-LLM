@@ -22,6 +22,10 @@ modeling-v2-onboard --workspace /scratch/me/qwen3-onboard \
     --feedback "Drop the regression tasks; they are not needed."   # steer a running run
 ```
 
+The run's agents do not read or write Claude Code's auto-memory: it is shared
+by every worktree of the checkout, so it would carry unrelated work and earlier
+runs into this one. What a run learns lives in its workspace.
+
 Rerunning the same command resumes an interrupted run. `--clean` starts over:
 it deletes the workspace's run state and every task worktree and `node/*`
 branch in the checkout.

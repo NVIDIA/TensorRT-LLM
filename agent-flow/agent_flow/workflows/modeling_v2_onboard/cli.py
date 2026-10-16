@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -143,6 +144,11 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(2)
         print(f"message left for the planner: {path}")
         return
+    # Claude Code keeps one auto-memory per repository, shared by all its
+    # worktrees: the run's agents would read memories of unrelated work and of
+    # earlier runs, and leave theirs to later ones. Every agent of a run starts
+    # from the run's own files instead.
+    os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     try:
         task_data = load_and_validate_task_yaml(args.task)
         workflow = ModelingV2OnboardWorkflow(

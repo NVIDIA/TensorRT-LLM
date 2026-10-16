@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,16 @@ def test_an_invalid_task_exits_with_an_error(tmp_path, capsys):
         main(["--task", str(task), "--workspace", str(tmp_path / "ws")])
     assert info.value.code == 2
     assert "reference_code_path" in capsys.readouterr().err
+
+
+def test_a_run_keeps_its_agents_off_claude_code_auto_memory(tmp_path, monkeypatch):
+    # Set through monkeypatch so the test leaves the variable as it found it.
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
+    task = tmp_path / "task.yaml"
+    task.write_text("checkpoint_path: /nonexistent\n")
+    with pytest.raises(SystemExit):
+        main(["--task", str(task), "--workspace", str(tmp_path / "ws")])
+    assert os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
 
 
 def test_feedback_leaves_a_message_without_a_task(tmp_path, capsys):
