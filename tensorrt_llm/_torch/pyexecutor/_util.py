@@ -534,6 +534,39 @@ def get_attention_workspace_fixed_bytes(model_config, mapping,
             model_config, mapping, **capacities)
 
 
+def get_overlap_headroom_penalty_workspace_bytes(
+        max_num_sequences: int, num_sequences_without_headroom: int,
+        max_beam_width: int, vocab_size: Optional[int]) -> int:
+    """Bytes the overlap headroom adds to the sampler's penalty workspace.
+
+    ``PenaltyStore`` allocates its vocab-sized occurrence workspace -- int32
+    ``counts_cuda`` with one row per beam of every seat, plus the bool
+    ``presence_prefix_cuda`` with one row per seat -- only when the first
+    penalized request arrives. That is after the KV cache has taken its share of
+    free memory, and the profiling requests carry no penalties, so the
+    estimation never measures it. The seats a configuration has without the
+    overlap headroom come out of the ``free_gpu_memory_fraction`` slack, as they
+    always have. The extra seats the headroom adds are reserved here instead.
+
+    ``max_num_sequences`` and ``max_beam_width`` are the ``PenaltyStore``'s own
+    dimensions; ``num_sequences_without_headroom`` is the seat pool the same
+    configuration gets with the headroom off. Returns 0 when the store has no
+    extra seats or when the vocabulary size is unknown.
+    """
+    extra_seats = max_num_sequences - num_sequences_without_headroom
+    if extra_seats <= 0 or not vocab_size:
+        return 0
+    counts_bytes = extra_seats * max_beam_width * vocab_size * torch.int32.itemsize
+    presence_prefix_bytes = extra_seats * vocab_size * torch.bool.itemsize
+    return counts_bytes + presence_prefix_bytes
+
+
+def get_penalty_store(sampler):
+    """Return the sampler's ``PenaltyStore``, or None if it does not own one."""
+    penalty_handler = getattr(sampler, "_penalty_handler", None)
+    return getattr(penalty_handler, "store", None)
+
+
 def get_mla_context_workspace_kv_len_cap(
         kv_cache_config,
         max_batch_size,
@@ -1484,6 +1517,27 @@ class KvCacheCreator:
             reserve += 2 * chunk_output_bytes
         return reserve
 
+    def _get_penalty_workspace_reserve(self, py_executor) -> int:
+        """Reserve the overlap-headroom seats' penalty workspace.
+
+        Sized from the profiling executor's own ``PenaltyStore``, so it follows
+        the sampler that will serve. See
+        ``get_overlap_headroom_penalty_workspace_bytes``.
+        """
+        store = get_penalty_store(getattr(py_executor, "sampler", None))
+        if store is None:
+            return 0
+        return get_overlap_headroom_penalty_workspace_bytes(
+            max_num_sequences=store.max_num_sequences,
+            num_sequences_without_headroom=compute_max_num_sequences(
+                self._mapping,
+                self._max_batch_size,
+                self._llm_args.disable_overlap_scheduler,
+                enable_overlap_headroom=False),
+            max_beam_width=store.max_beam_width,
+            vocab_size=resolve_vocab_size(
+                self._model_engine.model.model_config.pretrained_config))
+
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
         if 'cp_type' in self._mapping.cp_config:
@@ -1814,6 +1868,15 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {fixed_workspace_reserve / GB:.2f} GiB for capacity-sized "
                 "attention workspace across serving steps.")
+
+        penalty_workspace_reserve = self._get_penalty_workspace_reserve(
+            py_executor)
+        peak_memory += penalty_workspace_reserve
+        if penalty_workspace_reserve:
+            logger.info(
+                f"Reserving {penalty_workspace_reserve / GB:.2f} GiB for the penalty "
+                "workspace of the overlap-headroom seats, which is allocated on "
+                "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,

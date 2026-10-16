@@ -61,6 +61,8 @@ from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     compute_max_num_sequences,
     create_torch_sampler_args,
+    get_overlap_headroom_penalty_workspace_bytes,
+    get_penalty_store,
     is_disagg_enabled,
     kv_cache_manager_v2_incompatible_features,
     resolve_max_num_sequences,
@@ -596,14 +598,14 @@ def test_validator_permits_an_index_pool_above_the_seat_pool():
     widens. And a disaggregated run with the overlap scheduler disabled widens the
     index pool while the seat gate stays shut.
 
-    That gap is accepted rather than engineered away: admission is bounded
-    independently by the seat pool, so a surplus lease is never extra
-    concurrency, and it is the cheap direction -- spare leases cost page-table
-    rows, spare seats would cost sampler state, the eagerly allocated
-    ``[seats, draft_len, vocab]`` draft probabilities and the pinned-host
-    block-offset tables. Widening the seat pool to make the two numbers equal
-    would buy allocation and no admission, which is why the validator checks
-    coverage rather than equality.
+    That gap is accepted rather than engineered away: admission is capped
+    independently at ``max_num_active_requests`` (``max_batch_size * pp_size``),
+    so a surplus lease is never extra concurrency, and it is the cheap direction
+    -- spare leases cost page-table rows, spare seats would cost sampler state,
+    the eagerly allocated ``[seats, draft_len, vocab]`` draft probabilities and
+    the pinned-host block-offset tables. Widening the seat pool to make the two
+    numbers equal would buy allocation and no admission, which is why the
+    validator checks coverage rather than equality.
 
     Asserting on the signature as well: ``is_disagg`` used to select which
     surplus was tolerated, and its absence is what stops the validator from
@@ -922,3 +924,86 @@ def test_seq_slot_ids_remain_valid_after_partial_reuse():
     assert all(0 <= s < capacity for s in slots), slots
     assert len(set(slots)) == len(live)
     assert not manager.slot_manager.free_slots
+
+
+# The penalty workspace (``PenaltyStore.counts_cuda`` / ``presence_prefix_cuda``) is
+# allocated on the first penalized request, after the KV cache has taken its share
+# of free memory, so the estimation has to reserve the part the headroom adds.
+@pytest.mark.parametrize("max_beam_width", [1, 4])
+def test_penalty_workspace_reserve_covers_only_the_headroom_seats(max_beam_width):
+    vocab_size, max_batch_size = 152064, 2048
+    seats = compute_max_num_sequences(
+        Mapping(world_size=1, tp_size=1, pp_size=1),
+        max_batch_size,
+        disable_overlap_scheduler=False,
+        enable_overlap_headroom=True,
+    )
+    assert seats == 2 * max_batch_size
+    reserve = get_overlap_headroom_penalty_workspace_bytes(
+        max_num_sequences=seats,
+        num_sequences_without_headroom=max_batch_size,
+        max_beam_width=max_beam_width,
+        vocab_size=vocab_size,
+    )
+    # int32 counts per beam of each extra seat, plus one bool prefix row per extra seat.
+    assert reserve == max_batch_size * vocab_size * (4 * max_beam_width + 1)
+
+
+@pytest.mark.parametrize(
+    "max_num_sequences,num_sequences_without_headroom,vocab_size",
+    [
+        (8, 8, 1000),  # headroom off: the slack has always covered these seats
+        (16, 16, 1000),  # pipeline parallelism: the pool is pp_size wide either way
+        (16, 8, None),  # vocabulary unknown
+    ],
+)
+def test_penalty_workspace_reserve_is_zero_without_extra_seats(
+    max_num_sequences, num_sequences_without_headroom, vocab_size
+):
+    assert (
+        get_overlap_headroom_penalty_workspace_bytes(
+            max_num_sequences=max_num_sequences,
+            num_sequences_without_headroom=num_sequences_without_headroom,
+            max_beam_width=1,
+            vocab_size=vocab_size,
+        )
+        == 0
+    )
+
+
+def test_penalty_store_is_read_from_the_torch_sampler_only():
+    store = SimpleNamespace(max_num_sequences=16, max_beam_width=1)
+    assert (
+        get_penalty_store(SimpleNamespace(_penalty_handler=SimpleNamespace(store=store))) is store
+    )
+    # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
+    assert get_penalty_store(SimpleNamespace()) is None
+    assert get_penalty_store(None) is None
+
+
+@pytest.mark.parametrize("enable_overlap_headroom", [False, True])
+def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_headroom):
+    """The reserve follows the profiling executor's own sampler store."""
+    max_batch_size, vocab_size = 64, 1000
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    seats = compute_max_num_sequences(
+        mapping, max_batch_size, False, enable_overlap_headroom=enable_overlap_headroom
+    )
+    creator = KvCacheCreator.__new__(KvCacheCreator)
+    creator._mapping = mapping
+    creator._max_batch_size = max_batch_size
+    creator._llm_args = SimpleNamespace(disable_overlap_scheduler=False)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=vocab_size))
+        )
+    )
+    store = SimpleNamespace(max_num_sequences=seats, max_beam_width=1)
+    py_executor = SimpleNamespace(
+        sampler=SimpleNamespace(_penalty_handler=SimpleNamespace(store=store))
+    )
+    expected = max_batch_size * vocab_size * 5 if enable_overlap_headroom else 0
+    assert creator._get_penalty_workspace_reserve(py_executor) == expected
+    # No executor (skipped estimation) or a sampler without penalties reserves nothing.
+    assert creator._get_penalty_workspace_reserve(None) == 0
+    assert creator._get_penalty_workspace_reserve(SimpleNamespace(sampler=SimpleNamespace())) == 0
