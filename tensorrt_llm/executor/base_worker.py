@@ -141,8 +141,9 @@ class BaseWorker(GenerationExecutor):
         # Maps adapter ID to (canonical path, checkpoint source).
         self._lora_adapter_identities: dict[str, tuple[str, str]] = {}
         # Weak values avoid retaining locks for failed, one-off adapter IDs.
-        self._lora_adapter_locks = weakref.WeakValueDictionary()
-        self._lora_adapter_locks_lock = Lock()
+        self._lora_adapter_id_locks = weakref.WeakValueDictionary()
+        # Ensures concurrent requests for one adapter ID share the same lock.
+        self._lora_adapter_id_locks_guard = Lock()
         self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
@@ -333,11 +334,11 @@ class BaseWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
         """Returns True if the adapter was loaded by this call, False if it was already loaded"""
         adapter_id = str(lora_request.adapter_id)
-        with self._lora_adapter_locks_lock:
-            adapter_lock = self._lora_adapter_locks.get(adapter_id)
+        with self._lora_adapter_id_locks_guard:
+            adapter_lock = self._lora_adapter_id_locks.get(adapter_id)
             if adapter_lock is None:
                 adapter_lock = Lock()
-                self._lora_adapter_locks[adapter_id] = adapter_lock
+                self._lora_adapter_id_locks[adapter_id] = adapter_lock
 
         with adapter_lock:
             previous = self._lora_adapter_identities.get(adapter_id)

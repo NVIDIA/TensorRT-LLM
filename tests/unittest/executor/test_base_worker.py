@@ -71,8 +71,8 @@ def lora_identity_worker() -> BaseWorker:
     worker._runtime_model_config = None
     worker._lora_model_config = None
     worker._lora_adapter_identities = {}
-    worker._lora_adapter_locks = {}
-    worker._lora_adapter_locks_lock = Lock()
+    worker._lora_adapter_id_locks = {}
+    worker._lora_adapter_id_locks_guard = Lock()
     worker._lora_manager = Mock()
     worker._lora_manager.cpp_lora_weights = {}
     worker._lora_manager.cpp_lora_config = {}
@@ -216,7 +216,7 @@ def test_lora_identity_serializes_registration(lora_identity_worker: BaseWorker,
         return ["7"]
 
     adapter_lock = SignalingLock()
-    worker._lora_adapter_locks["7"] = adapter_lock
+    worker._lora_adapter_id_locks["7"] = adapter_lock
     worker._lora_manager.load_from_ckpt.side_effect = load_adapter
     requests = [
         LoRARequest("adapter", 7, str(tmp_path / name)) for name in ("a", "b")
