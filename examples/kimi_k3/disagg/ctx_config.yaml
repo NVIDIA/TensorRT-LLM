@@ -14,8 +14,9 @@
 # end-to-end.
 #
 # Hard K3 constraints baked in: no chunked prefill, no KV block reuse
-# (KDA state), tokens_per_block=64 (MLA latent layout), and
-# disable_overlap_scheduler=true (mandatory for any disagg ctx server).
+# (KDA state), and disable_overlap_scheduler=true (mandatory for any
+# disagg ctx server). tokens_per_block=64 is kept for historical reasons
+# (older TRTLLM-Gen MLA kernels required it).
 # K3 ships a custom (trust-remote-code) tokenizer; without this the
 # server starts tokenizer-less and 400s every string prompt with
 # "tokenizer is required to tokenize string prompt".
@@ -35,7 +36,7 @@ max_seq_len: 8212
 kv_cache_config:
   # Mandatory for K3 (per-request KDA recurrent state).
   enable_block_reuse: false
-  # Mandatory for K3 MLA (576, 512) trtllm-gen kernels.
+  # Historical: older TRTLLM-Gen MLA (576, 512) kernels required 64.
   tokens_per_block: 64
   # Conservative starting point proven by the aggregated DEP16 evals; the
   # ctx server only holds in-flight prefills (MLA latent KV is small:
