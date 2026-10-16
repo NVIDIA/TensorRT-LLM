@@ -3063,14 +3063,15 @@ def _use_gdn_flashinfer_ring_replay(use_replay: bool,
     Decided once at load: the ring and double-buffer history layouts differ,
     so the kernel cannot be switched per call.
     """
-    if not use_replay or not is_gdn_flashinfer_replay_enabled():
+    if not is_gdn_flashinfer_replay_enabled():
         return False
     from ..modules.fla.flashinfer_cached_replay import \
         is_flashinfer_cached_replay_available
 
-    tokens_per_step = spec_config.tokens_per_gen_step
     reason = None
-    if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+    if not use_replay:
+        reason = "requires GDN replay to be enabled"
+    elif not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         reason = ("requires MambaHybridCacheManagerV2, got "
                   f"{kv_cache_manager_cls.__name__}")
     elif not is_flashinfer_cached_replay_available():
@@ -3080,9 +3081,9 @@ def _use_gdn_flashinfer_ring_replay(use_replay: bool,
         reason = "requires bf16 model and SSM state dtypes"
     elif mamba_params.state_size != 128 or mamba_params.head_dim != 128:
         reason = "requires key and value head size 128"
-    elif tokens_per_step not in (4, 8):
+    elif spec_config.tokens_per_gen_step not in (4, 8):
         reason = ("supports 4 or 8 tokens per generation step, got "
-                  f"{tokens_per_step}")
+                  f"{spec_config.tokens_per_gen_step}")
     if reason is not None:
         if is_gdn_flashinfer_replay_required():
             raise RuntimeError(

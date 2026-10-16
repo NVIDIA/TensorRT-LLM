@@ -3777,7 +3777,7 @@ def _ring_gate_mamba_params(**overrides):
         ("1", True, MambaHybridCacheManagerV2, True, {}, 3, True, False),
         ("1", True, MambaHybridCacheManagerV2, True, {}, 7, True, False),
         (None, True, MambaHybridCacheManagerV2, True, {}, 3, False, False),
-        ("1", False, MambaHybridCacheManagerV2, True, {}, 3, False, False),
+        ("1", False, MambaHybridCacheManagerV2, True, {}, 3, False, True),
         ("1", True, CppMambaHybridCacheManager, True, {}, 3, False, True),
         ("1", True, MambaHybridCacheManagerV2, False, {}, 3, False, True),
         (
@@ -3861,6 +3861,22 @@ def test_gdn_flashinfer_ring_replay_gate_force(monkeypatch, available):
     else:
         with pytest.raises(RuntimeError, match="force"):
             _use_gdn_flashinfer_ring_replay(*args)
+
+
+def test_gdn_flashinfer_ring_replay_gate_force_replay_disabled(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: True,
+    )
+    with pytest.raises(RuntimeError, match="requires GDN replay"):
+        _use_gdn_flashinfer_ring_replay(
+            False,
+            MambaHybridCacheManagerV2,
+            _ring_gate_mamba_params(),
+            MTPDecodingConfig(max_draft_len=3),
+        )
 
 
 @pytest.mark.parametrize(
