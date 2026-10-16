@@ -41,9 +41,11 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
+    MultimodalFieldLayout,
     MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
+    select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
 
@@ -391,8 +393,8 @@ class MultimodalModelMixin:
       single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
     * A partially cached `MultimodalParams` is handled by encoding only its miss items
       and interleaving cached items back in original per-item order. The default
-      `build_multimodal_encoder_input` handles stacked-on-dim-0 and packed-with-grid-thw
-      layouts; models with other layouts override that method.
+      `build_multimodal_encoder_input` selects fields declared by
+      `get_multimodal_field_layout`. Undeclared models retain legacy stacked/packed inference.
     """
 
     supports_encoder_cache: ClassVar[bool] = False
@@ -813,44 +815,31 @@ class MultimodalModelMixin:
         # them as extra embeds without changing the base flow.
         return active_embeddings, ()
 
+    def get_multimodal_field_layout(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalFieldLayout] | None:
+        """Declare how items occupy each field of one modality's payload.
+
+        Models declare batched axes, packed item lengths, and shared values.
+        Unlisted fields pass through unchanged. Returning None retains legacy
+        layout inference for models that have not declared their fields.
+        """
+        return None
+
     def build_multimodal_encoder_input(
         self,
         param: MultimodalParams,
         item_indices: Sequence[int],
         modality: Optional[str] = None,
     ) -> MultimodalParams:
-        """Return a `MultimodalParams` whose raw modality inputs contain only
-        `item_indices` from `param`, in that order.
+        """Build a forward view containing selected modality-local items.
 
-        `item_indices` are indices into `modality`'s own payload. When `modality`
-        is None it is inferred from `param`, which requires the request to hold a
-        single modality -- the full-request path's case, where an item's global
-        index and its index within its modality coincide. Callers that already
-        know an item's modality (item scheduling reads it from `item_refs`) pass
-        it explicitly along with the modality-local indices, which is what lets
-        a single item be sliced out of an interleaved image+video request.
-
-        Default handles three common single-modality layouts:
-
-        - Image, stacked on dim 0 (Mistral 3 / Pixtral / LLaVA-family): `pixel_values`
-          `[B, C, H, W]` with a parallel `image_sizes` list; both sliced by item.
-        - Image / video, packed with `*_grid_thw` offsets (Qwen2-VL family):
-          `pixel_values` `[total_patches, feat]` + `image_grid_thw` `[B, 3]`;
-          prefix-summed patch counts locate each item's slice, and `image_grid_thw`
-          is sliced in parallel.
-        - Audio, stacked on dim 0 (Whisper / Qwen2-Audio / Gemma4 audio):
-          `input_features` `[B, mel_bins, T]` sliced by item.
-
-        Any additional sibling field in the modality dict whose first-axis length equals
-        the item count is also sliced -- covers per-item metadata such as
-        `second_per_grid_ts` (Qwen2.5-VL video) or `input_features_mask` /
-        `feature_attention_mask` (audio) without model-specific code.
-
-        Models with a different layout (e.g. mixed-modality per param, custom packed
-        formats) should override this method. The parallel per-item metadata
-        (`multimodal_embedding_lengths`, `multimodal_hashes`) is model-agnostic and is
-        re-sliced by the mixin after this returns, so overrides need only handle the
-        modality-specific raw data.
+        Declared field layouts drive common tensor/list selection. Models with
+        custom preprocessing can still override this hook. The caller slices
+        the parallel item metadata after this returns, preserving original
+        request indices for scheduler targets and cache ownership.
         """
         if modality is None:
             modality = self._encoder_cache_modality(param)
@@ -865,7 +854,34 @@ class MultimodalModelMixin:
             raise TypeError(
                 f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
             )
+        field_layout = self.get_multimodal_field_layout(param, modality)
+        if field_layout is None:
+            sliced = self._select_legacy_multimodal_fields(modality_data, modality, item_indices)
+        else:
+            sliced = select_multimodal_fields(modality_data, field_layout, item_indices)
 
+        # Metadata slicing must not rewrite the original request's hashes.
+        residual_input = (
+            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
+        )
+        residual_data = {
+            key: value
+            for key, value in param.multimodal_data.items()
+            if key not in _MM_DATA_INPUT_MODALITY_KEYS or key == modality
+        }
+        residual_data[modality] = sliced
+        return MultimodalParams(
+            multimodal_data=residual_data,
+            multimodal_input=residual_input,
+        )
+
+    def _select_legacy_multimodal_fields(
+        self,
+        modality_data: Dict[str, Any],
+        modality: str,
+        item_indices: Sequence[int],
+    ) -> Dict[str, Any]:
+        """Select recognized packed/stacked layouts for undeclared models."""
         indices = list(item_indices)
         grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
         pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
@@ -942,26 +958,7 @@ class MultimodalModelMixin:
             **self._slice_per_item_sibling_fields(modality_data, n_items, indices, sliced.keys()),
         }
 
-        # Shallow-copy `multimodal_input` so `_apply_metadata_slice` can rewrite
-        # `multimodal_hashes` on the residual without mutating the source.
-        residual_input = (
-            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
-        )
-        # Carry the source's other entries through, but keep only the sliced
-        # modality's raw payload: leaving a sibling modality's unsliced tensors
-        # on the residual would make it look mixed-modality to the encoder
-        # (`_lengths_by_modality` rejects that without an `mm_item_order`
-        # manifest) while its rows were never requested.
-        residual_data = {
-            key: value
-            for key, value in param.multimodal_data.items()
-            if key not in _MM_DATA_INPUT_MODALITY_KEYS or key == modality
-        }
-        residual_data[modality] = sliced
-        return MultimodalParams(
-            multimodal_data=residual_data,
-            multimodal_input=residual_input,
-        )
+        return sliced
 
     @staticmethod
     def _slice_per_item_sibling_fields(
