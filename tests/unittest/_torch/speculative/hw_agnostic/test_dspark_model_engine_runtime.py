@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch import utils as torch_utils
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+    DeepseekV4TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, DSparkCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
@@ -152,6 +156,7 @@ def _warmup_metadata(position_helper, mask_helper):
             ratio: torch.empty(48, dtype=torch.int32) for ratio in ratios
         },
         compressed_mask_cuda={ratio: torch.empty(48, dtype=torch.bool) for ratio in ratios},
+        batch_size_cuda=torch.tensor([17], dtype=torch.int32),
         _compute_gen_compressed_position_ids=position_helper,
         _compute_compressed_mask=mask_helper,
     )
@@ -164,8 +169,8 @@ def test_ragged_compressor_warmup_primes_and_cleans_intermediate_shape(monkeypat
     def record_positions(*args):
         position_calls.append((torch.is_inference_mode_enabled(), args[3:]))
 
-    def record_mask(*args):
-        mask_calls.append((torch.is_inference_mode_enabled(), args[3:]))
+    def record_mask(new_comp, cu_new_comp, compressed_mask, batch_size, compress_ratios):
+        mask_calls.append((torch.is_inference_mode_enabled(), batch_size.tolist(), compress_ratios))
 
     metadata = _warmup_metadata(record_positions, record_mask)
     engine = SimpleNamespace(
@@ -180,7 +185,8 @@ def test_ragged_compressor_warmup_primes_and_cleans_intermediate_shape(monkeypat
     DecoderRunner._warmup_dspark_ragged_compressor_metadata(engine)
 
     assert position_calls == [(True, (0, 7, 6, [1, 4], {1: 0, 4: 0}))]
-    assert mask_calls == [(True, (7, {1: 42, 4: 14}, [1, 4]))]
+    assert mask_calls == [(True, [7], [1, 4])]
+    assert metadata.batch_size_cuda.tolist() == [17]
     for ratio, token_count in ((1, 42), (4, 14)):
         assert not metadata.past_kv_lens_cuda[ratio][:7].any()
         assert not metadata.new_comp_kv_lens_cuda[ratio][:7].any()
@@ -212,6 +218,51 @@ def test_ragged_compressor_warmup_cleans_after_helper_failure(monkeypatch):
     assert not metadata.cu_new_comp_kv_cuda[1][:4].any()
     assert not metadata.compressed_position_ids_cuda[1][:18].any()
     assert not metadata.compressed_mask_cuda[1][:18].any()
+    assert metadata.batch_size_cuda.tolist() == [17]
+
+
+@pytest.mark.parametrize("fail_after_mask", [False, True])
+def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fail_after_mask):
+    """Run the real five-argument mask and position helper bodies on CPU tensors."""
+    actual_mask = DeepseekV4TrtllmAttentionMetadata._compute_compressed_mask
+
+    def mask(new_comp, cu_new_comp, compressed_mask, batch_size, compress_ratios):
+        actual_mask(new_comp, cu_new_comp, compressed_mask, batch_size, compress_ratios)
+        assert batch_size is metadata.batch_size_cuda
+        assert batch_size.tolist() == [7]
+        assert compressed_mask[1][:42].all()
+        assert compressed_mask[4][:14].all()
+        assert metadata.compressed_position_ids_cuda[1][:42].tolist() == list(range(6)) * 7
+        assert metadata.compressed_position_ids_cuda[4][:14].tolist() == [0, 4] * 7
+        if fail_after_mask:
+            raise RuntimeError("mask cleanup probe")
+
+    metadata = _warmup_metadata(
+        DeepseekV4TrtllmAttentionMetadata._compute_gen_compressed_position_ids, mask
+    )
+    original_storage = metadata.batch_size_cuda.data_ptr()
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=True,
+        attn_metadata=metadata,
+        _config=SimpleNamespace(max_batch_size=8, cuda_graph_batch_sizes=[1, 4, 8]),
+    )
+    # Exercise the helpers' existing eager branch, not a fake signature or GPU compile.
+    monkeypatch.setattr(torch_utils, "is_piecewise_running", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    if fail_after_mask:
+        with pytest.raises(RuntimeError, match="mask cleanup probe"):
+            DecoderRunner._warmup_dspark_ragged_compressor_metadata(engine)
+    else:
+        DecoderRunner._warmup_dspark_ragged_compressor_metadata(engine)
+    assert metadata.batch_size_cuda.data_ptr() == original_storage
+    assert metadata.batch_size_cuda.tolist() == [17]
+    for ratio, token_count in ((1, 42), (4, 14)):
+        assert not metadata.past_kv_lens_cuda[ratio][:7].any()
+        assert not metadata.new_comp_kv_lens_cuda[ratio][:7].any()
+        assert not metadata.cu_new_comp_kv_cuda[ratio][:8].any()
+        assert not metadata.compressed_position_ids_cuda[ratio][:token_count].any()
+        assert not metadata.compressed_mask_cuda[ratio][:token_count].any()
 
 
 def test_ragged_compressor_warmup_requires_trimmed_tokens():

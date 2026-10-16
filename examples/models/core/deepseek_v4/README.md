@@ -476,10 +476,15 @@ configuration.
 
 Confidence-guided verification is **default-off and experimental**. It proposes the full physical
 draft block `K`, then may select a smaller, measured verifier-token budget. It does not reduce the
-physical drafter length. This draft integration is not a production deployment recipe: strict
-receipt generation and performance qualification are external, and the composed source still needs native
-build, GPU/full-model, accuracy and performance validation. Optional mixed scheduling has the
-separate evidence and route requirements below; no composed-tip GPU qualification is implied.
+physical drafter length. This prototype is not a production deployment recipe. Native/API
+compatibility and bounded full-model execution have been exercised in the distinct scopes listed
+in [the reproduction guide](CONFIDENCE_REPRODUCTION.md). A newer same-source, same-node
+static/enabled-compact pair also completed physical-K3/global-BS512/G64, 512-request/32-output-token work with
+independent lifetimes and source/output/routing/natural-closure checks. It reused the original
+cost/calibration artifacts and did not produce equal token sequences. An exact-source native
+rebuild, global clean-install qualification, task accuracy, sustained-serving performance and
+optional mixed-route qualification are not implied. Strict receipt generation and performance
+qualification remain separate.
 
 The source includes candidate [offline cost profiling](COST_PROFILING.md),
 [cost export and artifact reuse](COST_EXPORT.md), and
@@ -491,7 +496,11 @@ remain as stated in those guides; source availability alone is not GPU qualifica
 `K` is the physical draft length, `G` is the rank-local request count for a captured graph, and
 `V` is its verifier-token budget. In the cost table, `V=0` denotes the native full-width path;
 positive `V` values denote measured compact layouts. The table must cover the configured physical
-`K` and exact graph ladder. The scheduler never invents a missing cell.
+`K` and contain valid native/compact cells for every configured captured graph size. Default reuse
+may select a configured subset of the originally measured ladder without rewriting the artifact;
+the complete original table and fingerprint are still validated. Optional strict freshness retains
+exact-ladder matching, and any drain-guard tail must remain measured and captured. The scheduler
+never invents a missing cell.
 
 ### Requested configuration versus actual execution
 
@@ -506,7 +515,7 @@ and positive workload-admission checks before constructing engines and workers:
 
 | Startup result | Resolved execution |
 | --- | --- |
-| Explicit opt-in with default artifact reuse | Confidence stays enabled; measured costs must still pass schema, finiteness, physical-`K`, exact graph and layout checks. No admission receipt is created or asserted. |
+| Explicit opt-in with default artifact reuse | Confidence stays enabled; measured costs must still pass schema, finiteness, physical-`K`, configured graph coverage and layout checks. No admission receipt is created or asserted. |
 | Strict validation with missing, unreadable, stale or non-positive admission evidence | Both confidence flags become false and all confidence artifact paths/digests are cleared; ordinary feature-off static `K` runs. A warning explains the fallback. |
 | Physical `K=1` | Feature-off static `K1`; there is no smaller verifier tier. Confidence inputs are ignored and cleared. |
 | Strict validation with a matching receipt and positive aggregate value | Confidence remains requested; the existing environment, graph, checkpoint and runtime checks must still pass. |

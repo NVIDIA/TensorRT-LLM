@@ -23,8 +23,11 @@ schema-v2 artifact and can copy its original bytes after structural validation.
 Both paths use the actual runtime schema validator. Plain graph summaries remain
 ineligible; that does not prevent reuse of structurally valid supplied costs.
 
-These are source/CPU-prepared development interfaces. The complete new GPU
-collection/export workflow has not been exercised or qualified yet.
+Direct whole-step collection/export has been exercised in the recorded earlier
+physical-K3/G64, global-BS512 environment. Original measurements and fingerprints
+are preserved, not relabeled as fresh measurements for later destinations or
+sources. See [the reproduction guide](CONFIDENCE_REPRODUCTION.md) for the distinct
+validation scopes and remaining limits.
 
 For a previously measured cost table and a runtime capturing G16 and G64:
 
@@ -38,9 +41,13 @@ python tensorrt_llm/tools/dspark_cost_export.py \
 request count of the actual captured graph, not always the global batch size.
 With eight attention-DP ranks, BS128 and BS512 correspond to G16 and G64; with
 attention DP off they do not. Pass the exact graph ladder the engine resolves.
-Native V0, positive finite timing values, physical K, cell provenance and graph
-coverage must satisfy the existing consumer. Missing cells are not interpolated,
-copied from another K or filled with zero. No cluster name or site path is used.
+Default reuse permits that configured ladder to be a subset of the originally
+measured ladder. The complete original table/fingerprint and native V0, positive
+finite timing values, physical K, cell provenance and configured graph coverage
+must satisfy the existing consumer. Any drain-guard tail must remain measured
+and captured; optional strict freshness still requires the original full ladder.
+Missing cells are not interpolated, copied from another K or filled with zero.
+No cluster name or site path is used.
 
 Add `--output /path/to/new-costs.json` only to deliver a new byte-identical copy.
 The destination must not exist. No original values, recorded source head or
@@ -82,8 +89,9 @@ python -m tensorrt_llm.tools.verify_costs profile \
 
 Use this command under the site's normal MPI/container launcher with the actual
 GPU count and full startup/generation/export/shutdown budget. No cluster or
-account is embedded in the tooling. This source-prepared interface is **not** a
-GPU-tested reproduction instruction. No extra sweep is needed before reusing
+account is embedded in the tooling. This is the configurable interface used by
+the recorded earlier integration, not a promise of portable performance or
+universal destination qualification. No extra sweep is needed before reusing
 valid supplied cost/calibration predictions.
 
 Reduce the closed raw observations with the existing `verify_costs.py export`
@@ -123,6 +131,7 @@ observations. Changing a label does not extend an existing measured scope.
 GPU-forward values and overlap `iterLatencyMS` are not replacements for clean
 complete-loop measurements: the former omits host work, while the latter can
 span more than one loop. Optional policy-overhead/economic validation stays
-separate. Authentic clean-checkout GPU collection, enabled-routing/output checks
-and matched benchmarking are still required before publishing this as a verified
-end-to-end self-generation recipe.
+separate. The recorded earlier whole-step integration does not by itself qualify
+a later runtime's enabled routing, outputs or matched benchmark. See
+[the reproduction guide](CONFIDENCE_REPRODUCTION.md) for the distinct completed
+and pending validation scopes.

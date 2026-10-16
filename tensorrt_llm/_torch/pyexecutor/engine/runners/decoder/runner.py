@@ -3401,6 +3401,7 @@ class DecoderRunner(ScheduledModelRunner):
             "compressed_mask_cuda",
             "compressed_position_ids_cuda",
             "cu_new_comp_kv_cuda",
+            "batch_size_cuda",
             "max_draft_tokens",
             "new_comp_kv_lens_cuda",
             "past_kv_lens_cuda",
@@ -3431,6 +3432,7 @@ class DecoderRunner(ScheduledModelRunner):
         total_compressed_tokens = {}
         gen_output_offsets = {ratio: 0 for ratio in compress_ratios}
         prepared_ratios = []
+        original_batch_size = metadata.batch_size_cuda.clone()
         try:
             for ratio in compress_ratios:
                 compressed_tokens_per_generation = (tokens_per_generation + ratio - 1) // ratio
@@ -3479,16 +3481,17 @@ class DecoderRunner(ScheduledModelRunner):
                 compress_ratios,
                 gen_output_offsets,
             )
+            metadata.batch_size_cuda.fill_(num_generations)
             metadata._compute_compressed_mask(
                 metadata.new_comp_kv_lens_cuda,
                 metadata.cu_new_comp_kv_cuda,
                 metadata.compressed_mask_cuda,
-                num_generations,
-                total_compressed_tokens,
+                metadata.batch_size_cuda,
                 compress_ratios,
             )
             torch.cuda.synchronize()
         finally:
+            metadata.batch_size_cuda.copy_(original_batch_size)
             for ratio in prepared_ratios:
                 total_tokens = total_compressed_tokens[ratio]
                 metadata.past_kv_lens_cuda[ratio][:num_generations].zero_()

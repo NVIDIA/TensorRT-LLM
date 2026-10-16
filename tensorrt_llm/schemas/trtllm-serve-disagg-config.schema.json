@@ -930,7 +930,7 @@
     },
     "DSparkDecodingConfig": {
       "additionalProperties": false,
-      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. This configuration selects\nnative full-block drafting and does not expose confidence-scheduling or\ncalibration controls.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. Confidence scheduling is\nopt-in; the default configuration retains native full-block verification.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -999,6 +999,89 @@
           "description": "Number of draft positions produced per block. If None, read from the draft model config (dspark_block_size). Should equal max_draft_len.",
           "title": "Block Size"
         },
+        "confidence_admission_receipt_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to an authenticated workload-level confidence admission receipt. Required only when validate_confidence_artifact_freshness=True; it must prove positive aggregate compact value after the fixed confidence-path overhead and safety margin are charged.",
+          "status": "prototype",
+          "title": "Confidence Admission Receipt Path"
+        },
+        "confidence_admission_receipt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Externally authenticated lowercase SHA256 of confidence_admission_receipt_path. This pin must come from the sealed deployment package rather than from the receipt itself.",
+          "status": "prototype",
+          "title": "Confidence Admission Receipt Sha256"
+        },
+        "confidence_mixed_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DSparkMixedEvidenceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional separately admitted physical-K3, eight-rank BREAKABLE mixed scheduling evidence. Does not reuse decode T(G,V) costs. None, unsupported routes, stale ownership, or uncovered mixed geometry retain native mixed verification while admitted decode remains enabled.",
+          "status": "prototype"
+        },
+        "confidence_sps_live_fingerprint_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to an independently generated JSON fingerprint of the active runtime. Required when validate_confidence_artifact_freshness=True. Otherwise it is optional observed provenance, kept separate from the cost artifact's original metadata.",
+          "status": "prototype",
+          "title": "Confidence Sps Live Fingerprint Path"
+        },
+        "confidence_sps_table_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to an authenticated schema-v2 JSON table of measured decode step costs keyed by exact rank-local CUDA-graph shape (G, V).",
+          "status": "prototype",
+          "title": "Confidence Sps Table Path"
+        },
+        "confidence_sts_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to a JSON file with per-position sequential-temperature-scaling (STS) values used to calibrate the confidence head. The scheduler consumes a cumulative product of per-position probabilities, so a per-position calibration error compounds geometrically along the block. If None, the raw sigmoid is used (identity calibration).",
+          "status": "prototype",
+          "title": "Confidence Sts Path"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1020,6 +1103,20 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "enable_confidence_scheduling": {
+          "default": false,
+          "description": "Score each drafted position with the draft's confidence head and let the verification scheduler size the batch's verify budget from those scores. The block is always drafted in full; only the number of tokens sent to the target for verification changes, so acceptance (and hence output distribution) is unaffected. Requires a checkpoint with trained confidence-head weights. Gains only appear at high concurrency -- at small batch sizes the step cost is nearly flat in the verified token count, so trimming saves nothing and costs acceptance length.",
+          "status": "prototype",
+          "title": "Enable Confidence Scheduling",
+          "type": "boolean"
+        },
+        "enable_fused_confidence_scheduler": {
+          "default": false,
+          "description": "Use the optional policy-neutral Triton implementation of confidence top-k allocation plus exact CUDA-graph bucket fill. This changes only the scheduler launch path: budgets, survival thresholds, selected windows, and fallback behavior remain identical. It is independently default-off and requires confidence scheduling.",
+          "status": "prototype",
+          "title": "Enable Fused Confidence Scheduler",
+          "type": "boolean"
         },
         "enable_penalty": {
           "default": false,
@@ -1209,9 +1306,72 @@
           "status": "prototype",
           "title": "Use Rejection Sampling",
           "type": "boolean"
+        },
+        "validate_confidence_artifact_freshness": {
+          "default": false,
+          "description": "Require exact live cost-artifact identity and a positive workload admission receipt before enabling confidence scheduling. By default, explicitly enabled scheduling reuses structurally valid cost and calibration artifacts, with a warning that performance predictions may be stale. This never changes target verification or acceptance.",
+          "status": "prototype",
+          "title": "Validate Confidence Artifact Freshness",
+          "type": "boolean"
         }
       },
       "title": "DSparkDecodingConfig",
+      "type": "object"
+    },
+    "DSparkMixedEvidenceConfig": {
+      "additionalProperties": false,
+      "description": "Optional measured BREAKABLE mixed evidence, independent of decode costs.\n\nAll SHA256 pins come from the authenticated deployment package. The live\nfingerprint must be independently observed for the current runtime; copying\nthe cost table's identity does not qualify it. Uncovered or invalid mixed\nevidence keeps full-width native verification without disabling admitted\ndecode confidence scheduling.",
+      "properties": {
+        "admission_path": {
+          "description": "Qualified mixed admission receipt JSON.",
+          "title": "Admission Path",
+          "type": "string"
+        },
+        "admission_sha256": {
+          "description": "Receipt SHA256.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Admission Sha256",
+          "type": "string"
+        },
+        "costs_path": {
+          "description": "Measured mixed geometry/action cost JSON.",
+          "title": "Costs Path",
+          "type": "string"
+        },
+        "costs_sha256": {
+          "description": "Cost-file SHA256.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Costs Sha256",
+          "type": "string"
+        },
+        "live_fingerprint_path": {
+          "description": "Independently generated mixed runtime fingerprint JSON.",
+          "title": "Live Fingerprint Path",
+          "type": "string"
+        },
+        "live_fingerprint_sha256": {
+          "description": "Live fingerprint SHA256.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Live Fingerprint Sha256",
+          "type": "string"
+        },
+        "protocol_sha256": {
+          "description": "Measured protocol SHA256.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Protocol Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "costs_path",
+        "costs_sha256",
+        "admission_path",
+        "admission_sha256",
+        "protocol_sha256",
+        "live_fingerprint_path",
+        "live_fingerprint_sha256"
+      ],
+      "title": "DSparkMixedEvidenceConfig",
       "type": "object"
     },
     "DecodeCudaGraphConfig": {

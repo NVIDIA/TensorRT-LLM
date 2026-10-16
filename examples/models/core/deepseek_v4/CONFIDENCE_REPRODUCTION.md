@@ -1,10 +1,21 @@
 # Confidence calibration and a fair static/enabled comparison
 
-This is a **source/CPU-reviewed candidate workflow**. These commands have not yet
-completed native full-model GPU validation. Do not describe this document as an
-already-supported public reproduction recipe until that validation and
-publication finish. Its tools have no private harness or cluster-name/path,
-Slurm account, fixed K3 or fixed BS512 binding.
+These commands have completed a bounded full-model GPU integration for physical
+K3 and global BS512 (G64 across eight attention-DP ranks) in an earlier, separately
+recorded Python/native environment: whole-step cost profiling/export, genuine
+paired calibration collection/fitting, and independent static and enabled-compact
+generation with output and natural-shutdown checks. A newer source composition
+has separately passed native/API compatibility and a same-source, same-node
+static/enabled-compact comparison at physical K3, global BS512 and G64 across
+eight attention-DP ranks, with 512 requests of 32 output tokens. Both independent
+model lifetimes completed source/native/artifact/input/output/routing, public
+comparison and natural-shutdown checks. The original calibration and costs were
+reused; exact generated token sequences were not equal. These are distinct
+evidence scopes, not fresh current-source cost/calibration measurements, an
+exact-source native rebuild, task accuracy, sustained-serving performance or
+global clean-install qualification. Original source/native provenance is
+preserved. The tools take explicit model, input, K, batch-size and output
+arguments, with no private harness, cluster, account or node requirement.
 
 The two routes are distinct:
 
@@ -35,10 +46,10 @@ parallelism and original startup/model/shutdown budget. Do not change numerical
 configuration or disable failed hardware/operator checks to make a command run.
 The code neither repairs machines nor changes cluster/security policy.
 
-The complete constructor controls run without constructing a model, inside the
-actual driver-backed installed runtime before a costly model caller. Some
-native imports require an available driver even though these controls do not
-execute model or GPU work; do not substitute a driverless import failure:
+Optional developer constructor regression checks do not construct a model.
+Run them in a matching installed native runtime; some imports still require an
+available driver. They are not a required colleague pre-run gate or a
+driverless/native GPU qualification:
 
 ```bash
 python -m pytest -q tests/unittest/executor/test_dspark_reproduction_factory.py
@@ -69,7 +80,10 @@ Set `--cost-table` and optionally `--calibration` for the dynamic command in
 step 5. No new cost profiling, forged live fingerprint or admission receipt is
 needed first. The normal loader still validates table structure, physical K,
 legal captured graph cells, finite costs and calibration geometry. Missing or
-incompatible cost coverage cannot be reported as dynamic throughput.
+incompatible cost coverage cannot be reported as dynamic throughput. Default
+reuse permits a configured subset of the originally measured graph ladder while
+validating the complete original table and fingerprint. Any drain-guard tail
+must remain both measured and captured.
 
 `validate_confidence_artifact_freshness` stays at its public default `False`.
 Users who choose `True` must supply the corresponding genuine destination

@@ -3,14 +3,15 @@
 
 # Offline DSpark graph-cost profiling
 
-This is a development interface for collecting and exporting measured graph
-replay costs. It is not yet a GPU-qualified colleague reproduction recipe.
-The default graph-replay collector does not itself generate a serving SPS table,
-paired calibration observations, an admission receipt, or an enabled throughput
-result. The explicit complete-loop mode and CPU schema-v2 adapter are described
-in [COST_EXPORT.md](COST_EXPORT.md); that new producer path remains GPU-unqualified.
-The separate CPU calibration fitter below can fit already collected, correctly
-paired shards. The complete public clean-checkout workflow is not yet qualified.
+This interface collects and exports measured graph replay costs. The direct
+whole-step producer/export and separate paired collector/fitter have completed
+one recorded physical-K3/G64, global-BS512 GPU integration in an earlier
+Python/native environment. See [the reproduction guide](CONFIDENCE_REPRODUCTION.md)
+for the distinct newer-source validation scope and remaining limits.
+The default graph-replay collector retains its narrower scope: it does not itself
+generate a serving SPS table, paired calibration observations, an admission
+receipt or an enabled throughput result. The explicit complete-loop mode and
+CPU schema-v2 adapter are described in [COST_EXPORT.md](COST_EXPORT.md).
 
 The tools contain no private model, dataset, scratch path, historical receipt or
 source-head pin. Use your own authorized local checkpoint and tokenized inputs.
@@ -19,8 +20,9 @@ access-controlled output directory.
 The Linux collector creates only a new directory with mode0700 and new raw files
 with mode0600, using exclusive/non-overwriting creation. It does not change
 existing paths, ACLs, process umask or host settings. Existing/symlink targets are
-rejected. POSIX permission behavior still needs actual Linux validation; Windows
-CPU controls do not qualify Linux permissions or Windows ACLs.
+rejected. The exercised Linux collector used new private output paths; CPU
+permission controls or one Linux execution do not qualify Windows ACLs or every
+destination filesystem.
 
 ## Scope and terminology
 
@@ -118,8 +120,10 @@ The interface can prepare all previously used global batch sizes
 G16/G32/G64/G128/G192/G256. With attention DP off, G is the full global batch,
 not BS/8. Smaller points are explicit G inputs too; no pilot batch is hardcoded.
 Each additional G requires its own captured graph and measured compatible cells.
-Preparation does not imply validation of that batch size. Native/GPU validation
-is still unperformed for this new tooling, including BS512/1024.
+Preparation does not imply validation of every batch size. The recorded K3/G64,
+global-BS512 integration has completed; other listed points remain prepared
+interfaces unless separately identified as tested. Compatible artifact reuse
+does not require a new batch-size sweep.
 
 The JSONL input file must contain at least the largest global cohort size, with
 one object per line and a nonempty list of integer `prompt_token_ids`. Use the
@@ -217,12 +221,13 @@ duplicate shards, wrong pairing/width, nonfinite data and invalid prefix order
 are rejected. Existing output files are never overwritten.
 
 This command has CPU math/CLI coverage, including exact agreement with the
-established fitter. The new public paired-observation collector is still a
-separate integration task: the graph-cost collector does not emit these shards.
-No private collector command or environment variable is a public prerequisite
-advertised here. CPU fitting does not certify GPU freshness, task accuracy or
-positive scheduling economics. Ordinary runtime reuse of a valid supplied STS
-vector remains available without fitting it again.
+established fitter. The public paired collector and fitter have also completed
+the recorded earlier GPU integration. They remain distinct from graph-cost
+collection, which does not emit paired shards. No private collector command or
+environment variable is a public prerequisite. Neither fitting nor cost
+measurement certifies GPU freshness, task accuracy or positive scheduling
+economics. Ordinary runtime reuse of a valid supplied STS vector remains
+available without fitting it again.
 
 ## Next stages and validation boundary
 
