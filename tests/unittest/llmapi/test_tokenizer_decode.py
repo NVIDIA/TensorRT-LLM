@@ -24,6 +24,10 @@ from transformers import PreTrainedTokenizerFast
 
 from tensorrt_llm.tokenizer import TransformersTokenizer
 
+# Pure-Python tokenizer checks with no GPU dependency. The l0_cpu stage runs pytest
+# with ``-m cpu_only`` and conftest drops any file lacking this marker.
+pytestmark = pytest.mark.cpu_only
+
 
 def _byte_fallback_tokenizer() -> TransformersTokenizer:
     """A tokenizer whose ``<0xC2>`` / ``<0xA0>`` ids are halves of one UTF-8 character.

@@ -22,6 +22,10 @@ from types import ModuleType
 
 import pytest
 
+# No GPU dependency. The l0_cpu stage runs pytest with ``-m cpu_only`` and conftest
+# drops any file lacking this marker.
+pytestmark = pytest.mark.cpu_only
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 AGENTX_CLIENT_PATH = REPO_ROOT / "tests" / "integration" / "defs" / "perf" / "agentx_client.py"
 
