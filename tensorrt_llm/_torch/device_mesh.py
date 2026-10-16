@@ -70,8 +70,12 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
 
     # Access Torch ProcessGroup
     @property
-    @require_device_mesh
     def tp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
+        tp_group_pg = getattr(self, '_tp_group_pg', None)
+        if tp_group_pg is not None:
+            return tp_group_pg
+        if DeviceMeshTopologyImpl.device_mesh is None:
+            self.build_mesh()
         return self._get_mesh_dim_by_name('tp').get_group()
 
     @property
