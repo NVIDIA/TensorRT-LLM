@@ -79,6 +79,18 @@ The module ``tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py`` implements t
 shared format. ``--reasoning_parser`` separately controls reasoning extraction;
 ``nemotron-v3`` and ``nano-v3`` are aliases for the same Nemotron reasoning parser.
 
+Multiple HTTP Frontends
+-----------------------
+
+At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, prototype). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
+
+.. note::
+
+   * Pass ``--num_serve_frontends 1`` (or set ``num_serve_frontends: 1`` in the ``--config`` YAML) to run a single frontend.
+   * The default applies to the OpenAI HTTP server on the default executor path on a fixed port. With ``--port 0`` / ``--report_addr``, ``orchestrator_type`` (``rpc`` / ``ray``), ``enable_resource_governor`` or ``--enable_sleep_mode`` it falls back to one frontend and logs why; an explicit ``--num_serve_frontends`` greater than 1 fails instead. ``--grpc`` also keeps one frontend unless ``--num_serve_frontends`` is given (only ``--grpc-protocol openengine`` supports more).
+   * Each request is handled entirely by the frontend that accepted its connection, and per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, and ``/metrics``, ``/perf_metrics``, ``/prometheus/metrics`` and ``/health`` describe the frontend that happened to answer rather than the whole server.
+   * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
+
 Inference Endpoints
 -------------------
 
