@@ -40,11 +40,12 @@ from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalEncoderItemMetadata,
     MultimodalInput,
+    MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
+    normalize_multimodal_item_metadata,
     select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
@@ -90,7 +91,7 @@ class EncoderGroup:
     Batching all items in a group into one encoder invocation amortizes
     fixed costs (kernel launches, dispatch) across items. The framework
     splits the output back per-modality and reorders it into prompt order
-    via each request's `MultimodalEncoderItemMetadata.item_refs` manifest,
+    via each request's `MultimodalItemMetadata.item_refs` manifest,
     falling back to `mm_item_order` for legacy processors.
 
     Contract between `build_batched_input` and `encoder_fn`:
@@ -238,7 +239,7 @@ def encode_multimodal_by_groups(
     For each group present in the batch, one encoder call is issued over all
     items across all requests belonging to that group's modalities
     (arithmetic-intensity win). The output is split back per-modality using
-    the prompt-ordered output lengths in `MultimodalEncoderItemMetadata`,
+    the prompt-ordered output lengths in `MultimodalItemMetadata`,
     then reordered by the same metadata's `item_refs`. Legacy processors
     fall back to `multimodal_embedding_lengths` and `mm_item_order`.
 
@@ -494,11 +495,7 @@ class MultimodalModelMixin:
             modality,
             item_metadata,
         ) in self._runs_by_request_modality(selected_items):
-            item_refs = (
-                item_metadata.item_refs
-                if item_metadata is not None
-                else multimodal_param.get_item_layout()[0]
-            )
+            item_refs = item_metadata.item_refs
             # The two slicers take different index spaces. The raw-tensor
             # slicer indexes the modality's own payload, so it gets the
             # modality-local indices (plus the modality, which also lets it
@@ -531,19 +528,15 @@ class MultimodalModelMixin:
     @staticmethod
     def _runs_by_request_modality(
         selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> Iterator[tuple[MultimodalParams, list[int], str, Optional[MultimodalEncoderItemMetadata]]]:
+    ) -> Iterator[tuple[MultimodalParams, list[int], str, MultimodalItemMetadata]]:
         """Split scheduler order into maximal same-request, same-modality runs.
 
-        Only adjacent items merge, so the flattened result keeps the
-        scheduler's order and outputs map back positionally. Each run also
-        carries its request's item metadata: fetching it validates the whole
-        record, so it is read once per request rather than once per item, and
-        the caller reuses it instead of fetching again.
+        Only adjacent items merge, preserving scheduler order. Reuse the item
+        metadata validated at the input boundary or executor admission.
         """
         run_param: Optional[MultimodalParams] = None
         run_modality: Optional[str] = None
-        run_metadata: Optional[MultimodalEncoderItemMetadata] = None
-        item_refs: list[tuple[str, int]] = []
+        run_metadata: Optional[MultimodalItemMetadata] = None
         run_indices: list[int] = []
         for multimodal_param, item_idx in selected_items:
             try:
@@ -552,19 +545,21 @@ class MultimodalModelMixin:
                     if multimodal_param is run_param
                     else multimodal_param.item_metadata
                 )
+                if metadata is None:
+                    metadata = normalize_multimodal_item_metadata(
+                        multimodal_param.multimodal_data, multimodal_param.mm_item_order
+                    )
             except (TypeError, ValueError) as error:
                 raise MultimodalEncoderContractError(str(error)) from error
-            if multimodal_param is not run_param:
-                item_refs = (
-                    metadata.item_refs
-                    if metadata is not None
-                    else multimodal_param.get_item_layout()[0]
-                )
-            if item_idx < 0 or item_idx >= len(item_refs):
+            if metadata is None or metadata.output_embedding_lengths is None:
                 raise MultimodalEncoderContractError(
-                    f"MM item index {item_idx} is out of range for {len(item_refs)} item(s)"
+                    "MM item metadata with output lengths is required for item encoding"
                 )
-            modality = item_refs[item_idx][0]
+            if item_idx < 0 or item_idx >= len(metadata.item_refs):
+                raise MultimodalEncoderContractError(
+                    f"MM item index {item_idx} is out of range for {len(metadata.item_refs)} item(s)"
+                )
+            modality = metadata.item_refs[item_idx][0]
             if run_indices and (multimodal_param is not run_param or modality != run_modality):
                 yield run_param, run_indices, run_modality, run_metadata
                 run_indices = []
@@ -845,7 +840,8 @@ class MultimodalModelMixin:
         Unlisted fields pass through unchanged. Returning None retains legacy
         layout inference for models that have not declared their fields.
         """
-        return None
+        metadata = param.item_metadata
+        return metadata.input_partitions.get(modality) if metadata is not None else None
 
     def build_multimodal_encoder_input(
         self,
@@ -1240,6 +1236,17 @@ class MultimodalModelMixin:
 
         item_metadata = param.item_metadata
         if item_metadata is not None:
+            if item_metadata.output_embedding_lengths is None:
+                return None
+            item_modalities = {modality for modality, _ in item_metadata.item_refs}
+            if any(
+                modality not in item_modalities
+                for modality in _MM_DATA_INPUT_MODALITY_KEYS
+                if mm_data.get(modality) is not None
+            ):
+                # A legacy caller may add another raw modality after its
+                # original single-modality metadata was normalized.
+                return None
             return cls.build_encoder_cache_item_keys(
                 mm_input.multimodal_hashes,
                 item_metadata.item_refs,
@@ -1392,7 +1399,7 @@ class MultimodalModelMixin:
         source: MultimodalParams,
         item_indices: Sequence[int],
         *,
-        item_metadata: Optional[MultimodalEncoderItemMetadata] = None,
+        item_metadata: Optional[MultimodalItemMetadata] = None,
     ) -> None:
         """Overwrite `residual`'s per-item metadata to match the sliced items.
 
@@ -1403,9 +1410,10 @@ class MultimodalModelMixin:
         if metadata is not None:
             selected = metadata.select(item_indices)
             residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = selected
-            residual.multimodal_data["multimodal_embedding_lengths"] = (
-                selected.output_embedding_lengths
-            )
+            if selected.output_embedding_lengths is not None:
+                residual.multimodal_data["multimodal_embedding_lengths"] = (
+                    selected.output_embedding_lengths
+                )
         else:
             source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
             residual.multimodal_data["multimodal_embedding_lengths"] = [

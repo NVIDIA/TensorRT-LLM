@@ -29,6 +29,8 @@ from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
     DisaggPrefillMultimodalInputs,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     _as_cpu_tensor,
     _compute_mm_masks,
@@ -1159,6 +1161,28 @@ class NemotronHMultimodalInputProcessor(
     BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
 ):
     supports_token_id_mm_expansion: ClassVar[bool] = True
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        audio = multimodal_data.get("audio")
+        if metadata is not None and isinstance(audio, dict) and audio.get("evs_ids") is None:
+            # One audio item can contain several clips. Video's embedded audio
+            # stays in its video bucket and retains the model's AV interleave.
+            clips = tuple(audio["audio_num_clips"].tolist())
+            item_count = sum(m == "audio" for m, _ in metadata.item_refs)
+            if len(clips) == item_count:
+                packed = MultimodalItemPartition(item_lengths=clips)
+                metadata.input_partitions["audio"] = {
+                    "input_audio_features": packed,
+                    "feature_attention_mask": packed,
+                    "audio_num_clips": MultimodalItemPartition(),
+                }
+        return metadata
 
     def __init__(
         self,

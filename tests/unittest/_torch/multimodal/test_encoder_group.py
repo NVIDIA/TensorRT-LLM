@@ -61,17 +61,15 @@ class TestLengthsByModality:
         }
 
     def test_length_mismatch_raises(self):
-        # ``strict=True`` inside the helper catches manifest/length divergence.
-        mp = _mp(
-            mm_item_order=[
-                {"modality": "image", "index": 0},
-                {"modality": "video", "index": 0},
-            ],
-            embedding_lengths=[4],  # one short
-            buckets={"image": {}, "video": {}},
-        )
-        with pytest.raises(ValueError):
-            _lengths_by_modality([mp.get_item_layout()], ("image", "video"))
+        with pytest.raises(ValueError, match="references and lengths must align"):
+            _mp(
+                mm_item_order=[
+                    {"modality": "image", "index": 0},
+                    {"modality": "video", "index": 0},
+                ],
+                embedding_lengths=[4],
+                buckets={"image": {}, "video": {}},
+            )
 
     def test_cross_group_multi_modality_without_manifest_raises(self):
         # Multi-group models register one single-modality group per encoder.

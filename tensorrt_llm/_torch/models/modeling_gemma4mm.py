@@ -48,7 +48,7 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...inputs.multimodal import MultimodalItemPartition, MultimodalParams
+from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
@@ -211,6 +211,26 @@ def _padded_patches_per_frame(processor) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _gemma4_input_partitions(
+    multimodal_data: dict[str, Any],
+    metadata: MultimodalItemMetadata,
+) -> dict[str, dict[str, MultimodalItemPartition]]:
+    """Declare item-major fields; video frame grouping stays model-owned."""
+    partitions = {}
+    for modality, fields in (
+        ("image", ("pixel_values", "image_position_ids", "image_seq_lens")),
+        ("audio", ("audio_features", "audio_features_mask")),
+    ):
+        data = multimodal_data.get(modality)
+        if not isinstance(data, dict):
+            continue
+        item_count = sum(m == modality for m, _ in metadata.item_refs)
+        value = data.get(fields[0])
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == item_count:
+            partitions[modality] = {name: MultimodalItemPartition() for name in fields}
+    return partitions
+
+
 class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Preprocesses image inputs for Gemma4.
 
@@ -218,6 +238,17 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     transformers; otherwise falls back to manual tokenization + image
     processing using the image processor saved in the model directory.
     """
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        if metadata is not None:
+            metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
+        return metadata
 
     # Default class-level fallback. Real value computed per-instance below
     # from text_config.use_bidirectional_attention. Only 26B/31B set
@@ -964,26 +995,13 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         param: MultimodalParams,
         modality: str,
     ) -> dict[str, MultimodalItemPartition] | None:
-        """Declare Gemma4's item-major image and audio fields."""
-        if modality not in ("image", "audio"):
+        partitions = super().get_multimodal_item_partitions(param, modality)
+        if partitions is not None:
+            return partitions
+        metadata = param.item_metadata
+        if metadata is None:
             return None
-        input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
-        modality_data = param.multimodal_data[modality]
-        item_refs, _ = param.get_item_layout()
-        item_count = sum(item_modality == modality for item_modality, _ in item_refs)
-        input_tensor = modality_data.get(input_key)
-        if (
-            not isinstance(input_tensor, torch.Tensor)
-            or input_tensor.dim() == 0
-            or input_tensor.shape[0] != item_count
-        ):
-            return None
-        fields = (
-            ("pixel_values", "image_position_ids", "image_seq_lens")
-            if modality == "image"
-            else ("audio_features", "audio_features_mask")
-        )
-        return {name: MultimodalItemPartition() for name in fields}
+        return _gemma4_input_partitions(param.multimodal_data, metadata).get(modality)
 
     @staticmethod
     def _build_video_encoder_input(

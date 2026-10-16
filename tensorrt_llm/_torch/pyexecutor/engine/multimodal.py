@@ -27,7 +27,8 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
-    get_multimodal_encoder_item_metadata,
+    _Unset,
+    get_multimodal_item_metadata,
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import (
@@ -38,7 +39,7 @@ from tensorrt_llm.inputs.registry import (
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, MultimodalEncoderRequestError, _Unset, get_mm_items_for_chunk
+from ..llm_request import LlmRequest, MultimodalEncoderRequestError, get_mm_items_for_chunk
 
 
 def resolve_mm_encoder_token_budget(base_budget: int, model_max_atomic_item_tokens: int) -> int:
@@ -438,12 +439,12 @@ class MultimodalItemScheduler:
             return state.stable_item_cache_keys
         mm_data = request.py_multimodal_data
         try:
-            item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+            item_metadata = get_multimodal_item_metadata(mm_data)
         except (TypeError, ValueError) as error:
             raise MultimodalEncoderRequestError(str(error)) from error
         keys = (
             None
-            if item_metadata is None
+            if item_metadata is None or item_metadata.output_embedding_lengths is None
             else (
                 self.model.build_encoder_cache_item_keys(
                     request.multimodal_hashes,
@@ -502,7 +503,9 @@ class MultimodalItemScheduler:
                     f"Scheduled MM request {request_id} has no encoder item state",
                     request_ids={request_id},
                 )
-            multimodal_param = MultimodalParams(multimodal_data=request.py_multimodal_data)
+            multimodal_param = MultimodalParams(
+                multimodal_data=request.py_multimodal_params.multimodal_data
+            )
             for item_idx in item_indices:
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
