@@ -32,14 +32,26 @@ CPP_METADATA_KEY = "fmha.cpp"
 class CppMetadata:
     """Controls a field's representation in the native FmhaParams struct.
 
-    The generator reads the schema's source, not this object, so the value here is
-    kept only for introspection. See cpp_metadata() for what ``dtype`` means.
+    The generator reads the schema's source, while Python lowering reads this
+    metadata to apply the same renaming and nested-field projections.
     """
 
-    dtype: object
+    dtype: object = None
+    name: str | None = None
+    skip: bool = False
+    optional: bool | None = None
+    flatten: dict[str, tuple] | None = None
 
 
-def cpp_metadata(*, dtype: object, default: object = None) -> dataclasses.Field[object]:
+def cpp_metadata(
+    *,
+    dtype: object = None,
+    default: object = None,
+    name: str | None = None,
+    skip: bool = False,
+    optional: bool | None = None,
+    flatten: dict[str, tuple] | None = None,
+) -> dataclasses.Field[object]:
     """Customize a dataclass field's representation in the native struct.
 
     The annotation gives the shape -- tensor, optional, set, scalar, or a named
@@ -54,6 +66,12 @@ def cpp_metadata(*, dtype: object, default: object = None) -> dataclasses.Field[
     view needs offsets. These getters are handwritten in attentionOp.h.
     Registered native structs and supported named types are recognized by their
     annotations and need no marker either. Defaults and default factories remain
-    Python-owned.
+    Python-owned. ``name`` renames a native field, ``skip`` keeps it Python-only,
+    and ``optional=False`` marks a tensor required at the native boundary.
+    ``flatten`` projects a nested object without copying its state: each entry
+    maps a native name to (native annotation, attribute path, optional dtype).
     """
-    return dataclasses.field(default=default, metadata={CPP_METADATA_KEY: CppMetadata(dtype)})
+    return dataclasses.field(
+        default=default,
+        metadata={CPP_METADATA_KEY: CppMetadata(dtype, name, skip, optional, flatten)},
+    )

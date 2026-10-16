@@ -979,12 +979,12 @@ class AttentionForwardArgs:
         default_factory=SparseRuntimeParams)
 
     @property
-    def mask_type(self) -> AttentionMaskType:
+    def mask_type(self) -> int:
         """Return the mask type this forward pass asks the native attention op for."""
         if self.attention_mask == PredefinedAttentionMask.CAUSAL:
-            return AttentionMaskType.causal
+            return int(AttentionMaskType.causal)
         if self.attention_mask == PredefinedAttentionMask.FULL:
-            return AttentionMaskType.padding
+            return int(AttentionMaskType.padding)
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
 

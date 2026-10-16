@@ -163,7 +163,13 @@ def get_multi_ctas_kv_counter(
     size = get_multi_ctas_kv_counter_size(
         num_heads, max_num_sequences, get_multi_processor_count_for_device(index)
     )
-    if counter is None or counter.device != device or counter.numel() < size:
+    if (
+        counter is None
+        or counter.device != device
+        or counter.dtype != torch.uint8
+        or not counter.is_contiguous()
+        or counter.numel() < size
+    ):
         with torch.cuda.device(device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(

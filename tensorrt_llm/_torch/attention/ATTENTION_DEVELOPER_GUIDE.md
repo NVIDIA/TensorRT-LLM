@@ -479,9 +479,8 @@ preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
 request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
 per-call lowered sparse runtime carrier and defaults to an empty
-`SparseRuntimeParams()`. The core forward overwrites that field with the carrier
-that `prepare_sparse_runtime_params` builds from the caller's carrier plus the
-hook results. The carrier holds both flat `AttentionOp` parameters and optional
+`SparseRuntimeParams()`. The core forward installs the predicted carrier in a new arguments object,
+leaving the caller's `sparse_runtime_params` unchanged. The carrier holds both flat `AttentionOp` parameters and optional
 `BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
 `Fmha.is_supported()` rejects a request that carries routes for every library
 that does not declare `supports_block_sparse_inputs`, so no dense kernel can

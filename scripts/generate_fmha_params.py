@@ -43,7 +43,7 @@ NATIVE_STRUCT_NAMES = (
 )
 
 DEFAULT_MODULE_PATHS = (
-    REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "interface.py",
+    REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "phased.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "fallback.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "interface.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "sparse" / "params.py",
@@ -133,31 +133,44 @@ def _read_struct(class_def: ast.ClassDef, schema_names: set[str]) -> Struct | No
         explicit = _has_cpp_metadata(statement)
         if not explicit and (_optional_inner(annotation) or annotation) not in implicit_types:
             continue
-        dtype = None
-        if explicit:
-            for keyword in statement.value.keywords:
-                if keyword.arg not in {"dtype", "default"}:
-                    raise ValueError(
-                        f"{statement.target.id}: unsupported {METADATA_FACTORY} argument {keyword.arg}"
+        options = (
+            {keyword.arg: keyword.value for keyword in statement.value.keywords} if explicit else {}
+        )
+        unknown = options.keys() - {"dtype", "default", "name", "skip", "optional", "flatten"}
+        if unknown:
+            raise ValueError(f"{statement.target.id}: unsupported cpp_metadata arguments {unknown}")
+        if "skip" in options and ast.literal_eval(options["skip"]):
+            continue
+        if "flatten" in options:
+            projections = options["flatten"]
+            if not isinstance(projections, ast.Dict):
+                raise ValueError(f"{statement.target.id}: flatten must be a dictionary")
+            for key, value in zip(projections.keys, projections.values):
+                if not isinstance(value, ast.Tuple) or len(value.elts) not in (2, 3):
+                    raise ValueError("flatten entries require (annotation, path[, dtype])")
+                fields.append(
+                    Field(
+                        name=ast.literal_eval(key),
+                        annotation=ast.unparse(value.elts[0]),
+                        dtype=ast.unparse(value.elts[2]) if len(value.elts) == 3 else None,
                     )
-                if keyword.arg == "dtype":
-                    dtype = (
-                        keyword.value.value
-                        if isinstance(keyword.value, ast.Constant)
-                        else ast.unparse(keyword.value)
-                    )
-            if dtype is None:
-                raise ValueError(
-                    f"{statement.target.id}: {METADATA_FACTORY} needs a dtype; "
-                    "use a plain default when no generated getter is needed"
                 )
+            continue
+        if "optional" in options and not ast.literal_eval(options["optional"]):
+            annotation = _optional_inner(annotation) or annotation
         fields.append(
             Field(
-                name=statement.target.id,
+                name=ast.literal_eval(options["name"])
+                if "name" in options
+                else statement.target.id,
                 annotation=annotation,
-                dtype=dtype,
+                dtype=ast.unparse(options["dtype"]) if "dtype" in options else None,
             )
         )
+    names = [field.name for field in fields]
+    if len(set(names)) != len(names):
+        raise ValueError(f"{class_def.name}: duplicate native field names")
+
     return Struct(class_def.name, tuple(fields)) if fields else None
 
 

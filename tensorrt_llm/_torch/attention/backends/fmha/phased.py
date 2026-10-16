@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass
 from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.cpp_schema import cpp_metadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import RotaryScalingType
 
 from .interface import Fmha
 
@@ -42,21 +44,84 @@ class FmhaParams:
     """Phase inputs with exactly one of packed QKV or a separate query tensor.
 
     MLA uses ``query_input`` with ``is_fused_qkv=False``.
+
+    This class also defines the native schema. Device token/sequence tensors are
+    phase-local views; host tensors, block offsets and FP4 scaling factors remain
+    whole-batch and native accessors apply ``seq_offset`` / ``token_offset``.
     """
 
-    attn: "TrtllmAttention"
-    meta: "TrtllmAttentionMetadata"
+    attn: "TrtllmAttention" = cpp_metadata(
+        default=MISSING,
+        flatten={
+            "local_layer_idx": (int, "local_layer_idx"),
+            "layer_idx": (int, "layer_idx"),
+            "rotary_embedding_base": (float, "rope_params.theta"),
+            "rotary_embedding_scale_type": (RotaryScalingType, "rope_params.scale_type"),
+            "rotary_embedding_scale": (float, "rope_params.scale"),
+            "rotary_embedding_short_mscale": (float, "rope_params.short_m_scale"),
+            "rotary_embedding_long_mscale": (float, "rope_params.long_m_scale"),
+            "rotary_embedding_max_positions": (int, "rope_params.max_positions"),
+            "rotary_embedding_original_max_positions": (int, "rope_params.original_max_positions"),
+            "attention_chunk_size": (Optional[int], "attention_chunk_size"),
+            "skip_softmax_stat": (Optional[torch.Tensor], "skip_softmax_stat", torch.uint32),
+            "rotary_inv_freq": (Optional[torch.Tensor], "rotary_inv_freq", torch.float32),
+            "rotary_cos_sin": (Optional[torch.Tensor], "rotary_cos_sin"),
+        },
+    )
+    meta: "TrtllmAttentionMetadata" = cpp_metadata(
+        default=MISSING,
+        flatten={
+            "use_paged_context_fmha": (bool, "use_paged_context_fmha"),
+            "max_context_length": (int, "max_context_length"),
+            "max_seq_len": (int, "max_seq_len"),
+            "max_num_requests": (int, "max_num_requests"),
+            "max_num_sequences": (int, "max_num_sequences"),
+            "beam_width": (int, "effective_beam_width"),
+            "is_spec_dec_tree": (bool, "is_spec_dec_tree"),
+            "force_prepare_spec_dec_tree_mask": (bool, "force_prepare_spec_dec_tree_mask"),
+            "host_past_key_value_lengths": (torch.Tensor, "kv_lens_runtime"),
+            "host_context_lengths": (torch.Tensor, "prompt_lens_cpu_runtime"),
+            "max_context_q_len_override": (Optional[int], "max_context_q_len_override"),
+            "kv_cache_block_offsets": (Optional[torch.Tensor], "kv_cache_block_offsets"),
+            "host_kv_cache_pool_pointers": (Optional[torch.Tensor], "host_kv_cache_pool_pointers"),
+            "host_kv_cache_pool_mapping": (Optional[torch.Tensor], "host_kv_cache_pool_mapping"),
+            "cache_indirection": (Optional[torch.Tensor], "cache_indirection", torch.int32),
+            "block_ids_per_seq": (Optional[torch.Tensor], "block_ids_per_seq", torch.int32),
+            "helix_position_offsets": (
+                Optional[torch.Tensor],
+                "helix_position_offsets",
+                torch.int32,
+            ),
+            "helix_is_inactive_rank": (
+                Optional[torch.Tensor],
+                "helix_is_inactive_rank",
+                torch.bool,
+            ),
+            "num_sparse_topk": (int, "num_sparse_topk"),
+            "flash_mla_tile_scheduler_metadata": (
+                Optional[torch.Tensor],
+                "flash_mla_tile_scheduler_metadata",
+                torch.int32,
+            ),
+            "flash_mla_num_splits": (Optional[torch.Tensor], "flash_mla_num_splits", torch.int32),
+            "trtllm_gen_jit_warmup": (bool, "trtllm_gen_jit_warmup"),
+        },
+    )
     fwd: AttentionForwardArgs
     workspace: torch.Tensor
-    qkv_input: Optional[torch.Tensor] = None
-    query_input: Optional[torch.Tensor] = None
-    key_input: Optional[torch.Tensor] = None
-    value_input: Optional[torch.Tensor] = None
-    output: Optional[torch.Tensor] = None
-    sequence_lengths: Optional[torch.Tensor] = None
-    context_lengths: Optional[torch.Tensor] = None
-    input_seq_length: int = 0
-    max_past_kv_length: int = 0
+    qkv_input: Optional[torch.Tensor] = cpp_metadata(name="qkv_or_q", optional=False)
+    query_input: Optional[torch.Tensor] = cpp_metadata(skip=True)
+    key_input: Optional[torch.Tensor] = cpp_metadata(name="k")
+    value_input: Optional[torch.Tensor] = cpp_metadata(name="v")
+    output: Optional[torch.Tensor] = cpp_metadata(optional=False)
+    sequence_lengths: Optional[torch.Tensor] = cpp_metadata(
+        name="sequence_length", optional=False, dtype=torch.int32
+    )
+    context_lengths: Optional[torch.Tensor] = cpp_metadata(optional=False, dtype=torch.int32)
+    # Compatibility callers can provide totals when their past lengths omit new tokens.
+    host_total_kv_lens: Optional[torch.Tensor] = None
+    input_seq_length: int = cpp_metadata(skip=True, default=0)
+    max_past_kv_length: int = cpp_metadata(skip=True, default=0)
     max_attention_window_size: int = 0
     cyclic_attention_window_size: int = 0
     num_tokens: int = 0
@@ -67,21 +132,26 @@ class FmhaParams:
     # indexes a separate per-token input, such as a sparse block table, needs
     # it to take the matching slice.
     token_offset: int = 0
-    tokens_per_block: int = 64
+    tokens_per_block: int = cpp_metadata(skip=True, default=64)
     kv_factor: int = 0
-    total_num_blocks: int = 0
+    total_num_blocks: int = cpp_metadata(skip=True, default=0)
     # Number of sequence rows in the active phase.
-    batch_size: int = 0
+    batch_size: int = cpp_metadata(name="num_seqs", default=0)
     # Number of logical requests in the active phase.
     num_requests: int = 0
     use_spec_decoding: bool = False
-    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
-    spec_decoding_position_offsets: Optional[torch.Tensor] = None
-    spec_decoding_packed_mask: Optional[torch.Tensor] = None
-    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
-    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
-    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+    # Metadata retains these buffers between steps. Only an active generation
+    # phase exposes them to native preprocessing, which also tests pointer presence.
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    spec_decoding_position_offsets: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    spec_decoding_packed_mask: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int64)
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = cpp_metadata(dtype=torch.uint32)
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = cpp_metadata(
+        dtype=torch.int32
+    )
     is_cross: bool = False
+    multi_ctas_kv_counter: Optional[torch.Tensor] = None
 
 
 def get_spec_decoding_position_offsets(

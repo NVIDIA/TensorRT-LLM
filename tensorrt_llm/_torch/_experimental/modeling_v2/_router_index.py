@@ -51,6 +51,9 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
+    # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
+    # config loader's composite branch writes the same name back.
+    "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
 }
 
 

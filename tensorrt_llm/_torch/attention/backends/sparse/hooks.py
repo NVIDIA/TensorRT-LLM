@@ -241,7 +241,7 @@ def prepare_sparse_runtime_params(
     available before the hooks run so they can also populate auxiliary fields.
     """
     runtime_params = replace(forward_args.sparse_runtime_params)
-    forward_args.sparse_runtime_params = runtime_params
+    forward_args = replace(forward_args, sparse_runtime_params=runtime_params)
     kv_indices, kv_offsets = backend.sparse_kv_predict(q, k, metadata, forward_args)
     attn_indices, attn_offsets = backend.sparse_attn_predict(q, k, metadata, forward_args)
     block_sparse_inputs = backend.block_sparse_attn_predict(q, k, v, metadata, forward_args)

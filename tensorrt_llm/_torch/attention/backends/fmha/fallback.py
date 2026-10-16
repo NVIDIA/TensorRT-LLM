@@ -35,7 +35,6 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from ..sparse.params import SparseRuntimeParams
-from . import interface
 from .interface import FmhaPhase, build_op_params
 from .phased import FmhaParams, PhasedFmha
 from .utils import get_multi_ctas_kv_counter
@@ -344,6 +343,8 @@ class FallbackFmha(PhasedFmha):
     """Fallback FMHA implementation over the phased TRT-LLM thop ops."""
 
     REQUIRES_PAGED_KV = False
+    # Native attention consumes pool pointers directly; sparse managers may have
+    # no Role.KEY buffer from which to query a dense block extent.
     NEEDS_BLOCK_EXTENT = False
     _attention_ops: ClassVar[_AttentionOpCache] = _AttentionOpCache()
     _compat_counters: ClassVar[WeakTensorKeyDictionary] = WeakTensorKeyDictionary()
@@ -795,8 +796,9 @@ class FallbackFmha(PhasedFmha):
 
         effective_beam_width = 1 if is_cross else beam_width
         sizing_num_contexts = num_contexts if num_ctx_tokens > 0 and not is_gen_only else 0
-        params = interface.FmhaParams._from_arguments(
+        params = dict(
             arguments,
+            kv_factor=1,
             qkv_or_q=q,
             layer_idx=local_layer_idx,
             num_seqs=sizing_num_contexts,
@@ -824,7 +826,8 @@ class FallbackFmha(PhasedFmha):
                 else cache_indirection.size(2)
             ),
         )
-        tp = params.to_op_params()
+        tp = thop.FmhaParams()
+        build_op_params(tp, params)
         op = cls._attention_ops.get(
             StaticAttentionConfig.from_legacy_arguments(arguments), arguments["q"].device
         )
@@ -873,7 +876,8 @@ class FallbackFmha(PhasedFmha):
         if num_generations > 0 and not is_ctx_only:
             # Native preparation mutates its carrier; each phase needs fresh parameters.
             if num_contexts > 0 and not is_gen_only:
-                tp = params.to_op_params()
+                tp = thop.FmhaParams()
+                build_op_params(tp, params)
             seq_offset = num_contexts
             tp.qkv_or_q = q[num_ctx_tokens:]
             if k is not None:
@@ -911,60 +915,17 @@ class FallbackFmha(PhasedFmha):
             raise RuntimeError("FallbackFmha requires workspace.")
         query = _phase_query(params)
 
+        params.multi_ctas_kv_counter = self._multi_ctas_kv_counter
         tp = thop.FmhaParams()
-        # Apply phase-local tensors and extents after the shared batch state.
-        build_op_params(tp, meta, params)
-
+        build_op_params(tp, params)
         tp.qkv_or_q = query
-        tp.sequence_length = params.sequence_lengths
         # Direct phase callers may omit the prompt-length view.
-        tp.context_lengths = (
-            params.context_lengths
-            if params.context_lengths is not None
-            else meta.prompt_lens_cuda_runtime[params.seq_offset :]
-        )
-        tp.num_seqs = params.batch_size
+        if params.context_lengths is None:
+            tp.context_lengths = meta.prompt_lens_cuda_runtime[params.seq_offset :]
         # Encoder KV is request-scoped; each decoder beam reads it independently.
-        tp.beam_width = meta.effective_beam_width
         tp.num_requests = params.batch_size if meta.is_cross else params.num_requests
-        tp.host_past_key_value_lengths = meta.kv_lens_runtime
-        tp.host_context_lengths = meta.prompt_lens_cpu_runtime
-        tp.max_context_length = meta.max_context_length
-        tp.max_num_requests = meta.max_num_requests
         tp.max_num_sequences = meta.max_num_sequences or meta.max_num_requests
-        tp.layer_idx = attn.layer_idx
         tp.local_layer_idx = attn.get_local_layer_idx(meta)
-
-        # Leave a native field alone when the source is None: it already holds the empty
-        # value, and its setter takes the field's own type, as build_op_params assumes.
-        for name, value in (
-            ("k", params.key_input),
-            ("v", params.value_input),
-            ("host_kv_cache_pool_pointers", meta.host_kv_cache_pool_pointers),
-            ("host_kv_cache_pool_mapping", meta.host_kv_cache_pool_mapping),
-            ("cache_indirection", meta.cache_indirection),
-            ("attention_chunk_size", attn.attention_chunk_size),
-            ("rotary_inv_freq", attn.rotary_inv_freq),
-            ("rotary_cos_sin", attn.rotary_cos_sin),
-            ("multi_ctas_kv_counter", self._multi_ctas_kv_counter),
-            ("skip_softmax_stat", attn.skip_softmax_stat),
-        ):
-            if value is not None:
-                setattr(tp, name, value)
-
-        tp.has_fp8_kv_cache = bool(getattr(attn, "has_fp8_kv_cache", False))
-
-        rope_params = attn.rope_params
-        if rope_params is not None:
-            # `rotary_embedding_dim` is layer configuration and reaches the op through
-            # StaticAttentionConfig, so it is not resent here.
-            tp.rotary_embedding_base = rope_params.theta
-            tp.rotary_embedding_scale_type = rope_params.scale_type
-            tp.rotary_embedding_scale = rope_params.scale
-            tp.rotary_embedding_short_mscale = rope_params.short_m_scale
-            tp.rotary_embedding_long_mscale = rope_params.long_m_scale
-            tp.rotary_embedding_max_positions = rope_params.max_positions
-            tp.rotary_embedding_original_max_positions = rope_params.original_max_positions
         return tp
 
     # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.

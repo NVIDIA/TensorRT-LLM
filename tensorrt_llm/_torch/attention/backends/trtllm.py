@@ -18,7 +18,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
                     List, Optional, Tuple)
 
@@ -2286,8 +2286,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     seq_start=num_ctx,
                 )
 
-        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, v, metadata, forward_args)
+        forward_args = replace(
+            forward_args,
+            sparse_runtime_params=prepare_sparse_runtime_params(
+                self, q, k, v, metadata, forward_args))
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata
