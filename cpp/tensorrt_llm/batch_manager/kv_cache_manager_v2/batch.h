@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/utils/cudaContext.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 
 #include <cstdint>
@@ -115,6 +116,8 @@ private:
         CachedCudaEvent completion = CachedCudaEvent::makeNull();
     };
 
+    // Before every member whose destruction calls the CUDA driver; see CudaContextBinding.
+    CudaContextBinding mCudaContext;
     std::shared_ptr<KvCacheManager> mManager;
     int mMaxRows;
     int mMaxBlocks;

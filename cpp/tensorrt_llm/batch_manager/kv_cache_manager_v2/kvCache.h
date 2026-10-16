@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
+#include "kv_cache_manager_v2/utils/cudaContext.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -149,6 +150,8 @@ public:
     void drop();
 
 private:
+    // Before every member whose destruction calls the CUDA driver; see CudaContextBinding.
+    CudaContextBinding mCudaContext;
     std::shared_ptr<KvCacheManager> mManager;
     // nullopt once dropped (mirrors Python's `_page_refs is None`).
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
@@ -757,6 +760,8 @@ private:
     void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
     void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
 
+    // Before every member whose destruction calls the CUDA driver; see CudaContextBinding.
+    CudaContextBinding mCudaContext;
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
     PriorityCb mPriorityCb;
