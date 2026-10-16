@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -243,9 +243,9 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
     // Run inference
     KvCacheDataType const cache_type
         = int8KVCache ? KvCacheDataType::INT8 : (fp8KVCache ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
-    invokeTranspose4dBatchMajor(bufferCast<T>(*kTransposedCache), bufferCast<T>(*vTransposedCache), blockArray,
-        batchSize, seqLen, maxSeqLen, dimsPerHead, headsNum, cache_type, kvScaleOrigQuantPtr, sequenceLengths,
-        streamPtr->get());
+    invokeTranspose4dBatchMajor(kTransposedCache->template getBufferPtr<T>(),
+        vTransposedCache->template getBufferPtr<T>(), blockArray, batchSize, seqLen, maxSeqLen, dimsPerHead, headsNum,
+        cache_type, kvScaleOrigQuantPtr, sequenceLengths, streamPtr->get());
 
     // Synchronize
     streamPtr->synchronize();
@@ -324,9 +324,9 @@ void testTransposeBatch4dContiguous(bool multiQueryMode, bool int8KVCache, bool 
     // Run inference
     KvCacheDataType const cache_type
         = int8KVCache ? KvCacheDataType::INT8 : (fp8KVCache ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
-    invokeTranspose4dBatchMajor(bufferCast<T>(*kTransposedCache), bufferCast<T>(*vTransposedCache), kvLinearBuffer,
-        batchSize, seqLen, maxSeqLen, dimsPerHead, headsNum, cache_type, kvScaleOrigQuantPtr, sequenceLengths,
-        streamPtr->get());
+    invokeTranspose4dBatchMajor(kTransposedCache->template getBufferPtr<T>(),
+        vTransposedCache->template getBufferPtr<T>(), kvLinearBuffer, batchSize, seqLen, maxSeqLen, dimsPerHead,
+        headsNum, cache_type, kvScaleOrigQuantPtr, sequenceLengths, streamPtr->get());
 
     // Synchronize
     streamPtr->synchronize();

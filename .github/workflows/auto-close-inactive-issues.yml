@@ -1,31 +1,64 @@
 # Ref: https://docs.github.com/en/actions/managing-issues-and-pull-requests/closing-inactive-issues
 name: Close inactive issues
+concurrency:
+  group: close-inactive-issues
+  cancel-in-progress: false
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log the PR feedback actions without writing labels, comments or closures
+        type: boolean
+        default: true
   schedule:
     - cron: "0 3 * * *"
 
 jobs:
+  pr-feedback:
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Test PR feedback lifecycle
+        run: node --test .github/scripts/stale_pr_feedback.test.js
+      - name: Process PR feedback with bot-aware activity
+        uses: actions/github-script@v8
+        env:
+          # Scheduled runs have no inputs and run live; manual runs default to dry run.
+          DRY_RUN: ${{ inputs.dry_run == true }}
+        with:
+          script: |
+            const {run} = require('./.github/scripts/stale_pr_feedback.js');
+            await run({github, context, core, dryRun: process.env.DRY_RUN === 'true'});
+
   stale:
     if: github.repository == 'NVIDIA/TensorRT-LLM'
     runs-on: ubuntu-latest
     permissions:
       issues: write
       pull-requests: write
-
     steps:
       - uses: actions/stale@v10
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           stale-issue-message: 'Issue has not received an update in over 14 days. Adding stale label.'
-          stale-pr-message: 'PR has not received an update in over 14 days. Adding stale label.'
           close-issue-message: 'This issue was closed because it has been 14 days without activity since it has been marked as stale.'
-          close-pr-message: 'This PR was closed because it has been 14 days without activity since it has been marked as stale.'
           days-before-issue-stale: 14
-          days-before-close: 14
+          days-before-issue-close: 14
+          # Pull requests are handled by the pr-feedback job above: -1 disables marking
+          # and closing, and the flag below keeps already-stale PRs from being unstaled.
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          remove-pr-stale-when-updated: false
           only-labels: 'waiting for feedback'
-          labels-to-add-when-unstale: 'investigating'
+          labels-to-add-when-unstale: 'Investigating'
           labels-to-remove-when-unstale: 'stale,waiting for feedback'
           stale-issue-label: 'stale'
-          stale-pr-label: 'stale'
           operations-per-run: 1000

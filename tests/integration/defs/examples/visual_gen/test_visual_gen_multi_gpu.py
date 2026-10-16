@@ -136,6 +136,12 @@ WAN22_LPIPS_TP_VARIANTS = [
         {"tp_size": 2, "attn2d_size": (2, 1)},
         WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
     ),
+    # Token-sharded TP: bitwise equal to all-reduce TP at TP2; the worker asserts it engaged.
+    (
+        "cfg2_tp2_ts",
+        {"cfg_size": 2, "tp_size": 2, "tp_layout": "token_sharded"},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
 ]
 
 
@@ -151,7 +157,7 @@ def _cleanup_mpi_env():
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -480,7 +486,10 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size,
             audios.append(torch.as_tensor(output.audio).cpu())
         finally:
             engine.shutdown()
-    torch.testing.assert_close(videos[2], videos[1])
+    # The tiled decoder batches a rank's tiles into one call, so the two runs decode with
+    # different batch shapes; compiled kernels may then round a pixel to the adjacent uint8
+    # level. Audio takes no tile batching and stays exact.
+    torch.testing.assert_close(videos[2], videos[1], atol=1, rtol=0)
     torch.testing.assert_close(audios[2], audios[1])
     for decode_size, audio in zip((1, vae_size), audios[1:]):
         audio_score = _multi_resolution_log_stft_distance(audio, audios[0])

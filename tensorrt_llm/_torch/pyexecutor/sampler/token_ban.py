@@ -237,8 +237,11 @@ class TokenBanHandler(ABC):
     ) -> None:
         """Add bans that suppress EOS until a request reaches its min length.
 
-        For a request with ``py_min_length``, the end-of-sequence token is
-        banned on every step whose generated length is still below the minimum.
+        For a request with ``py_min_length``, the end-of-sequence token and every
+        single-token stop word (e.g. a model's extra EOS ids, which
+        ``SamplingParams`` turns into stop words) are banned on every step whose
+        generated length is still below the minimum. Multi-token stop words
+        cannot be suppressed by banning one token, and are left alone.
         The ban is unconditional: it depends on the generated *length*, never on
         token values, so unlike the suffix-rule features it needs no device-side
         comparison and is identical under both handlers.
@@ -263,7 +266,9 @@ class TokenBanHandler(ABC):
             # Use the original end_id (before ignore_eos override) so we
             # suppress the real EOS token, not token -1.
             end_id = getattr(r, "py_original_end_id", r.py_end_id)
-            if end_id is None or end_id <= -1:
+            banned_ids = {end_id} if end_id is not None and end_id > -1 else set()
+            banned_ids.update(word[0] for word in r.py_stop_words_list or () if len(word) == 1)
+            if not banned_ids:
                 continue
 
             pending = pending_steps[index] if pending_steps is not None else 0
@@ -272,8 +277,10 @@ class TokenBanHandler(ABC):
                     if (
                         r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
                     ) + pending + step < r.py_min_length:
-                        bans.rows.append(request_offset + num_steps[index] * beam_idx + step)
-                        bans.cols.append(end_id)
+                        row = request_offset + num_steps[index] * beam_idx + step
+                        for token_id in banned_ids:
+                            bans.rows.append(row)
+                            bans.cols.append(token_id)
                     else:
                         break
 
