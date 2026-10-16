@@ -15,8 +15,8 @@ from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
     MultimodalEncoderItemMetadata,
-    MultimodalFieldLayout,
     MultimodalInput,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
@@ -36,20 +36,31 @@ pytestmark = pytest.mark.cpu_only
 @pytest.mark.parametrize("indices", [[2, 0], [1, 1, 0], []])
 def test_field_layout_selects_tensor_item_axis(axis: int, indices: list[int]) -> None:
     values = torch.arange(9).reshape(3, 3)
-    selected = MultimodalFieldLayout(item_axis=axis).select(values, indices)
+    selected = MultimodalItemPartition(item_axis=axis).select(values, indices)
     expected = torch.index_select(values, axis, torch.tensor(indices, dtype=torch.long))
     torch.testing.assert_close(selected, expected)
 
 
-@pytest.mark.parametrize("axis", [0, 1])
-@pytest.mark.parametrize("indices", [[2, 0], [1, 2], [1, 1, 0], []])
-def test_field_layout_selects_packed_items_and_preserves_contiguous_views(
-    axis: int, indices: list[int]
+@pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize(
+    ("indices", "is_view"),
+    [
+        ([2, 0], False),
+        ([1, 2], True),
+        ([1, 1, 0], False),
+        ([], True),
+        ([-1], True),
+        ([-2, -1], True),
+        ([-1, 0], False),
+    ],
+)
+def test_item_partition_selects_packed_items_and_preserves_contiguous_views(
+    axis: int, indices: list[int], is_view: bool
 ) -> None:
     values = torch.arange(12).reshape(6, 2)
-    if axis == 1:
+    if axis != 0:
         values = values.T
-    layout = MultimodalFieldLayout(item_axis=axis, item_lengths=(2, 3, 1))
+    layout = MultimodalItemPartition(item_axis=axis, item_lengths=(2, 3, 1))
 
     selected = layout.select(values, indices)
 
@@ -58,7 +69,7 @@ def test_field_layout_selects_packed_items_and_preserves_contiguous_views(
         torch.cat([items[i] for i in indices], dim=axis) if indices else values.narrow(axis, 0, 0)
     )
     torch.testing.assert_close(selected, expected)
-    if indices in ([1, 2], []):
+    if is_view:
         assert selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
     else:
         assert selected.untyped_storage().data_ptr() != values.untyped_storage().data_ptr()
@@ -67,7 +78,7 @@ def test_field_layout_selects_packed_items_and_preserves_contiguous_views(
 @pytest.mark.parametrize("sequence_type", [list, tuple])
 def test_field_layout_selects_item_sequences(sequence_type) -> None:
     values = sequence_type(["a", "b", "c"])
-    assert MultimodalFieldLayout().select(values, [2, 0]) == sequence_type(["c", "a"])
+    assert MultimodalItemPartition().select(values, [2, 0]) == sequence_type(["c", "a"])
 
 
 def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -> None:
@@ -83,10 +94,10 @@ def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -
     selected = select_multimodal_fields(
         data,
         {
-            "frames": MultimodalFieldLayout(),
-            "shared": MultimodalFieldLayout(item_axis=None),
-            "optional_mask": MultimodalFieldLayout(),
-            "nullable_mask": MultimodalFieldLayout(),
+            "frames": MultimodalItemPartition(),
+            "shared": MultimodalItemPartition(item_axis=None),
+            "optional_mask": MultimodalItemPartition(),
+            "nullable_mask": MultimodalItemPartition(),
         },
         [2, 0],
     )
@@ -101,7 +112,13 @@ def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -
 
 def test_packed_field_layout_rejects_inconsistent_lengths() -> None:
     with pytest.raises(ValueError, match="Packed field size"):
-        MultimodalFieldLayout(item_lengths=(2, 3)).select(torch.zeros(4, 2), [0])
+        MultimodalItemPartition(item_lengths=(2, 3)).select(torch.zeros(4, 2), [0])
+
+
+@pytest.mark.parametrize("index", [-4, 3])
+def test_packed_item_partition_rejects_out_of_bounds_indices(index: int) -> None:
+    with pytest.raises(IndexError):
+        MultimodalItemPartition(item_lengths=(2, 3, 1)).select(torch.zeros(6, 2), [index])
 
 
 def test_media_modalities_match_io_and_validation_contract() -> None:

@@ -32,7 +32,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalEncoderItemMetadata,
-                                            MultimodalFieldLayout,
+                                            MultimodalItemPartition,
                                             MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
@@ -2154,13 +2154,13 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states
 
 
-_QWEN_VISION_BATCHED_FIELD = MultimodalFieldLayout()
+_QWEN_VISION_BATCHED_FIELD = MultimodalItemPartition()
 
 
-def _qwen_vision_field_layout(
+def _qwen_vision_item_partitions(
     param: MultimodalParams,
     modality: str,
-) -> dict[str, MultimodalFieldLayout] | None:
+) -> dict[str, MultimodalItemPartition] | None:
     """Declare Qwen vision patch packing and parallel per-item grid fields."""
     if modality not in ("image", "video"):
         return None
@@ -2184,7 +2184,7 @@ def _qwen_vision_field_layout(
     else:
         patch_counts = tuple(t * h * w for t, h, w in grids.tolist())
     return {
-        pixel_key: MultimodalFieldLayout(item_lengths=patch_counts),
+        pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
     }
@@ -2193,12 +2193,12 @@ def _qwen_vision_field_layout(
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supports_mm_encoder_item_scheduling = True
 
-    def get_multimodal_field_layout(
+    def get_multimodal_item_partitions(
         self,
         param: MultimodalParams,
         modality: str,
-    ) -> dict[str, MultimodalFieldLayout] | None:
-        return _qwen_vision_field_layout(param, modality)
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
 
     def __init__(
         self,

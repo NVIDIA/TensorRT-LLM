@@ -48,7 +48,7 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...inputs.multimodal import MultimodalFieldLayout, MultimodalParams
+from ...inputs.multimodal import MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
@@ -959,11 +959,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 )
         return partition
 
-    def get_multimodal_field_layout(
+    def get_multimodal_item_partitions(
         self,
         param: MultimodalParams,
         modality: str,
-    ) -> dict[str, MultimodalFieldLayout] | None:
+    ) -> dict[str, MultimodalItemPartition] | None:
         """Declare Gemma4's item-major image and audio fields."""
         if modality not in ("image", "audio"):
             return None
@@ -983,7 +983,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             if modality == "image"
             else ("audio_features", "audio_features_mask")
         )
-        return {name: MultimodalFieldLayout() for name in fields}
+        return {name: MultimodalItemPartition() for name in fields}
 
     @staticmethod
     def _build_video_encoder_input(

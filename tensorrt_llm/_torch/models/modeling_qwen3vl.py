@@ -39,7 +39,7 @@ from ...inputs import (
 )
 from ...inputs.multimodal import (
     DisaggPrefillMultimodalInputs,
-    MultimodalFieldLayout,
+    MultimodalItemPartition,
     MultimodalParams,
 )
 from ...logger import logger
@@ -66,7 +66,7 @@ from .modeling_qwen2vl import (
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata,
-    _qwen_vision_field_layout,
+    _qwen_vision_item_partitions,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -1268,12 +1268,12 @@ class Qwen3VisionModelBase(nn.Module):
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_mm_encoder_item_scheduling = True
 
-    def get_multimodal_field_layout(
+    def get_multimodal_item_partitions(
         self,
         param: MultimodalParams,
         modality: str,
-    ) -> dict[str, MultimodalFieldLayout] | None:
-        return _qwen_vision_field_layout(param, modality)
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
 
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
