@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Selection of the unified target+DFlash KV cache layout."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantMode
+
+pytestmark = pytest.mark.cpu_only
+
+
+def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
+    pretrained = SimpleNamespace(
+        num_hidden_layers=2,
+        num_attention_heads=32,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        hidden_size=32 * head_dim,
+        torch_dtype=torch.bfloat16,
+    )
+    quant_mode = QuantMode.from_quant_algo(kv_cache_quant_algo=kv_quant_algo)
+    return SimpleNamespace(
+        pretrained_config=pretrained,
+        quant_config=SimpleNamespace(quant_mode=quant_mode),
+    )
+
+
+def _creator(*, is_disagg, target, draft, tp_size=1):
+    creator = object.__new__(KvCacheCreator)
+    creator._speculative_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_dflash=lambda: True),
+        attention_backend="TRTLLM",
+        _allow_separate_draft_kv_cache=True,
+        draft_len_schedule=None,
+    )
+    creator._draft_model_engine = None
+    creator._draft_config = draft
+    creator._mapping = SimpleNamespace(
+        pp_size=1, cp_size=1, tp_size=tp_size, enable_attention_dp=False
+    )
+    creator._llm_args = SimpleNamespace(attn_backend="TRTLLM", kv_cache_compression_config=None)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(model_config=target), dtype=torch.bfloat16
+    )
+    creator._kv_cache_manager_cls = KVCacheManagerV2
+    creator._is_disagg = is_disagg
+    creator._get_draft_kv_model_config = lambda: draft
+    return creator
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_matching_draft_layout_unifies(is_disagg):
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+
+    assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+
+
+def test_mismatched_draft_kv_heads_unify_only_in_aggregated_serving() -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=4, head_dim=128)
+
+    assert _creator(is_disagg=False, target=target, draft=draft)._should_unify_dflash_kv_cache()
+    assert not _creator(is_disagg=True, target=target, draft=draft)._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_mismatched_draft_head_dim_unifies(is_disagg: bool) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=64)
+
+    assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_fp8_target_with_bf16_draft_unifies(is_disagg: bool) -> None:
+    target = _model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8)
+    draft = _model_config(kv_heads=8, head_dim=128)
+
+    assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+
+
+def test_layout_compares_rank_local_heads():
+    # 8 target heads and 2 draft heads differ per rank at every TP size; at
+    # TP4 the draft is duplicated to 1 head per rank while the target has 2.
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=2, head_dim=128)
+    creator = _creator(is_disagg=True, target=target, draft=draft, tp_size=4)
+
+    assert creator._dflash_kv_layout(target, torch.bfloat16)[0] == 2
+    assert creator._dflash_kv_layout(draft, torch.bfloat16)[0] == 1
+    assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_attention_dp_unifies_with_unsharded_heads(is_disagg):
+    # Under attention DP each rank keeps every KV head, so the TP4 layouts of
+    # an 8-head target and a 2-head draft are not resharded to 2 and 1.
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft, tp_size=4)
+    creator._mapping.enable_attention_dp = True
+
+    assert creator._dflash_kv_layout(target, torch.bfloat16)[0] == 8
+    assert (
+        creator._dflash_kv_layout(_model_config(kv_heads=2, head_dim=128), torch.bfloat16)[0] == 2
+    )
+    assert creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+@pytest.mark.parametrize("per_layer_side", ["target", "draft"])
+def test_per_layer_kv_heads_keep_separate_cache(is_disagg, per_layer_side):
+    uniform = _model_config(kv_heads=8, head_dim=128)
+    per_layer = _model_config(kv_heads=[8, 4], head_dim=128)
+    target, draft = (per_layer, uniform) if per_layer_side == "target" else (uniform, per_layer)
+
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+
+    assert not creator._should_unify_dflash_kv_cache()
+    assert creator._build_unified_dflash_layer_specs(kv_cache_config=None) == ()
