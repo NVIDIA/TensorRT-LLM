@@ -750,6 +750,31 @@ def _input_image_to_chat_part(part: dict) -> dict[str, Any]:
     return {"type": "image_url", "image_url": chat_image}
 
 
+_INPUT_FILE_UNSUPPORTED = ("input_file content is not supported; send the "
+                           "file's text as input_text instead")
+
+# Responses text part types; the chat API calls the same part "text".
+_RESPONSES_TEXT_PART_TYPES = frozenset({"input_text", "output_text"})
+
+
+def _responses_part_to_chat_part(part: Any) -> Any:
+    """Translate one Responses content part into its chat form.
+
+    A part already in chat form, a plain string included, is returned as it
+    is, so the chat parser reads it exactly as it would in a chat request.
+    """
+    if not isinstance(part, dict):
+        return part
+    part_type = part.get("type")
+    if part_type in _RESPONSES_TEXT_PART_TYPES:
+        return {"type": "text", "text": part.get("text")}
+    if part_type == "input_image":
+        return _input_image_to_chat_part(part)
+    if part_type == "input_file":
+        raise ValueError(_INPUT_FILE_UNSUPPORTED)
+    return part
+
+
 def _input_content_to_chat_content(
         content: list) -> Union[str, list[dict[str, Any]]]:
     """Convert the content parts of a Responses message to chat content.
@@ -773,8 +798,7 @@ def _input_content_to_chat_content(
             chat_parts.append(part)
             has_media = True
         elif part_type == "input_file":
-            raise ValueError("input_file content is not supported; send the "
-                             "file's text as input_text instead")
+            raise ValueError(_INPUT_FILE_UNSUPPORTED)
         elif part.get("text"):
             chat_parts.append({"type": "text", "text": part["text"]})
     if not has_media:
@@ -794,12 +818,16 @@ def _response_output_item_to_chat_completion_message(
         case "":
             if "role" not in item:
                 raise ValueError(f"Invalid input message item: {item}")
-            # A message without a type carries Responses content parts
-            # (input_text, input_image), which the chat parser does not read.
+            # A message without a type can mix Responses parts (input_text,
+            # input_image), which the chat parser does not read, with chat
+            # parts, which it does. Only the Responses parts are translated,
+            # so chat-style content reads exactly as in a chat request.
             if isinstance(item.get("content"), list):
                 return {
-                    **item, "content":
-                    _input_content_to_chat_content(item["content"])
+                    **item, "content": [
+                        _responses_part_to_chat_part(part)
+                        for part in item["content"]
+                    ]
                 }
             return item
         case "message" | "reasoning":

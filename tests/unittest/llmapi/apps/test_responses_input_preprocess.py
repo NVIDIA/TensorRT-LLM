@@ -22,6 +22,8 @@ question into an assistant turn.
 
 import pytest
 
+from tensorrt_llm.inputs.utils import MultimodalDataTracker
+from tensorrt_llm.serve.chat_utils import parse_chat_message_content
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
@@ -430,16 +432,47 @@ def test_input_image_becomes_a_chat_image_part(typed):
     }
 
 
-def test_untyped_text_message_becomes_a_string():
+def _chat_text(message):
+    """The prompt text the chat parser reads from a converted message."""
+    return parse_chat_message_content(message, MultimodalDataTracker("llama"))["content"]
+
+
+def test_untyped_input_text_becomes_chat_text_parts():
     """input_text parts are not chat parts; passed through, the chat parser rejects them."""
     msg = _response_output_item_to_chat_completion_message(
         _user_item(
-            {"type": "input_text", "text": "hello "},
+            {"type": "input_text", "text": "hello"},
             {"type": "input_text", "text": "there"},
             typed=False,
         )
     )
-    assert msg == {"role": "user", "content": "hello there"}
+    assert msg == {
+        "role": "user",
+        "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "there"}],
+    }
+    assert _chat_text(msg) == "hello\nthere"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "text", "text": "First"}, {"type": "text", "text": "Second"}],
+        ["First", "Second"],
+    ],
+    ids=["text-parts", "string-parts"],
+)
+def test_untyped_chat_content_reads_as_in_a_chat_request(content):
+    """Chat-style parts are left for the chat parser, which joins them by line.
+
+    Converting them as Responses parts glued the text parts together and
+    dropped the plain strings, which changed or erased the prompt.
+    """
+    item = {"role": "user", "content": content}
+    msg = _response_output_item_to_chat_completion_message(item)
+    assert msg == item
+    assert _chat_text(msg) == "First\nSecond"
+    (message,) = _messages({"input": [item]})
+    assert _chat_text(message) == "First\nSecond"
 
 
 def test_input_image_accepts_the_chat_url_object():
