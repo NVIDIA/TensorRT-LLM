@@ -84,7 +84,6 @@ def _make_single_token_context_graph_batch(
             or request.context_current_position + 1 != request.py_prompt_len
             or request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.is_context_only_request
             or request.is_generation_only_request
             or request.py_disaggregated_params is not None
@@ -103,7 +102,6 @@ def _make_single_token_context_graph_batch(
         if (
             request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.py_disaggregated_params is not None
         ):
             return scheduled_requests, frozenset()

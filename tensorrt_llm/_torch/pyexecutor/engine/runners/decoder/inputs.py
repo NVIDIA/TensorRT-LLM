@@ -253,7 +253,6 @@ class HostLists:
     extend_requests: list[LlmRequest] = field(default_factory=list)
     extend_dummy_requests: list[LlmRequest] = field(default_factory=list)
     generation_requests: list[LlmRequest] = field(default_factory=list)
-    first_draft_requests: list[LlmRequest] = field(default_factory=list)
     # Collect generation request IDs during categorization to avoid
     # a separate iteration over scheduled_requests.generation_requests later.
     all_gen_request_ids: list[int] = field(default_factory=list)
@@ -824,7 +823,6 @@ class DecoderInputPreparer:
             spec_config,
             enable_spec_decode=enable_spec_decode,
         )
-        self._pack_first_draft_requests(host)
         self._pack_generation_requests(host, promoted_context_request_ids, new_tokens_device)
 
         self._copy_token_ids_to_device(
@@ -1168,11 +1166,10 @@ class DecoderInputPreparer:
         next_draft_tokens_device: torch.Tensor | None,
         enable_spec_decode: bool,
     ) -> None:
-        """Sort generation requests into the extend, first-draft and generation groups."""
+        """Sort generation requests into the extend and generation groups."""
         extend_requests = host.lists.extend_requests
         extend_dummy_requests = host.lists.extend_dummy_requests
         generation_requests = host.lists.generation_requests
-        first_draft_requests = host.lists.first_draft_requests
         all_gen_request_ids = host.lists.all_gen_request_ids
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
@@ -1203,8 +1200,6 @@ class DecoderInputPreparer:
                     extend_dummy_requests.append(request)
                 else:
                     extend_requests.append(request)
-            elif request.py_is_first_draft:
-                first_draft_requests.append(request)
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
@@ -1412,49 +1407,6 @@ class DecoderInputPreparer:
                     prompt_lengths.append(request.py_prompt_len)
 
             extra_inputs.add_generation_request(request)
-
-    def _pack_first_draft_requests(self, host: HostInputs) -> None:
-        """Pack the first draft-model step of each request."""
-        first_draft_requests = host.lists.first_draft_requests
-        request_ids = host.lists.request_ids
-        draft_lens = host.lists.draft_lens
-        position_ids = host.lists.position_ids
-        input_ids = host.lists.input_ids
-        gather_ids = host.lists.gather_ids
-        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
-        sequence_lengths = host.lists.sequence_lengths
-        prompt_lengths = host.lists.prompt_lengths
-        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
-        extra_inputs = host.extra_inputs
-
-        for request in first_draft_requests:
-            request_ids.append(request.py_request_id)
-            draft_lens.append(0)
-            # Only the length and the last (original_max_draft_len+1) tokens are
-            # needed here; get_num_tokens is O(1) and get_tokens_range copies only
-            # the requested window, whereas get_tokens(0) marshals the whole
-            # O(seq_len) VecTokens into a Python list.
-            _num_tokens = request.get_num_tokens(0)
-            begin_compute = _num_tokens - self._config.original_max_draft_len - 1
-            end_compute = begin_compute + self._config.original_max_draft_len + 1
-            prompt_tokens = request.get_tokens_range(0, begin_compute, end_compute)
-            position_ids.extend(range(begin_compute, begin_compute + len(prompt_tokens)))
-            input_ids.extend(prompt_tokens)
-            gather_ids.append(
-                len(input_ids)
-                - 1
-                - (self._config.original_max_draft_len - request.py_num_accepted_draft_tokens)
-            )
-            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
-
-            sequence_lengths.append(1 + self._config.original_max_draft_len)
-            prompt_lengths.append(request.py_prompt_len)
-            past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
-            extra_inputs.add_generation_request(request)
-
-            # update batch index
-            request.py_batch_idx = request.py_seq_slot
 
     def _pack_generation_requests(
         self,
@@ -2197,7 +2149,6 @@ class DecoderInputPreparer:
             len(host.lists.generation_requests)
             + len(host.lists.extend_requests)
             + sum(host.lists.draft_lens)
-            + len(host.lists.first_draft_requests)
         )
         self.iter_states["num_ctx_requests"] = host.num_ctx_requests
         self.iter_states["num_ctx_tokens"] = host.num_ctx_tokens
@@ -2210,7 +2161,6 @@ class DecoderInputPreparer:
                 (
                     (scheduled_requests.context_requests, 1),
                     (host.lists.extend_requests, 1),
-                    (host.lists.first_draft_requests, 1),
                     (host.lists.generation_requests, host.beam_width),
                 ),
             )
@@ -2269,7 +2219,6 @@ class DecoderInputPreparer:
             and not host.has_cp_helix
             and host.num_ctx_requests == 0
             and not host.lists.extend_requests
-            and not host.lists.first_draft_requests
             and host.n_gen > 0
             and host.previous_batch_len == host.n_gen
             and host.num_tokens == 0
