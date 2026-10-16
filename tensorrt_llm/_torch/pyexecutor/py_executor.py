@@ -4093,10 +4093,17 @@ class PyExecutor:
                              and (sizes[:, 1] > 0).any())
             can_queue_this_rank = scheduled_batch.batch_size > 0
         elif self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0].tolist()
-            can_queue = 0 not in tp_batch_sizes
-            can_queue_this_rank = scheduled_batch.batch_size > 0
+            # Vote over TP x CP. The helix CP ranks of one DP rank run each
+            # forward together, but their batch sizes can differ: one CP rank
+            # can pad a dummy request that its peer failed to allocate. With
+            # cp_size == 1 this is the TP gather.
+            batch_sizes = self.dist.tp_cp_allgather_int64(
+                [scheduled_batch.batch_size])[:, 0]
+            can_queue = bool(batch_sizes.all())
+            # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
+            # together whether to defer the previous batch.
+            cp_rows = batch_sizes.reshape(-1, self.dist.cp_size)
+            can_queue_this_rank = bool(cp_rows[self.dist.tp_rank].any())
         else:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
@@ -4155,7 +4162,7 @@ class PyExecutor:
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
 
-        Dummy allocation is rank-local, while ``can_queue`` is a TP-wide
+        Dummy allocation is rank-local, while ``can_queue`` is a TP x CP-wide
         decision. If one rank cannot allocate its dummy, peers that succeeded
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
@@ -5551,7 +5558,7 @@ class PyExecutor:
 
         The extra collective costs one allgather per check, and the check is
         already throttled to one iteration in
-        ``KV_POOL_REBALANCE_CHECK_INTERVAL``, against the ``tp_allgather`` that
+        ``KV_POOL_REBALANCE_CHECK_INTERVAL``, against the batch-size gather that
         ``_can_queue`` runs every iteration under ADP anyway.  It does add a
         lockstep requirement that ADP did not have before: every TP rank must
         reach this on the same iteration, so the ``_can_pause_for_rebalance``
