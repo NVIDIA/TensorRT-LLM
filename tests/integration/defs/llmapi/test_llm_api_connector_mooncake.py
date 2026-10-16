@@ -30,6 +30,7 @@ import contextlib
 import json
 import math
 import os
+import shutil
 import socket
 from types import SimpleNamespace
 
@@ -38,6 +39,7 @@ from test_common.mooncake_utils import running_master_on_free_ports
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    CLIENT_CONFIG_NAME,
     MooncakeStoreConnectorConfig,
     parse_size,
 )
@@ -398,6 +400,9 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool, tmp_
         reference.shutdown()
 
     client_run_dir = str(tmp_path_factory.mktemp("mooncake-small-cache-client"))
+    # Launcher-started workers find the rendered config through run_dir because
+    # they cannot inherit the fixture's MOONCAKE_CONFIG_PATH.
+    shutil.copyfile(mooncake_pool.config_path, os.path.join(client_run_dir, CLIENT_CONFIG_NAME))
     client_config = mooncake_pool.config.model_copy(update={"run_dir": client_run_dir})
     llm = LLM(
         **llm_kwargs(
