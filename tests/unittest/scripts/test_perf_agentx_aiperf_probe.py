@@ -58,41 +58,54 @@ def _write_stub_site(root: Path, *, fork: bool, datasets_version: str = "4.7.0")
         )
 
 
-def _probe(client: ModuleType, monkeypatch, site: Path) -> bool:
-    """Run aiperf_is_usable with only the stub packages importable."""
-    real_call = subprocess.call
+def _probe(client: ModuleType, monkeypatch, site: Path) -> tuple[bool, str]:
+    """Run aiperf_is_usable with only the stub packages importable; return (usable, log)."""
+    real_run = subprocess.run
 
-    def call(argv, **kwargs):
+    def run(argv, **kwargs):
         # -I keeps the host interpreter's own site-packages out of the probe.
-        return real_call(
-            [
-                sys.executable,
-                "-I",
-                "-c",
-                f"import sys; sys.path.insert(0, {str(site)!r}); " + argv[-1],
-            ],
+        probe = argv[-1]
+        return real_run(
+            [sys.executable, "-I", "-c", f"import sys\nsys.path.insert(0, {str(site)!r})\n{probe}"],
             **kwargs,
         )
 
-    monkeypatch.setattr(client.subprocess, "call", call)
-    return client.aiperf_is_usable()
+    logged = []
+    monkeypatch.setattr(client.subprocess, "run", run)
+    monkeypatch.setattr(client, "_log", logged.append)
+    return client.aiperf_is_usable(), "\n".join(logged)
 
 
 def test_upstream_aiperf_is_not_usable(client: ModuleType, monkeypatch, tmp_path: Path):
     # requirements-dev.txt installs the PyPI aiperf, which has no AgentX scenario
     # and rejects --scenario; it must trigger the fork install, not skip it.
     _write_stub_site(tmp_path, fork=False)
-    assert not _probe(client, monkeypatch, tmp_path)
+    usable, log = _probe(client, monkeypatch, tmp_path)
+    assert not usable
+    assert "aiperf.common.scenario.registry" in log
 
 
 def test_agentx_fork_is_usable(client: ModuleType, monkeypatch, tmp_path: Path):
     _write_stub_site(tmp_path, fork=True)
-    assert _probe(client, monkeypatch, tmp_path)
+    usable, log = _probe(client, monkeypatch, tmp_path)
+    assert usable
+    assert log == ""
+
+
+def test_fork_without_the_scenario_is_reported(client: ModuleType, monkeypatch, tmp_path: Path):
+    _write_stub_site(tmp_path, fork=True)
+    registry = tmp_path / "aiperf" / "common" / "scenario" / "registry.py"
+    registry.write_text("def get_scenario(name):\n    raise KeyError(name)\n")
+    usable, log = _probe(client, monkeypatch, tmp_path)
+    assert not usable
+    assert client.AGENTX_SCENARIO in log
 
 
 def test_fork_with_old_datasets_is_not_usable(client: ModuleType, monkeypatch, tmp_path: Path):
     _write_stub_site(tmp_path, fork=True, datasets_version="3.1.0")
-    assert not _probe(client, monkeypatch, tmp_path)
+    usable, log = _probe(client, monkeypatch, tmp_path)
+    assert not usable
+    assert "datasets 3.1.0" in log
 
 
 def _default_cmd(client: ModuleType, monkeypatch) -> list[str]:
@@ -114,3 +127,10 @@ def test_command_keeps_special_tokens_in_the_text(client: ModuleType, monkeypatc
     cmd = _default_cmd(client, monkeypatch)
     extra_inputs = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--extra-inputs"]
     assert "skip_special_tokens:false" in extra_inputs
+
+
+def test_command_runs_aiperf_from_the_checked_interpreter(client: ModuleType, monkeypatch):
+    # The probe and the install use sys.executable; a bare "aiperf" on PATH could be
+    # another installation, e.g. the upstream build without the AgentX scenario.
+    cmd = _default_cmd(client, monkeypatch)
+    assert cmd[:4] == [sys.executable, "-m", "aiperf", "profile"]

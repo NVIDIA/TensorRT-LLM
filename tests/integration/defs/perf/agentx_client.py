@@ -185,19 +185,37 @@ def aiperf_is_usable() -> bool:
     later, when loading the corpus. The fork check matters because
     requirements-dev.txt pins the upstream PyPI ``aiperf``, which imports fine
     but rejects ``--scenario`` at the start of the run.
+
+    The scenario is looked up through ``aiperf.common.scenario.registry``, the
+    module path in the pinned ``DEFAULT_AIPERF_REF`` build. The reason for a
+    failed probe is logged, so a fork that moves that module shows up as such
+    instead of as a reinstall on every run.
     """
     probe = (
-        "import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson; "
-        "from aiperf.common.scenario.registry import get_scenario; "
-        f"get_scenario({AGENTX_SCENARIO!r}); "
-        f"import sys; sys.exit(0 if int(datasets.__version__.split('.')[0]) >= {MIN_DATASETS_MAJOR} else 1)"
+        "import sys\n"
+        "try:\n"
+        "    import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson\n"
+        "except ImportError as e:\n"
+        "    sys.exit(f'missing module: {e}')\n"
+        "try:\n"
+        "    from aiperf.common.scenario.registry import get_scenario\n"
+        "except ImportError:\n"
+        "    sys.exit('aiperf has no aiperf.common.scenario.registry: not the agentx-harness fork, '\n"
+        "             'or the fork moved its scenario registry')\n"
+        "try:\n"
+        f"    get_scenario({AGENTX_SCENARIO!r})\n"
+        "except Exception as e:\n"
+        f"    sys.exit(f'aiperf does not provide the {AGENTX_SCENARIO} scenario: {{e}}')\n"
+        f"if int(datasets.__version__.split('.')[0]) < {MIN_DATASETS_MAJOR}:\n"
+        f"    sys.exit(f'datasets {{datasets.__version__}} < {MIN_DATASETS_MAJOR}')\n"
     )
-    return (
-        subprocess.call(
-            [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        == 0
+    result = subprocess.run(
+        [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
     )
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        _log(f"aiperf stack not usable: {lines[-1] if lines else f'exit {result.returncode}'}")
+    return result.returncode == 0
 
 
 def post_one_token(url: str, model: str, timeout: float) -> "str | None":
@@ -313,8 +331,15 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     Note ``--url`` carries scheme+host+port only; the request path is a separate
     ``--endpoint``. That is why this client takes ``--host``/``--port`` and
     composes them itself instead of having them appended to the argv.
+
+    aiperf runs as ``python -m aiperf`` under ``sys.executable``, the interpreter
+    that ``aiperf_is_usable`` checked and ``ensure_aiperf`` installed into. A bare
+    ``aiperf`` on PATH could be a different installation, such as the upstream
+    PyPI build that has no AgentX scenario.
     """
     cmd = [
+        sys.executable,
+        "-m",
         "aiperf",
         "profile",
         "--scenario",
@@ -376,8 +401,10 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     # skip_special_tokens it decodes to no text, and a one-token response
     # (every warmup request, and every ctx_only request) then carries no
     # content, which aiperf rejects as InvalidInferenceResultError. Keeping
-    # special tokens in the text makes every generated token visible; it does
-    # not change the token counts the metrics are built from.
+    # special tokens in the text makes every generated token visible. The token
+    # counts the metrics are built from stay the same only because the command
+    # also passes --use-server-token-count: without it aiperf would re-tokenize
+    # this text, special-token strings included, and count differently.
     cmd += ["--extra-inputs", "skip_special_tokens:false"]
 
     # Plain os.environ.get with a default, mirroring the reference script's

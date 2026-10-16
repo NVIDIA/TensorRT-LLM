@@ -15,8 +15,9 @@
 
 import pytest
 from tokenizers import Tokenizer
-from tokenizers.decoders import ByteFallback, Fuse, Sequence
-from tokenizers.models import WordLevel
+from tokenizers.decoders import ByteFallback, ByteLevel, Fuse, Sequence, Strip
+from tokenizers.models import BPE, WordLevel
+from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPreTokenizer
 from transformers import PreTrainedTokenizerFast
 
 from tensorrt_llm.tokenizer import TransformersTokenizer
@@ -42,6 +43,25 @@ def _byte_fallback_tokenizer() -> TransformersTokenizer:
     )
     backend.decoder = Sequence([ByteFallback(), Fuse()])
     backend.add_special_tokens(["</s>"])
+    return TransformersTokenizer(PreTrainedTokenizerFast(tokenizer_object=backend))
+
+
+def _space_prefixed_byte_level_tokenizer() -> TransformersTokenizer:
+    """A byte-level BPE whose ``ĠâĶ`` id is a space plus two bytes of ``─`` (U+2500).
+
+    ``DecodeStream`` holds ``ĠâĶ`` until ``Ģ`` supplies the last byte. The decoder
+    strips one leading space of the whole text, so the held piece decodes to a
+    different string on its own than after the token before it: only a decode in
+    that context reproduces what decoding the whole output gives.
+    """
+    backend = Tokenizer(
+        BPE(
+            vocab={"o": 0, "k": 1, "ok": 2, "Ġ": 3, "â": 4, "Ķ": 5, "Ģ": 6, "ĠâĶ": 7, "âĶ": 8},
+            merges=[("o", "k"), ("â", "Ķ"), ("Ġ", "âĶ")],
+        )
+    )
+    backend.pre_tokenizer = ByteLevelPreTokenizer(add_prefix_space=False)
+    backend.decoder = Sequence([ByteLevel(), Strip(" ", 1, 0)])
     return TransformersTokenizer(PreTrainedTokenizerFast(tokenizer_object=backend))
 
 
@@ -134,3 +154,26 @@ def test_hf_decode_incrementally_without_flush_holds_partial_token() -> None:
 
     text, _ = tokenizer.hf_decode_incrementally([1], text, states, flush=True)
     assert text == "»\N{NO-BREAK SPACE}"
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [
+        pytest.param([2, 7], id="ends_on_held_piece"),
+        pytest.param([2, 7, 6], id="held_piece_completed"),
+        pytest.param([7], id="only_held_piece"),
+    ],
+)
+def test_hf_decode_incrementally_flush_matches_full_decode_in_context(token_ids: list[int]) -> None:
+    """The flushed tail is decoded after the previous token, so the stream equals a full decode.
+
+    ``ĠâĶ`` decodes to a space plus U+FFFD after ``ok`` but to U+FFFD alone on its own,
+    because the decoder strips a leading space of the text. Decoding the held id without
+    the token before it would drop the space that the full decode keeps.
+    """
+    tokenizer = _space_prefixed_byte_level_tokenizer()
+    assert tokenizer.decode([7]) != tokenizer.decode([2, 7])[len(tokenizer.decode([2])) :]
+
+    text = _stream(tokenizer, token_ids, skip_special_tokens=True)
+
+    assert text == tokenizer.decode(token_ids, skip_special_tokens=True)
