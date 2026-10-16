@@ -23,48 +23,7 @@ enum class MpiTag : int
 {
     kDefault = 0,
 
-    // DecoderStepAsyncSend
-    kDecoderStepNewOutputTokensHost = 0,
-    kDecoderStepFinishedSumHost = 1,
-    kDecoderStepSequenceLengthsHost = 2,
-    kDecoderStepCumLogProbsHost = 3,
-    kDecoderStepLogProbsHost = 4,
-    kDecoderStepCacheIndirectionOutput = 5,
-    kDecoderStepAcceptedLengthsCumSumDevice = 6,
-    kDecoderStepAcceptedPackedPathsDevice = 7,
-    kDecoderStepFinishReasonsHost = 8,
-
-    // DecoderSlotAsyncSend
-    kDecoderSlotOutputIds = 9,
-    kDecoderSlotSequenceLengths = 10,
-    kDecoderSlotCumLogProbs = 11,
-    kDecoderSlotLogProbs = 12,
-
-    // CancelledRequestsAsyncSend
-    kCancelledRequestsNumReq = 13,
-    kCancelledRequestsIds = 14,
-
-    // Values 15-17 are retired; do not reuse.
-
-    // Executor
-    kExecutorNumActiveRequests = 18,
-    kExecutorLowestPriorityActiveHasValue = 19,
-    kExecutorLowestPriorityActive = 20,
-    kExecutorShouldExit = 21,
-
-    // TrtGptModelInflightBatching
-    kTrtGptModelInflightBatchingContextLogits = 22,
-    kTrtGptModelInflightBatchingGenerationLogits = 23,
-
-    // Orchestrator
-    kOrchestratorId = 127,
-    kOrchestratorData = 1023,
-    kOrchestratorStatsId = 128,
-    kOrchestratorStatsData = 1024,
-
-    // LogitsThread
-    kSpecDecLogitsId = 129,
-    kSpecDecLogitsData = 1025,
+    // Values 1-23, 127-129, and 1023-1025 are retired; do not reuse.
 
     // KvCacheEventManager
     kKvCacheEventSize = 1026,
