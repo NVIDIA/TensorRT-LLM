@@ -110,6 +110,7 @@ The planner's plan is checked before it runs (`plan.py`):
 |---|---|
 | `task.yaml` | copy of the brief |
 | `plan.md` | the current plan |
+| `issues.md` | suspected bugs outside this model's delivery, recorded by the planner and not investigated |
 | `task_results/` | `task_result_<id>.md` per task, plus earlier attempts |
 | `planner_turns/` | `turn_<n>.yaml` per planner turn |
 | `inbox/`, `inbox/consumed/` | human messages waiting for the planner, and those it acted on |

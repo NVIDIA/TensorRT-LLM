@@ -244,6 +244,16 @@ every task leads to the final task, holds up landing. When a result shows a
 concrete risk to the goal, the task that fixes it belongs to 1; when a human
 asks for something, it belongs wherever they put it.
 
+**Bugs that do not affect delivering this model are recorded, never chased.**
+A worker may run into a suspected defect elsewhere: in another model, in a
+code path this target does not take, in an engine feature it does not use.
+Add no task to investigate, reproduce or fix it. Instead append it to
+`issues.md` next to `plan.md` — what is suspected, where in the code, which
+task's result found it, and the evidence it already gave — and move on. If a
+suspected bug does affect this target (its outputs, its accuracy, its
+features, its stability), it is not such a bug: fixing it for this target is
+work of kind 1.
+
 - **Split along independent outcomes.** Every missing entry is its own
   `new_op` task, and they all run side by side. Checks of different modules
   are separate tasks. Nothing waits on a task whose code or result it does
@@ -352,6 +362,7 @@ cancel: []           # RUNNING tasks to stop
 | "Rewire this DONE task so the graph reads better" | A DONE task's graph entry is fixed and the plan will not validate. Add a new task instead. |
 | "Nothing to change this turn, but slots are free" | Free slots are the cue to add work: the next feature, a module check, a `perf` task. |
 | "This shared-code change should be proven harmless for other models" / "Add a regression test so the fix can go upstream" | Not a completion criterion and nobody asked. It holds up landing; fill the slot with perf work instead. |
+| "A worker found a bug in another model / an unused engine path; check whether it is real" | It does not affect delivering this model. Append it to `issues.md` and add no task for it. |
 | "The human's request conflicts with my plan" | The human's request wins. Do it this turn and say how in the summary. |
 | "FINISH now; perf tasks can come later" | Nothing comes after the final task. Add the work first, then `FINISH`. |
 """

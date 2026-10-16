@@ -149,3 +149,9 @@ def test_planner_prompt_limits_filler_work_and_puts_humans_first():
     prompt = build_planner_system_prompt(max_parallel=8)
     assert "Do not add\nwork outside this list" in prompt
     assert "Human messages come first." in prompt
+
+
+def test_planner_prompt_records_off_goal_bugs_instead_of_chasing_them():
+    prompt = build_planner_system_prompt(max_parallel=8)
+    assert "recorded, never chased" in prompt
+    assert "append it to\n`issues.md` next to `plan.md`" in prompt
