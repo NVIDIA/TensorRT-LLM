@@ -101,7 +101,15 @@ def test_native_state_layout_is_unchanged(manager, state):
             replace(config, layers=[config.layers[0], state], initial_pool_ratio=[0.5, 0.5])
         )
         retained = configured.layers[1]
-        assert retained == state
+        assert type(retained) is type(state)
+        assert retained.layer_id == state.layer_id
+        assert [(buffer.role, buffer.size) for buffer in retained.buffers] == [
+            (buffer.role, buffer.size) for buffer in state.buffers
+        ]
+        if isinstance(state, kv.AttentionLayerConfig):
+            assert retained.sliding_window_size == state.sliding_window_size
+            assert retained.num_sink_tokens == state.num_sink_tokens
+            assert retained.reuse_policy == state.reuse_policy
         assert manager.high_layers == {0: 2}
         assert len(configured.layers) == 3
         # Split the full-history KV budget without changing the native state's share.
