@@ -9,7 +9,6 @@ both representations without quantizing the high copy through the low copy.
 """
 
 import copy
-from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -17,50 +16,25 @@ import torch
 
 from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.quantization import QuantMode
-
-from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionBackend, AttentionMetadata
 
 
-@contextmanager
-def use_unquantized_kv(attention: "AttentionBackend"):
-    """Select existing kernels for the temporary FP16/BF16 cache."""
-    from .fmha.manager import FmhaManager
+def configure_attention(attention: "AttentionBackend") -> None:
+    """Bind an eligible layer's backend to its FP16/BF16 staging cache."""
     from .trtllm import TrtllmAttention
 
-    fp8 = attention.has_fp8_kv_cache
-    attention.has_fp8_kv_cache = False
+    quant_config = attention.quant_config
+    if quant_config is not None and quant_config.layer_quant_mode.has_kv_cache_quant():
+        quant_config = copy.copy(quant_config)
+        quant_config.kv_cache_quant_algo = None
+        # Both cached properties must describe the staging representation.
+        quant_config.__dict__.pop("quant_mode", None)
+        quant_config.__dict__.pop("layer_quant_mode", None)
+        attention.update_quant_config(quant_config)
     if isinstance(attention, TrtllmAttention):
-        saved = (
-            attention.quant_mode,
-            attention.has_fp4_kv_cache,
-            attention.local_layer_idx,
-            attention._fmha_manager,
-        )
-        attention.quant_mode = int(
-            QuantMode(attention.quant_mode)
-            & ~(QuantMode.FP8_KV_CACHE | QuantMode.INT8_KV_CACHE | QuantMode.NVFP4_KV_CACHE)
-        )
-        attention.has_fp4_kv_cache = False
         attention.local_layer_idx = 0
-    try:
-        if isinstance(attention, TrtllmAttention):
-            if attention._unquantized_fmha_manager is None:
-                attention._unquantized_fmha_manager = FmhaManager(attention)
-            attention._fmha_manager = attention._unquantized_fmha_manager
-        yield
-    finally:
-        attention.has_fp8_kv_cache = fp8
-        if isinstance(attention, TrtllmAttention):
-            (
-                attention.quant_mode,
-                attention.has_fp4_kv_cache,
-                attention.local_layer_idx,
-                attention._fmha_manager,
-            ) = saved
 
 
 def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -76,27 +50,25 @@ def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.
 class MixedPrecisionKVView:
     """Present temporary paged KV to Attention and return new writes to its pools."""
 
-    @staticmethod
     def prepare(
+        self,
         attention: "AttentionBackend",
-        metadata: "AttentionMetadata",
         *,
         history_dequant_scale: torch.Tensor | None = None,
-    ) -> "MixedPrecisionKVView | None":
-        view = metadata.mixed_precision_kv_views.get(attention.layer_idx)
-        if view is None:
-            return None
+    ) -> None:
+        from .trtllm import TrtllmAttention
+
+        configure_attention(attention)
+        if history_dequant_scale is None and isinstance(attention, TrtllmAttention):
+            history_dequant_scale = attention.kv_scale_quant_orig
         if history_dequant_scale is not None:
-            view.history_scale.copy_(history_dequant_scale)
-        view.materialize()
-        return view
+            self.history_scale.copy_(history_dequant_scale)
+        self.materialize()
 
     @classmethod
     def prepare_batch(cls, metadata: "AttentionMetadata") -> None:
         """Update addresses and native Attention plans before capture or replay."""
         manager = metadata.kv_cache_manager
-        if not isinstance(manager, MixedPrecisionKVCacheManager):
-            return
         for layer_idx, local in manager.layer_offsets.items():
             if local not in manager.high_layers:
                 continue

@@ -40,6 +40,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ...metadata import KVCacheParams
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    MixedPrecisionKVCacheManager
 from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
@@ -2004,8 +2006,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
 
-        from .mixed_precision_kv_view import MixedPrecisionKVView
-        MixedPrecisionKVView.prepare_batch(self)
+        if isinstance(self.kv_cache_manager, MixedPrecisionKVCacheManager):
+            from .mixed_precision_kv_view import MixedPrecisionKVView
+            MixedPrecisionKVView.prepare_batch(self)
 
     def plan(self,
              num_heads: int,

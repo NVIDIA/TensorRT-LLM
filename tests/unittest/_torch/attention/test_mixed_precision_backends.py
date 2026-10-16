@@ -72,24 +72,16 @@ def test_optimized_two_pool_prefill_and_decode(
         )
         for count in (query_heads, heads, heads)
     ]
+    quant_config = QuantConfig(kv_cache_quant_algo="FP8" if high_dtype == DataType.FP8 else "NVFP4")
+    original_config = quant_config.model_dump()
+    original_quant_mode = quant_config.quant_mode
     attention = backend(
         layer_idx=0,
         num_heads=query_heads,
         head_dim=width,
         num_kv_heads=heads,
-        quant_config=QuantConfig(
-            kv_cache_quant_algo="FP8" if high_dtype == DataType.FP8 else "NVFP4"
-        ),
+        quant_config=quant_config,
     )
-    original_fp8_kv_cache = attention.has_fp8_kv_cache
-    if backend is TrtllmAttention:
-        original_state = (
-            attention.quant_mode,
-            attention.has_fp8_kv_cache,
-            attention.has_fp4_kv_cache,
-            attention.local_layer_idx,
-            attention._fmha_manager,
-        )
     scale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
     module = SimpleNamespace(
         attn=attention,
@@ -155,13 +147,27 @@ def test_optimized_two_pool_prefill_and_decode(
                     tensor.copy_(tensor.flip(0))
             graph.replay()
             torch.testing.assert_close(output, reference.flip(0), atol=0.01, rtol=0.02)
-            decode_graph = (metadata, inputs, graph, output)
+            decode_graph = (metadata, graph, output, run)
             output = output.flip(0)
         assert metadata.kv_cache_manager is manager and metadata.kv_layout == kv_layout
         return output
 
     def token_major(pool):
         return pool.transpose(2, 3) if kv_layout == "HND" else pool
+
+    def assert_staging_config() -> None:
+        assert quant_config.model_dump() == original_config
+        assert quant_config.quant_mode is original_quant_mode
+        assert attention.quant_config is not quant_config
+        assert attention.quant_config.kv_cache_quant_algo is None
+        assert int(attention.quant_config.layer_quant_mode) == 0
+        assert not attention.quant_config.quant_mode.has_fp8_kv_cache()
+        assert not attention.quant_config.quant_mode.has_fp4_kv_cache()
+        assert not attention.has_fp8_kv_cache
+        if backend is TrtllmAttention:
+            assert attention.quant_mode == 0
+            assert not attention.has_fp4_kv_cache
+            assert attention.local_layer_idx == 0
 
     try:
         manager.add_dummy_requests(request_ids, [length] * batch, is_gen=False)
@@ -181,8 +187,9 @@ def test_optimized_two_pool_prefill_and_decode(
         scales_before = token_major(
             manager.get_mixed_precision_buffers(0, request_ids, kv_layout)[1][0]
         ).clone()
+        assert_staging_config()
         if backend is TrtllmAttention:
-            selection_cache = attention._unquantized_fmha_manager
+            selection_cache = attention._fmha_manager
             assert selection_cache is not None
         target, implementation = (
             (selection_cache, "select")
@@ -192,15 +199,9 @@ def test_optimized_two_pool_prefill_and_decode(
         with patch.object(target, implementation, side_effect=RuntimeError("test failure")):
             with pytest.raises(RuntimeError, match="test failure"):
                 forward(0, length, True)
-        assert attention.has_fp8_kv_cache == original_fp8_kv_cache
+        assert_staging_config()
         if backend is TrtllmAttention:
-            assert (
-                attention.quant_mode,
-                attention.has_fp8_kv_cache,
-                attention.has_fp4_kv_cache,
-                attention.local_layer_idx,
-                attention._fmha_manager,
-            ) == original_state
+            assert attention._fmha_manager is selection_cache
         torch.testing.assert_close(
             token_major(manager.get_buffers(0, kv_layout=kv_layout)), history_before, rtol=0, atol=0
         )
@@ -213,16 +214,9 @@ def test_optimized_two_pool_prefill_and_decode(
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
         assert manager._staging_buffer.data_ptr() == arena
-        assert attention.has_fp8_kv_cache == original_fp8_kv_cache
+        assert_staging_config()
         if backend is TrtllmAttention:
-            assert attention._unquantized_fmha_manager is selection_cache
-            assert (
-                attention.quant_mode,
-                attention.has_fp8_kv_cache,
-                attention.has_fp4_kv_cache,
-                attention.local_layer_idx,
-                attention._fmha_manager,
-            ) == original_state
+            assert attention._fmha_manager is selection_cache
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
         all_history_ids = manager.get_batch_cache_indices(request_ids, 0)
         (high, all_high_ids), (scales, all_scale_ids) = manager.get_mixed_precision_buffers(
@@ -286,7 +280,7 @@ def test_optimized_two_pool_prefill_and_decode(
             ).reshape_as(output[row])
             torch.testing.assert_close(output[row], expected, atol=0.01, rtol=0.02)
         if decode_graph is not None:
-            metadata, inputs, graph, captured_output = decode_graph
+            metadata, graph, captured_output, run = decode_graph
             for request_id in request_ids:
                 cache = manager.kv_cache_map[request_id]
                 assert cache.resize(None, length + 1)
@@ -296,7 +290,7 @@ def test_optimized_two_pool_prefill_and_decode(
             metadata.prepare()
             graph.replay()
             replayed = captured_output.clone()
-            eager = attention.forward(*inputs, metadata, kv_scale_quant_orig=scale)
+            eager = run()
             torch.testing.assert_close(replayed, eager, atol=0.01, rtol=0.02)
     finally:
         manager.shutdown()

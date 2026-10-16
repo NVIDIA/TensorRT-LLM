@@ -40,6 +40,8 @@ from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    MixedPrecisionKVCacheManager
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
@@ -1136,8 +1138,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
-        from .mixed_precision_kv_view import MixedPrecisionKVView
-        MixedPrecisionKVView.prepare_batch(self)
+        if isinstance(self.kv_cache_manager, MixedPrecisionKVCacheManager):
+            from .mixed_precision_kv_view import MixedPrecisionKVView
+            MixedPrecisionKVView.prepare_batch(self)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
@@ -1797,7 +1800,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: FmhaManager
-        self._unquantized_fmha_manager: Optional[FmhaManager] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1827,7 +1829,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
         self._fmha_manager = FmhaManager(self)
-        self._unquantized_fmha_manager = None
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",

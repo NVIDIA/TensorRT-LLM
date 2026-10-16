@@ -60,7 +60,7 @@ from .backends import (
     TrtllmAttentionMetadata,
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
-from .backends.mixed_precision_kv_view import MixedPrecisionKVView, use_unquantized_kv
+from .backends.mixed_precision_kv_view import MixedPrecisionKVView, configure_attention
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import append_mla_latent_cache, create_attention
 from .rotary_embedding import RotaryEmbedding
@@ -968,11 +968,10 @@ class MLA(nn.Module):
             )
             return
 
-        attention_kv = MixedPrecisionKVView.prepare(
-            self.mqa,
-            attn_metadata,
-        )
+        attention_kv = attn_metadata.mixed_precision_kv_views.get(self.layer_idx)
         if attention_kv is not None:
+            attention_kv.prepare(self.mqa)
+            configure_attention(self.mha)
             attn_metadata = attention_kv.metadata
             if self.rotary_emb is None:
                 self.rotary_emb = RotaryEmbedding(
@@ -980,21 +979,7 @@ class MLA(nn.Module):
                     head_dim=self.qk_rope_head_dim,
                     is_neox=self.pos_embd_params.is_neox,
                 )
-            apply_rotary_emb = self.apply_rotary_emb
             self.apply_rotary_emb = True
-            try:
-                with use_unquantized_kv(self.mqa), use_unquantized_kv(self.mha):
-                    self._forward_impl(
-                        position_ids,
-                        hidden_states,
-                        attn_metadata,
-                        attn_output[0],
-                        latent_cache_gen=latent_cache_gen,
-                    )
-                attention_kv.writeback()
-            finally:
-                self.apply_rotary_emb = apply_rotary_emb
-            return
 
         self._forward_impl(
             position_ids,
@@ -1003,6 +988,8 @@ class MLA(nn.Module):
             attn_output[0],
             latent_cache_gen=latent_cache_gen,
         )
+        if attention_kv is not None:
+            attention_kv.writeback()
 
     def _forward_impl(
         self,
