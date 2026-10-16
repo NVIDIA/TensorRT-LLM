@@ -20,9 +20,11 @@ LTX23_MODEL_PATH (generation checkpoint), LTX23_RETAKE_CHECKPOINT,
 LTX23_TEXT_ENCODER_PATH, and LTX23_GOLDEN_DIR.
 """
 
+import contextlib
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 
 import librosa
 import numpy as np
@@ -35,7 +37,6 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _assert_lpips_below_threshold,
     _cleanup_cuda,
     _golden_media_path,
-    _lpips_deterministic_algorithms,
     _lpips_model_path,
     _preserve_lpips_candidate_on_failure,
     _require_exists,
@@ -92,6 +93,20 @@ def _ltx23_golden_media_path(tmp_path, media_name: str, label: str) -> str:
     return str(_golden_media_path(tmp_path, media_name, label))
 
 
+@contextlib.contextmanager
+def _ltx23_reference_execution() -> Iterator[None]:
+    """Match upstream eager generation; LPIPS metric scoring remains deterministic."""
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        # Strict deterministic mode excludes the reference's CuDNN attention kernel.
+        torch.use_deterministic_algorithms(False)
+        with torch.compiler.set_stance("force_eager"):
+            yield
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+
+
 def _save_wav(audio, path, sample_rate):
     tensor = torch.as_tensor(audio, dtype=torch.float32).detach().cpu()
     mono = librosa.to_mono(tensor.reshape(-1, tensor.shape[-1]).numpy())
@@ -136,7 +151,7 @@ def _generate_ltx23_av(video_out_path, audio_out_path):
     )
 
     # Force eager: nested @torch.compile is not turned off by TorchCompileConfig.
-    with _lpips_deterministic_algorithms(fully_eager=True):
+    with _ltx23_reference_execution():
         args = VisualGenArgs(
             model=LTX23_MODEL_PATH,
             pipeline_config={"text_encoder_path": LTX23_TEXT_ENCODER_PATH},
