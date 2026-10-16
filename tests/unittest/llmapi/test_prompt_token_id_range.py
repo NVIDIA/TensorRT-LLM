@@ -173,6 +173,7 @@ def test_generate_async_rejects_raw_prompts_before_submission(monkeypatch, input
     with pytest.raises(RequestError, match=f"Prompt token id {_VOCAB} is out of range"):
         BaseLLM.generate_async(llm, inputs)
     preprocess.assert_called_once()
+    assert preprocess.call_args.args[0] == inputs
     executor.generate_async.assert_not_called()
 
 
