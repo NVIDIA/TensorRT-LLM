@@ -33,7 +33,7 @@ The examples below use `/path/to/musespark-open-checkpoint` — replace it with 
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`).
 * **KV-cache block reuse is supported and enabled** (`enable_block_reuse: true`, `enable_partial_reuse: true`).
 * **Guided decoding is supported** with the `xgrammar` backend (`guided_decoding_backend: xgrammar`), including JSON-schema constrained output.
-* **Speculative decoding is supported** with model-free suffix-automaton (SA) drafting as an opt-in; see [Speculative Decoding](#speculative-decoding) below.
+* **Speculative decoding is supported** with a DFlash2 drafter, and model-free suffix-automaton (SA) drafting is available as an opt-in; see [Speculative Decoding](#speculative-decoding) below.
 * **Disaggregated serving:** this model runs on the KV cache manager v2 only, which disaggregated serving keeps on the NIXL backend with the Python transceiver runtime (`cache_transceiver_config: {backend: NIXL, transceiver_runtime: PYTHON}`); other transceiver configurations are refused at startup. Some disaggregated configurations additionally require adjusting the attention-kernel library selection with `TLLM_FMHA_LIBS=-fallback` in the server environment (this removes the fallback attention library from the default selection order). On GB300 (`SM103`, aarch64) also set `UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp` in every worker environment: with the default UCX transport list, NIXL memory registration fails at startup (`registerMem: registration failed for the specified or all potential backends`).
 
 ## Deployment Steps
@@ -154,9 +154,20 @@ Token budgets for multimodal items count against `max_num_tokens` and `max_seq_l
 
 ## Speculative Decoding
 
-Suffix-automaton (SA) drafting — model-free speculation that drafts from the request's own token history — is available as an opt-in for low-concurrency or copy-heavy serving. Its measured trade-offs are covered in the [MuseSpark speculative-decoding guide](deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md).
+Muse Spark Open supports speculative decoding with a **DFlash2 drafter** — a small draft model that cross-attends to hidden states captured from the target model and predicts multiple draft tokens in one forward pass. The published drafter checkpoint is [`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2). A typical configuration drafts `K = 7` tokens per step:
 
-Draft-token acceptance is strict: an accepted token is exactly the token the target model emits at that position, so speculation changes serving speed, not what the model outputs. One honest caveat: at temperature 0, a speculation-enabled server may rarely produce a different completion than the same server with speculation off, when two candidate tokens are numerically near-tied — the different batch geometry of draft verification can flip which side of the tie wins. This is the same variability class as ordinary batching effects (the same request can also flip near-ties at different batch sizes), and it disappears at temperature > 0.
+```yaml
+speculative_config:
+  decoding_type: DFlash
+  max_draft_len: 7
+  speculative_model: nvidia/Muse-Spark-Open-816B-A42B-DFlash2
+```
+
+DFlash runs on the `TRTLLM` attention backend — the backend the validated aggregated recipe above already ships; a FlashInfer-attention configuration is refused at startup.
+
+Draft-token acceptance is strict: an accepted token is exactly the token the target model emits at that position. At temperature 0, completions still often differ from the same server with speculation off: draft verification runs the target model through a different attention path than one-token decoding, and the resulting small numeric differences flip which of two near-tied candidate tokens wins. Near-ties are common in this model's reasoning text, so the greedy text often diverges early in the reasoning. KV-cache prefix reuse and batch composition change temperature-0 completions in the same way; at temperature > 0 the effect disappears into ordinary sampling variation.
+
+Suffix-automaton (SA) drafting — model-free speculation that drafts from the request's own token history — is also available as an opt-in for low-concurrency or copy-heavy serving. Its measured trade-offs are covered in the [Muse Spark Open speculative-decoding guide](deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md).
 
 ## Testing API Endpoint
 
