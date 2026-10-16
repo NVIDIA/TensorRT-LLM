@@ -252,7 +252,10 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
         outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
 
     assert len(outputs) == 1
-    assert outputs[0].shape == (8, 8, 3)
+    # The copy path also gets a contiguous hidden-size buffer, so downstream
+    # residual and all-reduce fusions never see a strided slice.
+    assert outputs[0].shape == (8, 1, 16)
+    assert outputs[0].is_contiguous()
     assert outputs[0].dtype == torch.bfloat16
     mla_layer.create_output.assert_not_called()
 
@@ -350,10 +353,13 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
 ) -> None:
     groups = 2
     rank = 3
-    output = torch.full((bucket_tokens, groups, rank), -1.0)
+    output = torch.full((bucket_tokens, 1, 4), -1.0)
     mla_layer = SimpleNamespace(
         o_a_proj=torch.empty(0),
         o_a_proj_scale=torch.empty(0),
+        n_local_groups=groups,
+        o_lora_rank=rank,
+        dtype=torch.float32,
         hidden_size=4,
         o_b_proj=Mock(side_effect=lambda o_lora: o_lora[:, :4] + 100.0),
     )
