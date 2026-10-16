@@ -207,7 +207,9 @@ serialize access. If KVCM later supports concurrent public calls, synchronizatio
 one mutex per instance rather than inside each staging manager.
 
 If any lifecycle requests device indices, its `StorageManager` owns one device index ring, allocated lazily after codec
-configuration. The default host-index codec allocates no index staging. CUDA handles any internal host staging required
+configuration. A codec that reports `kHost` allocates no index staging; the default codec reports `kHost` where it
+selects the copy engines (PCIe-attached GPUs without chunked host registration, or a coherent link with
+`TLLM_KV_CACHE_MANAGER_V2_PAGE_COPY_PREFER_COPY_ENGINE=1`) and `kDevice` where it runs its copy kernel. CUDA handles any internal host staging required
 by `CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL`; KVCM does not retain a pinned index ring. Per-`StorageManager` device rings
 prevent codec traffic in one KVCM instance from consuming another instance's index capacity.
 
@@ -276,18 +278,24 @@ Hot -> Hot: existing per-pool copy, including defragmentation
 Cold -> Cold: raw one-pool copy
 ```
 
-The default concatenating codec reports `kHost` and consumes the `PageIndexPair` array synchronously. It builds one
-`cuMemcpyBatchAsync` descriptor for each page and hot pool, then submits the complete descriptor array once per codec
-call. Each descriptor copies the full pool contribution for that page. There is no codec-level 2 MiB work size,
-transfer chunking policy, or 16-byte alignment requirement; DMA scheduling and partitioning belong to CUDA.
-Before CUDA 12.8, the version-gated fallback submits the same descriptors as individual stream-ordered
-`cuMemcpyAsync` calls.
+The default concatenating codec delegates each pool's copy to `BatchedPageCopier`, which picks the path when the codec
+constructs it, from the platform and the variable below. On PCIe-attached GPUs it reports `kHost`, builds one
+descriptor per page for each hot pool and submits one `cuMemcpyBatchAsync` batch per pool and codec call, all on the
+same stream; the batch uses stream-ordered source access and sets `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE`, and
+non-empty calls require a non-legacy CUDA stream. On coherent NVLink-C2C links (Grace systems) it reports `kDevice`
+and runs a multi-CTA copy kernel whose grid is sized to the link bandwidth, because on wide links the kernel reaches a
+higher ceiling (355 GB/s measured on GH200; on GB300 the two paths are within 5 % of each other when the GPU is idle).
+Where `HostMem` registers pinned memory in adjacent 2 GiB chunks (Linux 6.11 to 6.13) the kernel is used on every
+link, since a copy-engine descriptor may not cross a registration boundary. There is no codec-level work size,
+transfer chunking policy, or 16-byte alignment requirement beyond the kernel's fast path; on the kernel path, a layout
+that is not 16-byte aligned takes a slower generic kernel, while the copy-engine path accepts any alignment.
 
-The batch uses stream-ordered source access and sets `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE` to prefer
-copy engines when the platform honors the hint. Non-empty calls require a non-legacy
-CUDA stream, as required by `cuMemcpyBatchAsync`. Host memory may be registered as adjacent 2 GiB regions by
-`HostMem`; a descriptor crossing such a registration boundary is split only to satisfy that allocation constraint.
-This boundary handling is unrelated to page-size or DMA work-unit tuning.
+`TLLM_KV_CACHE_MANAGER_V2_PAGE_COPY_PREFER_COPY_ENGINE=1` selects the copy engines on coherent links as well. The copy
+engines need no SM, so a page copy keeps its latency when another kernel occupies every SM slot, where the copy
+kernel's CTAs have to wait for a slot; on an idle GPU the two paths perform alike at the link ceiling. The codec then
+reports `kHost` on that link, so index pairs are consumed synchronously and KVCM allocates no device index ring. The
+variable is read when the copier is constructed, has no effect on PCIe-attached GPUs, and is ignored where chunked
+host registration is in force.
 
 The concrete codec, its configuration logic, and its factory live entirely in `coldPageCodec.cpp`. The class remains
 translation-unit-private and needs neither a pImpl nor a CUDA implementation file. Custom codecs remain free to choose
