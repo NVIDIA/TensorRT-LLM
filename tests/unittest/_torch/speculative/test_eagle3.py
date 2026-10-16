@@ -618,38 +618,21 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, False, False, False],
-        [False, "FLASHINFER", True, False, False, False, False, False, False],
-        [False, "TRTLLM", False, True, True, False, False, False, False],
-        [True, "TRTLLM", False, True, True, False, False, False, False],
-        [True, "TRTLLM", True, False, True, True, False, False, False],
-        [True, "TRTLLM", True, False, True, False, False, False, False],
-        [True, "TRTLLM", True, False, False, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, True, True, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False],
-        [True, "FLASHINFER", False, False, False, False, False, False, False],
-        [False, "FLASHINFER", False, False, False, False, False, False, False],
+        [False, "TRTLLM", False, True, False, False, False, False],
+        [True, "TRTLLM", False, True, False, False, False, False],
+        [True, "TRTLLM", True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, False, False, False],
         # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, False, False, True],
+        [False, "TRTLLM", True, False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
-                      use_one_model: bool, enable_chunked_prefill: bool,
-                      multi_batch: bool, attention_dp: bool,
-                      use_hf_speculative_model: bool):
-    if not use_one_model:
-        pytest.skip("Two model Eagle3 is deprecated")
-
+                      enable_chunked_prefill: bool, multi_batch: bool,
+                      attention_dp: bool, use_hf_speculative_model: bool):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:

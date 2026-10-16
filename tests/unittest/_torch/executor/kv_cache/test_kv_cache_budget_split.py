@@ -321,7 +321,7 @@ class TestSplitGpuBudgetForDraft:
         mode = Mock()
         mode.is_external_drafter.return_value = False
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
-        # one-engine arm; this test's config is a two-model drafter.
+        # one-engine arm; this test's config is a drafter outside the engine.
         mode.use_one_engine.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
