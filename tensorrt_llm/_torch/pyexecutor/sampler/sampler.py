@@ -19,9 +19,8 @@ early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
 :class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
 sampling logic of its own beyond batching and orchestration: each feature
 (beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-draft-token verification, seeds) lives in its own module and is held here as a
-handler, driven through ``setup_sampler_step`` / ``sample_async`` /
-``update_requests``.
+seeds) lives in its own module and is held here as a handler, driven through
+``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
 """
 
 import sys
@@ -53,7 +52,6 @@ from .beam_search import (
     finalize_beam,
     prepare_beam_search,
 )
-from .draft_verification import DraftTokenVerifier
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
 from .ops.custom import fused_sample_from_logits, fused_sample_from_logits_with_probs
@@ -705,8 +703,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
 
-        self._draft_verifier = DraftTokenVerifier(self)
-
         self._async_worker_init(args.enable_async_worker)
 
         # The speculative path bypasses _copy_to_host, so it cannot coexist
@@ -1187,6 +1183,46 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return True
         return False
 
+    def _process_draft_tokens(
+        self,
+        request: LlmRequest,
+        new_tokens_list: list[list[list[int]]],
+        finish_reasons: FinishReasonsList,
+    ) -> int:
+        """Add the target's tokens up to the first rejected draft token.
+
+        Only drafter-based speculation (NGram, user-provided) attaches draft tokens
+        to requests sampled here; a draft token is accepted while it matches the
+        token the target sampled at the same position.
+
+        Returns the number of accepted draft tokens.
+        """
+        new_token = add_token(request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
+        if (
+            self.finish_if_reason(request, finish_reasons, step=0, beam_idx=DEFAULT_BEAM_IDX)
+            or get_draft_token_length(request) == 0
+        ):
+            return 0
+        force_accept = self._force_num_accepted_tokens != 0
+        draft_tokens = (
+            request.py_draft_tokens[: self._force_num_accepted_tokens]
+            if force_accept
+            else request.py_draft_tokens
+        )
+        num_accepted = 0
+        for draft_token in draft_tokens:
+            if not force_accept and draft_token != new_token:
+                break
+            num_accepted += 1
+            new_token = add_token(
+                request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=num_accepted
+            )
+            if self.finish_if_reason(
+                request, finish_reasons, step=num_accepted, beam_idx=DEFAULT_BEAM_IDX
+            ):
+                break
+        return num_accepted
+
     @classmethod
     def _collect_new_requests_for_setup(
         cls, scheduled_requests: ScheduledRequests
@@ -1501,7 +1537,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 processed = 1
                 num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
-                num_accepted = self._draft_verifier.process_draft_tokens(
+                num_accepted = self._process_draft_tokens(
                     req,
                     new_tokens_list=new_tokens_list,
                     finish_reasons=finish_reasons,

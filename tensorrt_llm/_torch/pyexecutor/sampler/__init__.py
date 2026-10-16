@@ -36,7 +36,6 @@ Layout -- imports only ever point downward; there are no cycles::
                                                        finish_reasons
                                                        seed_manager
                                                        sampler_features
-                                                       draft_verification
           │           │           │           │           │
           └───────────┴───────────┴───────────┴───────────┘
                                   │
