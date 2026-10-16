@@ -1028,6 +1028,30 @@ def _register_fake():
     def _(x, gate_up_weight, down_weight, gate_up_tiling=-1, down_tiling=-1):
         return x.new_empty((x.shape[0], down_weight.shape[0]))
 
+    @torch.library.register_fake("trtllm::glm_fused_a_gemm")
+    def _(hidden_states, weight, l2_prefetch):
+        return hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
+
+    @torch.library.register_fake("trtllm::glm_router_gemm")
+    def _(hidden_states, weight):
+        return hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]),
+                                       dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::glm_mnnvl_hop")
+    def _(input, residual, gamma, epsilon, comm_buffer, buffer_flags,
+          shard_published):
+        return [torch.empty_like(residual), torch.empty_like(residual)]
+
+    @torch.library.register_fake("trtllm::glm_mnnvl_moe_finalize_hop")
+    def _(gemm2_output, expert_weights, expanded_idx_to_permuted_idx, addend,
+          residual, gamma, epsilon, comm_buffer, buffer_flags):
+        return [torch.empty_like(residual), torch.empty_like(residual)]
+
+    @torch.library.register_fake("trtllm::glm_mnnvl_allgather")
+    def _(input, comm_buffer, buffer_flags, group_size):
+        return input.new_empty((input.shape[0], input.shape[1] * group_size),
+                               dtype=torch.float32)
+
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
     def _(input: torch.Tensor,
           use_r128c4_layout: bool = True) -> tuple[torch.Tensor, torch.Tensor]:

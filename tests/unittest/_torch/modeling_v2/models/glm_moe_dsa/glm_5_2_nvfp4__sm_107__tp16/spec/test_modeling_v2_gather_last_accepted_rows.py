@@ -13,7 +13,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
 
 pytestmark = pytest.mark.skipif(
     get_sm_version() != 107, reason="the GLM-5.2 tp16 target's ops are certified on sm_107"
@@ -36,7 +36,7 @@ def _build(spec, seed):
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     """A gather moves bytes: the op and the reference agree bit for bit."""
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     certifying(op)
