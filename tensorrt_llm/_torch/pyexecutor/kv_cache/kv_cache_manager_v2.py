@@ -599,26 +599,34 @@ def _estimate_swa_cache_size(
     context: bool,
     scratch: bool,
     generation_capacity_headroom: int = BASE_GENERATION_TOKEN_COUNT,
+    layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
 ) -> tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
     size_per_request = 0
     scratch_keys = set()
-    for layer_size, window_size in zip(layer_sizes, attention_windows):
+    for layer_idx, (layer_size, window_size) in enumerate(zip(layer_sizes, attention_windows)):
         if window_size is not None and window_size > 0:
+            layer = layer_specs[layer_idx] if layer_specs is not None else None
+            sink_blocks = math.ceil((layer.num_sink_tokens or 0) / tokens_per_block) if layer else 0
             # Match AttnLifeCycle.get_stale_range(): the live interval contains
             # window_size + generation_capacity_headroom - 1 tokens. Across all
             # page offsets, that interval touches at most the count below.
             window_blocks = (
                 math.ceil((window_size + generation_capacity_headroom - 2) / tokens_per_block) + 1
             )
-            window_tokens = window_blocks * tokens_per_block
+            window_tokens = (sink_blocks + window_blocks) * tokens_per_block
             if not context:
                 size_per_request += window_tokens * layer_size
             elif not scratch:
                 size_per_token += layer_size
             else:
-                scratch_key = (int(window_size), layer_size)
+                scratch_key = (
+                    int(window_size),
+                    layer_size,
+                    sink_blocks,
+                    layer.reuse_policy if layer else None,
+                )
                 if scratch_key in scratch_keys:
                     size_per_request += window_tokens * layer_size
                 else:
@@ -655,6 +663,7 @@ def _estimate_cache_size_components(
     *,
     scratch: bool,
     generation_capacity_headroom: int,
+    layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
 ) -> tuple[int, int, int]:
     """Return context/generation bytes per token and generation bytes per request.
 
@@ -664,7 +673,12 @@ def _estimate_cache_size_components(
     """
     full_attn_size = _estimate_full_attn_size_per_token(layer_sizes, attention_windows)
     context_swa_size, _ = _estimate_swa_cache_size(
-        layer_sizes, attention_windows, tokens_per_block, context=True, scratch=scratch
+        layer_sizes,
+        attention_windows,
+        tokens_per_block,
+        context=True,
+        scratch=scratch,
+        layer_specs=layer_specs,
     )
     generation_swa_size, generation_swa_per_request = _estimate_swa_cache_size(
         layer_sizes,
@@ -673,6 +687,7 @@ def _estimate_cache_size_components(
         context=False,
         scratch=False,
         generation_capacity_headroom=generation_capacity_headroom,
+        layer_specs=layer_specs,
     )
     return (
         full_attn_size + context_swa_size,
@@ -2729,6 +2744,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.tokens_per_block,
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            layer_specs=self.layer_specs,
         )
         size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
@@ -2765,6 +2781,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.tokens_per_block,
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            layer_specs=self.layer_specs,
         )
         context_tokens = min(max_tokens, self.max_num_tokens)
         generation_tokens = max_tokens - context_tokens
@@ -6409,6 +6426,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 and not any(spec.owner == KVCacheLayerOwner.DRAFT for spec in (layer_specs or ()))
             ),
             generation_capacity_headroom=generation_capacity_headroom,
+            layer_specs=layer_specs,
         )
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
@@ -6419,16 +6437,43 @@ class KVCacheManagerV2(BaseResourceManager):
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
             layer_sizes, attention_windows, tokens_per_block
         )
-        if is_draft and fixed_cost > 0 and bytes_per_slot is not None:
+        if is_draft and fixed_cost > 0:
+            costs = [(fixed_cost, bytes_per_slot)]
+            if layer_specs is not None:
+                # Explicit lifecycles can have different slot counts. Normalize
+                # each layer separately so pool rounding cannot hide a deficit.
+                costs = []
+                for layer, layer_size, window in zip(layer_specs, layer_sizes, attention_windows):
+                    if window is None or window <= 0:
+                        continue
+                    _, retained_bytes = _estimate_swa_cache_size(
+                        [layer_size],
+                        [window],
+                        tokens_per_block,
+                        context=False,
+                        scratch=False,
+                        generation_capacity_headroom=generation_capacity_headroom,
+                        layer_specs=[layer],
+                    )
+                    costs.append(
+                        (
+                            layer_size * max_num_tokens + retained_bytes * max_batch_size,
+                            layer_size * tokens_per_block,
+                        )
+                    )
             # Without a config, all windows are full attention, so no SWA slot exists.
             assert kv_cache_config is not None
             # The affine intercept is the configured quota needed to preserve
             # the fixed usable capacity at V2's resume watermark. Keep the
             # allocator's page rounding inside the manager estimator rather
             # than extending the generic CacheCost model with pool geometry.
-            required_slots = math.ceil(fixed_cost / bytes_per_slot)
             resume_util = float(np.float32(kv_cache_config.max_util_for_resume))
-            fixed_cost = math.ceil(required_slots / resume_util) * bytes_per_slot
+            fixed_cost = sum(
+                cost
+                if slot_bytes is None
+                else math.ceil(math.ceil(cost / slot_bytes) / resume_util) * slot_bytes
+                for cost, slot_bytes in costs
+            )
         return (
             cache_size_per_token,
             fixed_cost,
@@ -6557,7 +6602,7 @@ class KVCacheManagerV2(BaseResourceManager):
             * tokens_per_block
         )
 
-        def window_tokens(window_size: Optional[int]) -> int:
+        def window_tokens(window_size: Optional[int], sink_tokens: int) -> int:
             if window_size is None or window_size <= 0 or window_size >= max_seq_len:
                 return full_tokens
             # Match _estimate_swa_cache_size: the live interval holds
@@ -6565,15 +6610,17 @@ class KVCacheManagerV2(BaseResourceManager):
             window_blocks = (
                 math.ceil((window_size + generation_capacity_headroom - 2) / tokens_per_block) + 1
             )
-            return min(window_blocks * tokens_per_block, full_tokens)
+            sink_blocks = math.ceil(sink_tokens / tokens_per_block)
+            return min((sink_blocks + window_blocks) * tokens_per_block, full_tokens)
 
         entries = []
-        for layer_size, retained_window, covered_window in zip(
-            layer_sizes, retained_windows, covered_windows
+        for layer_idx, (layer_size, retained_window, covered_window) in enumerate(
+            zip(layer_sizes, retained_windows, covered_windows)
         ):
-            retained = window_tokens(retained_window)
+            sink_tokens = (layer_specs[layer_idx].num_sink_tokens or 0) if layer_specs else 0
+            retained = window_tokens(retained_window, sink_tokens)
             covered = (
-                window_tokens(covered_window)
+                window_tokens(covered_window, sink_tokens)
                 if covered_window is not None and 0 < covered_window < max_seq_len
                 else 0
             )
