@@ -21,6 +21,7 @@ pytest's built-in junitxml plugin for simplified test result handling.
 
 import copy
 import faulthandler
+import json
 import os
 import platform
 import signal
@@ -29,6 +30,8 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Optional, TextIO
+
+import pytest
 
 try:
     from _pytest.config import Config
@@ -41,6 +44,112 @@ except ImportError:
     TestReport = None  # type: ignore
     LogXML = None  # type: ignore
     Item = None  # type: ignore
+
+_TIMEOUT_EVIDENCE_MARKER = "TRTLLM_PYTEST_TIMEOUT "
+_TIMEOUT_ATTEMPT_MARKER = "TRTLLM_PYTEST_ATTEMPT "
+_TIMEOUT_EVIDENCE_PLUGIN_NAME = "trtllm_pytest_timeout_evidence"
+
+
+def _emit_timeout_record(marker, payload) -> None:
+    """Emit one unbuffered structured record."""
+    try:
+        record = json.dumps(payload, separators=(",", ":"))
+        os.write(2, f"{marker}{record}\n".encode("utf-8"))
+    except (OSError, TypeError, UnicodeError, ValueError):
+        # Timeout handling must proceed even if diagnostic output is unavailable.
+        pass
+
+
+def _emit_timeout_evidence(item, settings, attempt) -> None:
+    """Emit a record immediately before pytest-timeout terminates."""
+    _emit_timeout_record(
+        _TIMEOUT_EVIDENCE_MARKER,
+        {
+            "nodeid": item.nodeid,
+            "timeout": float(settings.timeout),
+            "attempt": attempt,
+        },
+    )
+
+
+def _emit_timeout_attempt(item, attempt) -> None:
+    """Invalidate evidence from an earlier in-process attempt."""
+    _emit_timeout_record(
+        _TIMEOUT_ATTEMPT_MARKER,
+        {
+            "nodeid": item.nodeid,
+            "attempt": attempt,
+        },
+    )
+
+
+class _PytestTimeoutEvidencePlugin:
+    """Preserve pytest-timeout behavior while adding exact nodeid evidence."""
+
+    def __init__(self):
+        self._attempts = {}
+
+    @pytest.hookimpl(optionalhook=True, tryfirst=True)
+    def pytest_timeout_set_timer(self, item, settings):
+        import pytest_timeout
+
+        attempt = self._attempts.get(item.nodeid, 0) + 1
+        self._attempts[item.nodeid] = attempt
+        if attempt > 1:
+            _emit_timeout_attempt(item, attempt)
+
+        timeout_method = settings.method
+        if (timeout_method == "signal"
+                and threading.current_thread() is not threading.main_thread()):
+            timeout_method = "thread"
+
+        def timeout_is_suppressed():
+            return (not settings.disable_debugger_detection
+                    and pytest_timeout.is_debugging())
+
+        if timeout_method == "signal":
+
+            def handler(signum, frame):
+                __tracebackhide__ = True
+                if timeout_is_suppressed():
+                    return
+                _emit_timeout_evidence(item, settings, attempt)
+                pytest_timeout.timeout_sigalrm(item, settings)
+
+            def cancel():
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
+
+            item.cancel_timeout = cancel
+            signal.signal(signal.SIGALRM, handler)
+            signal.setitimer(signal.ITIMER_REAL, settings.timeout)
+        elif timeout_method == "thread":
+
+            def expire():
+                if timeout_is_suppressed():
+                    return
+                _emit_timeout_evidence(item, settings, attempt)
+                pytest_timeout.timeout_timer(item, settings)
+
+            timer = threading.Timer(settings.timeout, expire)
+            timer.name = f"{pytest_timeout.__name__} {item.nodeid}"
+
+            def cancel():
+                timer.cancel()
+                timer.join()
+
+            item.cancel_timeout = cancel
+            timer.start()
+        return True
+
+
+def register_pytest_timeout_evidence(config) -> None:
+    """Register timeout evidence in controllers and xdist workers once."""
+    if not config.pluginmanager.hasplugin(_TIMEOUT_EVIDENCE_PLUGIN_NAME):
+        config.pluginmanager.register(
+            _PytestTimeoutEvidencePlugin(),
+            _TIMEOUT_EVIDENCE_PLUGIN_NAME,
+        )
 
 
 class PeriodicJUnitXML:

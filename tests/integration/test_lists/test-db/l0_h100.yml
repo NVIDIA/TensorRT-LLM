@@ -16,6 +16,8 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # Temporary CI validation: exercise pytest-timeout classification.
+  - test_fmha.py::test_fmha TIMEOUT (1)
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
