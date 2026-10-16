@@ -1421,6 +1421,12 @@ M3_START, M3_END = "<mm:think>", "</mm:think>"
 M3_ENABLED = {"enable_thinking": True}
 M3_DISABLED = {"enable_thinking": False}
 M3_ADAPTIVE = None
+# The template's own knob, when the caller passes it.
+M3_MODE_ENABLED = {"thinking_mode": "enabled"}
+M3_MODE_ADAPTIVE = {"thinking_mode": "adaptive"}
+# What the Responses path hands the parser for `reasoning.effort`: an injected
+# `thinking` the M3 template never reads, here next to a resolved mode of off.
+M3_EFFORT_INJECTED = {"enable_thinking": False, "thinking": True}
 
 
 def _m3_parser(kwargs: dict | None):
@@ -1449,6 +1455,15 @@ def _m3_parser(kwargs: dict | None):
         # Disabled: the prompt ends with `</mm:think>`; the output is content.
         (M3_DISABLED, "b", "b", ""),
         (M3_DISABLED, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The template's knob decides when present; an injected `thinking`
+        # (Responses path, `reasoning.effort`) does not open the block.
+        (M3_MODE_ENABLED, f"a{M3_END}b", "b", "a"),
+        (M3_MODE_ADAPTIVE, f"{M3_START}a{M3_END}b", "b", "a"),
+        (M3_EFFORT_INJECTED, "b", "b", ""),
+        (M3_EFFORT_INJECTED, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking": True
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
     ])
 def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
                                      content: str,
@@ -1471,8 +1486,9 @@ def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:
     return content, reasoning_content
 
 
-@pytest.mark.parametrize("kwargs", [M3_ADAPTIVE, M3_ENABLED, M3_DISABLED],
-                         ids=["adaptive", "enabled", "disabled"])
+@pytest.mark.parametrize(
+    "kwargs", [M3_ADAPTIVE, M3_ENABLED, M3_DISABLED, M3_EFFORT_INJECTED],
+    ids=["adaptive", "enabled", "disabled", "effort-injected"])
 @pytest.mark.parametrize("text", [
     f"{M3_START}a{M3_END}b",
     f"{M3_END}b",

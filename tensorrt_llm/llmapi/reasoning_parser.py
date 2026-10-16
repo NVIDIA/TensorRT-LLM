@@ -542,8 +542,9 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     tag; with thinking disabled it prefills ``</mm:think>``, so the output is
     all content; in adaptive mode (the template default) it prefills nothing
     and the model emits ``<mm:think>`` or the bare sentinel first. The parser
-    therefore resolves its mode from the rendered prompt (the server relays
-    it as ``enable_thinking``) and otherwise starts outside reasoning. Both
+    therefore takes its mode from an explicit ``thinking_mode`` or from the
+    mode the server resolved off the rendered prompt (relayed as
+    ``enable_thinking``), and otherwise starts outside reasoning. Both
     tags are delimiters and never appear in the result; text before an
     opening tag is content; an opening tag without a closing tag is
     reasoning cut off by the token limit. ``parse`` and ``parse_delta``
@@ -558,8 +559,18 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
                  *,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         kwargs = chat_template_kwargs or {}
-        prefilled_open = bool(
-            kwargs.get("thinking") or kwargs.get("enable_thinking"))
+        # The template's own knob is `thinking_mode`; only "enabled" prefills
+        # the opening tag. Without it, trust the mode the server resolved
+        # from the rendered prompt, relayed as `enable_thinking` (a caller
+        # cannot pass that key: the template never reads it, so the
+        # unused-kwargs guard rejects it). A bare `thinking` is what the
+        # Responses path injects for `reasoning.effort`; this template does
+        # not act on it, so neither does the parser.
+        thinking_mode = kwargs.get("thinking_mode")
+        if thinking_mode is not None:
+            prefilled_open = thinking_mode == "enabled"
+        else:
+            prefilled_open = kwargs.get("enable_thinking") is True
         super().__init__(reasoning_at_start=prefilled_open,
                          chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<mm:think>"
