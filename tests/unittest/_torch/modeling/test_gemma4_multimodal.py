@@ -79,6 +79,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
 )
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalEncoderItemMetadata,
     MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
@@ -948,11 +949,13 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         """Gemma4 audio features and their mask remain item-aligned."""
         audio_features = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
         audio_mask = torch.arange(12).reshape(3, 4)
+        shared_stats = torch.arange(3)
         param = MultimodalParams(
             multimodal_data={
                 "audio": {
                     "audio_features": audio_features,
                     "audio_features_mask": audio_mask,
+                    "shared_stats": shared_stats,
                 },
                 "multimodal_embedding_lengths": [1, 1, 1],
             }
@@ -963,6 +966,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         residual_audio = residual.multimodal_data["audio"]
         torch.testing.assert_close(residual_audio["audio_features"], audio_features[[2, 0]])
         torch.testing.assert_close(residual_audio["audio_features_mask"], audio_mask[[2, 0]])
+        assert residual_audio["shared_stats"] is shared_stats
 
     def test_build_multimodal_encoder_input_slices_whole_videos(self):
         """A video item is the run of flattened frames its `num_frames` entry declares."""
@@ -1089,6 +1093,24 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
         torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    @pytest.mark.cpu_only
+    def test_build_multimodal_encoder_input_uses_typed_audio_item_count(self):
+        features = torch.arange(24).reshape(3, 4, 2)
+        param = MultimodalParams(
+            multimodal_data={
+                "audio": {"audio_features": features},
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                    [("audio", 0), ("audio", 1), ("audio", 2)], [8, 8, 8], [1, 1, 1]
+                ),
+            }
+        )
+
+        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+
+        torch.testing.assert_close(
+            residual.multimodal_data["audio"]["audio_features"], features[[2, 0]]
+        )
 
     def test_encoder_cache_partial_hit_with_unsupported_item_axis_becomes_full_miss(self):
         """Unexpected Gemma4 image and audio layouts bypass partial cache reuse."""

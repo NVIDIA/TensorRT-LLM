@@ -32,6 +32,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalEncoderItemMetadata,
+                                            MultimodalFieldLayout,
                                             MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
@@ -2153,8 +2154,51 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states
 
 
+_QWEN_VISION_BATCHED_FIELD = MultimodalFieldLayout()
+
+
+def _qwen_vision_field_layout(
+    param: MultimodalParams,
+    modality: str,
+) -> dict[str, MultimodalFieldLayout] | None:
+    """Declare Qwen vision patch packing and parallel per-item grid fields."""
+    if modality not in ("image", "video"):
+        return None
+    pixel_key, grid_key = (("pixel_values",
+                            "image_grid_thw") if modality == "image" else
+                           ("pixel_values_videos", "video_grid_thw"))
+    grids = param.multimodal_data[modality][grid_key]
+    # Host grids give packing lengths directly. Device grids reuse CPU item
+    # costs to avoid a device-to-host read during selection.
+    metadata = param.item_metadata if grids.device.type != "cpu" else None
+    if metadata is not None:
+        # Physical encoder costs are patch counts, in payload-local order.
+        costs_by_item = [0] * grids.shape[0]
+        for (item_modality,
+             local_index), cost in zip(metadata.item_refs,
+                                       metadata.encoder_token_lengths,
+                                       strict=True):
+            if item_modality == modality:
+                costs_by_item[local_index] = cost
+        patch_counts = tuple(costs_by_item)
+    else:
+        patch_counts = tuple(t * h * w for t, h, w in grids.tolist())
+    return {
+        pixel_key: MultimodalFieldLayout(item_lengths=patch_counts),
+        grid_key: _QWEN_VISION_BATCHED_FIELD,
+        "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+    }
+
+
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supports_mm_encoder_item_scheduling = True
+
+    def get_multimodal_field_layout(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalFieldLayout] | None:
+        return _qwen_vision_field_layout(param, modality)
 
     def __init__(
         self,
