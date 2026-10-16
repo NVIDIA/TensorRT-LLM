@@ -4455,7 +4455,7 @@ class PyExecutor:
         self._free_request_resources(request)
         self._pause_recompute_request(request)
         # Deferred completions bypass the scheduler's paused-request lists.
-        # Carry their count to the next stats snapshot, including idle iterations.
+        # Carry their count to the next emitted stats snapshot.
         if not (getattr(self, "enable_attention_dp", False)
                 and self._is_stats_dummy_request(request)):
             self._completed_deferred_recompute_pauses = getattr(

@@ -39,7 +39,7 @@ only when all ranks line up on the same iteration.
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -570,6 +570,35 @@ def test_full_mixed_iteration():
     assert ifb.num_queued_ctx_tokens == 256 + 512 + 1024
     assert ifb.num_paused_requests == 2
     assert ifb.num_paused_kv_tokens == 400 + 900
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+def test_deferred_preemption_counts_once_in_next_batch(dummy):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor.enable_attention_dp = True
+    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager.try_complete_preemption.side_effect = [True, False]
+    executor._free_request_resources = Mock()
+    executor._pause_recompute_request = Mock()
+    request = types.SimpleNamespace(is_dummy=dummy)
+
+    assert executor._resume_preempted_request(request)
+    assert not executor._resume_preempted_request(request)
+    executor._free_request_resources.assert_called_once_with(request)
+    executor._pause_recompute_request.assert_called_once_with(request)
+
+    batch = types.SimpleNamespace(
+        context_requests=[],
+        generation_requests=[],
+        paused_requests=[types.SimpleNamespace(is_dummy=False)],
+        recompute_paused_requests=[types.SimpleNamespace(is_dummy=False)],
+    )
+    assert executor._collect_scheduled_batch_stats(batch).num_paused_requests == 2 + (not dummy)
+    assert executor._collect_scheduled_batch_stats(batch).num_paused_requests == 2
+    assert executor._take_deferred_recompute_pauses() == 0
 
 
 @pytest.mark.parametrize("has_batch_snapshot", [False, True])
