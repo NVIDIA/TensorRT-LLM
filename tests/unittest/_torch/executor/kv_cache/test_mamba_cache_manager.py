@@ -4526,6 +4526,172 @@ def test_v2_gdn_replay_uses_combined_commit_only(monkeypatch):
     assert torch.equal(captured["is_dummy"], torch.tensor([True, False]))
 
 
+def _v2_gdn_mtp_replay_stub() -> MambaHybridCacheManagerV2:
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 1
+    mgr._use_kda_replay_update = False
+    mgr._use_gdn_mtp_replay = True
+    mgr._request_id_to_state_index = {}
+    mgr._request_id_to_is_dummy = {}
+    mgr.kv_cache_map = {}
+    mgr.ssm_layer_group_id = 0
+    mgr._host_state_indices = torch.zeros(4, dtype=torch.int32)
+    mgr.cuda_state_indices = torch.zeros(4, dtype=torch.int32)
+    mgr._dummy_request_mask = None
+    mgr.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
+    mgr.old_x, mgr.old_B, mgr.old_dt = [torch.zeros(1, 4, 2, 4) for _ in range(3)]
+    mgr.all_conv_states = [torch.zeros(4, 6, 3)]
+    mgr.flushed_lengths = []
+
+    def flush(slot: int) -> None:
+        mgr.flushed_lengths.append(int(mgr.prev_num_accepted_tokens[slot]))
+        mgr.prev_num_accepted_tokens[slot] = 0
+
+    mgr._flush_gdn_mtp_replay = MagicMock(side_effect=flush)
+    return mgr
+
+
+@pytest.mark.parametrize("resume_slot", [0, 2], ids=["same_slot", "different_slot"])
+def test_v2_gdn_replay_suspend_resume_starts_with_empty_history(resume_slot: int) -> None:
+    mgr = _v2_gdn_mtp_replay_stub()
+    request = SimpleNamespace(py_request_id=1, is_dummy=False)
+    other = SimpleNamespace(py_request_id=2, is_dummy=False)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    mgr._setup_state_indices([request])
+    mgr.prev_num_accepted_tokens[0] = 7
+    mgr.suspend_request(request)
+    assert mgr.flushed_lengths == [7]
+    assert 1 not in mgr._request_id_to_state_index
+    assert not mgr.kv_cache_map[1].is_active
+    mgr.suspend_request(request)
+    mgr._flush_gdn_mtp_replay.assert_called_once_with(0)
+
+    mgr.kv_cache_map[2] = _SlotCache(0)
+    mgr._setup_state_indices([other])
+    mgr.prev_num_accepted_tokens[0] = 3
+    for history in (mgr.old_x, mgr.old_B, mgr.old_dt):
+        history[:, 0] = 9
+    if resume_slot == 0:
+        del mgr.kv_cache_map[2]
+        del mgr._request_id_to_state_index[2]
+    restored_conv = torch.arange(18.0).view(6, 3)
+    mgr.all_conv_states[0][resume_slot] = restored_conv
+    mgr.kv_cache_map[1].slot = resume_slot
+    mgr.kv_cache_map[1].is_active = True
+    mgr._setup_state_indices([request] if resume_slot == 0 else [request, other])
+    assert mgr.prev_num_accepted_tokens[resume_slot] == 0
+    torch.testing.assert_close(mgr.all_conv_states[0][resume_slot], restored_conv, rtol=0, atol=0)
+    if resume_slot != 0:
+        assert mgr.prev_num_accepted_tokens[0] == 3
+        for history in (mgr.old_x, mgr.old_B, mgr.old_dt):
+            assert (history[:, 0] == 9).all()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("indirect", [False, True], ids=["affine", "indirect"])
+@pytest.mark.parametrize("resume_slot", [1, 2], ids=["same_slot", "different_slot"])
+def test_v2_gdn_replay_flush_precedes_slot_release(indirect: bool, resume_slot: int) -> None:
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not IS_CUTLASS_DSL_AVAILABLE or not is_sm_100f():
+        pytest.skip("GDN replay requires datacenter Blackwell and CUTLASS DSL")
+    torch.manual_seed(23)
+    mgr = _v2_gdn_mtp_replay_stub()
+    del mgr._flush_gdn_mtp_replay
+    layers, slots, heads, value_heads, dim, window = 2, 4, 2, 4, 128, 16
+    capacity = window + 4
+    if indirect:
+        mgr.all_ssm_states = [
+            torch.randn(slots, value_heads + layer + 1, dim, dim, device="cuda").bfloat16()[
+                :, :value_heads
+            ]
+            for layer in range(layers)
+        ]
+        mgr._gdn_mtp_replay_state_view = None
+        mgr._gdn_mtp_replay_state_descriptors = torch.tensor(
+            [(state.data_ptr(), state.stride(0)) for state in mgr.all_ssm_states],
+            device="cuda",
+            dtype=torch.int64,
+        )
+    else:
+        state_storage = torch.randn(slots, layers, value_heads, dim, dim, device="cuda").bfloat16()
+        mgr.all_ssm_states = [state_storage[:, layer] for layer in range(layers)]
+        mgr._gdn_mtp_replay_state_view = state_storage
+        mgr._gdn_mtp_replay_state_descriptors = None
+    mgr.all_conv_states = [
+        torch.randn(slots, 8, 3, device="cuda").bfloat16() for _ in range(layers)
+    ]
+    mgr.old_x = (
+        torch.randn(layers, slots, capacity, value_heads, dim, device="cuda") * 0.03
+    ).bfloat16()
+    mgr.old_B = (torch.randn(layers, slots, capacity, heads, dim, device="cuda") * 0.09).bfloat16()
+    mgr.old_dt = torch.cumsum(
+        -torch.rand(layers, slots, value_heads, capacity, device="cuda") * 0.1, dim=-1
+    )
+    mgr.prev_num_accepted_tokens = torch.zeros(slots, device="cuda", dtype=torch.int32)
+    mgr.cuda_state_indices = torch.zeros(slots, device="cuda", dtype=torch.int32)
+    mgr.replay_history_size = window
+    mgr._stream = torch.cuda.Stream()
+    mgr.local_num_mamba_layers = layers
+    request = SimpleNamespace(py_request_id=1, is_dummy=False)
+    cache = _SlotCache(1)
+    mgr.kv_cache_map[1] = cache
+    mgr._setup_state_indices([request])
+    mgr.prev_num_accepted_tokens[1] = 7
+    state_before = torch.stack([state[1].clone() for state in mgr.all_ssm_states]).float()
+    conv_before = [conv[1].clone() for conv in mgr.all_conv_states]
+    end_G = mgr.old_dt[:, 1, :, 6]
+    key_heads = torch.arange(value_heads, device="cuda") // (value_heads // heads)
+    update = torch.einsum(
+        "ltiv,ltik,lit->livk",
+        mgr.old_x[:, 1, :7].float(),
+        mgr.old_B[:, 1, :7][:, :, key_heads].float(),
+        torch.exp(end_G[:, :, None] - mgr.old_dt[:, 1, :, :7]),
+    )
+    expected = (state_before * torch.exp(end_G)[:, :, None, None] + update).bfloat16()
+    saved_states, saved_conv = [], []
+
+    def suspend() -> None:
+        saved_states.extend(state[1].clone() for state in mgr.all_ssm_states)
+        saved_conv.extend(conv[1].clone() for conv in mgr.all_conv_states)
+        cache.is_active = False
+
+    cache.suspend = suspend
+    mgr.suspend_request(request)
+    assert not cache.is_active and 1 not in mgr._request_id_to_state_index
+    assert mgr.prev_num_accepted_tokens[1] == 0
+    for actual, reference in zip(saved_states, expected):
+        torch.testing.assert_close(actual, reference, rtol=1e-2, atol=8e-3)
+    for actual, reference in zip(saved_conv, conv_before):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for layer, (state, conv) in enumerate(zip(mgr.all_ssm_states, mgr.all_conv_states)):
+        state[1].fill_(torch.nan)
+        conv[1].fill_(torch.nan)
+        state[resume_slot].copy_(saved_states[layer])
+        conv[resume_slot].copy_(saved_conv[layer])
+    for history in (mgr.old_x, mgr.old_B, mgr.old_dt):
+        history[:, 1].fill_(torch.nan)
+    mgr.prev_num_accepted_tokens.fill_(window)
+    cache.slot, cache.is_active = resume_slot, True
+    mgr._setup_state_indices([request])
+    assert mgr.prev_num_accepted_tokens[resume_slot] == 0
+    for actual, reference in zip(mgr.all_conv_states, conv_before):
+        torch.testing.assert_close(actual[resume_slot], reference, rtol=0, atol=0)
+
+
+def test_v2_gdn_replay_flush_failure_does_not_release_the_slot() -> None:
+    mgr = _v2_gdn_mtp_replay_stub()
+    request = SimpleNamespace(py_request_id=1, is_dummy=False)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    mgr._setup_state_indices([request])
+    mgr._flush_gdn_mtp_replay.side_effect = RuntimeError("flush failed")
+    with pytest.raises(RuntimeError, match="flush failed"):
+        mgr.suspend_request(request)
+    assert mgr.kv_cache_map[1].is_active
+    assert mgr._request_id_to_state_index[1] == 0
+
+
 def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.local_num_mamba_layers = 1
