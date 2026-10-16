@@ -80,6 +80,18 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 
+# Serving input aliases are shared by runtime construction and editor schemas.
+SERVE_CONFIG_ALIASES = {"hf_revision": "revision"}
+SERVE_CLI_CONFIG_FIELDS = {
+    "kv_cache_config": {
+        "free_gpu_memory_fraction": "free_gpu_memory_fraction",
+        "kv_cache_dtype": "dtype",
+    },
+    "multimodal_config": {
+        "video_pruning_rate": "video_pruning_rate"
+    },
+}
+
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
     # backend while llm_args is defining its public configuration models.
@@ -657,8 +669,10 @@ def validate_token_encoder_bucket_config(
 # For CudaGraphConfig's backward compatibility
 CudaGraphConfig = DecodeCudaGraphConfig
 
+CudaGraphConfigInput: TypeAlias = Union[DecodeCudaGraphConfig,
+                                        EncodeCudaGraphConfig]
 CudaGraphConfigType: TypeAlias = Annotated[
-    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+    CudaGraphConfigInput,
     Field(discriminator="mode"),
 ]
 
@@ -1335,6 +1349,15 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
         "self-sampling engine derives its bracket from the current row and "
         "does not use emission.")
+    gvr_deterministic_topk: bool = Field(
+        default=False,
+        description=
+        "Make the self-sampling GVR Top-K deterministic: the selected index "
+        "set is {score > tau} plus the smallest indices among the ties at tau, "
+        "and the output order is a fixed function of the input (decode and "
+        "prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect "
+        "with enable_heuristic_topk=True and use_self_sampling_topk=True; "
+        "ignored otherwise.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1478,6 +1501,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1512,6 +1536,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1623,6 +1648,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1651,6 +1677,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -3299,6 +3326,113 @@ class PARDDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.PARD
 
 
+# Backbone fields a speculators drafter nests under transformer_layer_config.
+# The rest of that dict (flex_attention_backend, use_cache, ...) is training
+# configuration.
+_SPECULATORS_BACKBONE_KEYS = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "hidden_act",
+    "rms_norm_eps",
+    "max_position_embeddings",
+    "vocab_size",
+    "attention_bias",
+    "attention_dropout",
+    "bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+    "initializer_range",
+    "rope_parameters",
+)
+_SPECULATORS_DSPARK_HEAD_KEYS = (
+    "markov_rank",
+    "markov_head_type",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+    "draft_vocab_size",
+)
+
+
+def is_speculators_dspark_config(config_dict: dict) -> bool:
+    """Whether a drafter ``config.json`` is a speculators-format DSpark drafter.
+
+    The vLLM speculators format (e.g. RedHatAI/Kimi-K3-speculator.dspark) has
+    no top-level ``model_type``: it names the algorithm in
+    ``speculators_model_type`` and nests the backbone under
+    ``transformer_layer_config``.
+    """
+    return (config_dict.get("speculators_model_type") == "dspark"
+            and isinstance(config_dict.get("transformer_layer_config"), dict))
+
+
+def translate_speculators_dspark_config(config_dict: dict) -> dict:
+    """Translate a speculators-format DSpark ``config.json`` for TRT-LLM.
+
+    The result is the config TRT-LLM's GQA DSpark drafter reads. Any other
+    config is returned unchanged.
+
+    - The qwen3 backbone is flattened from ``transformer_layer_config``.
+    - ``aux_hidden_state_layer_ids`` name the layer whose input is captured;
+      ``target_layer_ids`` name the 0-indexed layer whose output is, so each id
+      is one less.
+    - The sliding window is dropped, because the drafter attention backends
+      reject non-causal windows. That is exact while the context fits in the
+      trained window (2048 tokens for the Kimi K3 drafter).
+    - The checkpoint's ``block_size`` is not carried over: the runtime block
+      follows ``max_draft_len``.
+
+    The weights need no renaming. Every config.json reader of the drafter
+    (model config, spec config resolution, the context-buffer budget) goes
+    through this function, so they all see the same drafter.
+    """
+    if not is_speculators_dspark_config(config_dict):
+        return config_dict
+    layer = config_dict["transformer_layer_config"]
+    if layer.get("model_type") != "qwen3":
+        raise ValueError(
+            "speculators DSpark drafters are supported with a qwen3 backbone; "
+            f"this one has model_type {layer.get('model_type')!r}")
+    aux_layer_ids = config_dict.get("aux_hidden_state_layer_ids")
+    if not aux_layer_ids or min(aux_layer_ids) < 1:
+        raise ValueError(
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "(layer 0's input is the embedding output, which is not captured); "
+            f"got {aux_layer_ids}")
+    num_layers = layer["num_hidden_layers"]
+    dflash_config = {
+        "target_layer_ids": [int(layer_id) - 1 for layer_id in aux_layer_ids]
+    }
+    if config_dict.get("mask_token_id") is not None:
+        dflash_config["mask_token_id"] = config_dict["mask_token_id"]
+    translated = {
+        key: layer[key]
+        for key in _SPECULATORS_BACKBONE_KEYS if key in layer
+    }
+    translated.update(
+        architectures=["Qwen3ForCausalLM"],
+        model_type="qwen3",
+        tie_word_embeddings=bool(config_dict.get("tie_word_embeddings", False)),
+        torch_dtype=(config_dict.get("dtype") or config_dict.get("torch_dtype")
+                     or "bfloat16"),
+        use_sliding_window=False,
+        sliding_window=None,
+        max_window_layers=num_layers,
+        layer_types=["full_attention"] * num_layers,
+        dflash_config=dflash_config,
+    )
+    rope_theta = (layer.get("rope_parameters") or {}).get("rope_theta")
+    if rope_theta is not None:
+        translated["rope_theta"] = rope_theta
+    for key in _SPECULATORS_DSPARK_HEAD_KEYS:
+        if config_dict.get(key) is not None:
+            translated[key] = config_dict[key]
+    return translated
+
+
 class DFlashDecodingConfig(DecodingBaseConfig):
     """Configuration for DFlash speculative decoding.
 
@@ -3387,7 +3521,8 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         if not os.path.exists(draft_config_path):
             return
         with open(draft_config_path) as f:
-            dflash_cfg = json.load(f).get("dflash_config", {})
+            dflash_cfg = translate_speculators_dspark_config(json.load(f)).get(
+                "dflash_config", {})
 
         if self.target_layer_ids is None:
             layer_ids = dflash_cfg.get("target_layer_ids")
@@ -3456,14 +3591,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     layers as cross-attention context and drafts a whole block in a single
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
-    head) and predicts an acceptance-confidence per position to truncate the
-    proposed prefix.
+    head). A confidence head can score each draft position for verification
+    scheduling without truncating the proposed block. This configuration selects
+    native full-block drafting and does not expose confidence-scheduling or
+    calibration controls.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
     - Semi-parallel: one block backbone forward + cheap sequential head refine.
-    - Confidence head: truncates the proposed draft length (NOT the accept rule;
-      acceptance stays standard target verification, preserving greedy parity).
+    - Full-block proposals: confidence scoring does not change the draft tokens
+      or the standard target-verification acceptance rule.
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
@@ -3498,14 +3635,6 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "Type of the sequential refinement head used within a block. If None, "
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
-
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
@@ -3785,6 +3914,22 @@ class ExecutorMemoryType(StrEnum):
     MODEL_ENGINE_DRAFT = "draft_model"
     MODEL_WEIGHTS_MAIN = "model_weights"
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
+
+
+class RuntimeMemoryStatus(StrictBaseModel):
+    """Status of runtime memory managed by sleep and wakeup."""
+
+    state: Literal["running", "parking", "parked", "waking", "failed"] = Field(
+        description="Current runtime-memory admission state.")
+    parked_tags: list[ExecutorMemoryType] = Field(
+        default_factory=list,
+        description=
+        "Memory tags that remain released, sorted lexicographically by value.")
+
+    @field_validator("parked_tags")
+    @classmethod
+    def sort_parked_tags(cls, parked_tags):
+        return sorted(parked_tags, key=lambda tag: tag.value)
 
 
 @dataclass
@@ -4573,6 +4718,67 @@ class BlockReuseConfig(StrictBaseModel):
         return self
 
 
+class KvPoolRebalanceConfig(StrictBaseModel):
+    """Tuning for the KV cache manager v2 pool rebalance auto-tuner.
+
+    Only used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.
+    """
+
+    min_sampled_kv_caches: int = Field(
+        default=2000,
+        ge=0,
+        status="prototype",
+        description=
+        "Minimum number of sampled (closed) KvCaches observed before the auto-tuner "
+        "will consider making an adjustment.")
+
+    cooldown_secs: float = Field(
+        default=120.0,
+        ge=0,
+        allow_inf_nan=False,
+        status="prototype",
+        description=
+        "Minimum time, in seconds, between successive rebalance adjustments.")
+
+    target_ratio_update_interval: int = Field(
+        default=100,
+        gt=0,
+        status="prototype",
+        description=
+        "Number of newly sampled KvCaches between recomputations of the target "
+        "pool-group ratios.")
+
+    ratio_tolerance: float = Field(
+        default=0.25,
+        gt=0,
+        allow_inf_nan=False,
+        status="prototype",
+        description=
+        "How far a pool group's current ratio may drift from its target before a "
+        "rebalance is triggered, as a fraction of the smaller of the two. The "
+        "comparison is symmetric, so 0.25 means a rebalance is triggered once one of "
+        "the two exceeds the other by more than 25%.")
+
+    moving_average_decay: float = Field(
+        default=0.9999,
+        gt=0,
+        lt=1,
+        allow_inf_nan=False,
+        status="prototype",
+        description=
+        "Decay factor for the exponential moving averages (reused length, capacity, "
+        "history length) used to compute target pool ratios. Higher values react more "
+        "slowly to change.")
+
+    check_interval: int = Field(
+        default=10,
+        gt=0,
+        status="prototype",
+        description=
+        "Number of PyExecutor iterations between checks of whether a pool rebalance "
+        "should be attempted.")
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4731,10 +4937,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="Configuration for reusable Mamba state snapshots.")
 
     use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
-        default="auto",
+        default=True,
         status="prototype",
         description=
-        "Whether to use the KV cache manager v2 (experimental). 'auto' uses "
+        "Whether to use the KV cache manager v2 (experimental). Defaults to "
+        "True. Set False to select V1 for models that support it. 'auto' uses "
         "the model-specific preference and falls back to False when the model "
         "does not declare one.")
 
@@ -4771,11 +4978,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for "
         "rebalancing pool-group ratios between iterations. When True the "
         "PyExecutor calls ``adjust()`` opportunistically; the auto-tuner "
-        "itself remains gated by V2's internal 2000-sample / 120s cooldown. "
-        "When False (default) the rebalance hook is skipped entirely and "
-        "pool ratios remain at their warmup-derived values. Beta: enable at "
-        "your own risk. Only used when using KV cache manager v2 "
-        "(experimental). This option is incompatible with dtype='fp8_ds_mla'.")
+        "itself remains gated by the ``kv_pool_rebalance_config`` thresholds "
+        "(2000 samples / 120s by default). When False (default) the rebalance "
+        "hook is skipped entirely and pool ratios remain at their "
+        "warmup-derived values. Beta: enable at your own risk. Only used when "
+        "using KV cache manager v2 (experimental). This option is incompatible "
+        "with dtype='fp8_ds_mla'.")
+
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = Field(
+        default_factory=KvPoolRebalanceConfig,
+        status="prototype",
+        description=
+        "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when "
+        "``enable_kv_pool_rebalance`` is True.")
 
     disk_prefetch_num_reqs: int = Field(
         default=0,
@@ -5063,17 +5278,19 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             "The communication backend type to use for the cache transceiver.")
 
     transceiver_runtime: Optional[Literal["CPP", "PYTHON", "auto"]] = Field(
-        default="auto",
+        default="PYTHON",
         description=
-        "The runtime implementation. 'auto' (default) adopts the model's "
-        "preferred runtime when it declares one; otherwise it selects the "
-        "Python transceiver, falling back to the C++ transceiver only when "
-        "this config itself rules it out (non-NIXL backend or a null "
-        "kv_transfer_timeout_ms) — any other incompatibility fails at "
+        "The runtime implementation. 'PYTHON' (default) selects the Python "
+        "transceiver, while 'CPP' selects the C++ transceiver and requires "
+        "kv_cache_config.use_kv_cache_manager_v2=False with a model that "
+        "supports V1. 'auto' adopts "
+        "the model's preferred runtime when it declares one; otherwise it "
+        "selects the Python transceiver, falling back to the C++ transceiver "
+        "only when this config itself rules it out (non-NIXL backend or a "
+        "null kv_transfer_timeout_ms) — any other incompatibility fails at "
         "transceiver creation. The fallback is decided independently on "
         "each server and is only logged, not surfaced, so keep context and "
-        "generation server configurations consistent. 'CPP' selects the C++ "
-        "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
+        "generation server configurations consistent. None is equivalent "
         "to 'CPP'. 'auto' is resolved on the PyTorch backend's standard "
         "model-loading path.")
 
@@ -5295,6 +5512,12 @@ class DwdpConfig(StrictBaseModel):
 class BaseLlmArgs(StrictBaseModel):
     """Base class for the LLM arguments. It contains all the common arguments."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    # Internal serving policy, carried with the pickled args to every worker.
+    # Deliberately absent from the public LLM configuration/telemetry schema.
+    _enable_routing_load: bool = PrivateAttr(default=False)
+    _openengine_discovery: dict[str, str | int] | None = PrivateAttr(
+        default=None)
 
     # Explicit arguments
     model: Union[str, Path] = Field(
@@ -5643,7 +5866,9 @@ class BaseLlmArgs(StrictBaseModel):
         description="Telemetry configuration (opt-out, usage context).",
         status="prototype")
 
-    @field_validator('env_overrides', mode='before')
+    @field_validator('env_overrides',
+                     mode='before',
+                     json_schema_input_type=Optional[Dict[str, Any]])
     @classmethod
     def coerce_env_overrides_to_str(cls, v):
         """Coerce env_overrides values to strings for os.environ compatibility."""
@@ -5972,6 +6197,15 @@ class TorchCompileConfig(StrictBaseModel):
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
+    compile_only_piecewise_graphs: bool = Field(
+        default=False,
+        description="Compile only forwards eligible for piecewise prefill "
+        "CUDA graphs, while generation-only forwards, prefill graph misses, "
+        "and auxiliary kernel warmup forwards remain eager. Enabling this "
+        "will speed up startup, but might lead to degraded performance or "
+        "inconsistent output in specific configurations.",
+        status="prototype")
+
     enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
 
@@ -6084,7 +6318,9 @@ class TorchLlmArgs(BaseLlmArgs):
             "`encoder_cuda_graph_config` produce usable graph shapes."),
         status="prototype")
 
-    @field_validator('cuda_graph_config', mode='before')
+    @field_validator('cuda_graph_config',
+                     mode='before',
+                     json_schema_input_type=Optional[CudaGraphConfigInput])
     @classmethod
     def infer_cuda_graph_config_mode(cls, v):
         if isinstance(v, dict) and "mode" not in v:
@@ -6101,7 +6337,9 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Multimodal model configuration.",
         status="prototype")
 
-    @field_validator('multimodal_config', mode='before')
+    @field_validator('multimodal_config',
+                     mode='before',
+                     json_schema_input_type=Optional[MultimodalConfig])
     @classmethod
     def init_multimodal_config(cls, v):
         # The field is non-Optional, but callers (e.g. the multimodal
@@ -6638,6 +6876,17 @@ class TorchLlmArgs(BaseLlmArgs):
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
 
+    modeling_v2: Literal["off", "auto", "require"] = Field(
+        default="off",
+        status="prototype",
+        description=
+        "Whether to build the model from a modeling_v2 target (experimental) "
+        "instead of the built-in implementation. 'off' never does. 'auto' "
+        "uses a target when one claims this deployment and falls back to the "
+        "built-in implementation otherwise. 'require' raises instead of "
+        "falling back.",
+        json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
+
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
         default="pytorch",
@@ -6757,6 +7006,13 @@ class TorchLlmArgs(BaseLlmArgs):
             if not buckets_are_explicit and legacy_buckets is not None:
                 self.prefill_capture_num_tokens = list(legacy_buckets)
 
+        if (compile_config is not None
+                and compile_config.compile_only_piecewise_graphs):
+            if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.PIECEWISE:
+                raise ValueError(
+                    "torch_compile_config.compile_only_piecewise_graphs requires "
+                    "prefill_cuda_graph_backend='piecewise'")
+
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
             if self.prefill_capture_num_tokens is None:
                 self.prefill_capture_num_tokens = list(
@@ -6862,7 +7118,8 @@ class TorchLlmArgs(BaseLlmArgs):
                                              "config.json")
             if os.path.exists(draft_config_path):
                 with open(draft_config_path) as f:
-                    draft_config = json.load(f)
+                    draft_config = translate_speculators_dspark_config(
+                        json.load(f))
 
         arena_before_pool = self._kv_cache_estimation_runs()
         if spec_cfg.skip_ctx_buffer_budget_check:
@@ -7121,7 +7378,8 @@ class TorchLlmArgs(BaseLlmArgs):
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
-                        draft_cfg = json.load(f)
+                        draft_cfg = translate_speculators_dspark_config(
+                            json.load(f))
                     text_cfg = draft_cfg.get("text_config") or {}
 
                     def _dspark_get(
@@ -7506,6 +7764,16 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
 
+def build_cli_config(config_name: str, **values: Any) -> BaseModel:
+    """Construct a nested LLM config from its flat serving CLI options."""
+    config_type = TorchLlmArgs.model_fields[config_name].annotation
+    fields = SERVE_CLI_CONFIG_FIELDS[config_name]
+    return config_type(**{
+        fields[name]: value
+        for name, value in values.items()
+    })
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
@@ -7526,15 +7794,14 @@ def update_llm_args_with_extra_dict(
     # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
     # name to `explicit_cli_keys` to make it win over YAML's same-named
     # field inside `kv_cache_config:`.
-    cli_to_kv_cache_field = {
-        "free_gpu_memory_fraction": "free_gpu_memory_fraction",
-        "kv_cache_dtype": "dtype",
+    cli_to_kv_cache_field = SERVE_CLI_CONFIG_FIELDS["kv_cache_config"] | {
         "enable_block_reuse": "enable_block_reuse",
     }
     explicit_cli_keys = explicit_cli_keys or set()
 
-    if 'hf_revision' in llm_args_dict:
-        llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
+    for alias, name in SERVE_CONFIG_ALIASES.items():
+        if alias in llm_args_dict:
+            llm_args_dict.setdefault(name, llm_args_dict.pop(alias))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
@@ -7582,9 +7849,10 @@ def update_llm_args_with_extra_dict(
             if not isinstance(base_mm, dict):
                 base_mm = {}
             merged = dict(base_mm) | dict(yaml_mm)
-            if ("video_pruning_rate" in explicit_cli_keys
-                    and "video_pruning_rate" in base_mm):
-                merged["video_pruning_rate"] = base_mm["video_pruning_rate"]
+            for cli_name, field in SERVE_CLI_CONFIG_FIELDS[
+                    "multimodal_config"].items():
+                if cli_name in explicit_cli_keys and field in base_mm:
+                    merged[field] = base_mm[field]
             llm_args_dict['multimodal_config'] = merged
 
     # Drop YAML keys claimed by explicit CLI flags so the outer merge below

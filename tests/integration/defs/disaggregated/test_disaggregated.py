@@ -84,6 +84,21 @@ def get_ucx_tls():
     return "^ib,gdr_copy"
 
 
+def apply_pre_hopper_nccl_workaround(env: dict) -> None:
+    """Keep NCCL off PCIe peer-to-peer on pre-Hopper CI nodes.
+
+    The 8xL40S CI nodes run with the AMD IOMMU in DMA translation mode, so
+    PCIe P2P writes across the host bridge fault (``AMD-Vi IO_PAGE_FAULT``)
+    and never land. NCCL still picks its P2P/CUMEM transport there, and the
+    first PP send/recv or TP collective in the warmup forward hangs the
+    worker before it can register with the disagg server
+    (https://nvbugs/6728119). Restricting P2P to PCIe-switch peers makes NCCL
+    fall back to SHM on those nodes; NVLink platforms are unaffected.
+    """
+    if get_sm_version() < 90:
+        env.setdefault("NCCL_P2P_LEVEL", "PXB")
+
+
 def cleanup_output_files():
     """Clean up output files from previous runs."""
     for file in ['output.json', 'output_streaming.json']:
@@ -349,8 +364,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml",
         "ctxpp4_gentp4":
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
-        "deepseek_v3_lite_fp8_mpi":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
         "deepseek_v3_lite_fp8_tp1":
@@ -1061,6 +1074,7 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
@@ -1823,28 +1837,6 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip(
-    reason="MPI cache transceiver requires shared MPI process group, "
-    "incompatible with service discovery which launches separate subprocesses")
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_mpi",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 
 

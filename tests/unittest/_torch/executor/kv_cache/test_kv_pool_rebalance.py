@@ -34,7 +34,7 @@ isolation -- it is spread across three points inside
 ``test_py_executor.py`` does for the PP scheduling path.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -173,6 +173,39 @@ def _make_request(req_id: int) -> MagicMock:
     req = MagicMock()
     req.py_request_id = req_id
     return req
+
+
+# --------------------------------------------------------------------------- #
+# Constructor validation
+# --------------------------------------------------------------------------- #
+
+
+class TestKvPoolRebalanceCheckIntervalValidation:
+    """``kv_pool_rebalance_check_interval`` must be validated before it can
+
+    reach the ``iter_counter % self._rebalance_check_interval`` modulo in
+    ``_can_pause_for_rebalance``, where a non-positive value would raise
+    ``ZeroDivisionError`` (or silently mis-throttle, for a negative value)
+    deep inside the executor loop instead of failing fast at construction.
+
+    The check is the first statement in ``PyExecutor.__init__`` -- before any
+    CUDA or dependency access -- specifically so it can be exercised here as
+    an unbound call with placeholder positional args that are never touched.
+    """
+
+    @pytest.mark.parametrize("bad_interval", [0, -1])
+    def test_non_positive_interval_raises_before_construction(self, bad_interval):
+        with pytest.raises(ValueError, match="kv_pool_rebalance_check_interval"):
+            PyExecutor.__init__(
+                MagicMock(spec=PyExecutor),
+                resource_manager=None,
+                scheduler=None,
+                model_engine=None,
+                sampler=None,
+                dist=None,
+                max_num_sequences=1,
+                kv_pool_rebalance_check_interval=bad_interval,
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -936,6 +969,9 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # Per-iteration no-ops.
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
+    # No tentative attention-DP dummy is pending, so a skipped microbatch's
+    # rollback (_finalize_adp_dummy_allocation(False)) is a no-op.
+    exe._pending_adp_dummy_request = None
     exe._revert_gen_alloc = MagicMock()
     exe._add_inflight_ids = MagicMock()
     exe._handle_dynamic_draft_len = MagicMock()
@@ -1058,6 +1094,20 @@ class TestPpLoopDrainWiring:
         # And the rebalance ran exactly once, at the end of the drain.
         exe._rebalance_kv_pools_now.assert_called_once()
         assert exe._pp_rebalance_drain_iters is None
+
+    def test_skipped_microbatch_rolls_back_pending_adp_dummy(self, monkeypatch):
+        """Every microbatch the drain skips rolls back its tentative ADP dummy.
+
+        Otherwise a dummy allocated for a skipped microbatch keeps its KV
+        cache allocation.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(True, False))
+        exe._finalize_adp_dummy_allocation = MagicMock()
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        assert exe._finalize_adp_dummy_allocation.call_args_list == [call(False), call(False)]
 
     def test_drain_length_follows_the_ring_depth(self, monkeypatch):
         """A deeper ring drains for longer before rebalancing.

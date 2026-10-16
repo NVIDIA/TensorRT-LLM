@@ -37,7 +37,7 @@ def _keeps_p_smem_block_offset_bytes(
     cfg: Constexpr[FmhaDecodeConfig], row_idx: Int32, col_idx: Int32
 ) -> Int32:
     """JIT form of the Keeps P SWIZZLE_128B vector-block address."""
-    dtype_bytes = cfg.q_dtype_bytes
+    dtype_bytes = cfg.v_dtype_bytes
     chunk_cols = 128 // dtype_bytes
     chunk_idx = col_idx // Int32(chunk_cols)
     col_in_chunk = col_idx - chunk_idx * Int32(chunk_cols)

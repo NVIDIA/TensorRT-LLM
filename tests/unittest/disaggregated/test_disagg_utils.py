@@ -286,7 +286,7 @@ def test_ctx_gen_server_address_round_trip(server_type, address, hostname):
 def test_ctx_gen_server_address_formats_existing_ipv6_config():
     configs = [
         CtxGenServerConfig(type="ctx", hostname="::1", port=8000),
-        CtxGenServerConfig(type="gen", hostname="[::1]", port=8001),
+        CtxGenServerConfig(type="gen", hostname="::1", port=8001),
     ]
 
     assert get_ctx_gen_server_addrs(configs) == (["[::1]:8000"], ["[::1]:8001"])
@@ -304,8 +304,10 @@ def test_ctx_gen_server_address_formats_existing_ipv6_config():
     "worker:8000:extra",
 ])
 def test_ctx_gen_server_address_rejects_invalid_input(address):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         extract_ctx_gen_cfgs(type="ctx", urls=[address])
+    assert repr(address) in str(exc_info.value)
+    assert "expected host:port or [addr]:port" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
