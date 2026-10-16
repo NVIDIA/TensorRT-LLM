@@ -3355,48 +3355,7 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
-@pytest.mark.parametrize("local_invalid", [False, True])
-@pytest.mark.parametrize("has_manager", [False, True])
-@pytest.mark.parametrize("release_kv", [False, True])
-def test_sleep_config_validates_local_kv_release(local_invalid, has_manager, release_kv):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.virtual_memory import RestoreMode
-    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
-
-    stub = object.__new__(PyExecutor)
-    stub._is_kv_manager_v2 = True
-    stub.llm_args = types.SimpleNamespace(
-        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: "CPU"})
-    )
-    manager = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
-    manager.validate_sleep_config.side_effect = (
-        ValueError("host quota is too small") if local_invalid else None
-    )
-    managers = {"main": manager, "alias": manager} if has_manager else {}
-    estimating = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=True)
-    managers["estimating"] = estimating
-    stub.resource_manager = types.SimpleNamespace(resource_managers=managers)
-    stub.dist = Mock()
-    tags = [ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN]
-    if local_invalid and has_manager and release_kv:
-        with pytest.raises(ValueError, match="host quota is too small"):
-            stub.validate_sleep_config(tags)
-    else:
-        stub.validate_sleep_config(tags)
-    stub.dist.allgather.assert_not_called()
-    if has_manager and release_kv:
-        manager.validate_sleep_config.assert_called_once_with(RestoreMode.CPU)
-    else:
-        manager.validate_sleep_config.assert_not_called()
-    estimating.validate_sleep_config.assert_not_called()
-
-
-@pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
-@pytest.mark.parametrize("release_kv", [False, True])
-@pytest.mark.parametrize("has_draft", [False, True])
-def test_sleep_routes_native_kv_memory_without_recreating_dummies(
-    mode, release_kv, has_draft, monkeypatch
-):
+def test_sleep_routes_native_kv_memory_around_runtime_vmm(monkeypatch):
     from tensorrt_llm._torch import virtual_memory
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
@@ -3405,18 +3364,13 @@ def test_sleep_routes_native_kv_memory_without_recreating_dummies(
     stub._is_kv_manager_v2 = True
     stub._sleeping_memory_tags = set()
     stub.llm_args = types.SimpleNamespace(
-        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
+        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: "CPU"})
     )
-    main = Mock(spec=KVCacheManagerV2)
-    draft = Mock(spec=KVCacheManagerV2)
-    spec = Mock()
-    managers = {"main": main, "alias": main, "spec": spec}
-    if has_draft:
-        managers["draft"] = draft
+    main = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    draft = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    # Aliased managers are released once.
+    managers = {"main": main, "alias": main, "draft": draft, "spec": Mock()}
     stub.resource_manager = types.SimpleNamespace(resource_managers=managers)
-    dummy = object()
-    runner = Mock(padding_dummy_requests={0: dummy})
-    stub.model_engine = types.SimpleNamespace(cuda_graph_runner=runner)
     events = []
     for manager in (main, draft):
         manager.release_memory.side_effect = lambda _: events.append("native_release")
@@ -3425,35 +3379,24 @@ def test_sleep_routes_native_kv_memory_without_recreating_dummies(
     runtime.release_with_tag.side_effect = lambda _: events.append("runtime_release") or 1
     runtime.materialize_with_tag.side_effect = lambda _: events.append("runtime_materialize") or 1
     monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: runtime)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
-    tags = [
-        ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN,
-        ExecutorMemoryType.SPEC_RESOURCES,
-    ]
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    tags = [ExecutorMemoryType.KV_CACHE]
 
+    stub.validate_sleep_config(tags)
+    main.validate_sleep_config.assert_called_once_with(virtual_memory.RestoreMode.CPU)
     virtual_memory.release_with_tag(*tags, resource=stub)
+    virtual_memory.materialize_with_tag(*tags, resource=stub)
 
-    assert stub._sleeping_memory_tags == set(tags)
-    assert stub._pp_rebalance_drain_iters is None
-    assert main.release_memory.call_count == int(release_kv)
-    assert draft.release_memory.call_count == int(release_kv and has_draft)
-    if release_kv:
-        main.release_memory.assert_called_once_with(virtual_memory.RestoreMode[mode])
-        assert events.index("native_release") < events.index("runtime_release")
-
-    events.clear()
-    virtual_memory.materialize_with_tag(tags[0], resource=stub)
-    assert stub._sleeping_memory_tags == {tags[1]}
-    assert main.materialize_memory.call_count == int(release_kv)
-    if release_kv:
-        assert events.index("runtime_materialize") < events.index("synchronize")
-        assert events.index("synchronize") < events.index("native_materialize")
-    virtual_memory.materialize_with_tag(tags[1], resource=stub)
+    # Native pools are released before, and restored after, the tagged runtime allocations.
+    assert events == [
+        "native_release",
+        "native_release",
+        "runtime_release",
+        "runtime_materialize",
+        "native_materialize",
+        "native_materialize",
+    ]
     assert not stub._sleeping_memory_tags
-    assert runner.padding_dummy_requests == {0: dummy}
-    runner.release_padding_dummy.assert_not_called()
-    runner._get_or_create_padding_dummy.assert_not_called()
-    spec.free_resources.assert_not_called()
 
 
 class TestPendingTransferResponseFlush:

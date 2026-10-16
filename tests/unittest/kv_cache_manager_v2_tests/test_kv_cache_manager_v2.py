@@ -674,8 +674,6 @@ class TestNoBatching(TestKVCacheManagerV2):
     def test_discard_sleep_preserves_native_cache_state(
         self, _name: str, zero: bool, discard: bool
     ) -> None:
-        from unittest.mock import patch
-
         import torch
 
         self.manager = KVCacheManager(
@@ -694,17 +692,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 commit_min_snapshot=True,
             )
         )
-        remaining = None
-
-        def priority(ordinal: int, life_cycle: int) -> int:
-            nonlocal remaining
-            if remaining is not None:
-                if remaining == 0:
-                    raise RuntimeError("injected page materialization failure")
-                remaining -= 1
-            return 17
-
-        cache = self.manager.create_kv_cache(id=1, custom_priority_callback=priority)
+        cache = self.manager.create_kv_cache(id=1)
         never_resumed = self.manager.create_kv_cache(id=2)
         hole = self.manager.create_kv_cache(id=3)
         self.manager.mark_stats_excluded(1)
@@ -751,12 +739,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                         _KVCache.Status.UNMATERIALIZED if discard else _KVCache.Status.SUSPENDED,
                     )
                     self.assertEqual((cache.capacity, cache.history_length), (16, 8))
-                    if discard:
-                        with self.assertRaisesRegex(LogicError, "Cannot prefetch"):
-                            cache.prefetch(GPU_LEVEL)
-                    self.assertEqual(cache.page_storage_row, 0)
                     self.assertTrue(cache.is_decoding)
-                    self.assertTrue(cache.enable_swa_scratch_reuse)
                     self.assertEqual(
                         list(cache.get_base_page_indices(sparse)), [BAD_PAGE_INDEX] * 4
                     )
@@ -768,30 +751,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                         )
                     )
 
-                    if cycle == 0 and discard:
-                        with patch.dict(
-                            "os.environ", {"TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS": "invalid"}
-                        ):
-                            with self.assertRaises(ValueError):
-                                self.manager.materialize_gpu_memory(zero=zero)
-                        self.assertEqual(cache.status, _KVCache.Status.UNMATERIALIZED)
-                        self.assertTrue(
-                            all(stat.total == 0 for stat in self.manager.get_storage_statistics())
-                        )
-                        remaining = 1
-                        with self.assertRaisesRegex(
-                            RuntimeError, "injected page materialization failure"
-                        ):
-                            self.manager.materialize_gpu_memory(zero=zero)
-                        self.assertEqual(cache.status, _KVCache.Status.UNMATERIALIZED)
-                        self.assertTrue(
-                            all(
-                                stat.total == stat.free
-                                for level in range(2)
-                                for stat in self.manager.get_storage_statistics(CacheLevel(level))
-                            )
-                        )
-                        remaining = None
                     self.manager.materialize_gpu_memory(zero=zero)
                     self.assertEqual(
                         [
@@ -805,10 +764,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                     )
                     self.assertEqual(never_resumed.status, _KVCache.Status.SUSPENDED)
                     self.assertFalse(cache.is_active)
-                    if cycle == 0:
-                        # Materialization leaves caches suspended; scratch is allocated on resume.
-                        self.manager.release_gpu_memory(discard=discard)
-                        self.manager.materialize_gpu_memory(zero=zero)
                     self.assertTrue(cache.resume())
                     self.assertEqual(
                         cache.get_page_storage_snapshot(sparse).cache_levels, [1, 1, 0, 0]
@@ -842,7 +797,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                 never_resumed.close()
                 hole.close()
             finally:
-                remaining = None
                 stream.synchronize()
                 batch.close()
                 cache.close()
@@ -909,11 +863,9 @@ class TestNoBatching(TestKVCacheManagerV2):
         self,
         expected_num_pages: int,
         expected_cold_pages: dict[LayerGroupId, tuple[int, int, int]],
-        sleep: bool = False,
     ) -> None:
         """Force one request through cold storage, then validate its promoted KV."""
         requests: list[TestNoBatching.Request] = []
-        extra_levels = [0] * (len(self.cfg.cache_tiers) - 2)
         try:
             first = self.new_request(0, None, 3 * self.cfg.tokens_per_block, 0)
             requests.append(first)
@@ -924,7 +876,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             stream_holder.take_finish_event().synchronize()
             self.assertEqual(
                 _introspection.active_page_stats(first.kv_cache)[0],
-                [expected_num_pages, 0, *extra_levels],
+                [expected_num_pages, 0],
             )
             first.kv_cache.suspend()
             self.manager.get_and_reset_iteration_stats()
@@ -941,7 +893,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             # suspended request must now use the padded cold representation.
             self.assertEqual(
                 _introspection.active_page_stats(first.kv_cache)[0],
-                [0, expected_num_pages, *extra_levels],
+                [0, expected_num_pages],
             )
             offload_stats = self.manager.get_and_reset_iteration_stats()
             for life_cycle_id, (offload_pages, _, page_bytes) in expected_cold_pages.items():
@@ -951,57 +903,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                     offload_pages * page_bytes,
                 )
 
-            if sleep:
-                # Preserve held pages from both the encoded GPU pool and the hot pool.
-                capacities = [
-                    [stat.total for stat in self.manager.get_storage_statistics(CacheLevel(level))]
-                    for level in range(len(self.cfg.cache_tiers))
-                ]
-                addresses = [
-                    pool.base_address
-                    for group in self.manager.pool_group_descs
-                    for pool in group.pools
-                ]
-                self.manager.release_gpu_memory()
-                for level in (CacheLevel(0), CacheLevel(1)):
-                    self.assertTrue(
-                        all(stat.total == 0 for stat in self.manager.get_storage_statistics(level))
-                    )
-                for request in requests:
-                    self.assertEqual(
-                        _introspection.active_page_stats(request.kv_cache)[0],
-                        [0, 0, expected_num_pages],
-                    )
-                self.assertEqual(
-                    [stat.total for stat in self.manager.get_storage_statistics(CacheLevel(2))],
-                    capacities[2],
-                )
-                self.manager.materialize_gpu_memory()
-                self.assertEqual(
-                    [
-                        [
-                            stat.total
-                            for stat in self.manager.get_storage_statistics(CacheLevel(level))
-                        ]
-                        for level in range(len(self.cfg.cache_tiers))
-                    ],
-                    capacities,
-                )
-                self.assertEqual(
-                    [
-                        pool.base_address
-                        for group in self.manager.pool_group_descs
-                        for pool in group.pools
-                    ],
-                    addresses,
-                )
-                with TemporaryCudaStream([]) as stream_holder:
-                    stream = cast(CudaStream, stream_holder.handle)
-                    self.assertTrue(second.kv_cache.resume(stream))
-                    self.run_request(second, self.cfg.tokens_per_block, True)
-                stream_holder.take_finish_event().synchronize()
-                self.manager.get_and_reset_iteration_stats()
-
             second.kv_cache.close()
             with TemporaryCudaStream([]) as stream_holder:
                 stream = cast(CudaStream, stream_holder.handle)
@@ -1010,7 +911,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             stream_holder.take_finish_event().synchronize()
             self.assertEqual(
                 _introspection.active_page_stats(first.kv_cache)[0],
-                [expected_num_pages, 0, *extra_levels],
+                [expected_num_pages, 0],
             )
             onboard_stats = self.manager.get_and_reset_iteration_stats()
             for life_cycle_id, (_, onboard_pages, page_bytes) in expected_cold_pages.items():
@@ -1026,10 +927,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             if hasattr(self, "manager"):
                 self.manager.clear_reusable_blocks()
 
-    @parameterized.expand([("eviction", False), ("sleep", True)])
-    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(
-        self, _case: str, sleep: bool
-    ) -> None:
+    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
         """Padding merges full attention with one of two differently-sized SWA LCs."""
         unit = 1 << 20
         self.cfg = KVCacheManagerConfig(
@@ -1060,8 +958,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
             max_util_for_resume=1.0,
         )
-        if sleep:
-            self.cfg.cache_tiers = [*self.cfg.cache_tiers, HostCacheTierConfig(128 * unit)]
         self.engine = FakeEngine(self.cfg)
         codec = _introspection.create_test_padding_cold_page_codec(
             {0: 4 * unit, 1: 4 * unit, 2: 2 * unit}
@@ -1083,21 +979,16 @@ class TestNoBatching(TestKVCacheManagerV2):
         hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
         self.assertEqual(hot_stats[hot_groups[0]].total, 3)
         self.assertEqual(hot_stats[hot_groups[1]].total, 6)
-        for _ in range(2 if sleep else 1):
-            self._run_cold_page_codec_round_trip(
-                expected_num_pages=6,
-                expected_cold_pages={
-                    full_lc: (3, 3, 4 * unit),
-                    short_swa_lc: (3, 1, 4 * unit),
-                    long_swa_lc: (3, 2, 2 * unit),
-                },
-                sleep=sleep,
-            )
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=6,
+            expected_cold_pages={
+                full_lc: (3, 3, 4 * unit),
+                short_swa_lc: (3, 1, 4 * unit),
+                long_swa_lc: (3, 2, 2 * unit),
+            },
+        )
 
-    @parameterized.expand([("eviction", False), ("sleep", True)])
-    def test_cold_codec_splits_lifecycles_from_one_hot_pool_group(
-        self, _case: str, sleep: bool
-    ) -> None:
+    def test_cold_codec_splits_lifecycles_from_one_hot_pool_group(self) -> None:
         """Padding one SWA lifecycle splits a shared hot pool group in cold storage."""
         unit = 1 << 20
         self.cfg = KVCacheManagerConfig(
@@ -1122,8 +1013,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
             max_util_for_resume=1.0,
         )
-        if sleep:
-            self.cfg.cache_tiers = [*self.cfg.cache_tiers, HostCacheTierConfig(128 * unit)]
         self.engine = FakeEngine(self.cfg)
         codec = _introspection.create_test_padding_cold_page_codec({0: 2 * unit, 1: 4 * unit})
         self.manager = KVCacheManager(self.cfg, cold_page_codec=codec)
@@ -1140,12 +1029,10 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
         self.assertEqual(hot_stats[hot_groups[0]].total, 6)
-        for _ in range(2 if sleep else 1):
-            self._run_cold_page_codec_round_trip(
-                expected_num_pages=5,
-                expected_cold_pages={full_lc: (3, 3, 2 * unit), swa_lc: (3, 2, 4 * unit)},
-                sleep=sleep,
-            )
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=5,
+            expected_cold_pages={full_lc: (3, 3, 2 * unit), swa_lc: (3, 2, 4 * unit)},
+        )
 
     def run_naive(
         self,

@@ -767,7 +767,6 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
     c._disable_overlap_scheduler = disable_overlap_scheduler
     c._llm_args = SimpleNamespace(
         kv_cache_config=SimpleNamespace(kv_events_config=None),
-        sleep_config=None,
     )
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
@@ -778,10 +777,7 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-@pytest.mark.parametrize("enable_sleep", [False, True])
-def test_kv_cache_manager_receives_the_overlap_scheduler_flag(
-    disable_overlap_scheduler, enable_sleep
-):
+def test_kv_cache_manager_receives_the_overlap_scheduler_flag(disable_overlap_scheduler):
     """The index pool needs the overlap flag, and only the creator can supply it.
 
     ``KVCacheManagerV2`` derives its own lease headroom from
@@ -792,7 +788,6 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(
     which is the nvbug 6627795 shortfall.
     """
     creator = _make_kv_cache_creator(disable_overlap_scheduler)
-    creator._llm_args.sleep_config = SleepConfig() if enable_sleep else None
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
     )
@@ -804,7 +799,6 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(
         creator._create_kv_cache_manager(model_engine)
 
     assert create.call_args.kwargs["disable_overlap_scheduler"] is disable_overlap_scheduler
-    assert "enable_sleep" not in create.call_args.kwargs
 
 
 def _fake_req(request_id, *, init_state=False, transmission_complete=False):

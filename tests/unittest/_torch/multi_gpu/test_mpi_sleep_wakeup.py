@@ -240,7 +240,6 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
             llm.resume(sleep_tags)
             assert llm.get_memory_status().state == "running"
             mem_wakeup = _per_device_gpu_memory()
-            print(f"cycle={cycle} active={mem_active} asleep={mem_sleep} awake={mem_wakeup}")
             if process_gpu_memory_info_available:
                 for dev in active_devices:
                     assert mem_sleep.get(dev, 0) < mem_active[dev], (

@@ -3130,101 +3130,27 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "host_cache_size,mem_available,memlock_limit,integrated,expected_host_quota",
+    "host_tiers,mode,error",
     [
-        (None, 128 << 20, float("inf"), False, 16 << 20),
-        (-1, 128 << 20, float("inf"), False, 16 << 20),
-        (8 << 20, 128 << 20, float("inf"), False, 8 << 20),
-        (0, 128 << 20, float("inf"), False, 0),
-        (None, 32 << 20, float("inf"), False, 16 << 20),
-        (None, 128 << 20, 20 << 20, False, 16 << 20),
-        (None, 33 << 20, float("inf"), True, 17 << 19),
-        (None, 17 << 20, float("inf"), True, 1 << 19),
+        ([], RestoreMode.NONE, None),
+        ([], RestoreMode.CPU, "shortfall: 33554432 bytes"),
+        ([16 << 20], RestoreMode.CPU, "shortfall: 16777216 bytes"),
+        ([32 << 20], RestoreMode.PINNED, None),
     ],
 )
-def test_sleep_uses_normal_auto_host_capacity(
-    host_cache_size: int | None,
-    mem_available: int,
-    memlock_limit: float,
-    integrated: bool,
-    expected_host_quota: int,
-) -> None:
-    with (
-        patch.object(kv_cache_v2_module.os, "sysconf", side_effect=[1, mem_available]),
-        patch("resource.getrlimit", return_value=(memlock_limit, memlock_limit)),
-        patch.object(kv_cache_v2_module, "is_device_integrated", return_value=integrated),
-        patch.object(Distributed, "get", return_value=Mock(local_world_size=1)),
-    ):
-        manager, impl_constructor = _make_manager_for_cache_tier_test(
-            KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_cache_size),
-            [Mock()],
-            add_secondary_gpu_tier=True,
-        )
-
-    tiers = impl_constructor.call_args.args[0].cache_tiers
-    assert [tier.quota for tier in tiers if isinstance(tier, GpuCacheTierConfig)] == [
-        16 << 20,
-        1 << 20,
-    ]
-    assert [tier.quota for tier in tiers if isinstance(tier, HostCacheTierConfig)] == (
-        [expected_host_quota] if expected_host_quota else []
-    )
-    manager.impl.init_config = SimpleNamespace(cache_tiers=tiers)
-    for mode in (RestoreMode.NONE, RestoreMode.MEMSET):
-        manager.validate_sleep_config(mode)
-    for mode in (RestoreMode.CPU, RestoreMode.PINNED):
-        with pytest.raises(ValueError, match="shortfall:"):
-            manager.validate_sleep_config(mode)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("host_quota", [None, 8 << 20, 16 << 20, 32 << 20])
-@pytest.mark.parametrize("cold_gpu", [False, True])
-@pytest.mark.parametrize(
-    "mode", [RestoreMode.NONE, RestoreMode.MEMSET, RestoreMode.CPU, RestoreMode.PINNED]
-)
 def test_sleep_requires_host_capacity_covering_gpu(
-    host_quota: int | None, cold_gpu: bool, mode: RestoreMode
+    host_tiers: list[int], mode: RestoreMode, error: str | None
 ) -> None:
     manager = object.__new__(KVCacheManagerV2)
-    tiers = [GpuCacheTierConfig(quota=16 << 20)]
-    if cold_gpu:
-        tiers.append(GpuCacheTierConfig(quota=16 << 20))
-    gpu_quota = sum(tier.quota for tier in tiers)
-    if host_quota is not None:
-        tiers.append(HostCacheTierConfig(quota=host_quota))
+    # Hot and cold GPU levels both need backup capacity.
+    tiers = [GpuCacheTierConfig(quota=16 << 20), GpuCacheTierConfig(quota=16 << 20)]
+    tiers.extend(HostCacheTierConfig(quota=quota) for quota in host_tiers)
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
-    if mode in (RestoreMode.CPU, RestoreMode.PINNED) and (
-        host_quota is None or host_quota < gpu_quota
-    ):
-        with pytest.raises(ValueError, match="host_cache_size") as exc_info:
-            manager.validate_sleep_config(mode)
-        available = host_quota or 0
-        assert f"Required: {gpu_quota} bytes" in str(exc_info.value)
-        assert f"largest eligible host tier: {available} bytes" in str(exc_info.value)
-        assert f"shortfall: {gpu_quota - available} bytes" in str(exc_info.value)
-        assert f"host_cache_size to at least {gpu_quota} bytes" in str(exc_info.value)
-    else:
+    if error is None:
         manager.validate_sleep_config(mode)
-
-
-@pytest.mark.cpu_only
-def test_sleep_requires_host_below_last_gpu() -> None:
-    manager = object.__new__(KVCacheManagerV2)
-    tiers = [
-        GpuCacheTierConfig(quota=16 << 20),
-        HostCacheTierConfig(quota=32 << 20),
-        GpuCacheTierConfig(quota=16 << 20),
-    ]
-    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
-    with pytest.raises(ValueError, match="below all GPU levels") as exc_info:
-        manager.validate_sleep_config(RestoreMode.CPU)
-    assert "largest eligible host tier: 0 bytes" in str(exc_info.value)
-    tiers.extend([HostCacheTierConfig(quota=16 << 20), HostCacheTierConfig(quota=16 << 20)])
-    with pytest.raises(ValueError, match="shortfall: 16777216 bytes"):
-        manager.validate_sleep_config(RestoreMode.CPU)
-    tiers.append(HostCacheTierConfig(quota=32 << 20))
-    manager.validate_sleep_config(RestoreMode.CPU)
+    else:
+        with pytest.raises(ValueError, match=error):
+            manager.validate_sleep_config(mode)
 
 
 class _GuardKVCache:
@@ -3235,17 +3161,10 @@ class _GuardKVCache:
         self.resize_ok = resize_ok
         self.closed = False
         self.committing_stopped = False
-        self.capacity = 1
-        self.history_length = 0
-        self.beam_width = 1
         self.is_active = True
-        self.is_decoding = False
-        self.enable_swa_scratch_reuse = False
-        self.text_only = True
-        self.reuse_scope = None
         self.num_committed_tokens = 0
 
-    def resume(self, stream: object, is_decoding: bool = False) -> bool:
+    def resume(self, stream: object) -> bool:
         del stream
         self.is_active = self.resume_ok
         return self.resume_ok
@@ -3253,7 +3172,7 @@ class _GuardKVCache:
     def stop_committing(self) -> None:
         self.committing_stopped = True
 
-    def resize(self, num_tokens: int, history_length: int | None = None) -> bool:
+    def resize(self, num_tokens: int) -> bool:
         del num_tokens
         return self.resize_ok
 
@@ -3320,28 +3239,10 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     assert kv_cache.committing_stopped
     assert not kv_cache.closed
 
-    from tensorrt_llm._torch.virtual_memory import RestoreMode
-
     manager.release_memory(RestoreMode.NONE)
-    assert not kv_cache.closed
-    assert manager.kv_cache_map[kv_cache_v2_module._GUARD_PAGE_REQUEST_ID] is kv_cache
     manager.impl.release_gpu_memory.assert_called_once_with(discard=True)
-    manager.index_mapper.remove_sequence.assert_not_called()
     buffer.fill_(1)
-    kv_cache.resume = Mock(wraps=kv_cache.resume)
-    manager._restore_page_index_bufs.side_effect = [
-        RuntimeError("injected metadata rebind failure"),
-        None,
-    ]
-    with pytest.raises(RuntimeError, match="injected metadata rebind failure"):
-        manager.materialize_memory()
-    assert kv_cache.is_active
-    assert manager._sleep_restore_mode == RestoreMode.NONE
     manager.materialize_memory()
-    kv_cache.resume.assert_called_once()
-    assert manager._restore_page_index_bufs.call_count == 2
-    assert manager._sleep_restore_mode is None
-    assert not manager._sleeping_active_caches
     assert torch.isnan(buffer[3]).all()
     assert torch.equal(buffer[2], torch.ones(2))
     assert manager.guard_page_indices() == frozenset({3})

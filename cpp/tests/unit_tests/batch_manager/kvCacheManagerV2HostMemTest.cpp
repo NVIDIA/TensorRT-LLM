@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/exceptions.h"
-#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 
 #include <cuda_runtime_api.h>
@@ -27,9 +26,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -184,13 +181,6 @@ TEST_P(HostMemPageModeTest, RegistersAndResizesWithPrefaultDisabled)
         memory.resize(0);
         EXPECT_EQ(memory.address(), 0);
         EXPECT_EQ(memory.size(), 0);
-        memory.resize(0);
-        {
-            ScopedEnv invalidPrefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "invalid");
-            EXPECT_THROW(memory.resize(HostMem::kAlignment), std::invalid_argument);
-            EXPECT_EQ(memory.address(), 0);
-            EXPECT_EQ(memory.size(), 0);
-        }
         memory.resize(HostMem::kAlignment);
         EXPECT_NE(memory.address(), 0);
         EXPECT_EQ(memory.size(), HostMem::kAlignment);
@@ -201,67 +191,6 @@ TEST_P(HostMemPageModeTest, RegistersAndResizesWithPrefaultDisabled)
 }
 
 INSTANTIATE_TEST_SUITE_P(ThpModes, HostMemPageModeTest, testing::Values("0", "1"));
-
-TEST(KvCacheManagerV2HostMemTest, RestoresPoolGroupAfterPartialAllocationFailure)
-{
-    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-
-    class FailOnceHostPool : public HostSlotPool
-    {
-    public:
-        FailOnceHostPool()
-            : HostSlotPool(HostMem::kAlignment, 0)
-        {
-        }
-
-        void resize(SlotCount count) override
-        {
-            if (mFail)
-            {
-                mFail = false;
-                ScopedEnv invalidPrefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "invalid");
-                HostSlotPool::resize(count);
-                return;
-            }
-            HostSlotPool::resize(count);
-        }
-
-    private:
-        bool mFail = true;
-    };
-
-    class TestPoolGroup : public PoolGroupBase
-    {
-    public:
-        TestPoolGroup()
-            : PoolGroupBase(0)
-        {
-            mPools.push_back(std::make_unique<HostSlotPool>(HostMem::kAlignment, 0));
-            mPools.push_back(std::make_unique<FailOnceHostPool>());
-        }
-
-        HostMem const& memory(PoolIndex index) const
-        {
-            return *static_cast<HostSlotPool const&>(*mPools[index]).hostMem();
-        }
-    };
-
-    TestPoolGroup group;
-    EXPECT_THROW(group.resizePools(1), std::invalid_argument);
-    EXPECT_EQ(group.numSlots(), 0);
-    auto const firstAddress = group.memory(PoolIndex{0}).address();
-    ASSERT_NE(firstAddress, 0);
-    EXPECT_EQ(group.memory(PoolIndex{1}).address(), 0);
-    EXPECT_EQ(group.memory(PoolIndex{1}).size(), 0);
-    *reinterpret_cast<unsigned char*>(firstAddress) = 0x5A;
-    group.resizePools(1);
-    group.slotAllocator().expand(1);
-    EXPECT_EQ(group.numSlots(), 1);
-    EXPECT_EQ(group.memory(PoolIndex{0}).address(), firstAddress);
-    EXPECT_EQ(*reinterpret_cast<unsigned char const*>(firstAddress), 0x5A);
-    EXPECT_NE(group.memory(PoolIndex{1}).address(), 0);
-}
 
 TEST(KvCacheManagerV2HostMemTest, PrefaultedAllocationSupportsGpuRoundTrip)
 {

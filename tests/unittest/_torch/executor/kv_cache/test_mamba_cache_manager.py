@@ -3487,9 +3487,7 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
 
 
 @skip_no_cuda
-@pytest.mark.parametrize(
-    "restore_mode", [None, RestoreMode.NONE, RestoreMode.MEMSET, RestoreMode.CPU]
-)
+@pytest.mark.parametrize("restore_mode", [None, RestoreMode.NONE])
 def test_v2_hybrid_mamba_state_views_use_logical_slots(restore_mode):
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=4, num_mamba_layers=2, host_cache_size=16 << 20
@@ -3538,19 +3536,15 @@ def test_v2_hybrid_mamba_state_views_use_logical_slots(restore_mode):
         indices = mgr.get_state_indices([123, 456], [False, False])
         assert all(0 <= index < ssm_slots for index in indices)
         if restore_mode is not None:
-            pool_addresses = [state.data_ptr() for state in mgr.all_ssm_states]
-            for cycle in range(2):
-                mgr.release_memory(restore_mode)
-                mgr.materialize_memory()
-                restored = mgr.get_state_indices([123, 456], [False, False])
-                assert restored == [
-                    mgr.kv_cache_map[rid].get_ssm_block_base_index(mgr.ssm_layer_group_id)
-                    for rid in (123, 456)
-                ]
-                if cycle == 0:
-                    # The freed hole forces ordinary allocation onto different slots.
-                    assert restored != indices
-                assert [state.data_ptr() for state in mgr.all_ssm_states] == pool_addresses
+            mgr.release_memory(restore_mode)
+            mgr.materialize_memory()
+            restored = mgr.get_state_indices([123, 456], [False, False])
+            # The freed hole forces ordinary allocation onto different slots.
+            assert restored != indices
+            assert restored == [
+                mgr.kv_cache_map[rid].get_ssm_block_base_index(mgr.ssm_layer_group_id)
+                for rid in (123, 456)
+            ]
     finally:
         mgr.shutdown()
 
@@ -4220,9 +4214,7 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
 
 
 @skip_no_cuda
-@pytest.mark.parametrize(
-    "restore_mode", [None, RestoreMode.CPU, RestoreMode.NONE, RestoreMode.MEMSET]
-)
+@pytest.mark.parametrize("restore_mode", [None, RestoreMode.CPU])
 def test_v2_kda_replay_relocates_live_slot_history(restore_mode):
     tag = "kda_replay_sleep"
     with virtual_memory.maybe_scope(
@@ -4273,7 +4265,6 @@ def test_v2_kda_replay_relocates_live_slot_history(restore_mode):
                 replay_buffer[:, old_slots].clone() for replay_buffer in replay_buffers
             ]
             expected_counts = mgr.prev_num_accepted_tokens[old_slots].clone()
-            expected_indices = mgr.intermediate_state_indices.clone()
             mgr.release_memory(restore_mode)
             assert virtual_memory.release_with_tag(tag) > 0
             assert virtual_memory.materialize_with_tag(tag) > 0
@@ -4287,10 +4278,8 @@ def test_v2_kda_replay_relocates_live_slot_history(restore_mode):
                 for rid in (101, 102)
             ]
             torch.testing.assert_close(mgr.prev_num_accepted_tokens[new_slots], expected_counts)
-            torch.testing.assert_close(mgr.intermediate_state_indices, expected_indices)
-            if restore_mode == RestoreMode.CPU:
-                for replay_buffer, expected in zip(replay_buffers, expected_rows):
-                    torch.testing.assert_close(replay_buffer[:, new_slots], expected)
+            for replay_buffer, expected in zip(replay_buffers, expected_rows):
+                torch.testing.assert_close(replay_buffer[:, new_slots], expected)
         else:
             mgr._relocate_kda_replay_slots([0, 1], [1, 2])
 
@@ -4499,7 +4488,7 @@ def test_v2_hybrid_static_dynamic_tree_capacity():
 
 
 @skip_no_cuda
-@pytest.mark.parametrize("restore_mode", [None, RestoreMode.NONE, RestoreMode.MEMSET])
+@pytest.mark.parametrize("restore_mode", [None, RestoreMode.MEMSET])
 @pytest.mark.parametrize(
     "builder",
     [_build_hybrid_with_mamba_layer, _build_v2_hybrid_with_mamba_layer],

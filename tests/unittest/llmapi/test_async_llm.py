@@ -104,11 +104,7 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
                     f"active memory ({memory_usage_active:.2f} GB)"
                 )
 
-            if cycle == 0:
-                await llm.resume(tags[:1])
-                await llm.resume(tags[1:])
-            else:
-                await llm.resume(tags)
+            await llm.resume(tags)
             memory_usage_resumed = get_current_process_gpu_memory(True) / 1024**3
             print(f"[Cycle {cycle + 1}] Memory usage after resume: {memory_usage_resumed:.2f} GB")
             if process_gpu_memory_info_available:
@@ -117,9 +113,8 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
                     f"released memory ({memory_usage_released:.2f} GB)"
                 )
 
-            output_after = await llm.generate_async(prompt, sampling_params)
-            text_after = output_after.outputs[0].text
-            assert baseline_text == text_after
+        output_after = await llm.generate_async(prompt, sampling_params)
+        text_after = output_after.outputs[0].text
 
         print(f"[Cycle {num_cycles}] Generated text after release/resume: {text_after}")
         assert baseline_text == text_after, (

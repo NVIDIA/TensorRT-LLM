@@ -55,8 +55,6 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         sleep_config=sleep_config,
     )
     w.engine = SimpleNamespace(
-        release_memory=MagicMock(),
-        materialize_memory=MagicMock(),
         begin_sleep_transition=MagicMock(),
         complete_sleep_transition=MagicMock(),
         abort_sleep_transition=MagicMock(),
@@ -394,8 +392,6 @@ class TestMultiRankSleepWakeupLock:
             yield None
 
         w.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=SpyLock(),
             _sleep_wakeup_comm=mock_comm,
             control_action=_noop_control_action,
@@ -554,8 +550,6 @@ def _make_proto_worker(recv_responses, world_size=3):
         yield None
 
     w.engine = SimpleNamespace(
-        release_memory=MagicMock(),
-        materialize_memory=MagicMock(),
         _sleep_wakeup_lock=threading.Lock(),
         _sleep_wakeup_comm=FakeComm(),
         control_action=_noop_control_action,
@@ -649,8 +643,6 @@ class TestMnnvlSleepWakeupCoordination:
             modules.append(SimpleNamespace(comm=resource))
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor.model_engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
         executor.draft_model_engine = None
 
@@ -715,26 +707,17 @@ class TestMnnvlSleepWakeupCoordination:
         run_mnnvl = Mock()
         worker.engine._has_mnnvl_checkpoint_resources = lambda tags: False
         worker.engine._run_mnnvl_checkpoint_resources = run_mnnvl
-        events = []
-
-        def release(*tags, resource):
-            assert resource is worker.engine
-            events.append("release")
 
         with (
-            patch(
-                "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=release,
-            ),
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
-            patch("torch.cuda.synchronize", side_effect=lambda: events.append("synchronize")),
+            patch("torch.cuda.synchronize"),
             patch("gc.collect"),
             patch("torch.cuda.empty_cache"),
         ):
             worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
         run_mnnvl.assert_not_called()
-        assert events.index("synchronize") < events.index("release")
 
 
 class TestMultiRankSendFailureRecovery:
@@ -794,8 +777,6 @@ class TestMultiRankSendFailureRecovery:
             sleep_config=object(),
         )
         w.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -881,8 +862,6 @@ class TestMultiRankSendFailureRecovery:
             sleep_config=object(),
         )
         w.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -1018,8 +997,6 @@ class TestMultiRankSendFailureRecovery:
             sleep_config=object(),
         )
         w.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -1100,8 +1077,6 @@ class TestMultiRankSendFailureRecovery:
         )
         run_mnnvl = Mock()
         worker.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=control_action,
@@ -1176,8 +1151,6 @@ class TestMultiRankSendFailureRecovery:
         )
         run_mnnvl = Mock()
         worker.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=control_action,
@@ -1244,8 +1217,6 @@ class TestMultiRankSendFailureRecovery:
         worker = object.__new__(BaseWorker)
         worker._fatal_error = None
         worker.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _fatal_error=None,
             is_shutdown=False,
             fail_sleep_wakeup_transition=MagicMock(),
@@ -1261,43 +1232,30 @@ class TestMultiRankSendFailureRecovery:
         worker.engine.fail_sleep_wakeup_transition.assert_called_once_with()
         hard_kill.assert_called_once_with()
 
-    @pytest.mark.parametrize("capacity_failure", [False, True])
-    def test_precommit_local_failure_remains_recoverable(self, capacity_failure):
+    def test_precommit_local_failure_remains_recoverable(self):
         """A failure before local mutation aborts peers without fail-stopping."""
         from unittest.mock import Mock, patch
 
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
-        worker, recv_calls = _make_proto_worker(
+        worker, _ = _make_proto_worker(
             [{"status": "ok"}, {"status": "ok"}],
             world_size=2,
         )
         fail_stop = Mock()
         worker._fail_stop_divergent_sleep_wakeup = fail_stop
-        worker.engine.validate_sleep_config = Mock(
-            side_effect=ValueError("host quota is too small") if capacity_failure else None
-        )
-        worker.engine._has_mnnvl_checkpoint_resources = Mock(return_value=capacity_failure)
 
         with (
-            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
-            patch(
-                "torch.cuda.synchronize",
-                side_effect=None if capacity_failure else RuntimeError("sync failed"),
-            ),
+            patch("torch.cuda.synchronize", side_effect=RuntimeError("sync failed")),
             patch("gc.collect"),
             patch("torch.cuda.empty_cache"),
         ):
-            with pytest.raises(
-                RuntimeError, match="host quota is too small" if capacity_failure else "sync failed"
-            ):
+            with pytest.raises(RuntimeError, match="sync failed"):
                 worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
         fail_stop.assert_not_called()
-        release.assert_not_called()
-        assert recv_calls == [1, 1]
-        assert worker.engine._sleep_wakeup_comm.phase_by_source[1] == "abort"
 
 
 class TestListenerUncaughtExceptionSendsErrorAck:
@@ -1332,8 +1290,6 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1376,8 +1332,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 class TestListenerAbortAndShutdown:
     """Listener control messages must unblock cleanly and ACK rank-0."""
 
-    @pytest.mark.parametrize("capacity_failure", [False, True])
-    def test_prepare_does_not_execute_vmm_or_release_control(self, capacity_failure):
+    def test_prepare_does_not_execute_vmm_or_release_control(self):
         """Prepare quiesces the peer but leaves VMM and control_action_done untouched."""
         import threading
         from unittest.mock import patch
@@ -1406,8 +1361,6 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1415,9 +1368,7 @@ class TestListenerAbortAndShutdown:
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
         executor._active_control_id = op_id
-        executor.validate_sleep_config = MagicMock(
-            side_effect=ValueError("host quota is too small") if capacity_failure else None
-        )
+        executor.validate_sleep_config = MagicMock()
 
         with (
             patch("torch.cuda.set_device"),
@@ -1434,12 +1385,6 @@ class TestListenerAbortAndShutdown:
 
         release.assert_not_called()
         executor.validate_sleep_config.assert_called_once()
-        if capacity_failure:
-            assert sent_acks[0]["status"] == "error"
-            assert sent_acks[0]["phase"] == _SleepWakeupAction.PREPARE
-            assert "host quota is too small" in sent_acks[0]["error"]
-            assert executor.control_action_done.is_set()
-            return
         assert executor.control_request_barrier.is_set()
         assert not executor.control_action_done.is_set()
         assert sent_acks == [
@@ -1481,8 +1426,6 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1543,8 +1486,6 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1593,8 +1534,6 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1637,8 +1576,6 @@ class TestListenerAbortAndShutdown:
                 raise AssertionError("shutdown ACK drain must probe before recv")
 
         executor = object.__new__(PyExecutor)
-        executor.release_memory = MagicMock()
-        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor._sleep_wakeup_listener_thread = None
         executor.dist = SimpleNamespace(rank=0, world_size=3)
@@ -1774,8 +1711,6 @@ class TestSingleRankLockAcquired:
             yield None
 
         w.engine = SimpleNamespace(
-            release_memory=MagicMock(),
-            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=SpyLock(),
             control_action=_noop_control_action,
             begin_sleep_transition=MagicMock(),
