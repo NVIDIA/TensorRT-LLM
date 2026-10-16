@@ -16,6 +16,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
+from ..host_staging import copy_if_changed
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -348,12 +349,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
         # update batch indices
         num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(num_seqs,
-                                     dtype=torch.int,
-                                     device='cpu',
-                                     pin_memory=prefer_pinned())
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
-                                                 non_blocking=True)
+        copy_if_changed(self.batch_indices_cuda[:num_seqs], range(num_seqs))
         # Snapshot the real (unpadded) scheduled token count before the decrement
         # below. maybe_capture_hidden_states runs during the target forward and
         # must bound the capture by this count; self.num_tokens is about to be

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.host_staging import copy_if_changed
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
@@ -149,6 +150,28 @@ def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> 
         buffer[merged_begin:merged_end].fill_(0)
         merged_begin, merged_end = row_begin, row_end
     buffer[merged_begin:merged_end].fill_(0)
+
+
+def _zero_rows_outside(
+    buffer: torch.Tensor, nonzero_rows: tuple[int, int], kept_rows: tuple[int, int]
+) -> tuple[int, int]:
+    """Zero ``buffer`` everywhere except the half-open row span ``kept_rows``.
+
+    ``buffer`` is zero outside the half-open span ``nonzero_rows``, so only
+    that span's rows outside ``kept_rows`` are cleared. Returns the span
+    outside which the buffer is zero once ``kept_rows`` is rewritten.
+    """
+    begin, end = nonzero_rows
+    kept_begin, kept_end = kept_rows
+    if kept_begin >= kept_end:
+        if begin < end:
+            buffer[begin:end].zero_()
+        return (0, 0)
+    if begin < min(end, kept_begin):
+        buffer[begin : min(end, kept_begin)].zero_()
+    if max(begin, kept_end) < end:
+        buffer[max(begin, kept_end) : end].zero_()
+    return kept_rows
 
 
 def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
@@ -470,9 +493,6 @@ class DecoderRunner(ScheduledModelRunner):
             self.gather_ids_cuda = torch.empty(
                 (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
             )
-            self.num_accepted_draft_tokens_cuda = torch.empty(
-                (self._config.max_batch_size,), dtype=torch.int, device="cuda"
-            )
             self.previous_pos_indices_cuda = torch.empty(
                 (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
             )
@@ -482,6 +502,9 @@ class DecoderRunner(ScheduledModelRunner):
             self.previous_kv_lens_offsets_cuda = torch.zeros(
                 (self._config.max_batch_size,), dtype=torch.int, device="cuda"
             )
+            # Half-open row spans outside which the two offset buffers are zero.
+            self._previous_pos_id_offsets_rows = (0, 0)
+            self._previous_kv_lens_offsets_rows = (0, 0)
         self.previous_batch_indices_cuda = torch.empty(
             (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
         )
@@ -3327,6 +3350,22 @@ class DecoderRunner(ScheduledModelRunner):
             return request.py_multimodal_data
         return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
 
+    def _zero_previous_offsets_outside(
+        self, pos_id_rows: tuple[int, int], kv_lens_rows: tuple[int, int]
+    ) -> None:
+        """Zero the overlap position-id and KV-length offsets outside the
+        half-open row spans the caller rewrites next.
+
+        Only these writes change the two buffers, so rows outside the spans
+        rewritten last are already zero and are not cleared again.
+        """
+        self._previous_pos_id_offsets_rows = _zero_rows_outside(
+            self.previous_pos_id_offsets_cuda, self._previous_pos_id_offsets_rows, pos_id_rows
+        )
+        self._previous_kv_lens_offsets_rows = _zero_rows_outside(
+            self.previous_kv_lens_offsets_cuda, self._previous_kv_lens_offsets_rows, kv_lens_rows
+        )
+
     def _prepare_tp_inputs(
         self,
         scheduled_requests: ScheduledRequests,
@@ -3429,7 +3468,6 @@ class DecoderRunner(ScheduledModelRunner):
         mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
             self._config.max_num_tokens, self.mapping.pp_size
         )
-        num_accepted_draft_tokens = []  # per request
         extra_inputs = self._new_extra_inputs()
 
         context_prompt_lookahead = None
@@ -3466,7 +3504,6 @@ class DecoderRunner(ScheduledModelRunner):
 
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
-            num_accepted_draft_tokens.append(len(prompt_tokens) - 1)
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
@@ -3729,7 +3766,6 @@ class DecoderRunner(ScheduledModelRunner):
                     prompt_lengths.append(request.py_prompt_len)
 
                 sequence_lengths.append(1 + num_draft_tokens)
-                num_accepted_draft_tokens.append(num_draft_tokens)
                 gather_ids.extend(
                     list(range(len(position_ids), len(position_ids) + 1 + num_draft_tokens))
                 )
@@ -3769,7 +3805,6 @@ class DecoderRunner(ScheduledModelRunner):
                 request.py_batch_idx = request.py_seq_slot
 
                 sequence_lengths.append(runtime_tokens_per_gen_step)
-                num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
 
                 draft_lens.append(runtime_draft_token_buffer_width)
@@ -3834,7 +3869,6 @@ class DecoderRunner(ScheduledModelRunner):
                 - 1
                 - (self._config.original_max_draft_len - request.py_num_accepted_draft_tokens)
             )
-            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
 
             sequence_lengths.append(1 + self._config.original_max_draft_len)
             prompt_lengths.append(request.py_prompt_len)
@@ -3897,10 +3931,9 @@ class DecoderRunner(ScheduledModelRunner):
                 )
 
             # Pre-extend constant-value lists to avoid per-request append
-            # overhead (saves ~3 append calls per request).
+            # overhead (saves ~2 append calls per request).
             draft_lens.extend([0] * (_n_gen * beam_width))
             sequence_lengths.extend([1] * (_n_gen * beam_width))
-            num_accepted_draft_tokens.extend([0] * (_n_gen * beam_width))
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
@@ -4066,11 +4099,8 @@ class DecoderRunner(ScheduledModelRunner):
         previous_batch_len = len(previous_batch_indices)
 
         def previous_seq_slots_device():
-            previous_batch_indices_host = torch.tensor(
-                previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
-            )
             previous_slots = self.previous_batch_indices_cuda[:previous_batch_len]
-            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            copy_if_changed(previous_slots, previous_batch_indices)
             return previous_slots
 
         if scheduled_requests.is_attention_dp_phase_idle:
@@ -4091,19 +4121,24 @@ class DecoderRunner(ScheduledModelRunner):
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
             self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
-        if self._config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
-            num_accepted_draft_tokens = torch.tensor(
-                num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
-            )
-            self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
-                num_accepted_draft_tokens, non_blocking=True
-            )
         if next_draft_tokens_device is not None:
-            # Initialize these two values to zeros
-            self.previous_pos_id_offsets_cuda *= 0
-            self.previous_kv_lens_offsets_cuda *= 0
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+            # Initialize these two values to zeros, except the rows of the
+            # previous-batch requests, which are written below.
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+            previous_request_rows = (
+                (num_extend_reqeust_wo_dummy - previous_batch_len, num_extend_reqeust_wo_dummy)
+                if previous_batch_len > 0
+                else (0, 0)
+            )
+            self._zero_previous_offsets_outside(
+                (
+                    previous_request_rows[0] * runtime_tokens_per_gen_step,
+                    previous_request_rows[1] * runtime_tokens_per_gen_step,
+                ),
+                previous_request_rows,
+            )
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
@@ -4129,11 +4164,8 @@ class DecoderRunner(ScheduledModelRunner):
                     )
                 # prepare data for the preprocess inputs
                 kv_len_offsets_device = new_tokens_lens_device - runtime_tokens_per_gen_step
-                previous_pos_indices_host = torch.tensor(
-                    previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
-                )
-                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
-                    previous_pos_indices_host, non_blocking=True
+                copy_if_changed(
+                    self.previous_pos_indices_cuda[0:previous_batch_tokens], previous_pos_indices
                 )
 
                 # The order of requests in a batch: [context requests, generation requests]
@@ -4156,7 +4188,6 @@ class DecoderRunner(ScheduledModelRunner):
                 #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 #       Already set to '0' during initialization.
 
-                num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
                     (num_extend_reqeust_wo_dummy - previous_batch_len)
                     * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
@@ -4189,8 +4220,7 @@ class DecoderRunner(ScheduledModelRunner):
             # so we need to set the previous_pos_id_offsets and previous_kv_lens_offsets to zeros
             # to skip the value changes in _preprocess_inputs. Otherwise, there will be illegal memory access
             # when writing key/values to the KV cache.
-            self.previous_pos_id_offsets_cuda *= 0
-            self.previous_kv_lens_offsets_cuda *= 0
+            self._zero_previous_offsets_outside((0, 0), (0, 0))
 
         # The host copy covers input_ids_cuda[:num_tokens] and the device copies
         # cover the previous-batch rows; padding-request rows are covered by
@@ -4242,10 +4272,7 @@ class DecoderRunner(ScheduledModelRunner):
             final_position_ids = self.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
         if enable_spec_decode:
-            self.gather_ids_cuda[: len(gather_ids)].copy_(
-                torch.tensor(gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            copy_if_changed(self.gather_ids_cuda[: len(gather_ids)], gather_ids)
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -4487,9 +4514,6 @@ class DecoderRunner(ScheduledModelRunner):
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
             spec_metadata.host_position_ids = host_position_ids
-            spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[
-                : len(num_accepted_draft_tokens)
-            ]
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(context_prompt_lookahead)
             # No-op for non 1-model

@@ -28,6 +28,7 @@ from typing import Optional
 import torch
 
 from ...sampling_params import SamplingParams
+from ..host_staging import copy_if_changed
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -166,6 +167,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     """
 
     SampleState = SampleStateSpec
+    # Store rows of the sampled requests in batch order; allocated on first use.
+    _sampling_slots: Optional[torch.Tensor] = None
 
     def is_generation_model(self) -> bool:
         return True
@@ -442,8 +445,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             for r in sampling_requests
         ]
 
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
-        slots = slots.to(device="cuda", non_blocking=True)
+        if self._sampling_slots is None:
+            self._sampling_slots = torch.empty_like(self.store.new_tokens_lens, dtype=torch.long)
+        slots = self._sampling_slots[:num_sampling_requests]
+        copy_if_changed(slots, [r.py_seq_slot for r in sampling_requests])
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
