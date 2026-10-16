@@ -2857,6 +2857,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             beta * tanh(x/beta) = beta * (2*sigmoid(2x/beta) - 1)
                                 = 2*beta*sigmoid((2/beta)*x) - beta
+
+        Keep the packed SiTU algebra in sync with the Rubin fused FC12
+        ``rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py`` epilogue.
         """
         beta = self.situ_beta
         linear_beta = self.situ_linear_beta
