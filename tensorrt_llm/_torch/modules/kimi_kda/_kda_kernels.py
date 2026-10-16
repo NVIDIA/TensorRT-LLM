@@ -599,6 +599,37 @@ def is_kda_mtp_verify_available() -> bool:
     return is_kda_optimized_supported() and is_intree_mtp_available()
 
 
+def kda_mtp_max_num_spec() -> int:
+    """Largest draft count the fused multi-token verify kernel supports."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+        MAX_NUM_SPEC,
+    )
+
+    return MAX_NUM_SPEC
+
+
+def kda_mtp_replay_num_spec(num_spec: int) -> Optional[int]:
+    """Draft count to size the KDA replay caches for, or ``None``.
+
+    ``None`` keeps the legacy intermediate verification buffers, so the
+    module runs the sequential FLA verify: either the fused kernel cannot
+    run here, or ``num_spec`` exceeds what it supports.
+    """
+    if not is_kda_mtp_verify_available():
+        return None
+    max_num_spec = kda_mtp_max_num_spec()
+    if num_spec > max_num_spec:
+        from tensorrt_llm.logger import logger
+
+        logger.warning_once(
+            f"KDA fused multi-token verify supports at most {max_num_spec} draft "
+            f"tokens, got {num_spec}; using the sequential FLA verify.",
+            key="kda_mtp_num_spec_fallback",
+        )
+        return None
+    return num_spec
+
+
 # ---------------------------------------------------------------------------
 # Dispatch API used by the KimiKDALinearAttention module.
 # ---------------------------------------------------------------------------

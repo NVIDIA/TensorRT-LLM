@@ -113,8 +113,12 @@ NUM_THREADS = 512
 # halved state store pays off); larger batches run one CTA per tile.
 SPLIT_MAX_TILES = 64
 TILE_K = 128
-# Chunk length padding (MMA N granularity); NUM_SPEC <= 7 -> T_loop <= 15.
+# Chunk length padding (MMA N granularity).
 T_PAD = 16
+# Largest draft count per verify: up to NUM_SPEC replayed drafts plus 1 + NUM_SPEC new tokens
+# must fit the padded chunk (2 * 7 + 1 = 15 <= T_PAD). The executor falls back to the
+# sequential verify for longer drafts.
+MAX_NUM_SPEC = (T_PAD - 1) // 2
 # TMEM columns: D4 (16) + D2 halves (2 x 64) + S0 hi (128) + S0 lo (128) + D1 (48) + D3 (16)
 # = 464 of the 512 allocated.
 TMEM_COLS = 512
@@ -507,7 +511,9 @@ def kda_decode_mtp_kernel(
     sDtBias = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)
     sAlog = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
     # ---- tensor-core chunk recurrence buffers ----
-    assert NUM_SPEC <= 7 and t_max <= T_PAD, "chunk form pads the token axis to 16"
+    assert NUM_SPEC <= MAX_NUM_SPEC and t_max <= T_PAD, (
+        f"chunk form pads the token axis to {T_PAD}: NUM_SPEC must be <= {MAX_NUM_SPEC}"
+    )
     tmem_holder = smem.allocate_array(cutlass.Int32, 1)
     mbar1 = smem.allocate_array(cutlass.Int64, 1)
     mbar2 = smem.allocate_array(cutlass.Int64, 1)

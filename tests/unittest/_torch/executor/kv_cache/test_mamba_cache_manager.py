@@ -385,6 +385,37 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
     assert kwargs["conv_state_layout"] == "q_k_v"
 
 
+@pytest.mark.parametrize("max_draft_len, replay_enabled", [(7, True), (8, False)])
+def test_kimi_kda_replay_respects_fused_verify_draft_limit(
+    monkeypatch: pytest.MonkeyPatch, max_draft_len: int, replay_enabled: bool
+) -> None:
+    """Draft lengths beyond the fused KDA verify kernel's limit keep the
+    legacy intermediate buffers (sequential FLA verify) instead of
+    allocating replay caches the kernel would reject."""
+    kda_kernels = "tensorrt_llm._torch.modules.kimi_kda._kda_kernels"
+    monkeypatch.setattr(f"{kda_kernels}.is_kda_mtp_verify_available", lambda: True)
+    monkeypatch.setattr(f"{kda_kernels}.kda_mtp_max_num_spec", lambda: 7)
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
+
+    if replay_enabled:
+        assert kwargs["kda_replay_num_spec"] == max_draft_len
+    else:
+        assert "kda_replay_num_spec" not in kwargs
+
+
+def test_kda_mtp_max_num_spec_fits_the_kernel_chunk() -> None:
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import T_PAD
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import kda_mtp_max_num_spec
+
+    max_num_spec = kda_mtp_max_num_spec()
+    # A verify chunk holds up to max_num_spec replayed drafts plus 1 + max_num_spec new tokens.
+    assert max_num_spec == 7
+    assert 2 * max_num_spec + 1 <= T_PAD
+
+
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3441,11 +3441,11 @@ def _create_kv_cache_manager(
                                     MambaHybridCacheManagerV2)
         if (spec_config is not None
                 and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
-            from ..modules.kimi_kda._kda_kernels import \
-                is_kda_mtp_verify_available
-            if is_kda_mtp_verify_available():
-                kda_extra_kwargs["kda_replay_num_spec"] = (
-                    spec_config.tokens_per_gen_step - 1)
+            from ..modules.kimi_kda._kda_kernels import kda_mtp_replay_num_spec
+            kda_replay_num_spec = kda_mtp_replay_num_spec(
+                spec_config.tokens_per_gen_step - 1)
+            if kda_replay_num_spec is not None:
+                kda_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
         if is_glm5_next:
             # The manager places an indexer buffer on every attention layer.
             from ..attention.backends.sparse.glm_kpool import \
