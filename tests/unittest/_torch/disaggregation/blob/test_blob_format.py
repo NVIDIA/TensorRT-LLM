@@ -75,6 +75,7 @@ def test_capabilities_are_declared_in_full() -> None:
     with pytest.raises(ValueError):
         DriverCapabilities(get=True, put=True, cancel=False, probe=False, max_rows_per_op=0)
     caps = DriverCapabilities(get=True, put=False, cancel=False, probe=False, max_rows_per_op=4)
+    assert caps.hints is False  # a capability added later defaults to not supported
     with pytest.raises(AttributeError):
         caps.put = True  # type: ignore[misc]
 

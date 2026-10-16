@@ -14,7 +14,12 @@ from __future__ import annotations
 import enum
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+Hint = Any
+"""The caller's hint for where a get or probe should look, handed to the driver unchanged. The
+backend passes a hint only to a driver that declares ``hints`` and rejects it before dispatch for
+any other, which therefore keeps its hint-free calls as they were."""
 
 
 class StoreError(Exception):
@@ -194,7 +199,11 @@ class ProbeStatus(enum.Enum):
 
 @dataclass(frozen=True)
 class DriverCapabilities:
-    """What a driver implements. Fixed for the driver's life; every field is declared.
+    """What a driver implements. Fixed for the driver's life.
+
+    A field whose default would grant something, such as an unlimited row count, is declared
+    explicitly. A capability added later defaults to not supported, so existing drivers need no
+    change to stay honest.
 
     Args:
         get: ``get`` is implemented.
@@ -202,6 +211,8 @@ class DriverCapabilities:
         cancel: ``cancel`` does something; without it the backend only suppresses unstarted work.
         probe: ``probe`` answers; without it the backend fetches blindly.
         max_rows_per_op: Rows one ``put``/``get`` accepts, or ``None`` for no limit.
+        hints: ``get`` and ``probe`` read a caller's hint; without it the backend rejects a hint
+            before dispatch and the driver is called without one.
     """
 
     get: bool
@@ -209,6 +220,7 @@ class DriverCapabilities:
     cancel: bool
     probe: bool
     max_rows_per_op: int | None
+    hints: bool = False
 
     def __post_init__(self) -> None:
         if not (self.get or self.put):
@@ -277,8 +289,13 @@ class StoreDriver(Protocol):
         """
         ...
 
-    def get(self, rows: Sequence[RowIO]) -> OpHandle:
-        """Fetch ``rows``; may return before any byte moved. Raises as ``put``."""
+    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
+        """Fetch ``rows``, from where ``hint`` says when given; may return before any byte moved.
+
+        Raises as ``put``. ``hint`` is passed only to a driver that declares ``hints``; the
+        backend rejects it before dispatch otherwise, and a driver may treat an unexpected hint
+        as a programming error.
+        """
         ...
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
@@ -309,13 +326,17 @@ class StoreDriver(Protocol):
         Called only when ``capabilities.cancel`` is set."""
         ...
 
-    def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
-        """Advisory presence of ``keys``, answered within ``budget_s`` seconds.
+    def probe(
+        self, keys: Sequence[str], budget_s: float, hint: Hint = None
+    ) -> tuple[ProbeStatus, ...]:
+        """Advisory presence of ``keys``, at the source ``hint`` names when given, answered within
+        ``budget_s`` seconds.
 
         Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within the
         budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
         once. A key held by an unfinished write is NOT_READY, as a get would report. Called only
-        when ``capabilities.probe`` is set. Raises on a store error rather than answering MISS.
+        when ``capabilities.probe`` is set, and with a hint only when ``capabilities.hints`` is.
+        Raises on a store error rather than answering MISS.
         """
         ...
 
