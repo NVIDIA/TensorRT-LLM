@@ -18,6 +18,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
+    append_paged_state_rows,
+    compact_sparse_rows,
     kpool_expand,
     kpool_score,
     kpool_update,
@@ -641,3 +643,92 @@ def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatc
             expected = torch.arange(max(0, count - 512), count, dtype=torch.int32)
             assert torch.equal(valid, expected)
             assert int((actual == -1).sum()) == 512 - min(count, 512)
+
+
+@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("tokens_per_request", [1, 4])
+def test_append_paged_state_rows_matches_indexed_writes(latent_dtype, tokens_per_request):
+    """One launch writes the latent (quantized for FP8) and packed state of each
+    generation row into its paged slot, bit-exact with indexed writes."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import paged_slot_indices
+
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    requests, pages, slots, latent_dim = 6, 6, 40, 512
+    table = _paged_tables(requests, pages, slots, gen)
+    first = torch.randint(
+        0, pages * TPB - tokens_per_request, (requests, 1), generator=gen, device="cuda"
+    )
+    positions = first + torch.arange(tokens_per_request, device="cuda")
+    # Strided rows, like slices of a fused projection output.
+    latent = (
+        torch.randn(requests, tokens_per_request, latent_dim + 64, generator=gen, device="cuda")
+        * 50
+    ).to(torch.bfloat16)[..., :latent_dim]
+    packed = torch.randn(requests, tokens_per_request, 2 * HD, generator=gen, device="cuda").to(
+        torch.bfloat16
+    )
+    scale = torch.tensor([0.7], device="cuda")
+
+    def pools():
+        # Coalesced layer pages: foreign buffers sit between this layer's slots.
+        latent_pool = torch.zeros(slots, 2, TPB, latent_dim, device="cuda").to(latent_dtype)[:, 0]
+        index_pool = torch.zeros(slots, 3, TPB, 3 * HD, device="cuda", dtype=torch.bfloat16)[:, 1]
+        return latent_pool, index_pool
+
+    want_latent, want_index = pools()
+    page, offset = paged_slot_indices(table, positions, TPB)
+    if latent_dtype == torch.float8_e4m3fn:
+        quantized = (latent.float() * scale).clamp(-448, 448).to(latent_dtype)
+        want_latent.view(torch.uint8)[page, offset] = quantized.view(torch.uint8)
+    else:
+        want_latent[page, offset] = latent
+    want_index[page, offset, : 2 * HD] = packed
+
+    got_latent, got_index = pools()
+    append_paged_state_rows(latent, packed, positions, table, got_latent, got_index, TPB, scale)
+    assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
+    assert torch.equal(got_index, want_index)
+
+
+@pytest.mark.parametrize("tokens_per_request", [2, 4])
+def test_pool_key_refresh_draft_positions_match_sequential_updates(tokens_per_request):
+    """[N, T] draft positions in one launch equal T ordered single-position updates."""
+    gen = torch.Generator(device="cuda").manual_seed(8)
+    requests, pages, slots = 5, 6, 40
+    pool = _strided_index_pool(slots, gen)
+    table = _paged_tables(requests, pages, slots, gen)
+    first = torch.randint(
+        0, pages * TPB - tokens_per_request, (requests, 1), generator=gen, device="cuda"
+    )
+    positions = first + torch.arange(tokens_per_request, device="cuda")
+    ape = torch.randn(KPOOL, HD, generator=gen, device="cuda").to(torch.bfloat16)
+
+    sequential = pool.clone()
+    for step in range(tokens_per_request):
+        kpool_update(
+            sequential, table, positions[:, step].contiguous(), ape, TPB, head_dim=HD, kpool=KPOOL
+        )
+    batched = pool.clone()
+    kpool_update(batched, table, positions, ape, TPB, head_dim=HD, kpool=KPOOL)
+    assert torch.equal(batched, sequential)
+
+
+@pytest.mark.parametrize("width", [5, 64, 2052])
+def test_compact_sparse_rows_tail_and_empty_rows(width):
+    """Valid indices move to the front with a -1 tail; empty rows get one dummy index."""
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    rows = 7
+    indices = torch.randint(
+        -1, 1000, (rows, width), generator=gen, device="cuda", dtype=torch.int32
+    )
+    indices[3] = -1
+    packed, lengths, nonempty = compact_sparse_rows(indices)
+    for row in range(rows):
+        values = indices[row][indices[row] >= 0]
+        expected = torch.full((packed.shape[1],), -1, dtype=torch.int32, device="cuda")
+        expected[: values.numel()] = values
+        if values.numel() == 0:
+            expected[0] = 0
+        assert torch.equal(packed[row], expected)
+        assert int(lengths[row]) == max(values.numel(), 1)
+        assert bool(nonempty[row]) == (values.numel() > 0)
