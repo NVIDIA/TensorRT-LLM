@@ -1335,6 +1335,35 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def multiGpuLabelGateOpen = multiGpuRequired &&
             _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
         def coverageShadow = result.scope == "coverage" && !coveragePilotEligible
+        // Applied decisions pass the uploaded test DB to L0_Test. Shadow
+        // decisions save the same artifact but return null below, so L0_Test
+        // keeps using the baseline test DB.
+        if (result.test_db_dir_override || coverageShadow) {
+            try {
+                def archiveFiles = []
+                if (result.test_db_dir_override) {
+                    archiveFiles.add(result.test_db_dir_override)
+                }
+                if (coverageShadow) {
+                    writeFile file: "${LLM_ROOT}/cbts_shadow_decision.json", text: output
+                    archiveFiles.add("cbts_shadow_decision.json")
+                }
+                // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
+                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${archiveFiles.join(' ')}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
+                pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
+                if (coverageShadow) {
+                    def reportedDecision = new groovy.json.JsonSlurper().parseText(output)
+                    reportedDecision.shadow_selection_artifact_path = result.cbts_test_db_artifact_path
+                    output = groovy.json.JsonOutput.toJson(reportedDecision)
+                }
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS Layer 3: artifact upload failed (non-fatal): ${e.message}")
+            }
+        }
         if (coverageShadow) {
             pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
                           "stages=${result.affected_stages.size()}; baseline remains active")
@@ -1342,26 +1371,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                                 multiGpuRequired, multiGpuLabelGateOpen, false,
                                 coveragePilotEligible)
             return null
-        }
-        // Upload the generated cbts_test_db/ to Artifactory so each L0_Test
-        // stage agent can download it directly instead of re-running main.py
-        // with the raw PR diff. This avoids passing large payloads as Jenkins
-        // parameters (env vars), which caused "Argument list too long" failures
-        // when diffs were large. Agents fall back to the source test-db if the
-        // download fails.
-        if (result.test_db_dir_override) {
-            try {
-                // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
-                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
-                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
-                result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
-                pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
-            } catch (InterruptedException e) {
-                throw e
-            } catch (Exception e) {
-                pipeline.echo("CBTS Layer 3: artifact upload failed (${e.message}); " +
-                              "agents will fall back to source test-db")
-            }
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
