@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Local GPU QA: exercise the optimized backends, not a reference fallback."""
 
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,19 +30,28 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 
 
 @pytest.mark.parametrize(
-    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
-)
-@pytest.mark.parametrize(
-    "high_dtype,compute_dtype,width,query_heads,heads,kv_layout",
+    "backend,high_dtype,compute_dtype,width,query_heads,heads,kv_layout,fp8_input",
     [
-        (DataType.HALF, torch.float16, 64, 2, 2, "HND"),
-        (DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD"),
-        (DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD"),
+        (TrtllmAttention, DataType.HALF, torch.float16, 64, 2, 2, "HND", False),
+        (TrtllmAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD", False),
+        (TrtllmAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", False),
+        (FlashInferAttention, DataType.HALF, torch.float16, 64, 2, 2, "HND", False),
+        (FlashInferAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD", False),
+        (FlashInferAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", False),
+        (FlashInferAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", True),
     ],
-    ids=("mha_fp16", "gqa_bf16_nhd", "mqa_fp8_nhd"),
+    ids=[
+        "mha_fp16-trtllm",
+        "gqa_bf16_nhd-trtllm",
+        "mqa_fp8_nhd-trtllm",
+        "mha_fp16-flashinfer",
+        "gqa_bf16_nhd-flashinfer",
+        "mqa_fp8_nhd-flashinfer",
+        "mqa_fp8_nhd-flashinfer-fused_fp8",
+    ],
 )
 def test_optimized_two_pool_prefill_and_decode(
-    backend, high_dtype, compute_dtype, width, query_heads, heads, kv_layout
+    backend, high_dtype, compute_dtype, width, query_heads, heads, kv_layout, fp8_input
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for native KVCM")
@@ -60,7 +70,6 @@ def test_optimized_two_pool_prefill_and_decode(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=high_dtype,
         low_dtype=DataType.NVFP4,
-        compute_dtype=compute_dtype,
         high_low_pool_ratio=1 / 3,
         first_n=128,
         last_n=128,
@@ -72,24 +81,33 @@ def test_optimized_two_pool_prefill_and_decode(
         )
         for count in (query_heads, heads, heads)
     ]
-    quant_config = QuantConfig(kv_cache_quant_algo="FP8" if high_dtype == DataType.FP8 else "NVFP4")
+    if high_dtype == DataType.FP8:
+        query = query.to(torch.float8_e4m3fn).to(compute_dtype)
+    if fp8_input:
+        key, value = [tensor.to(torch.float8_e4m3fn).to(compute_dtype) for tensor in (key, value)]
+    quant_config = QuantConfig(kv_cache_quant_algo="FP8" if high_dtype == DataType.FP8 else None)
     original_config = quant_config.model_dump()
     original_quant_mode = quant_config.quant_mode
+    original_layer_quant_mode = quant_config.layer_quant_mode
     attention = backend(
         layer_idx=0,
         num_heads=query_heads,
         head_dim=width,
         num_kv_heads=heads,
         quant_config=quant_config,
+        **({"flashinfer_backend": "trtllm-gen"} if fp8_input else {}),
     )
-    scale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    selection_cache = attention._fmha_manager if backend is TrtllmAttention else None
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
     module = SimpleNamespace(
         attn=attention,
         mapping=manager.mapping,
-        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
-        qkv_proj=SimpleNamespace(kv_scales=scale, inv_kv_scales=scale.reciprocal()),
+        quant_config=quant_config,
+        sparse_attn_hooks=None,
+        register_to_config=False,
         _use_quantize_output=lambda: False,
     )
+    module._attn_impl = partial(Attention._attn_impl, module)
     decode_graph = None
 
     def forward(begin, end, context):
@@ -109,17 +127,19 @@ def test_optimized_two_pool_prefill_and_decode(
             runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
         )
         metadata.prepare()
+        assert metadata.mixed_precision_kv_views[0].pool.dtype == high_torch_dtype
         q, k, v = [
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
         ]
+        input_dtype = torch.float8_e4m3fn if fp8_input else compute_dtype
         inputs = (
             (torch.cat((q, k, v), dim=-1), None, None)
             if backend is TrtllmAttention
-            else (q.clone(), k.clone(), v.clone())
+            else tuple(tensor.to(input_dtype, copy=True) for tensor in (q, k, v))
         )
 
         def run():
-            return Attention._attn_impl(
+            return Attention.forward_impl(
                 module,
                 *inputs,
                 metadata,
@@ -127,8 +147,7 @@ def test_optimized_two_pool_prefill_and_decode(
                 None,
                 None,
                 None,
-                None,
-            )[0]
+            )
 
         output = run()
         if not context and high_dtype == DataType.BF16:
@@ -155,27 +174,32 @@ def test_optimized_two_pool_prefill_and_decode(
     def token_major(pool):
         return pool.transpose(2, 3) if kv_layout == "HND" else pool
 
-    def assert_staging_config() -> None:
+    def assert_native_config() -> None:
         assert quant_config.model_dump() == original_config
         assert quant_config.quant_mode is original_quant_mode
-        assert attention.quant_config is not quant_config
-        assert attention.quant_config.kv_cache_quant_algo is None
-        assert int(attention.quant_config.layer_quant_mode) == 0
-        assert not attention.quant_config.quant_mode.has_fp8_kv_cache()
-        assert not attention.quant_config.quant_mode.has_fp4_kv_cache()
-        assert not attention.has_fp8_kv_cache
+        assert quant_config.layer_quant_mode == original_layer_quant_mode
+        assert attention.quant_config is quant_config
+        assert attention.has_fp8_kv_cache == (high_dtype == DataType.FP8)
         if backend is TrtllmAttention:
-            assert attention.quant_mode == 0
+            assert attention.quant_mode == int(original_layer_quant_mode)
             assert not attention.has_fp4_kv_cache
-            assert attention.local_layer_idx == 0
+            assert attention._fmha_manager is selection_cache
 
     try:
         manager.add_dummy_requests(request_ids, [length] * batch, is_gen=False)
         output = forward(0, length, True)
         reference = torch.nn.functional.scaled_dot_product_attention(
             query[:, :length].reshape(batch, length, query_heads, width).transpose(1, 2),
-            key[:, :length].reshape(batch, length, heads, width).transpose(1, 2),
-            value[:, :length].reshape(batch, length, heads, width).transpose(1, 2),
+            key[:, :length]
+            .to(high_torch_dtype)
+            .to(compute_dtype)
+            .reshape(batch, length, heads, width)
+            .transpose(1, 2),
+            value[:, :length]
+            .to(high_torch_dtype)
+            .to(compute_dtype)
+            .reshape(batch, length, heads, width)
+            .transpose(1, 2),
             is_causal=True,
             enable_gqa=True,
         )
@@ -187,9 +211,8 @@ def test_optimized_two_pool_prefill_and_decode(
         scales_before = token_major(
             manager.get_mixed_precision_buffers(0, request_ids, kv_layout)[1][0]
         ).clone()
-        assert_staging_config()
+        assert_native_config()
         if backend is TrtllmAttention:
-            selection_cache = attention._fmha_manager
             assert selection_cache is not None
         target, implementation = (
             (selection_cache, "select")
@@ -199,9 +222,7 @@ def test_optimized_two_pool_prefill_and_decode(
         with patch.object(target, implementation, side_effect=RuntimeError("test failure")):
             with pytest.raises(RuntimeError, match="test failure"):
                 forward(0, length, True)
-        assert_staging_config()
-        if backend is TrtllmAttention:
-            assert attention._fmha_manager is selection_cache
+        assert_native_config()
         torch.testing.assert_close(
             token_major(manager.get_buffers(0, kv_layout=kv_layout)), history_before, rtol=0, atol=0
         )
@@ -214,9 +235,7 @@ def test_optimized_two_pool_prefill_and_decode(
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
         assert manager._staging_buffer.data_ptr() == arena
-        assert_staging_config()
-        if backend is TrtllmAttention:
-            assert attention._fmha_manager is selection_cache
+        assert_native_config()
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
         all_history_ids = manager.get_batch_cache_indices(request_ids, 0)
         (high, all_high_ids), (scales, all_scale_ids) = manager.get_mixed_precision_buffers(
@@ -230,12 +249,17 @@ def test_optimized_two_pool_prefill_and_decode(
             reference = []
             for role, tensor in enumerate((key, value)):
                 original = tensor[row].view(-1, heads, width)
+                high_values = original.to(high_torch_dtype).to(compute_dtype)
                 packed, scale_bytes = torch.ops.trtllm.fp4_quantize(
-                    original.contiguous(), scale.reciprocal(), 16, False, False
+                    high_values.contiguous(), scale, 16, False, False
                 )
                 scale_bytes = scale_bytes.view(length + 1, heads, width // 16)
-                low = _reference_dequant(packed, scale_bytes, scale).to(compute_dtype)
-                high_values = original.to(high_torch_dtype).to(compute_dtype)
+                low = (
+                    _reference_dequant(packed, scale_bytes, scale)
+                    .to(compute_dtype)
+                    .to(high_torch_dtype)
+                    .to(compute_dtype)
+                )
                 expected = low.clone()
                 for position in range(length + 1):
                     ordinal, offset = divmod(position, block)
@@ -259,8 +283,8 @@ def test_optimized_two_pool_prefill_and_decode(
                             rtol=0,
                             atol=0,
                         )
-                # The current step reads the fresh K/V before storing either copy.
-                expected[-1] = original[-1]
+                # New tokens use the native KV representation before NVFP4 storage.
+                expected[-1] = high_values[-1]
                 reference.append(expected.transpose(0, 1)[None])
             for ordinal in range(length // block):
                 torch.testing.assert_close(
@@ -358,7 +382,7 @@ def test_mixed_precision_public_options():
     "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
 )
 @torch.inference_mode()
-def test_mla_uses_independent_rope_and_native_attention(backend):
+def test_mla_preserves_native_rope_and_attention(backend):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     from tensorrt_llm._torch.attention.backends.interface import (
@@ -381,7 +405,6 @@ def test_mla_uses_independent_rope_and_native_attention(backend):
         max_batch_size=1,
         mapping=Mapping(),
         dtype=DataType.BF16,
-        compute_dtype=torch.bfloat16,
         first_n=128,
         last_n=128,
         high_low_pool_ratio=1 / 3,
@@ -436,25 +459,11 @@ def test_mla_uses_independent_rope_and_native_attention(backend):
                 ),
             )
             metadata.prepare()
+            assert metadata.mixed_precision_kv_views[0].pool.dtype == torch.bfloat16
             output = hidden.new_empty((end - begin, 16 * 128))
-            # These fused writes would target the stored layout before conversion.
-            with (
-                patch.object(
-                    model.mha,
-                    "mla_rope_append_paged_kv_assign_q",
-                    side_effect=AssertionError("fused write"),
-                    create=True,
-                ),
-                patch.object(
-                    model.mqa,
-                    "mla_rope_generation",
-                    side_effect=AssertionError("fused write"),
-                    create=True,
-                ),
-            ):
-                model.forward_impl(
-                    torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
-                )
+            model.forward_impl(
+                torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
+            )
             assert torch.isfinite(output).all()
             assert metadata.kv_cache_manager is manager
         (high, ids), _ = manager.get_mixed_precision_buffers(0, [0], "NHD")

@@ -47,7 +47,6 @@ def manager(request):
         mapping=Mapping(),
         dtype=high_dtype,
         low_dtype=history_dtype,
-        compute_dtype=torch.bfloat16,
         high_low_pool_ratio=1 / 3,
         first_n=1,
         last_n=65,
@@ -107,7 +106,6 @@ def test_native_swa_and_shared_kv_keep_original_storage(dtype):
         mixed = MixedPrecisionKVCacheManager(
             config,
             CacheType.SELF,
-            compute_dtype=torch.bfloat16,
             high_low_pool_ratio=1,
             first_n=128,
             last_n=128,

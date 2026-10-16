@@ -3286,7 +3286,6 @@ def _create_kv_cache_manager(
         manager_extra_kwargs.update(
             first_n=kv_cache_config.first_n,
             last_n=kv_cache_config.last_n,
-            compute_dtype=dtype,
             high_low_pool_ratio=kv_cache_config.high_low_pool_ratio,
         )
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):

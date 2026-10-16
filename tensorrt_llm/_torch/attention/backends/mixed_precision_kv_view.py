@@ -17,30 +17,31 @@ import torch
 from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
+from .interface import AttentionMetadata
+
 if TYPE_CHECKING:
     from .flashinfer import FlashInferAttentionMetadata
-    from .interface import AttentionBackend
     from .trtllm import TrtllmAttentionMetadata
 
 
-def configure_mixed_precision_attention(attention: "AttentionBackend") -> None:
-    """Bind an eligible layer's backend to its FP16/BF16 staging cache."""
-    from .trtllm import TrtllmAttention
+def create_mixed_precision_kv_views(
+    metadata: AttentionMetadata,
+) -> "dict[int, MixedPrecisionKVView] | None":
+    """Create per-layer views only for a mixed-precision cache manager."""
+    return {} if isinstance(metadata.kv_cache_manager, MixedPrecisionKVCacheManager) else None
 
-    quant_config = attention.quant_config
-    if quant_config is not None and quant_config.layer_quant_mode.has_kv_cache_quant():
-        quant_config = copy.copy(quant_config)
-        quant_config.kv_cache_quant_algo = None
-        # Both cached properties must describe the staging representation.
-        quant_config.__dict__.pop("quant_mode", None)
-        quant_config.__dict__.pop("layer_quant_mode", None)
-        attention.update_quant_config(quant_config)
-    if isinstance(attention, TrtllmAttention):
-        attention.local_layer_idx = 0
+
+def get_mixed_precision_kv_view(
+    metadata: AttentionMetadata, layer_idx: int
+) -> "MixedPrecisionKVView | None":
+    """Return the optional mixed-precision view for this layer."""
+    views = getattr(metadata, "mixed_precision_kv_views", None)
+    return None if views is None else views.get(layer_idx)
 
 
 def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Store the high copy without passing it through NVFP4."""
+    """Convert restored history to the native KV storage format."""
     if dtype == torch.float8_e4m3fn and values.dtype != dtype:
         values, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             values.contiguous(), torch.ones(1, dtype=torch.float32, device=values.device)
@@ -51,21 +52,6 @@ def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.
 
 class MixedPrecisionKVView:
     """Present temporary paged KV to Attention and return new writes to its pools."""
-
-    def prepare(
-        self,
-        attention: "AttentionBackend",
-        *,
-        history_dequant_scale: torch.Tensor | None = None,
-    ) -> None:
-        from .trtllm import TrtllmAttention
-
-        configure_mixed_precision_attention(attention)
-        if history_dequant_scale is None and isinstance(attention, TrtllmAttention):
-            history_dequant_scale = attention.kv_scale_quant_orig
-        if history_dequant_scale is not None:
-            self.history_scale.copy_(history_dequant_scale)
-        self.materialize()
 
     @classmethod
     def prepare_batch(
@@ -114,7 +100,7 @@ class MixedPrecisionKVView:
         self.page_starts = [row * self.max_blocks_per_seq for row in range(metadata.num_seqs + 1)]
         shape = [self.page_starts[-1], *self.high.shape[1:]]
         shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
-        self.pool = manager.get_staging_buffer(shape, manager.compute_dtype)
+        self.pool = manager.get_staging_buffer(shape, self.high.dtype)
         self.history_scale = torch.ones(1, dtype=torch.float32, device=self.pool.device)
         self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
@@ -174,10 +160,17 @@ class MixedPrecisionKVView:
         new_rows = self._indices["read_new"].numel()
         self.read_low = workspace("mixed_read_low", low_rows, width // 2, torch.uint8)
         self.read_scales = workspace("mixed_read_scales", low_rows, width // 16, torch.uint8)
-        self.restored_low = workspace("mixed_restored_low", low_rows, width, self.pool.dtype)
+        # The NVFP4 codec accepts FP16/BF16 buffers. Attention still sees the native KV dtype.
+        self.restored_low = workspace(
+            "mixed_restored_low", low_rows, width, manager.conversion_dtype
+        )
         self.read_high = workspace("mixed_read_high", high_rows, width, self.high.dtype)
-        self.restored_high = workspace("mixed_restored_high", high_rows, width, self.pool.dtype)
         self.new_values = workspace("mixed_new", new_rows, width, self.pool.dtype)
+        self.new_low_input = (
+            self.new_values
+            if self.pool.dtype == manager.conversion_dtype
+            else workspace("mixed_new_low_input", new_rows, width, manager.conversion_dtype)
+        )
         self.new_low = workspace("mixed_new_low", new_rows, width // 2, torch.uint8)
         self.new_scales = workspace("mixed_new_scales", new_rows, width // 16, torch.uint8)
 
@@ -206,7 +199,7 @@ class MixedPrecisionKVView:
                 self._indices["block_offsets"] = torch.empty_like(offsets, device=self.pool.device)
             self._indices["block_offsets"].copy_(offsets, non_blocking=True)
             self.metadata.kv_cache_block_offsets = self._indices["block_offsets"]
-        self.metadata.mixed_precision_kv_views = {}
+        self.metadata.mixed_precision_kv_views = None
 
     def materialize(self) -> None:
         from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
@@ -218,11 +211,11 @@ class MixedPrecisionKVView:
             get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
                 self.read_low, self.read_scales, self.history_scale, self.restored_low
             )
-            self._scatter(self.pool, "restore_low", self.restored_low)
+            restored = encode_high_precision_kv(self.restored_low, self.pool.dtype)
+            self._scatter(self.pool, "restore_low", restored)
         if self.read_high.numel():
             self._gather(self.high, "read_high", self.read_high)
-            self.restored_high.copy_(self.read_high)
-            self._scatter(self.pool, "restore_high", self.restored_high)
+            self._scatter(self.pool, "restore_high", self.read_high)
 
     @property
     def dtype(self) -> DataType:
@@ -334,10 +327,10 @@ class MixedPrecisionKVView:
         if not self.new_values.numel():
             return
         self._gather(self.pool, "read_new", self.new_values)
+        self.new_low_input.copy_(self.new_values)
         get_fp4_kv_quantization_module().nvfp4_kv_quant(
-            self.new_values, self.history_scale, self.new_low, self.new_scales
+            self.new_low_input, self.history_scale, self.new_low, self.new_scales
         )
         self._scatter(self.history, "write_low", self.new_low)
         self._scatter(self.scales, "write_scales", self.new_scales)
-        high_values = encode_high_precision_kv(self.new_values, self.high.dtype)
-        self._scatter(self.high, "write_high", high_values)
+        self._scatter(self.high, "write_high", self.new_values)

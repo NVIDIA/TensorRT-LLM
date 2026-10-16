@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
-    from .mixed_precision_kv_view import MixedPrecisionKVView
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
@@ -41,8 +40,6 @@ from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.kv_cache.kv_cache_manager_v2 import \
-    MixedPrecisionKVCacheManager
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
@@ -53,6 +50,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .mixed_precision_kv_view import (MixedPrecisionKVView,
+                                      create_mixed_precision_kv_views)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -140,8 +139,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
-    mixed_precision_kv_views: dict[int, "MixedPrecisionKVView"] = field(
-        init=False, default_factory=dict, repr=False, compare=False)
+    mixed_precision_kv_views: dict[int, MixedPrecisionKVView] | None = field(
+        init=False, default=None, repr=False, compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -373,7 +372,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
-        self.mixed_precision_kv_views = {}
+        self.mixed_precision_kv_views = create_mixed_precision_kv_views(self)
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1142,8 +1141,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
-        if isinstance(self.kv_cache_manager, MixedPrecisionKVCacheManager):
-            from .mixed_precision_kv_view import MixedPrecisionKVView
+        if self.mixed_precision_kv_views is not None:
             MixedPrecisionKVView.prepare_batch(self)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
@@ -2281,14 +2279,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert forward_args.latent_cache is not None
             from ...pyexecutor.kv_cache.mamba_cache_manager import \
                 BaseMambaCacheManager
-            from .mixed_precision_kv_view import MixedPrecisionKVView
 
             # Hybrid (mamba/masked-layer) KV managers take the graph-safe
             # append; the same predicate interface.py uses to detect hybrid
             # managers for mamba metadata. Dense MLA models keep the
             # host-side path unchanged.
-            if isinstance(metadata.kv_cache_manager,
-                          (BaseMambaCacheManager, MixedPrecisionKVView)):
+            if isinstance(metadata.kv_cache_manager, BaseMambaCacheManager):
                 from .utils import \
                     append_mla_latent_cache_generation_cuda_graph_safe
 
