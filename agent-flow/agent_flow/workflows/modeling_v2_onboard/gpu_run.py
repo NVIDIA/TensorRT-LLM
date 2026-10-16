@@ -225,10 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         os.write(fd, note.encode())
     print(f"[gpu_run] job {job} GPUs {gpus}", flush=True)
     mounts = ",".join(f"{path}:{path}" for path in pool["container_mounts"])
-    if pool.get("setup"):
-        inner = ["bash", pool["setup"], str(worktree), *args.command]
-    else:
-        inner = ["bash", "-c", 'cd "$1" && shift && exec "$@"', "_", str(worktree), *args.command]
+    inner = ["bash", "-c", 'cd "$1" && shift && exec "$@"', "_", str(worktree), *args.command]
     srun = [
         "srun",
         f"--jobid={job}",

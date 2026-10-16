@@ -172,9 +172,12 @@ and frees the GPUs when the command ends.
 - Never run TensorRT-LLM code on the login node: only a pool command is
   evidence.
 
-A fresh worktree has no native build artifacts. When `implements_tips` or
-`test_commands.md` give a way to reuse an existing build, use it; the pool may
-already do it for every command. `test_commands.md` in the workspace is a
+A fresh worktree has no native build artifacts, and the container knows
+nothing of the run's Python environment or model paths. The run's
+environment task writes a wrapper that prepares both and records it in
+`test_commands.md`: run your commands through it (`<gpu_run ...> bash
+<wrapper> <command...>`); if it is not recorded yet, write code and wait for
+it rather than building your own. `test_commands.md` in the workspace is a
 cache of commands other tasks have **verified** to work: read it before
 drafting a command, add or update an entry after one works (a one-line
 purpose, then the exact command), and delete entries you find broken. Other

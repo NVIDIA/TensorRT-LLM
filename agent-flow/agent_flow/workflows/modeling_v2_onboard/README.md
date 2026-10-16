@@ -127,9 +127,10 @@ which waits for N free GPUs on one holder job with at least M more minutes
 container, in the worktree, with `CUDA_VISIBLE_DEVICES` set. Waiting commands
 are served by the task's class in `gpu_priorities.json` (`accuracy`, then
 `feature`, then `perf`; first come first served within one), and `perf` work
-leaves the last `reserve` free GPUs alone. A `setup` script, when given, runs
-the command as `setup <worktree> <command...>` to prepare the environment
-(for example linking a built checkout's native libraries into the worktree).
+leaves the last `reserve` free GPUs alone. Preparing the environment inside
+the container (linking a built checkout's native libraries, the venv, model
+paths) is work for the planner's first batch: a worker writes the wrapper the
+other tasks then run their commands through.
 
 ## Side tasks
 

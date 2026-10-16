@@ -41,9 +41,9 @@ def test_pool_config_defaults_to_the_slurm_environment():
 
 def test_pool_config_lists_every_problem():
     with pytest.raises(PoolConfigError) as exc:
-        pool_config(_task(nodes=-1, account=None, hours=0, extra=1, setup="/absent.sh"))
+        pool_config(_task(nodes=-1, account=None, hours=0, extra=1))
     message = str(exc.value)
-    for problem in ("nodes", "account", "hours", "`gpu_pool.extra`", "setup"):
+    for problem in ("nodes", "account", "hours", "`gpu_pool.extra`"):
         assert problem in message
 
 
@@ -139,7 +139,7 @@ def test_waiters_are_served_by_class_then_by_arrival():
 
 
 def test_gpu_run_runs_the_command_in_the_worktree_on_locked_gpus(tmp_path, monkeypatch):
-    pool = _pool(tmp_path, _Slurm(), setup=None)
+    pool = _pool(tmp_path, _Slurm())
     pool.write()
     (tmp_path / "ws" / "gpu_priorities.json").write_text(json.dumps({"op-a": "accuracy"}))
     monkeypatch.setattr(gpu_run, "_holder_jobs", lambda name: [("4242", 10**6)])

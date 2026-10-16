@@ -27,7 +27,6 @@ trtllm_repo_path:    /path/to/TensorRT-LLM
 #     hours: 24                 # time limit of one holder job; default 24
 #     reserve: 2                # free GPUs perf work may not take; default 2
 #     container_mounts: [/path/to/models]   # besides the workspace and checkout
-#     setup: /path/to/setup.sh  # optional: runs `setup.sh <worktree> <command...>`
 
 # What the run must prove. The planner plans the tasks that prove each item,
 # and the run ends when they are DONE.

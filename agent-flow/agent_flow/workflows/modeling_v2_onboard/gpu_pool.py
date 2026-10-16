@@ -58,9 +58,6 @@ class PoolConfig:
         reserve: Free GPUs that ``perf`` work may not take.
         container_image: The container every command runs in.
         container_mounts: Paths mounted at the same path in the container.
-        setup: A script run in the container as ``setup <worktree> <command...>``
-            that prepares the environment and runs the command; without one, the
-            command runs in the worktree as is.
     """
 
     nodes: int
@@ -72,7 +69,6 @@ class PoolConfig:
     hours: float = 24
     reserve: int = 2
     container_mounts: tuple[str, ...] = ()
-    setup: str | None = None
 
 
 def pool_config(task_data: dict) -> PoolConfig | None:
@@ -97,7 +93,6 @@ def pool_config(task_data: dict) -> PoolConfig | None:
         "hours",
         "reserve",
         "container_mounts",
-        "setup",
     }
     problems += [f"`gpu_pool.{key}` is not a known field" for key in sorted(set(raw) - known)]
 
@@ -136,9 +131,6 @@ def pool_config(task_data: dict) -> PoolConfig | None:
     if not isinstance(mounts, list) or not all(isinstance(m, str) and m for m in mounts):
         problems.append("`gpu_pool.container_mounts` must be a list of paths")
         mounts = []
-    setup = text("setup", None)
-    if setup is not None and not Path(setup).is_file():
-        problems.append(f"`gpu_pool.setup` does not exist: {setup}")
     if problems:
         raise PoolConfigError("; ".join(problems))
     if nodes == 0:
@@ -153,7 +145,6 @@ def pool_config(task_data: dict) -> PoolConfig | None:
         hours=float(hours),
         reserve=reserve,
         container_mounts=tuple(mounts),
-        setup=setup,
     )
 
 

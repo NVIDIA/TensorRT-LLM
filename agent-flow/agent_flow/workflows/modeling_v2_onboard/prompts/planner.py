@@ -173,8 +173,14 @@ wait for it is lost. So write the plan in batches:
 - **First batch, before the deep reading.** Read `task.yaml`, the
   checkpoint's `config.json` and the ModelingV2 README, then write the tasks
   that need nothing more to be defined, and end the turn. These include:
-  - setting up the execution environment: the build, the container, the
-    GPU commands for `test_commands.md` and how to monitor long jobs;
+  - the execution environment, one task: from `task.yaml` (its
+    `slurm-environment` and `implements_tips`), write the wrapper every GPU
+    command runs through inside the container — reusing an existing build
+    instead of compiling, the Python environment, model paths, environment
+    variables — into a `tools/` directory next to `plan.md`, prove it with a
+    GPU smoke run, and record the verified commands in `test_commands.md`.
+    Other tasks do not depend on it: they write code meanwhile and take the
+    wrapper from `test_commands.md` before their first GPU run;
   - reviewing the contracts this target must meet (ModelingV2 entries,
     CUDA-graph capture, CPU/GPU overlap) against what the checkpoint needs,
     and recording the gaps in a task result;
