@@ -366,7 +366,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     # `mamba_ssm_cache_dtype` is float32 because the checkpoint declares
     # `mamba_ssm_dtype: float32` (the engine default is bfloat16); the bf16-state cases
     # set it to bfloat16. `dtype` is left at the checkpoint's bf16 KV, which is what the
-    # anchors were measured at; only the fp8 KV cases set it.
+    # anchors were measured at; only the fp8 and NVFP4 KV cases set it.
     KV_CACHE = KvCacheConfig(
         free_gpu_memory_fraction=0.6,
         enable_block_reuse=True,
@@ -379,6 +379,14 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     )
     KV_CACHE_FP8 = KvCacheConfig(
         dtype="fp8",
+        free_gpu_memory_fraction=0.6,
+        enable_block_reuse=True,
+        mamba_ssm_cache_dtype="float32",
+    )
+    # Block reuse is on, which (with chunked prefill and the MTP drafts) is what lets the
+    # attention op read an NVFP4 pool: its kernels exist for the paged-context path only.
+    KV_CACHE_NVFP4 = KvCacheConfig(
+        dtype="nvfp4",
         free_gpu_memory_fraction=0.6,
         enable_block_reuse=True,
         mamba_ssm_cache_dtype="float32",
@@ -424,6 +432,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     # target and variant.
     ACCEPTANCE_KEY = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1"
     ACCEPTANCE_KEY_FP8_KV = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_fp8_kv"
+    ACCEPTANCE_KEY_NVFP4_KV = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_nvfp4_kv"
     ACCEPTANCE_KEY_MTP3 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3"
     ACCEPTANCE_KEY_MTP3_CUTEDSL = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl"
     ACCEPTANCE_KEY_MTP5 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp5"
@@ -436,6 +445,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     ACCEPTANCE_KEY_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_long_context"
     ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT = (
         "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_fp8_kv_long_context"
+    )
+    ACCEPTANCE_KEY_NVFP4_KV_LONG_CONTEXT = (
+        "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_nvfp4_kv_long_context"
     )
     ACCEPTANCE_KEY_GDN_LEGACY = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_gdn_legacy"
 
@@ -554,6 +566,20 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_FP8)
         self._gsm8k_with_acceptance(
             mocker, monkeypatch, engine, self.MTP1, self.ACCEPTANCE_KEY_FP8_KV, "mtp1 fp8 kv"
+        )
+
+    @skip_not_sm103
+    def test_mtp1_nvfp4_kv_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """MTP with one draft over an NVFP4 KV cache: the NVFP4 KV row of references/gsm8k.yaml.
+
+        ``kv_cache_config.dtype="nvfp4"`` makes the engine resolve ``kv_cache_quant_algo``
+        NVFP4, which the reference lookup keys on. A lossy substitution of the checkpoint's bf16
+        K/V (e2m1 values under e4m3 block scales), so the accuracy and the acceptance length
+        each have a row of their own. The draft layer runs over the same NVFP4 pool.
+        """
+        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_NVFP4)
+        self._gsm8k_with_acceptance(
+            mocker, monkeypatch, engine, self.MTP1, self.ACCEPTANCE_KEY_NVFP4_KV, "mtp1 nvfp4 kv"
         )
 
     @skip_not_sm103
@@ -720,21 +746,35 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert_acceptance_length(getattr(self, key_name), acceptance_length)
 
     @pytest.mark.parametrize(
-        "fp8_kv, index_share, breakable, key_name",
+        "kv_cache, index_share, breakable, key_name",
         [
-            pytest.param(False, True, False, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
-            pytest.param(True, False, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"),
-            pytest.param(False, True, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="breakable_prefill"),
+            pytest.param("KV_CACHE", True, False, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
+            pytest.param(
+                "KV_CACHE_FP8", False, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"
+            ),
+            pytest.param(
+                "KV_CACHE_NVFP4",
+                False,
+                False,
+                "ACCEPTANCE_KEY_NVFP4_KV_LONG_CONTEXT",
+                id="nvfp4_kv",
+            ),
+            pytest.param(
+                "KV_CACHE", True, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="breakable_prefill"
+            ),
         ],
     )
     @skip_not_sm103
-    def test_mtp3_long_context_passkey(self, monkeypatch, fp8_kv, index_share, breakable, key_name):
+    def test_mtp3_long_context_passkey(
+        self, monkeypatch, kv_cache, index_share, breakable, key_name
+    ):
         """Pass key retrieval over 3k-6k-token prompts, where the sparse attention path runs.
 
         The gsm8k cases never leave the dense path (their prompts are under the indexer's
         2048-token budget), so this is the only case that runs the target's QSA selection, the
-        draft layer's selection and, with ``fp8_kv``, the fp8 sparse kernels end to end. A pass
-        key stated back correctly needs the right blocks selected at every depth.
+        draft layer's selection and, over an fp8 or NVFP4 pool, the sparse store and GQA kernels
+        of that format (the draft layer's included) end to end. A pass key stated back
+        correctly needs the right blocks selected at every depth.
 
         ``index_share`` makes the draft loop reuse the selection of its first step; the
         acceptance length then must not fall below the floor taken from the same prompts
@@ -746,7 +786,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         """
         engine = dict(
             self.ENGINE_BREAKABLE_CHUNKED if breakable else self.ENGINE,
-            kv_cache_config=self.KV_CACHE_FP8 if fp8_kv else self.KV_CACHE,
+            kv_cache_config=getattr(self, kv_cache),
         )
         self._long_context_passkey(
             monkeypatch,
@@ -755,7 +795,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             index_share,
             _PASSKEY_LENGTHS,
             key_name,
-            f"mtp3 long context fp8_kv={fp8_kv} breakable={breakable}",
+            f"mtp3 long context {kv_cache} breakable={breakable}",
         )
 
     @skip_not_sm103

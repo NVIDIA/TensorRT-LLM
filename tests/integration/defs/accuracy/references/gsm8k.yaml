@@ -298,6 +298,12 @@ Qwen/Qwen3.8-Flash-Next:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.94
+  # NVFP4 KV cache over the checkpoint's bf16 KV, measured on the built-in implementation:
+  # TP1 on GB300, MTP draft length 1, TRTLLM MoE, fp32 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 95.26
 moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8

@@ -163,6 +163,15 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_fp8_kv:
   # 95% of ref_al.
   min_al: 1.866
 
+# test_mtp1_nvfp4_kv_gsm8k_and_acceptance: the same draft over an NVFP4 KV cache, with a floor of
+# its own for the same reason as the fp8 one.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_nvfp4_kv:
+  # modeling_v2's own full-gsm8k reading on GB300 (TRTLLM MoE, 1319 samples); the bf16 KV
+  # reading of the same run is 1.971, so NVFP4 storage costs 0.6%.
+  ref_al: 1.959
+  # 95% of ref_al.
+  min_al: 1.861
+
 # test_mtp3_gsm8k_and_acceptance: three drafts, bf16 KV, trtllm-gen experts.
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3:
   # The built-in implementation's full-gsm8k reading on GB300, so the gate is not
@@ -201,6 +210,13 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_fp8_kv_long_context:
   ref_al: 3.981
   # 2.5% below ref_al, as for mtp3_long_context.
   min_al: 3.88
+
+# test_mtp3_long_context_passkey[nvfp4_kv]: the same prompts over an NVFP4 KV cache, IndexShare off.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_nvfp4_kv_long_context:
+  # 3.971 here, against 4.000 over bf16 and 3.981 over fp8.
+  ref_al: 3.971
+  # 2.5% below ref_al, as for mtp3_long_context.
+  min_al: 3.87
 
 # test_mtp1_gdn_legacy_verify: one draft with TRTLLM_USE_GDN_REPLAY=0, over six word problems.
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_gdn_legacy:
