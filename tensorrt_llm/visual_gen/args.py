@@ -372,6 +372,21 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    tp_layout: Optional[Literal["replicated", "token_sharded"]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Activation layout between TP projections: 'replicated' (all-reduce TP; the default "
+            "when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each "
+            "all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires "
+            "tp_size > 1 and no ulysses/ring/attn2d."
+        ),
+    )
+
+    @property
+    def token_sharded_tp(self) -> bool:
+        """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
+        return self.tp_layout == "token_sharded"
 
     @property
     def seq_parallel_size(self) -> int:
@@ -412,6 +427,25 @@ class ParallelConfig(StrictBaseModel):
                     "async_ulysses forces SEPARATE_QKV which bypasses the "
                     "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
                     f"(got ring_size={self.ring_size})."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tp_layout(self) -> "ParallelConfig":
+        # async_ulysses is excluded transitively (it requires ulysses_size > 1).
+        if self.token_sharded_tp:
+            if self.tp_size == 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' requires tp_size > 1 "
+                    f"(got tp_size={self.tp_size}). Set tp_size > 1 or leave tp_layout unset."
+                )
+            if self.seq_parallel_size > 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' cannot be combined with "
+                    f"ulysses_size/ring_size/attn2d_size yet (got ulysses_size={self.ulysses_size}, "
+                    f"ring_size={self.ring_size}, attn2d_size={tuple(self.attn2d_size)}): both "
+                    "shard the token dimension of the transformer's residual stream. Use "
+                    "cfg_size x tp_size with the token-sharded layout, or unset tp_layout."
                 )
         return self
 
