@@ -67,6 +67,7 @@ def test_draft_slot_tables_refresh_before_cuda_graph_replay() -> None:
     }
 
     def lookup_draft_slots(request_ids: list[int]) -> list[list[int]]:
+        """Return each batch's slots and reject host lookups during capture."""
         assert not torch.cuda.is_current_stream_capturing()
         return rows_by_request[tuple(request_ids)]
 

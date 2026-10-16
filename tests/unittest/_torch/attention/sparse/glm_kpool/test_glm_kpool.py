@@ -529,6 +529,7 @@ def test_draft_preparation_failure_preserves_target_tables(failure: str) -> None
     def copy_with_failure(
         tensor: torch.Tensor, source: torch.Tensor, non_blocking: bool = False
     ) -> torch.Tensor:
+        """Fail the device-table copy while allowing host staging to complete."""
         if tensor.data_ptr() == draft_buffer.data_ptr():
             raise RuntimeError("draft table preparation failed")
         return original_copy(tensor, source, non_blocking=non_blocking)

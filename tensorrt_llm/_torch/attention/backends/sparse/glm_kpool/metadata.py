@@ -31,6 +31,13 @@ if TYPE_CHECKING:
 
 class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
     def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
+        """Initialize recurrent metadata with separate target and draft table bindings.
+
+        Args:
+            max_batch_size: Maximum number of requests in a batch.
+            chunk_size: Token chunk size used by recurrent-state preparation.
+            max_num_tokens: Maximum number of tokens in a batch.
+        """
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
         self.glm_block_tables: torch.Tensor | None = None
         self._glm_block_tables_cpu: torch.Tensor | None = None

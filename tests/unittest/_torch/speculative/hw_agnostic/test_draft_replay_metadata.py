@@ -29,6 +29,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _metadata() -> TrtllmAttentionMetadata:
+    """Build target metadata with independent draft buffers and mocked backend hooks."""
     metadata = object.__new__(TrtllmAttentionMetadata)
     metadata.enable_flash_mla = False
     metadata.kv_cache_manager = Mock(name="target_manager")
@@ -43,6 +44,7 @@ def _metadata() -> TrtllmAttentionMetadata:
 
 
 def test_backend_preparation_failure_restores_metadata_and_allows_retry() -> None:
+    """Restore every registered swap after a backend error and allow a successful retry."""
     metadata = _metadata()
     draft_manager = Mock(host_kv_cache_block_offsets=torch.tensor([30, 40]))
     target_manager = metadata.kv_cache_manager
@@ -53,6 +55,7 @@ def test_backend_preparation_failure_restores_metadata_and_allows_retry() -> Non
     metadata.backend_table = target_table
 
     def fail_backend_preparation(attn_metadata: TrtllmAttentionMetadata) -> None:
+        """Register a backend-specific swap before simulating a preparation failure."""
         assert attn_metadata.kv_cache_manager is draft_manager
         attn_metadata.swap_for_draft("backend_table", draft_table)
         raise LookupError("draft backend lookup failed")
@@ -89,6 +92,7 @@ def test_backend_preparation_failure_restores_metadata_and_allows_retry() -> Non
 
 
 def test_flash_mla_preparation_failure_restores_target_buffers() -> None:
+    """Restore target buffers and invalidate FlashMLA metadata after a draft lookup fails."""
     metadata = _metadata()
     metadata.enable_flash_mla = True
     metadata._flash_mla_metadata_valid = True
