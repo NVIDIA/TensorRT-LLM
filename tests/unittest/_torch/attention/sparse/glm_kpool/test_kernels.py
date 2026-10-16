@@ -690,6 +690,70 @@ def test_append_paged_state_rows_matches_indexed_writes(latent_dtype, tokens_per
     assert torch.equal(got_index, want_index)
 
 
+@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("tokens_per_request", [1, 4])
+def test_generation_append_uses_generation_tables_in_mixed_batch(latent_dtype, tokens_per_request):
+    """Generation rows of a mixed batch write through the generation slice of the block
+    tables, leaving the context requests' pages untouched."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
+        GlmKpoolSparseAttention,
+        paged_slot_indices,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(12)
+    num_contexts, num_generations, pages, slots, latent_dim = 2, 3, 4, 40, 512
+    tables = _paged_tables(num_contexts + num_generations, pages, slots, gen)
+    first = torch.randint(
+        0, pages * TPB - tokens_per_request, (num_generations, 1), generator=gen, device="cuda"
+    )
+    positions = first + torch.arange(tokens_per_request, device="cuda")
+    latent = (
+        torch.randn(num_generations, tokens_per_request, latent_dim, generator=gen, device="cuda")
+        * 50
+    ).to(torch.bfloat16)
+    packed = torch.randn(
+        num_generations, tokens_per_request, 2 * HD, generator=gen, device="cuda"
+    ).to(torch.bfloat16)
+    scale = torch.tensor([0.7], device="cuda")
+
+    def pools():
+        latent_pool = torch.zeros(slots, TPB, latent_dim, device="cuda").to(latent_dtype)
+        index_pool = torch.zeros(slots, TPB, 3 * HD, device="cuda", dtype=torch.bfloat16)
+        return latent_pool, index_pool
+
+    want_latent, want_index = pools()
+    page, offset = paged_slot_indices(tables[num_contexts:], positions, TPB)
+    if latent_dtype == torch.float8_e4m3fn:
+        quantized = (latent.float() * scale).clamp(-448, 448).to(latent_dtype)
+        want_latent.view(torch.uint8)[page, offset] = quantized.view(torch.uint8)
+    else:
+        want_latent[page, offset] = latent
+    want_index[page, offset, : 2 * HD] = packed
+
+    got_latent, got_index = pools()
+    backend = object.__new__(GlmKpoolSparseAttention)
+    backend.kv_scale_orig_quant = scale
+    backend._cache_state = Mock(
+        return_value=SimpleNamespace(
+            latent_pool=got_latent,
+            index_pool=got_index,
+            tokens_per_block=TPB,
+            num_contexts=num_contexts,
+            block_tables=tables,
+        )
+    )
+    backend.append_paged_state(latent, packed, positions, object())
+
+    assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
+    assert torch.equal(got_index, want_index)
+    context_slots = tables[:num_contexts].flatten()
+    assert not got_latent.view(torch.uint8)[context_slots].any()
+    assert not got_index[context_slots].any()
+
+
 @pytest.mark.parametrize("tokens_per_request", [2, 4])
 def test_pool_key_refresh_draft_positions_match_sequential_updates(tokens_per_request):
     """[N, T] draft positions in one launch equal T ordered single-position updates."""
