@@ -32,11 +32,17 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 )
 @pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
 @pytest.mark.parametrize("compute_dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("width", (64, 128))
-def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtype, width):
+@pytest.mark.parametrize(
+    "width,query_heads,heads,kv_layout",
+    [(64, 2, 2, "HND"), (128, 2, 2, "HND"), (64, 4, 2, "NHD"), (64, 4, 1, "NHD")],
+    ids=("mha64", "mha128", "gqa_nhd", "mqa_nhd"),
+)
+def test_optimized_two_pool_prefill_and_decode(
+    backend, high_dtype, compute_dtype, width, query_heads, heads, kv_layout
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for native KVCM")
-    block, heads, length, batch = 128, 2, 640, 2
+    block, length, batch = 128, 640, 2
     request_ids = list(range(batch))
     high_torch_dtype = binding_to_torch_dtype(high_dtype)
     manager = MixedPrecisionKVCacheManager(
@@ -58,14 +64,14 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
     )
     generator = torch.Generator(device="cuda").manual_seed(123)
     query, key, value = [
-        torch.randn(batch, length + 1, heads * width, generator=generator, device="cuda").to(
+        torch.randn(batch, length + 1, count * width, generator=generator, device="cuda").to(
             compute_dtype
         )
-        for _ in range(3)
+        for count in (query_heads, heads, heads)
     ]
     attention = backend(
         layer_idx=0,
-        num_heads=heads,
+        num_heads=query_heads,
         head_dim=width,
         num_kv_heads=heads,
         quant_config=QuantConfig(
@@ -95,32 +101,42 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
             kv_cache_manager=manager,
             request_ids=request_ids,
             prompt_lens=[end] * batch,
+            kv_layout=kv_layout,
             runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
         )
         metadata.prepare()
         q, k, v = [
-            tensor[:, begin:end].reshape(-1, heads * width) for tensor in (query, key, value)
+            tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
         ]
         if backend is TrtllmAttention:
             qkv = torch.cat((q, k, v), dim=-1)
-            return attention.forward(qkv, None, None, metadata, kv_scale_quant_orig=scale)
-        return attention.forward(q, k, v, metadata, kv_scale_quant_orig=scale)
+            output = attention.forward(qkv, None, None, metadata, kv_scale_quant_orig=scale)
+        else:
+            output = attention.forward(q, k, v, metadata, kv_scale_quant_orig=scale)
+        assert metadata.kv_cache_manager is manager and metadata.kv_layout == kv_layout
+        return output
+
+    def token_major(pool):
+        return pool.transpose(2, 3) if kv_layout == "HND" else pool
 
     try:
         manager.add_dummy_requests(request_ids, [length] * batch, is_gen=False)
         output = forward(0, length, True)
         reference = torch.nn.functional.scaled_dot_product_attention(
-            query[:, :length].reshape(batch, length, heads, width).transpose(1, 2),
+            query[:, :length].reshape(batch, length, query_heads, width).transpose(1, 2),
             key[:, :length].reshape(batch, length, heads, width).transpose(1, 2),
             value[:, :length].reshape(batch, length, heads, width).transpose(1, 2),
             is_causal=True,
+            enable_gqa=True,
         )
         torch.testing.assert_close(
             output, reference.transpose(1, 2).reshape_as(output), atol=0.02, rtol=0.02
         )
         arena = manager._staging_buffer.data_ptr()
-        history_before = manager.get_buffers(0, kv_layout="HND").clone()
-        scales_before = manager.get_mixed_precision_buffers(0, request_ids, "HND")[1][0].clone()
+        history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
+        scales_before = token_major(
+            manager.get_mixed_precision_buffers(0, request_ids, kv_layout)[1][0]
+        ).clone()
         if backend is TrtllmAttention:
             selection_cache = attention._unquantized_fmha_manager
             assert selection_cache is not None
@@ -138,7 +154,7 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
                 attention._fmha_manager,
             ) == original_state
         torch.testing.assert_close(
-            manager.get_buffers(0, kv_layout="HND"), history_before, rtol=0, atol=0
+            token_major(manager.get_buffers(0, kv_layout=kv_layout)), history_before, rtol=0, atol=0
         )
         for request_id in request_ids:
             cache = manager.kv_cache_map[request_id]
@@ -159,13 +175,13 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
                 attention.local_layer_idx,
                 attention._fmha_manager,
             ) == original_state
-        history = manager.get_buffers(0, kv_layout="HND").transpose(2, 3)
+        history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
         all_history_ids = manager.get_batch_cache_indices(request_ids, 0)
         (high, all_high_ids), (scales, all_scale_ids) = manager.get_mixed_precision_buffers(
-            0, request_ids, "HND"
+            0, request_ids, kv_layout
         )
-        scales = scales.transpose(2, 3)
-        high = high.transpose(2, 3)
+        scales = token_major(scales)
+        high = token_major(high)
         for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
             assert high_ids[0] >= 0 and high_ids[1:3] == [kv.BAD_PAGE_INDEX] * 2
             assert high_ids[-1] >= 0
@@ -206,19 +222,19 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
                 reference.append(expected.transpose(0, 1)[None])
             for ordinal in range(length // block):
                 torch.testing.assert_close(
-                    history[history_ids[ordinal]].transpose(1, 2),
+                    history[history_ids[ordinal]],
                     history_before[history_ids[ordinal]],
                     rtol=0,
                     atol=0,
                 )
                 torch.testing.assert_close(
-                    scales[all_scale_ids[row][ordinal]].transpose(1, 2),
+                    scales[all_scale_ids[row][ordinal]],
                     scales_before[all_scale_ids[row][ordinal]],
                     rtol=0,
                     atol=0,
                 )
             expected = torch.nn.functional.scaled_dot_product_attention(
-                query[row, -1].view(1, heads, 1, width), *reference
+                query[row, -1].view(1, query_heads, 1, width), *reference, enable_gqa=True
             ).reshape_as(output[row])
             torch.testing.assert_close(output[row], expected, atol=0.01, rtol=0.02)
     finally:
@@ -266,7 +282,7 @@ def test_high_fp8_uses_native_saturating_conversion():
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
 
 
-def test_flashinfer_staged_metadata_does_not_change_original():
+def test_flashinfer_attention_kv_metadata_does_not_change_original():
     from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttentionMetadata
 
     original = object.__new__(FlashInferAttentionMetadata)
@@ -276,9 +292,9 @@ def test_flashinfer_staged_metadata_does_not_change_original():
     wrapper = SimpleNamespace(is_planned=True)
     original._plan_params_to_wrappers = {"original": wrapper}
     original._host_pool_indices = {0: original._host_paged_kv_indices}
-    staged = SimpleNamespace(page_counts=[2, 1], pool=torch.empty(0))
-    metadata = original.with_paged_kv_view(staged)
-    assert metadata.kv_cache_manager is staged
+    attention_kv = SimpleNamespace(page_counts=[2, 1], pool=torch.empty(0))
+    metadata = original.with_paged_kv_view(attention_kv)
+    assert metadata.kv_cache_manager is attention_kv
     assert metadata._host_paged_kv_indices.tolist() == [0, 1, 2]
     assert not metadata._host_pool_indices and not metadata._plan_params_to_wrappers
     assert original._host_paged_kv_indices.tolist() == [17, 42, 8]

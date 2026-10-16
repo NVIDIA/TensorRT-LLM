@@ -638,17 +638,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
 
-    def with_paged_kv_view(self, staged) -> "FlashInferAttentionMetadata":
+    def with_paged_kv_view(self, attention_kv) -> "FlashInferAttentionMetadata":
         """Use a materialized KV view without changing request lengths or cached plans."""
-        if list(self.num_blocks) != staged.page_counts:
+        if list(self.num_blocks) != attention_kv.page_counts:
             raise NotImplementedError(
                 "Mixed-precision staging requires logical page tables")
         metadata = copy.copy(self)
-        metadata.kv_cache_manager = staged
-        metadata._host_paged_kv_indices = torch.arange(sum(staged.page_counts),
+        metadata.kv_cache_manager = attention_kv
+        metadata._host_paged_kv_indices = torch.arange(sum(
+            attention_kv.page_counts),
                                                        dtype=torch.int32)
         metadata._paged_kv_indices = metadata._host_paged_kv_indices.to(
-            staged.pool.device)
+            attention_kv.pool.device)
         metadata._vswa_layer_to_pool = None
         metadata._vswa_active_pool_id = None
         metadata._vswa_pool_indices_cache = None
@@ -2876,13 +2877,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         from .mixed_precision_kv_view import MixedPrecisionKVView
 
-        staged = MixedPrecisionKVView.create(
+        attention_kv = MixedPrecisionKVView.create(
             self,
             metadata,
             q,
             history_dequant_scale=forward_args.kv_scale_quant_orig)
-        if staged is not None:
-            metadata = metadata.with_paged_kv_view(staged)
+        if attention_kv is not None:
+            metadata = metadata.with_paged_kv_view(attention_kv)
 
         attention_mask_data = forward_args.attention_mask_data
         latent_cache = forward_args.latent_cache
@@ -2925,7 +2926,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             attention_window_size = attention_window_size - 1
 
         original_fp8_kv_cache = self.has_fp8_kv_cache
-        if staged is not None:
+        if attention_kv is not None:
             self.has_fp8_kv_cache = False
         try:
             self.forward_impl(
@@ -2948,8 +2949,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 forward_args.attention_window_size, exc)
             raise
         finally:
-            if staged is not None:
+            if attention_kv is not None:
                 self.has_fp8_kv_cache = original_fp8_kv_cache
-        if staged is not None:
-            staged.writeback()
+        if attention_kv is not None:
+            attention_kv.writeback()
         return output

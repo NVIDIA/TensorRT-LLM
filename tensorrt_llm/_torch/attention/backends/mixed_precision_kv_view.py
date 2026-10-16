@@ -47,15 +47,14 @@ def dequantize_nvfp4_kv(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Restore dense rows directly to the Attention computation dtype."""
-    from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
+    from flashinfer.quantization import nvfp4_kv_dequantize
 
     width = packed.shape[-1] * 2
-    output = dequant_nvfp4_2d_triton(
+    output = nvfp4_kv_dequantize(
         packed.contiguous().view(torch.uint8).view(-1, width // 2),
         scales.contiguous().view(torch.uint8).view(-1, width // NVFP4_SF_VEC_SIZE),
         dequant_scale,
-        target_dtype=dtype,
-        sf_vec_size=NVFP4_SF_VEC_SIZE,
+        output_dtype=dtype,
     )
     return output.view(*packed.shape[:-1], width)
 
@@ -82,6 +81,7 @@ class MixedPrecisionKVView:
         *,
         history_dequant_scale: torch.Tensor | None = None,
         max_page_size: int | None = None,
+        kv_layout: str | None = None,
     ) -> "MixedPrecisionKVView | None":
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
@@ -95,7 +95,7 @@ class MixedPrecisionKVView:
             )
         if q.dtype != manager.compute_dtype:
             raise ValueError("Attention input dtype differs from its reserved mixed-precision view")
-        return cls(metadata, layer_idx, q.dtype, history_dequant_scale, max_page_size)
+        return cls(metadata, layer_idx, q.dtype, history_dequant_scale, max_page_size, kv_layout)
 
     def __init__(
         self,
@@ -104,17 +104,23 @@ class MixedPrecisionKVView:
         dtype: torch.dtype,
         history_dequant_scale: torch.Tensor | None,
         max_page_size: int | None,
+        kv_layout: str | None,
     ) -> None:
         manager = metadata.kv_cache_manager
-        self.layout = metadata.kv_layout
+        self.layout = kv_layout or metadata.kv_layout
         self.block_size = manager.tokens_per_block
         self.tokens_per_block = min(self.block_size, max_page_size or self.block_size)
         if self.block_size % self.tokens_per_block:
             raise ValueError("Staging pages must divide the owning cache's block size")
-        self.history = manager.get_buffers(layer_idx, kv_layout=self.layout)
+        self.history = manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
         (self.high, high_ids), (self.scales, scale_ids) = manager.get_mixed_precision_buffers(
-            layer_idx, metadata.request_ids, self.layout
+            layer_idx, metadata.request_ids, metadata.kv_layout
         )
+        if self.layout != metadata.kv_layout:
+            # Keep the stored layout; only the Attention buffer is materialized in the new layout.
+            self.history = self.history.transpose(2, 3)
+            self.high = self.high.transpose(2, 3)
+            self.scales = self.scales.transpose(2, 3)
         history_ids = manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
         cached_lengths = metadata.kv_cache_params.num_cached_tokens_per_seq
         lengths = [a + b for a, b in zip(cached_lengths, metadata.seq_lens.tolist())]

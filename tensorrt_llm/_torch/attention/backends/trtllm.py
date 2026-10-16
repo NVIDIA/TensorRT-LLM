@@ -2165,25 +2165,24 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         from .mixed_precision_kv_view import MixedPrecisionKVView
 
-        staged = MixedPrecisionKVView.create(
+        attention_kv = MixedPrecisionKVView.create(
             self,
             metadata,
             q,
             max_page_size=64,
+            kv_layout="HND",
             history_dequant_scale=(forward_args.kv_scale_quant_orig
                                    if forward_args.kv_scale_quant_orig
                                    is not None else self.kv_scale_quant_orig))
-        if staged is None:
+        if attention_kv is None:
             return self._forward_impl(q, k, v, metadata, forward_args)
         if self.sparse_params is not None:
             raise NotImplementedError(
                 "Mixed-precision staging requires dense K/V Attention")
-        if metadata.kv_layout != "HND":
-            raise NotImplementedError(
-                "TRTLLM mixed-precision writes require HND layout")
         metadata = copy.copy(metadata)
-        metadata.kv_cache_manager = staged
-        metadata.kv_cache_block_offsets = staged.block_offsets()
+        metadata.kv_layout = attention_kv.layout
+        metadata.kv_cache_manager = attention_kv
+        metadata.kv_cache_block_offsets = attention_kv.block_offsets()
         metadata.use_paged_context_fmha = True
         saved = (self.quant_mode, self.has_fp8_kv_cache, self.has_fp4_kv_cache,
                  self.local_layer_idx, self._fmha_manager)
@@ -2203,7 +2202,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 replace(forward_args,
                         kv_scale_orig_quant=None,
                         kv_scale_quant_orig=None))
-            staged.writeback()
+            attention_kv.writeback()
             return result
         finally:
             (self.quant_mode, self.has_fp8_kv_cache, self.has_fp4_kv_cache,
