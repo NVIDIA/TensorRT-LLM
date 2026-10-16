@@ -13797,6 +13797,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            # Whether an output_tensor without partition_id is a plain in-place
+            # GEMM. Otherwise a missing partition_id is rejected.
+            allow_unpartitioned_output: ClassVar[bool] = False
             tuning_config: ClassVar[TuningConfig]
 
             def __init__(self,
@@ -14201,12 +14204,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     0]
 
                 partition_id = kwargs.get("partition_id", -1)
-                # A caller-owned output without a partition id is a plain
-                # in-place GEMM; with one it is a locality-domain half GEMM.
-                locality_domain_half_gemm = (output_tensor is not None
-                                             and partition_id >= 0)
+                # A caller-owned output is a locality-domain half GEMM, except on
+                # runners that opt into plain in-place output without a partition.
+                locality_domain_half_gemm = output_tensor is not None and (
+                    partition_id >= 0
+                    or not self.__class__.allow_unpartitioned_output)
                 if locality_domain_half_gemm:
-                    if partition_id >= 2:
+                    if partition_id < 0 or partition_id >= 2:
                         raise ValueError(
                             "partition_id must be 0 or 1 when output_tensor is provided."
                         )
@@ -14605,18 +14609,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
         class CuteDSLMXFP8InplaceRubinLinear(CuteDSLMXFP8RubinLinear):
-            """SM107 MXFP8 runner that writes into a caller-owned output."""
+            """SM107 MXFP8 runner that writes into a caller-owned output.
 
-            kernel_cache = dict()
-            tuning_config = TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0, 0, get_last_power_of_2_num_tokens_buckets,
-                    last_positive_power_of_2), ),
-                constraint_specs=(ConstraintSpec(2, 0, mxfp8_scale_infer_shape),
-                                  ConstraintSpec(5, 0, infer_output_m_shape)),
-                use_cold_l2_cache=True,
-                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
-                use_cuda_graph=True,
+            Shares the parent's compiled kernels (the plain in-place output has
+            the same leading dimension) and tuning config; only the output M
+            follows the input M.
+            """
+
+            allow_unpartitioned_output = True
+            tuning_config = replace(
+                CuteDSLMXFP8RubinLinear.tuning_config,
+                constraint_specs=(
+                    *CuteDSLMXFP8RubinLinear.tuning_config.constraint_specs,
+                    ConstraintSpec(5, 0, infer_output_m_shape)),
             )
 
         class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
