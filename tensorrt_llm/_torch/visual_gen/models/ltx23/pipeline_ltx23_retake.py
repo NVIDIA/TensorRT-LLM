@@ -381,13 +381,14 @@ class LTX23RetakePipeline(LTX23Pipeline):
         audio_model = audio_latents.to(self.dtype) if audio_latents is not None else None
         video_timestep = (denoise_mask * timestep.unsqueeze(-1)).to(self.dtype)
         sigma = timestep.to(self.dtype)
+        frozen_audio_sigma = torch.zeros_like(sigma)
         video = LTX23Modality(
             latent=video_model,
             timesteps=video_timestep,
             positions=video_positions,
             context=text_cache.video_context,
             sigma=sigma,
-            cross_modality_sigma=sigma if audio_model is not None else None,
+            cross_modality_sigma=frozen_audio_sigma if audio_model is not None else None,
         )
         audio = None
         if audio_model is not None:
@@ -398,7 +399,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 timesteps=torch.zeros_like(timestep),
                 positions=audio_positions,
                 context=text_cache.audio_context,
-                sigma=sigma,
+                sigma=frozen_audio_sigma,
                 cross_modality_sigma=sigma,
             )
 
