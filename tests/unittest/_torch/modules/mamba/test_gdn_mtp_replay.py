@@ -435,3 +435,93 @@ def test_gdn_mtp_commit_matches_reference(
     torch.testing.assert_close(history_k, reference_k, rtol=0, atol=0)
     torch.testing.assert_close(history_G, reference_G, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(history_len, reference_len, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("window", [16, 32])
+@pytest.mark.parametrize("indirect", [False, True], ids=["affine", "indirect"])
+@pytest.mark.parametrize("head_ratio", [1, 2, 4, 8])
+@torch.no_grad()
+def test_gdn_mtp_flush_matches_reference(window: int, indirect: bool, head_ratio: int) -> None:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_gdn_mtp_commit import gdn_mtp_flush
+
+    torch.manual_seed(19)
+    layers, slots, key_heads, width = 2, 6, 2, 4
+    value_heads = key_heads * head_ratio
+    channels = (2 * key_heads + value_heads) * DIM
+    capacity = window + width
+    states, conv, state_arg, _conv_arg, state_desc, _conv_desc = _make_state_storage(
+        indirect, layers, slots, value_heads, channels
+    )
+    if indirect:
+        # The layers need not have equal slot strides in V2's indirect layout.
+        states = [
+            _randn((slots, value_heads + layer + 1, DIM, DIM), 0.012).bfloat16()[:, :value_heads]
+            for layer in range(layers)
+        ]
+        state_arg = states[0]
+        state_desc = torch.tensor(
+            [(state.data_ptr(), state.stride(0)) for state in states],
+            device="cuda",
+            dtype=torch.int64,
+        )
+    expected_states = [state.clone() for state in states]
+    conv_before = [value.clone() for value in conv]
+    history_u = _randn((layers, slots, capacity, value_heads, DIM), 0.012).bfloat16()
+    history_k = _randn((layers, slots, capacity, key_heads, DIM), 0.09).bfloat16()
+    history_G = torch.cumsum(
+        -(_randn((layers, slots, value_heads, capacity), 0.025).abs() + 0.002), dim=-1
+    )
+    history_len = torch.tensor([3, 1, window, 5, 0, 7], device="cuda", dtype=torch.int32)
+    selected = torch.tensor([4, 1, 5, 2], device="cuda", dtype=torch.int64)
+    keys_for_value = torch.arange(value_heads, device="cuda") // head_ratio
+    for slot in selected.tolist():
+        length = int(history_len[slot].item())
+        if length:
+            end_G = history_G[:, slot, :, length - 1]
+            update = torch.einsum(
+                "ltiv,ltik,lit->livk",
+                history_u[:, slot, :length].float(),
+                history_k[:, slot, :length][:, :, keys_for_value].float(),
+                torch.exp(end_G[:, :, None] - history_G[:, slot, :, :length]),
+            )
+            checkpoint = torch.stack([state[slot] for state in states]).float()
+            committed = checkpoint * torch.exp(end_G)[:, :, None, None] + update
+            for layer, state in enumerate(expected_states):
+                state[slot] = committed[layer].bfloat16()
+        history_u[:, slot, length:] = torch.nan
+        history_k[:, slot, length:] = torch.nan
+        history_G[:, slot, :, length:] = torch.nan
+    histories_before = [value.clone() for value in (history_u, history_k, history_G)]
+    expected_len = history_len.clone()
+    expected_len[selected] = 0
+    gdn_mtp_flush(
+        state_arg,
+        history_u,
+        history_k,
+        history_G,
+        history_len,
+        selected,
+        history_window=window,
+        ssm_state_descriptors=state_desc,
+    )
+    for actual, expected in zip(states, expected_states):
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-4)
+    for actual, expected in zip(conv, conv_before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual, expected in zip((history_u, history_k, history_G), histories_before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(history_len, expected_len, rtol=0, atol=0)
+    # Empty histories are a no-op when the entry point is reused with another B.
+    saved_states = [state.clone() for state in states]
+    gdn_mtp_flush(
+        state_arg,
+        history_u,
+        history_k,
+        history_G,
+        history_len,
+        selected[:1],
+        history_window=window,
+        ssm_state_descriptors=state_desc,
+    )
+    for actual, expected in zip(states, saved_states):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
