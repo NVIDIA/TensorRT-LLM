@@ -146,7 +146,10 @@ l0_b300:
   # batch 32 over long prompts; the recurrent-state verify path that
   # TRTLLM_USE_GDN_REPLAY=0 selects; the recurrent state stored in bf16 without speculation,
   # at three drafts and at seven drafts over long prompts; mmmu with MTP and synthetic
-  # videos, the only gates that reach the vision tower.
+  # videos, the only gates that reach the vision tower; and the opt-in breakable prefill
+  # CUDA graph: gsm8k, gsm8k with three drafts and the length floor, 3k-6k-token pass keys
+  # prefilled in replayed 2048-token chunks, mmmu, and replayed against eager greedy
+  # continuations at the bucket edges and with context and generation rows in one batch.
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_cutedsl_moe
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_and_acceptance
@@ -166,6 +169,11 @@ l0_b300:
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gdn_legacy_verify
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_video
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_breakable_prefill_cuda_graph
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_breakable_prefill_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[breakable_prefill]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu_breakable_prefill
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_breakable_prefill_matches_eager
 - condition:
     ranges:
       system_gpu_count:

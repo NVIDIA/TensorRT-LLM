@@ -21,6 +21,7 @@ and report the built-in's numbers as the target's.
 
 import random
 import re
+import time
 
 import pytest
 from PIL import Image, ImageDraw
@@ -31,6 +32,7 @@ from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_E
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as target_modeling,
 )
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs import VideoData
@@ -86,6 +88,23 @@ def _target_core(llm: LLM):
     where the iteration stats that ``compute_acceptance_length`` reads are not collected.
     """
     return llm._executor.engine.model_engine.model.model
+
+
+def _count_prefill_graph_replays(monkeypatch: pytest.MonkeyPatch) -> dict[int, int]:
+    """Replays of the breakable prefill graph by bucket, filled as the engine runs.
+
+    Needs the executor in this process. Without it a case that sets
+    ``prefill_cuda_graph_backend="breakable"`` could pass on the eager path.
+    """
+    replays: dict[int, int] = {}
+    replay = BreakableCUDAGraphRunner.replay
+
+    def counting_replay(self, num_tokens):
+        replays[num_tokens] = replays.get(num_tokens, 0) + 1
+        return replay(self, num_tokens)
+
+    monkeypatch.setattr(BreakableCUDAGraphRunner, "replay", counting_replay)
+    return replays
 
 
 def _acceptance_length_from_requests(outputs, draft_len: int) -> float:
@@ -385,6 +404,15 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         moe_config=MOE,
     )
 
+    # The breakable prefill CUDA graph is opt-in. The buckets cover the gsm8k prompts; with the
+    # 2048-token budget every chunk of a longer prompt lands on one as well.
+    BREAKABLE_PREFILL = dict(
+        prefill_cuda_graph_backend="breakable",
+        prefill_capture_num_tokens=[128, 256, 512, 1024, 2048, 3072],
+    )
+    ENGINE_BREAKABLE = dict(ENGINE, **BREAKABLE_PREFILL)
+    ENGINE_BREAKABLE_CHUNKED = dict(ENGINE_BREAKABLE, max_num_tokens=2048)
+
     # One-model MTP-Eagle with the checkpoint's single MTP module replayed
     # `max_draft_len` times.
     MTP1 = MTPDecodingConfig(max_draft_len=1)
@@ -439,6 +467,24 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         with LLM(
             self.MODEL_PATH,
             **self.ENGINE,
+            **_require_target(monkeypatch, **_VALIDATE),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_not_sm103
+    def test_gsm8k_breakable_prefill_cuda_graph(self, mocker, monkeypatch):
+        """The text model with ``prefill_cuda_graph_backend="breakable"``, against the same gsm8k anchor.
+
+        Every prefill step of up to 3072 tokens is padded to a captured bucket and replayed, so
+        the padding rows, the four eager breaks and the per-bucket graphs run under real
+        prompts. That replays happen is shown by ``test_breakable_prefill_matches_eager``.
+        """
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+
+        with LLM(
+            self.MODEL_PATH,
+            **self.ENGINE_BREAKABLE,
             **_require_target(monkeypatch, **_VALIDATE),
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -522,6 +568,23 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         """
         self._gsm8k_with_acceptance(
             mocker, monkeypatch, self.ENGINE, self.MTP3, self.ACCEPTANCE_KEY_MTP3, "mtp3"
+        )
+
+    @skip_not_sm103
+    def test_mtp3_breakable_prefill_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """MTP with three drafts over replayed prefill steps: the MTP row, and the length floor.
+
+        The padded rows must never reach the draft loop: the worker takes the batch's own rows
+        and the draft layer's first step runs over them eagerly. A draft layer fed a wrong
+        hidden state loses acceptance length without changing accuracy.
+        """
+        self._gsm8k_with_acceptance(
+            mocker,
+            monkeypatch,
+            self.ENGINE_BREAKABLE,
+            self.MTP3,
+            self.ACCEPTANCE_KEY_MTP3,
+            "mtp3 breakable prefill",
         )
 
     @skip_not_sm103
@@ -614,6 +677,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         )
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
         prompts = _passkey_prompts(tokenizer, lengths)
+        replays = _count_prefill_graph_replays(monkeypatch)
         # One prompt twice, far apart in the batch, so the two copies hold different slots.
         texts = [prompt for prompt, _ in prompts] + [prompts[len(prompts) // 2][0]]
 
@@ -640,6 +704,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert not missed, f"pass keys not stated back: {missed} of {[key for _, key in prompts]}"
         twins = outputs[len(prompts) // 2], outputs[-1]
         assert twins[0].outputs[0].token_ids == twins[1].outputs[0].token_ids
+        if engine.get("prefill_cuda_graph_backend") == "breakable":
+            # Every prompt is longer than the chunk budget, so its chunks fill the top bucket.
+            assert replays.get(2048, 0) >= len(texts), replays
+        else:
+            assert not replays, replays
         if index_share:
             assert reuse_calls, "IndexShare is on and the reuse op never ran"
         else:
@@ -651,14 +720,15 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert_acceptance_length(getattr(self, key_name), acceptance_length)
 
     @pytest.mark.parametrize(
-        "fp8_kv, index_share, key_name",
+        "fp8_kv, index_share, breakable, key_name",
         [
-            pytest.param(False, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
-            pytest.param(True, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"),
+            pytest.param(False, True, False, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
+            pytest.param(True, False, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"),
+            pytest.param(False, True, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="breakable_prefill"),
         ],
     )
     @skip_not_sm103
-    def test_mtp3_long_context_passkey(self, monkeypatch, fp8_kv, index_share, key_name):
+    def test_mtp3_long_context_passkey(self, monkeypatch, fp8_kv, index_share, breakable, key_name):
         """Pass key retrieval over 3k-6k-token prompts, where the sparse attention path runs.
 
         The gsm8k cases never leave the dense path (their prompts are under the indexer's
@@ -669,8 +739,15 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         ``index_share`` makes the draft loop reuse the selection of its first step; the
         acceptance length then must not fall below the floor taken from the same prompts
         with the draft layer selecting on every step, and the reuse op must have run.
+
+        With ``breakable`` the prompts are prefilled in 2048-token chunks, each replayed from
+        the top bucket: the continuations past the first chunk read the KV, index and recurrent
+        state the earlier replays wrote, which the single-chunk gsm8k prompts never do.
         """
-        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_FP8 if fp8_kv else self.KV_CACHE)
+        engine = dict(
+            self.ENGINE_BREAKABLE_CHUNKED if breakable else self.ENGINE,
+            kv_cache_config=self.KV_CACHE_FP8 if fp8_kv else self.KV_CACHE,
+        )
         self._long_context_passkey(
             monkeypatch,
             self.MTP3,
@@ -678,8 +755,101 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             index_share,
             _PASSKEY_LENGTHS,
             key_name,
-            f"mtp3 long context fp8_kv={fp8_kv}",
+            f"mtp3 long context fp8_kv={fp8_kv} breakable={breakable}",
         )
+
+    @skip_not_sm103
+    def test_breakable_prefill_matches_eager(self, monkeypatch):
+        """Greedy continuations of the same prompts, with the breakable prefill graph and without.
+
+        MTP with three drafts, a 3072-token chunk budget, and prompts of a natural document
+        cut at the edges of the buckets 128 and 1024 (one token under, at, one over), at the
+        top bucket 3072 and one past it, and a 5000-token prompt prefilled in two chunks. A
+        batch of word problems and a 5000-token prompt then prefills while the earlier ones
+        decode, so replayed steps carry generation rows beside the context rows.
+
+        A prompt that fills its bucket runs the same kernels on the same shapes as the eager
+        step, so its tokens must be identical. A padded prompt changes the row count every
+        GEMM sees, which moves the logits by what a different batch size does (about 0.2 nats
+        at most here); it must still agree on its first four tokens. The same engine given
+        the same prompts twice must repeat itself exactly. Replays are counted, since a
+        replay that never happens passes everything above.
+        """
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        replays = _count_prefill_graph_replays(monkeypatch)
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        document = tokenizer.encode(_passkey_prompts(tokenizer, (6000,))[0][0])
+        lengths = (127, 128, 129, 1023, 1024, 1025, 3072, 3073, 5000)
+        filled = (128, 1024, 3072)
+        # Word problems, answered in full, and one prompt of five thousand tokens prefilled in
+        # chunks while they decode. A word problem's first token can be a near tie between two
+        # openings, so its answer is checked, not its tokens.
+        problems = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": f"{question} {_WORD_PROBLEM_SUFFIX}"}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            for question, _ in _WORD_PROBLEMS
+        ]
+        greedy = SamplingParams(max_tokens=24, temperature=0)
+        answering = SamplingParams(max_tokens=384, temperature=0)
+
+        def run(engine):
+            with LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                **engine,
+                **_require_target(monkeypatch, **_VALIDATE),
+            ) as llm:
+                single = [
+                    llm.generate({"prompt_token_ids": document[:n]}, greedy, use_tqdm=False)
+                    .outputs[0]
+                    .token_ids
+                    for n in lengths
+                ]
+                again = [
+                    llm.generate({"prompt_token_ids": document[:n]}, greedy, use_tqdm=False)
+                    .outputs[0]
+                    .token_ids
+                    for n in lengths
+                ]
+                # The first requests are decoding when the long prompt arrives.
+                futures = []
+                for index, prompt in enumerate(problems):
+                    futures.append(llm.generate_async(prompt, answering))
+                    time.sleep(0.3)
+                    if index == 1:
+                        long_future = llm.generate_async(
+                            {"prompt_token_ids": document[:5000]}, greedy
+                        )
+                        time.sleep(0.3)
+                answers = [future.result().outputs[0].text for future in futures]
+                long_tokens = long_future.result().outputs[0].token_ids
+            return single, again, answers, long_tokens
+
+        single, again, answers, long_tokens = run(dict(self.ENGINE_BREAKABLE, max_num_tokens=3072))
+        assert {128, 256, 1024, 2048, 3072} <= set(replays), replays
+        assert single == again, "the same engine repeated itself with a different answer"
+
+        replays.clear()
+        eager_single, _, eager_answers, eager_long_tokens = run(
+            dict(self.ENGINE, max_num_tokens=3072)
+        )
+        assert not replays, replays
+
+        for n, got, want in zip(lengths, single, eager_single):
+            head = len(want) if n in filled else 4
+            assert got[:head] == want[:head], (n, got, want)
+        for texts in (answers, eager_answers):
+            wrong = [
+                (question, answer, text[-120:])
+                for (question, answer), text in zip(_WORD_PROBLEMS, texts)
+                if f"answer is {answer}" not in text.replace("**", "")
+            ]
+            assert not wrong, f"wrong or missing answers: {wrong}"
+        assert long_tokens[:4] == eager_long_tokens[:4], (long_tokens, eager_long_tokens)
 
     @skip_not_sm103
     def test_mtp7_long_context_passkey(self, monkeypatch):
@@ -828,7 +998,20 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         Block reuse is off here (on in the text cases above) because the vision path
         requires it.
         """
-        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_MULTIMODAL)
+        self._mmmu(monkeypatch, self.ENGINE)
+
+    @skip_not_sm103
+    def test_mtp1_mmmu_breakable_prefill(self, monkeypatch):
+        """``test_mtp1_mmmu`` over replayed prefill steps, against the same row.
+
+        The vision rows are spliced into the embedding inside the first break of every
+        replay; a replay that kept the previous step's rows or dropped them would answer
+        from the text alone, which this score detects.
+        """
+        self._mmmu(monkeypatch, self.ENGINE_BREAKABLE)
+
+    def _mmmu(self, monkeypatch, engine):
+        engine = dict(engine, kv_cache_config=self.KV_CACHE_MULTIMODAL)
 
         # MMMU adds <|endoftext|> to the stop token, as the built-in model's
         # MMMU test does.
