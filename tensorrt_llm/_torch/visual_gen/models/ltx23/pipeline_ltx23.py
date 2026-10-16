@@ -331,6 +331,15 @@ class LTX23Pipeline(BasePipeline):
         audio_embeds, _ = self.audio_connector(audio_proj, additive_mask)
         return video_embeds, audio_embeds, video_mask
 
+    @staticmethod
+    def _combine_cfg_predictions(
+        unconditional: torch.Tensor, conditional: torch.Tensor, guidance_scale: float
+    ) -> torch.Tensor:
+        """Accumulate guidance in FP32, then restore the denoised sample dtype."""
+        dtype = conditional.dtype
+        conditional, unconditional = conditional.float(), unconditional.float()
+        return (conditional + (guidance_scale - 1) * (conditional - unconditional)).to(dtype)
+
     @property
     def extra_param_specs(self):
         return {
@@ -535,7 +544,7 @@ class LTX23Pipeline(BasePipeline):
                 sigma = timestep_val.float()
                 while sigma.dim() < velocity.dim():
                     sigma = sigma.unsqueeze(-1)
-                return latent - velocity.float() * sigma
+                return (latent - velocity.float() * sigma).to(self.dtype)
 
             return to_x0(v_latents_f32, vel_v), to_x0(a_latents_f32, vel_a)
 
