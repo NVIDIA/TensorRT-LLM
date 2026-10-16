@@ -68,6 +68,7 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/disagg-serving-aws-efa.md
    features/subagent-routing.md
    features/embeddings.md
    features/kvcache.md
