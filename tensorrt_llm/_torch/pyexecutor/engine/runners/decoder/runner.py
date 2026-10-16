@@ -677,17 +677,49 @@ class DecoderRunner(ScheduledModelRunner):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
+        from tensorrt_llm._torch.jit_prefetch import cancel_flashinfer_build, start_flashinfer_build
+
+        # With JIT prefetch on, a CPU-only helper builds the sampling module
+        # while the eager warmup forwards below run on the GPU; it is joined
+        # (and the module loaded) before CUDA graph capture, the first phase
+        # that can launch the sampling kernels.
+        sampling_in_helper = kv_cache_manager is not None and start_flashinfer_build()
+        try:
+            with self._warmup_timer.phase(
+                "sampling_module_prewarm",
+                metrics=self._metrics,
+                metric_name="sampling_warmup_seconds",
+            ):
+                if not sampling_in_helper:
+                    warmup_sampling_module()
+                self._prewarm_engram_kernels(kv_cache_manager)
+                self._prewarm_csa2_sparse_indexer(kv_cache_manager)
+
+            if kv_cache_manager is None:
+                logger.info("Skipping warm up as no KV Cache manager allocated.")
+                return
+            self._warmup_scheduled_forwards(resource_manager, kv_cache_manager, sampling_in_helper)
+        finally:
+            if sampling_in_helper:
+                # No-op once joined. Warmup raised before the join: stop the
+                # helper rather than wait for it; the module is built in
+                # place on first use.
+                cancel_flashinfer_build()
+
+    def _join_sampling_module_build(self) -> None:
+        """Wait for the helper building FlashInfer's sampling module, then load it."""
+        from tensorrt_llm._torch.jit_prefetch import wait_flashinfer_build
+
         with self._warmup_timer.phase(
-            "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
+            "sampling_module_join", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
+            wait_flashinfer_build()
             warmup_sampling_module()
-            self._prewarm_engram_kernels(kv_cache_manager)
-            self._prewarm_csa2_sparse_indexer(kv_cache_manager)
 
-        if kv_cache_manager is None:
-            logger.info("Skipping warm up as no KV Cache manager allocated.")
-            return
-
+    def _warmup_scheduled_forwards(
+        self, resource_manager: ResourceManager, kv_cache_manager, sampling_in_helper: bool
+    ) -> None:
+        """The warmup phases that run forwards, after the pre-JIT prewarms."""
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
@@ -698,6 +730,8 @@ class DecoderRunner(ScheduledModelRunner):
                 logger.info(
                     f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
                 )
+                if sampling_in_helper:
+                    self._join_sampling_module_build()
                 return
 
         # Create AutoTuner singleton in eager context before any compiled forward.
@@ -767,6 +801,8 @@ class DecoderRunner(ScheduledModelRunner):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        if sampling_in_helper:
+            self._join_sampling_module_build()
         # Warm up every graph shape before capturing any graph. Attention
         # kernels can switch implementations at smaller batch sizes and require
         # a larger workspace, so the first pass grows the workspace to its
