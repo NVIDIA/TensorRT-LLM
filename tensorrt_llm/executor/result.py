@@ -582,6 +582,11 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        """Update outputs, completion state, and handoff metadata from a response.
+
+        Args:
+            response: Executor or postprocessing result for this request.
+        """
         req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
             req_perf_metrics_dict = response.request_perf_metrics

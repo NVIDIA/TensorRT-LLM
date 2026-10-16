@@ -118,6 +118,7 @@ class DisaggregatedParams:
             )
 
     def __post_init__(self):
+        """Restore serialized layout and validate request and multimodal metadata."""
         if self.multimodal_input_layout is not None:
             # Defer the import because inputs and executor import these parameters.
             from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs

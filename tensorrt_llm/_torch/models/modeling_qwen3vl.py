@@ -482,7 +482,18 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     def get_disagg_prefill_inputs(
         self, prompt_token_ids: List[int], multimodal_params: MultimodalParams
     ) -> Optional[DisaggPrefillMultimodalInputs]:
-        """Preserve timestamp text and frame-group boundaries from the encoder."""
+        """Preserve timestamp text and frame-group boundaries from the encoder.
+
+        Args:
+            prompt_token_ids: Fully expanded encoder prompt, including timestamps
+                and visual placeholders.
+            multimodal_params: Processed media metadata and per-item embedding
+                lengths associated with the prompt.
+
+        Returns:
+            An independent copy of the prompt layout, or None for inputs without
+            multimodal embeddings.
+        """
         mm_data = multimodal_params.multimodal_data or {}
         embedding_lengths = mm_data.get("multimodal_embedding_lengths")
         if not embedding_lengths:

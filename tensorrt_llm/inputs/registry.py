@@ -266,6 +266,13 @@ class BaseMultimodalInputProcessor(ABC):
         Returning None keeps the model's existing prefill reconstruction path.
         Models that return a layout accept it as ``encoder_inputs`` in their
         ``build_disagg_prefill_multimodal_inputs`` method.
+
+        Args:
+            prompt_token_ids: Fully expanded prompt produced by preprocessing.
+            multimodal_params: Processed media and layout metadata for the prompt.
+
+        Returns:
+            Encoder layout to carry to prefill, or None to use reconstruction.
         """
         return None
 

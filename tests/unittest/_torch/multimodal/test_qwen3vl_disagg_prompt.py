@@ -160,6 +160,7 @@ def test_qwen3vl_video_token_count_sums_single_video_grid_rows():
 
 @pytest.fixture
 def video_handoff():
+    """Build a video prompt with two frame groups separated by timestamp text."""
     processor = object.__new__(Qwen3VLInputProcessorBase)
     processor._config = SimpleNamespace(
         image_token_id=_IMAGE_TOKEN_ID,
@@ -215,6 +216,7 @@ def video_handoff():
 
 @pytest.mark.parametrize("hashing_enabled", [True, False])
 def test_encoder_handoff_preserves_video_timestamps(video_handoff, hashing_enabled):
+    """Keep timestamps and sparse visual runs with or without hashing metadata."""
     processor, token_ids, params = video_handoff
     if not hashing_enabled:
         params.multimodal_input = None
@@ -238,6 +240,7 @@ def test_encoder_handoff_preserves_video_timestamps(video_handoff, hashing_enabl
 
 @pytest.mark.parametrize("round_trip", ["json", "pickle"])
 def test_encoder_layout_survives_handoff_serialization(video_handoff, round_trip):
+    """Restore a typed encoder layout after JSON or pickle transport."""
     processor, token_ids, params = video_handoff
     original = DisaggregatedParams(
         multimodal_embedding_handles=[{"tensor_size": [4, 16]}],
@@ -253,6 +256,7 @@ def test_encoder_layout_survives_handoff_serialization(video_handoff, round_trip
 
 
 def test_prefill_consumes_encoder_layout_and_rejects_stale_positions(video_handoff):
+    """Use exact encoder tokens and reject mRoPE positions for a different prompt."""
     processor, token_ids, params = video_handoff
     llm = object.__new__(BaseLLM)
     llm.input_processor = processor
@@ -304,6 +308,7 @@ def test_prefill_consumes_encoder_layout_and_rejects_stale_positions(video_hando
     ],
 )
 def test_encoder_layout_does_not_bypass_handle_validation(video_handoff, shape, error, match):
+    """Reject embedding handles with incompatible rank, width, or row count."""
     processor, token_ids, params = video_handoff
     layout = processor.get_disagg_prefill_inputs(token_ids, params)
     with pytest.raises(error, match=match):
@@ -315,6 +320,7 @@ def test_encoder_layout_does_not_bypass_handle_validation(video_handoff, shape, 
 
 
 def test_encoder_layout_owns_its_metadata(video_handoff):
+    """Keep exported and consumed layouts independent of caller-owned metadata."""
     processor, token_ids, params = video_handoff
     layout = processor.get_disagg_prefill_inputs(token_ids, params)
     restored = processor.build_disagg_prefill_multimodal_inputs(
@@ -334,6 +340,7 @@ def test_encoder_layout_owns_its_metadata(video_handoff):
 
 @pytest.mark.parametrize("modality", ["image", "video"])
 def test_multiple_items_without_hashing_keep_prompt_order(video_handoff, modality):
+    """Recover ordered per-item runs from token masks when hashing is unavailable."""
     processor, video_ids, _ = video_handoff
     image_ids = [
         11,
@@ -370,6 +377,7 @@ def test_multiple_items_without_hashing_keep_prompt_order(video_handoff, modalit
 
 @pytest.mark.parametrize("data", [None, {}, {"multimodal_embedding_lengths": []}])
 def test_no_layout_for_text_only_inputs(video_handoff, data):
+    """Leave prompt reconstruction unchanged when there are no visual embeddings."""
     processor, _, _ = video_handoff
     params = MultimodalParams(multimodal_data=data)
     assert processor.get_disagg_prefill_inputs([1, 2, 3], params) is None
@@ -379,6 +387,7 @@ def test_no_layout_for_text_only_inputs(video_handoff, data):
 
 
 def test_legacy_image_handoff_still_works(video_handoff):
+    """Accept image handles without a layout while requiring paired mRoPE metadata."""
     processor, _, _ = video_handoff
     processor._tokenizer = _FakeTokenizer(
         [11, _VISION_START_TOKEN_ID, _IMAGE_TOKEN_ID, _VISION_END_TOKEN_ID, 12]
@@ -412,12 +421,14 @@ def test_legacy_image_handoff_still_works(video_handoff):
 
 @pytest.mark.parametrize("invalid_layout", [[], "layout", {"prompt_token_ids": [1, 2]}])
 def test_invalid_layout_is_rejected_at_deserialization(invalid_layout):
+    """Reject unsupported payload types and incomplete layout dictionaries."""
     with pytest.raises(TypeError):
         DisaggregatedParams(multimodal_input_layout=invalid_layout)
 
 
 @pytest.mark.parametrize("existing_params", [False, True])
 def test_encoder_submits_layout_without_mutating_caller_params(video_handoff, existing_params):
+    """Attach the layout to submitted parameters without modifying the caller's copy."""
     processor, token_ids, params = video_handoff
     encoder = object.__new__(BaseLLM)
     encoder.shutdown = Mock()
