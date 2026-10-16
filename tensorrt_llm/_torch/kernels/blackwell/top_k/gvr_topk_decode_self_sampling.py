@@ -4339,8 +4339,12 @@ class GvrMainKernel:
                                         )
                                         r_ = (
                                             r_
-                                            + cutlass.Int32(cutlass.Uint64(vlf) > cutlass.Uint64(u64f))
-                                            + cutlass.Int32(cutlass.Uint64(vhf) > cutlass.Uint64(u64f))
+                                            + cutlass.Int32(
+                                                cutlass.Uint64(vlf) > cutlass.Uint64(u64f)
+                                            )
+                                            + cutlass.Int32(
+                                                cutlass.Uint64(vhf) > cutlass.Uint64(u64f)
+                                            )
                                         )
                                     else:
                                         r_ = (
@@ -5733,7 +5737,6 @@ def get_compiled(
         return compiled
 
 
-
 def _get_compiled_lbm(
     tpl: tuple,
     options_extra: str = "",
@@ -5834,7 +5837,6 @@ def _get_compiled_lbm(
     )
     _COMPILE_CACHE[key] = compiled
     return compiled
-
 
 
 def workspace_bytes() -> int:
@@ -7870,7 +7872,9 @@ class GvrTopkRegKernel:
                         p = cutlass.Int32(0)
                         if qt2 >= LOQ:
                             bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
-                            p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                            p = atomic_add_cta(
+                                s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                            )
                             if p < lim1:
                                 out_row[p] = tix
                             else:
@@ -7946,7 +7950,8 @@ class GvrTopkRegKernel:
                             for s in cutlass.range_constexpr(S):
                                 if (m2 & cutlass.Int32(1 << s)) != cutlass.Int32(0):
                                     idx = (
-                                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                                        (tid + cutlass.Int32((s // 4) * self.blk))
+                                        << cutlass.Int32(2)
                                     ) + cutlass.Int32(s % 4)
                                     if p2 < cmp_:
                                         ck[p2] = fkey(_val(frags, s))
@@ -8050,20 +8055,28 @@ class GvrTopkRegKernel:
                                                 if live0 != cutlass.Int32(0):
                                                     minimum = cutlass.Uint32(key0)
                                                 if live1 != cutlass.Int32(0):
-                                                    if cutlass.Uint32(key1) < cutlass.Uint32(minimum):
+                                                    if cutlass.Uint32(key1) < cutlass.Uint32(
+                                                        minimum
+                                                    ):
                                                         minimum = cutlass.Uint32(key1)
                                                 minimum = warp_min_u32(cutlass.Uint32(minimum))
                                                 remove_id = cutlass.Uint32(0)
                                                 if live0 != cutlass.Int32(0) and cutlass.Uint32(
                                                     key0
                                                 ) == cutlass.Uint32(minimum):
-                                                    remove_id = cutlass.Uint32(lane + cutlass.Int32(1))
+                                                    remove_id = cutlass.Uint32(
+                                                        lane + cutlass.Int32(1)
+                                                    )
                                                 if live1 != cutlass.Int32(0) and cutlass.Uint32(
                                                     key1
                                                 ) == cutlass.Uint32(minimum):
-                                                    remove_id = cutlass.Uint32(lane + cutlass.Int32(33))
+                                                    remove_id = cutlass.Uint32(
+                                                        lane + cutlass.Int32(33)
+                                                    )
                                                 remove_id = warp_max_u32(remove_id)
-                                                if remove_id == cutlass.Uint32(lane + cutlass.Int32(1)):
+                                                if remove_id == cutlass.Uint32(
+                                                    lane + cutlass.Int32(1)
+                                                ):
                                                     live0 = cutlass.Int32(0)
                                                 if remove_id == cutlass.Uint32(
                                                     lane + cutlass.Int32(33)
@@ -8074,7 +8087,9 @@ class GvrTopkRegKernel:
                                             mask1 = ballot(live1 != cutlass.Int32(0))
                                             lower_lanes = cutlass.Int32(cute.arch.lanemask_lt())
                                             if live0 != cutlass.Int32(0):
-                                                out_row[above + popc(mask0 & lower_lanes)] = ci[lane]
+                                                out_row[above + popc(mask0 & lower_lanes)] = ci[
+                                                    lane
+                                                ]
                                             if live1 != cutlass.Int32(0):
                                                 out_row[
                                                     above + popc(mask0) + popc(mask1 & lower_lanes)
@@ -8179,7 +8194,13 @@ class GvrTopkRegKernel:
                                     cute.arch.barrier()  # level hist
                                     if cutlass.const_expr(self.nbh > 1024):
                                         scan_cross_w(
-                                            s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh
+                                            s_hist,
+                                            s_ws,
+                                            needC,
+                                            tid,
+                                            s_res,
+                                            blk=self.blk,
+                                            nb=self.nbh,
                                         )
                                     else:
                                         find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
@@ -8238,7 +8259,6 @@ class GvrTopkRegKernel:
                                     if p2e < needC:
                                         out_row[above + aboveC + p2e] = idv
                                 it = it + cutlass.Int32(1)
-
 
             if cutlass.const_expr(self.stage_output):
                 cute.arch.barrier()
