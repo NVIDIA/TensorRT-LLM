@@ -14,6 +14,7 @@ from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
+    MultimodalEncoderItemMetadata,
     MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
@@ -22,7 +23,6 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
-    MultimodalEncoderItemMetadata,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
@@ -135,6 +135,46 @@ def test_mm_item_metadata_retains_three_field_tuple_contract() -> None:
     assert item_refs == [("image", 0)]
     assert encoder_lengths == [4]
     assert output_lengths == [2]
+
+
+@pytest.mark.parametrize(
+    "selected, expected_refs, expected_costs, expected_lengths",
+    [
+        ([3, 0, 2], [("audio", 0), ("image", 0), ("image", 1)], [40, 20, 30], [4, 2, 3]),
+        ([2, 0], [("image", 0), ("image", 1)], [30, 20], [3, 2]),
+        ([], [], [], []),
+    ],
+)
+def test_mm_item_metadata_selection_rebases_refs_without_mutating_source(
+    selected, expected_refs, expected_costs, expected_lengths
+) -> None:
+    metadata = MultimodalEncoderItemMetadata(
+        [("image", 1), ("video", 0), ("image", 0), ("audio", 0)],
+        [20, 50, 30, 40],
+        [2, 5, 3, 4],
+    )
+
+    subset = metadata.select(selected)
+
+    assert subset == MultimodalEncoderItemMetadata(expected_refs, expected_costs, expected_lengths)
+    assert metadata.item_refs == [("image", 1), ("video", 0), ("image", 0), ("audio", 0)]
+    assert metadata.encoder_token_lengths == [20, 50, 30, 40]
+    assert metadata.output_embedding_lengths == [2, 5, 3, 4]
+    assert all(
+        selected_field is not source_field for selected_field, source_field in zip(subset, metadata)
+    )
+
+
+def test_mm_item_metadata_legacy_import_and_pickle() -> None:
+    import pickle
+
+    from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata as LegacyItemMetadata
+
+    assert LegacyItemMetadata is MultimodalEncoderItemMetadata
+    # Existing serialized records resolve the original registry module path.
+    legacy_class = pickle.loads(b"ctensorrt_llm.inputs.registry\nMultimodalEncoderItemMetadata\n.")
+    metadata = legacy_class([("audio", 0)], [8], [2])
+    assert pickle.loads(pickle.dumps(metadata)) == metadata
 
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():

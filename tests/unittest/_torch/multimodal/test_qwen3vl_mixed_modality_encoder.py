@@ -10,7 +10,6 @@ The same helper is what `Qwen3VisionModelBase.forward` (the mm-encoder-only
 disagg entrypoint) delegates to, so this suite covers both paths.
 """
 
-from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -21,6 +20,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import _qwen3vl_build_batched_input
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 def _encode_batched(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
@@ -43,7 +43,7 @@ def _param(
     video: Optional[dict] = None,
     order: Optional[list] = None,
     lengths: Optional[list] = None,
-) -> SimpleNamespace:
+) -> MultimodalParams:
     data: dict = {}
     if image is not None:
         data["image"] = image
@@ -51,7 +51,7 @@ def _param(
         data["video"] = video
     if lengths is not None:
         data["multimodal_embedding_lengths"] = lengths
-    return SimpleNamespace(multimodal_data=data, mm_item_order=order)
+    return MultimodalParams(multimodal_data=data, mm_item_order=order)
 
 
 def _patches(marker: int, n: int, dim: int = 2) -> torch.Tensor:

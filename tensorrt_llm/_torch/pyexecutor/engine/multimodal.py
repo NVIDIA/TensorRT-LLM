@@ -27,13 +27,13 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
+    get_multimodal_encoder_item_metadata,
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     InputProcessor,
-    get_multimodal_encoder_item_metadata,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
 from tensorrt_llm.logger import logger

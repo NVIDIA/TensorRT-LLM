@@ -15,7 +15,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
+from tensorrt_llm.inputs.multimodal import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig

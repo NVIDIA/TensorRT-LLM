@@ -1,17 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Junction tests: item-level MM encoder scheduling over `EncoderGroup` models.
+"""Full-request and selected-item encoding share prompt-order item metadata.
 
-The two features are developed independently and each has its own coverage, but
-nothing exercised them *together* until this file. They meet at a specific
-contract: `encode_multimodal_by_groups` reads `multimodal_embedding_lengths`
-off each `MultimodalParams` to split the encoder output back per modality, while
-item scheduling feeds it freshly sliced single-item params. A slice that omits
-that key splits the encoder output to zero rows, so every scheduled item comes
-back empty; the row-count check in `forward_multimodal_encoder_items` turns that
-into a hard error, but only after the wasted encoder forward.
+Group outputs follow modality-local payload order. Selecting items must slice
+the tensors and their metadata together, so output assembly returns the same
+rows and order as encoding those items in the full request.
 """
+
+from functools import partial
 
 import pytest
 import torch
@@ -22,10 +19,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import (
+from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
+    MultimodalParams,
 )
 
 HIDDEN = 4
@@ -112,9 +109,8 @@ def _make_request(modalities: list[str], *, value_start: float = 1.0) -> Multimo
         encoder_token_lengths=list(lengths),
         output_embedding_lengths=list(lengths),
     )
-    # Production attaches this alongside the item metadata (see
-    # `inputs/registry.py`); `_apply_metadata_slice` and
-    # `encode_multimodal_by_groups` both read it from the top level.
+    # Processors retain this field for legacy consumers. Encoder groups use
+    # the typed item metadata when available.
     multimodal_data["multimodal_embedding_lengths"] = list(lengths)
     return MultimodalParams(multimodal_data=multimodal_data)
 
@@ -245,8 +241,23 @@ def test_full_and_item_order_can_differ_from_raw_payload_order(use_metadata: boo
     torch.testing.assert_close(model.encode_multimodal_inputs([request]), expected, rtol=0, atol=0)
 
 
-def test_vision_and_audio_groups_share_full_and_item_ordering() -> None:
+@pytest.mark.parametrize("shared_vision_encoder", [False, True])
+def test_vision_and_audio_groups_share_full_and_item_ordering(shared_vision_encoder: bool) -> None:
     model = _GroupedEncoderModel()
+
+    def build_vision_input(
+        params: list[MultimodalParams], modality: str
+    ) -> dict[str, torch.Tensor]:
+        pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+        return {
+            "pixel_values": torch.cat([mp.multimodal_data[modality][pixel_key] for mp in params])
+        }
+
+    if not shared_vision_encoder:
+        model.mm_encoder_groups = tuple(
+            EncoderGroup((modality,), model._encode, partial(build_vision_input, modality=modality))
+            for modality in ("image", "video")
+        )
 
     def build_audio_input(params: list[MultimodalParams]) -> dict[str, torch.Tensor]:
         return {

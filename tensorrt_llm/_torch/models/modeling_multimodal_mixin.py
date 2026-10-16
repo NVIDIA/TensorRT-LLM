@@ -31,7 +31,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    cast,
 )
 
 import torch
@@ -41,13 +40,10 @@ from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalEncoderItemMetadata,
     MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
-)
-from tensorrt_llm.inputs.registry import (
-    MultimodalEncoderItemMetadata,
-    get_multimodal_encoder_item_metadata,
 )
 from tensorrt_llm.logger import logger
 
@@ -130,30 +126,17 @@ class EncoderGroup:
 
 
 def _lengths_by_modality(
-    multimodal_params: List[MultimodalParams],
+    item_layouts: Sequence[tuple[list[tuple[str, int]], list[int]]],
     modalities: Tuple[str, ...],
 ) -> Dict[str, List[int]]:
-    """Invert prompt-ordered output lengths into the per-modality item order
-    used by `EncoderGroup.build_batched_input`.
+    """Split resolved output lengths into each group's payload-local order.
 
-    Glossary used below:
-
-    * **group** — one `EncoderGroup` entry (a single tuple of modalities
-      that share an encoder call). E.g. Qwen3-VL registers one group
-      `("image", "video")`; Nano registers three groups
-      `("image",)`, `("video",)`, `("audio",)`.
-    * **group-local modalities** — the `modalities` tuple of the group
-      whose encoder is being invoked (this function's `modalities` arg).
-    * **cross-group mix** — a single request whose items span modalities
-      belonging to two *different* groups (e.g. one image + one audio
-      item for Nano, where image and audio live in separate groups).
-    * **multi-group model** — a model that registers more than one
-      `EncoderGroup`, so its group-local `modalities` tuples are each
-      strictly narrower than the full request-level modality set.
+    Layouts describe whole requests, so only modalities in this encoder
+    group contribute lengths (for example, image/video in a vision group
+    while the same request's audio is handled by another group).
     """
     by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
-    for mp in multimodal_params:
-        item_refs, lengths = _get_multimodal_item_layout(mp, modalities)
+    for item_refs, lengths in item_layouts:
         if not item_refs:
             continue
         request_lengths: dict[str, list[tuple[int, int]]] = {m: [] for m in modalities}
@@ -166,7 +149,7 @@ def _lengths_by_modality(
 
 
 def _reorder_embeds_by_manifest(
-    multimodal_params: List[MultimodalParams],
+    item_layouts: Sequence[tuple[list[tuple[str, int]], list[int]]],
     per_modality_embeds: Dict[str, torch.Tensor],
     per_modality_lengths: Dict[str, List[int]],
 ) -> torch.Tensor:
@@ -183,8 +166,7 @@ def _reorder_embeds_by_manifest(
     if len(populated_modalities) == 1:
         modality, embedding = populated_modalities[0]
         prompt_order_matches_encoder = True
-        for mp in multimodal_params:
-            item_refs, _ = _get_multimodal_item_layout(mp, per_modality_embeds.keys())
+        for item_refs, _ in item_layouts:
             item_indices = [
                 index for item_modality, index in item_refs if item_modality == modality
             ]
@@ -205,8 +187,7 @@ def _reorder_embeds_by_manifest(
     # Item indices are per-request per-modality; advance a cursor to
     # translate it into a global item index within `per_modality_embeds`.
     per_modality_cursor: Dict[str, int] = {m: 0 for m in per_modality_embeds}
-    for mp in multimodal_params:
-        item_refs, _ = _get_multimodal_item_layout(mp, per_modality_embeds.keys())
+    for item_refs, _ in item_layouts:
         req_counts: Dict[str, int] = {}
         for m, item_index in item_refs:
             if m not in per_modality_embeds:
@@ -234,38 +215,6 @@ def _reorder_embeds_by_manifest(
     return torch.cat(slices, dim=0)
 
 
-def _get_multimodal_item_layout(
-    mp: MultimodalParams,
-    modalities: Iterable[str],
-) -> tuple[list[tuple[str, int]], list[int]]:
-    """Read prompt-order refs and output lengths from the item metadata.
-
-    Legacy processors supply `mm_item_order` and embedding lengths instead.
-    Single-modality requests can omit the order; mixed requests cannot.
-    """
-    metadata = get_multimodal_encoder_item_metadata(mp.multimodal_data)
-    if metadata is not None:
-        return metadata.item_refs, metadata.output_embedding_lengths
-
-    flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
-    if mp.mm_item_order:
-        item_refs = cast(
-            list[tuple[str, int]],
-            [(entry["modality"], entry["index"]) for entry in mp.mm_item_order],
-        )
-        return item_refs, flat
-
-    present = [m for m in _MM_DATA_INPUT_MODALITY_KEYS if mp.multimodal_data.get(m) is not None]
-    if len(present) > 1:
-        raise ValueError(
-            "Request with multiple modalities present "
-            f"({present}) must carry item metadata or mm_item_order on MultimodalParams."
-        )
-    if present and present[0] in modalities:
-        return [(present[0], i) for i in range(len(flat))], flat
-    return [], []
-
-
 def encode_multimodal_by_groups(
     mm_encoder_groups: Sequence["EncoderGroup"],
     multimodal_params: List[MultimodalParams],
@@ -286,23 +235,25 @@ def encode_multimodal_by_groups(
     """
     per_modality_embeds: Dict[str, torch.Tensor] = {}
     per_modality_lengths: Dict[str, List[int]] = {}
+    item_layouts = [mp.get_item_layout() for mp in multimodal_params]
     for group in mm_encoder_groups:
-        group_params = [
-            mp
-            for mp in multimodal_params
-            if any(mp.multimodal_data.get(m) is not None for m in group.modalities)
-        ]
+        group_params = []
+        group_layouts = []
+        for mp, layout in zip(multimodal_params, item_layouts, strict=True):
+            if any(mp.multimodal_data.get(m) is not None for m in group.modalities):
+                group_params.append(mp)
+                group_layouts.append(layout)
         if not group_params:
             continue
         out = group.encoder_fn(**group.build_batched_input(group_params))
-        lengths = _lengths_by_modality(group_params, group.modalities)
+        lengths = _lengths_by_modality(group_layouts, group.modalities)
         cursor = 0
         for m in group.modalities:
             total = sum(lengths[m])
             per_modality_embeds[m] = out[cursor : cursor + total]
             cursor += total
         per_modality_lengths.update(lengths)
-    return _reorder_embeds_by_manifest(multimodal_params, per_modality_embeds, per_modality_lengths)
+    return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
 
 
 if TYPE_CHECKING:
@@ -579,9 +530,7 @@ class MultimodalModelMixin:
                 metadata = (
                     run_metadata
                     if multimodal_param is run_param
-                    else get_multimodal_encoder_item_metadata(
-                        multimodal_param.multimodal_data or {}
-                    )
+                    else multimodal_param.item_metadata
                 )
             except (TypeError, ValueError) as error:
                 raise MultimodalEncoderContractError(str(error)) from error
@@ -1273,7 +1222,7 @@ class MultimodalModelMixin:
             )
             return None
 
-        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        item_metadata = param.item_metadata
         if item_metadata is not None:
             return cls.build_encoder_cache_item_keys(
                 mm_input.multimodal_hashes,
@@ -1432,28 +1381,18 @@ class MultimodalModelMixin:
         Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
         the parallel per-item metadata slice so every model gets it identically.
         """
-        metadata = get_multimodal_encoder_item_metadata(source.multimodal_data)
+        metadata = source.item_metadata
         if metadata is not None:
-            local_counts: dict[str, int] = {}
-            item_refs = []
-            for i in item_indices:
-                modality = metadata.item_refs[i][0]
-                local_index = local_counts.get(modality, 0)
-                item_refs.append((modality, local_index))
-                local_counts[modality] = local_index + 1
-            residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
-                MultimodalEncoderItemMetadata(
-                    item_refs,
-                    [metadata.encoder_token_lengths[i] for i in item_indices],
-                    [metadata.output_embedding_lengths[i] for i in item_indices],
-                )
+            selected = metadata.select(item_indices)
+            residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = selected
+            residual.multimodal_data["multimodal_embedding_lengths"] = (
+                selected.output_embedding_lengths
             )
-            source_lengths = metadata.output_embedding_lengths
         else:
             source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
-        residual.multimodal_data["multimodal_embedding_lengths"] = [
-            source_lengths[i] for i in item_indices
-        ]
+            residual.multimodal_data["multimodal_embedding_lengths"] = [
+                source_lengths[i] for i in item_indices
+            ]
         if residual.multimodal_input is not None and source.multimodal_input is not None:
             source_hashes = source.multimodal_input.multimodal_hashes
             residual.multimodal_input.multimodal_hashes = [source_hashes[i] for i in item_indices]
