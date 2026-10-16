@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdint>
+#include <limits>
 #include <new>
 
 #include <unistd.h>
@@ -31,6 +32,8 @@ namespace
 std::size_t pageAlignedSize(std::size_t size)
 {
     auto const pageSize = PinnedAllocator::hostPageSize();
+    TLLM_CHECK_WITH_INFO(size <= std::numeric_limits<std::size_t>::max() - (pageSize - 1),
+        "Size %zu cannot be rounded up to a multiple of the host page size %zu", size, pageSize);
     return common::ceilDiv(size, pageSize) * pageSize;
 }
 
