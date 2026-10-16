@@ -378,8 +378,9 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
-def _release_consumed_batch_indices(consumed: ScheduledRequests,
-                                    current: Optional[ScheduledRequests]) -> None:
+def _release_consumed_batch_indices(
+        consumed: ScheduledRequests,
+        current: Optional[ScheduledRequests]) -> None:
     """Send requests that left the overlap pipeline back to the host token path.
 
     Once ``_update_requests`` has consumed a batch, its device tensors are gone.
@@ -396,8 +397,10 @@ def _release_consumed_batch_indices(consumed: ScheduledRequests,
     ``_update_requests`` just appended on host, one position off. ``current``
     is None when nothing was scheduled this iteration.
     """
-    keep = (set() if current is None else
-            {id(r) for r in (*current.context_requests, *current.generation_requests)})
+    keep = (set() if current is None else {
+        id(r)
+        for r in (*current.context_requests, *current.generation_requests)
+    })
     for r in (*consumed.context_requests, *consumed.generation_requests):
         if id(r) not in keep:
             r.py_batch_idx = None
@@ -464,6 +467,7 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
+        self._completed_deferred_recompute_pauses = 0
         # profile config
         _env_start_iters, _env_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -2309,6 +2313,11 @@ class PyExecutor:
     def _is_stats_dummy_request(req) -> bool:
         return bool(getattr(req, "is_dummy", False))
 
+    def _take_deferred_recompute_pauses(self) -> int:
+        count = getattr(self, "_completed_deferred_recompute_pauses", 0)
+        self._completed_deferred_recompute_pauses = 0
+        return count
+
     def _collect_scheduled_batch_stats(
             self, scheduled_batch: ScheduledRequests) -> ScheduledBatchStats:
         """Collect scheduled-batch counters before forward mutates requests."""
@@ -2345,7 +2354,7 @@ class PyExecutor:
             except RuntimeError:
                 pass
 
-        num_paused_requests = 0
+        num_paused_requests = self._take_deferred_recompute_pauses()
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
         for req in paused_requests:
@@ -2510,9 +2519,10 @@ class PyExecutor:
         num_gen_requests = int(
             scheduled_batch_stats.num_gen_requests if scheduled_batch_stats.
             num_gen_requests is not None else num_gen_requests)
-        num_paused_requests = int(
-            scheduled_batch_stats.num_paused_requests if scheduled_batch_stats.
-            num_paused_requests is not None else num_paused_requests)
+        if scheduled_batch_stats.num_paused_requests is None:
+            num_paused_requests += self._take_deferred_recompute_pauses()
+        else:
+            num_paused_requests = int(scheduled_batch_stats.num_paused_requests)
 
         stats.inflight_batching_stats.num_context_requests = num_context_requests
         stats.inflight_batching_stats.num_gen_requests = num_gen_requests
@@ -4444,6 +4454,12 @@ class PyExecutor:
         # and the next schedule would trip its assertion.
         self._free_request_resources(request)
         self._pause_recompute_request(request)
+        # Deferred completions bypass the scheduler's paused-request lists.
+        # Carry their count to the next stats snapshot, including idle iterations.
+        if not (getattr(self, "enable_attention_dp", False)
+                and self._is_stats_dummy_request(request)):
+            self._completed_deferred_recompute_pauses = getattr(
+                self, "_completed_deferred_recompute_pauses", 0) + 1
         return True
 
     def _kv_connector_wait_for_save(self):
@@ -5378,7 +5394,8 @@ class PyExecutor:
         if self.previous_batch is None:
             return
         self._update_requests(self.previous_batch.sample_state)
-        _release_consumed_batch_indices(self.previous_batch.scheduled_requests, None)
+        _release_consumed_batch_indices(self.previous_batch.scheduled_requests,
+                                        None)
         self._send_kv_async(
             self.previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()

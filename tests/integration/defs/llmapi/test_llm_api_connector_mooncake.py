@@ -342,7 +342,7 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
+def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool, tmp_path_factory):
     """Chunked prefill against a cache too small to hold every request.
 
     This is the preemption path the connector complicates: a victim's pages may
@@ -397,11 +397,15 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
     finally:
         reference.shutdown()
 
-    segments_before = len(read_segments(mooncake_pool.run_dir))
+    client_run_dir = str(tmp_path_factory.mktemp("mooncake-small-cache-client"))
+    client_config = mooncake_pool.config.model_copy(update={"run_dir": client_run_dir})
     llm = LLM(
         **llm_kwargs(
             mooncake_pool,
             enable_iter_perf_stats=True,
+            kv_connector_config=KvCacheConnectorConfig(
+                connector="mooncake-store", mooncake_store=client_config
+            ),
             # Keep every iteration rather than the most recent 1000, so the
             # sums below cover the whole run.
             iter_stats_max_iterations=-1,
@@ -422,11 +426,9 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
     # read zero and report that as a scheduler result.
     assert stats, "The engine returned no iteration statistics to assert on."
 
-    # The assertions below are about the scheduler, so a connector that did
-    # nothing would satisfy them. This run's own rank reaching the ledger is
-    # the evidence that the pool was in the loop, counted against a reading
-    # from before the engine started because the ledger outlives one test.
-    assert len(read_segments(mooncake_pool.run_dir)) > segments_before, (
+    # A fresh ledger proves this engine opened the store even if it reused a
+    # worker process: segment files are keyed by host and PID and are overwritten.
+    assert read_segments(client_run_dir), (
         "This run's rank recorded nothing, so the connector never opened the store "
         "and no save was ever in flight for a preemption to wait on."
     )
