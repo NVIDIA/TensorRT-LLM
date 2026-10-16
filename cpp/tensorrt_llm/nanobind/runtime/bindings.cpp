@@ -204,7 +204,63 @@ void initBindings(nb::module_& m)
             nb::arg("local_protocol_reset_succeeded"),
             "Collectively publish or abort a pending internal MNNVL restore after protocol reset.",
             nb::call_guard<nb::gil_scoped_release>())
-        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped);
+        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped)
+        .def("get_buffer_size", &tensorrt_llm::runtime::McastGPUBuffer::getBufferSize);
+
+    nb::enum_<tr::MnnvlTransport>(m, "MnnvlTransport")
+        .value("POSIX_FD", tr::MnnvlTransport::kPosixFd)
+        .value("FABRIC", tr::MnnvlTransport::kFabric);
+
+    nb::class_<tr::MnnvlWorkspace>(m, "MnnvlWorkspace")
+        .def(nb::init<size_t, tr::MnnvlTransport, int, int64_t>(), nb::arg("workspace_size"), nb::arg("transport"),
+            nb::arg("device_idx"), nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "__init__",
+            [](tensorrt_llm::runtime::MnnvlWorkspace* self, size_t workspaceSize, tr::MnnvlTransport transport,
+                int deviceIdx, nb::object pgObj, std::string const& pybind11Abi)
+            {
+                // Unboxing the pybind11-owned ProcessGroup needs the GIL; the collectives run
+                // afterwards do not.
+                auto pg = common::get_intrusive_ptr<c10d::ProcessGroup, nb::python_error>(pgObj.ptr(), pybind11Abi);
+                auto groupComm = std::make_shared<tensorrt_llm::runtime::PgMcastGroupComm>(std::move(pg));
+                nb::gil_scoped_release release;
+                new (self)
+                    tensorrt_llm::runtime::MnnvlWorkspace(workspaceSize, transport, deviceIdx, std::move(groupComm));
+            },
+            nb::arg("workspace_size"), nb::arg("transport"), nb::arg("device_idx"), nb::arg("process_group"),
+            nb::arg("pybind11_abi"))
+        .def_prop_ro("is_available", &tr::MnnvlWorkspace::isAvailable)
+        .def_prop_ro("reason", &tr::MnnvlWorkspace::getReason)
+        .def("get_local_buffer", &tr::MnnvlWorkspace::getLocalBuffer, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_workspace_size", &tr::MnnvlWorkspace::getWorkspaceSize)
+        .def("checkpoint_prepare", &tensorrt_llm::runtime::MnnvlWorkspace::checkpointPrepare,
+            "Internal, experimental hook; the caller must establish engine-wide quiescence before invoking it.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_restore",
+            nb::overload_cast<int64_t>(&tensorrt_llm::runtime::MnnvlWorkspace::checkpointRestore),
+            nb::arg("mpi_comm_fortran_handle"),
+            "Internal, experimental hook; the restored communicator must have the original ordered membership and "
+            "the engine must remain quiescent. A successful restore retains an owned communicator duplicate.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "checkpoint_restore",
+            [](tensorrt_llm::runtime::MnnvlWorkspace& self, nb::object pgObj, std::string const& pybind11Abi)
+            {
+                // Unboxing the pybind11-owned ProcessGroup needs the GIL; the collectives run
+                // afterwards do not.
+                auto pg = common::get_intrusive_ptr<c10d::ProcessGroup, nb::python_error>(pgObj.ptr(), pybind11Abi);
+                auto groupComm = std::make_shared<tensorrt_llm::runtime::PgMcastGroupComm>(std::move(pg));
+                nb::gil_scoped_release release;
+                return self.checkpointRestore(std::move(groupComm));
+            },
+            nb::arg("process_group"), nb::arg("pybind11_abi"),
+            "checkpoint_restore for a non-MPI orchestrator. The process group must cover the same processes, in the "
+            "same order, as the one the workspace was created with.")
+        .def("checkpoint_restore_complete", &tensorrt_llm::runtime::MnnvlWorkspace::checkpointRestoreComplete,
+            nb::arg("local_protocol_reset_succeeded"),
+            "Collectively publish or abort a pending internal MNNVL restore after protocol reset.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_mapped", &tensorrt_llm::runtime::MnnvlWorkspace::isMapped);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
