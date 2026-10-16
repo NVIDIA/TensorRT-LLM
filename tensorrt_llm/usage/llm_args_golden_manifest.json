@@ -182,6 +182,11 @@
       "path": "checkpoint_io_policy"
     },
     {
+      "capture_policy": "list[int]",
+      "kind": "value",
+      "path": "compact_beam_widths"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "context_parallel_size"
