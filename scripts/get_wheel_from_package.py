@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -117,6 +117,83 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch, bolt_profile_ref=None):
                 f"refusing to build an unoptimized release image")
 
 
+# Exit codes of jenkins/scripts/fetch_build_artifact.sh that download_package
+# acts on, by the names the helper gives them; any other non-zero code stops
+# it at once. tests/unittest/scripts/test_fetch_build_artifact.py checks that
+# they match.
+_FETCH_ABSENT = 2
+_FETCH_REJECTED = 3
+_FETCH_TRANSFER_FAILED = 4
+
+
+def _rejected_message(package_path: str) -> str:
+    """Describe why the primary location refused to serve `package_path`."""
+    if (os.environ.get("LLM_ARTIFACTS_PRIMARY") or "aws") == "urm":
+        return ("The primary location (urm) rejected the anonymous request "
+                f"for {package_path}.")
+    credential = (os.environ.get("ARTIFACTORY_CREDENTIAL_ID")
+                  or "<unset: ARTIFACTORY_CREDENTIAL_ID>")
+    return (
+        f"Artifactory rejected the credentials for {package_path}: the "
+        f"Artifactory access token in credential '{credential}' needs "
+        "renewal or lacks read permission on sw-tensorrt-llm-generic-local; "
+        "an Artifactory access token for artifactory.nvidia.com is required.")
+
+
+def download_package(artifact_path: str, tarfile_name: str,
+                     timeout: int) -> None:
+    """Download a packaged build, polling until it has been published.
+
+    jenkins/scripts/fetch_build_artifact.sh reads the primary location
+    (LLM_ARTIFACTS_PRIMARY) first, falls back to the other location only when
+    the file is absent there, and logs which location served it. It writes to
+    a temporary file and renames it only after the SHA-1 matches, so a failed
+    attempt never leaves a partial `tarfile_name` for the extract to read.
+
+    Args:
+        artifact_path: The build's artifact directory in the legacy layout,
+            a repository name followed by llm-artifacts/<job>/<build>. The
+            helper maps it to each location.
+        tarfile_name: File name of the packaged build, also used for the local
+            copy.
+        timeout: Maximum number of attempts, one minute apart.
+
+    Raises:
+        PermissionError: The primary location rejected the request.
+        RuntimeError: The helper failed for a reason other than the package
+            being absent or a transfer failure, such as a usage error.
+        TimeoutError: The package was not downloaded within `timeout`
+            attempts.
+    """
+    helper = (get_project_dir() / "jenkins" / "scripts" /
+              "fetch_build_artifact.sh")
+    package_path = f"{artifact_path}/{tarfile_name}"
+    for attempt in range(1, timeout + 1):
+        # The environment carries ARTIFACTORY_NETRC, LLM_ARTIFACTS_PRIMARY and
+        # ARTIFACTORY_CREDENTIAL_ID to the helper.
+        rc = subprocess.run(
+            ["bash", str(helper), package_path, tarfile_name],
+            env=os.environ.copy()).returncode
+        if rc == 0:
+            return
+        if rc == _FETCH_REJECTED:
+            raise PermissionError(_rejected_message(package_path))
+        if rc not in (_FETCH_ABSENT, _FETCH_TRANSFER_FAILED):
+            raise RuntimeError(
+                f"fetch_build_artifact.sh failed with exit code {rc} for "
+                f"{package_path}")
+        if attempt < timeout:
+            reason = ("not published yet"
+                      if rc == _FETCH_ABSENT else "transfer failed")
+            print(
+                f"Tarfile {reason}, waiting 60 seconds... "
+                f"(attempt {attempt}/{timeout})",
+                flush=True)
+            time.sleep(60)
+    raise TimeoutError(
+        f"Failed to download file after {timeout} attempts: {package_path}")
+
+
 def get_wheel_from_package(arch,
                            artifact_path,
                            timeout,
@@ -127,25 +204,7 @@ def get_wheel_from_package(arch,
     else:
         tarfile_name = "TensorRT-LLM-GH200.tar.gz"
 
-    tarfile_link = f"https://urm.nvidia.com/artifactory/{artifact_path}/{tarfile_name}"
-    for attempt in range(timeout):
-        try:
-            # -O pins the output name: without it wget falls back to
-            # <name>.1 when a previous attempt left a partial file behind,
-            # and the extract below would then read stale bytes.
-            subprocess.run(["wget", "-nv", "-O", tarfile_name, tarfile_link],
-                           check=True)
-            print(f"Tarfile is available at {tarfile_link}")
-            break
-        except Exception:
-            if attempt == timeout - 1:
-                raise TimeoutError(
-                    f"Failed to download file after {timeout} attempts: {tarfile_link}"
-                )
-            print(
-                f"Tarfile not ready yet, waiting 60 seconds... (attempt {attempt + 1}/{timeout})"
-            )
-            time.sleep(60)
+    download_package(artifact_path, tarfile_name, timeout)
 
     llm_root = get_project_dir()
     tmp_dir = llm_root / "tmp"
