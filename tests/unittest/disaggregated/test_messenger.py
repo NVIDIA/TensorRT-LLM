@@ -126,6 +126,12 @@ def test_req_rep(create_messenger_pair):
     rep.stop()
 
 
+def test_receive_timeout(dynamic_endpoint):
+    with ZMQMessenger("DEALER", endpoint=dynamic_endpoint) as messenger:
+        with pytest.raises(TimeoutError, match="Timed out waiting"):
+            messenger.receive(timeout_ms=10)
+
+
 def test_zmq_messenger_context_manager(dynamic_endpoint):
     with ZMQMessenger("ROUTER", endpoint=dynamic_endpoint) as messenger:
         assert messenger.endpoint == dynamic_endpoint

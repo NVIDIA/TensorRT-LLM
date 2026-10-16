@@ -358,6 +358,10 @@ class DisaggTransferCoordinator:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
+        begin_registration_batch = getattr(self._transceiver, "begin_peer_registration_batch", None)
+        if begin_registration_batch is not None:
+            begin_registration_batch()
+
         if not uses_async_gen_transfer():
             # Resources have already been prepared for every request in this
             # batch. Drain all synchronous receives even after one fails so no
@@ -406,6 +410,9 @@ class DisaggTransferCoordinator:
         the GPU; and it is never re-recorded, since a newer event would also
         cover every later forward.
         """
+        begin_registration_batch = getattr(self._transceiver, "begin_peer_registration_batch", None)
+        if begin_registration_batch is not None:
+            begin_registration_batch()
         published = []
         for request_id, (req, ready) in list(self._unpublished_gen_receives.items()):
             if req.state not in (

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
     MessageType,
+    PeerRegistrationError,
     Receiver,
     RxSession,
 )
@@ -576,6 +578,64 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
     assert session.status == SessionStatus.TRANSFERRING
     assert not session.resources_drained()
+
+
+@pytest.mark.cpu_only
+def test_peer_registration_failure_fails_only_affected_task() -> None:
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = False
+    receiver._build_recv_req_info = Mock(return_value=object())
+    receiver._get_sender_info = Mock(side_effect=PeerRegistrationError("rank info timeout"))
+    task = Mock()
+    task._params = SimpleNamespace(ctx_dp_rank=0)
+    task._unique_rid = 7
+
+    receiver.dispatch_task(task)
+
+    error = task.fail.call_args.args[0]
+    assert isinstance(error, PeerRegistrationError)
+
+
+@pytest.mark.cpu_only
+def test_peer_registration_batch_enforces_aggregate_deadline(monkeypatch) -> None:
+    receiver = object.__new__(Receiver)
+    receiver._peer_registration_timeout_ms = 5000
+    receiver._peer_registration_retry_after = {"expired": 9.0, "active": 20.0}
+    monkeypatch.setattr(transfer_mod.time, "monotonic", Mock(side_effect=[10.0, 14.0, 15.0]))
+
+    receiver.begin_peer_registration_batch()
+
+    assert receiver._peer_registration_retry_after == {"active": 20.0}
+    assert receiver._peer_registration_receive_timeout_ms() == 1000
+    with pytest.raises(PeerRegistrationError, match="budget exhausted"):
+        receiver._peer_registration_receive_timeout_ms()
+
+
+@pytest.mark.cpu_only
+def test_blackhole_peer_opens_registration_circuit() -> None:
+    receiver = object.__new__(Receiver)
+    receiver._incompatible_peers = {}
+    receiver._sender_ep_instance_map = {}
+    receiver._peer_registration_retry_after = {}
+    receiver._peer_registration_circuit_open_until = 0.0
+    receiver._peer_registration_deadline = None
+    receiver._peer_registration_timeout_ms = 10
+
+    with transfer_mod.ZMQMessenger("ROUTER") as blackhole:
+        params = DisaggregatedParams(ctx_info_endpoint=blackhole.endpoint)
+        with pytest.raises(PeerRegistrationError, match="timed out"):
+            receiver._get_sender_info(params)
+
+    assert params.ctx_info_endpoint in receiver._peer_registration_retry_after
+    assert receiver._peer_registration_circuit_open_until > time.monotonic()
+    rotated = DisaggregatedParams(ctx_info_endpoint="tcp://127.0.0.1:1")
+    with pytest.raises(PeerRegistrationError, match="temporarily unavailable"):
+        receiver._get_sender_info(rotated)
+    cached = object()
+    receiver._sender_ep_instance_map["tcp://cached:1"] = cached
+    assert (
+        receiver._get_sender_info(DisaggregatedParams(ctx_info_endpoint="tcp://cached:1")) is cached
+    )
 
 
 @pytest.mark.cpu_only

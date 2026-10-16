@@ -30,9 +30,10 @@ class MessengerInterface(ABC):
         ...
 
     @abstractmethod
-    def receive(self) -> list[bytes]:
+    def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
         """
         Receive messages.
+        :param timeout_ms: Optional maximum time to wait in milliseconds.
         :return: List of byte messages received.
         """
         ...
@@ -78,7 +79,12 @@ class ZMQMessenger(MessengerInterface):
         "REP": zmq.REP,  # Receives requests and sends replies (synchronous).
     }
 
-    def __init__(self, mode: str, endpoint: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        mode: str,
+        endpoint: Optional[str] = None,
+        max_message_size: Optional[int] = None,
+    ) -> None:
         if mode not in self.SOCKET_MODES:
             raise ValueError(
                 f"Invalid mode '{mode}'. Allowed modes are {list(self.SOCKET_MODES.keys())}"
@@ -86,6 +92,8 @@ class ZMQMessenger(MessengerInterface):
         self._context = zmq.Context()
         self._mode = mode
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
+        if max_message_size is not None:
+            self._socket.setsockopt(zmq.MAXMSGSIZE, max_message_size)
         self._endpoint: Optional[str] = None
         self._lock = Lock()
         self._closed = False
@@ -123,7 +131,9 @@ class ZMQMessenger(MessengerInterface):
         else:
             self._socket.send_multipart(messages)
 
-    def receive(self) -> list[bytes]:
+    def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
+        if timeout_ms is not None and not self._socket.poll(timeout_ms, zmq.POLLIN):
+            raise TimeoutError(f"Timed out waiting for a message from '{self._endpoint}'")
         return self._socket.recv_multipart()
 
     def start_listener(

@@ -129,6 +129,15 @@ def test_async_receive_starts_every_request_then_polls_status_once(clock, timeou
     assert h.effects.failed == []
 
 
+def test_receive_starts_peer_registration_batch() -> None:
+    h = CoordinatorHarness()
+    h.transceiver.begin_peer_registration_batch = Mock()
+
+    h.coordinator.receive_gen_init([_gen_init(h, 1)])
+
+    h.transceiver.begin_peer_registration_batch.assert_called_once_with()
+
+
 @pytest.mark.parametrize("outcome", ["complete", "error"])
 def test_async_receive_that_settles_immediately_is_reaped_in_the_same_call(outcome) -> None:
     """The trailing status poll picks up a receive that settled as soon as it

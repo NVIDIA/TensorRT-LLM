@@ -131,6 +131,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def consumes_transfer_buffer(self) -> bool:
         return False
 
+    def begin_peer_registration_batch(self) -> None:
+        self._transfer_worker.begin_peer_registration_batch()
+
     def __init__(
         self,
         mapping: Mapping,

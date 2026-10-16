@@ -95,6 +95,12 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+_MAX_PEER_REGISTRATION_BATCH_TIMEOUT_S = 5.0
+_MAX_PEER_REGISTRATION_RESPONSE_BYTES = 64 * 1024 * 1024
+_MAX_CACHED_PEER_INFO_BYTES = 64 * 1024 * 1024
+_MAX_PEER_DEALERS = 4096
+_MAX_REGISTERED_PEERS = 1024
+_PEER_REGISTRATION_RETRY_DELAY_S = 60.0
 
 
 class _TransferNotSubmittedError(RuntimeError):
@@ -193,6 +199,10 @@ class PeerIncompatibleError(ValueError):
     fail only the requests targeting that peer instead of crashing the
     executor loop.
     """
+
+
+class PeerRegistrationError(ValueError):
+    """A context peer failed the initial rank-information exchange."""
 
 
 class TaskStatus(Enum):
@@ -2452,10 +2462,20 @@ class Receiver(ReceiverBase):
         agent: BaseTransferAgent,
         bounce=None,
         enforce_physical_ownership: bool = False,
+        peer_registration_timeout_s: Optional[float] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
+        registration_timeout_s = min(
+            peer_registration_timeout_s or _MAX_PEER_REGISTRATION_BATCH_TIMEOUT_S,
+            _MAX_PEER_REGISTRATION_BATCH_TIMEOUT_S,
+        )
+        self._peer_registration_timeout_ms = max(1, int(registration_timeout_s * 1000))
+        self._peer_registration_deadline: Optional[float] = None
+        self._peer_registration_retry_after: dict[str, float] = {}
+        self._peer_registration_circuit_open_until = 0.0
+        self._cached_peer_info_bytes = 0
         # Internal component gate only. Production wiring is added after the
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
@@ -2480,6 +2500,28 @@ class Receiver(ReceiverBase):
 
         self._start_listener()
         logger.info(f"Receiver init with endpoint: {self._messenger.endpoint}")
+
+    def begin_peer_registration_batch(self) -> None:
+        now = time.monotonic()
+        self._peer_registration_deadline = now + self._peer_registration_timeout_ms / 1000
+        self._peer_registration_retry_after = {
+            endpoint: retry_after
+            for endpoint, retry_after in self._peer_registration_retry_after.items()
+            if retry_after > now
+        }
+
+    def _peer_registration_receive_timeout_ms(self) -> int:
+        if self._peer_registration_deadline is None:
+            return self._peer_registration_timeout_ms
+        remaining_ms = int((self._peer_registration_deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise PeerRegistrationError("Context peer registration budget exhausted")
+        return min(self._peer_registration_timeout_ms, remaining_ms)
+
+    def _delay_peer_registration(self, endpoint: str) -> None:
+        retry_after = time.monotonic() + _PEER_REGISTRATION_RETRY_DELAY_S
+        self._peer_registration_retry_after[endpoint] = retry_after
+        self._peer_registration_circuit_open_until = retry_after
 
     @property
     def endpoint(self):
@@ -2656,10 +2698,14 @@ class Receiver(ReceiverBase):
         sender_dp_rank = params.ctx_dp_rank
         try:
             peer_infos: RankInfo = self._get_sender_info(params)
-        except PeerIncompatibleError as e:
+            if sender_dp_rank is not None and (
+                type(sender_dp_rank) is not int or not 0 <= sender_dp_rank < peer_infos.dp_size
+            ):
+                raise PeerRegistrationError("Context peer has an invalid data-parallel rank")
+        except (PeerIncompatibleError, PeerRegistrationError) as e:
             # Fail only this request via the normal transfer-error path
             # (task ERROR -> session ERROR -> WaitResult.FAILED ->
-            # DISAGG_TRANS_ERROR), so one incompatible context peer does not
+            # DISAGG_TRANS_ERROR), so a failed peer registration does not
             # take down the whole generation worker. The async path's
             # cross-rank consensus unions failed rids, so the request fails
             # globally once any rank fails here — ranks whose page table has
@@ -2669,7 +2715,7 @@ class Receiver(ReceiverBase):
             # bounce reservation exists yet, and session._sender_endpoints
             # is still empty, so the unpublished owner can close locally.
             logger.error(
-                "dispatch_task: context peer incompatible, failing request "
+                "dispatch_task: context peer registration failed, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
             if self._enforce_physical_ownership:
@@ -2818,7 +2864,9 @@ class Receiver(ReceiverBase):
         if isinstance(ep, list):
             ep = ep[0] if ep else None
         if ep is None:
-            raise ValueError("ctx_info_endpoint is required")
+            raise PeerRegistrationError("ctx_info_endpoint is required")
+        if not isinstance(ep, str) or not ep.startswith(("tcp://", "ipc://", "inproc://")):
+            raise PeerRegistrationError("ctx_info_endpoint is invalid")
         return ep  # str (backward compat)
 
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
@@ -2838,15 +2886,48 @@ class Receiver(ReceiverBase):
             # Known-incompatible peer: fail fast without another
             # REQUEST_INSTANCE_INFO round-trip or re-validation.
             raise PeerIncompatibleError(self._incompatible_peers[info_endpoint])
+        retry_after = self._peer_registration_retry_after.get(info_endpoint)
+        if retry_after is not None:
+            if retry_after > time.monotonic():
+                raise PeerRegistrationError("Context peer registration temporarily unavailable")
+            del self._peer_registration_retry_after[info_endpoint]
         if self._should_register_peer(params):
+            if self._peer_registration_circuit_open_until > time.monotonic():
+                raise PeerRegistrationError("Context peer registration temporarily unavailable")
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
-            messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
+            messenger = None
             try:
+                messenger = ZMQMessenger(
+                    mode="DEALER",
+                    endpoint=info_endpoint,
+                    max_message_size=_MAX_PEER_REGISTRATION_RESPONSE_BYTES,
+                )
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
-                message = messenger.receive()
-                sender_info = RankInfo.from_bytes(message[0])
+                message = messenger.receive(self._peer_registration_receive_timeout_ms())
+                if len(message) != 1:
+                    raise PeerRegistrationError("Context peer returned invalid rank information")
+                message_size = len(message[0])
+                if (
+                    len(self._sender_ep_instance_map) >= _MAX_REGISTERED_PEERS
+                    or self._cached_peer_info_bytes + message_size > _MAX_CACHED_PEER_INFO_BYTES
+                ):
+                    raise PeerRegistrationError("Context peer registration capacity exceeded")
+                try:
+                    sender_info = RankInfo.from_bytes(message[0])
+                except Exception as e:
+                    raise PeerRegistrationError(
+                        "Context peer returned invalid rank information"
+                    ) from e
+            except Exception as e:
+                self._delay_peer_registration(info_endpoint)
+                if isinstance(e, PeerRegistrationError):
+                    raise
+                if isinstance(e, TimeoutError):
+                    raise PeerRegistrationError("Context peer registration timed out") from e
+                raise PeerRegistrationError("Context peer registration failed") from e
             finally:
-                messenger.stop()
+                if messenger is not None:
+                    messenger.stop()
 
             # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
@@ -2878,12 +2959,23 @@ class Receiver(ReceiverBase):
                 self._incompatible_peers[info_endpoint] = msg
                 raise PeerIncompatibleError(msg) from e
 
-            for endpoint in sender_info.sender_endpoints:
-                dealer = self._get_or_connect_dealer(endpoint)
-                rank_info = self._registrar.self_rank_info
-                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
+            existing_dealers = set(self._dealers)
+            try:
+                new_endpoints = set(sender_info.sender_endpoints) - existing_dealers
+                if len(self._dealers) + len(new_endpoints) > _MAX_PEER_DEALERS:
+                    raise PeerRegistrationError("Context peer dealer capacity exceeded")
+                for endpoint in sender_info.sender_endpoints:
+                    dealer = self._get_or_connect_dealer(endpoint)
+                    rank_info = self._registrar.self_rank_info
+                    dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
+            except Exception as e:
+                for endpoint in set(self._dealers) - existing_dealers:
+                    self._dealers.pop(endpoint).stop()
+                self._delay_peer_registration(info_endpoint)
+                raise PeerRegistrationError("Context peer sender setup failed") from e
 
             self._sender_ep_instance_map[info_endpoint] = sender_info
+            self._cached_peer_info_bytes += message_size
             return sender_info
 
         else:
@@ -3832,6 +3924,9 @@ class TransferWorker:
             prompt_len=request.prompt_len,
         )
 
+    def begin_peer_registration_batch(self) -> None:
+        self._receiver.begin_peer_registration_batch()
+
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
         return self._sender.has_all_peer_req_infos(unique_rid)
 
@@ -3895,6 +3990,7 @@ class TransferWorker:
                 self._agent,
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
+                peer_registration_timeout_s=self._config.rx_timeout_s,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
