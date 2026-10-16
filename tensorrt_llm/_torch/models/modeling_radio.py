@@ -1296,7 +1296,7 @@ class RADIOVisionModel(PreTrainedModel):
             inter_feature_normalizer=inter_feature_normalizer,
             model_config=self.model_config,
         )
-        self.radio_model.model._encoder_cuda_graph_config = encoder_cuda_graph_config
+        self.radio_model.model.encoder_cuda_graph_config = encoder_cuda_graph_config
 
     def load_weights(self, weights):
         # Load radio_model weights for pytorch modules.

@@ -69,7 +69,7 @@ def test_encoder_graph_capture_follows_metadata_setup_and_runs_once() -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(torch.empty(1))
             self.name = name
-            self._encoder_cuda_graph_config = config
+            self.encoder_cuda_graph_config = config
             self._blocks_graph_runner = None
             self.runner = Mock()
             self.runner.capture_all.side_effect = lambda device: events.append(
@@ -85,7 +85,7 @@ def test_encoder_graph_capture_follows_metadata_setup_and_runs_once() -> None:
 
         def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
             assert events.index((self.name, "metadata", 1024)) >= 0
-            assert config is self._encoder_cuda_graph_config
+            assert config is self.encoder_cuda_graph_config
             return self.runner
 
     config = MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
@@ -122,7 +122,7 @@ def test_encoder_graph_configs_are_selected_per_tower_and_validated_together() -
             self.runner = Mock()
 
         def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
-            assert config is self._encoder_cuda_graph_config
+            assert config is self.encoder_cuda_graph_config
             return self.runner
 
     vision_config = MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
@@ -133,8 +133,8 @@ def test_encoder_graph_configs_are_selected_per_tower_and_validated_together() -
     model = torch.nn.Module()
     model.vision = Encoder("vision", mm_config)
     model.audio = Encoder("audio", mm_config)
-    assert model.vision._encoder_cuda_graph_config is vision_config
-    assert model.audio._encoder_cuda_graph_config is audio_config
+    assert model.vision.encoder_cuda_graph_config is vision_config
+    assert model.audio.encoder_cuda_graph_config is audio_config
 
     setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph)
     setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph)
@@ -196,9 +196,123 @@ def test_automatic_encoder_graph_budgets_are_resolved_per_tower_without_mutating
 
 def test_automatic_encoder_graphs_need_a_token_budget_before_capture() -> None:
     encoder = MultimodalEncoderMixin()
-    encoder._encoder_cuda_graph_config = MultimodalEncoderCudaGraphConfig(max_batch_size=8)
+    encoder.encoder_cuda_graph_config = MultimodalEncoderCudaGraphConfig(max_batch_size=8)
     with pytest.raises(ValueError, match="from the config or engine"):
         encoder.enable_blocks_cuda_graph()
+
+
+@pytest.mark.parametrize("encoder_max_num_tokens", [None, 1024])
+@pytest.mark.parametrize("item_scheduling", [False, True])
+def test_engine_captures_encoder_graphs_with_original_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_max_num_tokens: int | None,
+    item_scheduling: bool,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import _util, model_engine
+    from tensorrt_llm.mapping import Mapping
+
+    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
+        encoder_cuda_graph_modality = "vision"
+
+        def __init__(self, mm_config: MultimodalConfig) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.configure_encoder_cuda_graph(mm_config)
+            self.setup_attn_metadata = Mock()
+            self.set_attn_max_seq_len = Mock()
+            self.build_runner = Mock(return_value=Mock())
+
+        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
+            return self.build_runner(config)
+
+    mm_config = MultimodalConfig(encoder_cuda_graph={"vision": {"max_batch_size": 8}})
+    mapping = Mapping()
+    model = torch.nn.Module()
+    model.encoder = Encoder(mm_config)
+    model.config = SimpleNamespace(torch_dtype=torch.float32)
+    model.model_config = SimpleNamespace(
+        pretrained_config=model.config, mapping=mapping, sparse_attention_config=None
+    )
+    llm_args = SimpleNamespace(
+        encode_only=False,
+        mm_encoder_only=False,
+        get_runtime_sizes=lambda: (1, 4096, 128, 4),
+        encoder_max_batch_size=None,
+        encoder_max_num_tokens=encoder_max_num_tokens,
+        enable_in_graph_sampling=False,
+        enable_return_routed_experts=False,
+        multimodal_config=mm_config,
+        checkpoint_format="HF",
+        trust_remote_code=False,
+        disable_overlap_scheduler=True,
+        kv_cache_config=None,
+        sleep_config=None,
+        enable_layerwise_nvtx_marker=False,
+        cuda_graph_config=None,
+        torch_compile_config=None,
+        prefill_cuda_graph_backend=None,
+        prefill_capture_num_tokens=None,
+        allreduce_strategy="AUTO",
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
+    )
+    for name in (
+        "should_enable_adp_dummy_fixes",
+        "should_enable_scheduler_aware_adp_dummy",
+        "should_enable_non_overlap_adp_forward_intent",
+        "should_enable_overlap_headroom",
+        "resolved_kv_cache_manager_is_v2",
+    ):
+        monkeypatch.setattr(_util, name, Mock(return_value=False))
+    monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
+    monkeypatch.setattr(model_engine, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(model_engine, "create_input_processor", Mock(return_value=object()))
+    monkeypatch.setattr(
+        model_engine, "resolve_mrope_position_deltas_cache", Mock(return_value=None)
+    )
+    monkeypatch.setattr(model_engine, "is_hybrid_linear", Mock(return_value=False))
+    scheduler = (
+        SimpleNamespace(
+            encoder_max_num_tokens=65536,
+            output_budget_bytes=1024,
+            bytes_per_embedding=4,
+            attention_metadata_capacity=None,
+        )
+        if item_scheduling
+        else None
+    )
+    monkeypatch.setattr(
+        model_engine.MultimodalItemScheduler, "maybe_create", Mock(return_value=scheduler)
+    )
+    engine_cls = model_engine.PyTorchModelEngine
+    monkeypatch.setattr(engine_cls, "_validate_breakable_cuda_graph_compatibility", Mock())
+    monkeypatch.setattr(engine_cls, "_init_model_capacity", engine_cls._init_max_num_tokens)
+    monkeypatch.setattr(engine_cls, "__del__", lambda self: None)
+    monkeypatch.setattr(
+        model_engine,
+        "get_attention_backend",
+        Mock(side_effect=RuntimeError("encoder graph setup complete")),
+    )
+    engine = engine_cls.__new__(engine_cls)
+    with pytest.raises(RuntimeError, match="encoder graph setup complete"):
+        engine_cls.__init__(
+            engine,
+            model_path="dummy",
+            mapping=mapping,
+            model=model,
+            llm_args=llm_args,
+            checkpoint_loader=Mock(),
+        )
+
+    configured_budget = encoder_max_num_tokens if encoder_max_num_tokens is not None else 4096
+    assert engine.max_num_tokens == 512
+    assert engine.encoder_max_num_tokens == (65536 if item_scheduling else configured_budget)
+    model.encoder.set_attn_max_seq_len.assert_called_once_with(engine.encoder_max_num_tokens)
+    capture_config = model.encoder.build_runner.call_args.args[0]
+    assert capture_config.max_num_tokens == configured_budget
+    assert mm_config.encoder_cuda_graph["vision"].max_num_tokens is None
+    model.encoder.build_runner.assert_called_once()
+    model.encoder._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
 
 
 @pytest.mark.parametrize("enable_padding", [False, True])
@@ -207,7 +321,7 @@ def test_encoder_graphs_preserve_eager_metadata_capacity(enable_padding, automat
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         def __init__(self) -> None:
             super().__init__()
-            self._encoder_cuda_graph_config = (
+            self.encoder_cuda_graph_config = (
                 MultimodalEncoderCudaGraphConfig(
                     max_batch_size=8, max_num_tokens=64, enable_padding=enable_padding
                 )

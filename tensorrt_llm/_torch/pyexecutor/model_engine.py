@@ -226,9 +226,10 @@ class PyTorchModelEngine(ModelEngine):
         # The multimodal encoder token budget falls back to the LLM-side value
         # when unset. It may be raised after model load because atomic MM items
         # cannot be split.
-        self.encoder_max_num_tokens = (llm_args.encoder_max_num_tokens
-                                       if llm_args.encoder_max_num_tokens
-                                       is not None else self.max_num_tokens)
+        configured_encoder_max_num_tokens = (
+            llm_args.encoder_max_num_tokens if llm_args.encoder_max_num_tokens
+            is not None else self.max_num_tokens)
+        self.encoder_max_num_tokens = configured_encoder_max_num_tokens
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -546,8 +547,7 @@ class PyTorchModelEngine(ModelEngine):
             setup_mm_encoder_cuda_graphs(
                 self.model,
                 mm_config.encoder_cuda_graph if mm_config is not None else None,
-                max_num_tokens=(self.llm_args.encoder_max_num_tokens
-                                or self.max_num_tokens))
+                max_num_tokens=configured_encoder_max_num_tokens)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
