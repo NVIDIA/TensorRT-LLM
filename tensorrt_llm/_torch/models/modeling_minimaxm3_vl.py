@@ -1861,6 +1861,47 @@ class MiniMaxM3VLInputProcessor:
             return list(value)
         return [value]
 
+    @staticmethod
+    def _rescale_kwargs(items: Sequence[Any], modality: str) -> Dict[str, Any]:
+        """Per-modality HF processor kwargs for already-rescaled media.
+
+        TRT-LLM's default ``"pt"`` media loaders deliver float tensors that
+        are already scaled to ``[0, 1]``, while the HF image / video
+        processors rescale by ``1/255`` by default; rescaling twice leaves the
+        vision tower a near-black input. uint8 tensors / arrays and PIL images
+        keep the processor's default.
+        """
+        prerescaled = {isinstance(x, torch.Tensor) and x.is_floating_point() for x in items}
+        if prerescaled == {True}:
+            return {"do_rescale": False}
+        if len(prerescaled) > 1:
+            raise ValueError(
+                f"MiniMax-M3 VL: {modality} inputs mix float tensors (already scaled "
+                "to [0, 1]) with uint8 / PIL data in one request; use a single format."
+            )
+        return {}
+
+    @staticmethod
+    def _video_metadata(metadata: Any, num_frames: int) -> Dict[str, Any]:
+        """Per-video metadata for the HF video processor.
+
+        The processor writes a timestamp before each temporal group when the
+        video's ``fps`` and ``frames_indices`` are known; otherwise the video
+        is processed without timestamps.
+        """
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        fps = metadata.get("fps")
+        frames_indices = metadata.get("frames_indices")
+        if fps is None or fps <= 0 or frames_indices is None or len(frames_indices) == 0:
+            fps, frames_indices = None, range(num_frames)
+        return {
+            # The media loader has already sampled the frames.
+            "total_num_frames": num_frames,
+            "fps": None if fps is None else float(fps),
+            "duration": metadata.get("duration"),
+            "frames_indices": [int(i) for i in frames_indices],
+        }
+
     # ----- tokenized + MM fast-path hooks ---------------------------------
     # Implementing these lets the runtime accept
     # ``(prompt_token_ids, multi_modal_data)`` directly. Without them the
@@ -2018,13 +2059,19 @@ class MiniMaxM3VLInputProcessor:
 
         # The HF MiniMaxVLProcessor expects video frames as nested lists
         # of frames (one list per video). Accept either pre-extracted
-        # frames or wrapper objects with a ``frames`` attribute.
+        # frames or wrapper objects with a ``frames`` attribute (e.g.
+        # ``VideoData``, whose ``metadata`` carries the frame timing).
         videos: List[Any] = []
+        video_metadata: List[Dict[str, Any]] = []
         for v in video_inputs:
             if hasattr(v, "frames"):
-                videos.append(list(v.frames))
+                frames = list(v.frames)
+                metadata = getattr(v, "metadata", None)
             else:
-                videos.append(list(v) if isinstance(v, (list, tuple)) else [v])
+                frames = list(v) if isinstance(v, (list, tuple)) else [v]
+                metadata = None
+            videos.append(frames)
+            video_metadata.append(self._video_metadata(metadata, len(frames)))
 
         # Apply the M3 chat template before invoking the processor. The
         # M3 ``chat_template.jinja`` inserts the canonical
@@ -2068,12 +2115,22 @@ class MiniMaxM3VLInputProcessor:
                 return ids, {"multimodal_data": {}}
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
-        # in the BatchFeature output.
+        # in the BatchFeature output. Image / video options go in their
+        # per-modality dicts so each modality is rescaled for its own format.
+        processor_kwargs: Dict[str, Any] = {}
+        if images:
+            processor_kwargs["images_kwargs"] = self._rescale_kwargs(images, "image")
+        if videos:
+            processor_kwargs["videos_kwargs"] = {
+                **self._rescale_kwargs([f for frames in videos for f in frames], "video"),
+                "video_metadata": video_metadata,
+            }
         processed = self._processor(
             text=[templated_text],
             images=images if images else None,
             videos=videos if videos else None,
             return_tensors="pt",
+            **processor_kwargs,
         )
 
         multimodal_data: Dict[str, Any] = {}
