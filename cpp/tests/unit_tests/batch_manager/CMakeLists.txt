@@ -290,73 +290,18 @@ add_tllm_gtest(
 
 add_tllm_gtest(
   kvCacheManagerV2DigestPoolTest
-  OWNER
-  batch-manager
-  SOURCES
-  kvCacheManagerV2DigestPoolTest.cpp
-  LINK_LIBRARIES
-  tllm::kv_cache
-  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
-  LABELS
-  "unit;batch-manager;host")
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
+add_gtest(llmRequestTest llmRequestTest.cpp)
+add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
+add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
+add_gtest(staticThreadPoolTest staticThreadPoolTest.cpp)
+add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)
+add_gtest(agentTreeTest agentTreeTest.cpp)
+add_gtest(truncateBlocksTest truncateBlocksTest.cpp)
 
-add_tllm_gtest(
-  kvCacheUtilsTest
-  OWNER
-  batch-manager
-  SOURCES
-  kvCacheUtilsTest.cpp
-  LINK_LIBRARIES
-  tllm::kv_cache_legacy
-  LABELS
-  "unit;batch-manager;gpu")
-
-add_tllm_gtest(
-  llmRequestTest
-  OWNER
-  batch-manager
-  SOURCES
-  llmRequestTest.cpp
-  LINK_LIBRARIES
-  tllm::kv_cache_legacy
-  LABELS
-  "unit;batch-manager;gpu")
-
-add_tllm_gtest(
-  microBatchSchedulerTest
-  OWNER
-  batch-manager
-  SOURCES
-  microBatchSchedulerTest.cpp
-  LINK_LIBRARIES
-  tllm::batch_scheduler
-  LABELS
-  "unit;batch-manager;gpu")
-
-add_tllm_gtest(peftCacheManagerTest SOURCES peftCacheManagerTest.cpp FULL_STACK
-               LABELS "unit;full-stack;gpu")
-
-add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
-               FULL_STACK LABELS "unit;full-stack;host")
-
-add_tllm_gtest(
-  agentTreeTest
-  OWNER
-  batch-manager
-  SOURCES
-  agentTreeTest.cpp
-  LINK_LIBRARIES
-  tllm::batch_scheduler
-  LABELS
-  "unit;batch-manager;host")
-
-add_tllm_gtest(
-  truncateBlocksTest
-  OWNER
-  batch-manager
-  SOURCES
-  truncateBlocksTest.cpp
-  LINK_LIBRARIES
-  tllm::kv_cache_legacy
-  LABELS
-  "unit;batch-manager;gpu")
+add_gtest(kvCacheManagerV2ConfigTest kvCacheManagerV2ConfigTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ConfigTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)

@@ -32,7 +32,7 @@ from typing import (
     Union,
 )
 
-from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
+from ._utils import HalfOpenRange as HalfOpenRange
 
 # From _common.py
 NDEBUG: Final[int]
@@ -75,6 +75,10 @@ def take_poison() -> str | None:
 def num_live_managers() -> int:
     """Number of constructed, not-yet-destroyed managers."""
 
+class CacheDomain(enum.Enum):
+    STANDALONE_DRAFT = 0
+    TARGET = 1
+
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
@@ -93,31 +97,27 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by window, sink tokens, sparsity, and reuse policy."""
+    """The attention life cycle, keyed by window, sink-token shape, and cache domain."""
 
     def __init__(
         self,
         window_size: int | None,
         num_sink_blocks: int,
-        is_sparse: bool = False,
-        reuse_policy: AttentionReusePolicy = ...,
+        cache_domain: CacheDomain = CacheDomain.TARGET,
     ) -> None: ...
     @staticmethod
     def make(
         window_size: int | None,
         num_sink_tokens: int | None,
         tokens_per_block: int,
-        is_sparse: bool = False,
-        reuse_policy: AttentionReusePolicy = ...,
+        cache_domain: CacheDomain = CacheDomain.TARGET,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
     @property
-    def is_sparse(self) -> bool: ...
-    @property
-    def reuse_policy(self) -> AttentionReusePolicy: ...
+    def cache_domain(self) -> CacheDomain: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -276,7 +276,7 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    cache_domain: CacheDomain = CacheDomain.TARGET
     @property
     def window_size(self) -> int | None: ...
 

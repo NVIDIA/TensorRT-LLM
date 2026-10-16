@@ -1399,16 +1399,21 @@ class DFlashForCausalLM(nn.Module):
         head_dim: int,
     ) -> None:
         trtllm_gen_ops = self._dflash_trtllm_gen_ops
-        workspace_bytes = trtllm_gen_ops.get_workspace_size(
-            dtype=dtype,
-            num_tokens=max_batch_size * block_size,
-            num_gen_tokens=max_batch_size * block_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_dim,
-            max_num_requests=max_batch_size,
-            rotary_embedding_dim=0,
-            fp8_context_fmha=False,
+        workspace_bytes = max(
+            trtllm_gen_ops.get_workspace_size(
+                dtype=dtype,
+                num_tokens=max_batch_size * block_size,
+                num_gen_tokens=max_batch_size * block_size,
+                num_heads=heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                max_num_requests=max_batch_size,
+                rotary_embedding_dim=0,
+                fp8_context_fmha=False,
+            )
+            # A non-causal block runs as one decode request whose query heads
+            # are the block's queries times the attention heads.
+            for heads in (num_heads, num_heads * block_size)
         )
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -1441,7 +1446,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads, max_batch_size, sm_count
+            num_heads * block_size, max_batch_size, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (
@@ -1623,20 +1628,14 @@ class DFlashForCausalLM(nn.Module):
                 .reshape(-1)
                 .contiguous()
             )
-        else:  # VANILLA
-            # Slot and column that each block K/V row occupies
-            self._prepare_dflash_index_buffers(
-                ctx_k_cache.device,
-                ctx_k_cache.size(0),
-                block_size,
-                need_batch_indices=False,
-            )
-            append_batch_indices = (
-                cache_batch_idx_i32.view(-1, 1).expand(-1, block_size).reshape(-1).long()
-            )
-            append_positions = (
-                (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets).reshape(-1).long()
-            )
+            # An FP8 cache takes the block's K/V through direct page writes
+            # (the same rows and kv positions the append addresses).
+            fp8_cache = ctx_kv_cache[0].dtype == torch.float8_e4m3fn
+            if fp8_cache:
+                append_rows = append_batch_indices.long()
+                append_pos_long = append_positions.long()
+                fp8_pages = block_tables[append_rows, append_pos_long // page_size].long()
+                fp8_offsets = append_pos_long % page_size
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
@@ -1741,23 +1740,41 @@ class DFlashForCausalLM(nn.Module):
             causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
-                trtllm_gen_ops.append_paged_kv_cache(
-                    append_key=k_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    batch_indices=append_batch_indices,
-                    positions=append_positions,
-                    paged_kv_cache=layer_cache,
-                    kv_indices=kv_indices,
-                    kv_indptr=kv_indptr,
-                    kv_last_page_len=kv_last_page_len,
-                    kv_layout="HND",
-                )
+                if fp8_cache:
+                    cache_bytes = layer_cache.view(torch.uint8)
+                    cache_bytes[fp8_pages, 0, :, fp8_offsets] = (
+                        k_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim)
+                        .to(layer_cache.dtype)
+                        .view(torch.uint8)
+                    )
+                    cache_bytes[fp8_pages, 1, :, fp8_offsets] = (
+                        v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim)
+                        .to(layer_cache.dtype)
+                        .view(torch.uint8)
+                    )
+                else:
+                    trtllm_gen_ops.append_paged_kv_cache(
+                        append_key=k_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        append_value=v_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        batch_indices=append_batch_indices,
+                        positions=append_positions,
+                        paged_kv_cache=layer_cache,
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        kv_last_page_len=kv_last_page_len,
+                        kv_layout="HND",
+                    )
                 out = torch.empty_like(Q_bshd)
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
+                if fp8_cache:
+                    # TRTLLM-Gen reads an FP8 cache with FP8 queries (the
+                    # context kernels have no BF16-query variant); scales stay
+                    # 1, matching the K/V writes.
+                    q_flat = q_flat.to(layer_cache.dtype)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
                 if causal:
@@ -1783,6 +1800,48 @@ class DFlashForCausalLM(nn.Module):
                         uses_shared_paged_kv_idx=True,
                         bmm1_scale_log2=None,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    )
+                elif window_left == -1:
+                    # Every block query attends the same keys (the history and
+                    # the whole block), so the block runs as one decode request
+                    # with block_size * num_heads query heads. Query (j, head
+                    # g * group + r) becomes head (g, j, r): the GQA group
+                    # grows to block_size * group and the decode kernel, which
+                    # also splits a long history across CTAs, reads each
+                    # history once.
+                    group = num_heads_per_rank // num_kv_heads_per_rank
+                    q_folded = q_flat.reshape(
+                        B, block_size, num_kv_heads_per_rank, group, head_dim
+                    ).permute(0, 2, 1, 3, 4)
+                    q_folded = q_folded.reshape(B, -1, head_dim)
+                    out_folded = q_folded.new_empty(q_folded.shape, dtype=out.dtype)
+                    trtllm_gen_ops.batch_decode_with_kv_cache(
+                        query=q_folded,
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_trtllm_gen_workspace,
+                        block_tables=block_tables,
+                        seq_lens=seq_lens_after,
+                        max_seq_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        window_left=window_left,
+                        out=out_folded,
+                        sinks=None,
+                        enable_pdl=False,
+                        kv_layout="HND",
+                        backend="trtllm-gen",
+                        q_len_per_req=1,
+                        max_q_len=None,
+                        cum_seq_lens_q=None,
+                        kv_cache_sf=None,
+                        uses_shared_paged_kv_idx=True,
+                        bmm1_scale_log2=None,
+                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    )
+                    out_flat.view(B, block_size, num_kv_heads_per_rank, group, head_dim).copy_(
+                        out_folded.view(
+                            B, num_kv_heads_per_rank, block_size, group, head_dim
+                        ).permute(0, 2, 1, 3, 4)
                     )
                 else:
                     cum_seq_lens_q = torch.arange(

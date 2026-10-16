@@ -9081,11 +9081,10 @@ class PyExecutor:
                 sample_state = self.sampler.sample_async(
                     scheduled_batch, batch_outputs,
                     num_context_logits_prefix_sum)
-                self._maybe_record_hang_diagnostic_phase(
-                    "sampling_returned", scheduled_batch)
+                if sample_state is not None:
+                    sample_state.draft_history_update = batch_outputs.get(
+                        'draft_history_update')
                 return sample_state
-            self._maybe_record_hang_diagnostic_phase("sampling_skipped",
-                                                     scheduled_batch)
         except Exception as e:
             self._maybe_record_hang_diagnostic_phase("sampling_error",
                                                      scheduled_batch)
@@ -9107,10 +9106,15 @@ class PyExecutor:
 
     @nvtx_range("_update_requests")
     def _update_requests(self,
-                         sample_state: SampleState,
+                         sample_state: SampleState | None,
                          resource_manager: Optional[ResourceManager] = None):
+        if sample_state is None:
+            return
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            if sample_state.draft_history_update is not None:
+                sample_state.draft_history_update.publish()
+                sample_state.draft_history_update = None
             self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()

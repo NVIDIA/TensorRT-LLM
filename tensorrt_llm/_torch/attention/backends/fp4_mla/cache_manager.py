@@ -288,6 +288,8 @@ class Fp4MlaV2CacheLayoutPolicy:
         dtype and logical shape as an all-BF16 cache manager.
         """
         local_layer = self.layer_offsets[layer_idx]
+        if self._is_standalone_draft_layer(local_layer):
+            return self.get_draft_buffers(self.draft_layer_ids.index(layer_idx), kv_layout)
         is_linear_layer = getattr(self, "_is_local_mamba_layer", None)
         if callable(is_linear_layer) and is_linear_layer(local_layer):
             return None
@@ -322,8 +324,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         if layer_idx is None:
             return self.dtype
         local_layer = self.layer_offsets[layer_idx]
-        if local_layer in self._bf16_mla_local_layer_indices():
-            return DataType.BF16
+        if self._is_standalone_draft_layer(local_layer):
+            return self.dtype_per_layer[local_layer]
+        if local_layer in self._fp8_mla_local_layer_indices():
+            return DataType.FP8
         return self.dtype
 
     def get_kv_cache_num_blocks(self, layer_idx: int) -> int:
@@ -969,10 +973,15 @@ class Fp4MlaV2CacheLayoutPolicy:
             int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
             for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids)
         }
+        draft_global = {
+            self.layer_offsets[layer_id]: 2 * layer_id for layer_id in self.draft_layer_ids
+        }
         result = []
         for layer_id in local_layer_ids:
             internal_layer = int(layer_id)
-            if internal_layer in cache_local:
+            if internal_layer in draft_global:
+                result.append(draft_global[internal_layer])
+            elif internal_layer in cache_local:
                 result.append(2 * int(self.pp_layers[cache_local[internal_layer]]))
             elif internal_layer in hp_local:
                 result.append(2 * int(self.pp_layers[hp_local[internal_layer]]) + 1)
@@ -998,6 +1007,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             for local_layer in fp4_local_layers
         )
         windows.extend([self._fp4_mla_hp_pool_size] * len(fp4_local_layers))
+        sizes.extend(self._draft_layer_sizes)
+        windows.extend([self.draft_retention_window_size] * len(self._draft_layer_sizes))
         return sizes, windows
 
     def _get_generation_request_capacity(self) -> int:
@@ -1007,7 +1018,7 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def get_cache_bytes_per_token(self) -> int:
         sizes, _ = self._get_runtime_cache_size_layer_components()
-        return sum(sizes)
+        return sum(sizes) + (self._helix_cp_size - 1) * sum(self._draft_layer_sizes)
 
     @staticmethod
     def get_cache_size_per_token(
@@ -1061,7 +1072,33 @@ class Fp4MlaV2CacheLayoutPolicy:
             * torch.empty((), dtype=torch.bfloat16).element_size()
             * num_bf16_layers
         )
-        return cache_bytes, hp_bytes * max_batch_size * mapping.pp_size
+        fixed_bytes = hp_bytes * max_batch_size * mapping.pp_size
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            _estimate_draft_cache_size_components,
+            _get_draft_layer_sizes,
+            _get_generation_kv_capacity,
+        )
+
+        draft_sizes = _get_draft_layer_sizes(**kwargs)
+        if draft_sizes:
+            scratch = kwargs.get("draft_scratch_tokens", 0)
+            _, headroom = _get_generation_kv_capacity(spec_config, is_draft=False)
+            draft_context, draft_generation, draft_fixed = _estimate_draft_cache_size_components(
+                draft_sizes,
+                tokens_per_block,
+                scratch_tokens=scratch,
+                window_size=kwargs.get("draft_window_size"),
+                generation_capacity_headroom=headroom + scratch,
+                helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
+            )
+            # The shared allocation envelope reserves space in target pools too.
+            draft_fixed += scratch * (cache_bytes + hp_bytes / (HP_BLOCK_SIZE + rewind))
+            fixed_bytes += int(draft_fixed * max_batch_size * mapping.pp_size)
+            fixed_bytes += (draft_context - draft_generation) * int(
+                kwargs.get("max_num_tokens") or 0
+            )
+            cache_bytes += draft_generation
+        return cache_bytes, fixed_bytes
 
 
 class Fp4MlaKVCacheManagerV2(Fp4MlaV2CacheLayoutPolicy, KVCacheManagerV2):

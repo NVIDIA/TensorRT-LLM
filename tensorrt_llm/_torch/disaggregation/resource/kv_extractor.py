@@ -43,10 +43,15 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_physical_pool,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
-from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
+)
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PoolGroupDesc, SlotDescVariant
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -201,7 +206,12 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
 
     if not hasattr(manager, "_layer_attn_to_layer_id"):
         # Standard: local_layer_id is index into pp_layers
-        return [manager.pp_layers[lid] for lid in local_layer_ids]
+        local_to_global = dict(enumerate(manager.pp_layers))
+        local_to_global.update(
+            (manager.layer_offsets[layer_id], layer_id)
+            for layer_id in getattr(manager, "draft_layer_ids", ())
+        )
+        return [local_to_global[lid] for lid in local_layer_ids]
 
     # Virtual layers: build inverse mapping internal_layer_id -> (model_layer, attn_type)
     # and encode as model_layer * num_attn_types + attn_type_value
@@ -214,7 +224,9 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     # matching this ID is required to be consistent for.
     inverse = {}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-        inverse.setdefault(layer_id, (model_layer, attn_type.value))
+        inverse[layer_id] = (model_layer, attn_type.value)
+    for draft_layer in getattr(manager, "draft_layer_ids", ()):
+        inverse[manager.layer_offsets[draft_layer]] = (draft_layer, 0)
 
     # Use the full enum range for consistent encoding across all PP ranks.
     # Different PP ranks may have different subsets of attention types (e.g.,
@@ -327,6 +339,56 @@ def _build_pool_views_for_variant(
     return pool_views
 
 
+def _build_draft_pool_views(
+    manager: KVCacheManagerV2, variant: SlotDescVariant, pg_desc: PoolGroupDesc
+) -> tuple[PhysicalPoolGroup, list[PoolView]]:
+    """Expose expanded draft buffers as physical-token pages for transfer."""
+    if len(variant.coalesced_buffers) != 1:
+        raise ValueError("Standalone draft layers must share one equal-sized K/V pool")
+    buffer = variant.coalesced_buffers[0]
+    first_layer = buffer.buffer_ids[0].layer_id
+    expansion = manager.impl.get_page_index_converter(first_layer, Role.KEY).expansion
+    buffer_size = int(buffer.single_buffer_size)
+    if buffer_size % expansion:
+        raise ValueError("Draft buffer size is not divisible by its page expansion")
+    page_bytes = buffer_size // expansion
+    physical_pool = pg_desc.pools[0]
+    slot_bytes = int(physical_pool.slot_bytes)
+    if slot_bytes % page_bytes:
+        raise ValueError("Draft pool slots must contain whole physical-token pages")
+    pool_group = PhysicalPoolGroup(
+        pools=[
+            PhysicalPool(
+                base_address=int(physical_pool.base_address),
+                slot_bytes=page_bytes,
+                num_slots=int(pg_desc.num_slots) * (slot_bytes // page_bytes),
+                slot_stride_bytes=page_bytes,
+            )
+        ]
+    )
+    entries_by_role = defaultdict(list)
+    for index, buffer_id in enumerate(buffer.buffer_ids):
+        if buffer_id.role not in (Role.KEY, Role.VALUE):
+            raise ValueError("Standalone draft transfer expects only K/V buffers")
+        entries_by_role[buffer_id.role].append(
+            (int(buffer_id.layer_id), index * buffer_size, page_bytes)
+        )
+    # K and V occupy separate expanded runs. Keeping one role per view lets
+    # the existing head mapper copy each physical-token page without treating
+    # the intervening subpages as part of that page's payload.
+    views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=frozenset({str(role)}),
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=page_bytes,
+        )
+        for role, entries in entries_by_role.items()
+    ]
+    return pool_group, views
+
+
 def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
@@ -428,19 +490,21 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
             ]
 
-            # A life cycle is recurrent when its layers are the manager's
-            # mamba layers. Recurrent and attention layers never share a life
-            # cycle: their buffer configs differ, so V2 groups them apart.
-            is_recurrent = isinstance(manager, MambaHybridCacheManagerV2) and any(
-                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
-            )
-            if is_recurrent and not all(
-                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
-            ):
-                raise ValueError(
-                    f"Layer group {layer_group_id} mixes recurrent and attention layers"
+            layer_id = int(all_internal_layer_ids[0])
+            if layer_id in manager.cp_as_tp_layer_ids:
+                draft_pool_group, pool_views = _build_draft_pool_views(manager, variant, pg_desc)
+                draft_pool_group_idx = len(pool_groups)
+                pool_groups.append(draft_pool_group)
+                layer_groups_by_id[layer_group_id] = AttentionLayerGroup(
+                    pool_group_idx=draft_pool_group_idx,
+                    local_layers=local_layers,
+                    pool_views=pool_views,
+                    kv_head_num_per_rank=manager.num_kv_heads_per_layer[layer_id],
+                    sliding_window_size=_window_size_for_layer(all_internal_layer_ids[0]),
+                    cp_as_tp=True,
+                    total_kv_head_num=manager._draft_total_num_kv_heads,
                 )
-            cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
+                continue
 
             # Bucket buffer entries by (pool, mapper kind). One PoolView is
             # emitted per bucket and spans every layer of that role class,

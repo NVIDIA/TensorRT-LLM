@@ -204,10 +204,10 @@ struct AttentionLayerConfig
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
 
-    // Private working pages never constrain prefix matching or enter the tree.
-    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+    // Layers in different ownership domains must not share lifecycle or storage pools.
+    CacheDomain cacheDomain = CacheDomain::kTarget;
 
-    [[nodiscard]] std::optional<int> windowSize() const noexcept
+    std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
     }

@@ -612,9 +612,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
         first_head_dim = self.head_dim_per_layer[0]
         first_num_heads = self.num_kv_heads_per_layer[0]
-        if any(head_dim != first_head_dim for head_dim in self.head_dim_per_layer):
+        if any(
+            head_dim != first_head_dim
+            for head_dim in self.head_dim_per_layer[: self.num_local_layers]
+        ):
             raise ValueError("DSA requires a uniform KV head dimension")
-        if any(num_heads != first_num_heads for num_heads in self.num_kv_heads_per_layer):
+        if any(
+            num_heads != first_num_heads
+            for num_heads in self.num_kv_heads_per_layer[: self.num_local_layers]
+        ):
             raise ValueError("DSA requires a uniform KV head count")
 
         first_converter = self.impl.get_page_index_converter(0, Role.KEY)
@@ -657,13 +663,22 @@ class DSACacheManagerV2(KVCacheManagerV2):
         )
         return self._unique_primary_pool
 
+    def _append_standalone_draft_layers(self, config, **kwargs):
+        # DSA masks and fused primary views describe target layers only.
+        return super()._append_standalone_draft_layers(
+            config, register_model_layers=False, **kwargs
+        )
+
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         if data_role == Role.INDEX_KEY:
             return _get_indexer_k_cache_bytes_per_token(
                 self.index_head_dim, self.quant_block_size, self.use_fp4
             )
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        if self.dtype == DataType.NVFP4 and self.mla_kv_cache_residual_dim > 0:
+        if (
+            self.dtype_per_layer[local_layer_idx] == DataType.NVFP4
+            and self.mla_kv_cache_residual_dim > 0
+        ):
             if data_role == Role.KEY:
                 cache_bytes += self.mla_kv_cache_residual_dim // 2
             elif data_role == Role.KEY_BLOCK_SCALE:
@@ -673,12 +688,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 cache_bytes += self.mla_kv_cache_residual_dim // 16
         if (
             data_role == Role.ALL
-            and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
+            and local_layer_idx < len(self.indexer_k_cache_local_layer_mask)
+            and self.indexer_k_cache_local_layer_mask[local_layer_idx]
         ):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
 
     def get_cache_bytes_per_token(self) -> int:
+        if self._draft_layer_sizes:
+            return super().get_cache_bytes_per_token()
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx, Role.ALL)
             for local_layer_idx in range(self.num_local_layers)
@@ -709,6 +727,30 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 model_config, mapping, num_layers
             )
             cache_bytes += num_attention_layers * (residual_dim // 2 + math.ceil(residual_dim / 16))
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            _estimate_draft_cache_size_components,
+            _get_draft_layer_sizes,
+            _get_generation_kv_capacity,
+        )
+
+        draft_sizes = _get_draft_layer_sizes(**kwargs)
+        if draft_sizes:
+            scratch = kwargs.get("draft_scratch_tokens", 0)
+            _, headroom = _get_generation_kv_capacity(kwargs.get("spec_config"), is_draft=False)
+            context, generation, fixed = _estimate_draft_cache_size_components(
+                draft_sizes,
+                kwargs["tokens_per_block"],
+                scratch_tokens=scratch,
+                window_size=kwargs.get("draft_window_size"),
+                generation_capacity_headroom=headroom + scratch,
+                helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
+            )
+            fixed += scratch * cache_bytes
+            return (
+                cache_bytes + generation,
+                fixed * int(kwargs.get("max_batch_size") or 0)
+                + (context - generation) * int(kwargs.get("max_num_tokens") or 0),
+            )
         return cache_bytes
 
     def shutdown(self) -> None:

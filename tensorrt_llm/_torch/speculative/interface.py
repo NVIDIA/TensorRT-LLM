@@ -37,6 +37,8 @@ from ..pyexecutor.resource_manager import ResourceManagerType
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
+    from ..pyexecutor.resource_manager import ResourceManager
+    from ..pyexecutor.standalone_draft_cache import DraftHistoryUpdate
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -1691,6 +1693,19 @@ class SpecWorkerBase(nn.Module, ABC):
         for handler in self._auxiliary_state_handlers:
             handler.commit_speculative_states(num_accepted_tokens,
                                               state_indices, num_contexts)
+
+    def prepare_managed_draft_cache(
+        self,
+        draft_model: nn.Module | None,
+        spec_metadata: "SpecMetadata",
+        attn_metadata: AttentionMetadata,
+        resource_manager: "ResourceManager",
+    ) -> None:
+        """Stage manager-owned draft history before eager execution or replay."""
+
+    def snapshot_managed_draft_history(self) -> Optional["DraftHistoryUpdate"]:
+        """Snapshot this execution's history for publication at completion."""
+        return None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
