@@ -30,7 +30,12 @@ from ..ltx2.transformer_ltx2 import (
     LTXModel,
     TransformerConfig,
 )
-from ._precision import _make_mlp, _slice_batch_bundle, _uses_reference_precision
+from ._precision import (
+    _DenseReferenceRMSNorm,
+    _make_mlp,
+    _slice_batch_bundle,
+    _uses_reference_precision,
+)
 
 _get_ada_table_ts_pairs = BasicAVTransformerBlock._get_ada_table_ts_pairs
 _get_av_ca_ada_table_ts_pairs = BasicAVTransformerBlock._get_av_ca_ada_table_ts_pairs
@@ -81,8 +86,8 @@ class LTX23TransformerBlock(nn.Module):
             )
             if _uses_reference_precision(config):
                 module.fuse_qk_norm_rope = False
-                module.norm_q = nn.RMSNorm(module.q_dim, eps=norm_eps, dtype=config.torch_dtype)
-                module.norm_k = nn.RMSNorm(module.kv_dim, eps=norm_eps, dtype=config.torch_dtype)
+                module.norm_q = _DenseReferenceRMSNorm(module.q_dim, norm_eps, config.torch_dtype)
+                module.norm_k = _DenseReferenceRMSNorm(module.kv_dim, norm_eps, config.torch_dtype)
             return module
 
         if video is not None:

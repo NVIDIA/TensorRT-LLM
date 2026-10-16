@@ -8,6 +8,7 @@ from dataclasses import fields, replace
 from typing import TYPE_CHECKING, TypeGuard, TypeVar
 
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import gelu_tanh
@@ -38,6 +39,17 @@ class _DenseReferenceMLP(MLP):
     def _unquantized_gelu_fusion_eligible(self, _x: torch.Tensor) -> bool:
         """Keep the BF16 up-projection rounded before applying GELU."""
         return False
+
+
+class _DenseReferenceRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float, dtype: torch.dtype) -> None:
+        super().__init__()
+        # A constant factory is also valid inside the loader's meta-init context.
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
+        self.eps = eps
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return nn.functional.rms_norm(value, self.weight.shape, self.weight, self.eps)
 
 
 def _make_mlp(cfg: TransformerConfig, model_config: DiffusionModelConfig | None, idx: int) -> MLP:
