@@ -302,6 +302,15 @@ authentication, configurable private workdirs, daemon launch/stop, and recovery.
 No GitHub App or systemd setup is required. All remote writes are opt-in with
 `--publish`; operator settings and credentials are not committed to this repo.
 
+Each monitor handles one vendor and consumer base branch. Main and release
+branches can use different canonical source branches, but require separate
+workdirs and explicit launches. A periodic upstream refresh remains a separate
+code-changing PR with normal CI: stop its monitor or configure an audited
+`--refresh-branch` target before opening it, then migrate the canonical branch
+in the existing workdir after merge. See the toolkit guide's
+[base-branch setup](../scripts/vendor/README.md#different-consumer-base-branches)
+and [refresh cutover](../scripts/vendor/README.md#switching-canonical-branches-after-a-refresh).
+
 Use the entry points under `scripts/vendor/` directly. The old top-level scripts
 and PrimTS-specific CLI aliases are not retained; callers must migrate to the
 generic commands and supply their vendor and repository configuration explicitly.

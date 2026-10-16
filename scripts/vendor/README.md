@@ -26,7 +26,12 @@ lock and is not migrated by this change.
 
 ```mermaid
 flowchart TD
-    source[Source-update PR changes a vendor pin] --> metadata[Author lists upstream PRs in description]
+    candidate[Lock-changing PR for the configured consumer and base branch] --> classify{Selected vendor change}
+    classify -->|new pin on temporary branch| metadata[Author lists upstream PRs in description]
+    classify -->|temporary reference at current canonical pin| restore[Author restores canonical URL and branch only]
+    restore --> cleanup[Reconcile obsolete bot feedback without approving code]
+    classify -->|no promotion needed| cleanup
+    classify -->|operator-configured refresh target| refresh[Separate upstream refresh PR and normal CI]
     metadata --> match[Bot validates metadata and matches lock-selected file changes]
     match -->|missing or ambiguous| feedback[Request changes with author-facing instructions]
     feedback -->|author corrects block, pin, or targeted resolution| metadata
@@ -41,7 +46,7 @@ flowchart TD
     recover -->|pending recorded operation| verify
     recover -->|no record and pin still pending| metadata
     recover -->|completed promotion| merged
-    refresh[Separate upstream refresh PR and normal CI] -->|merged| migrate[Stop bot and verify explicit branch migration]
+    refresh -->|merged| migrate[Stop bot and verify explicit branch migration]
     migrate --> rediscover[Reuse workdir and revalidate GitHub state]
     rediscover --> rebase
 ```
@@ -65,11 +70,13 @@ repository authorization. No GitHub App, repository-admin access, webhook
 server, or systemd unit is required merely to run the monitor. Repository rules,
 SSO/token policies, CI-bot authorization, and required owner reviews still apply.
 
-Run only one **publishing** monitor per consumer/vendor/canonical branch. The
-workdir lock prevents duplicate processes using the same directory; it is not a
-distributed lock between operators or machines. Finish one promotion before
-merging the next source update for that vendor. Unexpected concurrent changes
-stop publication rather than force-pushing or selecting an arbitrary newer pin.
+Run only one **publishing** monitor per consumer repository/base/vendor. If
+multiple monitors share a canonical source branch, serialize their publications
+as well. The workdir lock prevents duplicate processes using the same directory;
+it is not a distributed lock between operators, machines, or workdirs. Finish
+one promotion before merging the next source update for that consumer/base/vendor.
+Unexpected concurrent changes stop publication rather than force-pushing or
+selecting an arbitrary newer pin.
 
 ## Contributor metadata
 
@@ -166,6 +173,8 @@ All operator-specific settings are CLI inputs. Start with one dry-run pass:
 ```bash
 python scripts/vendor/bot.py run \
   --vendor example-library \
+  --consumer-repo NVIDIA/TensorRT-LLM \
+  --base-branch main \
   --upstream-repo UPSTREAM/library \
   --canonical-repo MAINTAINER/library \
   --canonical-branch consumer-dev \
@@ -297,6 +306,13 @@ do not require promotion metadata. Eligible updates are still checked against
 the latest canonical lock, so their source branches must include the refreshed
 canonical history before promotion.
 
+A same-commit temporary URL/branch redirect is not a source update, but can still
+need author feedback: if the PR itself changes the reference and its pin equals
+the current canonical base pin, restore the base's canonical URL/branch only.
+No promotion metadata is required. When an open PR no longer needs promotion,
+the bot reconciles any existing feedback instead of leaving a stale objection.
+It does not post new feedback on otherwise ignored PRs.
+
 ### Monitoring health
 
 `--log-level INFO` is the default, in both foreground and daemon mode. Logs use
@@ -326,6 +342,8 @@ The JSON separates process liveness from work completion:
 | Field | Meaning |
 | --- | --- |
 | `running`, `pid`, `publish` | Process lock held, recorded PID, and whether remote writes are enabled; not a health verdict |
+| `vendor`, `base_branch`, `canonical_repo`, `canonical_branch` | Cached monitor scope and publishing destination; verify these after a restart or migration |
+| `refresh_branches`, `migration` | Explicit refresh-target policy and last verified canonical-branch migration; not authorization to publish to a refresh target |
 | `operation`, `progress_at` | Current phase/PR/start time and last worker checkpoint |
 | `counts` | Current poll's scanned records, tracked lock PRs, relevant vendor updates, processed PRs, author-blocked PRs, and errors |
 | `last_completed_poll` | Last fully scanned/processed poll, even if individual PRs needed attention |
@@ -354,7 +372,8 @@ authorizes publication; restart recovery still verifies Git/GitHub provenance.
 
 Git/GitHub are the source of truth; SQLite is not required to reconstruct a
 promotion. Stop the old process before replacing or discarding its database.
-Relaunch with the **same account, repositories, canonical branch, and cutoff**.
+Relaunch with the **same account, repositories, consumer base branch, canonical
+branch, and cutoff**, and re-supply any `--refresh-branch` policy.
 The bot accepts an existing workdir containing only recognized bot artifacts
 even if SQLite is missing. It preserves those artifacts and refuses unrelated
 files and symlinks. A new empty workdir also works; existing registered Git
@@ -478,3 +497,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest --noconftest -c /dev/null \
   tests/unittest/others/test_maintain_prims_ts.py \
   tests/unittest/others/test_vendor_bot.py
 ```
+
+These suites carry `cpu_only` markers and are included in normal CPU CI through
+the `unittest/others` parent entry in
+`tests/integration/test_lists/test-db/l0_cpu.yml`. The standalone command above
+avoids loading the TensorRT-LLM runtime or unrelated pytest plugins; it does not
+replace normal CI for changes to the tools.
