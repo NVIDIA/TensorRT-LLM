@@ -55,12 +55,7 @@ LTX23_TEXT_ENCODER_PATH = os.environ.get(
     _lpips_model_path("gemma", "gemma-3-12b-it-qat-q4_0-unquantized"),
 )
 
-LTX23_GOLDEN_DIR = os.environ.get(
-    "LTX23_GOLDEN_DIR",
-    os.path.join(os.path.dirname(__file__), "golden", "visual_gen_lpips"),
-)
-LTX23_GOLDEN_VIDEO = os.path.join(LTX23_GOLDEN_DIR, "ltx23_lpips_golden_video.mp4")
-LTX23_GOLDEN_AUDIO = os.path.join(LTX23_GOLDEN_DIR, "ltx23_audio_golden.wav")
+LTX23_GOLDEN_DIR = os.environ.get("LTX23_GOLDEN_DIR")
 
 LTX23_LPIPS_PROMPT = (
     "A cinematic close-up of a golden retriever puppy running through a sunlit "
@@ -86,7 +81,15 @@ LTX23_RETAKE_CHECKPOINT_ENV = "LTX23_RETAKE_CHECKPOINT"
 LTX23_RETAKE_LPIPS_FRAME_START = 89
 LTX23_RETAKE_LPIPS_FRAME_STOP = 118
 LTX23_RETAKE_LPIPS_THRESHOLD = 0.05
-LTX23_RETAKE_PROMPT_CONDITIONING = "ltx23_retake_prompt_conditioning.safetensors"
+LTX23_RETAKE_PROMPT = "a person talking to the camera, natural head motion, clear speech"
+
+
+def _ltx23_golden_media_path(tmp_path, media_name: str, label: str) -> str:
+    if LTX23_GOLDEN_DIR is not None:
+        path = os.path.join(LTX23_GOLDEN_DIR, media_name)
+        _require_exists(path, label)
+        return path
+    return str(_golden_media_path(tmp_path, media_name, label))
 
 
 def _save_wav(audio, path, sample_rate):
@@ -177,20 +180,22 @@ def ltx23_av_candidate(tmp_path_factory):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_ltx23_video_lpips_against_golden(tmp_path, ltx23_av_candidate):
     """Compare only the BF16 generation output against the LPIPS golden."""
-    _require_exists(LTX23_GOLDEN_VIDEO, "LTX-2.3 LPIPS golden video")
-    video_path, _ = ltx23_av_candidate
-    score = _run_lpips_eval(
-        tmp_path, "ltx23", "video", LTX23_LPIPS_PROMPT, LTX23_GOLDEN_VIDEO, video_path
+    golden_path = _ltx23_golden_media_path(
+        tmp_path, "ltx23_lpips_golden_video.mp4", "LTX-2.3 LPIPS golden video"
     )
+    video_path, _ = ltx23_av_candidate
+    score = _run_lpips_eval(tmp_path, "ltx23", "video", LTX23_LPIPS_PROMPT, golden_path, video_path)
     _assert_lpips_below_threshold(score, LTX23_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx23_audio_against_golden(ltx23_av_candidate):
+def test_ltx23_audio_against_golden(tmp_path, ltx23_av_candidate):
     """The only gate on the vocoder and BWE output; LPIPS cannot see audio."""
-    _require_exists(LTX23_GOLDEN_AUDIO, "LTX-2.3 golden audio")
+    golden_path = _ltx23_golden_media_path(
+        tmp_path, "ltx23_audio_golden.wav", "LTX-2.3 golden audio"
+    )
     _, audio_path = ltx23_av_candidate
-    distance = _audio_mel_l1_distance(audio_path, LTX23_GOLDEN_AUDIO)
+    distance = _audio_mel_l1_distance(audio_path, golden_path)
     assert distance < LTX23_AUDIO_MEL_L1_THRESHOLD, (
         f"LTX-2.3 audio log-mel L1 too high: {distance:.6f} "
         f"(expected < {LTX23_AUDIO_MEL_L1_THRESHOLD:.6f})"
@@ -240,10 +245,8 @@ def _generate_ltx23_retake_video(
         "ltx23_retake_lpips_input_video.mp4",
         "LTX-2.3 delete-disfluency retake input",
     )
-    prompt_conditioning = _golden_media_path(
-        tmp_path,
-        LTX23_RETAKE_PROMPT_CONDITIONING,
-        "LTX-2.3 retake prompt conditioning",
+    _require_exists(
+        LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True
     )
     checkpoint = os.environ.get(LTX23_RETAKE_CHECKPOINT_ENV) or os.path.join(
         os.path.dirname(LTX23_MODEL_PATH), "ltx-2.3-22b-distilled-1.1.safetensors"
@@ -265,8 +268,10 @@ def _generate_ltx23_retake_video(
             "2.9667",
             "--end",
             "3.9333",
-            "--prompt_conditioning_path",
-            str(prompt_conditioning),
+            "--prompt",
+            LTX23_RETAKE_PROMPT,
+            "--text_encoder_path",
+            LTX23_TEXT_ENCODER_PATH,
             "--output_path",
             str(output_path),
         ],
