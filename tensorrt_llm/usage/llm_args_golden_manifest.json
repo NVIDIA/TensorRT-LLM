@@ -666,6 +666,14 @@
       "path": "kv_cache_config.enable_kv_pool_rebalance"
     },
     {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "kv_cache_config.enable_mix_precision"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.enable_partial_reuse"
@@ -681,6 +689,11 @@
       "path": "kv_cache_config.event_buffer_max_size"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.first_n"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
@@ -689,6 +702,11 @@
       "capture_policy": "float|none",
       "kind": "value",
       "path": "kv_cache_config.free_gpu_memory_fraction"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "kv_cache_config.high_low_pool_ratio"
     },
     {
       "capture_policy": "int|none",
@@ -739,6 +757,11 @@
       "capture_policy": "literal|none",
       "kind": "categorical",
       "path": "kv_cache_config.kv_events_config.publisher"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.last_n"
     },
     {
       "allowed_values": [
@@ -1378,6 +1401,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.gvr_deterministic_topk"
     },
     {
       "allowed_values": [

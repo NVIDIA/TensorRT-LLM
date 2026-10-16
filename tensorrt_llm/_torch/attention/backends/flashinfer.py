@@ -638,27 +638,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
 
-    def with_paged_kv_view(self, attention_kv) -> "FlashInferAttentionMetadata":
-        """Use a materialized KV view without changing request lengths or cached plans."""
-        if list(self.num_blocks) != attention_kv.page_counts:
-            raise NotImplementedError(
-                "Mixed-precision staging requires logical page tables")
-        metadata = copy.copy(self)
-        metadata.kv_cache_manager = attention_kv
-        metadata._host_paged_kv_indices = torch.arange(sum(
-            attention_kv.page_counts),
-                                                       dtype=torch.int32)
-        metadata._paged_kv_indices = metadata._host_paged_kv_indices.to(
-            attention_kv.pool.device)
-        metadata._vswa_layer_to_pool = None
-        metadata._vswa_active_pool_id = None
-        metadata._vswa_pool_indices_cache = None
-        metadata._host_pool_indices = {}
-        # Plans contain physical page indices. Do not mutate wrappers shared
-        # with the original metadata, which may still serve other layers.
-        metadata._plan_params_to_wrappers = {}
-        return metadata
-
     def _sanitize_swa_page_indices(self, page_indices: torch.Tensor,
                                    layer_idx: int) -> None:
         """Replace evicted SWA pages with a safe in-range page index."""
@@ -2025,6 +2004,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
 
+        from .mixed_precision_kv_view import MixedPrecisionKVView
+        MixedPrecisionKVView.prepare_batch(self)
+
     def plan(self,
              num_heads: int,
              num_kv_heads: int,
@@ -2880,10 +2862,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         attention_kv = MixedPrecisionKVView.create(
             self,
             metadata,
-            q,
             history_dequant_scale=forward_args.kv_scale_quant_orig)
         if attention_kv is not None:
-            metadata = metadata.with_paged_kv_view(attention_kv)
+            metadata = attention_kv.prepare_metadata(metadata)
 
         attention_mask_data = forward_args.attention_mask_data
         latent_cache = forward_args.latent_cache

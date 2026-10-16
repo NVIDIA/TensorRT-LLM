@@ -91,6 +91,9 @@ class AttentionMetadata:
     enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
+    mixed_precision_kv_views: dict = field(default_factory=dict,
+                                           init=False,
+                                           repr=False)
 
     # The length of each sequence in the batch for query.
     # The shape is (batch_size), and located on CPU memory.
@@ -390,6 +393,7 @@ class AttentionMetadata:
             return self
 
         cuda_graph_metadata = copy.copy(self)
+        cuda_graph_metadata.mixed_precision_kv_views = {}
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:

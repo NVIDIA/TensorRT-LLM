@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import contextlib
-import copy
 import functools
 import math
 import os
@@ -1137,6 +1136,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
+        from .mixed_precision_kv_view import MixedPrecisionKVView
+        MixedPrecisionKVView.prepare_batch(self)
+
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
             context_kv_tokens: int, generation_kv_tokens: int,
@@ -2161,42 +2163,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
-        from tensorrt_llm.quantization import QuantMode
-
-        from .mixed_precision_kv_view import MixedPrecisionKVView
+        from .mixed_precision_kv_view import (MixedPrecisionKVView,
+                                              use_unquantized_kv)
 
         attention_kv = MixedPrecisionKVView.create(
             self,
             metadata,
-            q,
-            max_page_size=64,
-            kv_layout="HND",
             history_dequant_scale=(forward_args.kv_scale_quant_orig
                                    if forward_args.kv_scale_quant_orig
                                    is not None else self.kv_scale_quant_orig))
         if attention_kv is None:
             return self._forward_impl(q, k, v, metadata, forward_args)
-        if self.sparse_params is not None:
-            raise NotImplementedError(
-                "Mixed-precision staging requires dense K/V Attention")
-        metadata = copy.copy(metadata)
-        metadata.kv_layout = attention_kv.layout
-        metadata.kv_cache_manager = attention_kv
-        metadata.kv_cache_block_offsets = attention_kv.block_offsets()
-        metadata.use_paged_context_fmha = True
-        saved = (self.quant_mode, self.has_fp8_kv_cache, self.has_fp4_kv_cache,
-                 self.local_layer_idx, self._fmha_manager)
-        self.quant_mode = int(
-            QuantMode(self.quant_mode)
-            & ~(QuantMode.FP8_KV_CACHE | QuantMode.INT8_KV_CACHE
-                | QuantMode.NVFP4_KV_CACHE))
-        self.has_fp8_kv_cache = self.has_fp4_kv_cache = False
-        self.local_layer_idx = 0
-        try:
-            # Keep separate selection caches for stored NVFP4 and unpacked KV.
-            if self._unquantized_fmha_manager is None:
-                self._unquantized_fmha_manager = FmhaManager(self)
-            self._fmha_manager = self._unquantized_fmha_manager
+        metadata = attention_kv.prepare_metadata(metadata)
+        with use_unquantized_kv(self):
             result = self._forward_impl(
                 q, k, v, metadata,
                 replace(forward_args,
@@ -2204,9 +2183,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                         kv_scale_quant_orig=None))
             attention_kv.writeback()
             return result
-        finally:
-            (self.quant_mode, self.has_fp8_kv_cache, self.has_fp4_kv_cache,
-             self.local_layer_idx, self._fmha_manager) = saved
 
     def _forward_impl(
         self,
@@ -2329,12 +2305,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert forward_args.latent_cache is not None
             from ...pyexecutor.kv_cache.mamba_cache_manager import \
                 BaseMambaCacheManager
-
             # Hybrid (mamba/masked-layer) KV managers take the graph-safe
             # append; the same predicate interface.py uses to detect hybrid
             # managers for mamba metadata. Dense MLA models keep the
             # host-side path unchanged.
-            if isinstance(metadata.kv_cache_manager, BaseMambaCacheManager):
+            from .mixed_precision_kv_view import MixedPrecisionKVView
+            if isinstance(metadata.kv_cache_manager,
+                          (BaseMambaCacheManager, MixedPrecisionKVView)):
                 from .utils import \
                     append_mla_latent_cache_generation_cuda_graph_safe
 

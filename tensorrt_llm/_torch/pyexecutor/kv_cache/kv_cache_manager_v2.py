@@ -6746,7 +6746,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
 
 class MixedPrecisionKVCacheManager(KVCacheManagerV2):
-    """Dense K/V prototype using the existing full-history and SWA lifecycles.
+    """Dense KV prototype using the existing full-history and SWA lifecycles.
 
     ``first_n`` is the sink length; ``last_n`` counts previously written tokens.
     Counts are block aligned. Both pools use native allocation, migration,
@@ -6770,6 +6770,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
     ) -> None:
         if kwargs.get("cold_page_codec_provider") is not None:
             raise NotImplementedError("Mixed-precision cold-page compression is not supported yet")
+        if torch.cuda.get_device_capability()[0] not in (10, 12):
+            raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.first_n = first_n
         self.last_n = last_n
         self.high_dtype = dtype
@@ -6799,8 +6801,11 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         self._staging_bytes = 0
         self._staging_buffer: torch.Tensor | None = None
         self._staging_stream: int | None = None
+        from ...memory_buffer_utils import Buffers
+
+        self.mixed_precision_buffers = Buffers()
         super().__init__(*args, dtype=dtype, **kwargs)
-        for layer in self.high_layers:
+        for layer in self.high_layers if self.kv_factor == 2 else ():
             key = self.impl.get_mem_pool_base_address(
                 layer, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
             )
@@ -6821,7 +6826,9 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
     def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
         roles = super()._get_buffer_roles_for_layer(local_layer_idx)
         if self._uses_mixed_precision(local_layer_idx):
-            roles.extend((Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE))
+            roles.append(Role.KEY_BLOCK_SCALE)
+            if Role.VALUE in roles:
+                roles.append(Role.VALUE_BLOCK_SCALE)
         return roles
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
@@ -6848,7 +6855,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         config = super()._build_cache_config(config)
         # Assign extra SWA IDs after the native removal of empty layers.
         config = super()._remove_zero_size_buffers(config)
-        if self.kv_cache_type != CacheTypeCpp.SELF:
+        if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
             raise NotImplementedError(
                 "Mixed precision currently supports dense self Attention only"
             )
@@ -6893,7 +6900,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                     role=role,
                     size=get_size_in_bytes(elements_per_page, self.high_dtype),
                 )
-                for role in (Role.KEY, Role.VALUE)
+                for role in (buffer.role for buffer in layer.buffers)
+                if role in (Role.KEY, Role.VALUE)
             ]
             self.high_layers[layer_id] = next_id
             layers.append(
@@ -6907,7 +6915,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                 )
             )
             next_id += 1
-            largest_page = max(largest_page, 2 * elements_per_page)
+            largest_page = max(largest_page, self.kv_factor * elements_per_page)
 
         if not self.high_layers:
             return config

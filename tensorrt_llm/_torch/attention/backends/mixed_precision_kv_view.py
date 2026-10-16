@@ -2,19 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare one ordinary paged cache for optimized mixed-precision Attention.
 
-The native manager owns both REQUIRED history and SWA/sink pages. This
-eager implementation stages only the current batch, one layer at a time. The
+The native manager owns both REQUIRED history and SWA/sink pages. Metadata
+preparation reserves the current batch's buffers, one layer at a time. The
 backend writes new, post-RoPE K/V into that staging cache; writeback then stores
 both representations without quantizing the high copy through the low copy.
 """
 
-from itertools import accumulate
-from typing import TYPE_CHECKING, NamedTuple
+import copy
+from contextlib import contextmanager
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
@@ -23,11 +26,42 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionBackend, AttentionMetadata
 
 
-class _TokenLocations(NamedTuple):
-    staging: torch.Tensor
-    history: torch.Tensor
-    scales: torch.Tensor
-    high: torch.Tensor
+@contextmanager
+def use_unquantized_kv(attention: "AttentionBackend"):
+    """Select existing kernels for the temporary FP16/BF16 cache."""
+    from .fmha.manager import FmhaManager
+    from .trtllm import TrtllmAttention
+
+    fp8 = attention.has_fp8_kv_cache
+    attention.has_fp8_kv_cache = False
+    if isinstance(attention, TrtllmAttention):
+        saved = (
+            attention.quant_mode,
+            attention.has_fp4_kv_cache,
+            attention.local_layer_idx,
+            attention._fmha_manager,
+        )
+        attention.quant_mode = int(
+            QuantMode(attention.quant_mode)
+            & ~(QuantMode.FP8_KV_CACHE | QuantMode.INT8_KV_CACHE | QuantMode.NVFP4_KV_CACHE)
+        )
+        attention.has_fp4_kv_cache = False
+        attention.local_layer_idx = 0
+    try:
+        if isinstance(attention, TrtllmAttention):
+            if attention._unquantized_fmha_manager is None:
+                attention._unquantized_fmha_manager = FmhaManager(attention)
+            attention._fmha_manager = attention._unquantized_fmha_manager
+        yield
+    finally:
+        attention.has_fp8_kv_cache = fp8
+        if isinstance(attention, TrtllmAttention):
+            (
+                attention.quant_mode,
+                attention.has_fp4_kv_cache,
+                attention.local_layer_idx,
+                attention._fmha_manager,
+            ) = saved
 
 
 def quantize_nvfp4_kv(
@@ -77,43 +111,46 @@ class MixedPrecisionKVView:
         cls,
         attention: "AttentionBackend",
         metadata: "AttentionMetadata",
-        q: torch.Tensor,
         *,
         history_dequant_scale: torch.Tensor | None = None,
-        max_page_size: int | None = None,
-        kv_layout: str | None = None,
     ) -> "MixedPrecisionKVView | None":
+        view = metadata.mixed_precision_kv_views.get(attention.layer_idx)
+        if view is None:
+            return None
+        if history_dequant_scale is not None:
+            view.history_scale.copy_(history_dequant_scale)
+        view.materialize()
+        return view
+
+    @classmethod
+    def prepare_batch(cls, metadata: "AttentionMetadata") -> None:
+        """Update addresses and native Attention plans before capture or replay."""
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
-            return None
-        layer_idx = attention.layer_idx
-        if manager.layer_offsets[layer_idx] not in manager.high_layers:
-            return None
-        if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
-            raise NotImplementedError(
-                "Mixed-precision paged-cache staging requires eager execution"
-            )
-        if q.dtype != manager.compute_dtype:
-            raise ValueError("Attention input dtype differs from its reserved mixed-precision view")
-        return cls(metadata, layer_idx, q.dtype, history_dequant_scale, max_page_size, kv_layout)
+            return
+        for layer_idx, local in manager.layer_offsets.items():
+            if local not in manager.high_layers:
+                continue
+            view = metadata.mixed_precision_kv_views.get(layer_idx)
+            if view is None or not metadata.is_cuda_graph:
+                view = cls(metadata, layer_idx)
+                metadata.mixed_precision_kv_views[layer_idx] = view
+            view.update(metadata, layer_idx)
 
     def __init__(
         self,
         metadata: "AttentionMetadata",
         layer_idx: int,
-        dtype: torch.dtype,
-        history_dequant_scale: torch.Tensor | None,
-        max_page_size: int | None,
-        kv_layout: str | None,
     ) -> None:
+        from .trtllm import TrtllmAttentionMetadata
+
         manager = metadata.kv_cache_manager
-        self.layout = kv_layout or metadata.kv_layout
+        trtllm = isinstance(metadata, TrtllmAttentionMetadata)
+        self.layout = "HND" if trtllm else metadata.kv_layout
         self.block_size = manager.tokens_per_block
-        self.tokens_per_block = min(self.block_size, max_page_size or self.block_size)
-        if self.block_size % self.tokens_per_block:
-            raise ValueError("Staging pages must divide the owning cache's block size")
+        self.tokens_per_block = min(self.block_size, 64) if trtllm else self.block_size
         self.history = manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
-        (self.high, high_ids), (self.scales, scale_ids) = manager.get_mixed_precision_buffers(
+        (self.high, _), (self.scales, _) = manager.get_mixed_precision_buffers(
             layer_idx, metadata.request_ids, metadata.kv_layout
         )
         if self.layout != metadata.kv_layout:
@@ -121,42 +158,127 @@ class MixedPrecisionKVView:
             self.history = self.history.transpose(2, 3)
             self.high = self.high.transpose(2, 3)
             self.scales = self.scales.transpose(2, 3)
+        self.max_seq_len = manager.max_seq_len
+        self.max_blocks_per_seq = (
+            self.max_seq_len + self.tokens_per_block - 1
+        ) // self.tokens_per_block
+        self.kv_factor = manager.kv_factor
+        self.layer_offsets = {layer_idx: 0}
+        self.max_attention_window_vec = (None,)
+        # Fixed per-request spans keep addresses unchanged as sequences grow.
+        self.page_starts = [row * self.max_blocks_per_seq for row in range(metadata.num_seqs + 1)]
+        shape = [self.page_starts[-1], *self.high.shape[1:]]
+        shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
+        self.pool = manager.get_staging_buffer(shape, manager.compute_dtype)
+        self.history_scale = torch.ones(1, dtype=torch.float32, device=self.pool.device)
+        self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
+        self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
+        self._indices: dict[str, torch.Tensor] = {}
+        self._metadata = None
+
+    def update(self, metadata: "AttentionMetadata", layer_idx: int) -> None:
+        manager = metadata.kv_cache_manager
+        (_, high_ids), (_, scale_ids) = manager.get_mixed_precision_buffers(
+            layer_idx, metadata.request_ids, metadata.kv_layout
+        )
         history_ids = manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
         cached_lengths = metadata.kv_cache_params.num_cached_tokens_per_seq
         lengths = [a + b for a, b in zip(cached_lengths, metadata.seq_lens.tolist())]
         self.page_counts = [
-            (length + self.tokens_per_block - 1) // self.tokens_per_block for length in lengths
+            (n + self.tokens_per_block - 1) // self.tokens_per_block for n in lengths
         ]
-        self.page_starts = list(accumulate(self.page_counts, initial=0))
-        shape = [max(1, self.page_starts[-1]), *self.high.shape[1:]]
-        shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
-        self.pool = manager.get_staging_buffer(shape, dtype)
-        self.pool.zero_()
-        self.history_scale = (
-            torch.ones(1, dtype=torch.float32, device=self.pool.device)
-            if history_dequant_scale is None
-            else history_dequant_scale.to(device=self.pool.device, dtype=torch.float32).contiguous()
-        )
-        if self.history_scale.numel() != 1:
-            raise ValueError("Dense NVFP4 KV conversion requires one per-tensor scale")
-        self.max_seq_len = manager.max_seq_len
-        self.layer_offsets = {layer_idx: 0}
-        self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
-        self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
-        self.max_attention_window_vec = (None,)
         tables = (history_ids, scale_ids, high_ids)
         cached = self._locations([0] * len(lengths), cached_lengths, tables)
-        self.new_tokens = self._locations(cached_lengths, lengths, tables)
-        low_rows = torch.nonzero(cached.high < 0).flatten()
-        if low_rows.numel():
-            packed = self._gather(self.history, cached.history[low_rows])
-            scales = self._gather(self.scales, cached.scales[low_rows])
-            values = dequantize_nvfp4_kv(packed, scales, self.history_scale, dtype)
-            self._scatter(self.pool, cached.staging[low_rows], values)
-        high_rows = torch.nonzero(cached.high >= 0).flatten()
-        if high_rows.numel():
-            values = self._gather(self.high, cached.high[high_rows]).to(dtype)
-            self._scatter(self.pool, cached.staging[high_rows], values)
+        new = self._locations(cached_lengths, lengths, tables)
+        low = cached[:, cached[3] < 0]
+        high = cached[:, cached[3] >= 0]
+        capacity = len(lengths) * self.max_seq_len if metadata.is_cuda_graph else None
+        for name, pool, tokens, source, size in (
+            ("read_low", self.history, low[1], True, capacity),
+            ("read_scales", self.scales, low[2], True, capacity),
+            ("restore_low", self.pool, low[0], False, capacity),
+            ("read_high", self.high, high[3], True, capacity),
+            ("restore_high", self.pool, high[0], False, capacity),
+            ("read_new", self.pool, new[0], True, None),
+            ("write_low", self.history, new[1], False, None),
+            ("write_scales", self.scales, new[2], False, None),
+            ("write_high", self.high, new[3], False, None),
+        ):
+            indices = self._row_indices(pool, tokens)
+            rows_per_token = self.kv_factor * self.high.shape[2 if self.layout == "HND" else 3]
+            count = size * rows_per_token if size is not None else indices.numel()
+            host = torch.full(
+                (count,), 0 if source else -1, dtype=torch.int64, pin_memory=prefer_pinned()
+            )
+            host[: indices.numel()] = indices.clamp_min(0) if source else indices
+            if name not in self._indices:
+                self._indices[name] = torch.empty(count, dtype=torch.int64, device=self.pool.device)
+            self._indices[name].copy_(host, non_blocking=True)
+
+        # Reuse the existing workspace owner; layers execute sequentially.
+        buffers = manager.mixed_precision_buffers
+
+        def workspace(name, rows, width, dtype):
+            return buffers.get_buffer((rows, width), dtype, name, metadata.is_cuda_graph)
+
+        width = self.high.shape[-1]
+        low_rows = self._indices["read_low"].numel()
+        high_rows = self._indices["read_high"].numel()
+        new_rows = self._indices["read_new"].numel()
+        self.read_low = workspace("mixed_read_low", low_rows, width // 2, torch.uint8)
+        self.read_scales = workspace("mixed_read_scales", low_rows, width // 16, torch.uint8)
+        self.restored_low = workspace("mixed_restored_low", low_rows, width, self.pool.dtype)
+        self.read_high = workspace("mixed_read_high", high_rows, width, self.high.dtype)
+        self.restored_high = workspace("mixed_restored_high", high_rows, width, self.pool.dtype)
+        self.new_values = workspace("mixed_new", new_rows, width, self.pool.dtype)
+        self.new_low = workspace("mixed_new_low", new_rows, width // 2, torch.uint8)
+        self.new_scales = workspace("mixed_new_scales", new_rows, width // 16, torch.uint8)
+
+        from .flashinfer import FlashInferAttentionMetadata
+
+        if isinstance(metadata, FlashInferAttentionMetadata):
+            if self._metadata is None:
+                self._metadata = replace(metadata, kv_cache_manager=self, cuda_graph_buffers=None)
+            else:
+                for name in (
+                    "seq_lens",
+                    "seq_lens_kv",
+                    "num_contexts",
+                    "kv_cache_params",
+                    "request_ids",
+                    "prompt_lens",
+                    "position_ids",
+                    "padded_num_tokens",
+                ):
+                    setattr(self._metadata, name, getattr(metadata, name))
+            self._metadata.prepare()
+        else:
+            self._metadata = copy.copy(metadata)
+            self._metadata.kv_cache_manager = self
+            self._metadata.kv_layout = self.layout
+            self._metadata.use_paged_context_fmha = True
+            offsets = self.block_offsets()
+            if "block_offsets" not in self._indices:
+                self._indices["block_offsets"] = torch.empty_like(offsets, device=self.pool.device)
+            self._indices["block_offsets"].copy_(offsets, non_blocking=True)
+            self._metadata.kv_cache_block_offsets = self._indices["block_offsets"]
+        self._metadata.mixed_precision_kv_views = {}
+
+    def materialize(self) -> None:
+        from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
+
+        self.pool.zero_()
+        if self.read_low.numel():
+            self._gather(self.history, "read_low", self.read_low)
+            self._gather(self.scales, "read_scales", self.read_scales)
+            get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
+                self.read_low, self.read_scales, self.history_scale, self.restored_low
+            )
+            self._scatter(self.pool, "restore_low", self.restored_low)
+        if self.read_high.numel():
+            self._gather(self.high, "read_high", self.read_high)
+            self.restored_high.copy_(self.read_high)
+            self._scatter(self.pool, "restore_high", self.restored_high)
 
     @property
     def dtype(self) -> DataType:
@@ -166,17 +288,41 @@ class MixedPrecisionKVView:
         return self.pool if kv_layout == self.layout else self.pool.transpose(2, 3)
 
     def get_attention_op_num_blocks(self, local_layer_idx: int) -> int:
-        return self.pool.shape[0] * 2
+        return self.pool.shape[0] * self.pool.shape[1]
 
     def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
-        return 1
+        return self.pool.shape[1] - 1
+
+    def get_batch_cache_indices(self, request_ids: list[int], layer_idx: int) -> list[list[int]]:
+        return [
+            list(range(start, start + count))
+            for start, count in zip(self.page_starts, self.page_counts)
+        ]
+
+    @property
+    def blocks_in_primary_pool(self) -> int:
+        return self.pool.shape[0]
+
+    def get_batch_cache_indices_flat(self, request_ids, num_blocks, layer_idx=None):
+        return torch.tensor(
+            [
+                page
+                for start, count in zip(self.page_starts, num_blocks)
+                for page in range(start, start + count)
+            ],
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+
+    def prepare_metadata(self, metadata: "AttentionMetadata") -> "AttentionMetadata":
+        return self._metadata
 
     def _locations(
         self,
         begins: list[int],
         ends: list[int],
         page_tables: tuple[list[list[int]], list[list[int]], list[list[int]]],
-    ) -> _TokenLocations:
+    ) -> torch.Tensor:
         """Map logical tokens to flat token indices in each native pool."""
         tables = []
         for row, (begin, end, history, scales, high) in enumerate(zip(begins, ends, *page_tables)):
@@ -203,39 +349,54 @@ class MixedPrecisionKVView:
                 )
             )
         table = torch.cat(tables, dim=1) if tables else torch.empty((4, 0), dtype=torch.int64)
-        return _TokenLocations(*table.to(self.pool.device).unbind())
+        return table
 
-    def _gather(self, pool: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        view = pool.transpose(2, 3) if self.layout == "HND" else pool
-        # Byte indexing also works for FP8, without invoking arithmetic on it.
-        return view.view(torch.uint8)[indices // view.shape[2], :, indices % view.shape[2]].view(
-            pool.dtype
-        )
+    def _row_indices(self, pool: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Prepare physical head-row addresses on the host, outside Attention."""
+        token_axis, head_axis = (3, 2) if self.layout == "HND" else (2, 3)
+        kv = torch.arange(pool.shape[1])[None, :, None]
+        head = torch.arange(pool.shape[head_axis])[None, None, :]
+        addresses = (
+            (tokens // pool.shape[token_axis])[:, None, None] * pool.stride(0)
+            + (tokens % pool.shape[token_axis])[:, None, None] * pool.stride(token_axis)
+            + kv * pool.stride(1)
+            + head * pool.stride(head_axis)
+        ) // pool.shape[-1]
+        return addresses.masked_fill(tokens[:, None, None] < 0, -1).flatten()
 
-    def _scatter(self, pool: torch.Tensor, indices: torch.Tensor, values: torch.Tensor) -> None:
-        view = pool.transpose(2, 3) if self.layout == "HND" else pool
-        view.view(torch.uint8)[indices // view.shape[2], :, indices % view.shape[2]] = (
-            values.contiguous().view(torch.uint8)
-        )
+    @staticmethod
+    def _rows(pool: torch.Tensor) -> torch.Tensor:
+        width = pool.shape[-1]
+        return pool.as_strided((pool.numel() // width, width), (width, 1)).view(torch.uint8)
+
+    def _gather(self, pool: torch.Tensor, name: str, output: torch.Tensor) -> None:
+        torch.index_select(self._rows(pool), 0, self._indices[name], out=output.view(torch.uint8))
+
+    def _scatter(self, pool: torch.Tensor, name: str, values: torch.Tensor) -> None:
+        from .sparse.csa2.kernel import scatter_packed_rows
+
+        scatter_packed_rows(self._rows(pool), self._indices[name], values.view(torch.uint8))
 
     def block_offsets(self) -> torch.Tensor:
         width = (self.max_seq_len + self.tokens_per_block - 1) // self.tokens_per_block
         ordinals = torch.arange(width, dtype=torch.int32)
         pages = torch.tensor(self.page_starts[:-1], dtype=torch.int32)[:, None] + ordinals
-        offsets = torch.stack((2 * pages, 2 * pages + 1), dim=1)
+        kv_factor = self.pool.shape[1]
+        offsets = torch.stack((kv_factor * pages, kv_factor * pages + kv_factor - 1), dim=1)
         valid = ordinals < torch.tensor(self.page_counts, dtype=torch.int32)[:, None]
-        return offsets.masked_fill(~valid[:, None], -1).unsqueeze(0).to(self.pool.device)
+        return maybe_pin_memory(offsets.masked_fill(~valid[:, None], -1).unsqueeze(0))
 
     def writeback(self) -> None:
         """Publish only newly computed tokens; never overwrite shared history."""
-        locations = self.new_tokens
-        if not locations.history.numel():
+        from flashinfer.quantization.fp4_quantization import get_fp4_kv_quantization_module
+
+        if not self.new_values.numel():
             return
-        values = self._gather(self.pool, locations.staging)
-        packed, scales = quantize_nvfp4_kv(values, self.history_scale)
-        self._scatter(self.history, locations.history, packed)
-        self._scatter(self.scales, locations.scales, scales)
-        rows = torch.nonzero(locations.high >= 0).flatten()
-        if rows.numel():
-            high_values = encode_high_precision_kv(values[rows], self.high.dtype)
-            self._scatter(self.high, locations.high[rows], high_values)
+        self._gather(self.pool, "read_new", self.new_values)
+        get_fp4_kv_quantization_module().nvfp4_kv_quant(
+            self.new_values, self.history_scale, self.new_low, self.new_scales
+        )
+        self._scatter(self.history, "write_low", self.new_low)
+        self._scatter(self.scales, "write_scales", self.new_scales)
+        high_values = encode_high_precision_kv(self.new_values, self.high.dtype)
+        self._scatter(self.high, "write_high", high_values)

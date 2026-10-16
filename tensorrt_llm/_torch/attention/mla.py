@@ -60,8 +60,9 @@ from .backends import (
     TrtllmAttentionMetadata,
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
+from .backends.mixed_precision_kv_view import MixedPrecisionKVView, use_unquantized_kv
 from .backends.sparse.hooks import get_sparse_mla_hooks
-from .backends.utils import create_attention
+from .backends.utils import append_mla_latent_cache, create_attention
 from .rotary_embedding import RotaryEmbedding
 
 
@@ -967,6 +968,34 @@ class MLA(nn.Module):
             )
             return
 
+        attention_kv = MixedPrecisionKVView.create(
+            self.mqa,
+            attn_metadata,
+        )
+        if attention_kv is not None:
+            attn_metadata = attention_kv.prepare_metadata(attn_metadata)
+            if self.rotary_emb is None:
+                self.rotary_emb = RotaryEmbedding(
+                    self.pos_embd_params.rope,
+                    head_dim=self.qk_rope_head_dim,
+                    is_neox=self.pos_embd_params.is_neox,
+                )
+            apply_rotary_emb = self.apply_rotary_emb
+            self.apply_rotary_emb = True
+            try:
+                with use_unquantized_kv(self.mqa), use_unquantized_kv(self.mha):
+                    self._forward_impl(
+                        position_ids,
+                        hidden_states,
+                        attn_metadata,
+                        attn_output[0],
+                        latent_cache_gen=latent_cache_gen,
+                    )
+                attention_kv.writeback()
+            finally:
+                self.apply_rotary_emb = apply_rotary_emb
+            return
+
         self._forward_impl(
             position_ids,
             hidden_states,
@@ -1213,7 +1242,18 @@ class MLA(nn.Module):
         trtllm_attention = cast(TrtllmAttention, self.mha)
 
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
-        trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        if isinstance(attn_metadata.kv_cache_manager, MixedPrecisionKVView):
+            append_mla_latent_cache(
+                attn_metadata.kv_cache_manager,
+                self.layer_idx,
+                attn_metadata.request_ids[: attn_metadata.num_contexts],
+                attn_metadata.seq_lens[: attn_metadata.num_contexts],
+                attn_metadata.kv_cache_params.num_cached_tokens_per_seq,
+                latent_cache,
+                kv_layout=attn_metadata.kv_layout,
+            )
+        else:
+            trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
 
         # copy full_compressed_kv and full_k_pe from paged kv cache
         full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
@@ -1526,6 +1566,8 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
+            if isinstance(attn_metadata.kv_cache_manager, MixedPrecisionKVView):
+                return self.forward_context_with_cached_kv(q, latent_cache, attn_metadata, output)
             # Warm up maybe_compiled_cat for both the chunked-prefill path and
             # the cached-kv path; without this, the cached-kv prefill
             # (block-reuse without chunked_prefill) recompiles per shape and
@@ -1597,6 +1639,8 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        if isinstance(attn_metadata.kv_cache_manager, MixedPrecisionKVView):
+            kwargs["skip_mla_rope_generation"] = True
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )

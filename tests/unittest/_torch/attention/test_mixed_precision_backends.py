@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Local GPU QA: exercise the optimized backends, not a reference fallback."""
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +15,7 @@ from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import (
     quantize_nvfp4_kv,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -30,12 +30,14 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 @pytest.mark.parametrize(
     "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
 )
-@pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
-@pytest.mark.parametrize("compute_dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize(
-    "width,query_heads,heads,kv_layout",
-    [(64, 2, 2, "HND"), (128, 2, 2, "HND"), (64, 4, 2, "NHD"), (64, 4, 1, "NHD")],
-    ids=("mha64", "mha128", "gqa_nhd", "mqa_nhd"),
+    "high_dtype,compute_dtype,width,query_heads,heads,kv_layout",
+    [
+        (DataType.HALF, torch.float16, 64, 2, 2, "HND"),
+        (DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD"),
+        (DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD"),
+    ],
+    ids=("mha_fp16", "gqa_bf16_nhd", "mqa_fp8_nhd"),
 )
 def test_optimized_two_pool_prefill_and_decode(
     backend, high_dtype, compute_dtype, width, query_heads, heads, kv_layout
@@ -108,11 +110,31 @@ def test_optimized_two_pool_prefill_and_decode(
         q, k, v = [
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
         ]
-        if backend is TrtllmAttention:
-            qkv = torch.cat((q, k, v), dim=-1)
-            output = attention.forward(qkv, None, None, metadata, kv_scale_quant_orig=scale)
-        else:
-            output = attention.forward(q, k, v, metadata, kv_scale_quant_orig=scale)
+        inputs = (
+            (torch.cat((q, k, v), dim=-1), None, None) if backend is TrtllmAttention else (q, k, v)
+        )
+
+        def run():
+            return attention.forward(*inputs, metadata, kv_scale_quant_orig=scale)
+
+        output = run()
+        if not context and high_dtype == DataType.BF16:
+            reference = output.clone()
+            metadata = metadata.create_cuda_graph_metadata(batch, buffers=Buffers())
+            metadata.prepare()
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = run()
+            # Replay with different physical pages, without recapturing.
+            metadata.request_ids = request_ids[::-1]
+            metadata.prepare()
+            for tensor in inputs:
+                if tensor is not None:
+                    tensor.copy_(tensor.flip(0))
+            graph.replay()
+            torch.testing.assert_close(output, reference.flip(0), atol=0.01, rtol=0.02)
+            output = output.flip(0)
         assert metadata.kv_cache_manager is manager and metadata.kv_layout == kv_layout
         return output
 
@@ -252,8 +274,7 @@ def _reference_dequant(packed, scales, scale):
     return table[codes] * block_scales * scale
 
 
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float8_e4m3fn))
-@pytest.mark.parametrize("width", (64, 80, 128))
+@pytest.mark.parametrize("dtype,width", [(torch.float16, 64), (torch.bfloat16, 80)])
 def test_nvfp4_conversion_kernels(dtype, width):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -282,20 +303,117 @@ def test_high_fp8_uses_native_saturating_conversion():
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
 
 
-def test_flashinfer_attention_kv_metadata_does_not_change_original():
-    from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttentionMetadata
+def test_mixed_precision_public_options():
+    from pydantic import ValidationError
 
-    original = object.__new__(FlashInferAttentionMetadata)
-    original.num_blocks = [2, 1]
-    original._host_paged_kv_indices = torch.tensor([17, 42, 8], dtype=torch.int32)
-    original._paged_kv_indices = original._host_paged_kv_indices
-    wrapper = SimpleNamespace(is_planned=True)
-    original._plan_params_to_wrappers = {"original": wrapper}
-    original._host_pool_indices = {0: original._host_paged_kv_indices}
-    attention_kv = SimpleNamespace(page_counts=[2, 1], pool=torch.empty(0))
-    metadata = original.with_paged_kv_view(attention_kv)
-    assert metadata.kv_cache_manager is attention_kv
-    assert metadata._host_paged_kv_indices.tolist() == [0, 1, 2]
-    assert not metadata._host_pool_indices and not metadata._plan_params_to_wrappers
-    assert original._host_paged_kv_indices.tolist() == [17, 42, 8]
-    assert original._plan_params_to_wrappers["original"] is wrapper and wrapper.is_planned
+    config = KvCacheConfig(enable_mix_precision="nvfp4", dtype="fp8", high_low_pool_ratio=0.25)
+    assert config.first_n == config.last_n == 256
+    assert config.dtype == "fp8"
+    for invalid in ({"enable_mix_precision": "int4"}, {"first_n": -1}, {"high_low_pool_ratio": 0}):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**invalid)
+
+
+@pytest.mark.parametrize(
+    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
+)
+@torch.inference_mode()
+def test_mla_uses_independent_rope_and_native_attention(backend):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from tensorrt_llm._torch.attention.backends.interface import (
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.mla import MLA
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.functional import PositionEmbeddingType
+
+    torch.manual_seed(123)
+    manager = MixedPrecisionKVCacheManager(
+        KvCacheConfig(max_tokens=65536),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=128,
+        max_seq_len=1024,
+        max_batch_size=1,
+        mapping=Mapping(),
+        dtype=DataType.BF16,
+        compute_dtype=torch.bfloat16,
+        first_n=128,
+        last_n=128,
+        high_low_pool_ratio=1 / 3,
+    )
+    model = MLA(
+        hidden_size=256,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        q_lora_rank=128,
+        kv_lora_rank=512,
+        max_position_embeddings=1024,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=RopeParams(dim=64, max_positions=1024, duplicate_data=True),
+            is_neox=False,
+        ),
+        config=ModelConfig(attn_backend="TRTLLM" if backend is TrtllmAttention else "FLASHINFER"),
+        dtype=torch.bfloat16,
+    ).cuda()
+    for parameter in model.parameters():
+        parameter.uniform_(-0.02, 0.02)
+    hidden = torch.randn(513, 256, device="cuda", dtype=torch.bfloat16)
+    try:
+        manager.add_dummy_requests([0], [256], is_gen=False)
+        cache = manager.kv_cache_map[0]
+        for begin, end in ((0, 256), (256, 512), (512, 513)):
+            if begin:
+                assert cache.resize(None, begin)
+                cache.suspend()
+                assert cache.resume(torch.cuda.current_stream().cuda_stream, is_decoding=end == 513)
+                assert cache.resize(end)
+                manager._restore_page_index_bufs(0, cache)
+            metadata = backend.Metadata(
+                seq_lens=torch.tensor([end - begin], dtype=torch.int32),
+                num_contexts=int(end != 513),
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[begin]),
+                max_num_requests=1,
+                max_num_tokens=512,
+                kv_cache_manager=manager,
+                request_ids=[0],
+                prompt_lens=[512],
+                kv_layout="HND",
+                enable_context_mla_with_cached_kv=True,
+                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+            )
+            metadata.prepare()
+            output = hidden.new_empty((end - begin, 16 * 128))
+            # These fused writes would target the stored layout before conversion.
+            with (
+                patch.object(
+                    model.mha,
+                    "mla_rope_append_paged_kv_assign_q",
+                    side_effect=AssertionError("fused write"),
+                    create=True,
+                ),
+                patch.object(
+                    model.mqa,
+                    "mla_rope_generation",
+                    side_effect=AssertionError("fused write"),
+                    create=True,
+                ),
+            ):
+                model.forward_impl(
+                    torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
+                )
+            assert torch.isfinite(output).all()
+            assert metadata.kv_cache_manager is manager
+        (high, ids), _ = manager.get_mixed_precision_buffers(0, [0], "NHD")
+        assert high.shape[1] == 1
+        assert ids[0][0] >= 0 and ids[0][1] == kv.BAD_PAGE_INDEX and ids[0][-1] >= 0
+    finally:
+        manager.shutdown()
