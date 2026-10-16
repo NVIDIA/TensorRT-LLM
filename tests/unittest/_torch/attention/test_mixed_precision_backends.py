@@ -222,8 +222,12 @@ def test_optimized_two_pool_prefill_and_decode(
             is_causal=True,
             enable_gqa=True,
         )
+        # Match test_attention.py for native FP8 FMHA, which also quantizes P.
         torch.testing.assert_close(
-            output, reference.transpose(1, 2).reshape_as(output), atol=0.02, rtol=0.02
+            output,
+            reference.transpose(1, 2).reshape_as(output),
+            atol=0.05 if high_dtype == DataType.FP8 else 0.02,
+            rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
         )
         arena = manager._staging_buffer.data_ptr()
         history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
