@@ -621,6 +621,28 @@ def test_publish_is_not_starved_by_fetches() -> None:
     endpoint.close()
 
 
+def test_publishes_leave_one_worker_to_fetches() -> None:
+    store = KeyGatedStore(commits=True, keys=[store_key("P1"), store_key("P2")])
+    published(store, {"F": b"ffffffff"})
+    endpoint = Endpoint(MemoryDriver(store), ["P1", "P2", "F"], workers=2, rows_per_batch=1)
+    endpoint.write("P1", b"pppppppp")
+    endpoint.write("P2", b"qqqqqqqq")
+    publish = endpoint.backend.publish(endpoint.view("P1", "P2"), None)
+    try:
+        store.wait_for_waiting(1)
+        time.sleep(PROMPT_S)  # the second publish batch would have taken the other worker by now
+        assert endpoint.driver.in_flight == 1
+        fetch = endpoint.backend.fetch(endpoint.view("F"), None)
+        assert masks(endpoint.wait_outcome(fetch)) == [[True]]
+        assert store_calls(endpoint) == ["put", "get"]
+    finally:
+        store.gate.set()
+    assert masks(endpoint.wait_outcome(publish)) == [[True, True]]
+    for attempt in (publish, fetch):
+        endpoint.wait_quiesced(attempt)
+    endpoint.close()
+
+
 def test_submissions_return_while_every_worker_is_blocked_in_the_driver() -> None:
     store = KeyGatedStore(gets=True)
     published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})

@@ -271,7 +271,8 @@ def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, req
     # rows; then the first publish delivers them all.
     names = [f"{request.node.name}-{i}" for i in range(64)]
     sdk = FirstScatterWaits(clients())
-    writer = clients.add(Endpoint(MooncakeDriver(sdk), names, slot_bytes=SLOT_BYTES, workers=2))
+    two_publishing = Endpoint(MooncakeDriver(sdk), names, slot_bytes=SLOT_BYTES, workers=3)
+    writer = clients.add(two_publishing)  # one worker stays for fetches
     rows = random_rows(writer, seed=8)
     first = writer.backend.publish(writer.view(*names), None)
     try:

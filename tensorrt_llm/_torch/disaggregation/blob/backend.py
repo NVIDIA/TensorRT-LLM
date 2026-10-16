@@ -79,8 +79,11 @@ class BlobConfig:
 
     Attributes:
         key_prefix: The deployment's key namespace; matches ``[A-Za-z0-9_-]{1,64}``.
-        workers: Driver calls at once, each on a backend thread of its own.
-        rows_per_batch: Most rows in one driver call.
+        workers: Driver calls at once, each on a backend thread of its own. A Mooncake put moves
+            its rows as one transfer batch, which alone does not fill the links, and a get
+            busy-polls a core while its transfers run.
+        rows_per_batch: Most rows in one driver call. A call prepares and maps its rows in Python
+            for a few microseconds each, holding the GIL, so this bounds that stretch too.
         bytes_per_batch: Most payload bytes in one driver call. Larger calls return into Python
             fewer times per byte, and a busy executor thread makes each return wait for the GIL;
             but one call must end well inside the store's read lease (Mooncake: 10 s), and its
@@ -89,8 +92,8 @@ class BlobConfig:
     """
 
     key_prefix: str = "trtllm-kv"
-    workers: int = 2
-    rows_per_batch: int = 64
+    workers: int = 4
+    rows_per_batch: int = 256
     bytes_per_batch: int = 128 << 20
 
     def __post_init__(self) -> None:
@@ -362,6 +365,10 @@ class BlobBackend:
         )
         self._unprovable_batches = 0
         self._workers_alive = config.workers
+        # Publishes leave one worker to fetches, so a fetch waits for a publish call only when
+        # there is a single worker.
+        self._publish_limit = max(1, config.workers - 1)
+        self._publishes_running = 0
         self._workers = [
             threading.Thread(target=self._worker_loop, name=f"{name}-worker-{i}", daemon=True)
             for i in range(config.workers)
@@ -511,6 +518,7 @@ class BlobBackend:
                 attempt = batch.attempt
                 if attempt._stopped:  # its queued count was cleared when it stopped
                     continue
+                self._publishes_running += not attempt.is_fetch
                 self._fetches_in_a_row = self._fetches_in_a_row + 1 if attempt.is_fetch else 0
                 # Counted as started before the driver call: while the call runs, this count alone
                 # keeps the attempt from quiescing once a cancel or a fault has cleared its queue.
@@ -521,8 +529,10 @@ class BlobBackend:
                 return batch
 
     def _pop_next(self) -> _Batch | None:
-        publish_due = self._publish_queue and (
-            not self._fetch_queue or self._fetches_in_a_row >= FETCH_BATCHES_PER_PUBLISH_BATCH
+        publish_due = (
+            self._publish_queue
+            and self._publishes_running < self._publish_limit
+            and (not self._fetch_queue or self._fetches_in_a_row >= FETCH_BATCHES_PER_PUBLISH_BATCH)
         )
         if publish_due:
             return self._publish_queue.popleft()
@@ -578,6 +588,9 @@ class BlobBackend:
     ) -> None:
         with self._lock:
             del self._in_driver[batch]
+            # A worker waits only when nothing it may take is queued, and a publish's room frees
+            # only here, just before this worker takes its next batch: no wake is needed.
+            self._publishes_running -= not batch.attempt.is_fetch
             settled = self._record(batch, results, ended, unprovable)
             if batch.op is not None and not batch.settled:
                 self._watched.add(batch)
