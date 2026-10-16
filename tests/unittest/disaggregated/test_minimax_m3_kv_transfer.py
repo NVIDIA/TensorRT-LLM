@@ -95,13 +95,19 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
     }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "implementation,expected_main_mapper",
-    [("triton", MapperKind.NHD), ("msa", MapperKind.HND)],
+    "implementation,cache_dtype,expected_main_mapper",
+    [
+        ("triton", DataType.BF16, MapperKind.HND),
+        ("msa", DataType.BF16, MapperKind.HND),
+        ("triton", DataType.NVFP4, MapperKind.NHD),
+    ],
 )
 def test_minimax_disagg_role_mapper_kinds(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
+    cache_dtype: DataType,
     expected_main_mapper: MapperKind,
 ) -> None:
     def fake_base_init(self: KVCacheManagerV2, *args: Any, **kwargs: Any) -> None:
@@ -114,6 +120,7 @@ def test_minimax_disagg_role_mapper_kinds(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     manager = MiniMaxM3KVCacheManagerV2(
         num_layers=0,
+        dtype=cache_dtype,
         sparse_layer_ids=[],
         disable_index_value_layer_ids=[],
         sparse_attention_config=SimpleNamespace(
@@ -126,11 +133,24 @@ def test_minimax_disagg_role_mapper_kinds(
         Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+    if implementation == "triton":
+        fp8_manager = MiniMaxM3KVCacheManagerV2(
+            num_layers=0,
+            dtype=DataType.FP8,
+            sparse_layer_ids=[],
+            disable_index_value_layer_ids=[],
+            sparse_attention_config=SimpleNamespace(
+                implementation="triton", indexer_kv_dtype="bf16"
+            ),
+        )
+        assert fp8_manager.get_disagg_role_mapper_kinds()[Role.ALL] == MapperKind.NHD
+        assert fp8_manager._dense_native_layer_ids == ()
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
     def fake_base_init(self, *args, **kwargs):
         self.is_disagg = kwargs.get("is_disagg", False)
+        self.dtype = kwargs.get("dtype", DataType.BF16)
         self.layer_offsets = {layer_id: layer_id for layer_id in range(kwargs["num_layers"])}
 
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
@@ -235,7 +255,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
         assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.NHD)
+        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
         assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
         assert idx_view.pool_role == frozenset({str(Role.INDEX_KEY)})
@@ -259,7 +279,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
         assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.NHD)
+        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
         assert kv_view.pool_idx != idx_view.pool_idx
         starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
@@ -309,7 +329,7 @@ def _zero_physical_pools(manager: MiniMaxM3KVCacheManagerV2) -> None:
 def _get_nvfp4_scale_view(
     manager: MiniMaxM3KVCacheManagerV2, layer_idx: int
 ) -> torch.Tensor | None:
-    if manager.dtype != DataType.NVFP4:
+    if not manager.is_nvfp4_layer(layer_idx):
         return None
     page_table = KVRegionExtractorV1(manager).page_table
     local_layer_id = manager.layer_offsets[layer_idx]
@@ -374,17 +394,18 @@ def _as_nvfp4_scale_tensor(
     scale_view = _get_nvfp4_scale_view(manager, layer_idx)
     if scale_view is None:
         return None
-    if manager._main_kv_mapper_kind != MapperKind.NHD:
-        raise AssertionError("MSA uses an FP8 KV cache; NVFP4 scale pools are NHD-only")
     local_layer_id = manager.layer_offsets[layer_idx]
     local_heads = manager.num_kv_heads_per_layer[local_layer_id]
     bytes_per_token_head = HEAD_DIM // 16
+    page_shape = (
+        (local_heads, TOKENS_PER_BLOCK, bytes_per_token_head)
+        if manager._main_kv_mapper_kind == MapperKind.HND
+        else (TOKENS_PER_BLOCK, local_heads, bytes_per_token_head)
+    )
     return scale_view.view(
         scale_view.shape[0],
         2,
-        TOKENS_PER_BLOCK,
-        local_heads,
-        bytes_per_token_head,
+        *page_shape,
     )
 
 
@@ -447,7 +468,11 @@ def _initialize_cache(
             continue
 
         for layer_idx in manager.pp_layers:
-            kv = manager.get_buffers(layer_idx)
+            kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())
+            if manager.dtype == DataType.NVFP4:
+                sparse = layer_idx in manager.sparse_layer_ids
+                assert kv.dtype == (torch.int8 if sparse else torch.float8_e4m3fn)
+                assert kv.shape[-1] == (HEAD_DIM // 2 if sparse else HEAD_DIM)
             first_global_head = _first_global_head(manager)
             _fill_position_dependent(
                 kv,
@@ -456,7 +481,9 @@ def _initialize_cache(
                 layout=manager._main_kv_mapper_kind,
             )
 
-            index_key = manager.get_index_k_buffer(layer_idx)
+            index_key = manager.get_index_k_buffer(
+                layer_idx, kv_layout=manager._main_kv_layout_name()
+            )
             if index_key is not None:
                 index_tensor = index_key.unsqueeze(1)
                 _fill_position_dependent(
@@ -502,7 +529,9 @@ def _verify_cache(
                 gen_indices = _valid_indices(manager, gen_request_id, layer_idx)
                 assert gen_indices
 
-                gen_kv = manager.get_buffers(layer_idx)[gen_indices]
+                gen_kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())[
+                    gen_indices
+                ]
                 head_axis = 2 if manager._main_kv_mapper_kind == MapperKind.HND else 3
                 local_heads = gen_kv.shape[head_axis]
                 first_global_head = _first_global_head(manager)
@@ -520,7 +549,9 @@ def _verify_cache(
                         ctx_indices = _valid_indices(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
-                        ctx_kv = ctx_manager.get_buffers(layer_idx)
+                        ctx_kv = ctx_manager.get_buffers(
+                            layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
+                        )
                         if manager._main_kv_mapper_kind == MapperKind.HND:
                             actual = gen_kv[:, kv_idx, local_head, :, :]
                             expected = ctx_kv[ctx_indices, kv_idx, ctx_local_head, :, :]
@@ -529,7 +560,9 @@ def _verify_cache(
                             expected = ctx_kv[ctx_indices, kv_idx, :, ctx_local_head, :]
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-                index_key = manager.get_index_k_buffer(layer_idx)
+                index_key = manager.get_index_k_buffer(
+                    layer_idx, kv_layout=manager._main_kv_layout_name()
+                )
                 if index_key is not None:
                     ctx_manager, _ = _find_ctx_source(
                         ctx_managers,
@@ -540,7 +573,9 @@ def _verify_cache(
                         global_head=0,
                     )
                     ctx_indices = _valid_indices(ctx_manager, ctx_request_ids[req_idx], layer_idx)
-                    ctx_index_key = ctx_manager.get_index_k_buffer(layer_idx)
+                    ctx_index_key = ctx_manager.get_index_k_buffer(
+                        layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
+                    )
                     assert ctx_index_key is not None
                     torch.testing.assert_close(
                         index_key[gen_indices],
@@ -655,6 +690,7 @@ def test_minimax_m3_kv_transfer(
 
 @pytest.mark.cuda
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("cache_dtype", [DataType.FP8, DataType.NVFP4], ids=["fp8", "nvfp4"])
 @pytest.mark.parametrize(
     "update_before_transfer",
     [True, False],
@@ -662,6 +698,7 @@ def test_minimax_m3_kv_transfer(
 )
 def test_minimax_m3_msa_hnd_head_mismatch_transfer(
     update_before_transfer: bool,
+    cache_dtype: DataType,
 ) -> None:
     transfer_harness.run_kv_transfer_test(
         ctx_tp=1,
@@ -675,7 +712,7 @@ def test_minimax_m3_msa_hnd_head_mismatch_transfer(
             tp,
             pp,
             enable_dp,
-            DataType.FP8,
+            cache_dtype,
             implementation="msa",
         ),
         init_fn=_initialize_cache,

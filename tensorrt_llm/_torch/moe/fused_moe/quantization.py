@@ -40,7 +40,8 @@ from tensorrt_llm.quantization.functional import \
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_e2m1x2, float4_sf_dtype,
     get_reorder_rows_for_gated_act_gemm_row_indices,
-    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
+    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
+    nvfp4_scaling_vector_size)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
@@ -270,6 +271,27 @@ def interleave_linear_and_gate(x: torch.Tensor,
     x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size,
                *post_sizes)
     x = x.transpose(dim, dim + 1).contiguous().view(*sizes)
+    return x
+
+
+def interleave_gate_and_linear(x: torch.Tensor,
+                               group_size: int = 16,
+                               dim: int = -1) -> torch.Tensor:
+    """Interleave a ``[linear | gate]`` FC1 tensor into ``[gate, linear]`` groups.
+
+    Same input contract as ``interleave_linear_and_gate`` (the two halves of
+    ``dim`` are the linear/up and gate projections), but every group of
+    ``group_size`` rows leads with the gate half. ``group_size=16`` is the FC1
+    B / block-scale row order the Rubin (SM107) NVFP4 CuTe DSL kernels read.
+    """
+    sizes = x.size()
+    dim = dim % x.dim()
+    assert sizes[dim] % (group_size * 2) == 0
+    prev_sizes = sizes[:dim]
+    post_sizes = sizes[dim + 1:]
+    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size,
+               *post_sizes)
+    x = x.flip(dim).transpose(dim, dim + 1).contiguous().view(*sizes)
     return x
 
 
@@ -2342,12 +2364,24 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self,
                        module: torch.nn.Module,
-                       weight_dtype,
-                       weight_vec_size,
-                       block_scales_dtype,
-                       block_scales_vec_size,
-                       scaling_vector_size=16,
-                       bias_dtype: Optional[torch.dtype] = None):
+                       weight_dtype: torch.dtype,
+                       weight_vec_size: int,
+                       block_scales_dtype: torch.dtype,
+                       block_scales_vec_size: int,
+                       scaling_vector_size: int = 16,
+                       bias_dtype: Optional[torch.dtype] = None) -> None:
+        # W4A8_NVFP4_FP8 uses a backend-fixed width of 32, independent of
+        # QuantConfig.group_size. Only these algorithms declare an NVFP4 width.
+        if module.quant_config is not None and module.quant_config.quant_algo in (
+                QuantAlgo.NVFP4, QuantAlgo.NVFP4_ARC, QuantAlgo.W4A16_NVFP4):
+            declared_scaling_vector_size = nvfp4_scaling_vector_size(
+                module.quant_config)
+            if declared_scaling_vector_size != scaling_vector_size:
+                raise NotImplementedError(
+                    f"{type(self).__name__} supports {scaling_vector_size}-element "
+                    "NVFP4 scale blocks, but the checkpoint declares group_size="
+                    f"{declared_scaling_vector_size}; wider blocks are only "
+                    "supported by the dense W4A16_NVFP4 Linear path.")
         from ...locality_domain_utils import get_current_locality_domain
         is_locality_domain_weights = get_current_locality_domain() is not None
         locality_domain_factor = 2 if is_locality_domain_weights else 1
@@ -3471,6 +3505,20 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         """Transform CUTLASS-format NVFP4 weights to Marlin tiled format."""
         from tensorrt_llm.quantization.utils import marlin_utils
 
+        # An AWQ-style checkpoint carries a per-channel pre-quant scale, which
+        # ``load_quant_scales`` turns into ``fc31_act_scale``. CutlassFusedMoE
+        # pre-multiplies the input by it; the Marlin kernel takes no activation
+        # scale and this family's ``run_moe`` never applies one, so serving such
+        # a checkpoint here would be silently wrong rather than merely slower.
+        # Checked at this stage because that parameter does not exist until the
+        # weights have been loaded, and refused rather than ignored.
+        if getattr(module, "fc31_act_scale", None) is not None:
+            raise ValueError(
+                f"{type(module).__name__} cannot serve a checkpoint with a "
+                "pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC): the Marlin "
+                "kernel applies no activation scale. Select a backend that does, "
+                "e.g. moe_backend=CUTLASS.")
+
         # Standard CUTLASS loading (swizzles scales, computes alpha, etc.)
         super().transform_weights(module)
 
@@ -3547,30 +3595,20 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
 
 class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
-    """W4A16 dequant-on-the-fly variant of NVFP4 MoE for SM<100.
-
-    Loads an unmodified NVFP4 MoE ckpt; only load-time change is un-swizzling
-    per-block scales once so the per-forward dequant skips that step.
-    ``CutlassFusedMoE.run_moe`` dispatches here and uses an active-mask Triton
-    kernel (``dequant_active_experts_to_hp``) to dequant only routed experts
-    into a static [E_total, N, K] workspace, then runs the bf16 ``fused_moe``.
-    """
+    """Dequantize active NVFP4 experts into a BF16/FP16 workspace for CUTLASS."""
 
     quantizes_nvfp4_activations = False
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
-        super().process_weights_after_loading(module)
+    def _interleave_w3_w1_weight_scale(
+            self, dst_w3_w1_weight_scale: torch.Tensor) -> None:
+        # Dequantization reads linear scales, including host copies migrated
+        # into resident slots by online EPLB.
+        pass
 
-        # Scale buffer: int32-packed FP8, viewed as uint8 has shape
-        # [E, pad_up(N, 128), pad_up(K/sf_vec, 4)] -- the 3D layout
-        # block_scale_interleave_reverse accepts.
-        def _unswizzle_inplace(scale_param: torch.nn.Parameter):
-            sf_view = scale_param.data.view(float4_sf_dtype)
-            linear = torch.ops.trtllm.block_scale_interleave_reverse(sf_view)
-            scale_param.data.view(float4_sf_dtype).copy_(linear)
-
-        _unswizzle_inplace(module.w3_w1_weight_scale)
-        _unswizzle_inplace(module.w2_weight_scale)
+    def _interleave_w2_weight_scale(self,
+                                    dst_w2_weight_scale: torch.Tensor) -> None:
+        # FC2 uses the same linear layout for resident and host copies.
+        pass
 
     def dequant_active_experts_to_hp(
         self,
@@ -3646,12 +3684,24 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # CuteDsl interleave deferred to process_weights_after_loading().
 
     @staticmethod
+    def _interleave_fc1_rows(x: torch.Tensor) -> torch.Tensor:
+        """Reorder FC1 rows (dim 0) into the gate/up interleave the fused
+        gather+GEMM+activation kernel of this GPU reads.
+
+        The Rubin (SM107) kernels consume ``[gate16, up16]`` groups; the
+        Blackwell kernels consume ``[up64, gate64]`` groups. Weights and their
+        block scales go through the same permutation.
+        """
+        if get_sm_version() == 107:
+            return interleave_gate_and_linear(x, group_size=16, dim=0)
+        return interleave_linear_and_gate(x, group_size=64, dim=0)
+
+    @staticmethod
     def _interleave_w3_w1_weight(dst_w3_w1_weight: torch.Tensor):
         """Interleave FC1 weight for GEMM1 + SwiGLU fusion."""
         w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
-        w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
-                                                              group_size=64,
-                                                              dim=0)
+        w3_w1_weight_interleaved = (
+            NVFP4CuteDslFusedMoEMethod._interleave_fc1_rows(w3_w1_weight))
         dst_w3_w1_weight.copy_(
             w3_w1_weight_interleaved.view(dst_w3_w1_weight.dtype))
 
@@ -3684,8 +3734,8 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
         w3_w1_weight_scale_unswizzled = unswizzle_sf(
             w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
-        w3_w1_weight_scale_unswizzled_interleaved = interleave_linear_and_gate(
-            w3_w1_weight_scale_unswizzled, group_size=64, dim=0)
+        w3_w1_weight_scale_unswizzled_interleaved = self._interleave_fc1_rows(
+            w3_w1_weight_scale_unswizzled)
         w3_w1_weight_scale_interleaved = swizzle_sf(
             w3_w1_weight_scale_unswizzled_interleaved, n,
             k).view(n, k // module.scaling_vector_size)
@@ -7214,6 +7264,11 @@ def _import_deep_gemm():
             f"tensorrt_llm.deep_gemm missing mega_moe symbols {missing}; "
             f"upgrade the TRT-LLM bundled DeepGEMM to a release that "
             f"includes fp8_fp4_mega_moe.")
+    if not hasattr(_dg, "set_barrier_timeout_seconds"):
+        raise _MegaMoEUnavailable(
+            "tensorrt_llm.deep_gemm lacks set_barrier_timeout_seconds; rebuild "
+            "so the bundled DeepGEMM carries "
+            "3rdparty/patches/deepgemm_configurable_barrier_timeout.patch.")
 
     mega_moe_params = inspect.signature(_dg.fp8_fp4_mega_moe).parameters
     missing_situ_params = [

@@ -49,7 +49,8 @@ private:
             {
                 float score;
                 int16_t newIdx = static_cast<int16_t>(ie);
-                score = static_cast<float>(bufferCast<T>(*this->mPtrScoresHost)[it * param.numExperts + ie]);
+                score
+                    = static_cast<float>(this->mPtrScoresHost->template getBufferPtr<T>()[it * param.numExperts + ie]);
 
                 PackedFloat si{static_cast<float>(score), newIdx};
                 expWeightsIdx[ie] = si;
@@ -71,17 +72,21 @@ private:
                 auto finalScore = 1.F / (1.F + std::exp(-expIdx[ie].score));
 
                 PackedType si{static_cast<T>(finalScore), expIdx[ie].idx};
-                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
+                reinterpret_cast<PackedType*>(
+                    this->mPtrTopKPackedHost->template getBufferPtr<int8_t>())[it * param.topK + ie]
+                    = si;
 
                 if (param.useTopKAsInput)
                 {
-                    bufferCast<int32_t>(*this->mPtrTopKIdsHost)[it * param.topK + ie]
+                    this->mPtrTopKIdsHost->template getBufferPtr<int32_t>()[it * param.topK + ie]
                         = static_cast<int32_t>(expIdx[ie].idx);
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(finalScore);
+                    this->mPtrTopKWeightsHost->template getBufferPtr<T>()[it * param.topK + ie]
+                        = static_cast<T>(finalScore);
                 }
                 else if (param.getExpWeights)
                 {
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(finalScore);
+                    this->mPtrTopKWeightsHost->template getBufferPtr<T>()[it * param.topK + ie]
+                        = static_cast<T>(finalScore);
                 }
             }
         }
@@ -101,10 +106,11 @@ private:
         RoutingKernelTest<T>::setCommonParams(param, routingData);
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
 
-        routingData.mPtrTopKPacked = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedDevice));
+        routingData.mPtrTopKPacked
+            = reinterpret_cast<PackedType*>(this->mPtrTopKPackedDevice->template getBufferPtr<int8_t>());
         if (param.useTopKAsInput)
         {
-            routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrTopKIds = this->mPtrTopKIdsDevice->template getBufferPtr<int32_t>();
             routingData.mPtrScores = nullptr;
         }
         else if (param.useTopKPackedAsInput)
@@ -116,7 +122,7 @@ private:
         else
         {
             routingData.mPtrTopKIds = nullptr;
-            routingData.mPtrScores = bufferCast<T>(*this->mPtrScoresDevice);
+            routingData.mPtrScores = this->mPtrScoresDevice->template getBufferPtr<T>();
         }
     }
 
@@ -138,6 +144,43 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
                      .withNumTokens(3)
                      .withNumExperts(128)
                      .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withRequiredComputeCapability(8)
+                     .build();
+    this->runTest(param);
+};
+
+// The warp kernel runs for numTokens < 4. With a non-zero localExpertsStartIdx, the batch index it
+// writes is only correct if it is mapped into this rank's expert window, and the CTA and padded
+// token counts it reports are only correct if tokens routed to remote experts are excluded from
+// them. The host reference gates both, so an ungated kernel disagrees on "cta idx -> batch idx",
+// "#non exiting CTAs" and "permuted idx size". Scores are drawn from a time-based seed, so which of
+// those three mismatches first depends on the run.
+TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationWithExpertParallelization)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withExpertParallelization(2, 1)
+                     .withTileTokensDim(8)
+                     .withRequiredComputeCapability(8)
+                     .build();
+    this->runTest(param);
+};
+
+// Same path, but with fewer local experts than tokens. This is the regime where a capacity bound
+// taken over the global expert count and one taken over the local count diverge, so it is the shape
+// that decides whether buffers sized from local_num_experts are large enough.
+TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationNarrowLocalExpertWindow)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withExpertParallelization(64, 1)
                      .withTileTokensDim(8)
                      .withRequiredComputeCapability(8)
                      .build();

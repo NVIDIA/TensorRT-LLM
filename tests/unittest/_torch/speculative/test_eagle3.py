@@ -57,6 +57,7 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     """Refresh DSA mappings after switching to the draft cache."""
     events = []
+    state = {}
     draft_manager = object.__new__(DSACacheManagerV2)
 
     class _Metadata(DSAtrtllmAttentionMetadata):
@@ -66,13 +67,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
             self._num_ctx_tokens = 0
 
         def set_in_mtp_draft_loop(self, active):
-            pass
+            state["in_mtp_draft_loop"] = active
 
         def set_mtp_num_accepted(self, value):
-            pass
+            state["mtp_num_accepted"] = value
 
         def set_skip_topk(self, value):
-            pass
+            state["skip_topk"] = value
 
         def on_update_kv_lens(self):
             events.append("refresh")
@@ -116,6 +117,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
         )
 
     assert events == ["switch", "refresh", "forward"]
+    # The draft forward raised, so only the ExitStack callback can have cleared
+    # this; a leaked flag would let the next target forward reuse the selections.
+    assert state == {
+        "in_mtp_draft_loop": False,
+        "mtp_num_accepted": None,
+        "skip_topk": False,
+    }
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
@@ -495,15 +503,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
     ]
 
-    # Create a mock KV cache manager
-    mock_kv_cache_manager = MagicMock()
-    mock_kv_cache_manager.tokens_per_block = 32
-    mock_kv_cache_manager.num_pools = 1
-    mock_kv_cache_manager.num_attention_op_pools = mock_kv_cache_manager.num_pools
-    mock_kv_cache_manager.max_blocks_per_seq = 16
-    mock_kv_cache_manager.max_batch_size = num_seqs
-    mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
-    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    mock_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
 
     attn_metadata = TrtllmAttentionMetadata(
         max_num_requests=num_seqs,
@@ -548,6 +548,9 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.max_batch_size = num_seqs
     mock_kv_cache_manager.max_seq_len = 512
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
+    # layout from this hook, so a plain (non-FP4) manager must not expose it.
+    mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
     return mock_kv_cache_manager
 
 
@@ -765,7 +768,8 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
         pytest.skip(f"Required models not found")
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.6)
+                                    free_gpu_memory_fraction=0.6,
+                                    use_kv_cache_manager_v2=eagle3_one_model)
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
@@ -879,9 +883,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    # The LLM with speculation on should dynamically turn it off in this
-    # test since it goes beyond the max seqlen. Thus, the text should be
-    # _exactly_ the same, no need to use similarity scoring.
+    # Greedy decoding must match the non-speculative reference for a long prompt.
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
@@ -1058,7 +1060,8 @@ def test_multi_eagle3(use_one_model: bool):
         max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        free_gpu_memory_fraction=0.5)
+                                        free_gpu_memory_fraction=0.5,
+                                        use_kv_cache_manager_v2=use_one_model)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
@@ -1102,7 +1105,8 @@ def test_multi_eagle3(use_one_model: bool):
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                                                use_cuda_graph: bool):
-    """Test one-model rejection sampling with and without dynamic tree."""
+    """Test one-model rejection sampling with and without dynamic tree, with
+    more than one generation request per step."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -1111,13 +1115,13 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
     eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
-    max_batch_size = 1
+    max_batch_size = 2
     max_draft_len = 6
     dynamic_tree_max_top_k = 10
     max_total_draft_tokens = 60
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1, 2]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,
@@ -1145,14 +1149,17 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                    speculative_config=Eagle3DecodingConfig(
                        **spec_config_kwargs))
 
-    prompts = ["The president of the United States is"]
+    prompts = [
+        "The president of the United States is",
+        "The capital of France is",
+    ]
     sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=1.0)
 
     results = llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 
     assert len(results) == len(prompts)
-    assert len(results[0].outputs[0].token_ids) > 0
+    assert all(len(result.outputs[0].token_ids) > 0 for result in results)
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])

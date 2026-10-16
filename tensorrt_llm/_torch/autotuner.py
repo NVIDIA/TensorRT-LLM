@@ -1402,6 +1402,17 @@ class AutoTuner:
                         tuning_config,
                         apply_map_to_tuning_buckets=False))
                 has_tuning_failure_occurred = True
+            # The shortcut's candidate is recorded like the timed path's, so a
+            # run's log lists every pair either way: 0.000 is the documented
+            # recorded-without-profiling marker, a failure shows as inf. Same
+            # placement rationale as the timed path: after the handler, so a
+            # formatting error is never recorded as a tactic failure.
+            self._debug_logger(
+                f"[Autotuner] Candidate: custom_op={custom_op}, "
+                f"runner={runner}, tactic={tac}, "
+                f"shapes={profile.get_opt_shapes()}, "
+                f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
+            )
         else:
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
@@ -1458,6 +1469,11 @@ class AutoTuner:
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
                         has_tuning_failure_occurred = True
+                    self._debug_logger(
+                        f"[Autotuner] Candidate: custom_op={custom_op}, "
+                        f"runner={runner}, tactic={tac}, "
+                        f"shapes={profile.get_opt_shapes()}, "
+                        f"time={time_measured:.3f}ms")
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
@@ -1474,7 +1490,7 @@ class AutoTuner:
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
             )
-            logger.debug(
+            self._debug_logger(
                 f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
                 f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
             )

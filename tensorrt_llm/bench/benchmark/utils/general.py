@@ -23,7 +23,7 @@ _KV_CACHE_MAP = {
     QuantAlgo.NVFP4.value: "fp8",
 }
 
-ALL_SUPPORTED_BACKENDS = ["pytorch", "_autodeploy"]
+ALL_SUPPORTED_BACKENDS = ["pytorch"]
 
 
 def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
@@ -163,7 +163,6 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "backend": backend,
         "decoding_config": {},
         "performance_options": {
-            "cuda_graphs": True,
             "pytorch_config": pyt_options,
         }
     }

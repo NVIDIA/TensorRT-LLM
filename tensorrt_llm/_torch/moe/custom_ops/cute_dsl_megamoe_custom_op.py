@@ -1846,12 +1846,18 @@ if IS_MEGAMOE_OP_AVAILABLE:
         Owns a process-global ``kernel_cache`` keyed on the full
         ``(static_shape + tactic)`` tuple so multiple MoE layers with
         identical shapes amortize the (expensive) ``cute.compile``.
+        ``_kernel_descriptor_cache`` keeps the resolved host-side kernel
+        descriptor per (static shape + tactic + fallback policy) so
+        ``forward`` does not rebuild the token-comm / scheduler / epilogue /
+        workspace plan on every call.
         ``get_valid_tactics`` enumerates the upstream-tested geometries
         and validates each against the kernel-side constraints.
         """
 
         # Keep metadata with its successful compiled kernel; failed traces are not cached.
         kernel_cache: dict = {}
+        # Module-scope resolved (kernel descriptor, tactic) cache, same sharing.
+        _kernel_descriptor_cache: dict = {}
 
         def __init__(
             self,
@@ -2246,6 +2252,22 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 launch_config,
             )
 
+        def _resolve_kernel_descriptor(
+            self, tactic: Tuple, *, allow_fallback: bool
+        ) -> Tuple[Any, Tuple]:
+            # Cache static geometry, not this per-launch runner or its tensors.
+            # Keep the requested tactic and fallback policy in the key so a
+            # rejected heuristic is resolved only once without accepting an
+            # invalid explicitly selected tactic.
+            key = (self._tactic_cache_key(tactic), allow_fallback)
+            cached = self.__class__._kernel_descriptor_cache.get(key)
+            if cached is None:
+                cached = _resolve_megamoe_kernel_tactic(
+                    tactic, allow_fallback=allow_fallback, build=self._build_kernel_once
+                )
+                self.__class__._kernel_descriptor_cache[key] = cached
+            return cached
+
         def forward(
             self,
             inputs: List[torch.Tensor],
@@ -2297,10 +2319,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 f"peer_offsets length {len(peer_offsets)} != world_size {self.world_size}"
             )
 
-            kernel, tactic_t = _resolve_megamoe_kernel_tactic(
+            kernel, tactic_t = self._resolve_kernel_descriptor(
                 tactic_t,
                 allow_fallback=use_default_tactic,
-                build=self._build_kernel_once,
             )
 
             # form-B accumulates the top-k reduction into ``combine_output``,

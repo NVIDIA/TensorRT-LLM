@@ -30,6 +30,7 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
@@ -39,6 +40,11 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
     DeepGemmFusedMoE,
 )
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import (
+    DenseGEMMFusedMoE,
+    TrtllmCutedslDenseGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
@@ -61,6 +67,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_identity import (
     MoEImplRegistry,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
+from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,
     MegaMoECuteDsl,
@@ -118,6 +125,45 @@ def test_pinned_deepgemm_identity_resolves_to_the_leaf():
     assert report.selected_by == "pinned"
     assert report.requested == _DEEPGEMM_IMPL_ID
     assert not report.degraded
+
+
+def test_pinned_deepgemm_rejects_post_silu_clamping():
+    activation = SwigluActivation(clamp=5.0, clamp_after_silu=True)
+    with override_moe_environment(_deepgemm_environment()):
+        report = resolve_moe_impl(
+            _deepgemm_model_config(),
+            activation=activation,
+            impl_id=_DEEPGEMM_IMPL_ID,
+        )
+
+    assert report.winner is None
+    assert report.rejected[-1].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert "post-SiLU clamping" in report.rejected[-1].detail
+
+
+@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False)])
+def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        activation_constants=frozenset({"clamp"}),
+        clamp_after_silu=True,
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=sm),
+        parallel_size=1,
+    )
+
+    verdict = CutlassFusedMoE.can_implement(problem, deployment)
+
+    assert verdict.eligible is eligible
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+        assert "Triton fallback" in verdict.detail
 
 
 def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
@@ -190,8 +236,8 @@ def _megamoe_problem(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8) -> MoEProblem:
     return MoEProblem(
         quant=canonical_quant(quant_algo),
         dtype_act=torch.bfloat16,
-        # Both widths are % 512 == 0, which is what the packed-UE8M0 SF rows
-        # need to stay TMA-aligned.
+        # Both widths are % 512 == 0, which is what keeps the packed-UE8M0 SF
+        # records in DeepGEMM's dispatch buffer TMA-aligned.
         hidden_size=1024,
         intermediate_size=1024,
         num_experts=8,
@@ -765,6 +811,20 @@ def test_trtllm_gen_leaves_without_a_bias_runner_decline_during_selection(impl_i
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
+@pytest.mark.parametrize("sm, eligible", [(100, True), (103, True), (107, False)])
+def test_w4a8_nvfp4_fp8_leaf_is_pinned_to_its_arch_specific_cubins(sm, eligible):
+    """Its E2m1 x E4m3 drop is sm_100a/sm_103a only, so the family gate is too wide."""
+    impl = TrtllmTrtllmGenW4a8Nvfp4Fp8Impl
+    verdict = impl.can_implement(
+        MoEProblem(quant=impl.descriptor.identity.quant.upper(), dtype_act=torch.bfloat16),
+        _single_rank_deployment(_trtllm_gen_environment(sm=sm)),
+    )
+
+    assert verdict.eligible == eligible
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
+
+
 # The leaves whose runner reads no activation constant: their cubins have no
 # parameter for alpha, beta or the clamp and pin ``act_type``.
 _NO_ACTIVATION_CONSTANT_LEAVES = (
@@ -956,12 +1016,134 @@ def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
 
 
 # =====================================================================
+# Marlin: two formats over one kernel
+# =====================================================================
+# Both leaves run the same ``marlin_nvfp4_moe_gemm`` launch sequence, and are
+# still two identities because the ``quant`` a leaf publishes has to be the
+# ``quant`` the request named.
+
+_MARLIN_IDS = (
+    "marlin.cuda.fused_moe.nvfp4",
+    "marlin.cuda.fused_moe.w4a16_nvfp4",
+)
+
+
+def _marlin_environment(sm: int = 90) -> MoEEnvironment:
+    """Marlin's own SM window, so quantization stays the only variable."""
+    return MoEEnvironment(sm=sm)
+
+
+def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
+    cfg = ModelConfig()
+    cfg.moe_backend = "MARLIN"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+def test_marlin_registers_exactly_two_identities():
+    """The grid is the deliverable: two addressable ids, no more, no fewer."""
+    registered = sorted(
+        identity.canonical()
+        for identity in MOE_IMPL_REGISTRY.identities()
+        if identity.provider == "marlin"
+    )
+    assert registered == sorted(_MARLIN_IDS)
+
+
+@pytest.mark.parametrize("impl_id", _MARLIN_IDS)
+def test_marlin_identity_round_trips_through_registry(impl_id):
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    assert impl is not None
+    # ``vars``, not attribute access: an inherited descriptor would give both
+    # classes one identity.
+    assert "descriptor" in vars(impl)
+    assert impl.descriptor.identity.canonical() == impl_id
+    assert not impl.__abstractmethods__
+
+
+@pytest.mark.parametrize("impl_id", _MARLIN_IDS)
+def test_marlin_leaf_admits_only_its_own_format(impl_id):
+    """Two leaves over one kernel still admit one format each."""
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    quant = impl.descriptor.identity.quant
+    other = "w4a16_nvfp4" if quant == "nvfp4" else "nvfp4"
+    verdict = impl.can_implement(
+        MoEProblem(quant=other.upper(), dtype_act=torch.bfloat16),
+        _single_rank_deployment(_marlin_environment()),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+@pytest.mark.parametrize("impl_id", _MARLIN_IDS)
+def test_marlin_leaf_admits_the_format_it_publishes(impl_id):
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    verdict = impl.can_implement(
+        MoEProblem(
+            quant=impl.descriptor.identity.quant.upper(),
+            dtype_act=torch.bfloat16,
+        ),
+        _single_rank_deployment(_marlin_environment()),
+    )
+    assert verdict.eligible, verdict.detail
+
+
+def test_marlin_parent_is_abstract_and_unaddressable():
+    """The name survives for ``issubclass``; it is not an implementation."""
+    assert "descriptor" not in vars(MarlinFusedMoE)
+    assert MarlinFusedMoE not in {
+        MOE_IMPL_REGISTRY.lookup(ident) for ident in MOE_IMPL_REGISTRY.identities()
+    }
+    assert "can_implement" not in vars(MarlinFusedMoE)
+    assert MarlinFusedMoE.__abstractmethods__
+
+
+def test_every_marlin_leaf_descends_from_the_surviving_name():
+    """What the ``issubclass`` dispatch in create_moe.py depends on."""
+    for impl_id in _MARLIN_IDS:
+        assert issubclass(MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id)), MarlinFusedMoE)
+
+
+@pytest.mark.parametrize(
+    "quant_algo, expected",
+    [
+        pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
+        pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+    ],
+)
+def test_marlin_literal_picks_the_leaf_that_publishes_the_format(quant_algo, expected):
+    """``moe_backend: MARLIN`` names the family; the quant picks which leaf."""
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(_marlin_model_config(quant_algo))
+    assert impl_class_for(report) is expected
+    assert not report.degraded
+
+
+@pytest.mark.parametrize(
+    "quant_algo, impl_id",
+    [
+        pytest.param(QuantAlgo.NVFP4, _MARLIN_IDS[0], id="nvfp4"),
+        pytest.param(QuantAlgo.W4A16_NVFP4, _MARLIN_IDS[1], id="w4a16_nvfp4"),
+    ],
+)
+def test_pinned_marlin_identity_resolves_to_its_leaf(quant_algo, impl_id):
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(_marlin_model_config(quant_algo), impl_id=impl_id)
+    assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    assert report.selected_by == "pinned"
+
+
+# =====================================================================
 # One class per identity
 # =====================================================================
 # Each single-format identity is declared on the class that executes it: one
 # class owns the descriptor and all four abstract methods, and the pre-identity
 # name survives only as a module-level alias. So both request tracks and every
-# legacy call site land on that one class, and a run reports one name.
+# legacy call site land on that one class, and a run reports one name. The
+# multi-format families split the alias off onto an abstract parent instead,
+# and have their own sections above.
+
+_DENSEGEMM_IMPL_ID = "trtllm.cutedsl.dense_gemm.nvfp4"
 
 # The legacy alias, the class that carries the identity, the id it publishes,
 # and the scheduler kind that class declares.
@@ -986,6 +1168,13 @@ _SINGLE_FORMAT_IMPLS = (
         _MEGAMOE_CUTEDSL_IMPL_ID,
         MoESchedulerKind.FUSED_COMM,
         id="mega_moe_cutedsl",
+    ),
+    pytest.param(
+        DenseGEMMFusedMoE,
+        TrtllmCutedslDenseGemmNvfp4Impl,
+        _DENSEGEMM_IMPL_ID,
+        MoESchedulerKind.EXTERNAL_COMM,
+        id="dense_gemm",
     ),
 )
 

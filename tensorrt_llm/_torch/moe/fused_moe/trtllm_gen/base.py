@@ -46,12 +46,11 @@ from ..activation import (
     MoEActivationSupport,
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
-from ..impl_contract import canonical_quant, normalize_quant
+from ..impl_contract import canonical_quant, identity_quant_of, normalize_quant
 from ..impl_identity import MOE_IMPL_REGISTRY
 from ..interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode
 from ..moe_op_backend import MoEOpBackend, get_op_backend
 from ..routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod, MiniMaxM2MoeRoutingMethod
-from .eligibility import identity_quant_of
 from .identity import (
     PROVIDER_FLASHINFER,
     TECHNIQUE_TRTLLM_GEN,

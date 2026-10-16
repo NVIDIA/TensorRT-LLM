@@ -50,8 +50,8 @@ void invokeDeepseekV4QNorm(
 // the plain no-RoPE behaviour.
 void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes,
-    bool isBfloat16, float eps, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
-    int const* cu_q_seqlens, int num_seqs, cudaStream_t stream);
+    bool isBfloat16, float eps, bool applyNorm, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads,
+    int seq_len, int const* cu_q_seqlens, int num_seqs, cudaStream_t stream);
 
 } // namespace kernels
 

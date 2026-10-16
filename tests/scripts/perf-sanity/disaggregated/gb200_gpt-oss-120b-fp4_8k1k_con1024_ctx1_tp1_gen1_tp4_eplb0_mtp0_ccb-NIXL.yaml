@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: gpt_oss_120b_fp4
   precision: fp4
@@ -65,7 +68,6 @@ worker_config:
       enable_padding: true
       max_batch_size: 1280
     kv_cache_config:
-      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
       dtype: fp8
@@ -76,6 +78,7 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
+      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     num_postprocess_workers: 4
     stream_interval: 20
@@ -94,7 +97,6 @@ worker_config:
       enable_padding: true
       max_batch_size: 30
     kv_cache_config:
-      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
       dtype: fp8
@@ -105,6 +107,7 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
+      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     num_postprocess_workers: 4
     stream_interval: 20

@@ -256,6 +256,35 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     assert calls == idle_pass + _SHUTDOWN_PASS
 
 
+@pytest.mark.parametrize(
+    "loop",
+    [PyExecutor._executor_loop, PyExecutor._executor_loop_overlap],
+    ids=["executor_loop", "executor_loop_overlap"],
+)
+def test_insufficient_kv_fail_fast_ends_the_loop_before_the_benchmark_gate(
+    monkeypatch, loop
+) -> None:
+    """Once the ranks agree the benchmark fill can no longer fit KV, the
+    iteration fails every active request, flushes buffered responses and leaves
+    the loop: the benchmark gate and everything behind it (resource
+    preparation, forward, sampling) never run for the doomed batch."""
+    calls = []
+    executor = _idle_executor(monkeypatch, calls)
+    executor.dist = Mock(tp_size=1, world_size=1)
+    executor.active_requests = [Mock(), Mock()]
+    executor.benchmark_req_queues_size = 2  # quoted in the error message
+    executor._sync_gen_only_benchmark_has_insufficient_kv = Mock(return_value=True)
+    executor._handle_errors = lambda error_msg, *, requests: calls.append(
+        ("fail_requests", len(requests))
+    )
+
+    loop(executor)
+
+    assert calls == _SCHEDULE_HEAD + [("fail_requests", 2), ("flush_pending_transfer_responses",)]
+    executor._check_benchmark_disagg_gate.assert_not_called()
+    assert executor._event_loop_completed
+
+
 def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
     """The PP loop admits inside schedule propagation, checks transfer timeouts
     only on the retry and executed-batch paths, and flushes responses only from
