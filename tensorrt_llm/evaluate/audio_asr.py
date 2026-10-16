@@ -346,7 +346,7 @@ def _get_audio_data(audio_value: Any, dataset_path: str) -> Any:
             if Path(resolved_path).exists():
                 return resolved_path
         if audio_value.get("bytes") is not None:
-            return soundfile.read(BytesIO(audio_value["bytes"]))
+            return soundfile.read(BytesIO(audio_value["bytes"]), dtype="float32")
         if "array" in audio_value and "sampling_rate" in audio_value:
             return audio_value["array"], audio_value["sampling_rate"]
         if path:
