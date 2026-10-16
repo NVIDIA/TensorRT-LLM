@@ -54,7 +54,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
 )
 
+from .common import get_sparse_layer_ids
+
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -185,6 +189,25 @@ def derive_shared_draft_layout(
     return list(range(num_target, total)), num_target
 
 
+def default_sparse_layer_ids(
+    pretrained_config: Optional[PretrainedConfig], num_target_layers: Optional[int]
+) -> List[int]:
+    """Sparse target layers for a manager built without ``sparse_layer_ids``.
+
+    The model picks dense or sparse attention per layer from the checkpoint's
+    ``sparse_attention_config`` (:func:`get_sparse_layer_ids`), so the index-K
+    cache follows the same split whenever the config describes exactly the
+    target layers. Without such a config, layers 0..2 are dense and the rest
+    sparse, as in the MiniMax-M3 checkpoint.
+    """
+    if num_target_layers is None:
+        return []
+    num_hidden_layers = getattr(pretrained_config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and int(num_hidden_layers) == num_target_layers:
+        return get_sparse_layer_ids(pretrained_config)[1]
+    return list(range(3, num_target_layers))
+
+
 def extend_attention_op_pools_for_shared_draft_layers(
     pool_pointers: torch.Tensor,
     pool_mapping: torch.Tensor,
@@ -265,7 +288,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     stays empty in production.
 
     Constructor extras (forwarded kwargs go to :class:`KVCacheManagerV2`):
-      * ``sparse_layer_ids`` — layer indices using sparse attention.
+      * ``sparse_layer_ids`` — layer indices using sparse attention;
+        defaults to :func:`default_sparse_layer_ids`.
       * ``disable_index_value_layer_ids`` — subset whose index-V is
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
@@ -303,11 +327,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first, then
-        # from the executor's ``sparse_attention_config`` keyword, then from
-        # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
+        # from the executor's ``sparse_attention_config`` and
+        # ``pretrained_config`` keywords, then from the M3 checkpoint
+        # convention (layers 0..2 dense, 3..N-1 sparse,
         # disable_index_value=True, sparse_index_dim=128). Honoring the
-        # executor keyword also makes non-default sparse_index_dim values
-        # authoritative for the cache layout instead of falling back to 128.
+        # executor keywords also makes a non-default sparse layer split or
+        # sparse_index_dim authoritative for the cache layout.
         # Peeked (not popped) so the base __init__ still receives them.
         sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
@@ -334,10 +359,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
         )
         if sparse_layer_ids is None:
-            if num_target_layers is not None:
-                sparse_layer_ids = list(range(3, num_target_layers))
-            else:
-                sparse_layer_ids = []
+            sparse_layer_ids = default_sparse_layer_ids(
+                kwargs.get("pretrained_config"), num_target_layers
+            )
         if disable_index_value_layer_ids is None:
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
@@ -1171,6 +1195,7 @@ __all__ = [
     "MiniMaxM3DraftKVCacheView",
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3SparseIndexCache",
+    "default_sparse_layer_ids",
     "derive_shared_draft_layout",
     "extend_attention_op_pools_for_shared_draft_layers",
     "get_minimax_m3_kv_cache_manager_cls",

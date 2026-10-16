@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftKVCacheView,
     MiniMaxM3KVCacheManagerV2,
+    default_sparse_layer_ids,
     derive_shared_draft_layout,
     extend_attention_op_pools_for_shared_draft_layers,
     shared_draft_layer_count,
@@ -383,6 +384,73 @@ def test_shared_draft_layer_count_follows_the_base_manager():
     assert shared_draft_layer_count(eagle3, None) == 1
     assert shared_draft_layer_count(eagle3, [True] * 60) == 0
     assert shared_draft_layer_count(None, None) == 0
+
+
+def _text_config(sparse_attention_freq):
+    return SimpleNamespace(
+        num_hidden_layers=len(sparse_attention_freq),
+        sparse_attention_config={"sparse_attention_freq": list(sparse_attention_freq)},
+    )
+
+
+def test_default_sparse_layers_follow_the_text_config():
+    # The model reads its dense/sparse split from the config; so does the cache.
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 5) == [0, 2, 3]
+    assert default_sparse_layer_ids(_text_config([0, 0, 0, 1, 1]), 5) == [3, 4]
+    # Without a config spanning the target layers, layers 0..2 stay dense.
+    assert default_sparse_layer_ids(None, 5) == [3, 4]
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 6) == [3, 4, 5]
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), None) == []
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", ["msa", "triton"])
+def test_index_k_cache_follows_the_config_sparse_layers(
+    monkeypatch: pytest.MonkeyPatch, implementation: str
+) -> None:
+    """Every layer the config makes sparse gets an index-K view, and only those."""
+    resolved = []
+
+    def fake_base_init(self, *args, **kwargs):
+        self.is_disagg = False
+        self.dtype = DataType.BF16
+        # Five target layers and the shared Eagle3 layer appended after them.
+        self.layer_offsets = {layer: layer for layer in range(6)}
+
+    def fake_get_index_k_buffer(self, layer_idx, **kwargs):
+        resolved.append(layer_idx)
+        return torch.empty(0)
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
+    mode = SimpleNamespace(
+        is_mtp_eagle_one_model=lambda: False,
+        is_mtp_vanilla=lambda: False,
+        is_eagle3_one_model=lambda: True,
+    )
+
+    manager = MiniMaxM3KVCacheManagerV2(
+        num_layers=5,
+        spec_config=SimpleNamespace(spec_dec_mode=mode, _num_draft_hidden_layers=None),
+        sparse_attention_config=SimpleNamespace(
+            implementation=implementation, indexer_kv_dtype="bf16"
+        ),
+        pretrained_config=_text_config([1, 0, 1, 1, 0]),
+    )
+
+    assert manager._shared_draft_layer_ids == [5]
+    assert manager.sparse_layer_ids == [0, 2, 3]
+    assert manager.disable_index_value_layer_ids == {0, 2, 3}
+    assert resolved == [0, 2, 3]
+    for layer in (0, 2, 3):
+        assert manager.get_index_k_buffer(layer) is not None
+    for layer in (1, 4, 5):
+        assert manager.get_index_k_buffer(layer) is None
+    # The Triton path runs the dense target layers on the native attention op.
+    expected_dense_native = (1, 4) if implementation == "triton" else ()
+    assert manager._dense_native_layer_ids == expected_dense_native
 
 
 @pytest.mark.cpu_only
