@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import pytest
 from tokenizers import Tokenizer
 from tokenizers.decoders import ByteFallback, ByteLevel, Fuse, Sequence, Strip
@@ -177,3 +179,22 @@ def test_hf_decode_incrementally_flush_matches_full_decode_in_context(token_ids:
     text = _stream(tokenizer, token_ids, skip_special_tokens=True)
 
     assert text == tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+@pytest.mark.parametrize(
+    "make_tokenizer, held_ids",
+    [
+        pytest.param(_byte_fallback_tokenizer, [0], id="byte_fallback"),
+        pytest.param(_space_prefixed_byte_level_tokenizer, [2, 7], id="space_prefixed_byte_level"),
+    ],
+)
+def test_hf_decode_incrementally_flush_with_no_new_tokens(
+    make_tokenizer: Callable[[], TransformersTokenizer], held_ids: list[int]
+) -> None:
+    """A final response that brings no new token ids still releases the held ones."""
+    tokenizer = make_tokenizer()
+
+    text, states = tokenizer.decode_incrementally(held_ids, "", None, skip_special_tokens=True)
+    text, _ = tokenizer.decode_incrementally([], text, states, flush=True, skip_special_tokens=True)
+
+    assert text == tokenizer.decode(held_ids, skip_special_tokens=True)
