@@ -177,7 +177,6 @@ def test_optimized_two_pool_prefill_and_decode(
             for tensor, other_tensor in (
                 (view.page_tables, other_view.page_tables),
                 (view.lengths, other_view.lengths),
-                (view.cu_new_tokens, other_view.cu_new_tokens),
             ):
                 assert tensor.untyped_storage().data_ptr() == (
                     other_tensor.untyped_storage().data_ptr()
@@ -271,8 +270,8 @@ def test_optimized_two_pool_prefill_and_decode(
                 original = tensor[row].view(-1, heads, width)
                 native_high_values = original.to(high_torch_dtype)
                 high_values = native_high_values.to(compute_dtype)
-                packed, scale_bytes = torch.ops.trtllm.fp4_quantize(
-                    native_high_values.contiguous(), history_scale.reciprocal(), 16, False, False
+                packed, scale_bytes = _reference_quant(
+                    native_high_values, history_scale.reciprocal()
                 )
                 scale_bytes = scale_bytes.view(length + 1, heads, width // 16)
                 low = (
@@ -355,6 +354,20 @@ def test_optimized_two_pool_prefill_and_decode(
         manager.shutdown()
 
 
+def _reference_quant(values, global_scale):
+    """Use the contiguous codec to check the paged kernel's address mapping."""
+    from flashinfer.quantization.fp4_quantization import SfLayout, nvfp4_quantize
+
+    width = values.shape[-1]
+    packed, scales = nvfp4_quantize(
+        values.reshape(-1, width), global_scale, sfLayout=SfLayout.layout_linear, backend="cute-dsl"
+    )
+    return (
+        packed.view(torch.uint8).reshape(*values.shape[:-1], width // 2),
+        scales.view(torch.uint8).reshape(*values.shape[:-1], width // 16),
+    )
+
+
 def _reference_dequant(packed, scales, scale):
     """Independent E2M1/linear-scale oracle, used only by these tests."""
     table = torch.tensor(
@@ -366,48 +379,54 @@ def _reference_dequant(packed, scales, scale):
     return table[codes] * block_scales * scale
 
 
-@pytest.mark.parametrize("dtype,width", [(torch.float16, 64), (torch.bfloat16, 80)])
-def test_nvfp4_conversion_kernels(dtype, width):
+@pytest.mark.parametrize("layout", ("HND", "NHD"))
+@pytest.mark.parametrize(
+    "dtype,width", [(torch.float16, 64), (torch.bfloat16, 80), (torch.float8_e4m3fn, 96)]
+)
+def test_mixed_precision_paged_conversion(dtype, width, layout):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    from flashinfer.quantization.fp4_quantization import (
-        get_fp4_kv_dequantization_module,
-        get_fp4_kv_quantization_module,
+    from tensorrt_llm._torch.cute_dsl_kernels.mixed_precision_kv import (
+        materialize_mixed_precision_kv,
+        writeback_mixed_precision_kv,
     )
 
-    values = torch.linspace(-6, 6, 17 * width, device="cuda").view(17, width).to(dtype)
-    scale = torch.tensor([0.5], device="cuda", dtype=torch.float32)
-    packed = torch.empty((17, width // 2), device="cuda", dtype=torch.uint8)
-    scales = torch.empty((17, width // 16), device="cuda", dtype=torch.uint8)
-    get_fp4_kv_quantization_module().nvfp4_kv_quant(values, scale, packed, scales)
-    native_packed, native_scales = torch.ops.trtllm.fp4_quantize(
-        values, scale.reciprocal(), 16, False, False
-    )
-    torch.testing.assert_close(packed, native_packed, rtol=0, atol=0)
-    torch.testing.assert_close(scales.flatten(), native_scales, rtol=0, atol=0)
-    decoded = torch.empty_like(values)
-    get_fp4_kv_dequantization_module().nvfp4_kv_dequant(packed, scales, scale, decoded)
-    expected = _reference_dequant(packed, scales, scale).to(dtype)
-    torch.testing.assert_close(decoded.float(), expected.float(), rtol=0, atol=0)
+    values = torch.linspace(-6, 6, 192 * 4 * width, device="cuda").view(192, 2, 2, width).to(dtype)
+    pool = values.view(3, 64, 2, 2, width).transpose(1, 2).contiguous()
+    low = torch.full((3, 2, 128, 2, width // 2), 23, dtype=torch.uint8, device="cuda")
+    scales = torch.full((3, 2, 128, 2, width // 16), 17, dtype=torch.uint8, device="cuda")
+    high = torch.zeros((3, 2, 128, 2, width), dtype=dtype, device="cuda")
+    tables = torch.tensor([[[2, 0]], [[0, 2]], [[1, -1]]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([[0], [130]], dtype=torch.int32, device="cuda")
+    factor = 1 / 6 if dtype == torch.float8_e4m3fn else 1.0
+    quant_scale = torch.tensor([1 / factor], dtype=torch.float32, device="cuda")
+    packed, block_scales = _reference_quant(values[:130], quant_scale)
+    expected_low, expected_scales, expected_high = low.clone(), scales.clone(), high.clone()
+    for page, count in enumerate((128, 2)):
+        expected_low[(2, 0)[page], :, :count] = packed[128 * page : 128 * page + count].transpose(
+            0, 1
+        )
+        expected_scales[(0, 2)[page], :, :count] = block_scales[
+            128 * page : 128 * page + count
+        ].transpose(0, 1)
+    expected_high[1] = values[:128].transpose(0, 1)
+    pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, scales, high))
+    writeback_mixed_precision_kv(*pools, tables, lengths, 130, layout)
+    for actual, expected in ((low, expected_low), (scales, expected_scales), (high, expected_high)):
+        torch.testing.assert_close(
+            actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+        )
 
-
-def test_nvfp4_conversion_from_native_fp8():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
-
-    values = torch.linspace(-448, 448, 128, device="cuda").view(2, 64).to(torch.float8_e4m3fn)
-    quant_scale = torch.full((1,), 6.0, device="cuda", dtype=torch.float32)
-    history_scale = quant_scale.reciprocal()
-    packed, scales = torch.ops.trtllm.fp4_quantize(values, quant_scale, 16, False, False)
-    scales = scales.view(2, 4)
-    decoded = torch.empty(values.shape, device="cuda", dtype=torch.bfloat16)
-    get_fp4_kv_dequantization_module().nvfp4_kv_dequant(packed, scales, history_scale, decoded)
-    expected = _reference_dequant(packed, scales, history_scale).to(decoded.dtype)
-    torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
-    torch.testing.assert_close(
-        decoded.float()[[0, 1], [0, 63]], values.float()[[0, 1], [0, 63]], rtol=0, atol=0
-    )
+    restored = _reference_dequant(packed, block_scales, factor)
+    if dtype == torch.float8_e4m3fn:
+        restored = restored.to(torch.bfloat16).float().clamp(-448, 448)
+    expected = torch.zeros_like(values)
+    expected[:128] = values[:128]
+    expected[128:130] = restored[128:130].to(dtype)
+    lengths[0].fill_(130)
+    materialize_mixed_precision_kv(*pools, tables, lengths, layout)
+    actual = pool.transpose(1, 2).reshape_as(values)
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
 def test_mixed_precision_public_options():

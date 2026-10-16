@@ -6789,7 +6789,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         self.last_n = last_n
         self.high_dtype = dtype
         self.low_dtype = low_dtype
-        self.conversion_dtype = torch.float16 if dtype == DataType.HALF else torch.bfloat16
         self.high_low_pool_ratio = high_low_pool_ratio
         if high_low_pool_ratio is not None and (
             not math.isfinite(high_low_pool_ratio) or high_low_pool_ratio <= 0
@@ -6810,7 +6809,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                         first_shared - 1 - source_types[::-1].index(layer_type)
                     )
         self._staging_bytes = 0
-        self.mixed_precision_workspace_elements = 0
         self._staging_buffer: torch.Tensor | None = None
         self._staging_stream: int | None = None
         from ...memory_buffer_utils import Buffers
@@ -6899,19 +6897,14 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
 
         if not self.high_layers:
             return config
-        # Layers share one native KV view and bounded codec workspaces.
+        # Layers share one native KV view.
         pages = self.max_batch_size * math.ceil(self.max_seq_len / self.tokens_per_block)
         elements = pages * largest_page
-        self.mixed_precision_workspace_elements = elements
         self._staging_bytes = get_size_in_bytes(elements, self.high_dtype)
-        low_bytes = get_size_in_bytes(
-            elements, self.low_dtype
-        ) + self.calculate_scaling_factor_size_bytes(elements, 16, DataType.FP8)
-        restored_bytes = elements * torch.empty((), dtype=self.conversion_dtype).element_size()
-        reserve = 2 * self._staging_bytes + restored_bytes + 2 * low_bytes
+        reserve = self._staging_bytes
         # Page tables are per layer; lengths are shared by the batch. No token/head indices.
         reserve += len(self.high_layers) * 3 * pages * 4
-        reserve += (3 * self.max_batch_size + 1) * 4
+        reserve += 2 * self.max_batch_size * 4
         # TRTLLM uses at most 64 tokens per staging page and two offsets even for MLA.
         view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 64))
         reserve += len(self.high_layers) * self.max_batch_size * 2 * view_pages * 4
