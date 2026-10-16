@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError
+from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError, VideoMediaIO
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
@@ -276,17 +277,17 @@ def _base_input_from_request(
     raise ValueError("exactly one of prompt or token_ids must be set")
 
 
-def _image_io_for_model(llm: Any) -> ImageMediaIO:
+def _media_io_for_model(llm: Any, modality: str, media_io_type: type[Any]) -> Any:
     input_processor = getattr(llm, "input_processor", None)
     defaults = None
     if isinstance(input_processor, BaseMultimodalInputProcessor):
         preferences = input_processor.get_preferred_media_io_kwargs() or {}
-        defaults = preferences.get("image")
-    return ImageMediaIO.create(defaults, None)
+        defaults = preferences.get(modality)
+    return media_io_type.create(defaults, None)
 
 
-async def _load_image_item(
-    item: generation_pb2.MediaItem, image_io: ImageMediaIO, index: int
+async def _load_media_item(
+    item: generation_pb2.MediaItem, media_io: Any, index: int, modality: str
 ) -> Any:
     source = item.WhichOneof("source")
     if source is None:
@@ -300,17 +301,19 @@ async def _load_image_item(
             raise ValueError(f"media[{index}].data_uri must use the data scheme")
         value = item.data_uri
     elif source == "raw_bytes":
-        if item.mime_type and not item.mime_type.lower().startswith("image/"):
-            raise ValueError(f"media[{index}].mime_type must be an image type for raw image bytes")
+        if item.mime_type and not item.mime_type.lower().startswith(f"{modality}/"):
+            raise ValueError(
+                f"media[{index}].mime_type must start with {modality}/ for raw {modality} bytes"
+            )
         try:
-            return await image_io.async_load_bytes(bytes(item.raw_bytes))
+            return await media_io.async_load_bytes(bytes(item.raw_bytes))
         except Exception as error:
             raise ValueError(f"media[{index}].raw_bytes could not be decoded: {error}") from error
     else:
         raise ValueError(f"media[{index}] has an unknown source '{source}'")
 
     try:
-        return await image_io.async_load(value)
+        return await media_io.async_load(value)
     except MediaFetchError as error:
         raise MediaUnavailableError(
             f"media[{index}].{source} is temporarily unavailable: {error}"
@@ -320,10 +323,19 @@ async def _load_image_item(
 
 
 def _image_loader_factory(llm: Any) -> _MediaLoader:
-    image_io = _image_io_for_model(llm)
+    image_io = _media_io_for_model(llm, "image", ImageMediaIO)
 
     async def load(item: generation_pb2.MediaItem, index: int) -> Any:
-        return await _load_image_item(item, image_io, index)
+        return await _load_media_item(item, image_io, index, "image")
+
+    return load
+
+
+def _video_loader_factory(llm: Any) -> _MediaLoader:
+    video_io = _media_io_for_model(llm, "video", VideoMediaIO)
+
+    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
+        return await _load_media_item(item, video_io, index, "video")
 
     return load
 
@@ -342,9 +354,39 @@ def _decoded_image_bytes(image: Any) -> int:
     raise TypeError(f"unsupported decoded image type: {type(image).__name__}")
 
 
+def _decoded_audio_data_bytes(audio: AudioData) -> int:
+    import numpy as np
+    import torch
+
+    if isinstance(audio.samples, torch.Tensor):
+        return audio.samples.numel() * audio.samples.element_size()
+    if isinstance(audio.samples, np.ndarray):
+        return audio.samples.nbytes
+    raise TypeError(f"unsupported decoded audio type: {type(audio.samples).__name__}")
+
+
+def _decoded_video_bytes(video: Any) -> int:
+    import numpy as np
+
+    if not isinstance(video, VideoData):
+        raise TypeError(f"unsupported decoded video type: {type(video).__name__}")
+    if isinstance(video.frames, np.ndarray):
+        total = video.frames.nbytes
+    elif isinstance(video.frames, list):
+        total = sum(_decoded_image_bytes(frame) for frame in video.frames)
+    else:
+        raise TypeError(f"unsupported decoded video frames type: {type(video.frames).__name__}")
+    if video.audio is not None:
+        total += _decoded_audio_data_bytes(video.audio)
+    return total
+
+
 _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
     generation_pb2.MODALITY_IMAGE: _MediaHandler(
         "image", _image_loader_factory, _decoded_image_bytes
+    ),
+    generation_pb2.MODALITY_VIDEO: _MediaHandler(
+        "video", _video_loader_factory, _decoded_video_bytes
     ),
 }
 

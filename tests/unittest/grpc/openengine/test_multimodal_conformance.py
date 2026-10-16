@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Image conformance tests against a real TensorRT-LLM VLM engine."""
+"""Multimodal conformance tests against a real TensorRT-LLM VLM engine."""
 
 import asyncio
 import base64
@@ -44,7 +44,7 @@ def vlm():
         engine.shutdown()
 
 
-def test_image_capability_and_generate_agree_on_a_loaded_vlm(vlm):
+def test_image_and_video_capabilities_agree_with_generate(vlm, tmp_path):
     inference = OpenEngineInferenceServicer(vlm, MODEL_NAME)
     control = OpenEngineControlServicer(vlm, MODEL_NAME, inference)
     info = asyncio.run(
@@ -55,7 +55,7 @@ def test_image_capability_and_generate_agree_on_a_loaded_vlm(vlm):
     )
 
     assert info.supports_multimodal is True
-    assert list(info.extra["trtllm_supported_modalities"]) == ["image"]
+    assert list(info.extra["trtllm_supported_modalities"]) == ["image", "video"]
 
     prompt = (
         "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
@@ -91,3 +91,45 @@ def test_image_capability_and_generate_agree_on_a_loaded_vlm(vlm):
     assert finished[0].usage.total_tokens == (
         finished[0].usage.prompt_tokens + finished[0].usage.completion_tokens
     )
+
+    cv2 = pytest.importorskip("cv2", reason="video conformance requires OpenCV")
+    import numpy as np
+
+    video_path = tmp_path / "colors.mp4"
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 2.0, (32, 32))
+    if not writer.isOpened():
+        pytest.skip("OpenCV has no MP4 encoder")
+    for value in (0, 64, 128, 255):
+        writer.write(np.full((32, 32, 3), value, dtype=np.uint8))
+    writer.release()
+
+    video_prompt = (
+        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+        "Describe this video briefly.<|im_end|>\n<|im_start|>assistant\n"
+    )
+    video_request = generation_pb2.GenerateRequest(
+        request_id="openengine-video-conformance",
+        model=MODEL_NAME,
+        token_ids=generation_pb2.TokenIds(ids=vlm.tokenizer.encode(video_prompt)),
+        stopping=generation_pb2.StoppingOptions(max_tokens=4),
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                data_uri="data:video/mp4;base64,"
+                + base64.b64encode(video_path.read_bytes()).decode(),
+                uuid="colors",
+            )
+        ],
+    )
+
+    async def collect_video():
+        return [
+            response async for response in inference.Generate(video_request, FakeServicerContext())
+        ]
+
+    video_responses = asyncio.run(collect_video())
+    assert video_responses
+    assert not any(response.HasField("error") for response in video_responses)
+    video_finished = [response for response in video_responses if response.HasField("finished")]
+    assert len(video_finished) == 1
+    assert video_finished[0].usage.prompt_tokens > len(video_request.token_ids.ids)
