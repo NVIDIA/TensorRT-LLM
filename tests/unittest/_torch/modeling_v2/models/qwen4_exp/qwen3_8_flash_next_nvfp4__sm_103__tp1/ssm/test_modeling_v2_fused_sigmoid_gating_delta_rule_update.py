@@ -187,7 +187,7 @@ def test_certified_branch_is_the_vendored_triton_kernel() -> None:
     """Both target decode calls keep the FlashInfer arm out, armed both ways: its entry
     point is replaced by one that raises; the packed call over an fp32 pool and the rows
     form over a bf16 pool complete, and the packed call over a bf16 pool in the same
-    process does raise -- so the witness is not blind."""
+    process does raise -- so the replaced entry point is known to be reachable."""
 
     def _boom(*args, **kwargs):
         raise AssertionError("FlashInfer arm taken")
