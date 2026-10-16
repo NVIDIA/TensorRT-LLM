@@ -317,6 +317,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
     )
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(
@@ -394,6 +395,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _completed_autotuner_warmup_num_tokens=None,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
         is_warmup=True,
         model=SimpleNamespace(
             modules=lambda: [

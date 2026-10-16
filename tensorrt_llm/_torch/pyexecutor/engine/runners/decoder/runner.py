@@ -5,6 +5,7 @@
 
 import contextlib
 import inspect
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -20,6 +21,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -184,6 +186,7 @@ class DecoderRunner(ScheduledModelRunner):
         # and the eager workspace reclaimer that serving forwards run under.
         self._trtllm_gen_jit_warmup = False
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
+        self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
 
         self._buffers = DecoderInputBuffers.for_config(self._config, self.use_beam_search)
         self._metadata = DecoderMetadata(
@@ -193,6 +196,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
+        self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
             mapping=mapping,
@@ -324,6 +328,19 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool = False,
     ) -> Any:
         return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
+
+    def _initialize_moe_workspace_reclaimer(self) -> None:
+        """Create the native workspace owner for this runner's lifetime."""
+        self._moe_workspace_reclaimer = None
+        if (
+            os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
+            and not self._config.is_spec_decode
+            and self.mapping.cp_size == 1
+            and self._eager_workspace_reclaim_supported
+            and self._torch_compile_backend is None
+            and self.breakable_cuda_graph_runner is None
+        ):
+            self._moe_workspace_reclaimer = CutlassWorkspaceReclaimer()
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         self._eager_workspace_reclaimer = None
@@ -700,7 +717,11 @@ class DecoderRunner(ScheduledModelRunner):
             and isinstance(metadata, TrtllmAttentionMetadata)
             else contextlib.nullcontext()
         )
-        with reclaim_scope:
+        moe_reclaimer = self._moe_workspace_reclaimer
+        moe_scope = contextlib.nullcontext()
+        if moe_reclaimer is not None:
+            moe_scope = moe_reclaimer.forward(warmup=is_dummy, num_tokens=metadata.num_tokens)
+        with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
     @nvtx_range("_forward_step")

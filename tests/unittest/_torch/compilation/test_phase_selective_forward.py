@@ -180,6 +180,7 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
         "_init_decoder_state",
         "_make_input_preparer",
         "_make_cuda_graphs",
+        "_initialize_moe_workspace_reclaimer",
     ):
         monkeypatch.setattr(DecoderRunner, method, Mock())
     expected_error = (
