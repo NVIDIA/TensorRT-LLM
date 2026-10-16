@@ -11,9 +11,17 @@
              - add tasks, or rewrite, rewire or remove tasks not yet started;
              - retry, rewrite or remove FAILED tasks;
              - cancel RUNNING tasks;
+             - mark ``perf`` tasks ``side`` (not merged) or merge them again;
              - FINISH: let the final task start once its dependencies are DONE;
              - ABORT the run.
-    done   the final task is DONE, or the planner aborted
+    wrap   the final task is DONE: side tasks still running get up to
+           ``side_wait_minutes`` to finish, side tasks not started never start,
+           and the planner may still chain a new landing task after the final one
+    done   nothing is left to run, or the planner aborted
+
+A run that lands keeps every side task's branch as
+``<landed branch>-unmerged/<id>`` and commits ``UNMERGED_OPTIMIZATIONS.md``
+listing them, so a human can merge any of them later.
 
 A human steers a running run by leaving a message in its inbox
 (``modeling-v2-onboard --workspace <ws> --feedback ...``): it wakes the planner,
@@ -51,11 +59,13 @@ from .files import (
     HandoffError,
     Layout,
     PlannerDecision,
+    TaskResult,
     parse_planner_decision,
+    parse_task_result,
     read_handoff,
     read_inbox,
 )
-from .node_runner import Agent, AgentFactory, make_run_task
+from .node_runner import Agent, AgentFactory, make_run_task, write_failure
 from .plan import PRIORITIES, PlanError, PlanSpec, parse_plan
 from .prompts import (
     build_planner_system_prompt,
@@ -72,6 +82,8 @@ MAX_PLAN_FIXES = 3
 MAX_STALLED_TURNS = 3
 # How often the orchestrator looks for human messages in the inbox.
 INBOX_POLL_SECONDS = 10
+# The file a landed run commits to list the side tasks it did not merge.
+UNMERGED_FILE = "UNMERGED_OPTIMIZATIONS.md"
 
 _STATE_VERSION = 2
 
@@ -98,6 +110,9 @@ class _State:
     tasks: dict[str, NodeState] = field(default_factory=dict)
     # Tasks that finished since the planner's last turn: (id, status, summary).
     finished: list[tuple[str, str, str]] = field(default_factory=list)
+    # The checkout's HEAD when each landing task started, to restore it when
+    # the task is reset.
+    landing_base: dict[str, str] = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
         data = {"version": _STATE_VERSION, **asdict(self)}
@@ -121,6 +136,7 @@ class _State:
             finish=data["finish"],
             tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
             finished=[tuple(item) for item in data.get("finished", [])],
+            landing_base=data.get("landing_base", {}),
         )
 
 
@@ -143,6 +159,13 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _result_summary(path: Path) -> str | None:
+    try:
+        return read_handoff(path, parse_task_result).summary
+    except HandoffError:
+        return None
+
+
 class ModelingV2OnboardWorkflow:
     """Run the planner alongside parallel workers until the final task lands.
 
@@ -153,6 +176,8 @@ class ModelingV2OnboardWorkflow:
         task_data: Its validated contents.
         agent_factory: Builds the planner's and the workers' agents.
         max_parallel: The most workers that run at once.
+        side_wait_minutes: How long side tasks still running when the final
+            task is DONE may take to finish before they are stopped.
     """
 
     def __init__(
@@ -163,6 +188,7 @@ class ModelingV2OnboardWorkflow:
         task_data: dict,
         agent_factory: AgentFactory,
         max_parallel: int = 8,
+        side_wait_minutes: float = 60,
     ) -> None:
         self.layout = Layout(Path(workspace).absolute())
         self.task_path = Path(task_path)
@@ -170,6 +196,7 @@ class ModelingV2OnboardWorkflow:
         self.slurm = "slurm-environment" in task_data
         self.agent_factory = agent_factory
         self.max_parallel = max_parallel
+        self.side_wait_minutes = side_wait_minutes
         self.isolation = GitWorktreeIsolation(
             repo_path=self.repo_path, worktrees_root=self.layout.worktrees_dir
         )
@@ -287,9 +314,22 @@ class ModelingV2OnboardWorkflow:
             return True
         if tasks[node.id] != NodeState.PENDING:
             return False
-        if node.id == self._plan.sink_id() and not self._state.finish:
+        if self._plan.is_landing(node.id) and not self._state.finish:
+            return False
+        if node.id in self._plan.side and self._landed():
             return False
         return all(tasks.get(dep) == NodeState.DONE for dep in node.depends_on)
+
+    def _landed(self) -> bool:
+        """Whether a landing task has committed to the checkout."""
+        return any(
+            self._plan.is_landing(node.id) and self._state.tasks[node.id] == NodeState.DONE
+            for node in self._plan.graph.nodes
+        )
+
+    def _delivered(self) -> bool:
+        """Whether the final task is DONE."""
+        return self._state.tasks[self._plan.sink_id()] == NodeState.DONE
 
     def _ready(self) -> list[Node]:
         """Tasks that can start now but have no worker yet.
@@ -316,34 +356,81 @@ class ModelingV2OnboardWorkflow:
             self._running[node.id] = asyncio.create_task(self._task(node))
 
     async def _task(self, node: Node) -> None:
-        """One task end to end: worktree, merge of its dependencies, worker, commit."""
-        tags = self._plan.tags[node.id]
-        is_final = node.id == self._plan.sink_id()
-        dep_nodes = [self._plan.graph.by_id[dep] for dep in node.depends_on]
+        """One task end to end; a side task stopped at the deadline ends FAILED."""
         try:
-            path = await self._git(self.isolation.acquire, node)
-            try:
-                if dep_nodes:
-                    await self._git(self.isolation.prepare, node, dep_nodes, path)
-                result = await self._run_task(node, path, tags, is_final)
-                await self._git(self.isolation.commit, node, path)
-            finally:
-                await self._git(self.isolation.release, node)
+            result = await self._work(node)
+        except asyncio.CancelledError:
+            if node.id not in self._overdue:
+                raise
+            result = None
         except Exception as exc:
             # Worker failures arrive as FAILED results; an exception here is the
             # orchestrator's own git machinery failing, which stops the run.
             self._crash = exc
             self._wake.set()
             return
+        if result is None:
+            result = self._overdue_result(node.id)
         del self._running[node.id]
         state = NodeState.DONE if result.status == "DONE" else NodeState.FAILED
         self._set(node.id, state)
         self._state.finished.append((node.id, result.status, result.summary))
         self._save()
-        if is_final and state == NodeState.DONE:
-            self._outcome = RunOutcome.SUCCEEDED
         self._wake.set()
         self._dispatch()
+
+    async def _work(self, node: Node) -> TaskResult | None:
+        """Worktree, merge of the dependencies, worker, commit.
+
+        Returns ``None`` for a side task stopped at the deadline; what its
+        worker left in the worktree is still committed to its branch.
+        """
+        plan = self._plan
+        landing = plan.is_landing(node.id)
+        dep_nodes = [plan.graph.by_id[dep] for dep in node.depends_on]
+        if landing and node.id not in self._state.landing_base:
+            head = _git(self.repo_path, "rev-parse", "HEAD")
+            self._state.landing_base[node.id] = head.stdout.strip()
+            self._save()
+        path = await self._git(self.isolation.acquire, node)
+        try:
+            if dep_nodes:
+                await self._git(self.isolation.prepare, node, dep_nodes, path)
+            try:
+                result = await self._run_task(
+                    node, path, plan.tags[node.id], landing, node.id in plan.side
+                )
+            except asyncio.CancelledError:
+                if node.id not in self._overdue:
+                    raise
+                result = None
+            await self._git(self.isolation.commit, node, path)
+        finally:
+            await self._git(self.isolation.release, node)
+        return result
+
+    def _overdue_result(self, task_id: str) -> TaskResult:
+        """The result of a side task stopped at the deadline: its own, if it wrote one."""
+        path = self.layout.result_path(task_id)
+        try:
+            return read_handoff(path, parse_task_result)
+        except HandoffError:
+            minutes = f"{self.side_wait_minutes:g}"
+            return write_failure(
+                path,
+                f"The final task was DONE and this side task was still running "
+                f"{minutes} minutes later, so the orchestrator stopped it. What it had "
+                "changed is committed on its branch.",
+                summary=f"stopped {minutes} minutes after the final task was DONE",
+            )
+
+    async def _stop_side_after(self, seconds: float) -> None:
+        """Stop the side tasks still running ``seconds`` from now."""
+        await asyncio.sleep(seconds)
+        for task_id, task in list(self._running.items()):
+            if task_id in self._plan.side:
+                self._overdue.add(task_id)
+                task.cancel()
 
     def _cancel_jobs(self, task_id: str) -> None:
         jobs_path = self.layout.jobs_path(task_id)
@@ -385,6 +472,16 @@ class ModelingV2OnboardWorkflow:
     async def _discard(self, node: Node) -> None:
         await self._git(self.isolation.release, node)
         await self._git(self.isolation.reclaim, node)
+
+    def _restore_checkout(self, task_id: str) -> None:
+        """Undo what a reset landing task did to the checkout, commits included."""
+        base = self._state.landing_base.pop(task_id, None)
+        self._save()
+        if base is None:
+            return
+        repo = self.repo_path
+        for args in (("merge", "--abort"), ("reset", "--hard", base), ("clean", "-fd")):
+            _git(repo, *args)
 
     # ---------------------------------------------------------------- planner
 
@@ -520,6 +617,8 @@ class ModelingV2OnboardWorkflow:
                 result.replace(self.layout.attempt_path(tid, attempt))
             shutil.rmtree(self.layout.node_dir(tid), ignore_errors=True)
             await self._discard(node)
+            if node.isolation == "shared":
+                self._restore_checkout(tid)
             self._resetting.discard(tid)
 
     def _describe(self, node: Node) -> str:
@@ -532,8 +631,10 @@ class ModelingV2OnboardWorkflow:
         waiting = [dep for dep in node.depends_on if tasks.get(dep) != NodeState.DONE]
         if waiting:
             return f"pending — waiting on {', '.join(waiting)}"
-        if node.id == self._plan.sink_id() and not self._state.finish:
+        if self._plan.is_landing(node.id) and not self._state.finish:
             return "pending — held until FINISH"
+        if node.id in self._plan.side and self._landed():
+            return "pending — side, will not start: the run has landed"
         return "pending — ready, waiting for a slot"
 
     async def _turn(self, *, stalled: bool, resumed: bool) -> None:
@@ -559,6 +660,8 @@ class ModelingV2OnboardWorkflow:
             ready=len(self._ready()),
             max_parallel=self.max_parallel,
             finish=state.finish,
+            delivered=self._delivered(),
+            side_wait_minutes=self.side_wait_minutes,
             stalled=stalled,
             resumed=resumed,
             rejected=self._rejected,
@@ -610,8 +713,14 @@ class ModelingV2OnboardWorkflow:
                 raise self._crash
             if self._outcome is not None:
                 return await self._finish(self._outcome)
-            finished = bool(self._state.finished)
             feedback = bool(read_inbox(self.layout))
+            if self._delivered():
+                if self._idle() and not feedback:
+                    return await self._finish(RunOutcome.SUCCEEDED)
+                if self._deadline is None:
+                    seconds = self.side_wait_minutes * 60
+                    self._deadline = asyncio.create_task(self._stop_side_after(seconds))
+            finished = bool(self._state.finished)
             stalled = self._idle() and not finished and not feedback
             if not (finished or feedback or stalled or resumed):
                 self._wake.clear()
@@ -630,15 +739,22 @@ class ModelingV2OnboardWorkflow:
         """Record the outcome; free task branches only when everything landed.
 
         After an ABORT, work the final task has not landed exists only on its
-        ``node/<id>`` branch, so every branch is kept.
+        ``node/<id>`` branch, so every branch is kept. After a landing, the
+        side tasks' branches are kept and listed in :data:`UNMERGED_FILE`.
         """
         await self._stop_workers()
+        if self._deadline is not None:
+            self._deadline.cancel()
         for tid, state in self._state.tasks.items():
             if state != NodeState.DONE:
                 self._cancel_jobs(tid)
         if outcome == RunOutcome.SUCCEEDED:
             for node in self._plan.graph.nodes:
-                await self._discard(node)
+                if node.id in self._plan.side:
+                    await self._git(self.isolation.release, node)
+                else:
+                    await self._discard(node)
+            self._list_unmerged(self._keep_side_branches())
         self._state.phase, self._state.outcome = "done", outcome.value
         self._save()
         print_rule(f"[bold]Run finished: {outcome.value}[/bold]", self._log)
@@ -650,6 +766,57 @@ class ModelingV2OnboardWorkflow:
             )
         return outcome
 
+    def _keep_side_branches(self) -> dict[str, str]:
+        """Rename each side task's branch after the landed branch; return the new names."""
+        repo = self.repo_path
+        landed = _git(repo, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
+        prefix = f"{landed}-unmerged/" if landed else "unmerged/"
+        kept = {}
+        for task_id in sorted(self._plan.side):
+            old, new = f"node/{task_id}", f"{prefix}{task_id}"
+            if _git(repo, "branch", "-M", old, new).returncode == 0:
+                kept[task_id] = new
+        return kept
+
+    def _list_unmerged(self, branches: dict[str, str]) -> None:
+        """Commit :data:`UNMERGED_FILE`, describing every side task, to the checkout."""
+        plan, tasks = self._plan, self._state.tasks
+        side = [node for node in plan.graph.nodes if node.id in plan.side]
+        if not side:
+            return
+        lines = [
+            "# Performance work left unmerged",
+            "",
+            "The run that landed this branch also tried the changes below on side",
+            "branches and did not merge them. Each branch starts from the code of the",
+            "tasks it lists as its base. To take one, merge its branch and run the",
+            "accuracy and performance gates again.",
+        ]
+        for node in side:
+            state = tasks[node.id]
+            path = self.layout.result_path(node.id)
+            summary = "not started"
+            if state in (NodeState.DONE, NodeState.FAILED):
+                summary = f"{state.name}: " + (_result_summary(path) or "(no summary)")
+            lines += [
+                "",
+                f"## {node.id}",
+                "",
+                f"- Branch: `{branches[node.id]}`" if node.id in branches else "- Branch: none",
+                f"- Result: {summary}",
+                f"- Base: {', '.join(node.depends_on) or 'the starting checkout'}",
+            ]
+            if path.is_file():
+                lines.append(f"- Full report: `{path}`")
+            section = plan.section(node.id)
+            if section:
+                lines += ["", section]
+        repo = self.repo_path
+        (repo / UNMERGED_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _git(repo, "add", UNMERGED_FILE)
+        message = "[None][doc] List the performance work this run left unmerged"
+        _git(repo, "commit", "-s", "--no-verify", "-m", message)
+
     async def _main(self) -> RunOutcome:
         self._running: dict[str, asyncio.Task[None]] = {}
         self._resetting: set[str] = set()
@@ -660,6 +827,9 @@ class ModelingV2OnboardWorkflow:
         self._outcome: RunOutcome | None = None
         self._crash: Exception | None = None
         self._rejected: list[str] = []
+        # Side tasks stopped at the deadline, and the deadline's timer.
+        self._overdue: set[str] = set()
+        self._deadline: asyncio.Task[None] | None = None
         self._planner: Agent = self.agent_factory(
             "planner",
             build_planner_system_prompt(max_parallel=self.max_parallel),

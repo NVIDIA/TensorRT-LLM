@@ -18,12 +18,12 @@ from ._fakes import FakeFactory, result_path_in, write_result
 _PLAN = parse_plan(PLAN_EXAMPLE)
 
 
-def _run(tmp_path, factory, node_id="join-core", *, slurm=False):
+def _run(tmp_path, factory, node_id="join-core", *, slurm=False, side=False):
     layout = Layout(tmp_path / "ws")
     run_task = make_run_task(layout=layout, agent_factory=factory, slurm=slurm)
     node = _PLAN.graph.by_id[node_id]
     is_final = node_id == _PLAN.sink_id()
-    result = anyio.run(run_task, node, tmp_path / "wt", _PLAN.tags[node_id], is_final)
+    result = anyio.run(run_task, node, tmp_path / "wt", _PLAN.tags[node_id], is_final, side)
     return layout, result
 
 
@@ -101,3 +101,15 @@ def test_final_task_and_slurm_are_announced(tmp_path):
     assert "final task" in agent.prompts[0]
     assert str(layout.test_commands_path) in agent.prompts[0]
     assert "## Running GPU work on Slurm" in agent.system_prompt
+
+
+def test_a_side_task_is_told_its_branch_is_not_merged(tmp_path):
+    async def worker(agent, prompt):
+        write_result(result_path_in(prompt), "DONE")
+
+    factory = FakeFactory(worker=worker)
+    _run(tmp_path, factory, node_id="perf-moe-gemm", side=True)
+    _run(tmp_path / "main", factory, node_id="perf-fuse-add-norm")
+    side, main = factory.agents
+    assert "**side task**" in side.prompts[0]
+    assert "side task" not in main.prompts[0]

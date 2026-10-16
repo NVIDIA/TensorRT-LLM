@@ -37,21 +37,25 @@ run    every task whose dependencies are DONE starts, up to --max-parallel;
          decision: CONTINUE | FINISH | ABORT
          retry:  [FAILED tasks to run again unchanged]
          cancel: [RUNNING tasks to stop]
-done   the final task is DONE (succeeded), or the planner aborted
+wrap   the final task is DONE: running side tasks get --side-wait-minutes
+       (default 60) to finish, side tasks not started never start, and the
+       planner may still chain another landing after the final task
+done   nothing is left to run (succeeded), or the planner aborted
 ```
 
 What a turn may change depends on each task's state:
 
 | state | the planner may |
 |---|---|
-| `DONE` | nothing — its graph entry and `###` section are fixed |
+| `DONE` | nothing but its `priority` and `side` — its graph entry and `###` section are fixed |
 | `RUNNING` | nothing, unless it `cancel`s it: it then starts over, or goes away if removed |
 | `FAILED` | rewrite it, `retry` it, or remove it; until then its dependents wait |
 | `PENDING` | anything |
 
 A `FAILED` task holds back only the tasks that depend on it; nothing pauses.
-The final task does not start until the planner decides `FINISH`, so it can
-keep adding work. A rewritten, retried or cancelled task starts on a fresh
+A shared task does not start until the planner decides `FINISH`, so it can
+keep adding work. A cancelled shared task's changes to the checkout, commits
+included, are undone before it starts again. A rewritten, retried or cancelled task starts on a fresh
 branch; its earlier results are kept as `task_result_<id>.attempt<k>.md` for
 the next attempt and the planner to read. A turn that still does not validate
 after the errors are sent back three times is discarded (`plan.md` is
@@ -71,6 +75,26 @@ seconds and wakes the planner, whose next turn shows it first and is told to
 act on it before anything else. The message moves to `inbox/consumed/` once a
 turn that saw it has been applied, so a discarded turn or a crash hands it to
 the planner again.
+
+## Side tasks
+
+A `perf` node marked `side: true` is work the run does not merge: no task but
+another side task may depend on it, the final task does not wait for it, and
+it only takes the slots and GPUs the main line leaves free (its priority is
+`perf`). The planner marks the unmerged `perf` tasks `side` once every goal in
+`task.yaml` is met, so the run can land without another round of merging and
+verifying, and keeps filling free slots with new side tasks until it lands.
+`side` can be set and dropped on a task in any state without re-running it.
+
+When a human asks to keep optimizing, the planner drops `side` and merges the
+work: before the final task if it has not run, or — once it is `DONE` — by
+chaining a merge task, an accuracy gate and a new `isolation: shared` task
+after it, which lands the result and becomes the new final task.
+
+When a run lands, each side task's branch is kept as
+`<landed branch>-unmerged/<id>`, and `UNMERGED_OPTIMIZATIONS.md` is committed
+to the checkout with each side task's status, result summary, base and task
+description.
 
 ## Task tags
 
@@ -101,9 +125,13 @@ The planner's plan is checked before it runs (`plan.py`):
 - every task has a `### <id>` section and a node in a flat graph;
 - tags are from the table above; `kind: merge` exactly on `merge` tasks;
 - a task that depends on two or more tasks is a `merge` task;
-- exactly one final task, which every other task leads to, takes
+- exactly one final task, which every task but the side ones leads to, takes
   `isolation: shared` and the `merge` tag: it runs in the checkout itself and
   its commits are what the run delivers;
+- other shared tasks are `merge` tasks that land one after another: each
+  depends, directly or not, on the one before;
+- `side` only on `perf` tasks that are not `merge` tasks, and no task outside
+  `side` depends on one;
 - on a revision, a `DONE` task's graph entry may not change or disappear.
 
 ## Workspace
@@ -127,5 +155,6 @@ The planner's plan is checked before it runs (`plan.py`):
 `trtllm_repo_path` must be a clean git checkout (no modified or untracked
 files) and the workspace must be outside it: the final task commits
 everything it finds there. Use a dedicated clone or `git worktree add`. On
-success every `node/*` branch is deleted; when the planner aborts the run, the
-branches are kept so unfinished work can be inspected.
+success every `node/*` branch is deleted, except the side tasks', which are
+renamed as above; when the planner aborts the run, the branches are kept so
+unfinished work can be inspected.

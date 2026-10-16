@@ -155,3 +155,35 @@ def test_planner_prompt_records_off_goal_bugs_instead_of_chasing_them():
     prompt = build_planner_system_prompt(max_parallel=8)
     assert "recorded, never chased" in prompt
     assert "append it to\n`issues.md` next to `plan.md`" in prompt
+
+
+def test_planner_prompt_parks_unmerged_perf_work_on_side_once_the_goal_is_met():
+    prompt = build_planner_system_prompt(max_parallel=8)
+    assert "## Side tasks: performance work the run does not merge" in prompt
+    assert "**When every goal in `task.yaml` is met**" in prompt
+    assert (
+        "**A human asking to keep optimizing, or to merge a side result, undoes\n  this.**"
+        in prompt
+    )
+    assert "UNMERGED_OPTIMIZATIONS.md" in prompt
+
+
+def test_planner_turn_prompt_says_when_the_run_has_delivered(tmp_path: Path):
+    args = dict(
+        turn_file=tmp_path / "turn_9.yaml",
+        plan=tmp_path / "plan.md",
+        task_yaml=tmp_path / "task.yaml",
+        results_dir=tmp_path,
+        finished=[],
+        states=[("land", "done"), ("s", "running")],
+        running=1,
+        ready=0,
+        max_parallel=8,
+        finish=True,
+        stalled=False,
+        resumed=False,
+        rejected=[],
+    )
+    assert "The final task is DONE" not in planner_turn_prompt(**args)
+    text = planner_turn_prompt(**args, delivered=True, side_wait_minutes=30)
+    assert "The final task is DONE" in text and "up to 30 minutes" in text

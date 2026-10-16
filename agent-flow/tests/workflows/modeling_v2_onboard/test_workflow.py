@@ -60,7 +60,12 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _workflow(
-    tmp_path: Path, repo: Path, factory: FakeFactory, max_parallel: int = 4, **task
+    tmp_path: Path,
+    repo: Path,
+    factory: FakeFactory,
+    max_parallel: int = 4,
+    side_wait_minutes: float = 60,
+    **task,
 ) -> ModelingV2OnboardWorkflow:
     task_path = tmp_path / "task.yaml"
     task_data = {"trtllm_repo_path": str(repo), **task}
@@ -71,6 +76,7 @@ def _workflow(
         task_data=task_data,
         agent_factory=factory,
         max_parallel=max_parallel,
+        side_wait_minutes=side_wait_minutes,
     )
 
 
@@ -633,3 +639,218 @@ def test_a_human_message_wakes_the_planner_and_is_acted_on(tmp_path, tmp_git_rep
     assert len(list(layout.consumed_dir.glob("*.md"))) == 1
     # busywork may be cancelled before its worker even starts.
     assert all(agent.closed for agent in factory.workers("busywork"))
+
+
+def _task_state(tmp_path: Path, task_id: str) -> str | None:
+    return json.loads(Layout(tmp_path / "ws").state_path.read_text())["tasks"].get(task_id)
+
+
+async def _until(condition) -> None:
+    for _ in range(2000):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("timed out")
+
+
+def _finish_once_done(*task_ids: str):
+    """FINISH as soon as ``task_ids`` are done, whatever else is running."""
+
+    async def on_turn(agent, prompt):
+        states = _states(prompt)
+        _decide(prompt, "FINISH" if all(states[t] == "done" for t in task_ids) else "CONTINUE")
+
+    return on_turn
+
+
+# s is side work on a's code; t is side work on s's code. land only needs a.
+_SIDE_GRAPH = """\
+  - id: a
+    type: new_op
+  - id: s
+    type: perf
+    depends_on: [a]
+    side: true
+  - id: t
+    type: perf
+    depends_on: [s]
+    side: true
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+"""
+
+
+def test_side_work_lands_beside_the_run_and_is_listed(tmp_path, tmp_git_repo):
+    async def s(agent, prompt, attempt):
+        # Still running when the final task lands.
+        await _until(lambda: _task_state(tmp_path, "land") == "done")
+        assert "**side task**" in prompt
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _plan_path(prompt).write_text(_plan_text(_SIDE_GRAPH, notes={"s": "Fuse the MoE."}))
+        else:
+            await _finish_once_done("a")(agent, prompt)
+
+    workers = _Workers(s=s)
+    factory = FakeFactory(planner=planner, worker=workers)
+    workflow = _workflow(tmp_path, tmp_git_repo, factory)
+    landed = _git(tmp_git_repo, "symbolic-ref", "--short", "HEAD").strip()
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    # s only finished once land was done; t never started once the run had landed.
+    assert _task_state(tmp_path, "s") == "done"
+    assert "t" not in workers.attempts
+    assert not (tmp_git_repo / "s.txt").exists()
+    assert _git(tmp_git_repo, "branch", "--list", "node/*") == ""
+    branch = f"{landed}-unmerged/s"
+    assert _git(tmp_git_repo, "show", f"{branch}:s.txt") == "s\n"
+    assert _git(tmp_git_repo, "branch", "--list", f"{landed}-unmerged/t") == ""
+
+    listing = (tmp_git_repo / "UNMERGED_OPTIMIZATIONS.md").read_text()
+    assert f"- Branch: `{branch}`" in listing
+    assert "- Result: DONE: s done" in listing
+    assert "Fuse the MoE." in listing
+    assert "## t\n\n- Branch: none\n- Result: not started\n- Base: s" in listing
+    assert _git(tmp_git_repo, "status", "--porcelain") == ""
+    assert "Signed-off-by:" in _git(tmp_git_repo, "log", "-1", "--format=%B")
+
+
+def test_side_work_still_running_is_stopped_after_the_wait(tmp_path, tmp_git_repo):
+    async def s(agent, prompt, attempt):
+        (agent.cwd / "partial.txt").write_text("half\n")
+        await asyncio.Event().wait()
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _plan_path(prompt).write_text(_plan_text(_SIDE_GRAPH))
+        else:
+            await _finish_once_done("a")(agent, prompt)
+
+    workers = _Workers(s=s)
+    factory = FakeFactory(planner=planner, worker=workers)
+    workflow = _workflow(tmp_path, tmp_git_repo, factory, side_wait_minutes=0.002)
+    landed = _git(tmp_git_repo, "symbolic-ref", "--short", "HEAD").strip()
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert _task_state(tmp_path, "s") == "failed"
+    assert factory.workers("s")[0].closed
+    # What s had done is kept on its branch.
+    assert _git(tmp_git_repo, "show", f"{landed}-unmerged/s:partial.txt") == "half\n"
+    listing = (tmp_git_repo / "UNMERGED_OPTIMIZATIONS.md").read_text()
+    assert "- Result: FAILED: stopped 0.002 minutes after the final task was DONE" in listing
+
+
+def test_side_work_is_merged_after_landing_when_asked(tmp_path, tmp_git_repo):
+    merged = """\
+  - id: a
+    type: new_op
+  - id: s
+    type: perf
+    depends_on: [a]
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+  - id: merge-s
+    type: merge
+    kind: merge
+    depends_on: [land, s]
+  - id: land-2
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [merge-s]
+"""
+    side_only = _SIDE_GRAPH.replace(
+        "  - id: t\n    type: perf\n    depends_on: [s]\n    side: true\n", ""
+    )
+    turns: list[str] = []
+
+    async def s(agent, prompt, attempt):
+        await _until(lambda: "land-2" in Layout(tmp_path / "ws").running_plan_path.read_text())
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _plan_path(prompt).write_text(_plan_text(side_only))
+            return
+        turns.append(prompt)
+        states = _states(prompt)
+        if states.get("land") == "done" and "land-2" not in states:
+            assert "The final task is DONE" in prompt
+            _edit_plan(prompt).write_text(_plan_text(merged))
+            _decide(prompt)
+        else:
+            await _finish_once_done("a")(agent, prompt)
+
+    workers = _Workers(s=s)
+    factory = FakeFactory(planner=planner, worker=workers)
+    workflow = _workflow(tmp_path, tmp_git_repo, factory)
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert workers.order[-1] == "land-2"
+    assert (tmp_git_repo / "s.txt").read_text() == "s\n"
+    (land_2,) = factory.workers("land-2")
+    assert land_2.cwd == tmp_git_repo.absolute() and "final task" in land_2.prompts[0]
+    assert not (tmp_git_repo / "UNMERGED_OPTIMIZATIONS.md").exists()
+    assert _git(tmp_git_repo, "branch", "--list", "*unmerged*") == ""
+
+
+def test_a_cancelled_final_task_leaves_the_checkout_as_it_found_it(tmp_path, tmp_git_repo):
+    with_s = """\
+  - id: a
+    type: new_op
+  - id: s
+    type: perf
+    depends_on: [a]
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a, s]
+"""
+    land_started = asyncio.Event()
+
+    async def land(agent, prompt, attempt):
+        if attempt > 1:
+            return None
+        (agent.cwd / "half.txt").write_text("x\n")
+        _git(agent.cwd, "add", "half.txt")
+        _git(agent.cwd, "commit", "-m", "half-landed")
+        (agent.cwd / "stray.txt").write_text("x\n")
+        land_started.set()
+        await asyncio.Event().wait()
+
+    async def s(agent, prompt, attempt):
+        await land_started.wait()
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _plan_path(prompt).write_text(
+                _plan_text(
+                    _SIDE_GRAPH.replace(
+                        "  - id: t\n    type: perf\n    depends_on: [s]\n    side: true\n", ""
+                    )
+                )
+            )
+            return
+        states = _states(prompt)
+        if states.get("land") == "running" and states.get("s") == "done":
+            _edit_plan(prompt).write_text(_plan_text(with_s))
+            _decide(prompt, cancel=["land"])
+        else:
+            await _finish_once_done("a")(agent, prompt)
+
+    workers = _Workers(s=s, land=land)
+    factory = FakeFactory(planner=planner, worker=workers)
+    workflow = _workflow(tmp_path, tmp_git_repo, factory)
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert workers.attempts["land"] == 2
+    assert (tmp_git_repo / "s.txt").is_file()
+    assert not (tmp_git_repo / "half.txt").exists() and not (tmp_git_repo / "stray.txt").exists()
+    assert "half-landed" not in _git(tmp_git_repo, "log", "--format=%s")

@@ -21,7 +21,7 @@ from agent_flow.orchestration import Node
 from .files import HandoffError, Layout, TaskResult, parse_task_result, read_handoff
 from .prompts import WorkerTask, build_worker_system_prompt, worker_retry_prompt, worker_turn_prompt
 
-__all__ = ["Agent", "AgentFactory", "RunTask", "make_run_task"]
+__all__ = ["Agent", "AgentFactory", "RunTask", "make_run_task", "write_failure"]
 
 
 class Agent(Protocol):
@@ -36,13 +36,14 @@ class Agent(Protocol):
 # substitute scripted agents for real backends.
 AgentFactory = Callable[[str, str, Path, str], Agent]
 
-# ``(node, worktree, tags, is_final) -> result``.
-RunTask = Callable[[Node, Path, tuple[str, ...], bool], Awaitable[TaskResult]]
+# ``(node, worktree, tags, is_final, side) -> result``.
+RunTask = Callable[[Node, Path, tuple[str, ...], bool, bool], Awaitable[TaskResult]]
 
 
-def _write_failure(path: Path, reason: str) -> TaskResult:
+def write_failure(
+    path: Path, reason: str, summary: str = "the worker ended without a valid result file"
+) -> TaskResult:
     """Record a task the worker could not report on, so the planner can see why."""
-    summary = "the worker ended without a valid result file"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"---\nstatus: FAILED\nsummary: {summary}\n---\n\n"
@@ -62,7 +63,7 @@ async def _run_worker(agent: Agent, prompt: str, result_path: Path) -> TaskResul
     try:
         return read_handoff(result_path, parse_task_result)
     except HandoffError as exc:
-        return _write_failure(result_path, str(exc))
+        return write_failure(result_path, str(exc))
 
 
 def make_run_task(
@@ -79,7 +80,9 @@ def make_run_task(
         slurm: Whether ``task.yaml`` carries a ``slurm-environment``.
     """
 
-    async def run_task(node: Node, cwd: Path, tags: tuple[str, ...], is_final: bool) -> TaskResult:
+    async def run_task(
+        node: Node, cwd: Path, tags: tuple[str, ...], is_final: bool, side: bool
+    ) -> TaskResult:
         result_path = layout.result_path(node.id)
         # A result left by an interrupted turn of this same attempt is stale.
         result_path.unlink(missing_ok=True)
@@ -90,6 +93,7 @@ def make_run_task(
             tags=tags,
             worktree=Path(cwd),
             is_final=is_final,
+            side=side,
             task_yaml=layout.task_path,
             plan=layout.plan_path,
             result=result_path,
@@ -109,7 +113,7 @@ def make_run_task(
             return await _run_worker(agent, worker_turn_prompt(task), result_path)
         except Exception as exc:
             # A crashed session fails this task, not the run: the planner decides.
-            return _write_failure(result_path, f"The worker's session raised: {exc!r}")
+            return write_failure(result_path, f"The worker's session raised: {exc!r}")
         finally:
             await agent.__aexit__(None, None, None)
 

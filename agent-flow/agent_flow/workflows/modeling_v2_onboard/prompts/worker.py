@@ -114,6 +114,7 @@ class WorkerTask:
         worktree: Where the worker edits code.
         is_final: Whether this is the run's final task (its worktree is the
             TensorRT-LLM checkout).
+        side: Whether the task is ``side`` work, which the run does not merge.
         task_yaml: The user's task spec.
         plan: ``plan.md``.
         result: The result file to write.
@@ -136,6 +137,7 @@ class WorkerTask:
     jobs: Path
     previous_attempts: tuple[Path, ...] = ()
     test_commands: Path | None = None
+    side: bool = False
 
 
 def worker_turn_prompt(task: WorkerTask) -> str:
@@ -156,6 +158,15 @@ def worker_turn_prompt(task: WorkerTask) -> str:
             "",
             "This is the run's **final task**: your worktree is the TensorRT-LLM "
             "checkout itself, and what you commit is what the run delivers.",
+        ]
+    if task.side:
+        lines += [
+            "",
+            "This is a **side task**: the run does not merge your branch unless a "
+            "human asks for it. The branch is kept and listed, with your result's "
+            "`summary`, for a human to decide on, so make the `summary` say what you "
+            "changed, the speedup you measured and at which shapes, and its effect on "
+            "accuracy.",
         ]
     if task.upstream_results:
         lines += ["", "Upstream tasks (their branches were merged into your worktree):"]

@@ -84,16 +84,28 @@ class PlanSpec:
         text: The plan.md text this spec was parsed from.
         priorities: Each task's GPU priority class (one of :data:`PRIORITIES`).
             Not part of a task's definition: changing it never re-runs a task.
+        side: The ``side`` tasks: ``perf`` work whose branch the run does not
+            merge, listed for a human when the run ends. Not part of a task's
+            definition either: a task moves in and out of it without re-running.
     """
 
     graph: ExecutionGraph
     tags: Mapping[str, tuple[str, ...]]
     text: str
     priorities: Mapping[str, str]
+    side: frozenset[str] = frozenset()
 
     def sink_id(self) -> str:
-        """The id of the plan's single final task."""
-        return _sinks(self.graph)[0]
+        """The id of the plan's final task, the one every task but the side ones leads to."""
+        return _sinks(self.graph, self.side)[0]
+
+    def section(self, node_id: str) -> str | None:
+        """The body of task ``node_id``'s ``###`` section."""
+        return _section(self.text, node_id)
+
+    def is_landing(self, node_id: str) -> bool:
+        """Whether task ``node_id`` runs in the checkout and lands what it commits."""
+        return self.graph.by_id[node_id].isolation == "shared"
 
     def entry(self, node_id: str) -> tuple[object, ...]:
         """Everything that defines task ``node_id``: its graph entry and its section."""
@@ -104,7 +116,7 @@ class PlanSpec:
             node.kind,
             node.isolation,
             self.tags[node_id],
-            _section(self.text, node_id),
+            self.section(node_id),
         )
 
 
@@ -132,9 +144,12 @@ def _graph_block(text: str) -> str | None:
     return None
 
 
-def _sinks(graph: ExecutionGraph) -> list[str]:
-    depended_on = {dep for node in graph.nodes for dep in node.depends_on}
-    return [node.id for node in graph.nodes if node.id not in depended_on]
+def _sinks(graph: ExecutionGraph, side: Iterable[str] = ()) -> list[str]:
+    """The tasks outside ``side`` that no task outside ``side`` depends on."""
+    side = set(side)
+    main = [node for node in graph.nodes if node.id not in side]
+    depended_on = {dep for node in main for dep in node.depends_on}
+    return [node.id for node in main if node.id not in depended_on]
 
 
 def _raw_field(block: str, key: str) -> dict[str, object]:
@@ -223,6 +238,70 @@ def _section(text: str, node_id: str) -> str | None:
     return (body[: end.start()] if end else body).strip()
 
 
+def _side_tasks(
+    graph: ExecutionGraph,
+    tags: Mapping[str, tuple[str, ...]],
+    raw: Mapping[str, object],
+    problems: list[str],
+) -> frozenset[str]:
+    """The tasks marked ``side: true``, checked against the rules for them."""
+    side: set[str] = set()
+    for node_id, value in raw.items():
+        if node_id not in tags or value is None or value is False:
+            continue
+        if value is not True:
+            problems.append(f"task {node_id!r}: `side` must be true or false, got {value!r}")
+        elif "perf" not in tags[node_id] or "merge" in tags[node_id]:
+            problems.append(
+                f"task {node_id!r}: only a `perf` task that is not a `merge` task can be `side`"
+            )
+        elif graph.by_id[node_id].isolation == "shared":
+            problems.append(f"task {node_id!r}: a `side` task cannot take `isolation: shared`")
+        else:
+            side.add(node_id)
+    for node in graph.nodes:
+        on_side = [dep for dep in node.depends_on if dep in side]
+        if node.id not in side and on_side:
+            problems.append(
+                f"task {node.id!r} depends on side task(s) {on_side}; a side branch is never "
+                "merged into the main line — drop `side` from a task to merge it"
+            )
+    return frozenset(side)
+
+
+def _check_landing(
+    graph: ExecutionGraph,
+    tags: Mapping[str, tuple[str, ...]],
+    side: frozenset[str],
+    problems: list[str],
+) -> None:
+    """Check the final task and the chain of tasks that land in the checkout."""
+    sinks = _sinks(graph, side)
+    if len(sinks) != 1:
+        problems.append(
+            f"the graph must end in exactly one final task that every task but the "
+            f"`side` ones leads to; found {len(sinks)}: {sinks}"
+        )
+    shared = [node.id for node in graph.nodes if node.isolation == "shared"]
+    if len(sinks) == 1 and sinks[0] not in shared:
+        problems.append(
+            f"the final task {sinks[0]!r} must take `isolation: shared`, which lands the "
+            f"result in the TensorRT-LLM checkout; found shared tasks {shared}"
+        )
+    for node_id in shared:
+        if "merge" not in tags[node_id]:
+            problems.append(f"the shared task {node_id!r} must be tagged `merge`")
+    ancestors = {node_id: _ancestors(graph, node_id) for node_id in shared}
+    chain = sorted(shared, key=lambda node_id: len(ancestors[node_id]))
+    for earlier, later in zip(chain, chain[1:]):
+        if earlier not in ancestors[later]:
+            problems.append(
+                f"shared tasks {earlier!r} and {later!r} would land side by side; each "
+                "task that takes `isolation: shared` must depend, directly or not, on the "
+                "one before it"
+            )
+
+
 def parse_plan(
     text: str,
     *,
@@ -282,20 +361,8 @@ def parse_plan(
         if not _has_task_section(text, node.id):
             problems.append(f"task {node.id!r} has no `### {node.id}` section describing it")
 
-    sinks = _sinks(graph)
-    shared = [node.id for node in graph.nodes if node.isolation == "shared"]
-    if len(sinks) != 1:
-        problems.append(
-            f"the graph must end in exactly one final task that every other task leads "
-            f"to; found {len(sinks)}: {sinks}"
-        )
-    if len(shared) != 1 or shared != sinks[:1]:
-        problems.append(
-            "exactly one task — the final one — takes `isolation: shared`, which lands "
-            f"the result in the TensorRT-LLM checkout; found shared tasks {shared}"
-        )
-    elif "merge" not in tags[shared[0]]:
-        problems.append(f"the final task {shared[0]!r} must be tagged `merge`")
+    side = _side_tasks(graph, tags, _raw_field(block, "side"), problems)
+    _check_landing(graph, tags, side, problems)
 
     priorities = default_priorities(graph, tags)
     for node_id, value in raw_priorities.items():
@@ -306,9 +373,13 @@ def parse_plan(
                 f"task {node_id!r}: `priority` must be one of {', '.join(PRIORITIES)}, "
                 f"got {value!r}"
             )
+        elif node_id in side and value != "perf":
+            problems.append(f"task {node_id!r} is `side`, so its `priority` is perf")
         else:
             priorities[node_id] = value
-    spec = PlanSpec(graph=graph, tags=tags, text=text, priorities=priorities)
+    for node_id in side:
+        priorities[node_id] = "perf"
+    spec = PlanSpec(graph=graph, tags=tags, text=text, priorities=priorities, side=side)
     if previous is not None and states is not None:
         for node_id, state in states.items():
             frozen = state in (NodeState.DONE, NodeState.RUNNING)

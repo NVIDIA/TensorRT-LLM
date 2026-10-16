@@ -202,6 +202,8 @@ block with a flat `nodes:` list. Each node is a task:
   `accuracy`, other `perf`-tagged tasks are `perf`, and the rest is
   `feature`. Change it whenever the situation
   does; it never re-runs a task.
+- `side: true` — a `perf` task whose branch the run does not merge (see Side
+  tasks). Set or drop it on a task in any state; it never re-runs a task.
 - `depends_on` — the tasks that must finish first. **A task starts from the
   merged code of the tasks it depends on**; this is the only way code reaches
   a task. Depend on a task only when you need its code or its result.
@@ -210,15 +212,17 @@ block with a flat `nodes:` list. Each node is a task:
 - `kind: merge` — exactly on tasks tagged `merge`. **A task that depends on
   two or more tasks must be tagged `merge`**: joining branches can conflict,
   and a merge worker is briefed to resolve that.
-- `isolation: shared` — exactly one task, the **final** one, which every
-  other task leads to. It runs in the TensorRT-LLM checkout itself and its
-  commits are what the run delivers. Make it a `merge` task that only lands
-  verified work: do the verifying in the tasks before it.
+- `isolation: shared` — the **final** task, which every task but the `side`
+  ones leads to. It runs in the TensorRT-LLM checkout itself and its commits
+  are what the run delivers. Make it a `merge` task that only lands verified
+  work: do the verifying in the tasks before it. Only to merge more after it
+  is `DONE` does another task take `isolation: shared`: it depends on the
+  final task and becomes the new final task (see Side tasks).
 
-The final task does not start until you decide `FINISH`, and the run ends
-when it is `DONE`. Before it, the plan must contain the tasks that prove
-`completion_criteria` — typically an `e2e_accuracy` task on the fully joined
-code just before the final one.
+A shared task does not start until you decide `FINISH`, and the run ends
+once the final task is `DONE` and nothing else is left to run. Before it, the
+plan must contain the tasks that prove `completion_criteria` — typically an
+`e2e_accuracy` task on the fully joined code just before the final one.
 
 Shape of a typical plan:
 
@@ -284,9 +288,47 @@ work of kind 1.
   not by its tag: a `new_op` the first target needs is `accuracy`. A running
   task keeps its slot, so a long `perf` task holds one until it ends; the
   order of tasks in the graph only breaks ties within a class.
-- **Everything still reaches the final task.** Feature and performance
-  branches join the main line through `merge` tasks, and an `e2e_accuracy`
-  task on the joined code runs after the last of them, before the final task.
+- **Everything but side work reaches the final task.** Feature and
+  performance branches join the main line through `merge` tasks, and an
+  `e2e_accuracy` task on the joined code runs after the last of them, before
+  the final task.
+
+## Side tasks: performance work the run does not merge
+
+Once the goal is met, every merge stretches the serial tail of the run:
+joining, re-verifying, fixing what the combination breaks. Performance work
+that is still in flight then goes on **beside** the main line instead.
+
+- **When every goal in `task.yaml` is met** — each `completion_criteria` item
+  proven on the main line, every feature it asks for done — mark `side: true`
+  on every `perf` task whose branch has not been merged yet (no `DONE` task
+  depends on it), and drop those tasks from the `depends_on` of the merge
+  tasks that have not started. The main line is then only what is already
+  verified: join it, gate it, `FINISH`.
+- **Keep the free slots busy with side work** until the final task is `DONE`:
+  new `perf` tasks marked `side: true`, built on the latest merged code (they
+  depend on the newest `DONE` merge task). Side tasks only take slots and GPUs
+  the main line leaves free.
+- A side task's definition of done asks its result `summary` for the change,
+  the speedup measured and at which shapes, and the effect on accuracy: when
+  the run ends, its branch is kept as `<landed branch>-unmerged/<id>` and that
+  summary is listed for a human in `UNMERGED_OPTIMIZATIONS.md` in the
+  checkout.
+- No task but another side task may depend on a side task. Side tasks not
+  started when the final task is `DONE` never start; running ones get a
+  limited time to finish.
+- **A human asking to keep optimizing, or to merge a side result, undoes
+  this.** Drop `side` from the tasks they name (from all of them if they name
+  none), and merge them like any other work:
+  - final task not started: join them through a `merge` task and an
+    `e2e_accuracy` gate, and make the final task depend on the gate;
+  - final task running: also list it under `cancel`; its changes to the
+    checkout are undone and it starts again once the new gate is `DONE`;
+  - final task `DONE`: add a `merge` task that depends on the final task and
+    on the work to merge (it starts from the landed code), an
+    `e2e_accuracy` gate on it, and a new `merge` task with
+    `isolation: shared` after the gate. That task lands the result and is the
+    new final task.
 
 ## Each turn
 
@@ -311,7 +353,7 @@ What you may change depends on each task's state:
 
 | state | what you may do |
 |---|---|
-| `DONE` | nothing: its graph entry and its section are fixed and it stays in the plan. Follow-up work on finished code is a new task that depends on it. |
+| `DONE` | nothing but its `priority` and `side`: its graph entry and its section are fixed and it stays in the plan. Follow-up work on finished code is a new task that depends on it. |
 | `RUNNING` | nothing, unless you list it under `cancel`: it is stopped, its branch is dropped, and it starts over from its (possibly rewritten) definition, or goes away if you remove it. Cancel only work that has become wrong or useless. |
 | `FAILED` | rewrite it (it re-runs from scratch on a fresh branch), list it under `retry` to re-run it unchanged, or remove it. Until you do one of these, it stays `FAILED` and every task depending on it waits. Its result, and every earlier attempt, stays available to the next attempt. |
 | `PENDING` | anything: rewrite, rewire, remove. |
@@ -336,11 +378,11 @@ cancel: []           # RUNNING tasks to stop
 ```
 
 - `CONTINUE` — keep going.
-- `FINISH` — let the final task start as soon as all of its dependencies are
-  `DONE`. Decide it when the plan already holds every task the run should
-  do: the tasks that prove each `completion_criteria` item and the
-  performance work worth doing. You keep being woken until the final task
-  is done and can still add tasks before it starts.
+- `FINISH` — let shared tasks start as soon as all of their dependencies are
+  `DONE`. Decide it when the main line holds every task the run should
+  merge: the tasks that prove each `completion_criteria` item and the
+  performance work worth merging; the rest is side work. You keep being
+  woken until the run ends and can still add tasks.
 - `ABORT` — stop the run now, only when the goal cannot be reached at all (a
   computation with no implementable server anywhere, an anchor that cannot
   exist), with the evidence. Running workers are stopped and every branch is
@@ -367,7 +409,9 @@ cancel: []           # RUNNING tasks to stop
 | "This shared-code change should be proven harmless for other models" / "Add a regression test so the fix can go upstream" | Not a completion criterion and nobody asked. It holds up landing; fill the slot with perf work instead. |
 | "A worker found a bug in another model / an unused engine path; check whether it is real" | It does not affect delivering this model. Append it to `issues.md` and add no task for it. |
 | "The human's request conflicts with my plan" | The human's request wins. Do it this turn and say how in the summary. |
-| "FINISH now; perf tasks can come later" | Nothing comes after the final task. Add the work first, then `FINISH`. |
+| "FINISH now; perf tasks can come later" | Perf work not merged before the final task stays on side branches. Merge what should ship first, then `FINISH`. |
+| "The goal is met, but one more perf merge first" | Mark the unmerged perf tasks `side` and land. The human decides what else to merge. |
+| "The human asked to keep optimizing, but the run already landed" | Drop `side`, merge the work after the final task and land it with a new shared task. |
 """
 
 
@@ -417,6 +461,8 @@ def planner_turn_prompt(
     resumed: bool,
     rejected: Sequence[str],
     feedback: Sequence[str] = (),
+    delivered: bool = False,
+    side_wait_minutes: float = 60,
 ) -> str:
     """One planner turn while the workers run.
 
@@ -438,6 +484,8 @@ def planner_turn_prompt(
         rejected: Problems that made the orchestrator discard the previous
             turn's changes.
         feedback: Messages from the human, oldest first.
+        delivered: The final task is DONE.
+        side_wait_minutes: How long side tasks may still run once it is.
     """
     lines: list[str] = []
     if feedback:
@@ -465,6 +513,16 @@ def planner_turn_prompt(
             for tid, status, summary, path in finished
         ]
         lines.append("")
+    if delivered:
+        lines += [
+            "**The final task is DONE: its commits are delivered.** Side tasks still "
+            f"running get up to {side_wait_minutes:g} minutes from then to finish; side "
+            "tasks not started will not start. The run ends when nothing is left to run. "
+            "To merge a side task now, drop its `side` and add, after the final task, a "
+            "new `isolation: shared` merge task that depends on the final task and on "
+            "the work to merge (see Side tasks).",
+            "",
+        ]
     if stalled:
         lines += [
             "**The run is stalled: nothing is running and nothing can start.** Retry, "

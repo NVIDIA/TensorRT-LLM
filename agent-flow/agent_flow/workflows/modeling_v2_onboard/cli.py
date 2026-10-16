@@ -80,6 +80,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=8,
         help="The most workers that run at the same time (default: 8).",
     )
+    parser.add_argument(
+        "--side-wait-minutes",
+        type=float,
+        default=60,
+        help="Once the final task is done, how long side tasks still running may take to "
+        "finish before they are stopped (default: 60).",
+    )
     message = parser.add_mutually_exclusive_group()
     message.add_argument(
         "--feedback",
@@ -101,6 +108,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.max_parallel < 1:
         parser.error("--max-parallel must be at least 1")
+    if args.side_wait_minutes < 0:
+        parser.error("--side-wait-minutes cannot be negative")
     leaving_message = args.feedback is not None or args.feedback_file is not None
     if leaving_message and args.clean:
         parser.error("--feedback cannot be combined with --clean")
@@ -130,6 +139,7 @@ def main(argv: list[str] | None = None) -> None:
             task_data=task_data,
             agent_factory=make_agent_factory(args.backend, args.model),
             max_parallel=args.max_parallel,
+            side_wait_minutes=args.side_wait_minutes,
         )
         if args.clean:
             workflow.clean()

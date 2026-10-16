@@ -271,3 +271,125 @@ def test_a_perf_task_on_the_way_to_the_first_gate_is_accuracy():
         "tune": "perf",
         "land": "feature",
     }
+
+
+_SIDE_NODES = """\
+  - id: a
+    type: new_op
+  - id: s
+    type: perf
+    depends_on: [a]
+    side: true
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+"""
+
+
+def test_a_side_task_does_not_lead_to_the_final_task():
+    spec = parse_plan(_plan(_SIDE_NODES, ["a", "s", "land"]))
+    assert spec.side == {"s"}
+    assert spec.sink_id() == "land"
+    assert spec.priorities["s"] == "perf"
+    # Without `side`, s would be a second final task.
+    unmarked = _SIDE_NODES.replace("    side: true\n", "")
+    assert any(
+        "exactly one final task" in p for p in _problems(_plan(unmarked, ["a", "s", "land"]))
+    )
+
+
+def test_side_is_only_for_perf_work_off_the_main_line():
+    nodes = """\
+  - id: a
+    type: new_op
+    side: true
+  - id: s
+    type: perf
+    side: yes please
+  - id: t
+    type: perf
+    side: true
+    priority: accuracy
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a, s, t]
+"""
+    problems = _problems(_plan(nodes, ["a", "s", "t", "land"]))
+    assert problems == [
+        "task 'a': only a `perf` task that is not a `merge` task can be `side`",
+        "task 's': `side` must be true or false, got 'yes please'",
+        "task 'land' depends on side task(s) ['t']; a side branch is never merged into "
+        "the main line — drop `side` from a task to merge it",
+        "task 't' is `side`, so its `priority` is perf",
+    ]
+
+
+def test_side_can_change_on_a_done_or_running_task():
+    previous = parse_plan(_plan(_SIDE_NODES, ["a", "s", "land"]))
+    unmarked = """\
+  - id: a
+    type: new_op
+  - id: s
+    type: perf
+    depends_on: [a]
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a, s]
+"""
+    for state in (NodeState.DONE, NodeState.RUNNING):
+        states = {"a": NodeState.DONE, "s": state, "land": NodeState.PENDING}
+        spec = parse_plan(_plan(unmarked, ["a", "s", "land"]), previous=previous, states=states)
+        assert spec.side == frozenset()
+
+
+def test_landing_tasks_may_chain_after_the_final_task():
+    chained = """\
+  - id: a
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+  - id: more
+    type: merge
+    kind: merge
+    depends_on: [land, a]
+  - id: land-2
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [more]
+"""
+    assert parse_plan(_plan(chained, ["a", "land", "more", "land-2"])).sink_id() == "land-2"
+
+    side_by_side = """\
+  - id: a
+    type: new_op
+  - id: early
+    type: merge
+    kind: merge
+    isolation: shared
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+  - id: join
+    type: merge
+    kind: merge
+    depends_on: [early, land]
+  - id: last
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [join]
+"""
+    problems = _problems(_plan(side_by_side, ["a", "early", "land", "join", "last"]))
+    assert len(problems) == 1 and "would land side by side" in problems[0]
