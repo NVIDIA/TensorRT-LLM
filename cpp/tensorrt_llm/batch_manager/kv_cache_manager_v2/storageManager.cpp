@@ -739,14 +739,13 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
-void StorageManager::initializeColdSlot(LifeCycleId lc, CacheLevel level, SlotId slotId)
+void StorageManager::initializeColdSlot(LifeCycleId lc, CacheLevel level, Slot& destination)
 {
     TLLM_CHECK(level != kHotLevel);
     PoolGroupIndex const hotGroup = getPoolGroupIndex(kHotLevel, lc);
-    auto source = poolGroup(kHotLevel, hotGroup).allocate();
+    auto slots = newSlotsForPoolGroup(kHotLevel, hotGroup, 1);
+    auto source = std::move(slots.front());
     auto releaseSource = FuncGuard([&]() { releaseSlot(lc, kHotLevel, std::move(source)); });
-    auto destination = allocateSlotAt(lc, level, slotId);
-    auto releaseDestination = FuncGuard([&]() { releaseSlot(lc, level, std::move(destination)); });
     TemporaryCudaStream stream({source.readyEvent.handle(), destination.readyEvent.handle()});
     auto finish = FuncGuard(
         [&]()
@@ -1150,7 +1149,7 @@ LayerGroupId StorageManager::getMigrationBatchingLayerGroupId(
 
 std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder,
-    bool defrag, std::vector<Slot>* reservedSlots)
+    bool defrag)
 {
     TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     if (srcPages.empty())
@@ -1182,10 +1181,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
 
-    if (!reservedSlots && dstPoolGroup.numFreeSlots() < numSlots)
+    if (dstPoolGroup.numFreeSlots() < numSlots)
         throw OutOfPagesError("Not enough free slots for migration");
 
-    auto dstSlots = reservedSlots ? std::move(*reservedSlots) : dstPoolGroup.allocateMultiple(numSlots);
+    auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
     // A15: allocated slot count must match the request.
     TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
     try
@@ -1279,69 +1278,6 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             }
         }
         throw;
-    }
-}
-
-Slot StorageManager::allocateSlotAt(LifeCycleId lifeCycle, CacheLevel level, SlotId slotId)
-{
-    return poolGroup(level, getPoolGroupIndex(level, lifeCycle)).slotAllocator().allocateAt(slotId);
-}
-
-void StorageManager::restorePageLocations(std::vector<PageLocation> const& locations)
-{
-    std::map<std::tuple<CacheLevel, CacheLevel, LayerGroupId>, std::vector<PageLocation const*>> groups;
-    auto reschedule = FuncGuard(
-        [&]()
-        {
-            for (auto const& location : locations)
-            {
-                auto& page = *location.page;
-                if (!page.scheduledForEviction() && isEvictable(page))
-                {
-                    scheduleForEviction(page);
-                }
-            }
-        });
-    for (auto const& location : locations)
-    {
-        auto& page = *location.page;
-        if (page.scheduledForEviction())
-        {
-            excludeFromEviction(page);
-        }
-        if (page.cacheLevel != location.level || page.slotId() != location.slotId)
-        {
-            groups[{location.level, page.cacheLevel,
-                       getMigrationBatchingLayerGroupId(location.level, page.cacheLevel, page.lifeCycle)}]
-                .push_back(&location);
-        }
-    }
-    for (auto& [key, group] : groups)
-    {
-        auto const [dstLevel, srcLevel, layerGroup] = key;
-        std::sort(group.begin(), group.end(),
-            [](auto const* left, auto const* right) { return left->slotId < right->slotId; });
-        std::vector<SharedPtr<Page>> pages;
-        std::vector<Slot> slots;
-        pages.reserve(group.size());
-        slots.reserve(group.size());
-        auto releaseSlots = FuncGuard(
-            [&]()
-            {
-                for (auto& slot : slots)
-                {
-                    if (slot.hasValidSlot())
-                    {
-                        poolGroup(dstLevel, getPoolGroupIndex(dstLevel, layerGroup)).release(std::move(slot));
-                    }
-                }
-            });
-        for (auto const* location : group)
-        {
-            pages.push_back(location->page);
-            slots.push_back(allocateSlotAt(location->page->lifeCycle, dstLevel, location->slotId));
-        }
-        _batchedMigrate(dstLevel, srcLevel, pages, /*updateSrc=*/true, {}, /*defrag=*/false, &slots);
     }
 }
 

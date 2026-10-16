@@ -289,14 +289,16 @@ those pages in the configured tiers fails the sleep operation.
 
 Sleep drains user requests before changing memory. Internal padding requests
 retain their native cache identities, logical state, and metadata buffers. Wakeup
-restores their original GPU page slots, including SSM state and SWA scratch slots,
-before resuming them. GPU pool virtual addresses remain reserved throughout
-sleep. Both hot and cold GPU pools release their physical backing and recover
-their capacities on wakeup. Encoded cold pages retain their representation when
-moved from GPU to host. Discard modes also release HOST pool mappings without
-migrating their contents to disk; independent disk staging buffers are retained.
-HOST mappings may change address and are restored before cache pages. Sleeping registered V2 KV memory used by a cache
-transceiver is unsupported.
+resumes them through normal page and scratch allocation and refreshes their KV
+and SSM indices before execution. Slot IDs may change; CUDA graphs consume the
+updated indices through stable metadata buffers. GPU pool virtual addresses
+remain reserved throughout sleep. Both hot and cold GPU pools release their
+physical backing and recover their capacities on wakeup. Encoded cold pages retain
+their representation when moved from GPU to host. Discard modes also release HOST
+pool mappings without migrating their contents to disk; independent disk staging
+buffers are retained. HOST mappings may change address and are restored before
+cache pages. Sleeping registered V2 KV memory used by a cache transceiver is
+unsupported.
 
 ### Partial Reuse
 

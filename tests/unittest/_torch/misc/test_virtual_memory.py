@@ -296,16 +296,6 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
                                        is_gen=True,
                                        max_beam_width=2)[0]
         index = mgr.index_mapper.get_index(dummy.py_request_id)
-        original_indices = [
-            list(mgr.kv_cache_map[dummy.py_request_id].get_base_page_indices(
-                lg, beam)) for lg in range(len(mgr.impl.layer_grouping))
-            for beam in range(2)
-        ]
-        original_page_addresses = [
-            mgr.get_buffers(0)[page].data_ptr()
-            for page in mgr.get_batch_cache_indices([dummy.py_request_id],
-                                                    layer_idx=0)[0]
-        ]
     for cycle in range(2):
         for buffer in buffers:
             buffer.fill_(cycle + 1)
@@ -350,16 +340,6 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
             cache = mgr.kv_cache_map[dummy.py_request_id]
             assert cache.is_active
             assert cache is old_cache
-            assert [
-                list(cache.get_base_page_indices(lg, beam))
-                for lg in range(len(mgr.impl.layer_grouping))
-                for beam in range(2)
-            ] == original_indices
-            assert [
-                mgr.get_buffers(0)[page].data_ptr()
-                for page in mgr.get_batch_cache_indices([dummy.py_request_id],
-                                                        layer_idx=0)[0]
-            ] == original_page_addresses
             assert (cache.capacity, cache.history_length, cache.beam_width,
                     cache.is_decoding) == old_shape
             # Shared prompt blocks use beam 0 via cache indirection; the writable tail has both beams.
@@ -493,22 +473,33 @@ def test_cuda_graph(process_gpu_memory_info_available, restore_mode):
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
             dtype=tensorrt_llm.bindings.DataType.FLOAT,
         )
+        hole = manager.add_dummy_requests([122], token_nums=[4], is_gen=True)[0]
         dummy = manager.add_dummy_requests([123], token_nums=[4],
                                            is_gen=True)[0]
+        manager.free_resources(hole)
         page = manager.get_batch_cache_indices([dummy.py_request_id],
                                                layer_idx=0)[0][0]
-        static_input = manager.get_buffers(0)[page].view(-1)[:1024]
-        input_address = static_input.data_ptr()
-        static_output = torch.zeros_like(static_input)
+        kv_pool = manager.get_buffers(0)
+        pool_address = kv_pool.data_ptr()
+        block_offsets = torch.zeros(
+            (manager.num_attention_op_pools, 1, 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda")
+        manager.copy_batch_block_offsets(block_offsets, [dummy.py_request_id],
+                                         1, 0, 1)
+        static_output = torch.zeros(1024, dtype=kv_pool.dtype, device="cuda")
         resource = SimpleNamespace(
             release_memory=lambda tags: manager.release_memory(restore_mode),
             materialize_memory=lambda tags: manager.materialize_memory(),
         )
 
         with torch.cuda.graph(g):
+            # Attention offsets index individual K/V pages, while get_buffers groups them by slot.
+            static_input = kv_pool.flatten(0, 1).index_select(
+                0, block_offsets[0, 0, 0, :1].long()).view(-1)[:1024]
             static_output.copy_(work(static_input))
 
-    torch.fill_(static_input, 1.0)
+    kv_pool[page].fill_(1.0)
     g.replay()
 
     torch.cuda.synchronize()
@@ -527,14 +518,23 @@ def test_cuda_graph(process_gpu_memory_info_available, restore_mode):
     virtual_memory.materialize_with_tag(tag, resource=resource)
     restored_page = manager.get_batch_cache_indices([dummy.py_request_id],
                                                     layer_idx=0)[0][0]
-    assert manager.get_buffers(0)[restored_page].data_ptr() == input_address
+    assert manager.get_buffers(0).data_ptr() == pool_address
+    # The freed hole forces this test through the changed-slot path.
+    assert restored_page != page
+    manager.copy_batch_block_offsets(block_offsets, [dummy.py_request_id], 1, 0,
+                                     1)
 
-    torch.fill_(static_input, 1.0)
+    if restore_mode == virtual_memory.RestoreMode.CPU:
+        assert torch.all(kv_pool[restored_page] == 1.0)
+    else:
+        assert torch.all(kv_pool[restored_page] == 0.0)
+    kv_pool[page].fill_(7.0)
+    kv_pool[restored_page].fill_(1.0)
     torch.fill_(static_output, 0.0)
     g.replay()
 
     torch.cuda.synchronize()
     assert static_output[0].item() == 3.0
 
-    del static_input, static_output, g, pool
+    del static_input, static_output, block_offsets, kv_pool, g, pool
     manager.shutdown()

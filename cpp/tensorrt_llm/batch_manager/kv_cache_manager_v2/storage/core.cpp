@@ -118,43 +118,6 @@ Slot SlotAllocator::allocate()
     return slot;
 }
 
-Slot SlotAllocator::allocateAt(SlotId slotId)
-{
-    if (shrinkInProgress() || !isValidSlotId(slotId) || mOccupiedMask.get(toSizeT(slotId)))
-    {
-        throw LogicError("SlotAllocator::allocateAt: requested slot is unavailable");
-    }
-    scrubEvents();
-    Slot slot;
-    if (slotId >= SlotId{mNumActiveSlots})
-    {
-        while (slotId > SlotId{mNumActiveSlots})
-        {
-            // Publish each hole only after deque allocation succeeds.
-            mRecycledSlots.emplace_back();
-            mRecycledSlots.back().setSlotId(SlotId{mNumActiveSlots++});
-        }
-        slot.setSlotId(SlotId{mNumActiveSlots++});
-    }
-    else
-    {
-        auto const it = mRecycledSlots.back().slotId() == slotId
-            ? std::prev(mRecycledSlots.end())
-            : std::find_if(mRecycledSlots.begin(), mRecycledSlots.end(),
-                [slotId](Slot const& recycled) { return recycled.slotId() == slotId; });
-        TLLM_CHECK(it != mRecycledSlots.end());
-        if (std::distance(mRecycledSlots.begin(), it) < mNumReadyRecycledSlots)
-        {
-            --mNumReadyRecycledSlots;
-        }
-        slot = std::move(*it);
-        mRecycledSlots.erase(it);
-    }
-    mOccupiedMask.set(toSizeT(slotId));
-    TLLM_CHECK_DEBUG(check());
-    return slot;
-}
-
 std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
 {
     if (numSlots < 0)

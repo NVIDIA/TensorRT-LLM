@@ -119,12 +119,10 @@ types/config/exceptions
   pages. HOST mappings may move on restore; GPU virtual addresses remain fixed.
   Storage restores HOST pools before materializing cache pages and retains saved
   capacities until every pool has been restored, allowing allocation retries.
-  The manager captures GPU page locations and scratch slot order before suspending
-  active caches. Wakeup reacquires those exact slots before any cache resumes;
-  preserving modes use the existing codec migration path to restore page contents.
-  Pool VA plus slot offset, including SSM and scratch, therefore stays stable for
-  active padding requests across sleep. These are native resource locations,
-  not a second copy of request state.
+  Wakeup uses ordinary page allocation and codec migration, with scratch slots
+  acquired by resume. Slot IDs may change. Consumers must refresh their KV and SSM
+  indices before execution; CUDA graphs read updated indices through stable
+  metadata buffers while GPU pool virtual addresses remain reserved.
 
 `commit()` finalizes full blocks. Its `isEnd=true` form is a terminal-memory
 contract: later writes to the request's KV memory are invalid, because final

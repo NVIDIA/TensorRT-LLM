@@ -125,12 +125,12 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
-    //! Suspend living caches and release GPU backing while retaining their original slot locations.
+    //! Suspend living caches and release GPU backing while retaining their logical state.
     //! Discard also releases HOST backing, invalidates reusable blocks, and releases stats-excluded cache pages in
     //! place.
     void releaseGpuMemory(bool discard = false);
 
-    //! Restore HOST/GPU backing and original GPU page/scratch slots, leaving living caches suspended.
+    //! Restore HOST/GPU backing and discarded pages, leaving living caches suspended. Slot IDs may change.
     void materializeGpuMemory(bool zero = false);
 
     // ---- KvCache creation -------------------------------------------------
@@ -446,16 +446,7 @@ private:
     //! Engaged after GPU backing is restored, until all released request pages are materialized.
     std::optional<bool> mMaterializingGpuMemory;
 
-    struct SleepingPageLocation
-    {
-        WeakPtr<Page> page;
-        CacheLevel level;
-        SlotId slotId;
-    };
-
-    std::vector<SleepingPageLocation> mSleepingPageLocations;
     bool mSleepRestorePending = false;
-    bool mReleasedPagesInitialized = false;
 
     // Moving averages used for ratio rebalancing.
     MovingAverage mAvgReusedLength;

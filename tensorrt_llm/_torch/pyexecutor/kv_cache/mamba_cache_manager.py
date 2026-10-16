@@ -4423,6 +4423,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 )
             self.prev_num_accepted_tokens[slot] = 0
 
+    def materialize_memory(self) -> None:
+        super().materialize_memory()
+        if self.local_num_mamba_layers == 0:
+            return
+        # Padding requests survive sleep without going through prepare_resources().
+        # Refresh their indices before metadata preparation uploads them for graph replay.
+        # This refresh can be retried after base materialization has completed.
+        request_ids = [
+            request_id for request_id, cache in self.kv_cache_map.items()
+            if cache.is_active and request_id in self._request_id_to_state_index
+        ]
+        new_slots = [
+            self.kv_cache_map[request_id].get_ssm_block_base_index(
+                self.ssm_layer_group_id) for request_id in request_ids
+        ]
+        old_slots = [
+            self._request_id_to_state_index[request_id]
+            for request_id in request_ids
+        ]
+        if old_slots == new_slots:
+            return
+        if self.use_kda_replay_update:
+            with torch.cuda.stream(self._stream):
+                self._relocate_kda_replay_slots(old_slots, new_slots)
+            self._stream.synchronize()
+        self._request_id_to_state_index.update(zip(request_ids, new_slots))
+
     def add_dummy_requests(
         self,
         request_ids: List[int],

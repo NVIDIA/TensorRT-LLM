@@ -61,6 +61,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
@@ -2394,6 +2395,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
     enable_kv_pool_rebalance=False,
+    host_cache_size=None,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2408,6 +2410,7 @@ def _build_v2_hybrid_with_mamba_layer(
         )
     kv_cache_config = KvCacheConfig(
         max_tokens=512,
+        host_cache_size=host_cache_size,
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=enable_partial_reuse,
         block_reuse_config=BlockReuseConfig(
@@ -3483,8 +3486,13 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
 
 
 @skip_no_cuda
-def test_v2_hybrid_mamba_state_views_use_logical_slots():
-    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
+@pytest.mark.parametrize(
+    "restore_mode", [None, RestoreMode.NONE, RestoreMode.MEMSET, RestoreMode.CPU]
+)
+def test_v2_hybrid_mamba_state_views_use_logical_slots(restore_mode):
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4, num_mamba_layers=2, host_cache_size=16 << 20
+    )
     try:
         assert len(mgr.all_ssm_states) == 2
         assert len(mgr.all_conv_states) == 2
@@ -3523,9 +3531,25 @@ def test_v2_hybrid_mamba_state_views_use_logical_slots():
                 // conv_scale
             )
 
+        hole = mgr.add_dummy_requests([122], token_nums=[8], is_gen=False)[0]
         mgr.add_dummy_requests([123, 456], token_nums=[8, 8], is_gen=False)
+        mgr.free_resources(hole)
         indices = mgr.get_state_indices([123, 456], [False, False])
         assert all(0 <= index < ssm_slots for index in indices)
+        if restore_mode is not None:
+            pool_addresses = [state.data_ptr() for state in mgr.all_ssm_states]
+            for cycle in range(2):
+                mgr.release_memory(restore_mode)
+                mgr.materialize_memory()
+                restored = mgr.get_state_indices([123, 456], [False, False])
+                assert restored == [
+                    mgr.kv_cache_map[rid].get_ssm_block_base_index(mgr.ssm_layer_group_id)
+                    for rid in (123, 456)
+                ]
+                if cycle == 0:
+                    # The freed hole forces ordinary allocation onto different slots.
+                    assert restored != indices
+                assert [state.data_ptr() for state in mgr.all_ssm_states] == pool_addresses
     finally:
         mgr.shutdown()
 
@@ -4195,13 +4219,15 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
 
 
 @skip_no_cuda
-def test_v2_kda_replay_relocates_live_slot_history():
+@pytest.mark.parametrize("sleep", [False, True])
+def test_v2_kda_replay_relocates_live_slot_history(sleep):
     mgr = _build_v2_hybrid_with_mamba_layer(
         spec_config=MTPDecodingConfig(max_draft_len=2),
         conv_state_layout="q_k_v",
         mamba_n_groups=4,
         mamba_ssm_cache_dtype=torch.float32,
         kda_replay_num_spec=2,
+        host_cache_size=16 << 20,
     )
     try:
         assert mgr.prev_num_accepted_tokens is not None
@@ -4224,12 +4250,40 @@ def test_v2_kda_replay_relocates_live_slot_history():
             replay_buffer[:, 1].fill_(offset * 10 + 1)
             source_rows.append((replay_buffer[:, 0].clone(), replay_buffer[:, 1].clone()))
 
-        mgr._relocate_kda_replay_slots([0, 1], [1, 2])
+        if sleep:
+            hole = mgr.add_dummy_requests([100], token_nums=[8], is_gen=True)[0]
+            mgr.add_dummy_requests([101, 102], token_nums=[8, 8], is_gen=True)
+            mgr.free_resources(hole)
+            old_slots = mgr.get_state_indices([101, 102])
+            mgr.prev_num_accepted_tokens[old_slots] = torch.tensor(
+                [3, 5], dtype=torch.int32, device="cuda"
+            )
+            for offset, replay_buffer in enumerate(replay_buffers):
+                replay_buffer[:, old_slots[0]].fill_(offset * 10 + 1)
+                replay_buffer[:, old_slots[1]].fill_(offset * 10 + 2)
+            expected_rows = [
+                replay_buffer[:, old_slots].clone() for replay_buffer in replay_buffers
+            ]
+            expected_counts = mgr.prev_num_accepted_tokens[old_slots].clone()
+            mgr.release_memory(RestoreMode.CPU)
+            mgr.materialize_memory()
+            new_slots = mgr.get_state_indices([101, 102])
+            # The freed hole forces this test through replay-history relocation.
+            assert new_slots != old_slots
+            assert new_slots == [
+                mgr.kv_cache_map[rid].get_ssm_block_base_index(mgr.ssm_layer_group_id)
+                for rid in (101, 102)
+            ]
+            torch.testing.assert_close(mgr.prev_num_accepted_tokens[new_slots], expected_counts)
+            for replay_buffer, expected in zip(replay_buffers, expected_rows):
+                torch.testing.assert_close(replay_buffer[:, new_slots], expected)
+        else:
+            mgr._relocate_kda_replay_slots([0, 1], [1, 2])
 
-        assert mgr.prev_num_accepted_tokens[:3].tolist() == [10, 10, 20]
-        for replay_buffer, (source_zero, source_one) in zip(replay_buffers, source_rows):
-            torch.testing.assert_close(replay_buffer[:, 1], source_zero)
-            torch.testing.assert_close(replay_buffer[:, 2], source_one)
+            assert mgr.prev_num_accepted_tokens[:3].tolist() == [10, 10, 20]
+            for replay_buffer, (source_zero, source_one) in zip(replay_buffers, source_rows):
+                torch.testing.assert_close(replay_buffer[:, 1], source_zero)
+                torch.testing.assert_close(replay_buffer[:, 2], source_one)
     finally:
         mgr.shutdown()
 

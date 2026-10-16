@@ -54,7 +54,6 @@ struct ScratchDesc;
 struct UnmaterializedPage
 {
     CacheLevel level;
-    SlotId slotId;
 };
 
 using BlockPage = std::variant<std::monostate, // nullptr
@@ -607,14 +606,8 @@ private:
     //! Discard uncommitted storage while retaining the suspended cache's logical state and page layout.
     void releaseMemory();
 
-    //! Allocate replacement pages for a released cache, leaving it suspended. Does not restore discarded data.
-    void materializeMemory();
-
-    //! Produce valid cold representations before any original GPU slots are reclaimed.
-    void initializeReleasedColdPages();
-
-    //! Reacquire sleep scratch slots in their original order without ordinary allocation.
-    void restoreScratchSlots();
+    //! Allocate replacement pages for released caches atomically, leaving them suspended.
+    static void materializeMemory(std::vector<KvCache*> const& caches);
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
@@ -840,8 +833,8 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
-    // Engaged even with no scratch slots: an admitted sleep restore bypasses new-request utilization gating.
-    std::optional<TypedVec<LifeCycleId, std::vector<SlotId>>> mSleepingScratchSlots;
+    // Previously active caches resume after sleep without new-request utilization gating.
+    bool mResumeAfterSleep = false;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

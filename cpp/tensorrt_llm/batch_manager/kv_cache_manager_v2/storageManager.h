@@ -160,7 +160,7 @@ public:
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
     //! Initialize a discarded cold slot with the codec's representation of a zero hot page.
-    void initializeColdSlot(LifeCycleId lc, CacheLevel level, SlotId slotId);
+    void initializeColdSlot(LifeCycleId lc, CacheLevel level, Slot& slot);
 
     // ---- Eviction ----------------------------------------------------------
 
@@ -334,18 +334,6 @@ public:
         return mSleepingPoolSlots.has_value();
     }
 
-    struct PageLocation
-    {
-        SharedPtr<Page> page;
-        CacheLevel level;
-        SlotId slotId;
-    };
-
-    //! Restore retained GPU pages to their original slots through the normal codec/copy path.
-    void restorePageLocations(std::vector<PageLocation> const& locations);
-
-    Slot allocateSlotAt(LifeCycleId lifeCycle, CacheLevel level, SlotId slotId);
-
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
     {
@@ -413,7 +401,7 @@ private:
 
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
-        bool defrag = false, std::vector<Slot>* reservedSlots = nullptr);
+        bool defrag = false);
     void _migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
         KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(

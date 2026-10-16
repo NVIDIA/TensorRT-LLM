@@ -198,43 +198,12 @@ void KvCacheManager::releaseGpuMemory(bool discard)
         TLLM_CHECK_WITH_INFO(!discard || (isStatsExcluded(cache->id) && cache->numCommittedTokens() == 0),
             "Discarding KV cache memory requires all user requests to be drained");
     }
-    mSleepingPageLocations.clear();
-    std::unordered_set<Page*> seen;
-    for (KvCache* cache : mLivingKvCaches)
-    {
-        if (cache->isActive())
-        {
-            TypedVec<LifeCycleId, std::vector<SlotId>> scratch(cache->mScratchSlots.size());
-            for (LifeCycleId lc{0}; lc < scratch.size(); ++lc)
-            {
-                for (auto const& lock : cache->mScratchSlots[lc])
-                {
-                    scratch[lc].push_back(lock.slot().slotId());
-                }
-            }
-            cache->mSleepingScratchSlots = std::move(scratch);
-        }
-        if (!discard)
-        {
-            for (auto const& ap : cache->_activePages())
-            {
-                auto const& bp = ap.ordinal == kBadBlockOrdinal ? cache->mSsmBlocks[ap.beamIdx][ap.lcId]
-                                                                : cache->mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
-                auto const& page = blockPageGetPage(bp);
-                if (page && mStorage->cacheTier(page->cacheLevel) == CacheTier::GPU_MEM
-                    && seen.insert(page.get()).second)
-                {
-                    mSleepingPageLocations.push_back({page, page->cacheLevel, page->slotId()});
-                }
-            }
-        }
-    }
     mSleepRestorePending = true;
-    mReleasedPagesInitialized = false;
     for (KvCache* cache : mLivingKvCaches)
     {
         if (cache->isActive())
         {
+            cache->mResumeAfterSleep = true;
             cache->suspend();
         }
         else if (cache->hasScratchSlots())
@@ -272,41 +241,15 @@ void KvCacheManager::materializeGpuMemory(bool zero)
     }
     TLLM_CHECK_WITH_INFO(
         *mMaterializingGpuMemory == zero, "Cannot change zero mode while retrying GPU memory restoration");
-    if (!mReleasedPagesInitialized)
-    {
-        for (KvCache* cache : mLivingKvCaches)
-        {
-            if (cache->status() == KvCache::Status::UNMATERIALIZED)
-            {
-                cache->initializeReleasedColdPages();
-            }
-        }
-        mReleasedPagesInitialized = true;
-    }
-    std::vector<StorageManager::PageLocation> locations;
-    locations.reserve(mSleepingPageLocations.size());
-    for (auto const& location : mSleepingPageLocations)
-    {
-        if (auto page = location.page.lock())
-        {
-            locations.push_back({std::move(page), location.level, location.slotId});
-        }
-    }
-    mStorage->restorePageLocations(locations);
+    std::vector<KvCache*> releasedCaches;
     for (KvCache* cache : mLivingKvCaches)
     {
         if (cache->status() == KvCache::Status::UNMATERIALIZED)
         {
-            cache->materializeMemory();
+            releasedCaches.push_back(cache);
         }
     }
-    // No ordinary allocation or resume may run until every original page and scratch slot is owned again.
-    for (KvCache* cache : mLivingKvCaches)
-    {
-        cache->restoreScratchSlots();
-        cache->onPageStorageChanged();
-    }
-    mSleepingPageLocations.clear();
+    KvCache::materializeMemory(releasedCaches);
     mMaterializingGpuMemory.reset();
     mSleepRestorePending = false;
 }

@@ -731,9 +731,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 table = torch.from_dlpack(batch.page_table(sparse))
                 table_address = table.data_ptr()
                 swa_valid = [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)]
-                original_indices = [list(cache.get_base_page_indices(lg)) for lg in (sparse, swa)]
-                original_scratch = list(cache.get_scratch_desc(swa).slot_ids)
-                original_ssm = cache.get_ssm_block_base_index(ssm)
+                scratch_count = len(cache.get_scratch_desc(swa).slot_ids)
                 gpu_addresses = [
                     pool.base_address
                     for group in self.manager.pool_group_descs
@@ -808,7 +806,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                     self.assertEqual(never_resumed.status, _KVCache.Status.SUSPENDED)
                     self.assertFalse(cache.is_active)
                     if cycle == 0:
-                        # Materialization leaves caches suspended, including reserved scratch slots.
+                        # Materialization leaves caches suspended; scratch is allocated on resume.
                         self.manager.release_gpu_memory(discard=discard)
                         self.manager.materialize_gpu_memory(zero=zero)
                     self.assertTrue(cache.resume())
@@ -817,12 +815,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                     )
                     self.assertIsNotNone(cache.get_scratch_desc(swa))
                     self.assertTrue(cache.has_scratch_slots)
-                    self.assertEqual(
-                        [list(cache.get_base_page_indices(lg)) for lg in (sparse, swa)],
-                        original_indices,
-                    )
-                    self.assertEqual(list(cache.get_scratch_desc(swa).slot_ids), original_scratch)
-                    self.assertEqual(cache.get_ssm_block_base_index(ssm), original_ssm)
+                    self.assertEqual(len(cache.get_scratch_desc(swa).slot_ids), scratch_count)
                     self.assertEqual(
                         [
                             pool.base_address
@@ -960,9 +953,6 @@ class TestNoBatching(TestKVCacheManagerV2):
 
             if sleep:
                 # Preserve held pages from both the encoded GPU pool and the hot pool.
-                original_indices = [
-                    list(second.kv_cache.get_base_page_indices(lg)) for lg in expected_cold_pages
-                ]
                 capacities = [
                     [stat.total for stat in self.manager.get_storage_statistics(CacheLevel(level))]
                     for level in range(len(self.cfg.cache_tiers))
@@ -1008,13 +998,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                 with TemporaryCudaStream([]) as stream_holder:
                     stream = cast(CudaStream, stream_holder.handle)
                     self.assertTrue(second.kv_cache.resume(stream))
-                    self.assertEqual(
-                        [
-                            list(second.kv_cache.get_base_page_indices(lg))
-                            for lg in expected_cold_pages
-                        ],
-                        original_indices,
-                    )
                     self.run_request(second, self.cfg.tokens_per_block, True)
                 stream_holder.take_finish_event().synchronize()
                 self.manager.get_and_reset_iteration_stats()

@@ -358,9 +358,10 @@ addresses, and restores or initializes contents according to `SleepConfig`.
 Native V2 KV pools use the cache manager's own storage lifecycle. Preserving
 modes migrate live pages through its cache tiers; destructive modes retain the
 native cache objects with unmaterialized pages. Wakeup restores pool capacity
-and the original GPU page and scratch slots without reconstructing logical
-request state in Python. Together with reserved GPU virtual addresses, this
-keeps active padding requests' KV and SSM addresses stable across sleep/wakeup.
+and resumes the caches through normal allocation without reconstructing logical
+request state in Python. GPU pool virtual addresses and metadata buffer addresses
+stay stable; page and scratch slot IDs may change. KV and SSM indices are refreshed
+before graph replay so kernels address the restored pages.
 
 Principal implementation locations are:
 

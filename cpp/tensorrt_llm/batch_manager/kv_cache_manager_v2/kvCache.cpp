@@ -538,13 +538,12 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
-    if (!mSleepingScratchSlots && utilization > mManager->config().maxUtilForResume)
+    if (!mResumeAfterSleep && utilization > mManager->config().maxUtilForResume)
     {
         return false;
     }
 
     auto& storageMgr = mManager->storage();
-    restoreScratchSlots();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
 
@@ -892,7 +891,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
     rollbackActivation.cancel();
     restorePhase.cancel();
-    mSleepingScratchSlots.reset();
+    mResumeAfterSleep = false;
     // Only a previously admitted request counts as a preemption recovery.
     if (mHasResumed && _shouldRecordStats())
     {
@@ -1020,49 +1019,44 @@ void KvCache::releaseMemory()
                                                   : mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
         auto const page = blockPageGetPage(bp);
         TLLM_CHECK_DEBUG(page && !page->isCommitted());
-        bp = UnmaterializedPage{page->cacheLevel, page->slotId()};
+        bp = UnmaterializedPage{page->cacheLevel};
     }
     mStatus = Status::UNMATERIALIZED;
     onPageStorageChanged();
     TLLM_CHECK_DEBUG(_checkSanity());
 }
 
-void KvCache::initializeReleasedColdPages()
-{
-    for (auto const& ap : _activePages())
-    {
-        auto const& bp = ap.ordinal == kBadBlockOrdinal ? mSsmBlocks[ap.beamIdx][ap.lcId]
-                                                        : mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
-        auto const& location = std::get<UnmaterializedPage>(bp);
-        if (location.level != kHotLevel)
-        {
-            mManager->storage().initializeColdSlot(ap.lcId, location.level, location.slotId);
-        }
-    }
-}
-
-void KvCache::materializeMemory()
+void KvCache::materializeMemory(std::vector<KvCache*> const& caches)
 {
     KVCM2_API_GUARD();
-    auto const apiLock = mManager->lockExclusive();
-    TLLM_CHECK_WITH_INFO(mStatus == Status::UNMATERIALIZED, "Cache pages have not been released");
-    auto& storage = mManager->storage();
-    auto activePages = _activePages();
-    auto blockPage = [this](ActivePage const& ap) -> BlockPage&
+    if (caches.empty())
     {
-        return ap.ordinal == kBadBlockOrdinal ? mSsmBlocks[ap.beamIdx][ap.lcId]
-                                              : mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
+        return;
+    }
+    auto const apiLock = caches.front()->mManager->lockExclusive();
+    auto& storage = caches.front()->mManager->storage();
+    TypedVec<CacheLevel, TypedVec<LifeCycleId, SlotCount>> counts(
+        storage.numCacheLevels(), TypedVec<LifeCycleId, SlotCount>(storage.numLifeCycles(), 0));
+
+    struct ReleasedPage
+    {
+        KvCache* cache;
+        ActivePage descriptor;
+        BlockPage* target;
     };
-    std::sort(activePages.begin(), activePages.end(),
-        [&](ActivePage const& left, ActivePage const& right)
+
+    std::vector<ReleasedPage> released;
+    for (auto* cache : caches)
+    {
+        TLLM_CHECK_WITH_INFO(cache->mStatus == Status::UNMATERIALIZED, "Cache pages have not been released");
+        for (auto const& ap : cache->_activePages())
         {
-            auto key = [&](ActivePage const& ap)
-            {
-                auto const& location = std::get<UnmaterializedPage>(blockPage(ap));
-                return std::tuple{location.level, storage.getPoolGroupIndex(location.level, ap.lcId), location.slotId};
-            };
-            return key(left) < key(right);
-        });
+            auto& bp = ap.ordinal == kBadBlockOrdinal ? cache->mSsmBlocks[ap.beamIdx][ap.lcId]
+                                                      : cache->mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
+            ++counts[std::get<UnmaterializedPage>(bp).level][ap.lcId];
+            released.push_back({cache, ap, &bp});
+        }
+    }
 
     struct PendingPage
     {
@@ -1071,23 +1065,43 @@ void KvCache::materializeMemory()
     };
 
     std::vector<PendingPage> pending;
-    pending.reserve(activePages.size());
-    for (auto const& ap : activePages)
+    pending.reserve(released.size());
+    // Cold initialization borrows a hot slot, so finish it for every cache before allocating hot pages.
+    for (CacheLevel level{storage.numCacheLevels()}; level > kHotLevel;)
     {
-        auto& bp = blockPage(ap);
-        auto const location = std::get<UnmaterializedPage>(bp);
-        auto slot = storage.allocateSlotAt(ap.lcId, location.level, location.slotId);
-        auto releaseSlot = FuncGuard(
+        --level;
+        auto slots = storage.newSlots(level, counts[level]);
+        auto releaseSlots = FuncGuard(
             [&]()
             {
-                if (slot.hasValidSlot())
+                for (LifeCycleId lc{0}; lc < slots.size(); ++lc)
                 {
-                    storage.releaseSlot(ap.lcId, location.level, std::move(slot));
+                    for (auto& slot : slots[lc])
+                    {
+                        if (slot.hasValidSlot())
+                        {
+                            storage.releaseSlot(lc, level, std::move(slot));
+                        }
+                    }
                 }
             });
-        auto page = makeShared<UncommittedPage>(*this, ap.ordinal, ap.lcId, location.level, ap.beamIdx);
-        page->setSlot(slot);
-        pending.push_back({&bp, page->hold()});
+        for (auto const& entry : released)
+        {
+            if (std::get<UnmaterializedPage>(*entry.target).level != level)
+            {
+                continue;
+            }
+            auto const& ap = entry.descriptor;
+            auto& slot = slots[ap.lcId].back();
+            if (level != kHotLevel)
+            {
+                storage.initializeColdSlot(ap.lcId, level, slot);
+            }
+            auto page = makeShared<UncommittedPage>(*entry.cache, ap.ordinal, ap.lcId, level, ap.beamIdx);
+            page->setSlot(slot);
+            pending.push_back({entry.target, page->hold()});
+            slots[ap.lcId].pop_back();
+        }
     }
     // Publish only after allocation and eviction registration succeed. Temporary holders remove
     // their eviction entries and release their slots on failure, leaving every placeholder intact.
@@ -1099,37 +1113,11 @@ void KvCache::materializeMemory()
     {
         *entry.target = std::move(entry.holder);
     }
-    mStatus = Status::SUSPENDED;
-    onPageStorageChanged();
-    TLLM_CHECK_DEBUG(_checkSanity());
-}
-
-void KvCache::restoreScratchSlots()
-{
-    if (!mSleepingScratchSlots)
+    for (auto* cache : caches)
     {
-        return;
-    }
-    auto& storage = mManager->storage();
-    for (LifeCycleId lc{0}; lc < mScratchSlots.size(); ++lc)
-    {
-        auto const& ids = (*mSleepingScratchSlots)[lc];
-        auto& locks = mScratchSlots[lc];
-        locks.reserve(ids.size());
-        for (size_t i = locks.size(); i < ids.size(); ++i)
-        {
-            auto slot = storage.allocateSlotAt(lc, kHotLevel, ids[i]);
-            auto releaseSlot = FuncGuard(
-                [&]()
-                {
-                    if (slot.hasValidSlot())
-                    {
-                        storage.releaseSlot(lc, kHotLevel, std::move(slot));
-                    }
-                });
-            slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
-            locks.emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
-        }
+        cache->mStatus = Status::SUSPENDED;
+        cache->onPageStorageChanged();
+        TLLM_CHECK_DEBUG(cache->_checkSanity());
     }
 }
 
