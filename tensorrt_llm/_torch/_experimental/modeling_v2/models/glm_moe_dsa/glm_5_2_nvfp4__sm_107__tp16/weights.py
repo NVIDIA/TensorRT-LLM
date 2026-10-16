@@ -4,17 +4,23 @@
 
 The target's modules are the built-in GLM-5.2 modules (see ``modeling.py``),
 so the checkpoint loads through the built-in loader into exactly the shapes
-and layouts the context server uses.
+and layouts the context server uses. The MTP draft steps also derive operands
+from two of the MTP layer's checkpoint tensors (``DraftWeights``), taken before
+the built-in loader shards them.
 """
 
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
+from typing import Optional
 
+import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3WeightLoader
+from tensorrt_llm._torch.modules.linear import TensorParallelMode, load_weight_shard
 
 
 def normalize_model_config(model_config: ModelConfig[PretrainedConfig]) -> ModelConfig[PretrainedConfig]:
@@ -43,6 +49,66 @@ def normalize_model_config(model_config: ModelConfig[PretrainedConfig]) -> Model
     return model_config
 
 
-def load_weights(model, weights) -> None:
-    """Load the checkpoint into the target's modules with the built-in loader."""
+@dataclass(frozen=True, eq=False)
+class DraftWeights:
+    """The MTP layer's checkpoint tensors the decode target derives draft-step operands from.
+
+    Attributes:
+        eh_proj: The whole ``[H, 2H]`` eh_proj weight, on the model's device. The built-in
+            eh_proj is row-parallel (``2H / tp`` input columns per rank); the draft token table
+            needs every column.
+        w3_w1: ``[E, 2 * I / tp, H]``: per expert, this rank's ``I / tp`` rows of up_proj, then
+            the same rows of gate_proj (the low-M BF16 MoE's layout).
+        w2: ``[E, H, I / tp]``: per expert, this rank's ``I / tp`` columns of down_proj.
+
+    ``w3_w1`` and ``w2`` hold the slices the built-in MoE loader gives this rank, in plain
+    row-major layout: the built-in BF16 MoE may keep its own copy in a backend layout.
+    """
+
+    eh_proj: torch.Tensor
+    w3_w1: torch.Tensor
+    w2: torch.Tensor
+
+
+def load_weights(model, weights, draft: bool) -> Optional[DraftWeights]:
+    """Load the checkpoint into the target's modules with the built-in loader.
+
+    With ``draft``, first take the MTP layer's ``DraftWeights`` (the built-in loader releases
+    checkpoint tensors once it has copied them) and return them; None without ``draft`` or
+    when the checkpoint has no MTP layer.
+    """
+    draft_weights = _draft_weights(model, weights) if draft else None
     DeepseekV3WeightLoader(model).load_weights(weights)
+    return draft_weights
+
+
+def _draft_weights(model, weights) -> Optional[DraftWeights]:
+    """The MTP layer's ``DraftWeights``: checkpoint layer ``num_hidden_layers``."""
+    config = model.config
+    prefix = f"model.layers.{config.num_hidden_layers}"
+    eh_proj_key = f"{prefix}.eh_proj.weight"
+    if eh_proj_key not in weights:
+        return None
+    mapping = model.model_config.mapping
+    tp_size, tp_rank = mapping.tp_size, mapping.tp_rank
+    hidden = config.hidden_size
+    inter = config.moe_intermediate_size // tp_size
+    device = model.lm_head.weight.device
+    eh_proj = weights[eh_proj_key][:].to(device)
+    w3_w1 = torch.empty(
+        (config.n_routed_experts, 2 * inter, hidden), dtype=torch.bfloat16, device=device
+    )
+    w2 = torch.empty((config.n_routed_experts, hidden, inter), dtype=torch.bfloat16, device=device)
+
+    def shard(key: str, mode: TensorParallelMode) -> torch.Tensor:
+        tensor = load_weight_shard(weights[key], tp_size, tp_rank, mode, device=device)
+        assert tensor.dtype == torch.bfloat16, f"{key}: the MTP layer's experts are not BF16"
+        return tensor
+
+    for expert in range(config.n_routed_experts):
+        name = f"{prefix}.mlp.experts.{expert}"
+        # The built-in MoE loader's slices: up_proj and gate_proj by rows, down_proj by columns.
+        w3_w1[expert, :inter].copy_(shard(f"{name}.up_proj.weight", TensorParallelMode.COLUMN))
+        w3_w1[expert, inter:].copy_(shard(f"{name}.gate_proj.weight", TensorParallelMode.COLUMN))
+        w2[expert].copy_(shard(f"{name}.down_proj.weight", TensorParallelMode.ROW))
+    return DraftWeights(eh_proj, w3_w1, w2)
