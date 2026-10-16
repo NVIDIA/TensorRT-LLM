@@ -38,11 +38,11 @@ The decision is one function, `route`, in the family's `routing.py`. It reads
 the facts that fix which code runs -- the checkpoint's config shape, the
 parallel mapping, the GPU's compute capability, the speculative-decoding
 config and the engine choices in `EngineFacts` (KV cache quantization, MoE
-backend, recurrent-state cache dtype) -- and either returns a target class or
+backend, recurrent-state cache dtype, prefill CUDA graph backend) -- and either returns a target class or
 raises `NoTarget` with the reason in words. A target declines what its
 constructor would refuse, so that `auto` falls back instead of failing mid-build.
-Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
-settings are not routing inputs: they do not change which code runs, so a
+Tuning knobs such as `max_batch_size`, `max_num_tokens` and the CUDA graph
+bucket lists are not routing inputs: they do not change which code runs, so a
 target claims a configuration regardless of them. `require` therefore promises
 that the target ran, not that a particular knob setting was measured. The model
 loader decides when it is about to build the model, after the built-in model's

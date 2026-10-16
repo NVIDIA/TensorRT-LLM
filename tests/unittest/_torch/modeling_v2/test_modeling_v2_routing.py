@@ -379,6 +379,19 @@ def test_qwen4_exp_kv_cache_dtype_fp8_matches():
     _claimed(_model_config(_qwen4_exp_config()), dict(kv_cache_config=KvCacheConfig(dtype="fp8")))
 
 
+def test_qwen4_exp_piecewise_prefill_cuda_graph_falls_back():
+    config = _model_config(_qwen4_exp_config())
+    _declined(config, dict(prefill_cuda_graph_backend="piecewise"), match="piecewise")
+
+
+@pytest.mark.parametrize("backend", ["disabled", "breakable"])
+def test_qwen4_exp_matches_without_or_with_the_breakable_prefill_cuda_graph(backend):
+    _claimed(
+        _model_config(_qwen4_exp_config()),
+        dict(prefill_cuda_graph_backend=backend),
+    )
+
+
 @pytest.mark.parametrize("backend", ["CUTLASS", "TRITON", "DEEPGEMM", "VANILLA"])
 def test_qwen4_exp_unimplemented_moe_backend_falls_back(backend):
     config = replace(_model_config(_qwen4_exp_config()), moe_backend_requested=backend)

@@ -135,6 +135,7 @@ class EngineFacts(NamedTuple):
     moe_backend: str  # `moe_config.backend` as requested, before AUTO resolves
     mamba_ssm_cache_dtype: Any  # torch.dtype of the recurrent-state cache
     gdn_replay: bool  # TRTLLM_USE_GDN_REPLAY, which the engine reads for eligible MTP workloads
+    prefill_cuda_graph_backend: str  # `prefill_cuda_graph_backend`: disabled, piecewise, breakable
 
 
 def engine_facts(config: "ModelConfig", llm_args: "TorchLlmArgs") -> EngineFacts:
@@ -154,6 +155,7 @@ def engine_facts(config: "ModelConfig", llm_args: "TorchLlmArgs") -> EngineFacts
             config, kv_cache_config.mamba_ssm_cache_dtype
         ),
         gdn_replay=is_gdn_replay_enabled(),
+        prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
     )
 
 

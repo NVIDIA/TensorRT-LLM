@@ -78,6 +78,12 @@ def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> 
             f"a {engine.mamba_ssm_cache_dtype} recurrent-state cache; the target serves "
             "float32 or bfloat16 (kv_cache_config.mamba_ssm_cache_dtype)"
         )
+    if engine.prefill_cuda_graph_backend == "piecewise":
+        raise NoTarget(
+            "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
+            "which the target does not implement; 'breakable' runs the prefill step as a "
+            "breakable CUDA graph"
+        )
     if spec_config is None:
         return
     draft = spec_config.max_draft_len

@@ -60,6 +60,20 @@ at every cached-replay checkpoint commit. The conv, PLE and replay-history buffe
 types under both. A bf16 pool makes the decode step call its recurrence without ``cu_seqlens``;
 see ``DecodeTarget._gdn_block``.
 
+**Breakable prefill CUDA graph.** With ``prefill_cuda_graph_backend: breakable`` the engine
+captures the core's ``forward`` (the body, not the shell) for a step with context rows at each of
+``prefill_capture_num_tokens``, pads any such step up to the nearest bucket and replays it without
+calling the body. The shell therefore calls the core's ``begin_step`` before the body on every
+step: the asserts, the cache-manager bind, the target choice and the prefill target's host
+bookkeeping (``PrefillTarget.prepare``, one immutable ``_PrefillStep``) all live there. The prefill
+``forward`` is row-wise over the ``T`` rows it is handed, with four breaks
+(``catalog/graph/eager_on_graph``) that run eagerly between the captured segments and read the
+step: the vision splice, the PLE block, and each layer's attention core and Gated-DeltaNet
+recurrence. Each writes rows ``[:n]`` of a fixed output and zeroes rows ``[n:]``. Under MTP the
+prefill body returns one packed ``[T, hidden + stream]`` tensor that ``split_spec_output`` splits,
+and the shell hands the spec worker the batch's own ``n`` rows. With the backend off every step is
+eager and unpadded and the breaks are plain calls.
+
 **Host offload.** By default the PLE table lives in host memory the device
 addresses (`weights._host_resident_empty`), and the gather reads it unchanged;
 ``TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD=0`` restores the resident declaration. Output
@@ -88,6 +102,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
+    eager_on_graph,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
@@ -1313,6 +1330,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # None until the first forward.
         self._bound: _Bound | None = None
         self._binds = 0
+        # Set by `begin_step`, cleared by `forward`: a forward without a prepared step is a bug.
+        self._step_begun = False
         # The draft layer's own bind, keyed on the manager its draft step sees.
         self._draft_bound: _DraftBound | None = None
 
@@ -1695,6 +1714,67 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         draft step routes through here per call."""
         return self._decode if attn_metadata.num_contexts == 0 else self._prefill
 
+    def begin_step(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor | None,
+        position_ids: torch.IntTensor | None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        lora_params: dict | None = None,
+        spec_metadata=None,
+        vision: tuple | None = None,
+    ) -> None:
+        """Check what holds for every step, bind the cache manager, choose the target and
+        let the prefill target prepare the step.
+
+        The shell calls it before `forward`, on every step. It is separate because a
+        breakable prefill CUDA graph captures `forward` and replays it without calling it:
+        whatever a step reads from the host (metadata, host buffers, the manager) is read
+        here, where it runs eagerly on a replayed step too. `vision` is `(rows,
+        mm_token_indices)` when the step carries media: the tower's `[R, hidden]` rows and
+        the `[R]` packed-batch rows they replace; the prefill target splices them inside
+        its forward."""
+        assert self._prefill is not None and self._decode is not None, (
+            "load_weights must run before forward"
+        )
+        assert position_ids is not None
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        # Unimplemented inputs must fail loudly, not be dropped.
+        assert lora_params is None, "LoRA is not implemented by this target"
+        # `input_ids` is required on every step: the PLE block hashes token ids whether or
+        # not vision rows replace some embeddings, and text gates would not catch a mis-hash.
+        assert input_ids is not None, (
+            "this target's PLE layer hashes token ids, so input_ids is required "
+            "on every step, including one that carries vision rows"
+        )
+        # The token embedding is this target's own and vision rows are spliced into it
+        # inside the forward; an embedding handed in from outside would be dropped on every
+        # replay of a breakable prefill graph.
+        assert inputs_embeds is None, (
+            "this target computes its token embedding itself and splices vision rows into "
+            "it; an engine-supplied inputs_embeds is not implemented"
+        )
+        # `spec_metadata` is present exactly when drafting. On MTP_EAGLE_ONE_MODEL it
+        # sets `layers_to_capture = ()`, so the trunk owes no capture hook.
+        assert (spec_metadata is not None) == self.mtp_enabled, (
+            f"spec_metadata {'arrived' if spec_metadata is not None else 'is absent'} "
+            f"but the model was built with mtp_enabled={self.mtp_enabled}; the "
+            "draft path and the weights it loads are decided at construction"
+        )
+        # Keyed on the manager, not a first-forward flag: capacity estimation swaps the
+        # manager under the same module (see `_bind_cache_manager`).
+        if self._bound is None or attn_metadata.kv_cache_manager is not self._bound.cm:
+            self._bind_cache_manager(attn_metadata, position_ids)
+        target = self._select_target(attn_metadata)
+        if target is self._prefill:
+            target.prepare(attn_metadata, input_ids, position_ids, vision, spec_metadata)
+        else:
+            assert vision is None, (
+                "a generation-only step carries vision rows; the executor attaches media "
+                "to context requests only"
+            )
+        self._step_begun = True
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1704,40 +1784,30 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         lora_params: dict | None = None,
         **kwargs,
     ):
-        """Check what holds for every step, bind the cache manager, then route."""
-        assert self._prefill is not None and self._decode is not None, (
-            "load_weights must run before forward"
+        """Run the step `begin_step` prepared on the target it chose.
+
+        Under a breakable prefill CUDA graph this is the body the engine captures for a
+        step with context rows; a replayed step never enters it, which is why nothing here
+        may read the step from the host. Returns the logits input, or under speculation the
+        decode target's `(final, hc)` pair and the prefill target's one packed tensor
+        (`split_spec_output`)."""
+        assert self._step_begun, (
+            "the shell calls begin_step before every forward; this forward has no prepared step"
         )
-        assert position_ids is not None
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        # Unimplemented inputs must fail loudly, not be dropped.
-        assert lora_params is None, "LoRA is not implemented by this target"
-        # `input_ids` is required even with `inputs_embeds` (upstream passes
-        # `input_ids=None` after splicing): the PLE block hashes token ids every step,
-        # and text gates would not catch a mis-hash.
-        assert input_ids is not None, (
-            "this target's PLE layer hashes token ids, so input_ids is required "
-            "on every step, including one whose embeddings were spliced upstream"
-        )
-        # `spec_metadata` is present exactly when drafting. On MTP_EAGLE_ONE_MODEL it
-        # sets `layers_to_capture = ()`, so the trunk owes no capture hook.
-        spec_metadata = kwargs.get("spec_metadata")
-        assert (spec_metadata is not None) == self.mtp_enabled, (
-            f"spec_metadata {'arrived' if spec_metadata is not None else 'is absent'} "
-            f"but the model was built with mtp_enabled={self.mtp_enabled}; the "
-            "draft path and the weights it loads are decided at construction"
-        )
-        # Keyed on the manager, not a first-forward flag: capacity estimation swaps
-        # the manager under the same module (see `_bind_cache_manager`).
-        if self._bound is None or attn_metadata.kv_cache_manager is not self._bound.cm:
-            self._bind_cache_manager(attn_metadata, position_ids)
+        self._step_begun = False
         return self._select_target(attn_metadata).forward(
-            attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
+            attn_metadata, input_ids=input_ids, position_ids=position_ids, **kwargs
         )
+
+    def split_spec_output(self, output) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(final, hc)` out of what `forward` returned under speculation: `final` is the
+        `[T, hidden]` mix `lm_head` reads and `hc` the `[T, hc_count * hidden]` stream the
+        MTP module reads. The decode target returns the pair; the prefill target returns one
+        `[T, hidden + stream]` tensor, of which the two are column views."""
+        if isinstance(output, tuple):
+            return output
+        final, hc = torch.split(output, [self.hidden, self.stream], -1)
+        return final, hc
 
 
 class _LayerWeights(NamedTuple):
@@ -2130,6 +2200,29 @@ class _KvRangeProbe:
         return False
 
 
+class _PrefillStep(NamedTuple):
+    """One step's host-side state, built by `PrefillTarget.prepare` and read by the forward's
+    breaks.
+
+    `num_tokens` is the batch's row count `n` and `physical_tokens` the `T` the forward runs
+    over (`n`, or the prefill CUDA graph bucket it was padded to); `input_ids` is the batch's
+    `n` ids. `attn` is thop_attention's per-step arguments; `gdn`, `ple` and `qsa` are the
+    recurrent, PLE and QSA bookkeeping tuples their breaks unpack, each cut to the batch's
+    rows; `stage` says the speculative rollback stages this verify step; `vision` is the
+    shell's `(rows, mm_token_indices)` or None. A new one replaces it every step, so no
+    break reads a previous step's."""
+
+    num_tokens: int
+    physical_tokens: int
+    input_ids: torch.Tensor
+    attn: dict
+    gdn: tuple
+    ple: tuple
+    qsa: tuple
+    stage: bool
+    vision: tuple | None
+
+
 class PrefillTarget:
     """Any batch with context rows (`num_contexts > 0`), possibly with generation rows
     beside them; the recurrent layers' decode-only branches never run here."""
@@ -2148,6 +2241,8 @@ class PrefillTarget:
         )
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
+        # The step `prepare` built, read by the breaks.
+        self._step: _PrefillStep | None = None
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast (TRTLLM_MODELING_V2_VALIDATE): calling
@@ -2334,35 +2429,17 @@ class PrefillTarget:
         gate_logits = cublas_mm(x, L.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
+    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, pos, pos3):
         """One gated GQA layer plus its QSA index branch.
 
         The q projection is twice as wide as q (q and output gate interleave per
         head, as HF chunks the last dim); only the q half is packed into the QKV
-        buffer and the gate half is read later through its own strides. The index
-        plane advances on every step, including below the threshold, so a request
-        growing past it finds its prefix compressed; above it the main K/V append
-        becomes this layer's own call.
-
-        `stage` is True on a verify step: the generation rows' index slots (and, on
-        the first attention layer, their position slots) are snapshotted for
-        `SpeculativeRollback` before the store and compression overwrite them."""
+        buffer and the gate half is read later through its own strides. The
+        projections, the packing and both ropes are row-wise and run over all `T` rows
+        here; the cache writes, the selection and the attention core read the step's
+        batch and run in the `_attention_core` break, which leaves the attention output
+        in `attn_out`."""
         core = self.core
-        (
-            req_idx,
-            logical,
-            seq_lens_q,
-            visible_blocks,
-            topk_indices,
-            topk_row_starts,
-            block_table,
-            tokens_per_block,
-            pos,
-            pos3,
-            coords,
-            sparse,
-            live_cols,
-        ) = qsa
         num_tokens = x.shape[0]
 
         qg = cublas_mm(x, L.q)
@@ -2405,33 +2482,12 @@ class PrefillTarget:
         if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
             self._kv_probe = None
 
-        # ---- the QSA index branch ------------------------------------------
-        # One replicated projection produces [index_heads q | 1 k]. The raw key is
-        # stored before any norm/rotation: the compression step applies both itself,
-        # so a pre-normalized key is double-normalized (invisible below the
-        # sparse threshold).
+        # One replicated projection produces [index_heads q | 1 k]; its raw key is what
+        # the break stores. The query's norm and rotation run here in the fused call's
+        # packed layout, on a scratch copy: the k slot is computed and discarded, the v
+        # slot exists only because the layout has one. Coordinate 0 alone, matching
+        # `_QSA_MROPE_SECTION` on the key side.
         qk_index = cublas_mm(x, L.idx)
-        index_cache = core._bound.index_cache[i]
-        token_k = torch.split(
-            torch.reshape(qk_index, [num_tokens, core.index_heads + core.index_kv_heads, -1]),
-            [core.index_heads, core.index_kv_heads],
-            1,
-        )[1]
-        if stage:
-            core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
-        qsa_paged_index_store(
-            token_k,
-            coords,
-            index_cache,
-            core._bound.position_cache,
-            req_idx,
-            logical,
-            block_table,
-            tokens_per_block,
-        )
-        # Query norm+rotation in the fused call's packed layout; the k slot is
-        # computed and discarded, the v slot exists only because the layout has one.
-        # Coordinate 0 alone, matching `_QSA_MROPE_SECTION` on the key side.
         scratch_h = torch.reshape(index_scratch, [num_tokens, core.index_scratch_width])
         scratch_h[:, : core.index_width].copy_(qk_index)
         fused_qk_norm_rope(
@@ -2453,9 +2509,68 @@ class PrefillTarget:
             mrope_section1=(_QSA_MROPE_SECTION or (0, 0, 0))[1],
             mrope_section2=(_QSA_MROPE_SECTION or (0, 0, 0))[2],
         )
+        eager_on_graph(qkv, qk_index, index_scratch, attn_out, i, inner=self._attention_core)
+        fused_sigmoid_mul_inplace(attn_out, gate)
+        return cublas_mm(attn_out, L.o)
+
+    def _attention_core(self, qkv, qk_index, index_scratch, attn_out, i) -> None:
+        """Break: the index plane's store and compression, the dense/sparse decision and the
+        attention core over the step's `n` rows. Writes rows `[:n]` of `attn_out`
+        `[T, q_width]` in place and zeroes rows `[n:]`.
+
+        The index plane advances on every step, including below the threshold, so a
+        request growing past it finds its prefix compressed; above it the main K/V append
+        becomes this layer's own call. The raw index key is stored before any
+        norm/rotation: the compression step applies both itself, so a pre-normalized key
+        is double-normalized (invisible below the sparse threshold).
+
+        On a verify step (`stage`) the generation rows' index slots (and, on the first
+        attention layer, their position slots) are snapshotted for `SpeculativeRollback`
+        before the store and compression overwrite them."""
+        core = self.core
+        L = self._layers[i]
+        step = self._step
+        (
+            req_idx,
+            logical,
+            seq_lens_q,
+            visible_blocks,
+            topk_indices,
+            topk_row_starts,
+            block_table,
+            tokens_per_block,
+            coords,
+            sparse,
+            live_cols,
+        ) = step.qsa
+        num_tokens = step.num_tokens
+        qkv = qkv[:num_tokens]
+        qkv_h = torch.reshape(qkv, [num_tokens, core.heads_q + 2 * core.heads_kv, core.head_dim])
+        q_dst, k_dst, v_dst = torch.split(qkv_h, [core.heads_q, core.heads_kv, core.heads_kv], 1)
+
+        index_cache = core._bound.index_cache[i]
+        token_k = torch.split(
+            torch.reshape(
+                qk_index[:num_tokens], [num_tokens, core.index_heads + core.index_kv_heads, -1]
+            ),
+            [core.index_heads, core.index_kv_heads],
+            1,
+        )[1]
+        if step.stage:
+            core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
+        qsa_paged_index_store(
+            token_k,
+            coords,
+            index_cache,
+            core._bound.position_cache,
+            req_idx,
+            logical,
+            block_table,
+            tokens_per_block,
+        )
         q_index = torch.split(
             torch.reshape(
-                scratch_h,
+                index_scratch[:num_tokens],
                 [num_tokens, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
             ),
             [core.index_heads, core.index_kv_heads, core.index_kv_heads],
@@ -2503,27 +2618,29 @@ class PrefillTarget:
                 compress_ratio=core.compress_ratio,
                 token_topk=core.token_topk,
             )
-            out = torch.reshape(
-                qsa_paged_sparse_gqa(
-                    q=q_dst,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    block_table=block_table,
-                    selected_tokens=selected,
-                    request_indices=req_idx,
-                    tokens_per_block=tokens_per_block,
-                    softmax_scale=core.softmax_scale,
-                    # A bound, not a mask: lets the kernel stop scanning a row early
-                    # (context-batch branch only).
-                    query_positions=logical,
-                    compress_ratio=core.compress_ratio,
-                ),
-                [num_tokens, core.q_width],
+            attn_out[:num_tokens].copy_(
+                torch.reshape(
+                    qsa_paged_sparse_gqa(
+                        q=q_dst,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        block_table=block_table,
+                        selected_tokens=selected,
+                        request_indices=req_idx,
+                        tokens_per_block=tokens_per_block,
+                        softmax_scale=core.softmax_scale,
+                        # A bound, not a mask: lets the kernel stop scanning a row early
+                        # (context-batch branch only).
+                        query_positions=logical,
+                        compress_ratio=core.compress_ratio,
+                    ),
+                    [num_tokens, core.q_width],
+                )
             )
         else:
-            out = thop_attention(
+            thop_attention(
                 q=qkv,
-                output=attn_out,
+                output=attn_out[:num_tokens],
                 local_layer_idx=core._bound.pool_idx[i],
                 num_heads=core.heads_q,
                 num_kv_heads=core.heads_kv,
@@ -2531,11 +2648,10 @@ class PrefillTarget:
                 quant_mode=core.quant_mode,
                 kv_scale_orig_quant=core.kv_scale_orig_quant,
                 kv_scale_quant_orig=core.kv_scale_quant_orig,
-                **step,
+                **step.attn,
                 **_CALL_CONSTANTS,
             )
-        fused_sigmoid_mul_inplace(out, gate)
-        return cublas_mm(out, L.o)
+        attn_out[num_tokens:].zero_()
 
     def _gdn_verify(
         self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay
@@ -2626,10 +2742,27 @@ class PrefillTarget:
         )
         return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 
-    def _gdn_block(self, x, i, L, gdn_state) -> torch.Tensor:
-        """One Gated-DeltaNet layer over a batch with a context prefix. Every branch
-        is on a host int the engine fixes per capture, never a tensor value."""
+    def _gdn_block(self, x, i, L, core_out) -> torch.Tensor:
+        """One Gated-DeltaNet layer over a batch with a context prefix: the four input
+        projections and the gated-norm epilogue run over all `T` rows here, the
+        recurrence in the `_gdn_core` break, which leaves its output in `core_out`
+        `[1, T, num_v_heads, head_v_dim]`."""
+        mixed_qkv = cublas_mm(x, L.in_qkv)
+        z = cublas_mm(x, L.in_z)
+        a = cublas_mm(x, L.in_a)
+        b = cublas_mm(x, L.in_b)
+        eager_on_graph(mixed_qkv, a, b, core_out, i, inner=self._gdn_core)
+        return self._gdn_epilogue(core_out, z, L, x.shape[0])
+
+    def _gdn_core(self, mixed_qkv, a, b, out, i) -> None:
+        """Break: the recurrence over the step's `n` rows (the conv, the post-conv gating and
+        the chunked delta rule, or under speculation the verify path for the generation
+        rows). Writes rows `[:n]` of `out` `[1, T, num_v_heads, head_v_dim]` in place and
+        zeroes rows `[n:]`. Every branch is on a host int of the step, never a tensor
+        value."""
         core = self.core
+        L = self._layers[i]
+        step = self._step
         (
             num_prefill_tokens,
             num_decode_tokens,
@@ -2647,13 +2780,11 @@ class PrefillTarget:
             int_idx,
             qsl_long_p,
             replay,
-        ) = gdn_state
-        num_tokens = x.shape[0]
-
-        mixed_qkv = cublas_mm(x, L.in_qkv)
-        z = cublas_mm(x, L.in_z)
-        a = cublas_mm(x, L.in_a)
-        b = cublas_mm(x, L.in_b)
+        ) = step.gdn
+        num_tokens = step.num_tokens
+        mixed_qkv = mixed_qkv[:num_tokens]
+        a = a[:num_tokens]
+        b = b[:num_tokens]
 
         conv_states = core._bound.conv[i]
         ssm_states = core._bound.ssm[i]
@@ -2716,7 +2847,10 @@ class PrefillTarget:
                 out_d = self._gdn_verify(
                     mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
                 )
-                return self._gdn_epilogue(torch.cat([out_p, out_d], 1), z, L, num_tokens)
+                out[:, :num_prefill_tokens].copy_(out_p)
+                out[:, num_prefill_tokens:num_tokens].copy_(out_d)
+                out[:, num_tokens:].zero_()
+                return
             causal_conv1d_update(
                 x=mq_d,
                 conv_state=conv_states,
@@ -2770,7 +2904,7 @@ class PrefillTarget:
                 softplus_threshold=_SOFTPLUS_THRESHOLD,
             )
         # q and k are already L2-normalized; the recurrence must not repeat it.
-        out, _ = chunk_gated_delta_rule(
+        recurrence, _ = chunk_gated_delta_rule(
             q,
             k,
             v,
@@ -2785,7 +2919,8 @@ class PrefillTarget:
             use_qk_l2norm_in_kernel=False,
             output=None,
         )
-        return self._gdn_epilogue(out, z, L, num_tokens)
+        out[:, :num_tokens].copy_(recurrence)
+        out[:, num_tokens:].zero_()
 
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
         """Gated RMS norm and output projection shared by every recurrence."""
@@ -2801,9 +2936,10 @@ class PrefillTarget:
         )
         return cublas_mm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
 
-    def _ple_block(self, hc, input_ids, ple_state, stage) -> torch.Tensor:
-        """The n-gram side path on one decoder layer; the caller adds the result into
-        the hyper-connection stream.
+    def _ple_block(self, hc, out) -> None:
+        """Break: the n-gram side path on one decoder layer, over the step's `n` rows. Writes
+        rows `[:n]` of `out` `[T, stream]` in place and zeroes rows `[n:]`; the caller adds
+        `out` into the hyper-connection stream.
 
         Per-request stateful: ids become one `ngram_size`-wide window per token
         (predecessors from the paged id history); each window hashes to one row per
@@ -2819,7 +2955,12 @@ class PrefillTarget:
         accepted prefix once the sampler has decided it."""
         core = self.core
         S = self._stack
-        conv_states, ngram_pool, si_all, carry_all, qsl = ple_state
+        step = self._step
+        conv_states, ngram_pool, si_all, carry_all, qsl = step.ple
+        stage = step.stage
+        num_tokens = step.num_tokens
+        input_ids = step.input_ids
+        hc = hc[:num_tokens]
 
         if stage:
             core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
@@ -2864,72 +3005,67 @@ class PrefillTarget:
             silu_activation=True,
             pad_slot_id=_PAD_SLOT_ID,
         )
-        return torch.add(gated, torch.transpose(convolved, 0, 1))
+        torch.add(gated, torch.transpose(convolved, 0, 1), out=out[:num_tokens])
+        out[num_tokens:].zero_()
+
+    def _splice(self, h) -> None:
+        """Break: write the step's vision rows over their placeholder rows of the token
+        embedding `h` `[T, hidden]` in place, and zero rows `[n:]`.
+
+        `mm_token_indices` names every placeholder row of the packed batch in the order the
+        per-request rows concatenate in. An indexed write, not a slice copy: two images in
+        one prompt are separated by framing tokens, so the placeholder rows are several
+        disjoint runs. A text step writes nothing but the padding. The rows are the step's:
+        a replayed graph never sees the previous step's."""
+        step = self._step
+        if step.vision is not None:
+            rows, mm_token_indices = step.vision
+            h.index_copy_(0, mm_token_indices, rows)
+        h[step.num_tokens :].zero_()
 
     # -------------------------------------------------------------- forward ---
 
-    def forward(
+    def prepare(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.IntTensor | None = None,
-        position_ids: torch.IntTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        **kwargs,
-    ):
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        vision: tuple | None,
+        spec_metadata,
+    ) -> None:
+        """Everything this step reads from the host, kept for the forward's breaks as one
+        `_PrefillStep`: the contract check, the attention op's per-step arguments and the
+        batch's bookkeeping, built once and shared by every layer.
+
+        Called by the core's `begin_step` on every step with context rows, before the
+        forward. On a step a breakable prefill graph replays, this and the breaks are all of
+        this target that runs."""
         core = self.core
         md = attn_metadata
         self._check_step_contract(md)
-        step = self.step_args(md)
-        spec_metadata = kwargs.get("spec_metadata")
+        attn_args = self.step_args(md)
         mm = md.mamba_metadata
 
-        # Three views of one `[3, 1, T]` buffer: `pos` (row 0, flat `[T]`: QSA index
-        # rope), `pos3` (contiguous `[3, T]` for `use_mrope=True`; the engine hands a
-        # slice of a larger buffer and the op rejects the row stride, hence the
-        # copy), `coords` (`[T, 3]`, stored by the QSA position side cache).
-        pos = torch.reshape(torch.split(position_ids, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
-        coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
-        pos3 = torch.empty(
-            [_QSA_POSITION_AXES, position_ids.shape[-1]],
-            dtype=torch.int32,
-            device=position_ids.device,
+        # **The activation rows are the batch's rows, or a prefill CUDA graph bucket's.** A
+        # breakable prefill graph pads the step's rows up to `padded_num_tokens` (zero ids,
+        # zero positions), and so does a padded step that runs eagerly; the forward runs over
+        # all of them and every break slices the batch's own rows back out. Anything else is
+        # an activation buffer longer than the batch, which would push padding rows through
+        # the recurrences into the state pools.
+        physical_tokens = input_ids.shape[0]
+        assert physical_tokens in (md.num_tokens, md.padded_num_tokens), (
+            f"the engine handed {physical_tokens} activation rows for a batch its "
+            f"metadata describes as {md.num_tokens} tokens "
+            f"(padded_num_tokens={md.padded_num_tokens})"
         )
-        pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
-
-        # Spliced vision rows are already the embedding; a lookup would overwrite them.
-        if inputs_embeds is None:
-            h = nn.functional.embedding(input_ids, core.w["embed"])
-        else:
-            assert inputs_embeds.shape[0] == input_ids.shape[0], (
-                f"the spliced embedding carries {inputs_embeds.shape[0]} rows for "
-                f"{input_ids.shape[0]} token ids"
-            )
-            assert inputs_embeds.shape[1] == core.hidden, (
-                f"the spliced embedding is {inputs_embeds.shape[1]} wide, not {core.hidden}"
-            )
-            h = inputs_embeds
-        num_tokens = h.shape[0]
-        dt = h.dtype
-        dev = h.device
 
         # The batch's bookkeeping, built once and shared by every layer.
+        num_tokens = md.num_tokens
         batch = md.num_seqs
         num_prefills = md.num_contexts
         num_decodes = batch - num_prefills
         num_prefill_tokens = md.num_ctx_tokens
         num_decode_tokens = num_tokens - num_prefill_tokens
-        # Host-int check (graph-safe): an activation buffer longer than the batch
-        # would push padding rows through the recurrences into the state pools.
-        assert num_tokens == md.num_tokens, (
-            f"the engine handed {num_tokens} activation rows for a batch its "
-            f"metadata describes as {md.num_tokens} tokens "
-            f"(padded_num_tokens={getattr(md, 'padded_num_tokens', None)}). A "
-            "prefill/piecewise CUDA-graph backend pads the activation buffer "
-            "past the batch and expects the model to slice it back; this "
-            "target does not implement that configuration. Decode CUDA graphs "
-            "pad with real dummy requests instead, so they are in the metadata "
-            "and this assert is silent for them."
-        )
         # Rows per generation sequence: 1 without speculation, else
         # `runtime_draft_len + 1`; read from the metadata because the worker rewrites
         # it between draft steps.
@@ -2965,7 +3101,7 @@ class PrefillTarget:
             check_verify_width(gen_p)
             check_replay_width(core._bound.replay, gen_p)
         is_verify = spec_metadata is not None and num_decodes > 0 and gen_p > 1
-        step["predicted_tokens_per_seq"] = gen_p
+        attn_args["predicted_tokens_per_seq"] = gen_p
 
         si_all = mm.state_indices[:batch]
         hi_all = mm.has_initial_states[:batch]
@@ -3025,6 +3161,9 @@ class PrefillTarget:
         # short/long decode graph families.
         sparse = batch > 0 and int(md.kv_lens_runtime[:batch].max()) > core.dense_threshold
 
+        # The `[T, 3]` transpose of the `[3, 1, T]` position buffer, which the QSA position
+        # plane stores.
+        coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
         qsa = (
             md.qsa_req_idx_per_token[:num_tokens],
             md.qsa_logical_positions[:num_tokens],
@@ -3034,9 +3173,7 @@ class PrefillTarget:
             md.qsa_topk_row_starts[:num_tokens],
             md.qsa_block_table,
             md.tokens_per_block,
-            pos,
-            pos3,
-            coords,
+            coords[:num_tokens],
             sparse,
             _live_score_columns(core, md, batch),
         )
@@ -3063,10 +3200,72 @@ class PrefillTarget:
                 tokens_per_block=md.tokens_per_block,
             )
 
-        # Scratch shared by all attention layers (each fully rewrites them).
+        self._step = _PrefillStep(
+            num_tokens=num_tokens,
+            physical_tokens=physical_tokens,
+            input_ids=input_ids[:num_tokens],
+            attn=attn_args,
+            gdn=gdn_state,
+            ple=ple_state,
+            qsa=qsa,
+            stage=stage,
+            vision=vision,
+        )
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        **kwargs,
+    ):
+        """The step `prepare` built, over the `T` activation rows the engine handed in: the
+        batch's `n` rows, or the prefill CUDA graph bucket they were padded to.
+
+        **This is the body a breakable prefill CUDA graph captures**, once per bucket, and
+        replays for every step it pads to that bucket without running this Python. So
+        nothing here reads the step: every op is row-wise and sized by `T` alone, its inputs
+        are the engine's persistent `input_ids` / `position_ids` buffers, and every buffer is
+        allocated here. What depends on the step's batch runs in one of four breaks that
+        run eagerly between the captured segments and read `self._step`: `_splice` (once),
+        `_ple_block` (once), `_attention_core` (every attention layer) and `_gdn_core` (every
+        Gated-DeltaNet layer). Each writes rows `[:n]` of a fixed output allocated here and
+        zeroes rows `[n:]`, so the padding rows stay finite through the row-wise ops and
+        reach neither a state pool nor a real row. With the backend off every step is
+        eager and unpadded, and the breaks are plain calls."""
+        core = self.core
+        num_tokens = input_ids.shape[0]
+        assert num_tokens == self._step.physical_tokens, (
+            f"the forward got {num_tokens} activation rows and prepare saw "
+            f"{self._step.physical_tokens}"
+        )
+
+        # Two views of one `[3, 1, T]` buffer: `pos` (row 0, flat `[T]`: QSA index rope) and
+        # `pos3` (contiguous `[3, T]` for `use_mrope=True`; the engine hands a slice of a
+        # larger buffer and the op rejects the row stride, hence the copy).
+        pos = torch.reshape(torch.split(position_ids, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
+        pos3 = torch.empty(
+            [_QSA_POSITION_AXES, position_ids.shape[-1]],
+            dtype=torch.int32,
+            device=position_ids.device,
+        )
+        pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
+
+        # The token embedding with this step's vision rows spliced over their placeholders.
+        h = nn.functional.embedding(input_ids, core.w["embed"])
+        eager_on_graph(h, inner=self._splice)
+        dt = h.dtype
+        dev = h.device
+
+        # Scratch shared by every layer that uses it; each break rewrites its whole output
+        # and both packed buffers are fully rewritten by the projection copies.
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
+        gdn_out = torch.empty(
+            [1, num_tokens, core.num_v_heads, core.head_v_dim], dtype=dt, device=dev
+        )
+        ple_out = torch.empty([num_tokens, core.stream], dtype=dt, device=dev)
         # The CuteDSL routed output, shared by all layers: each layer's unpermute rewrites
         # every row, and the post-inject consumes it before the next layer's MoE starts.
         routed_out = (
@@ -3080,16 +3279,17 @@ class PrefillTarget:
         hc = torch.cat([h] * hc_count, -1)
         for i, L in enumerate(self._layers):
             if i == core.ple_layer:
-                hc = torch.add(hc, self._ple_block(hc, input_ids, ple_state, stage))
+                eager_on_graph(hc, ple_out, inner=self._ple_block)
+                hc = torch.add(hc, ple_out)
             mixed, inject = qwen4_exp_gated_residual(
                 self._grouped_norm(hc, L.ahc_norm), L.ahc_down, L.ahc_up, L.ahc_inject, hc_count
             )
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, stage
+                    mixed, i, L, qkv, index_scratch, attn_out, pos, pos3
                 )
             else:
-                block_out = self._gdn_block(mixed, i, L, gdn_state)
+                block_out = self._gdn_block(mixed, i, L, gdn_out)
             hc = qwen4_exp_post_inject(hc, block_out, inject)
             mixed, inject = qwen4_exp_gated_residual(
                 self._grouped_norm(hc, L.mhc_norm), L.mhc_down, L.mhc_up, L.mhc_inject, hc_count
@@ -3100,11 +3300,13 @@ class PrefillTarget:
         final, _ = qwen4_exp_gated_residual(
             self._grouped_norm(hc, S.fhc_norm), S.fhc_down, S.fhc_up, None, hc_count
         )
-        if spec_metadata is None:
+        if not core.mtp_enabled:
             return final
         # `lm_head` reads the `[T, hidden]` mix; the MTP module reads the
-        # `[T, hc_count * hidden]` stream it was collapsed from.
-        return final, hc
+        # `[T, hc_count * hidden]` stream it was collapsed from. They leave packed in one
+        # tensor, because a breakable prefill graph's body returns one tensor; the shell
+        # takes the two column views (`split_spec_output`).
+        return torch.cat([final, hc], -1)
 
     # ------------------------------------------------------------- the draft ---
 
@@ -5406,9 +5608,11 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
                     f"carries {len(grid)}"
                 )
 
-    def _multimodal_embeds(self, input_ids, kwargs):
-        """Run the vision tower for this batch and splice its rows in; returns the
-        `[T, hidden]` embedding buffer, or None when the step carries no media.
+    def _multimodal_embeds(self, kwargs):
+        """Run the vision tower for this batch; returns `(rows, mm_token_indices)` (the
+        tower's `[R, hidden]` rows in packed-batch order and the `[R]` placeholder rows they
+        replace, which the prefill target splices into its embedding), or None when the step
+        carries no media.
 
         Lives in the shell because the inherited `DecoderModelForCausalLM.forward`
         drops `multimodal_params` from `**kwargs` on the no-speculation path (a
@@ -5426,7 +5630,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         mm_params = kwargs.get("multimodal_params") or []
         if not mm_params:
             return None
-        core = self.model
         rows = []
         for params in mm_params:
             data = getattr(params, "multimodal_data", None) or {}
@@ -5480,10 +5683,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             f"the batch has {mm_token_indices.shape[0]} placeholder rows and the "
             f"tower produced {vision.shape[0]} embedding rows"
         )
-        h = nn.functional.embedding(input_ids, core.w["embed"])
-        # Indexed write: placeholder rows form several disjoint, data-dependent runs.
-        h.index_copy_(0, mm_token_indices, vision)
-        return h
+        return vision, mm_token_indices
 
     def _run_tower(self, media, pixel_key, grid_key):
         """The tower over one modality's payload: `(rows, grid_thw)`, the rows one per
@@ -5555,16 +5755,18 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         it would drop it from what the base receives). With one, the shell owns the
         logits gather (one-model modes set `without_logits`) and the worker needs
         ungathered hidden states; `position_ids` is passed in the engine's layout
-        (flattening gives silently wrong draft positions). The vision splice happens
-        here because the base forward would not pass `multimodal_params` through."""
-        spliced = self._multimodal_embeds(input_ids, kwargs)
-        if spliced is not None:
-            assert inputs_embeds is None, (
-                "the engine supplied inputs_embeds and this step also carries "
-                "multimodal params; this target owns the splice and cannot "
-                "reconcile two embedding sources"
-            )
-            inputs_embeds = spliced
+        (flattening gives silently wrong draft positions). The vision tower runs here
+        because the base forward would not pass `multimodal_params` through; its rows reach
+        the core through `begin_step`, and the prefill target splices them."""
+        self.model.begin_step(
+            attn_metadata,
+            input_ids,
+            position_ids,
+            inputs_embeds=inputs_embeds,
+            lora_params=lora_params,
+            spec_metadata=spec_metadata,
+            vision=self._multimodal_embeds(kwargs),
+        )
         if self.spec_worker is None:
             assert spec_metadata is None, (
                 "spec_metadata arrived without a spec worker; this engine was "
@@ -5584,14 +5786,16 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             "the spec worker is built but the engine passed no spec_metadata"
         )
         # `final` is the `[T, hidden]` mix for `lm_head`, `hc` the stream the MTP reads.
-        final, hc = self.model(
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            lora_params=lora_params,
-            spec_metadata=spec_metadata,
-            **kwargs,
+        final, hc = self.model.split_spec_output(
+            self.model(
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                lora_params=lora_params,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
         )
         # `gather_ids`: one row per context request, `runtime_draft_len + 1` per
         # generation request.
@@ -5601,6 +5805,12 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             attn_metadata,
             True,
         )
+        # A prefill CUDA graph pads the step's rows; the worker reshapes generation rows per
+        # request, so it takes the batch's own.
+        if attn_metadata.padded_num_tokens is not None:
+            n = attn_metadata.num_tokens
+            input_ids, hc = input_ids[:n], hc[:n]
+            position_ids = position_ids[..., :n]
         return self.spec_worker(
             input_ids=input_ids,
             position_ids=position_ids,

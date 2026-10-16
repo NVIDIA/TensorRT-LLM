@@ -80,16 +80,24 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
     return SimpleNamespace(multimodal_data=data, mm_item_order=order, multimodal_runtime=runtime)
 
 
-def _splice(tower, params, num_rows):
-    """The splice over a prompt whose tokens 1..num_rows are the placeholders; returns
-    the rows that landed there, one value per row, or None when nothing was spliced."""
-    input_ids = torch.zeros(num_rows + 2, dtype=torch.int64)
+def _splice(tower, params, num_rows, padding=0):
+    """The tower's rows spliced, as the prefill target's break does, over a prompt whose
+    tokens 1..num_rows are the placeholders and which `padding` rows follow; returns the
+    rows that landed there, one value per row, or None when the step carries no media."""
     kwargs = {
         "multimodal_params": [params],
         "mm_token_indices": torch.arange(1, 1 + num_rows, dtype=torch.int64),
     }
-    out = Shell._multimodal_embeds(_shell(tower), input_ids, kwargs)
-    return None if out is None else out[1 : 1 + num_rows, 0].tolist()
+    vision = Shell._multimodal_embeds(_shell(tower), kwargs)
+    if vision is None:
+        return None
+    total = num_rows + 2
+    h = torch.full((total + padding, HIDDEN), -1.0)
+    target = SimpleNamespace(_step=SimpleNamespace(vision=vision, num_tokens=total))
+    M.PrefillTarget._splice(target, h)
+    assert torch.count_nonzero(h[total:]) == 0, "padding rows must be zeroed"
+    assert torch.all(h[0] == -1.0) and torch.all(h[total - 1] == -1.0)
+    return h[1 : 1 + num_rows, 0].tolist()
 
 
 def _item(modality, index):
@@ -107,6 +115,17 @@ def test_image_request_is_unchanged():
     tower = _Tower()
     assert _splice(tower, _params(image=IMAGES), 5) == [100.0] * 4 + [101.0]
     assert tower.calls == 1
+
+
+def test_the_splice_zeroes_the_padding_rows():
+    assert _splice(_Tower(), _params(image=IMAGES), 5, padding=3) == [100.0] * 4 + [101.0]
+
+
+def test_a_text_step_writes_only_the_padding():
+    target = SimpleNamespace(_step=SimpleNamespace(vision=None, num_tokens=2))
+    h = torch.full((4, HIDDEN), -1.0)
+    M.PrefillTarget._splice(target, h)
+    assert torch.all(h[:2] == -1.0) and torch.count_nonzero(h[2:]) == 0
 
 
 def test_video_rows_reach_the_placeholders_item_by_item():
