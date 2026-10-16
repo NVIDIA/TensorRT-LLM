@@ -158,6 +158,17 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (1, 4, 1)),
             },
         }
+        # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
+        PRIMSTS_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -186,12 +197,18 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            sm_version = get_sm_version()
+            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
+                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
                     f"{sorted(recipes)}."
+                )
+            if q_config.smooth_k and q_config.q_block_size == 0:
+                raise ValueError(
+                    "smooth_k is a SageAttention option and does not apply to the per-tensor "
+                    f"recipe {recipe!r}."
                 )
         elif q_config.smooth_k:
             raise ValueError(

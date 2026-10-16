@@ -162,9 +162,13 @@ class TestAttentionConfigQuantValidation:
             (100, "fp8", 1, 4, 1),
             (103, "fp8", 1, 1, 1),
             (103, "fp8", 1, 4, 1),
+            (100, "bf16", 0, 0, 0),
+            (100, "fp8", 0, 0, 0),
+            (103, "bf16", 0, 0, 0),
+            (103, "fp8", 0, 0, 0),
         ],
     )
-    def test_supported_quant_config_sage(
+    def test_supported_quant_config_trtllm(
         self, sm_ver, qk_dtype, q_block_size, k_block_size, v_block_size
     ):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
@@ -180,15 +184,16 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
-    @pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
-    def test_smooth_k_rejected_on_non_trtllm_backend(self, backend):
-        with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):
-            AttentionConfig(
-                backend=backend,
-                quant_attention_config=QuantAttentionConfig(
-                    qk_dtype="bf16", v_dtype="fp8", smooth_k=True
-                ),
-            )
+    @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
+    def test_smooth_k_rejected_without_sage_recipe(self, backend):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="bf16", v_dtype="fp8", smooth_k=True
+                    ),
+                )
 
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
