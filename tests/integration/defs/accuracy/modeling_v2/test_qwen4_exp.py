@@ -345,13 +345,18 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     GSM8K_MAX_OUTPUT_LEN = 512
 
     # `mamba_ssm_cache_dtype` is float32 because the checkpoint declares
-    # `mamba_ssm_dtype: float32` (the engine default is bfloat16). `dtype` is
-    # left at the checkpoint's bf16 KV, which is what the anchors were measured at;
-    # only the fp8 KV cases set it.
+    # `mamba_ssm_dtype: float32` (the engine default is bfloat16); the bf16-state cases
+    # set it to bfloat16. `dtype` is left at the checkpoint's bf16 KV, which is what the
+    # anchors were measured at; only the fp8 KV cases set it.
     KV_CACHE = KvCacheConfig(
         free_gpu_memory_fraction=0.6,
         enable_block_reuse=True,
         mamba_ssm_cache_dtype="float32",
+    )
+    KV_CACHE_BF16_STATE = KvCacheConfig(
+        free_gpu_memory_fraction=0.6,
+        enable_block_reuse=True,
+        mamba_ssm_cache_dtype="bfloat16",
     )
     KV_CACHE_FP8 = KvCacheConfig(
         dtype="fp8",
@@ -396,6 +401,10 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     ACCEPTANCE_KEY_MTP5 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp5"
     ACCEPTANCE_KEY_MTP7 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7"
     ACCEPTANCE_KEY_MTP7_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_long_context"
+    ACCEPTANCE_KEY_MTP3_BF16_STATE = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_bf16_state"
+    ACCEPTANCE_KEY_MTP7_BF16_STATE_LONG_CONTEXT = (
+        "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_bf16_state_long_context"
+    )
     ACCEPTANCE_KEY_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_long_context"
     ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT = (
         "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_fp8_kv_long_context"
@@ -443,6 +452,27 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         """
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
         engine = dict(self.ENGINE, moe_config=MoeConfig(backend="CUTEDSL"))
+
+        with LLM(
+            self.MODEL_PATH,
+            **engine,
+            **_require_target(monkeypatch, **_VALIDATE),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_not_sm103
+    def test_gsm8k_bf16_ssm_state(self, mocker, monkeypatch):
+        """The text model with the recurrent state stored in bf16, against the fp32 gsm8k anchor.
+
+        ``mamba_ssm_cache_dtype="bfloat16"`` (what ``auto`` resolves to for this checkpoint) rounds
+        the state to bf16 on every decode token and every prefill call, a lossy substitution
+        for the checkpoint's fp32 state. It reads the same reference row as ``test_gsm8k``, so
+        the rounding has to stay inside that row's tolerance. The decode step runs its
+        recurrence in the batch-invariant form that a bf16 pool needs.
+        """
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_BF16_STATE)
 
         with LLM(
             self.MODEL_PATH,
@@ -537,6 +567,24 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         """
         self._gsm8k_with_acceptance(
             mocker, monkeypatch, self.ENGINE, self.MTP7, self.ACCEPTANCE_KEY_MTP7, "mtp7"
+        )
+
+    @skip_not_sm103
+    def test_mtp3_bf16_ssm_state_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """MTP with three drafts over a bf16 recurrent state: the MTP row, and a length floor.
+
+        The cached replay rebuilds the state from a checkpoint that is now bf16 and rounds it
+        once at every commit; drafts after the first are the ones a degraded state would lose,
+        so the length floor has its own entry.
+        """
+        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_BF16_STATE)
+        self._gsm8k_with_acceptance(
+            mocker,
+            monkeypatch,
+            engine,
+            self.MTP3,
+            self.ACCEPTANCE_KEY_MTP3_BF16_STATE,
+            "mtp3 bf16 state",
         )
 
     def _long_context_passkey(
@@ -651,6 +699,26 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             _PASSKEY_LENGTHS_LONG,
             "ACCEPTANCE_KEY_MTP7_LONG_CONTEXT",
             "mtp7 long context",
+        )
+
+    @skip_not_sm103
+    def test_mtp7_bf16_ssm_state_long_context_passkey(self, monkeypatch):
+        """``test_mtp7_long_context_passkey`` over a bf16 recurrent state.
+
+        The state is rounded to bf16 at every cached-replay checkpoint commit, each time a
+        slot's history of 16 accepted tokens fills, and once per prefill chunk, so the rounding
+        adds up with the length of the prompt and of the answer; pass keys stated back over
+        3k-12k tokens bound that drift.
+        """
+        engine = dict(self.ENGINE, max_seq_len=16384, kv_cache_config=self.KV_CACHE_BF16_STATE)
+        self._long_context_passkey(
+            monkeypatch,
+            self.MTP7,
+            engine,
+            True,
+            _PASSKEY_LENGTHS_LONG,
+            "ACCEPTANCE_KEY_MTP7_BF16_STATE_LONG_CONTEXT",
+            "mtp7 bf16 state long context",
         )
 
     @pytest.mark.parametrize(

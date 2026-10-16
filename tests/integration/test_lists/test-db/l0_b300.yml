@@ -144,8 +144,9 @@ l0_b300:
   # run the sparse attention path (IndexShare over bf16 KV, fp8 KV), and 3k-12k-token ones
   # at seven drafts; seven drafts all rejected and all accepted by forced acceptance at
   # batch 32 over long prompts; the recurrent-state verify path that
-  # TRTLLM_USE_GDN_REPLAY=0 selects; mmmu with MTP and synthetic videos, the only gates
-  # that reach the vision tower.
+  # TRTLLM_USE_GDN_REPLAY=0 selects; the recurrent state stored in bf16 without speculation,
+  # at three drafts and at seven drafts over long prompts; mmmu with MTP and synthetic
+  # videos, the only gates that reach the vision tower.
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_cutedsl_moe
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_and_acceptance
@@ -159,6 +160,9 @@ l0_b300:
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_rejected]
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_accepted]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_bf16_ssm_state
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_bf16_ssm_state_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_bf16_ssm_state_long_context_passkey
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gdn_legacy_verify
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_video
