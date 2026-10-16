@@ -1359,7 +1359,6 @@ class PyTorchModelEngine(ModelEngine):
         self._remove_torch_compile()
 
     @with_warmup_flag
-    @warmup_with_kv_cache_cleanup
     def restore_compiled_model_after_refit(
             self, resource_manager: ResourceManager) -> None:
         """Re-install the torch.compile wrapper after refit.
@@ -1379,9 +1378,18 @@ class PyTorchModelEngine(ModelEngine):
         trainer-side Ray state costs seconds; this hook sits inside the
         refit bubble, so that was pure generation-idle time.
 
-        ``resource_manager`` is unused here but is required by the
-        ``warmup_with_kv_cache_cleanup`` decorator, and is part of the signature
-        callers (including NeMo-RL) already pass.
+        Deliberately NOT decorated with ``warmup_with_kv_cache_cleanup``: that
+        decorator ends with ``check_invalid_values_in_kv_cache(fill_with_zero=
+        True)``, which zero-fills every attention KV pool whether or not it
+        found a NaN. It belongs after a capture warm-up that ran forwards on
+        placeholder inputs; this hook never runs a forward, and under an
+        in-flight weight update (``drain=False``) the zero-fill would wipe the
+        KV of every request kept across the refit. The wrapper also ran when
+        torch.compile is disabled, because the early return below happens
+        inside the wrapped method.
+
+        ``resource_manager`` is unused here; it stays in the signature because
+        callers (including NeMo-RL) already pass it.
         """
         if not self._torch_compile_enabled:
             return
