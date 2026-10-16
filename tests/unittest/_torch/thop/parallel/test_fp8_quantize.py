@@ -265,6 +265,15 @@ def test_mxfp8_quantize_tiny_block_is_finite(dtype, is_sf_swizzled_layout):
         "MXFP8 quantization produced non-finite values for near-zero blocks: "
         f"{a_f32}")
 
+    # Finite is not enough: a kernel that zeroed every tiny block would also pass. Blocks above
+    # the threshold must keep their signal; only the blocks at or below it may flush to zero.
+    block_heads = a_f32[0, ::32]
+    assert block_heads[5] != 0, "a block with amax 1.0 lost its value"
+    if dtype == torch.bfloat16:
+        # 2x the threshold is representable in bfloat16 (it flushes to zero in half).
+        assert block_heads[
+            4] != 0, "a block just above the threshold lost its value"
+
 
 def _run_megamoe_prepare(hidden_states, token_selected_experts,
                          token_final_scales):

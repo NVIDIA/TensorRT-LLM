@@ -413,6 +413,7 @@ def _request_flag(request, name: str) -> bool:
         value = value()
     return bool(value)
 
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -9679,21 +9680,27 @@ class PyExecutor:
                 transfer_bound.append(request)
             else:
                 requests_to_recompute.append(request)
-        print(
-            "TRTLLM_RECOMPUTE_ACTIVE_REQUESTS_CALLED "
-            f"active_requests={len(self.active_requests)} "
-            f"recompute={len(requests_to_recompute)} "
-            f"disagg_transfer_bound={len(transfer_bound)}",
-            flush=True,
-        )
+        logger.info(
+            f"recompute_active_requests: recomputing {len(requests_to_recompute)} "
+            f"of {len(self.active_requests)} active request(s)")
         if transfer_bound:
             logger.info(
                 "recompute_active_requests: leaving "
                 f"{len(transfer_bound)} disaggregated transfer-bound request(s) "
                 "untouched (their KV cache keeps the previous weights): "
                 f"{[r.py_request_id for r in transfer_bound[:8]]}")
-        self._terminate_requests(requests_to_recompute)
-        self._pause_requests(requests_to_recompute)
+
+        # The same teardown an immediate recompute pause does (see
+        # ``_resume_preempted_request``): free the execution resources, then
+        # reset the request for a re-prefill. Terminating instead would pop
+        # the request's response routing (``result_wait_queues``) and release
+        # its multimodal inputs, neither of which a continuing request can lose.
+        connector = getattr(self, "kv_connector_manager", None)
+        for request in requests_to_recompute:
+            if connector is not None:
+                connector.release_unstarted_prefix_loads(request)
+            self._free_request_resources(request)
+            self._pause_recompute_request(request)
 
         # free_resources() may register old-weight blocks for reuse. Clear the
         # reuse tree after the recomputed requests have released their caches.

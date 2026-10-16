@@ -1126,13 +1126,15 @@ class HfWeightLoader(BaseWeightLoader):
         # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
         if local_communicator is None:
             rank, size = local_mpi_rank(), local_mpi_size()
-            if size == 1:
+            if mpi_disabled():
                 # Under Ray orchestration MPI is disabled: local_mpi_size()
                 # falls back to 1 while local_mpi_rank() falls back to
                 # torch.cuda.current_device(), so the stride partition below
                 # degenerates to "every file from index <rank> onward" and
-                # each rank re-reads nearly the whole checkpoint (8x read
-                # amplification at TP8 over 2 nodes). Stride by the node's GPU
+                # each rank re-reads nearly the whole checkpoint. A plain
+                # single-process MPI run also has size 1 but one rank per
+                # node, so it keeps prefetching every file.
+                # Stride by the node's GPU
                 # count instead: the node's ranks then partition the file list
                 # and their union still covers every file, which is all
                 # prefetch exists for (the page cache is node-shared). A rank

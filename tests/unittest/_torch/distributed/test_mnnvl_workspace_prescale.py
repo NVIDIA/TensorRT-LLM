@@ -92,9 +92,9 @@ def test_prescale_covers_every_forward_size(tp4_mapping, monkeypatch):
     max_num_tokens, hidden_dim = 16384, 4096
     module.prescale_workspace(max_num_tokens, hidden_dim)
 
-    # Every reachable forward() call must fit: sample the token range on both
-    # sides of the one-shot/two-shot switch.
-    for num_tokens in (1, 8, 32, 33, 128, 1024, 1025, 8192, max_num_tokens):
+    # Every reachable forward() call must fit, including both sides of the one-shot/two-shot
+    # switch. The size is not monotonic across it, so check every count (pure arithmetic).
+    for num_tokens in range(1, max_num_tokens + 1):
         needed = MNNVLAllReduce.get_required_workspace_size(
             num_tokens, hidden_dim, tp4_mapping.tp_size, torch.bfloat16
         )

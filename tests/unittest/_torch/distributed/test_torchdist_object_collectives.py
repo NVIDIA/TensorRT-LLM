@@ -29,7 +29,9 @@ Multi-process, no Ray: run inside a container with >= 2 GPUs as
     TLLM_DISABLE_MPI=1 torchrun --nproc_per_node=2 -m pytest \\
         tests/unittest/_torch/distributed/test_torchdist_object_collectives.py -q
 
-The tests skip when not launched that way.
+The tests skip when not launched that way. No CI list launches this module under ``torchrun``
+(the ``unittest/_torch/distributed`` entry only runs it in the CPU stage, where it skips), so
+it is a local and QA test until a multi-GPU stage launches it.
 """
 
 import datetime

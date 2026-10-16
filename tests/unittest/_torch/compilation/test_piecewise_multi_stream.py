@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Piecewise CUDA graphs with max_num_streams > 1: the auto multi-stream scheduler costs the graph
 by kernel class and overlaps independent branches."""
+
 import torch
 
 import tensorrt_llm._torch.compilation.multi_stream.auto_multi_stream as ams
@@ -13,7 +14,6 @@ def test_schedule_overlaps_independent_branches():
     on a cross-stream event and the simulated makespan is shorter than serial execution."""
 
     class Block(torch.nn.Module):
-
         def forward(self, h, w_router, w_routed, w_up, w_down):
             logits = torch.ops.aten.mm.default(h, w_router)
             routed = torch.ops.aten.mm.default(logits, w_routed)
