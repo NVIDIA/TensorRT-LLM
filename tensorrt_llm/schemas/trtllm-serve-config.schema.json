@@ -4420,7 +4420,7 @@
       "description": "Configuration for NVFP4 GEMM backend selection.",
       "properties": {
         "allowed_backends": {
-          "description": "List of backends to consider for auto-selection. Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme performance at the cost of longer server launch time.",
+          "description": "List of backends to consider for auto-selection.",
           "items": {
             "enum": [
               "cutlass",
