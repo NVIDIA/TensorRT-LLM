@@ -27,8 +27,8 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PositionalEmbeddingParams,
     merge_attention_forward_args,
 )
-from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import MixedPrecisionKVRows
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.kv_cache_conversion import encode_high_precision_kv
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
@@ -457,19 +457,18 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
-            high_rows = MixedPrecisionKVRows.create(
-                metadata,
-                int(
-                    kv_cache_manager._layer_attn_to_layer_id[
-                        layer_idx, DeepseekV4AttentionType.COMPRESS
-                    ]
-                ),
-                DeepseekV4AttentionType.COMPRESS.role,
+            high_kv = metadata.get_high_precision_kv_indices(
+                layer_idx, req_id[:, None], compressed_local_indices
             )
-            if high_rows is not None:
+            if high_kv is not None:
                 # Match the native sparse Attention input format (FP8).
-                high_rows.overlay(
-                    scratch, compressed_indices, req_id[:, None], compressed_local_indices
+                pool, pages, offsets, valid = high_kv
+                destinations = compressed_indices.reshape(-1).long()
+                valid &= destinations >= 0
+                values = pool.view(torch.uint8)[pages[valid], offsets[valid]].view(pool.dtype)
+                values = encode_high_precision_kv(values, scratch.dtype)
+                scratch.view(-1, 1, self.head_dim).view(torch.uint8)[destinations[valid]] = (
+                    values.view(torch.uint8)
                 )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices

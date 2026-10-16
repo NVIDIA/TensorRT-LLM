@@ -10,10 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
-from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import MixedPrecisionKVRows
+from tensorrt_llm._torch.attention.kv_cache_conversion import encode_high_precision_kv
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 
 from .params import DeepseekV4AttentionType
 
@@ -290,16 +291,17 @@ class Compressor(nn.Module):
         quant_output = None
         scale_output = None
         manager = metadata.kv_cache_manager
-        high_rows = (
-            MixedPrecisionKVRows.create(
-                metadata,
-                int(manager._layer_attn_to_layer_id[self.layer_idx, compress_type]),
-                compress_type.role,
+        high_kv = None
+        if not self.is_indexer and isinstance(manager, MixedPrecisionKVCacheManager):
+            row_indices = torch.arange(total_tokens, device=kv_comp.device)
+            requests = torch.searchsorted(cu_new_comp_kv[1 : bsz + 1], row_indices, right=True)
+            valid_requests = requests < bsz
+            requests = requests.clamp_max(bsz - 1)
+            local_rows = row_indices - cu_new_comp_kv[requests]
+            high_kv = metadata.get_high_precision_kv_indices(
+                self.layer_idx, requests, start_pos[requests] + local_rows
             )
-            if not self.is_indexer
-            else None
-        )
-        if high_rows is not None:
+        if high_kv is not None:
             if self.kv_cache_dtype != KVCacheDtype.NVFP4_BLOCKWISE:
                 raise ValueError("Mixed-precision CSA requires the native NVFP4 compressor writer")
             kv_out = torch.empty_like(kv_comp)
@@ -367,14 +369,11 @@ class Compressor(nn.Module):
             scale_output,
         )
 
-        if high_rows is not None:
-            row_indices = torch.arange(total_tokens, device=kv_comp.device)
-            requests = torch.searchsorted(cu_new_comp_kv[1 : bsz + 1], row_indices, right=True)
-            valid_requests = requests < bsz
-            requests = requests.clamp_max(bsz - 1)
-            local_rows = row_indices - cu_new_comp_kv[requests]
-            valid = compressed_mask & valid_requests & (local_rows < num_comp_tokens[requests])
-            high_rows.store(kv_out, requests, start_pos[requests] + local_rows, valid)
+        if high_kv is not None:
+            pool, pages, offsets, valid = high_kv
+            valid &= compressed_mask & valid_requests & (local_rows < num_comp_tokens[requests])
+            values = encode_high_precision_kv(kv_out[valid].view(-1, 1, self.head_dim), pool.dtype)
+            pool.view(torch.uint8)[pages[valid], offsets[valid]] = values.view(torch.uint8)
             # Keep the compressor's ordinary return contract unchanged.
             kv_out = None
 

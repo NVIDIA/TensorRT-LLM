@@ -15,7 +15,6 @@ import torch
 
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, DataRole
 
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from ..kv_cache_conversion import dequantize_nvfp4_kv, encode_high_precision_kv, quantize_nvfp4_kv
@@ -26,12 +25,9 @@ if TYPE_CHECKING:
 
 class _TokenLocations(NamedTuple):
     staging: torch.Tensor
-    staging_offset: torch.Tensor
     history: torch.Tensor
     scales: torch.Tensor
     high: torch.Tensor
-    offset: torch.Tensor
-    high_rows: torch.Tensor
 
 
 class MixedPrecisionKVView:
@@ -84,26 +80,26 @@ class MixedPrecisionKVView:
         history_dequant_scale: torch.Tensor | None,
         max_page_size: int | None,
     ) -> None:
-        self.manager = metadata.kv_cache_manager
+        manager = metadata.kv_cache_manager
         self.layout = metadata.kv_layout
-        self.block_size = self.manager.tokens_per_block
+        self.block_size = manager.tokens_per_block
         self.tokens_per_block = min(self.block_size, max_page_size or self.block_size)
         if self.block_size % self.tokens_per_block:
             raise ValueError("Staging pages must divide the owning cache's block size")
-        self.history = self.manager.get_buffers(layer_idx, kv_layout=self.layout)
-        (self.high, self.high_ids), (self.scales, self.scale_ids) = (
-            self.manager.get_mixed_precision_buffers(layer_idx, metadata.request_ids, self.layout)
+        self.history = manager.get_buffers(layer_idx, kv_layout=self.layout)
+        (self.high, high_ids), (self.scales, scale_ids) = manager.get_mixed_precision_buffers(
+            layer_idx, metadata.request_ids, self.layout
         )
-        self.history_ids = self.manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
-        self.cached_lengths = list(metadata.kv_cache_params.num_cached_tokens_per_seq)
-        self.lengths = [a + b for a, b in zip(self.cached_lengths, metadata.seq_lens.tolist())]
+        history_ids = manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
+        cached_lengths = metadata.kv_cache_params.num_cached_tokens_per_seq
+        lengths = [a + b for a, b in zip(cached_lengths, metadata.seq_lens.tolist())]
         self.page_counts = [
-            (length + self.tokens_per_block - 1) // self.tokens_per_block for length in self.lengths
+            (length + self.tokens_per_block - 1) // self.tokens_per_block for length in lengths
         ]
         self.page_starts = list(accumulate(self.page_counts, initial=0))
         shape = [max(1, self.page_starts[-1]), *self.high.shape[1:]]
         shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
-        self.pool = self.manager.get_staging_buffer(shape, dtype)
+        self.pool = manager.get_staging_buffer(shape, dtype)
         self.pool.zero_()
         self.history_scale = (
             torch.ones(1, dtype=torch.float32, device=self.pool.device)
@@ -112,22 +108,24 @@ class MixedPrecisionKVView:
         )
         if self.history_scale.numel() != 1:
             raise ValueError("Dense NVFP4 KV conversion requires one per-tensor scale")
-        self.max_seq_len = self.manager.max_seq_len
+        self.max_seq_len = manager.max_seq_len
         self.layer_offsets = {layer_idx: 0}
         self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
         self.max_attention_window_vec = (None,)
-        cached = self._locations(new_tokens=False)
-        self.new_tokens = self._locations(new_tokens=True)
-        if cached.history.numel():
-            packed = self._gather(self.history, cached.history, cached.offset)
-            scales = self._gather(self.scales, cached.scales, cached.offset)
+        tables = (history_ids, scale_ids, high_ids)
+        cached = self._locations([0] * len(lengths), cached_lengths, tables)
+        self.new_tokens = self._locations(cached_lengths, lengths, tables)
+        low_rows = torch.nonzero(cached.high < 0).flatten()
+        if low_rows.numel():
+            packed = self._gather(self.history, cached.history[low_rows])
+            scales = self._gather(self.scales, cached.scales[low_rows])
             values = dequantize_nvfp4_kv(packed, scales, self.history_scale, dtype)
-            self._scatter(self.pool, cached.staging, cached.staging_offset, values)
-        if cached.high_rows.numel():
-            rows = cached.high_rows
-            values = self._gather(self.high, cached.high[rows], cached.offset[rows]).to(dtype)
-            self._scatter(self.pool, cached.staging[rows], cached.staging_offset[rows], values)
+            self._scatter(self.pool, cached.staging[low_rows], values)
+        high_rows = torch.nonzero(cached.high >= 0).flatten()
+        if high_rows.numel():
+            values = self._gather(self.high, cached.high[high_rows]).to(dtype)
+            self._scatter(self.pool, cached.staging[high_rows], values)
 
     @property
     def dtype(self) -> DataType:
@@ -142,50 +140,52 @@ class MixedPrecisionKVView:
     def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
         return 1
 
-    def _locations(self, *, new_tokens: bool) -> _TokenLocations:
-        """Build batched token addresses from native page tables on the host."""
+    def _locations(
+        self,
+        begins: list[int],
+        ends: list[int],
+        page_tables: tuple[list[list[int]], list[list[int]], list[list[int]]],
+    ) -> _TokenLocations:
+        """Map logical tokens to flat token indices in each native pool."""
         tables = []
-        for row, (cached, length) in enumerate(zip(self.cached_lengths, self.lengths)):
-            if length > min(len(self.history_ids[row]), len(self.scale_ids[row])) * self.block_size:
+        for row, (begin, end, history, scales, high) in enumerate(zip(begins, ends, *page_tables)):
+            if end > min(len(history), len(scales)) * self.block_size:
                 raise ValueError("Mixed-precision history does not cover the requested KV length")
-            positions = torch.arange(cached if new_tokens else 0, length if new_tokens else cached)
+            positions = torch.arange(begin, end)
             ordinals = positions // self.block_size
-            history = torch.tensor(self.history_ids[row], dtype=torch.int64)[ordinals]
-            scales = torch.tensor(self.scale_ids[row], dtype=torch.int64)[ordinals]
-            if torch.any(history < 0) or torch.any(scales < 0):
+            history_pages = torch.tensor(history, dtype=torch.int64)[ordinals]
+            scale_pages = torch.tensor(scales, dtype=torch.int64)[ordinals]
+            if torch.any(history_pages < 0) or torch.any(scale_pages < 0):
                 raise ValueError(
                     "Mixed-precision Attention requires existing NVFP4 data and scales"
                 )
-            high = torch.full((len(self.history_ids[row]),), -1, dtype=torch.int64)
-            high[: len(self.high_ids[row])] = torch.tensor(self.high_ids[row], dtype=torch.int64)
+            high_pages = torch.tensor(high + [-1] * (len(history) - len(high)), dtype=torch.int64)
+            offsets = positions % self.block_size
             tables.append(
                 torch.stack(
                     (
-                        self.page_starts[row] + positions // self.tokens_per_block,
-                        positions % self.tokens_per_block,
-                        history,
-                        scales,
-                        high[ordinals],
-                        positions % self.block_size,
+                        self.page_starts[row] * self.tokens_per_block + positions,
+                        history_pages * self.block_size + offsets,
+                        scale_pages * self.block_size + offsets,
+                        high_pages[ordinals] * self.block_size + offsets,
                     )
                 )
             )
-        table = torch.cat(tables, dim=1) if tables else torch.empty((6, 0), dtype=torch.int64)
-        high_rows = torch.nonzero(table[4] >= 0).flatten().to(self.pool.device)
-        return _TokenLocations(*table.to(self.pool.device).unbind(), high_rows)
+        table = torch.cat(tables, dim=1) if tables else torch.empty((4, 0), dtype=torch.int64)
+        return _TokenLocations(*table.to(self.pool.device).unbind())
 
-    def _gather(
-        self, pool: torch.Tensor, pages: torch.Tensor, offsets: torch.Tensor
-    ) -> torch.Tensor:
+    def _gather(self, pool: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         view = pool.transpose(2, 3) if self.layout == "HND" else pool
         # Byte indexing also works for FP8, without invoking arithmetic on it.
-        return view.view(torch.uint8)[pages, :, offsets].view(pool.dtype)
+        return view.view(torch.uint8)[indices // view.shape[2], :, indices % view.shape[2]].view(
+            pool.dtype
+        )
 
-    def _scatter(
-        self, pool: torch.Tensor, pages: torch.Tensor, offsets: torch.Tensor, values: torch.Tensor
-    ) -> None:
+    def _scatter(self, pool: torch.Tensor, indices: torch.Tensor, values: torch.Tensor) -> None:
         view = pool.transpose(2, 3) if self.layout == "HND" else pool
-        view.view(torch.uint8)[pages, :, offsets] = values.contiguous().view(torch.uint8)
+        view.view(torch.uint8)[indices // view.shape[2], :, indices % view.shape[2]] = (
+            values.contiguous().view(torch.uint8)
+        )
 
     def block_offsets(self) -> torch.Tensor:
         width = (self.max_seq_len + self.tokens_per_block - 1) // self.tokens_per_block
@@ -200,91 +200,11 @@ class MixedPrecisionKVView:
         locations = self.new_tokens
         if not locations.history.numel():
             return
-        values = self._gather(self.pool, locations.staging, locations.staging_offset)
+        values = self._gather(self.pool, locations.staging)
         packed, scales = quantize_nvfp4_kv(values, self.history_scale)
-        self._scatter(self.history, locations.history, locations.offset, packed)
-        self._scatter(self.scales, locations.scales, locations.offset, scales)
-        if locations.high_rows.numel():
-            rows = locations.high_rows
+        self._scatter(self.history, locations.history, packed)
+        self._scatter(self.scales, locations.scales, scales)
+        rows = torch.nonzero(locations.high >= 0).flatten()
+        if rows.numel():
             high_values = encode_high_precision_kv(values[rows], self.high.dtype)
-            self._scatter(self.high, locations.high[rows], locations.offset[rows], high_values)
-
-
-class MixedPrecisionKVRows:
-    """Copy fresh model-native rows to SWA and select them after the native gather."""
-
-    @classmethod
-    def create(
-        cls, metadata: "AttentionMetadata", layer_id: int, role: DataRole
-    ) -> "MixedPrecisionKVRows | None":
-        manager = metadata.kv_cache_manager
-        if (
-            not isinstance(manager, MixedPrecisionKVCacheManager)
-            or layer_id not in manager.high_layers
-        ):
-            return None
-        if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
-            raise NotImplementedError("Mixed-precision row selection requires eager execution")
-        return cls(manager, layer_id, role, metadata.request_ids)
-
-    def __init__(
-        self,
-        manager: MixedPrecisionKVCacheManager,
-        layer_id: int,
-        role: DataRole,
-        request_ids: list[int],
-    ) -> None:
-        self.pool, tables = manager.get_high_precision_rows(layer_id, role, request_ids)
-        self.rows_per_block = manager.high_layouts[layer_id].rows_per_block
-        width = max((len(row) for row in tables), default=0)
-        table = torch.full((max(1, len(tables)), max(1, width)), BAD_PAGE_INDEX, dtype=torch.int64)
-        for index, row in enumerate(tables):
-            table[index, : len(row)] = torch.tensor(row, dtype=torch.int64)
-        self.table = table.to(self.pool.device)
-
-    def _locations(
-        self, requests: torch.Tensor, rows: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        requests, rows = torch.broadcast_tensors(requests, rows)
-        requests, rows = requests.reshape(-1).long(), rows.reshape(-1).long()
-        blocks = rows // self.rows_per_block
-        valid = (requests >= 0) & (requests < self.table.shape[0]) & (rows >= 0)
-        valid &= blocks < self.table.shape[1]
-        pages = self.table[
-            requests.clamp(0, self.table.shape[0] - 1), blocks.clamp(0, self.table.shape[1] - 1)
-        ]
-        valid &= pages >= 0
-        return pages, rows % self.rows_per_block, valid
-
-    def store(
-        self,
-        values: torch.Tensor,
-        requests: torch.Tensor,
-        rows: torch.Tensor,
-        valid: torch.Tensor,
-    ) -> None:
-        """Store only valid new writes, before any NVFP4 round trip."""
-        pages, offsets, selected = self._locations(requests, rows)
-        selected &= valid.reshape(-1)
-        source = values.reshape(-1, *self.pool.shape[2:])[selected]
-        encoded = encode_high_precision_kv(source, self.pool.dtype)
-        self.pool.view(torch.uint8)[pages[selected], offsets[selected]] = encoded.view(torch.uint8)
-
-    def overlay(
-        self,
-        output: torch.Tensor,
-        output_rows: torch.Tensor,
-        requests: torch.Tensor,
-        rows: torch.Tensor,
-    ) -> None:
-        """Replace gathered low-precision rows only where native SWA retains high KV."""
-        pages, offsets, selected = self._locations(requests, rows)
-        destinations = output_rows.reshape(-1).long()
-        selected &= destinations >= 0
-        values = self.pool.view(torch.uint8)[pages[selected], offsets[selected]].view(
-            self.pool.dtype
-        )
-        values = encode_high_precision_kv(values, output.dtype)
-        output.view(-1, *self.pool.shape[2:]).view(torch.uint8)[destinations[selected]] = (
-            values.view(torch.uint8)
-        )
+            self._scatter(self.high, locations.high[rows], high_values)

@@ -6915,8 +6915,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             + get_size_in_bytes(elements, DataType.NVFP4)
             + self.calculate_scaling_factor_size_bytes(elements, 16, DataType.FP8)
         )
-        # Six token addresses plus selected-high row indices, and the paged table.
-        reserve += self.max_batch_size * self.max_seq_len * 7 * 8 + pages * self.kv_factor * 4
+        # Four flat token addresses plus source-selection indices, and the paged table.
+        reserve += self.max_batch_size * self.max_seq_len * 5 * 8 + pages * self.kv_factor * 4
         tiers = []
         for tier in config.cache_tiers:
             if isinstance(tier, GpuCacheTierConfig):

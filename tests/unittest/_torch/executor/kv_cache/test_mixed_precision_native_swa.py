@@ -9,7 +9,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import MixedPrecisionKVRows
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+    DeepseekV4TrtllmAttentionMetadata,
+)
+from tensorrt_llm._torch.attention.kv_cache_conversion import encode_high_precision_kv
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     MixedPrecisionKVCacheManager,
@@ -267,6 +270,22 @@ def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
         last_n=128,
         **kwargs,
     )
+
+    def row_locations(layer_id, role, rows):
+        if family != "dsa":
+            layer_idx, _ = manager._manager_layer_id_to_layer_attn[layer_id, role]
+            metadata = SimpleNamespace(
+                kv_cache_manager=manager, request_ids=[0], is_cuda_graph=False
+            )
+            return DeepseekV4TrtllmAttentionMetadata.get_high_precision_kv_indices(
+                metadata, layer_idx, torch.zeros_like(rows), rows
+            )
+        pool, tables = manager.get_high_precision_rows(layer_id, role, [0])
+        blocks = rows // pool.shape[1]
+        pages = torch.tensor(tables[0], device="cuda")[blocks.clamp(0, len(tables[0]) - 1)]
+        valid = (rows >= 0) & (blocks < len(tables[0])) & (pages >= 0)
+        return pool, pages, rows % pool.shape[1], valid
+
     cache = None
     try:
         assert isinstance(manager, manager_cls)
@@ -307,23 +326,26 @@ def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
                     .to(torch.bfloat16)
                     .view(-1, 1, spec.head_dim)
                 )
-                selected = MixedPrecisionKVRows(manager, layer_id, buffer.role, [0])
-                selected.store(values, torch.zeros_like(rows), rows, rows >= 0)
+                pool, pages, offsets, valid = row_locations(layer_id, buffer.role, rows)
+                encoded = encode_high_precision_kv(values[valid], pool.dtype)
+                pool.view(torch.uint8)[pages[valid], offsets[valid]] = encoded.view(torch.uint8)
                 written.append((layer_id, buffer.role, rows, values))
 
         cache.commit(list(range(640)))
         cache.suspend()
         assert cache.resume(torch.cuda.current_stream().cuda_stream, is_decoding=True)
         for layer_id, role, rows, values in written:
-            selected = MixedPrecisionKVRows(manager, layer_id, role, [0])
+            pool, pages, offsets, valid = row_locations(layer_id, role, rows)
             output = torch.full_like(values, -1)
-            selected.overlay(
-                output, torch.arange(len(rows), device="cuda"), torch.zeros_like(rows), rows
+            output[valid] = (
+                pool.view(torch.uint8)[pages[valid], offsets[valid]]
+                .view(pool.dtype)
+                .to(output.dtype)
             )
             block_rows = manager.high_layouts[layer_id].rows_per_block
             retained = (rows >= 0) & ((rows < block_rows) | (rows >= 4 * block_rows))
             expected = torch.full_like(values, -1)
-            expected[retained] = values[retained].to(selected.pool.dtype).to(values.dtype)
+            expected[retained] = values[retained].to(pool.dtype).to(values.dtype)
             torch.testing.assert_close(output, expected, atol=0, rtol=0)
     finally:
         manager.kv_cache_map.pop(0, None)
