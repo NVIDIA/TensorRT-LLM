@@ -28,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     merge_helix_requests,
     merge_requests,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _CachingRequestGrouper
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
@@ -229,18 +229,11 @@ def test_logprob_flag_is_python_owned(enabled, mode) -> None:
     if enabled:
         assert request.child_requests[0].py_result._log_probs is not request.py_result._log_probs
     request.py_logprobs_mode = mode
-    grouper = _CachingRequestGrouper(max_num_sequences=1)
-    grouper.prepare_for_new_request(request, 0)
-    groups, raw_mask = grouper.group_requests_by_strategy_key(
-        [request],
-        strategy_to_key=lambda strategy: strategy,
-        seq_slots=torch.tensor([0]),
-        vocab_size=16,
-    )
-    assert raw_mask.tolist() == [enabled and mode == LogprobMode.RAW]
-    assert next(iter(groups.values())).need_processed_logprobs.tolist() == [
-        enabled and mode == LogprobMode.PROCESSED
-    ]
+    request.py_seq_slot = 0
+    slot_params = SlotSamplingParams(num_slots=1, device="cpu")
+    slot_params.admit([request], torch.tensor([0]))
+    assert slot_params.need_raw_logprobs == [enabled and mode == LogprobMode.RAW]
+    assert slot_params.need_processed_logprobs == [enabled and mode == LogprobMode.PROCESSED]
 
 
 @pytest.mark.parametrize("streaming", [False, True])
