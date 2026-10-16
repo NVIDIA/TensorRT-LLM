@@ -67,6 +67,7 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
     monkeypatch.setattr(attention, "forward_decode", forward_decode)
     layer_cache = SimpleNamespace(
         conv=torch.empty(4, 3 * attention.proj_size, attention.conv_size),
+        has_kda_replay_caches=False,
         temporal=torch.empty(
             4,
             attention.num_heads,
@@ -93,8 +94,73 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
     assert captured["ssm_state_indices"].data_ptr() == state_indices.data_ptr()
 
 
+def test_forward_routes_single_token_kda_replay_through_verify(monkeypatch):
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0)
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    replay_metadata = object()
+    dummy_mask = torch.tensor([False, True])
+    captured = {}
+
+    def forward_decode(*args, **kwargs):
+        pytest.fail("single-token KDA replay must not use plain decode")
+
+    def forward_verify(
+        hidden_states,
+        num_steps,
+        layer_cache,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        **kwargs,
+    ):
+        captured["num_steps"] = num_steps
+        captured["slot_indices"] = slot_indices
+        captured["replay_metadata"] = kwargs["replay_metadata"]
+        captured["is_dummy"] = kwargs["is_dummy"]
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(attention, "forward_decode", forward_decode)
+    monkeypatch.setattr(attention, "forward_verify", forward_verify)
+    layer_cache = SimpleNamespace(
+        conv=torch.empty(4, 3 * attention.proj_size, attention.conv_size),
+        has_kda_replay_caches=True,
+        temporal=torch.empty(
+            4,
+            attention.num_heads,
+            attention.head_dim,
+            attention.head_k_dim,
+        ),
+    )
+    cache_manager = SimpleNamespace(
+        get_replay_dummy_request_mask=lambda: dummy_mask,
+        get_replay_state_update_metadata=lambda: replay_metadata,
+        mamba_layer_cache=lambda _: layer_cache,
+    )
+    metadata = SimpleNamespace(
+        mamba_metadata=SimpleNamespace(
+            state_indices=state_indices,
+            query_start_loc_long=torch.zeros(1, dtype=torch.long),
+        ),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_tokens=2,
+        seq_lens=torch.tensor([1, 1]),
+        kv_cache_manager=cache_manager,
+    )
+
+    output = attention._forward_impl(
+        torch.empty(2, _Cfg.hidden_size, dtype=torch.bfloat16), metadata
+    )
+
+    assert output.shape == (2, _Cfg.hidden_size)
+    assert captured["num_steps"] == 1
+    assert captured["slot_indices"].data_ptr() == state_indices.data_ptr()
+    assert captured["replay_metadata"] is replay_metadata
+    torch.testing.assert_close(captured["is_dummy"], dummy_mask)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_forward_uses_metadata_aligned_generation_state_indices(
+def test_forward_uses_generation_state_indices_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).cuda()
@@ -112,6 +178,8 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         conv_pool: torch.Tensor,
         ssm_pool: torch.Tensor,
         slot_indices: torch.Tensor,
+        replay_metadata=None,
+        is_dummy: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
@@ -122,11 +190,10 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     layer_cache = SimpleNamespace(
         conv=torch.empty(0, device="cuda"),
         temporal=torch.empty(0, device="cuda"),
+        has_kda_replay_caches=False,
     )
 
     class KdaCacheManager:
-        use_kda_replay_update = True
-
         def __init__(self) -> None:
             self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
 
@@ -154,16 +221,13 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     metadata.mamba_metadata = mamba_metadata
     hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
     generation_slice = mamba_metadata.state_indices[1:]
-    aligned_indices = mamba_metadata.generation_state_indices
 
     assert generation_slice.data_ptr() % 16 != 0
-    assert aligned_indices.data_ptr() % 16 == 0
 
     output = attention(hidden_states, metadata)
 
     assert output.shape == hidden_states.shape
-    assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
-    torch.testing.assert_close(aligned_indices, generation_slice)
+    assert captured["slot_indices"].data_ptr() == generation_slice.data_ptr()
 
 
 class _LayerCache:
@@ -176,8 +240,8 @@ class _LayerCache:
         self.intermediate_ssm = torch.zeros(
             slots, t_max, h, v, k, dtype=torch.float32, device=device
         )
-        # This double drives the sequential-verify path, not the KDA
-        # fused-replay path, so it has no kda_* replay caches.
+        # This double drives the sequential-verify path, so it has no KDA
+        # replay histories.
         self.has_kda_replay_caches = False
 
 

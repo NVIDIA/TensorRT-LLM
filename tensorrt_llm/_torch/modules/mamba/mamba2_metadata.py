@@ -102,6 +102,52 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
     )
 
 
+@triton.jit
+def _prepare_kda_replay_work_items_kernel(
+    state_indices,
+    history_len,
+    work_items,
+    n_writes_output,
+    num_decodes,
+    work_item_width: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Snapshot slot and history metadata before the per-layer replay loop."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    active = offsets < num_decodes
+    slots = tl.load(state_indices + offsets, mask=active, other=0)
+    lengths = tl.load(history_len + slots, mask=active, other=0)
+    output_base = work_items + offsets * work_item_width
+    tl.store(output_base, offsets, mask=active)
+    tl.store(output_base + 1, slots, mask=active)
+    tl.store(output_base + 2, lengths, mask=active)
+    tl.store(output_base + 3, 0, mask=active)
+    if tl.program_id(0) == 0:
+        tl.store(n_writes_output, 0)
+
+
+def _build_kda_replay_work_items(
+    state_indices: torch.Tensor,
+    history_len: torch.Tensor,
+    work_items: torch.Tensor,
+    n_writes: torch.Tensor,
+) -> None:
+    """Build immutable work rows for the split KDA replay commit."""
+    num_decodes = state_indices.shape[0]
+    block_size = 256
+    _prepare_kda_replay_work_items_kernel[(triton.cdiv(
+        num_decodes, block_size), )](
+            state_indices,
+            history_len,
+            work_items,
+            n_writes,
+            num_decodes,
+            work_item_width=REPLAY_WORK_ITEM_WIDTH,
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
+
+
 def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    cache_buf_idx, work_items, n_writes,
                                    replay_step_width, replay_history_size):
@@ -431,6 +477,15 @@ class Mamba2Metadata:
         cache_buf_idx = replay_metadata.cache_buf_idx
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
+
+        if getattr(kv_cache_manager, "use_kda_replay_update", False):
+            _build_kda_replay_work_items(
+                self.state_indices[num_contexts:batch_size],
+                replay_metadata.history_len,
+                self.replay_work_items,
+                self.replay_n_writes,
+            )
+            return
 
         if (use_gdn_all_layer_commit
                 and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
