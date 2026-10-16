@@ -2708,6 +2708,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # Key and Value
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
+        has_fp8_kv_cache = kv_cache.dtype == torch.float8_e4m3fn
 
         # VSWA: swap in the correct pool's page indices for this layer
         # before both the KV cache append and the attention plan/run.
@@ -2717,9 +2718,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-            if self.has_fp8_kv_cache:
-                assert kv_cache.dtype == torch.float8_e4m3fn, (
-                    f"KV cache should have fp8 dtype, but get {kv_cache.dtype}")
+            if has_fp8_kv_cache:
                 k = k.to(torch.float8_e4m3fn)
                 v = v.to(torch.float8_e4m3fn)
             assert k.dtype == v.dtype == kv_cache.dtype, (
@@ -2741,7 +2740,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # (QkvE4m3OBfloat16) can be used.  trtllm-gen context cubins
         # require same Q/KV dtype; only decode cubins support mixed dtypes.
         # Guard on flashinfer_backend to avoid affecting fa2/fa3 paths.
-        if (self.flashinfer_backend == "trtllm-gen" and self.has_fp8_kv_cache
+        if (self.flashinfer_backend == "trtllm-gen" and has_fp8_kv_cache
                 and q.dtype != kv_cache.dtype):
             q = q.to(kv_cache.dtype)
 
@@ -2868,26 +2867,23 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             if k is None or v is None:
                 raise NotImplementedError(
                     "Mixed-precision staging requires new K/V inputs")
-            staged_meta = copy.copy(metadata)
-            staged_meta.kv_cache_manager = staged
+            metadata = copy.copy(metadata)
+            metadata.kv_cache_manager = staged
             # Keep the native prepared row lengths, append positions and CSR
             # boundaries, replacing only the pages consumed by the wrappers.
             if list(metadata.num_blocks) != staged.page_counts:
                 raise NotImplementedError(
                     "Mixed-precision staging requires logical page tables")
-            staged_meta._host_paged_kv_indices = torch.arange(sum(
+            metadata._host_paged_kv_indices = torch.arange(sum(
                 staged.page_counts),
-                                                              dtype=torch.int32)
-            staged_meta._paged_kv_indices = staged_meta._host_paged_kv_indices.to(
+                                                           dtype=torch.int32)
+            metadata._paged_kv_indices = metadata._host_paged_kv_indices.to(
                 q.device)
-            staged_meta._vswa_layer_to_pool = None
-            staged_meta._vswa_active_pool_id = None
-            staged_meta._plan_params_to_wrappers = {}
-            staged_attn = copy.copy(self)
-            staged_attn.has_fp8_kv_cache = False
-            result = staged_attn.forward(q, k, v, staged_meta, forward_args)
-            staged.writeback()
-            return result
+            metadata._vswa_layer_to_pool = None
+            metadata._vswa_active_pool_id = None
+            # Replan with the temporary page indices, retaining the wrappers.
+            for wrappers in metadata._plan_params_to_wrappers.values():
+                wrappers.is_planned = False
 
         attention_mask_data = forward_args.attention_mask_data
         latent_cache = forward_args.latent_cache
@@ -2949,4 +2945,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 type(self).__name__, self.layer_idx, metadata,
                 forward_args.attention_window_size, exc)
             raise
+        if staged is not None:
+            staged.writeback()
         return output

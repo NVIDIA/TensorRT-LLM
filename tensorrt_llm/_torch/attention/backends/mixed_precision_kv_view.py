@@ -8,6 +8,7 @@ backend writes new, post-RoPE K/V into that staging cache; writeback then stores
 both representations without quantizing the high copy through the low copy.
 """
 
+from itertools import accumulate
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -72,34 +73,24 @@ class MixedPrecisionKVView:
         max_page_size: int | None,
     ) -> None:
         self.manager = metadata.kv_cache_manager
-        self.layer_idx = layer_idx
-        self.request_ids = metadata.request_ids
         self.layout = metadata.kv_layout
         self.block_size = self.manager.tokens_per_block
-        self.stage_block_size = min(self.block_size, max_page_size or self.block_size)
-        if self.block_size % self.stage_block_size:
+        self.tokens_per_block = min(self.block_size, max_page_size or self.block_size)
+        if self.block_size % self.tokens_per_block:
             raise ValueError("Staging pages must divide the owning cache's block size")
         self.history = self.manager.get_buffers(layer_idx, kv_layout=self.layout)
-        self.high, self.high_ids = self.manager.get_high_precision_window(
-            layer_idx, self.request_ids, self.layout
+        (self.high, self.high_ids), (self.scales, self.scale_ids) = (
+            self.manager.get_mixed_precision_buffers(layer_idx, metadata.request_ids, self.layout)
         )
-        self.history_ids = self.manager.get_batch_cache_indices(self.request_ids, layer_idx)
-        self.scales, self.scale_ids = self.manager.get_history_block_scales(
-            layer_idx, self.request_ids, self.layout
-        )
+        self.history_ids = self.manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
         self.cached_lengths = list(metadata.kv_cache_params.num_cached_tokens_per_seq)
-        self.query_lengths = metadata.seq_lens.tolist()
-        self.lengths = [a + b for a, b in zip(self.cached_lengths, self.query_lengths)]
+        self.lengths = [a + b for a, b in zip(self.cached_lengths, metadata.seq_lens.tolist())]
         self.page_counts = [
-            (length + self.stage_block_size - 1) // self.stage_block_size for length in self.lengths
+            (length + self.tokens_per_block - 1) // self.tokens_per_block for length in self.lengths
         ]
-        self.page_ids = []
-        cursor = 0
-        for count in self.page_counts:
-            self.page_ids.append(list(range(cursor, cursor + count)))
-            cursor += count
-        shape = [max(1, cursor), *self.high.shape[1:]]
-        shape[3 if self.layout == "HND" else 2] = self.stage_block_size
+        self.page_starts = list(accumulate(self.page_counts, initial=0))
+        shape = [max(1, self.page_starts[-1]), *self.high.shape[1:]]
+        shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
         self.pool = self.manager.get_staging_buffer(shape, dtype)
         self.pool.zero_()
         self.history_scale = (
@@ -109,7 +100,6 @@ class MixedPrecisionKVView:
         )
         if self.history_scale.numel() != 1:
             raise ValueError("Dense NVFP4 KV conversion requires one per-tensor scale")
-        self.tokens_per_block = self.stage_block_size
         self.max_seq_len = self.manager.max_seq_len
         self.layer_offsets = {layer_idx: 0}
         self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
@@ -159,10 +149,8 @@ class MixedPrecisionKVView:
             tables.append(
                 torch.stack(
                     (
-                        torch.tensor(self.page_ids[row], dtype=torch.int64)[
-                            positions // self.stage_block_size
-                        ],
-                        positions % self.stage_block_size,
+                        self.page_starts[row] + positions // self.tokens_per_block,
+                        positions % self.tokens_per_block,
                         history,
                         scales,
                         high[ordinals],
@@ -188,21 +176,12 @@ class MixedPrecisionKVView:
         view.view(torch.uint8)[pages, :, offsets] = values.contiguous().view(torch.uint8)
 
     def block_offsets(self) -> torch.Tensor:
-        offsets = torch.full(
-            (
-                1,
-                len(self.page_ids),
-                2,
-                (self.manager.max_seq_len + self.stage_block_size - 1) // self.stage_block_size,
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        for row, ids in enumerate(self.page_ids):
-            indices = torch.tensor(ids, dtype=torch.int32)
-            offsets[0, row, 0, : len(ids)] = 2 * indices
-            offsets[0, row, 1, : len(ids)] = 2 * indices + 1
-        return offsets.to(self.pool.device)
+        width = (self.max_seq_len + self.tokens_per_block - 1) // self.tokens_per_block
+        ordinals = torch.arange(width, dtype=torch.int32)
+        pages = torch.tensor(self.page_starts[:-1], dtype=torch.int32)[:, None] + ordinals
+        offsets = torch.stack((2 * pages, 2 * pages + 1), dim=1)
+        valid = ordinals < torch.tensor(self.page_counts, dtype=torch.int32)[:, None]
+        return offsets.masked_fill(~valid[:, None], -1).unsqueeze(0).to(self.pool.device)
 
     def writeback(self) -> None:
         """Publish only newly computed tokens; never overwrite shared history."""

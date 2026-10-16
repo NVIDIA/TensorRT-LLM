@@ -6985,29 +6985,35 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             return None
         return super()._get_block_scale_role(role_a, layer_id)
 
-    def get_high_precision_window(
+    def get_mixed_precision_buffers(
         self, layer_idx: int, request_ids: list[int], kv_layout: str
-    ) -> tuple[torch.Tensor, list[list[int]]]:
-        """Return native SWA storage and its logical-to-physical page mapping."""
+    ) -> tuple[tuple[torch.Tensor, list[list[int]]], tuple[torch.Tensor, list[list[int]]]]:
+        """Return dense high KV and low block scales, each with its native page table."""
         local = self.layer_offsets[layer_idx]
-        high_id = self.high_layers[local]
-        address = self.impl.get_mem_pool_base_address(high_id, Role.KEY, PageIndexMode.SHARED)
-        shape = [
-            self.impl.get_page_index_upper_bound(high_id, Role.KEY) // self.kv_factor,
-            self.kv_factor,
-            self.tokens_per_block,
-            self.num_kv_heads_per_layer[local],
-            self.head_dim_per_layer[local],
-        ]
-        if kv_layout == "HND":
-            shape[2], shape[3] = shape[3], shape[2]
-        view = convert_to_torch_tensor(TensorWrapper(address, self.high_dtype, shape))
-        indices = self._get_batch_cache_indices_by_pool_id(
-            request_ids,
-            pool_id=int(self.impl.get_layer_group_id(high_id)),
-            index_scale=int(self.impl.get_page_index_converter(high_id, Role.KEY).scale),
-        )
-        return view, indices
+        width = self.head_dim_per_layer[local]
+        buffers = []
+        for layer, role, dtype, elements in (
+            (self.high_layers[local], Role.KEY, self.high_dtype, width),
+            (local, Role.KEY_BLOCK_SCALE, torch.uint8, width // 16),
+        ):
+            address = self.impl.get_mem_pool_base_address(layer, role, PageIndexMode.SHARED)
+            shape = [
+                self.impl.get_page_index_upper_bound(layer, role) // self.kv_factor,
+                self.kv_factor,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[local],
+                elements,
+            ]
+            if kv_layout == "HND":
+                shape[2], shape[3] = shape[3], shape[2]
+            view = convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
+            indices = self._get_batch_cache_indices_by_pool_id(
+                request_ids,
+                pool_id=int(self.impl.get_layer_group_id(layer)),
+                index_scale=int(self.impl.get_page_index_converter(layer, role).scale),
+            )
+            buffers.append((view, indices))
+        return buffers[0], buffers[1]
 
     def get_high_precision_rows(
         self, layer_id: int, role: DataRole, request_ids: list[int]
@@ -7028,30 +7034,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             pool_id=int(self.impl.get_layer_group_id(high_id)),
             index_scale=int(self.impl.get_page_index_converter(high_id, role).scale),
             is_kv_aggregate=False,
-        )
-        return view, indices
-
-    def get_history_block_scales(
-        self, layer_idx: int, request_ids: list[int], kv_layout: str
-    ) -> tuple[torch.Tensor, list[list[int]]]:
-        """Return linear NVFP4 scales using their own native page-index mapping."""
-        local = self.layer_offsets[layer_idx]
-        role = Role.KEY_BLOCK_SCALE
-        address = self.impl.get_mem_pool_base_address(local, role, PageIndexMode.SHARED)
-        shape = [
-            self.impl.get_page_index_upper_bound(local, role) // self.kv_factor,
-            self.kv_factor,
-            self.tokens_per_block,
-            self.num_kv_heads_per_layer[local],
-            self.head_dim_per_layer[local] // 16,
-        ]
-        if kv_layout == "HND":
-            shape[2], shape[3] = shape[3], shape[2]
-        view = convert_to_torch_tensor(TensorWrapper(address, torch.uint8, shape))
-        indices = self._get_batch_cache_indices_by_pool_id(
-            request_ids,
-            pool_id=int(self.impl.get_layer_group_id(local)),
-            index_scale=int(self.impl.get_page_index_converter(local, role).scale),
         )
         return view, indices
 

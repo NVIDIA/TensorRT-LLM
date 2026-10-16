@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Local GPU QA: exercise the optimized backends, not a reference fallback."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -67,6 +69,14 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
         num_kv_heads=heads,
         quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
     )
+    if backend is TrtllmAttention:
+        original_state = (
+            attention.quant_mode,
+            attention.has_fp8_kv_cache,
+            attention.has_fp4_kv_cache,
+            attention.local_layer_idx,
+            attention._fmha_manager,
+        )
     scale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
 
     def forward(begin, end, context):
@@ -106,7 +116,23 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
         )
         arena = manager._staging_buffer.data_ptr()
         history_before = manager.get_buffers(0, kv_layout="HND").clone()
-        scales_before = manager.get_history_block_scales(0, request_ids, "HND")[0].clone()
+        scales_before = manager.get_mixed_precision_buffers(0, request_ids, "HND")[1][0].clone()
+        if backend is TrtllmAttention:
+            selection_cache = attention._unquantized_fmha_manager
+            assert selection_cache is not None
+            with patch.object(attention, "_forward_impl", side_effect=RuntimeError("test failure")):
+                with pytest.raises(RuntimeError, match="test failure"):
+                    forward(0, length, True)
+            assert (
+                attention.quant_mode,
+                attention.has_fp8_kv_cache,
+                attention.has_fp4_kv_cache,
+                attention.local_layer_idx,
+                attention._fmha_manager,
+            ) == original_state
+            torch.testing.assert_close(
+                manager.get_buffers(0, kv_layout="HND"), history_before, rtol=0, atol=0
+            )
         for request_id in request_ids:
             cache = manager.kv_cache_map[request_id]
             assert cache.resize(None, length)
@@ -116,11 +142,21 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
         assert manager._staging_buffer.data_ptr() == arena
+        if backend is TrtllmAttention:
+            assert attention._unquantized_fmha_manager is selection_cache
+            assert (
+                attention.quant_mode,
+                attention.has_fp8_kv_cache,
+                attention.has_fp4_kv_cache,
+                attention.local_layer_idx,
+                attention._fmha_manager,
+            ) == original_state
         history = manager.get_buffers(0, kv_layout="HND").transpose(2, 3)
         all_history_ids = manager.get_batch_cache_indices(request_ids, 0)
-        scales, all_scale_ids = manager.get_history_block_scales(0, request_ids, "HND")
+        (high, all_high_ids), (scales, all_scale_ids) = manager.get_mixed_precision_buffers(
+            0, request_ids, "HND"
+        )
         scales = scales.transpose(2, 3)
-        high, all_high_ids = manager.get_high_precision_window(0, request_ids, "HND")
         high = high.transpose(2, 3)
         for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
             assert high_ids[0] >= 0 and high_ids[1:3] == [kv.BAD_PAGE_INDEX] * 2
