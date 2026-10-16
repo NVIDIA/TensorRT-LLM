@@ -1184,7 +1184,8 @@ class PyTorchModelEngine(ModelEngine):
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
-                                    max_batch_size=self.batch_size)
+                                    max_batch_size=self.batch_size,
+                                    max_seq_len=self.max_seq_len)
         if provider and prefetcher.register("mamba_ssd", provider):
             logger.info(f"[JIT prefetch] Mamba SSD provider: "
                         f"{len(provider.shapes)} distinct layer shape(s)")
@@ -1198,6 +1199,10 @@ class PyTorchModelEngine(ModelEngine):
         # Helpers were started when the prefetcher was created; make sure
         # their start-up is paid here, inside warmup, not by a request.
         prefetcher.wait_ready()
+        # Benchmark the untuned autotune keys the providers reach on the
+        # GPU now (their candidates compiled by the helpers), before the
+        # background enumeration fills the helpers' queue.
+        prefetcher.tune()
         prefetcher.start_background()
 
     def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,

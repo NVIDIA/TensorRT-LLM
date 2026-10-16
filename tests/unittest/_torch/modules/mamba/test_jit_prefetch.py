@@ -172,6 +172,126 @@ def test_enumeration_covers_real_launches(token_major, ctx_lens, any_cached):
     assert not missing, f"real launches the enumeration did not predict: {missing}"
 
 
+def _tune_keys(calls):
+    """(kernel, autotune key) of every autotuned launch with more than one
+    candidate config, i.e. every launch that can run the benchmark."""
+    keys = set()
+    for call in calls:
+        jit_fn, autotuner, _ = jp._unwrap_jit(call.fn)
+        if autotuner is not None and len(autotuner.configs) > 1:
+            keys.add(
+                (jit_fn.fn.__name__, jp._autotune_key(autotuner, None, call.args, call.kwargs))
+            )
+    return keys
+
+
+def _tune_provider(token_major, max_num_tokens=512, max_batch_size=64, max_seq_len=0):
+    s = _shape(token_major)
+    prov = mjp.MambaSSDProvider.__new__(mjp.MambaSSDProvider)
+    prov.shapes, prov._seen_keys = [s], set()
+    prov.max_num_tokens, prov.max_batch_size = max_num_tokens, max_batch_size
+    prov.max_seq_len = max_seq_len
+    return s, prov
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("token_major", [True, False])
+@pytest.mark.parametrize(
+    "ctx_lens,any_cached",
+    [([512], False), ([300, 212], False), ([300, 213], True), ([1, 511], True), ([17] * 3, True)],
+)
+def test_tune_batches_reach_every_autotune_key(token_major, ctx_lens, any_cached):
+    """The batches tune ahead runs reach the autotune key of every autotuned
+    launch any batch within the engine limits makes: a key does not depend
+    on the batch's size or sequence count."""
+    s, prov = _tune_provider(token_major)
+    batches = list(prov.tune_batches())
+    assert [b.any_ctx_cached for b in batches] == [False, True]
+    for b in batches:
+        assert sum(b.ctx_chunk_lens) == 512 and len(b.ctx_chunk_lens) == 64
+    reached = set()
+    for b in batches:
+        reached |= _tune_keys(prov(b, seen=set()))
+    missing = _tune_keys(_real_calls(s, ctx_lens, any_cached)) - reached
+    assert not missing, f"autotune keys tune ahead does not reach: {missing}"
+
+
+def test_tune_batches_respect_engine_limits(monkeypatch):
+    """The tune batch stays within max_num_tokens, the token cap, the batch
+    size and the per-sequence length limit; none without a Triton SSD layer."""
+    monkeypatch.setattr(mjp._MixerShape, "triton_ssd", False)
+    _, prov = _tune_provider(True)
+    assert list(prov.tune_batches()) == []
+    monkeypatch.setattr(mjp._MixerShape, "triton_ssd", True)
+    _, prov = _tune_provider(True, max_num_tokens=100_000, max_batch_size=8, max_seq_len=300)
+    lens = next(prov.tune_batches()).ctx_chunk_lens
+    assert sum(lens) == 8 * 299 and len(lens) == 8 and max(lens) <= 299
+    _, prov = _tune_provider(True, max_num_tokens=100_000, max_batch_size=512)
+    lens = next(prov.tune_batches()).ctx_chunk_lens
+    assert sum(lens) == mjp.MambaSSDProvider.TUNE_MAX_TOKENS
+    _, prov = _tune_provider(True, max_num_tokens=3, max_batch_size=64)
+    assert [b.ctx_chunk_lens for b in prov.tune_batches()] == [[1, 1, 1]] * 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.usefixtures("restore_triton_hooks")
+def test_tune_ahead_benchmarks_untuned_keys(monkeypatch):
+    """JitPrefetcher.tune runs the autotune benchmark of every untuned key of
+    the provider's tune batches on the GPU, so later batches of other sizes,
+    with and without cached prefixes, find each key tuned; a second call
+    runs no batch."""
+    import queue
+
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.delenv("TLLM_JIT_PREFETCH_TUNE", raising=False)
+    # No helpers here: the queued variants compile in process at launch.
+    monkeypatch.setenv("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "0")
+    monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
+    s, prov = _tune_provider(True, max_num_tokens=512, max_batch_size=8)
+    batches = list(prov.tune_batches())
+    tune_keys = set()
+    for batch in batches:
+        for call in prov(batch, seen=set()):
+            _, autotuner, _ = jp._unwrap_jit(call.fn)
+            if autotuner is not None:
+                autotuner.cache.clear()
+        tune_keys |= _tune_keys(prov(batch, seen=set()))
+    p = jp.JitPrefetcher(rank=0)
+    p._queues["triton"] = queue.PriorityQueue()
+    p.register("mamba_ssd", prov)
+    p.tune()
+    assert p.stats.ta_batches == len(batches) == 2
+    assert p.stats.ta_tunes == len(tune_keys) > 0
+    for lens, cached in (([37, 120, 211], True), ([37, 120, 211], False), ([300], False)):
+        later = _real_calls(s, lens, cached)
+        assert not [c.label for c in later if jp._untuned(c)], (lens, cached)
+    p.tune()
+    assert p.stats.ta_batches == 2
+    assert p.stats.ta_tunes == len(tune_keys)
+
+
+@pytest.mark.usefixtures("restore_triton_hooks")
+def test_tune_ahead_off(monkeypatch):
+    """TLLM_JIT_PREFETCH_TUNE=0 runs no tune batch."""
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setenv("TLLM_JIT_PREFETCH_TUNE", "0")
+    monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
+    ran = []
+
+    class Provider:
+        def __call__(self, batch_ctx, seen=None):
+            raise AssertionError("tune ahead is off")
+
+        def tune_batches(self):
+            ran.append(1)
+            return iter(())
+
+    p = jp.JitPrefetcher(rank=0)
+    p.register("p", Provider())
+    p.tune()
+    assert not ran and p.stats.ta_batches == 0
+
+
 @pytest.fixture
 def restore_triton_hooks():
     """A JitPrefetcher installs process-wide Triton hooks; restore them so a

@@ -30,6 +30,11 @@ Batch facts used, all known once the batch is scheduled:
 They decide every specialization that varies at runtime: ``HAS_INITSTATES``,
 the multi-sequence chunk-index kernel, and Triton's integer specialization of
 ``seqlen`` / token counts (== 1, % 16 == 0, otherwise).
+
+Tune ahead (``tune_batches`` / ``run_tune_batch``, see
+``JitPrefetcher.tune``): the same launchers run once more on the GPU, on
+scratch tensors, at the end of warmup, so the autotune keys of a batch with
+cached prefixes are benchmarked before serving.
 """
 
 from __future__ import annotations
@@ -67,6 +72,21 @@ class _MixerShape:
         )
         self.zxbcdt_width = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
 
+    @property
+    def triton_ssd(self) -> bool:
+        """Whether prefill runs the Triton SSD kernels: the same test as
+        ``ssd_combined.mamba_chunk_scan_combined`` (the mixer passes z=None),
+        else FlashInfer's fused SSD kernel runs instead."""
+        from tensorrt_llm._utils import is_sm_100f
+
+        from .ssd_combined import _flashinfer_ssd_supported, _use_flashinfer_ssd
+
+        return not (
+            is_sm_100f()
+            and _use_flashinfer_ssd()
+            and _flashinfer_ssd_supported(self.chunk_size, self.d_state, self.head_dim)
+        )
+
     def key(self):
         return (
             self.nheads,
@@ -88,11 +108,17 @@ class _MixerShape:
 class MambaSSDProvider:
     """Plans the SSD prefill launches of every distinct Mamba2 layer shape."""
 
-    def __init__(self, model, max_num_tokens: int = 0, max_batch_size: int = 0):
+    # Largest batch tune ahead runs, in tokens (see tune_batches).
+    TUNE_MAX_TOKENS = 4096
+
+    def __init__(
+        self, model, max_num_tokens: int = 0, max_batch_size: int = 0, max_seq_len: int = 0
+    ):
         from .mamba2_mixer import Mamba2Mixer
 
         self.max_num_tokens = int(max_num_tokens)
         self.max_batch_size = int(max_batch_size)
+        self.max_seq_len = int(max_seq_len)
 
         shapes = {}
         for m in model.modules():
@@ -222,77 +248,136 @@ class MambaSSDProvider:
                         seen_cls.add(cls)
                         yield SimpleNamespace(ctx_chunk_lens=lens, any_ctx_cached=any_cached)
 
+    def tune_batches(self) -> Iterator[Any]:
+        """The batches tune ahead runs on the GPU (``JitPrefetcher.tune``).
+
+        An SSD kernel's autotune key does not depend on the batch's size or
+        sequence count, only on whether some request has a cached prefix (the
+        initial states and the chunk indices then join the key of three
+        kernels). So two batches reach every key: the largest context batch
+        the engine admits, capped at ``TUNE_MAX_TOKENS`` tokens and split into
+        ``max_batch_size`` sequences of near-equal length (the split warmup
+        uses for a multi-sequence batch), once without and once with a cached
+        prefix on every sequence. Each key's config is the autotuner's own
+        benchmark on that batch; a batch whose keys warmup already tuned is
+        not run. Nothing is yielded if no layer runs the Triton SSD kernels.
+        """
+        if not any(s.triton_ssd for s in self.shapes):
+            return
+        T = min(self.max_num_tokens, self.TUNE_MAX_TOKENS)
+        if self.max_seq_len > 1:
+            T = min(T, self.max_batch_size * (self.max_seq_len - 1))
+        n = min(T, self.max_batch_size)
+        if T <= 0 or n <= 0:
+            return
+        q, r = divmod(T, n)
+        lens = [q + 1] * r + [q] * (n - r)
+        for any_cached in (False, True):
+            yield SimpleNamespace(ctx_chunk_lens=lens, any_ctx_cached=any_cached)
+
+    def run_tune_batch(self, batch_ctx: Any) -> None:
+        """Run ``batch_ctx``'s SSD prefill launches on the GPU, on scratch
+        tensors, for every layer shape: each untuned autotune key they reach
+        runs the autotuner's benchmark. Nothing outside the scratch tensors
+        is read or written."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        with torch.inference_mode():
+            for s in self.shapes:
+                if s.triton_ssd:
+                    self._launch(s, batch_ctx.ctx_chunk_lens, batch_ctx.any_ctx_cached, device)
+
     def _plan_one(self, s: _MixerShape, ctx_lens: List[int], any_cached: bool) -> List[KernelCall]:
+        with shadow_launches() as rec:
+            self._launch(s, ctx_lens, any_cached, torch.device("meta"))
+        return list(rec)
+
+    @staticmethod
+    def _launch(s: _MixerShape, ctx_lens: List[int], any_cached: bool, device) -> None:
+        """Issue one batch's SSD prefill launches for layer shape ``s``.
+
+        The tensors entering the SSD have the layouts Mamba2Mixer.forward_core
+        builds. On ``meta`` tensors, under ``shadow_launches``, the launches
+        are recorded; on the GPU they run, on zero-filled tensors with the
+        batch's sequence boundaries.
+        """
         from .mamba2_metadata import (
             compute_extra_chunks_cpu,
             cu_seqlens_to_chunk_indices_offsets_triton,
         )
         from .ssd_combined import _mamba_chunk_scan_combined_fwd
 
-        meta = torch.device("meta")
+        alloc = torch.empty if device.type == "meta" else torch.zeros
         n = len(ctx_lens)
         T = sum(ctx_lens)
         # in_proj output: [T, zxbcdt_width] contiguous; dt is a column slice.
-        zxbcdt = torch.empty(T, s.zxbcdt_width, dtype=s.io_dtype, device=meta)
+        zxbcdt = alloc(T, s.zxbcdt_width, dtype=s.io_dtype, device=device)
         dt = zxbcdt[:, s.d_inner + s.conv_dim :].unsqueeze(0)
         bc = s.ngroups * s.d_state
         if s.token_major_conv:
             # Mamba2Mixer.forward_core: empty(T, conv_dim).t() is the conv's
             # channel-last output, and .t() again gives the token-major
             # [T, conv_dim] view that x/B/C are sliced from.
-            xbc = torch.empty(T, s.conv_dim, dtype=s.io_dtype, device=meta)
+            xbc = alloc(T, s.conv_dim, dtype=s.io_dtype, device=device)
             x = xbc[:, : s.d_inner].view(T, s.nheads, s.head_dim).unsqueeze(0)
             B = xbc[:, s.d_inner : s.d_inner + bc].view(T, s.ngroups, s.d_state).unsqueeze(0)
             C = xbc[:, s.d_inner + bc :].view(T, s.ngroups, s.d_state).unsqueeze(0)
         else:
-            x = torch.empty(T, s.d_inner, dtype=s.io_dtype, device=meta).view(
+            x = alloc(T, s.d_inner, dtype=s.io_dtype, device=device).view(
                 1, T, s.nheads, s.head_dim
             )
-            B = torch.empty(T, bc, dtype=s.io_dtype, device=meta).view(1, T, s.ngroups, s.d_state)
-            C = torch.empty(T, bc, dtype=s.io_dtype, device=meta).view(1, T, s.ngroups, s.d_state)
-        A = torch.empty(s.nheads, dtype=torch.float32, device=meta)
-        D = torch.empty(s.nheads, dtype=torch.float32, device=meta) if s.has_d else None
-        dt_bias = torch.empty(s.nheads, dtype=torch.float32, device=meta) if s.has_dt_bias else None
-        cu_seqlens = torch.empty(n + 1, dtype=torch.int, device=meta)
-        seq_idx = torch.empty(1, T, dtype=torch.int, device=meta)
-        out = torch.empty(T, s.nheads * s.head_dim, dtype=s.io_dtype, device=meta).view(
+            B = alloc(T, bc, dtype=s.io_dtype, device=device).view(1, T, s.ngroups, s.d_state)
+            C = alloc(T, bc, dtype=s.io_dtype, device=device).view(1, T, s.ngroups, s.d_state)
+        A = alloc(s.nheads, dtype=torch.float32, device=device)
+        D = alloc(s.nheads, dtype=torch.float32, device=device) if s.has_d else None
+        dt_bias = alloc(s.nheads, dtype=torch.float32, device=device) if s.has_dt_bias else None
+        if device.type == "meta":
+            cu_seqlens = torch.empty(n + 1, dtype=torch.int, device=device)
+            seq_idx = torch.empty(1, T, dtype=torch.int, device=device)
+        else:
+            # The kernels index with these: they hold the batch's real
+            # boundaries, as Mamba2Metadata.prepare builds them.
+            lens = torch.tensor(ctx_lens, dtype=torch.int, device=device)
+            cu_seqlens = torch.zeros(n + 1, dtype=torch.int, device=device)
+            torch.cumsum(lens, dim=0, dtype=torch.int, out=cu_seqlens[1:])
+            seq_idx = torch.repeat_interleave(
+                torch.arange(n, dtype=torch.int, device=device), lens, output_size=T
+            ).unsqueeze(0)
+        out = alloc(T, s.nheads * s.head_dim, dtype=s.io_dtype, device=device).view(
             1, T, -1, s.head_dim
         )
         initial_states: Optional[torch.Tensor] = None
         chunk_indices = chunk_offsets = None
 
-        with shadow_launches() as rec:
-            if any_cached:
-                # Mamba2Metadata.prepare: only built when some request has a
-                # cached prefix. The multi-seq branch launches the kernel; the
-                # single-seq fast path is torch-only.
-                extra = compute_extra_chunks_cpu(ctx_lens, n, s.chunk_size)
-                chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
-                    cu_seqlens, s.chunk_size, total_seqlens=T, extra_chunks=extra
-                )
-                # forward_core: torch.where(...) over the gathered SSM states
-                # yields a fresh contiguous tensor in the SSM-cache dtype.
-                initial_states = torch.empty(
-                    n, s.nheads, s.head_dim, s.d_state, dtype=s.state_dtype, device=meta
-                )
-            _mamba_chunk_scan_combined_fwd(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                s.chunk_size,
-                D=D,
-                z=None,
-                dt_bias=dt_bias,
-                initial_states=initial_states,
-                seq_idx=seq_idx,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                cu_seqlens=cu_seqlens,
-                dt_softplus=s.delta_softplus,
-                dt_limit=(0.0, float("inf")),
-                out=out,
-                state_dtype=s.state_dtype,
+        if any_cached:
+            # Mamba2Metadata.prepare: only built when some request has a
+            # cached prefix. The multi-seq branch launches the kernel; the
+            # single-seq fast path is torch-only.
+            extra = compute_extra_chunks_cpu(ctx_lens, n, s.chunk_size)
+            chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
+                cu_seqlens, s.chunk_size, total_seqlens=T, extra_chunks=extra
             )
-        return list(rec)
+            # forward_core: torch.where(...) over the gathered SSM states
+            # yields a fresh contiguous tensor in the SSM-cache dtype.
+            initial_states = alloc(
+                n, s.nheads, s.head_dim, s.d_state, dtype=s.state_dtype, device=device
+            )
+        _mamba_chunk_scan_combined_fwd(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            s.chunk_size,
+            D=D,
+            z=None,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            cu_seqlens=cu_seqlens,
+            dt_softplus=s.delta_softplus,
+            dt_limit=(0.0, float("inf")),
+            out=out,
+            state_dtype=s.state_dtype,
+        )
