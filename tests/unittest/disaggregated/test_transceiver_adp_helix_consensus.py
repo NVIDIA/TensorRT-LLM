@@ -168,7 +168,10 @@ def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_
 
 
 def test_kv_size_rank_factor_is_the_tp_scale() -> None:
-    """The constant factor covers TP only; helix CP is scaled per request."""
+    """The constant factor counts the TP ranks that receive a request.
+
+    Helix CP is scaled per request instead.
+    """
     factor = KvCacheTransceiverV2._kv_size_rank_factor_for
     assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=True)) == 1
     assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=False)) == 2
@@ -177,6 +180,15 @@ def test_kv_size_rank_factor_is_the_tp_scale() -> None:
 
 _TPB = 32
 _BLOCK_BYTES = 100
+
+
+def _metric_transceiver(mapping, local_len, total_len):
+    """A transceiver for ``mapping`` and a request holding ``local_len`` of ``total_len`` tokens."""
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = mapping
+    tc._kv_size_rank_factor = KvCacheTransceiverV2._kv_size_rank_factor_for(mapping)
+    tc._reuse_adapter = SimpleNamespace(tokens_per_block=_TPB)
+    return tc, SimpleNamespace(prompt_len=local_len, total_input_len_cp=total_len)
 
 
 @pytest.mark.parametrize(
@@ -206,12 +218,79 @@ def test_helix_kv_cache_size_counts_round_robin_blocks(
     expected_blocks: int,
 ) -> None:
     """kv_cache_size is the request total, not one CP rank's share times cp_size."""
-    mapping = _mapping(tp_size=tp_size, cp_size=cp_size, enable_attention_dp=enable_attention_dp)
-    tc = object.__new__(KvCacheTransceiverV2)
-    tc._mapping = mapping
-    tc._kv_size_rank_factor = KvCacheTransceiverV2._kv_size_rank_factor_for(mapping)
-    tc._reuse_adapter = SimpleNamespace(tokens_per_block=_TPB)
-    req = SimpleNamespace(prompt_len=local_len, total_input_len_cp=total_len)
-    local_bytes = (local_len + _TPB - 1) // _TPB * _BLOCK_BYTES
+    local_paged = (local_len + _TPB - 1) // _TPB * _BLOCK_BYTES
+    tc, req = _metric_transceiver(
+        _mapping(tp_size=tp_size, cp_size=cp_size, enable_attention_dp=enable_attention_dp),
+        local_len,
+        total_len,
+    )
 
-    assert tc._request_kv_bytes(req, local_bytes) == expected_blocks * _BLOCK_BYTES
+    assert tc._request_kv_bytes(req, local_paged, 0) == expected_blocks * _BLOCK_BYTES
+
+
+_STATE_BYTES = 7
+
+
+@pytest.mark.parametrize(
+    "enable_attention_dp,tp_size,cp_size,total_len,local_len,expected",
+    [
+        # Helix tp1 x cp2, 3 blocks: CP rank 0 holds 2. Both CP ranks hold a STATE
+        # slot, so STATE counts twice, not by the 3/2 block ratio.
+        (False, 1, 2, 80, 48, 3 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # The empty CP rank still holds its STATE slot.
+        (False, 1, 2, 20, 0, 0 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # Helix tp2 x cp2: paged bytes scale by tp, STATE by tp x cp.
+        (False, 2, 2, 80, 48, 6 * _BLOCK_BYTES + 4 * _STATE_BYTES),
+        # Attention DP with helix: the CP ranks of one DP rank each hold the slot.
+        (True, 2, 2, 80, 48, 3 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # No helix: STATE scales by tp like the paged bytes.
+        (False, 2, 1, 80, 80, 6 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # Attention DP without helix: one DP rank holds the request.
+        (True, 2, 1, 80, 80, 3 * _BLOCK_BYTES + 1 * _STATE_BYTES),
+    ],
+)
+def test_request_kv_bytes_counts_state_once_per_holding_rank(
+    enable_attention_dp: bool,
+    tp_size: int,
+    cp_size: int,
+    total_len: int,
+    local_len: int,
+    expected: int,
+) -> None:
+    """STATE bytes scale by the ranks that hold the request, paged bytes by the block ratio.
+
+    Each such rank has a STATE (recurrent) slot of the same size, even with no prompt block.
+    """
+    local_paged = (local_len + _TPB - 1) // _TPB * _BLOCK_BYTES
+    tc, req = _metric_transceiver(
+        _mapping(tp_size=tp_size, cp_size=cp_size, enable_attention_dp=enable_attention_dp),
+        local_len,
+        total_len,
+    )
+
+    assert tc._request_kv_bytes(req, local_paged, _STATE_BYTES) == expected
+
+
+def test_chunk_bytes_by_kind_counts_paged_per_block_and_state_once(monkeypatch) -> None:
+    """Paged views count per valid block, STATE views once, excluded views not at all."""
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+    from tensorrt_llm._torch.disaggregation.base import CacheKind
+
+    # Each pool view stands for its own slot byte count.
+    monkeypatch.setattr(transceiver_module, "get_pool_view_slot_bytes", lambda pv: pv)
+    page_table = SimpleNamespace(
+        layer_groups=[
+            SimpleNamespace(kind=CacheKind.PAGED, pool_views=[10, 1]),
+            SimpleNamespace(kind=CacheKind.STATE, pool_views=[100]),
+        ]
+    )
+    chunk = SimpleNamespace(
+        block_ids_per_layer_groups=[np.array([3, 4, -1]), np.array([5])],
+        excluded_pool_views={(0, 1)},
+    )
+
+    paged, state = transceiver_module._chunk_bytes_by_kind(page_table, chunk)
+
+    assert (paged, state) == (2 * 10, 100)

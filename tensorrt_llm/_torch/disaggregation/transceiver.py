@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -228,6 +228,45 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
+    """This rank's (paged, STATE) KV bytes in a chunk, as the mappers move them.
+
+    Per view, the valid block count (one slot for STATE) times the view's transferable slot
+    region. The sum is expected_write_bytes: verified-reuse admission compares the sender's
+    attested bytes against it. The pair also feeds kv_cache_size. So count the bytes the
+    mappers move, never physical slot bytes: a coalesced pool carries one view per role class
+    (summing slot_bytes per view would double count the slot) and ignored-role buffers occupy
+    slot offsets no view transfers.
+
+    Bounce sizing (bounce/impl.py block_bytes_per_group) counts physical slot bytes once per
+    pool, ignored-role regions included; keep the two accountings in mind together when
+    changing either.
+    """
+    if page_table is None:
+        return 0, 0
+    paged_bytes = state_bytes = 0
+    for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
+        if block_ids is None or block_ids.size == 0:
+            continue
+        n = int((block_ids >= 0).sum())
+        if n == 0:
+            continue
+        lg = page_table.layer_groups[lg_id]
+        for pool_idx, pv in enumerate(lg.pool_views):
+            if (lg_id, pool_idx) in chunk.excluded_pool_views:
+                continue
+            # The view's byte regions within one slot (all of its layers).
+            view_bytes = get_pool_view_slot_bytes(pv)
+            if lg.kind == CacheKind.STATE:
+                # STATE: one slot per request; the transfer covers each
+                # view region once regardless of the block count.
+                state_bytes += view_bytes
+            else:
+                # Paged: n blocks, each covering the view's regions.
+                paged_bytes += n * view_bytes
+    return paged_bytes, state_bytes
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -396,34 +435,46 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @staticmethod
     def _kv_size_rank_factor_for(mapping) -> int:
-        """TP part of the scale from this rank's KV shard bytes to the request total.
+        """Number of TP ranks that receive each request's KV.
 
-        TP shards are equal, so they scale by tp_size; under attention DP the TP dimension
-        is not sharded. Helix CP shares are unequal and are scaled per request instead
+        Every TP rank receives the same number of bytes, split or replicated, so the TP
+        total is tp_size times this rank's bytes; under attention DP one DP rank holds the
+        request. Helix CP ranks receive different paged bytes, so CP is scaled per request
         (see _request_kv_bytes).
         """
         return 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
 
-    def _request_kv_bytes(self, req: LlmRequest, local_bytes: int) -> int:
-        """Request-total KV bytes from this rank's share (metric only, no collective).
+    def _request_kv_bytes(self, req: LlmRequest, paged_bytes: int, state_bytes: int) -> int:
+        """KV bytes the request's transfer moves into the TP and CP ranks of this PP stage.
+
+        A metric only. The C++ transceiver can sum what every rank received, PP stages
+        included. This computes that sum for this PP stage alone from this rank's paged
+        and STATE bytes (_chunk_bytes_by_kind), with no collective. Both scale by the
+        TP factor. Each CP rank also holds a STATE (recurrent) slot of the same size, so
+        STATE bytes scale by the CP size too. Paged bytes follow the prompt blocks each
+        CP rank holds instead (_request_paged_bytes).
+        """
+        tp_paged = paged_bytes * self._kv_size_rank_factor
+        tp_state = state_bytes * self._kv_size_rank_factor
+        return self._request_paged_bytes(req, tp_paged) + tp_state * self._mapping.cp_size
+
+    def _request_paged_bytes(self, req: LlmRequest, paged_bytes: int) -> int:
+        """Request-total paged bytes, given this CP rank's paged bytes times the TP factor.
 
         Helix deals prompt blocks round-robin over the CP ranks, so this rank holds
         ceil(prompt_len / tpb) of the ceil(total_input_len_cp / tpb) blocks (prompt_len
         is the rank-local slice) and the shares differ by up to one block. Scaling the
-        per-block bytes by the global block count gives the exact total. A CP rank that
-        owns no block reports 0; responses come from CP rank 0, which owns block 0.
+        per-block bytes by the global block count gives the request total. A CP rank that
+        owns no block has no paged bytes; responses come from CP rank 0, which owns block 0.
         """
-        if local_bytes == 0:
-            return 0
-        total = local_bytes * self._kv_size_rank_factor
-        if self._mapping.cp_size == 1:
-            return total
+        if paged_bytes == 0 or self._mapping.cp_size == 1:
+            return paged_bytes
         tpb = self._reuse_adapter.tokens_per_block
         local_blocks = (req.prompt_len + tpb - 1) // tpb
         global_blocks = (req.total_input_len_cp + tpb - 1) // tpb
         if local_blocks == 0:
-            return total
-        return total * global_blocks // local_blocks
+            return paged_bytes
+        return paged_bytes * global_blocks // local_blocks
 
     def _init_sync_policy(self):
         m = self._mapping
@@ -657,44 +708,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         window[:n] = ordinals[:n]
         window[: min(cached_blocks, prompt_blocks)] = -1
         return window
-
-    def _chunk_num_bytes(self, chunk: Chunk) -> int:
-        """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
-        transferable slot region. Populates kv_cache_size (and the perf-metric timestamps that gate
-        on it) and is the exact expected-write total the verified-reuse admission checks attested
-        sender bytes against, so it must count what the mappers move, never physical slot bytes: a
-        coalesced pool carries one view per role class (summing slot_bytes per view would double
-        count the slot) and ignored-role buffers occupy slot offsets no view transfers.
-
-        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
-        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
-        """
-        pt = self._page_table
-        if pt is None:
-            return 0
-        total = 0
-        for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
-            if block_ids is None or block_ids.size == 0:
-                continue
-            n = int((block_ids >= 0).sum())
-            if n == 0:
-                continue
-            lg = pt.layer_groups[lg_id]
-            for pool_idx, pv in enumerate(lg.pool_views):
-                if (lg_id, pool_idx) in chunk.excluded_pool_views:
-                    continue
-                # The view's byte regions within one slot (all of its layers).
-                view_bytes = get_pool_view_slot_bytes(pv)
-                if lg.kind == CacheKind.STATE:
-                    # STATE: one slot per request; the transfer covers each
-                    # view region once regardless of the block count.
-                    total += view_bytes
-                else:
-                    # Attention: n blocks, each covering the view's regions.
-                    total += n * view_bytes
-        return total
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -1186,10 +1199,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         fetches = None
         try:
             extent = self._create_cache_extent(req)
+            paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
-            fetches.fetch(extent, expected_write_bytes=self._chunk_num_bytes(extent.local))
+            fetches.fetch(extent, expected_write_bytes=paged_bytes + state_bytes)
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
@@ -1200,9 +1214,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(
-                    self._request_kv_bytes(req, self._chunk_num_bytes(extent.local))
-                )
+                req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -1264,8 +1276,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             return
         extent = self._create_cache_extent(req)
-        chunk_bytes = self._chunk_num_bytes(extent.local)
-        req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, chunk_bytes)
+        paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
+        req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, paged_bytes, state_bytes)
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
@@ -1276,7 +1288,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
-            fetches.fetch(extent, expected_write_bytes=chunk_bytes)
+            fetches.fetch(extent, expected_write_bytes=paged_bytes + state_bytes)
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
