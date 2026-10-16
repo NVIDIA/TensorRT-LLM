@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional, Tuple
 
@@ -279,6 +280,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
         self._radix_rows_per_sequence = 1
+        # Set only inside defer_cuda_graph_decode_outputs().
+        self._defer_decode_outputs = False
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -357,10 +360,46 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
+    @contextmanager
+    def defer_cuda_graph_decode_outputs(self):
+        """Engine-only scope for a selected decode graph's preparation.
+
+        The engine must run ``on_update_kv_lens`` before any model consumer,
+        including warmup and capture. That call rebuilds the generation
+        indptrs, ``req_idx_per_token``, the indexer slot mappings, the DeepGEMM
+        schedules and the dense TopK indices from the KV lengths the forward
+        uses, so ``prepare`` leaves them to it for a generation-only batch.
+        Direct ``prepare`` callers retain fully initialized outputs.
+        """
+        previous = getattr(self, "_defer_decode_outputs", False)
+        self._defer_decode_outputs = True
+        try:
+            yield
+        finally:
+            self._defer_decode_outputs = previous
+
+    def _defers_decode_outputs(self) -> bool:
+        """Whether this ``prepare`` leaves the decode outputs to ``on_update_kv_lens``.
+
+        Ragged verification, helix, a separate draft KV cache and non-native
+        DSA cache layouts keep the complete preparation.
+        """
+        return (
+            getattr(self, "_defer_decode_outputs", False)
+            and self.is_cuda_graph
+            and self.num_contexts == 0
+            and self.num_generations > 0
+            and not self.enable_ragged_verification
+            and not self.enable_helix
+            and self.draft_kv_cache_manager is None
+            and is_dsa_cache_manager(self.kv_cache_manager)
+        )
+
     def prepare(self):
         self._validate_ragged_verification()
         super().prepare()
         self._invalidate_pool_view_cache()
+        defer_decode_outputs = self._defers_decode_outputs()
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -382,13 +421,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         kv_lens = self._prepare_device_window_kv_lens(kv_lens)
 
         # For mla_rope_append_paged_kv_assign_q
-        self.prepare_for_mla_rope_append(cached_token_lens, kv_lens)
+        self.prepare_for_mla_rope_append(
+            cached_token_lens, kv_lens, generation_indptrs=not defer_decode_outputs
+        )
 
         # Prepare to support skip indexer
-        self.prepare_for_skip_indexer(kv_lens)
+        self.prepare_for_skip_indexer(kv_lens, dense_topk_indices=not defer_decode_outputs)
 
         # For indices conversion
-        self.prepare_for_indices_conversion()
+        if not defer_decode_outputs:
+            self.prepare_for_indices_conversion()
 
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
@@ -397,7 +439,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prepare_for_spec_decode(kv_lens)
 
         # Prepare metadata for indexer
-        Indexer.prepare(metadata=self)
+        Indexer.prepare(metadata=self, defer_decode_outputs=defer_decode_outputs)
 
     def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         """Bound host-side KV extents until device-selected windows are installed."""
@@ -886,6 +928,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        # Entry 0 of an exclusive prefix sum is always 0, and the unfused
+        # rebuild in on_update_kv_lens() writes only the entries after it.
+        self.gen_cached_token_indptr[:1].zero_()
+        self.gen_kv_indptr[:1].zero_()
 
     def _create_nvfp4_mla_generation_buffers(self, capture_graph=False):
         """Allocate stable NVFP4 gather outputs for all MTP generation rows."""
@@ -1457,9 +1503,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
             self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
         )
-        # Sanitize graph-padding entries that may be stale after cache
+        # The batch rows hold non-negative pool slots. Sanitize the
+        # graph-padding rows after them, which may be stale after cache
         # eviction or host-cache onboarding.
-        self.indexer_k_cache_block_offsets.clamp_(min=0)
+        padding_rows = self.indexer_k_cache_block_offsets[self.num_seqs :]
+        if padding_rows.numel() > 0:
+            padding_rows.clamp_(min=0)
         return pool_indices
 
     def set_skip_topk(self, skip: bool) -> None:
@@ -2028,7 +2077,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             host_block_table, non_blocking=True
         )
 
-    def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
+    def prepare_for_skip_indexer(self, kv_lens: torch.Tensor, dense_topk_indices: bool = True):
+        """Decide which requests skip the indexer.
+
+        ``dense_topk_indices=False`` leaves their dense TopK indices to
+        ``on_update_kv_lens``.
+        """
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
         if self.num_contexts > 0 and self.enable_indexer_skip:
             # Minus the number of extra KV tokens because when using one-model MTP, the
@@ -2049,9 +2103,20 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.skip_indexer_for_gen_reqs = False
-        self.prepare_dense_topk_indices(kv_lens)
+        if dense_topk_indices:
+            self.prepare_dense_topk_indices(kv_lens)
 
-    def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
+    def prepare_for_mla_rope_append(
+        self,
+        cached_token_lens: torch.Tensor,
+        kv_lens: torch.Tensor,
+        generation_indptrs: bool = True,
+    ):
+        """Set the MLA RoPE-append lengths and indptrs.
+
+        ``generation_indptrs=False`` leaves the generation indptrs to
+        ``on_update_kv_lens``.
+        """
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[: self.num_contexts].sum().item()
             self.num_ctx_mla_kv_tokens = kv_lens[: self.num_contexts].sum().item()
@@ -2085,6 +2150,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         if self.num_generations > 0:
             self.max_gen_seq_len = self.seq_lens[self.num_contexts : self.num_seqs].max().item()
+            if not generation_indptrs:
+                return
             # generation cached token indptr
             torch.cumsum(
                 cached_token_lens[self.num_contexts : self.num_seqs],

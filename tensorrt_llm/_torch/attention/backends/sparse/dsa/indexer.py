@@ -1248,7 +1248,9 @@ class Indexer(nn.Module):
             )
 
     @staticmethod
-    def prepare(metadata: DSAtrtllmAttentionMetadata) -> None:
+    def prepare(
+        metadata: DSAtrtllmAttentionMetadata, *, defer_decode_outputs: bool = False
+    ) -> None:
         """
         Prepare indexer for the forward pass.
         This should be called during metadata.prepare() stage.
@@ -1256,6 +1258,9 @@ class Indexer(nn.Module):
         - Computes slot_mapping for KV cache updates
         - Prepares schedule_metadata for fp8_paged_mqa_logits
         - Stores generation request IDs for decode phase
+
+        ``defer_decode_outputs`` leaves the slot mappings and schedules of a
+        generation-only batch to ``on_update_kv_lens``.
         """
 
         # Skip indexer preparation if the kv_cache_manager doesn't have index_head_dim.
@@ -1275,9 +1280,11 @@ class Indexer(nn.Module):
         )
         # Store compressed KV token count for context requests
         metadata.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:num_contexts].sum().item()
+        defer_decode_outputs = defer_decode_outputs and num_contexts == 0
 
         # Prepare for update_k_cache
-        Indexer.prepare_for_update_k_cache(metadata, indexer_params)
+        if not defer_decode_outputs:
+            Indexer.prepare_for_update_k_cache(metadata, indexer_params)
 
         # Prepare for prefill phase if there are context requests
         if num_contexts > 0:
@@ -1305,7 +1312,7 @@ class Indexer(nn.Module):
             Indexer.prepare_for_chunked_prefill(metadata, indexer_params)
 
         # Prepare for decode phase if there are generation requests
-        if num_generations > 0:
+        if num_generations > 0 and not defer_decode_outputs:
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
             Indexer.prepare_scheduler_metadata(metadata)

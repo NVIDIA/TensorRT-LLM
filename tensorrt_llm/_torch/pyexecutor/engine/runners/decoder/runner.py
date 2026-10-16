@@ -5254,8 +5254,13 @@ class DecoderRunner(ScheduledModelRunner):
         """Allow derived outputs only when this forward owns a decode graph.
 
         Both capture/warmup and replay execute _preprocess_inputs before model
-        consumers. Non-speculative overlap has the same ordering; speculative
-        acceptance corrections and draft-manager swaps keep full preparation.
+        consumers, and it runs on_update_kv_lens, which rebuilds the derived
+        outputs. Non-speculative overlap has the same ordering. When a linear
+        one-model speculative step verifies drafts, that call follows the
+        overlap acceptance correction of kv_lens_cuda, so the outputs come
+        from the corrected lengths. Draft-manager swaps and ragged
+        verification rebuild metadata outside the graph and keep full
+        preparation, as does a speculative step without drafts.
         """
         defer = getattr(attn_metadata, "defer_cuda_graph_decode_outputs", None)
         if (
@@ -5263,17 +5268,32 @@ class DecoderRunner(ScheduledModelRunner):
             and isinstance(key, KeyType)
             and attn_metadata.is_cuda_graph is True
             and key.num_contexts == 0
-            and key.draft_len == 0
+            and (
+                key.draft_len > 0 and self._linear_one_model_spec_decode(attn_metadata)
+                if enable_spec_decode
+                else key.draft_len == 0
+            )
             and scheduled_requests.num_context_requests == 0
             and scheduled_requests.num_generation_requests > 0
             and not promoted_context_request_ids
-            and not enable_spec_decode
             and not self.use_beam_search
             and self._context_graph_promotion_supported
             and self.mapping.cp_size == 1
         ):
             return defer()
         return contextlib.nullcontext()
+
+    def _linear_one_model_spec_decode(self, attn_metadata: AttentionMetadata) -> bool:
+        """Whether speculation verifies a linear draft in the target model's
+        own forward, with no separate draft KV cache and no ragged windows."""
+        spec_config = self._config.spec_config
+        return (
+            spec_config is not None
+            and spec_config.spec_dec_mode.use_one_engine()
+            and spec_config.is_linear_tree
+            and getattr(attn_metadata, "draft_kv_cache_manager", None) is None
+            and not getattr(attn_metadata, "enable_ragged_verification", False)
+        )
 
     def _get_remote_tail_decode_rank_tokens(
         self, attn_metadata: AttentionMetadata, can_run_graph: bool
