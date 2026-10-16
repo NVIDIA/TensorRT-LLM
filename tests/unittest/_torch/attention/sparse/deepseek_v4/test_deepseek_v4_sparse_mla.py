@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Tests for DeepSeek-V4 sparse MLA attention.
+"""Tests for DeepSeek-V4 sparse MLA attention.
+
+The scenario tests run both the TRTLLM backend and the Vanilla golden, each on its
+own cache manager, against the hand-written references in this file.
 """
 
 import math
@@ -36,6 +38,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
+    DeepseekV4VanillaAttention,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -101,6 +104,13 @@ class RopeConfig:
 
 # Layers to test: layer 0 → compress_ratio=1, layer 1 → ratio=4, layer 2 → ratio=128
 TEST_LAYERS = [0, 1, 2]
+
+# Backends a scenario test can run. Each parameterized run builds its own cache
+# manager, so one backend's cache writes can never feed another's reads.
+ATTENTION_BACKENDS = {
+    "TRTLLM": DeepseekV4TrtllmAttention,
+    "VANILLA": DeepseekV4VanillaAttention,
+}
 
 # The widest generation window the parameterized test exercises, i.e. the static
 # ceiling the DSA metadata sizes its expanded buffers from. Matches
@@ -822,7 +832,10 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
         ([14, 508, 3947], [2, 2, 2]),
     ],
 )
-def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q: int | List[int]):
+@pytest.mark.parametrize("backend", list(ATTENTION_BACKENDS))
+def test_deepseek_v4_sparse_mla(
+    backend: str, context_lengths: List[int], generation_seq_len_q: int | List[int]
+):
     num_generation_steps = 2
     is_ragged = isinstance(generation_seq_len_q, list)
     generation_lens = (
@@ -906,7 +919,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
     # 4. Create attention layers
     layers = {}
     for layer_idx in TEST_LAYERS:
-        layer = DeepseekV4TrtllmAttention(
+        layer = ATTENTION_BACKENDS[backend](
             layer_idx=layer_idx,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -1403,7 +1416,8 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[14, 508, 3947]])
-def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
+@pytest.mark.parametrize("backend", list(ATTENTION_BACKENDS))
+def test_deepseek_v4_sparse_mla_mixed_batch(backend: str, context_lengths: List[int]):
     scenario = Scenario()
     device = torch.device("cuda")
     dtype = scenario.dtype
@@ -1469,7 +1483,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
     layers = {}
     for li in TEST_LAYERS:
-        layer = DeepseekV4TrtllmAttention(
+        layer = ATTENTION_BACKENDS[backend](
             layer_idx=li,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -1550,8 +1564,10 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
         req.add_new_token(ctx_len, 0)
     cache_manager.update_context_resources(gen_prefill_batch)
 
-    # Pre-fill COMPRESS buffers for ratio > 1.
+    # Pre-fill COMPRESS buffers for ratio > 1. The context request's compressed
+    # rows are filled too, because its selection reads them from the cache.
     compress_ref_data: Dict[int, List[torch.Tensor]] = {}
+    ctx_compress_ref_data: Dict[int, List[torch.Tensor]] = {}
     for li in TEST_LAYERS:
         ratio = scenario.compress_ratios[li]
         if ratio > 1:
@@ -1560,6 +1576,14 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
                 li,
                 gen_ctx_lengths,
                 gen_request_ids,
+                head_dim,
+                device,
+            )
+            ctx_compress_ref_data[li] = _prefill_compress_buffer(
+                cache_manager,
+                li,
+                context_lengths[:num_ctx],
+                request_ids[:num_ctx],
                 head_dim,
                 device,
             )
@@ -1713,7 +1737,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
         ctx_ref = calculate_deepseek_v4_ref_ctx_sparse(
             ctx_q_rot,
             ctx_latent_ref,
-            None,
+            ctx_compress_ref_data.get(li),
             scenario.window_size,
             ctx_topk,
             [context_lengths[0]],
@@ -1780,4 +1804,4 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_deepseek_v4_sparse_mla(context_lengths=[4399], num_generation_steps=2)
+    test_deepseek_v4_sparse_mla("TRTLLM", context_lengths=[4399], generation_seq_len_q=1)
