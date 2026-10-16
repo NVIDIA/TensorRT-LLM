@@ -1617,6 +1617,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
             return False
+        # A deferred victim will release capacity when its connector saves finish.
+        if self.kv_cache_manager.has_pending_preemption():
+            return False
         # A disaggregated generation worker received its context KV rather
         # than computing it, so it cannot replay a prefill at all.
         if not self.enable_recompute_pause:
@@ -1963,7 +1966,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         Recompute pause does not shrink the ordinary scheduling frontier; exact
         victim indices prevent destructively-freed requests from being revisited.
         """
-        if not self.enable_recompute_pause:
+        if not self.enable_recompute_pause or self.kv_cache_manager.has_pending_preemption():
             return req_it_end, False
 
         while True:

@@ -683,20 +683,27 @@ def make_kv_cache_manager(
 def defer_preemption(mgr, *request_ids):
     """Make *mgr* hold back the preemption of each id, as a connector save does.
 
-    Nothing is released, and `has_pending_preemption` stays true until the
-    returned set is cleared, which stands in for the executor completing it.
+    A deferred request leaves the schedulable range and retains its pages until
+    the executor completes the release. The returned map tracks actual pending
+    requests, not requests whose saves might defer a future preemption.
     """
     deferred = set(request_ids)
+    pending = {}
 
     def preempt_request(req):
         if req.py_request_id in deferred:
+            pending[req.py_request_id] = req
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            req.state_value = req.state.value
+            req.is_generation_in_progress_state = False
+            req.is_context_init_state = False
             return False
         mgr.free_resources(req)
         return True
 
     mgr.preempt_request.side_effect = preempt_request
-    mgr.has_pending_preemption.side_effect = lambda: bool(deferred)
-    return deferred
+    mgr.has_pending_preemption.side_effect = lambda: bool(pending)
+    return pending
 
 
 def make_peft_cache_manager(max_device_pages, pages_per_task=1):
@@ -1277,8 +1284,10 @@ class TestKVCacheFailuresGen:
         """The draft pool mirrors the target pool, so a draft-side failure is
         an ordinary KV shortage: roll the target growth back and run the same
         last-resort self-suspend used for target-pool pressure."""
-        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
-        draft_mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True, can_evict=True)
+        draft_mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False, can_evict=True
+        )
         sched = make_scheduler(
             mgr,
             max_num_tokens=100,
@@ -1917,7 +1926,6 @@ class TestEviction:
         assert ids(out.paused_requests) == [0]
         assert len(out.context_requests) == 0
 
-
     def test_single_tier_never_suspends(self):
         """Without a secondary tier suspension frees nothing: no victim is suspended."""
         call_count = [0]
@@ -2310,26 +2318,29 @@ class TestPreemptionDefersToConnectorSaves:
         mgr.free_resources.assert_not_called()
 
     def test_one_victim_drains_at_a_time(self):
-        """A deferral stops the search rather than taking a second victim.
+        """A pending save blocks extra victims, but not runnable peers."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: req.py_request_id == 2,
+            resize_context_fn=_out_of_pages_for(5),
+            has_cache_tier_below_gpu=False,
+        )
+        pending = defer_preemption(mgr, 1, 3, 4)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_gen_request(i) for i in range(5)] + [make_ctx_request(5, 100)]
 
-        Giving up another request's cache buys nothing while the first
-        victim's pages are already promised to this allocation.
-        """
-        mgr = self._blocked_by_a_suspended_victim(victim_id=2)
-        defer_preemption(mgr, 1, 2)
-        sched = make_scheduler(mgr, max_num_tokens=100)
-        current = make_gen_request(0)
-        first = make_gen_request(1)
-        second = make_gen_request(2)
-        for victim in (first, second):
-            mgr.kv_cache_map[victim.py_request_id].is_active = False
+        for _ in range(2):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.generation_requests) == [2]
+            assert out.context_requests == []
+            assert out.recompute_paused_requests == []
+            assert out.paused_requests == []
 
-        sched.schedule_request([current, first, second], set())
-
-        assert [call.args[0].py_request_id for call in mgr.preempt_request.call_args_list] == [2]
+        assert list(pending) == [4]
+        mgr.preempt_request.assert_called_once_with(reqs[4])
+        mgr.free_resources.assert_not_called()
 
     def test_the_pages_are_released_once_the_save_retires(self):
-        """The victim is a victim again next pass, and this time it gives them up."""
+        """Save completion releases the parked victim before the next schedule."""
         mgr = self._blocked_by_a_suspended_victim()
         deferred = defer_preemption(mgr, 1)
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -2342,12 +2353,17 @@ class TestPreemptionDefersToConnectorSaves:
 
         # The connector reports the save retired, which is what
         # PyExecutor._resume_preempted_request acts on.
-        deferred.clear()
-        out = sched.schedule_request([current, victim], set())
+        assert deferred.pop(victim.py_request_id) is victim
+        mgr.free_resources(victim)
+        # The executor resets the parked request to a complete context request.
+        resumed = make_ctx_request(victim.py_request_id, 10)
+        out = sched.schedule_request([current, resumed], set())
 
         mgr.free_resources.assert_called_once_with(victim)
-        assert ids(out.recompute_paused_requests) == [1]
+        mgr.preempt_request.assert_called_once_with(victim)
+        assert out.recompute_paused_requests == []
         assert ids(out.generation_requests) == [0]
+        assert ids(out.context_requests) == [1]
 
     def test_a_deferred_preemption_is_not_a_stall(self):
         """Those pages are coming, so the pass that waits for them is progress."""
@@ -3856,6 +3872,7 @@ class TestMixedOrdering:
         """Gen fails → self-evicts → break. Ctx after is NOT tried."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_gen_request(0), make_ctx_request(1, 100)]
@@ -3923,6 +3940,7 @@ class TestMixedOrdering:
 
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=selective_gen_alloc,
+            can_evict=True,
         )
         sched = make_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
@@ -4855,7 +4873,7 @@ class TestPrefixAwareSkip:
             return call_count[0] != 1
 
         mgr = self._keyed_manager(
-            {99: b"blockA", 1: b"blockA"}, try_allocate_generation_fn=alloc_fn
+            {99: b"blockA", 1: b"blockA"}, try_allocate_generation_fn=alloc_fn, can_evict=True
         )
         sched = make_scheduler(mgr, max_num_tokens=1000)
         duplicate = make_ctx_request(1, 500)

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Consumed overlap batches release indices for requests omitted from the next forward."""
+
 from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor.py_executor import _release_consumed_batch_indices
@@ -11,14 +12,12 @@ def _req(batch_idx):
 
 
 def _batch(ctx=(), gen=()):
-    return SimpleNamespace(context_requests=list(ctx),
-                           generation_requests=list(gen))
+    return SimpleNamespace(context_requests=list(ctx), generation_requests=list(gen))
 
 
 def test_skipped_generation_request_is_released():
     kept, skipped = _req(1), _req(2)
-    _release_consumed_batch_indices(_batch(gen=[kept, skipped]),
-                                    _batch(gen=[kept]))
+    _release_consumed_batch_indices(_batch(gen=[kept, skipped]), _batch(gen=[kept]))
     assert kept.py_batch_idx == 1
     assert skipped.py_batch_idx is None
 
@@ -28,16 +27,16 @@ def test_request_that_finished_context_then_got_skipped_is_released():
     # _prepare_tp_inputs); the scheduler skipped it this iteration.
     finished_ctx = _req(5)
     other_gen = _req(6)
-    _release_consumed_batch_indices(_batch(ctx=[finished_ctx], gen=[other_gen]),
-                                    _batch(gen=[other_gen]))
+    _release_consumed_batch_indices(
+        _batch(ctx=[finished_ctx], gen=[other_gen]), _batch(gen=[other_gen])
+    )
     assert finished_ctx.py_batch_idx is None
     assert other_gen.py_batch_idx == 6
 
 
 def test_request_that_finished_context_and_runs_now_keeps_index():
     finished_ctx = _req(5)
-    _release_consumed_batch_indices(_batch(ctx=[finished_ctx]),
-                                    _batch(gen=[finished_ctx]))
+    _release_consumed_batch_indices(_batch(ctx=[finished_ctx]), _batch(gen=[finished_ctx]))
     assert finished_ctx.py_batch_idx == 5
 
 
