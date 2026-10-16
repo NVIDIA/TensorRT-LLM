@@ -968,12 +968,12 @@ class MLA(nn.Module):
             )
             return
 
-        attention_kv = MixedPrecisionKVView.create(
+        attention_kv = MixedPrecisionKVView.prepare(
             self.mqa,
             attn_metadata,
         )
         if attention_kv is not None:
-            attn_metadata = attention_kv.prepare_metadata(attn_metadata)
+            attn_metadata = attention_kv.metadata
             if self.rotary_emb is None:
                 self.rotary_emb = RotaryEmbedding(
                     self.pos_embd_params.rope,

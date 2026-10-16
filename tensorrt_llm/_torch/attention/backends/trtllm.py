@@ -2166,14 +2166,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         from .mixed_precision_kv_view import (MixedPrecisionKVView,
                                               use_unquantized_kv)
 
-        attention_kv = MixedPrecisionKVView.create(
+        attention_kv = MixedPrecisionKVView.prepare(
             self,
             metadata,
             history_dequant_scale=(forward_args.kv_scale_quant_orig
                                    if forward_args.kv_scale_quant_orig
                                    is not None else self.kv_scale_quant_orig))
         if attention_kv is not None:
-            metadata = attention_kv.prepare_metadata(metadata)
+            metadata = attention_kv.metadata
             forward_args = replace(forward_args,
                                    kv_scale_orig_quant=None,
                                    kv_scale_quant_orig=None)

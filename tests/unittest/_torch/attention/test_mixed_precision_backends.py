@@ -9,11 +9,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import (
-    dequantize_nvfp4_kv,
-    encode_high_precision_kv,
-    quantize_nvfp4_kv,
-)
+from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import encode_high_precision_kv
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -300,17 +296,24 @@ def _reference_dequant(packed, scales, scale):
 def test_nvfp4_conversion_kernels(dtype, width):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
+    from flashinfer.quantization.fp4_quantization import (
+        get_fp4_kv_dequantization_module,
+        get_fp4_kv_quantization_module,
+    )
+
     values = torch.linspace(-6, 6, 17 * width, device="cuda").view(17, width).to(dtype)
     scale = torch.tensor([0.5], device="cuda", dtype=torch.float32)
-    packed, scales = quantize_nvfp4_kv(values, scale)
+    packed = torch.empty((17, width // 2), device="cuda", dtype=torch.uint8)
+    scales = torch.empty((17, width // 16), device="cuda", dtype=torch.uint8)
+    get_fp4_kv_quantization_module().nvfp4_kv_quant(values, scale, packed, scales)
     native_packed, native_scales = torch.ops.trtllm.fp4_quantize(
         values, scale.reciprocal(), 16, False, False
     )
     torch.testing.assert_close(packed, native_packed, rtol=0, atol=0)
     torch.testing.assert_close(scales.flatten(), native_scales, rtol=0, atol=0)
-    compute_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    decoded = dequantize_nvfp4_kv(packed, scales, scale, compute_dtype)
-    expected = _reference_dequant(packed, scales, scale).to(compute_dtype)
+    decoded = torch.empty_like(values)
+    get_fp4_kv_dequantization_module().nvfp4_kv_dequant(packed, scales, scale, decoded)
+    expected = _reference_dequant(packed, scales, scale).to(dtype)
     torch.testing.assert_close(decoded.float(), expected.float(), rtol=0, atol=0)
 
 

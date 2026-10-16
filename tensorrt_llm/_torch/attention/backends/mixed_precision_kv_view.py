@@ -18,7 +18,6 @@ import torch
 from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 
@@ -64,35 +63,6 @@ def use_unquantized_kv(attention: "AttentionBackend"):
             ) = saved
 
 
-def quantize_nvfp4_kv(
-    values: torch.Tensor, dequant_scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use the existing quantizer with linear, per-head NVFP4 block scales."""
-    packed, scales = torch.ops.trtllm.fp4_quantize(
-        values.contiguous(), dequant_scale.reciprocal(), NVFP4_SF_VEC_SIZE, False, False
-    )
-    return packed, scales.view(*values.shape[:-1], values.shape[-1] // NVFP4_SF_VEC_SIZE)
-
-
-def dequantize_nvfp4_kv(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    dequant_scale: torch.Tensor,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Restore dense rows directly to the Attention computation dtype."""
-    from flashinfer.quantization import nvfp4_kv_dequantize
-
-    width = packed.shape[-1] * 2
-    output = nvfp4_kv_dequantize(
-        packed.contiguous().view(torch.uint8).view(-1, width // 2),
-        scales.contiguous().view(torch.uint8).view(-1, width // NVFP4_SF_VEC_SIZE),
-        dequant_scale,
-        output_dtype=dtype,
-    )
-    return output.view(*packed.shape[:-1], width)
-
-
 def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Store the high copy without passing it through NVFP4."""
     if dtype == torch.float8_e4m3fn and values.dtype != dtype:
@@ -106,9 +76,8 @@ def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.
 class MixedPrecisionKVView:
     """Present temporary paged KV to Attention and return new writes to its pools."""
 
-    @classmethod
-    def create(
-        cls,
+    @staticmethod
+    def prepare(
         attention: "AttentionBackend",
         metadata: "AttentionMetadata",
         *,
@@ -174,7 +143,7 @@ class MixedPrecisionKVView:
         self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
         self._indices: dict[str, torch.Tensor] = {}
-        self._metadata = None
+        self.metadata = None
 
     def update(self, metadata: "AttentionMetadata", layer_idx: int) -> None:
         manager = metadata.kv_cache_manager
@@ -237,29 +206,29 @@ class MixedPrecisionKVView:
         from .flashinfer import FlashInferAttentionMetadata
 
         if isinstance(metadata, FlashInferAttentionMetadata):
-            if self._metadata is None:
-                self._metadata = replace(metadata, kv_cache_manager=self, cuda_graph_buffers=None)
+            if self.metadata is None:
+                self.metadata = replace(metadata, kv_cache_manager=self, cuda_graph_buffers=None)
             else:
-                self._metadata.seq_lens = metadata.seq_lens
-                self._metadata.seq_lens_kv = metadata.seq_lens_kv
-                self._metadata.num_contexts = metadata.num_contexts
-                self._metadata.kv_cache_params = metadata.kv_cache_params
-                self._metadata.request_ids = metadata.request_ids
-                self._metadata.prompt_lens = metadata.prompt_lens
-                self._metadata.position_ids = metadata.position_ids
-                self._metadata.padded_num_tokens = metadata.padded_num_tokens
-            self._metadata.prepare()
+                self.metadata.seq_lens = metadata.seq_lens
+                self.metadata.seq_lens_kv = metadata.seq_lens_kv
+                self.metadata.num_contexts = metadata.num_contexts
+                self.metadata.kv_cache_params = metadata.kv_cache_params
+                self.metadata.request_ids = metadata.request_ids
+                self.metadata.prompt_lens = metadata.prompt_lens
+                self.metadata.position_ids = metadata.position_ids
+                self.metadata.padded_num_tokens = metadata.padded_num_tokens
+            self.metadata.prepare()
         else:
-            self._metadata = copy.copy(metadata)
-            self._metadata.kv_cache_manager = self
-            self._metadata.kv_layout = self.layout
-            self._metadata.use_paged_context_fmha = True
+            self.metadata = copy.copy(metadata)
+            self.metadata.kv_cache_manager = self
+            self.metadata.kv_layout = self.layout
+            self.metadata.use_paged_context_fmha = True
             offsets = self.block_offsets()
             if "block_offsets" not in self._indices:
                 self._indices["block_offsets"] = torch.empty_like(offsets, device=self.pool.device)
             self._indices["block_offsets"].copy_(offsets, non_blocking=True)
-            self._metadata.kv_cache_block_offsets = self._indices["block_offsets"]
-        self._metadata.mixed_precision_kv_views = {}
+            self.metadata.kv_cache_block_offsets = self._indices["block_offsets"]
+        self.metadata.mixed_precision_kv_views = {}
 
     def materialize(self) -> None:
         from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
@@ -310,9 +279,6 @@ class MixedPrecisionKVView:
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-
-    def prepare_metadata(self, metadata: "AttentionMetadata") -> "AttentionMetadata":
-        return self._metadata
 
     def _locations(
         self,
