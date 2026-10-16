@@ -68,11 +68,13 @@ Structure (all stage boundaries are CTA barriers):
 With ``SPLIT_V == 2`` two CTAs per (head, request) run as a cluster: both
 recompute the k-side and the outputs, each seeds and stores half of the state
 rows (the SM -> L2 drain of the 64 KB state is the tail of the kernel). The pair
-must be co-scheduled because the state is updated in place, and a cluster
-barrier separates every CTA's S0 load from the pair's stores. The TMA views of
-the state follow the tensor's own strides (the runtime's per-layer state cache
-is a strided slice of a larger buffer). The state may be fp32 or bf16; a bf16
-state is exact in tf32 (the ``S0_lo`` sweep is skipped) and the committed state
+must be co-scheduled because the state is updated in place. Two cluster
+barrier phases order the pair: the first separates both CTAs' load-phase reads
+of the conv windows and replay caches from their update, which only CTA 0
+stores; the second separates every CTA's S0 load from the pair's state stores.
+The TMA views of the state follow the tensor's own strides (the runtime's
+per-layer state cache is a strided slice of a larger buffer). The state may be
+fp32 or bf16; a bf16 state is exact in tf32 (the ``S0_lo`` sweep is skipped) and the committed state
 is rounded to nearest on the way out.
 
 Measured on Rubin (nsys, state L2-resident) against the previous CUDA-core
@@ -826,6 +828,14 @@ def kda_decode_mtp_kernel(
                 # ---- per-token-parallel precompute ----
                 # (REPLAY_ONLY has no new tokens: nothing to precompute, convolve or cache)
                 if cutlass.const_expr(not REPLAY_ONLY):
+                    # Cluster phase 1 of 2: the precompute below overwrites the conv windows and
+                    # replay caches that both CTAs of the pair read in the load phase. The CTA
+                    # barrier above completed this CTA's reads; the cluster barrier makes the
+                    # peer's complete too before CTA 0, the only writer, stores. Phase 2 is the
+                    # S0 arrive / wait pair around the state store.
+                    if cutlass.const_expr(SPLIT_V == 2):
+                        cute.arch.cluster_arrive()
+                        cute.arch.cluster_wait()
                     num_warps = NUM_THREADS // 32
                     half = num_warps // 2
                     role = warp_idx // half
@@ -886,29 +896,33 @@ def kda_decode_mtp_kernel(
                                 for i in cutlass.range(vec_size, unroll_full=True):
                                     k_idx = i * 32 + in_warp_tid
                                     sK[t, k_idx] = r_k[i]
-                                if j == 0:
-                                    for i in cutlass.range(vec_size, unroll_full=True):
-                                        k_idx = i * 32 + in_warp_tid
-                                        for w in cutlass.range(KERNEL_WIDTH - 1, unroll_full=True):
-                                            cs_q[slot, hk_off + k_idx, w] = sXQ[
-                                                (t + 1 + w) * K + k_idx
-                                            ].to(CONV_DTYPE)
-                                            cs_k[slot, hk_off + k_idx, w] = sXK[
-                                                (t + 1 + w) * K + k_idx
-                                            ].to(CONV_DTYPE)
-                                else:
-                                    cache_pos = j - 1
-                                    for i in cutlass.range(vec_size, unroll_full=True):
-                                        k_idx = i * 32 + in_warp_tid
-                                        k_cache[slot, cache_pos, hk_off + k_idx] = r_k[i].to(
-                                            K_CACHE_DTYPE
-                                        )
-                                        cs_q[slot, hk_off + k_idx, KERNEL_WIDTH - 1 + cache_pos] = (
-                                            sXQ[(t + 3) * K + k_idx].to(CONV_DTYPE)
-                                        )
-                                        cs_k[slot, hk_off + k_idx, KERNEL_WIDTH - 1 + cache_pos] = (
-                                            sXK[(t + 3) * K + k_idx].to(CONV_DTYPE)
-                                        )
+                                # Both CTAs of a pair compute the same values; CTA 0 stores them.
+                                if cutlass.const_expr(SPLIT_V == 1) or vh == 0:
+                                    if j == 0:
+                                        for i in cutlass.range(vec_size, unroll_full=True):
+                                            k_idx = i * 32 + in_warp_tid
+                                            for w in cutlass.range(
+                                                KERNEL_WIDTH - 1, unroll_full=True
+                                            ):
+                                                cs_q[slot, hk_off + k_idx, w] = sXQ[
+                                                    (t + 1 + w) * K + k_idx
+                                                ].to(CONV_DTYPE)
+                                                cs_k[slot, hk_off + k_idx, w] = sXK[
+                                                    (t + 1 + w) * K + k_idx
+                                                ].to(CONV_DTYPE)
+                                    else:
+                                        cache_pos = j - 1
+                                        for i in cutlass.range(vec_size, unroll_full=True):
+                                            k_idx = i * 32 + in_warp_tid
+                                            k_cache[slot, cache_pos, hk_off + k_idx] = r_k[i].to(
+                                                K_CACHE_DTYPE
+                                            )
+                                            cs_q[
+                                                slot, hk_off + k_idx, KERNEL_WIDTH - 1 + cache_pos
+                                            ] = sXQ[(t + 3) * K + k_idx].to(CONV_DTYPE)
+                                            cs_k[
+                                                slot, hk_off + k_idx, KERNEL_WIDTH - 1 + cache_pos
+                                            ] = sXK[(t + 3) * K + k_idx].to(CONV_DTYPE)
                             else:
                                 for i in cutlass.range(vec_size, unroll_full=True):
                                     k_idx = i * 32 + in_warp_tid
@@ -942,28 +956,31 @@ def kda_decode_mtp_kernel(
                                     )
                                     sVall[t * V + v_idx] = _v_conv
                                     r_bk[i] = _v_conv
-                                if j == 0:
-                                    for i in cutlass.range(vec_size, unroll_full=True):
-                                        v_idx = i * 32 + in_warp_tid
-                                        for w in cutlass.range(KERNEL_WIDTH - 1, unroll_full=True):
-                                            cs_v[slot, hv_off + v_idx, w] = sXV[
-                                                (t + 1 + w) * V + v_idx
-                                            ].to(CONV_DTYPE)
-                                else:
-                                    cache_pos = j - 1
-                                    for i in cutlass.range(vec_size, unroll_full=True):
-                                        k_idx = i * 32 + in_warp_tid
-                                        g_cache[slot, cache_pos, hk_off + k_idx] = r_decay[i]
-                                        v_cache[slot, cache_pos, hv_off + k_idx] = r_bk[i].to(
-                                            V_CACHE_DTYPE
-                                        )
-                                        cs_v[slot, hv_off + k_idx, KERNEL_WIDTH - 1 + cache_pos] = (
-                                            sXV[(t + 3) * V + k_idx].to(CONV_DTYPE)
-                                        )
-                                    if in_warp_tid == 0:
-                                        beta_cache[slot, cache_pos, i_hv] = r_beta_t.to(
-                                            BETA_CACHE_DTYPE
-                                        )
+                                if cutlass.const_expr(SPLIT_V == 1) or vh == 0:
+                                    if j == 0:
+                                        for i in cutlass.range(vec_size, unroll_full=True):
+                                            v_idx = i * 32 + in_warp_tid
+                                            for w in cutlass.range(
+                                                KERNEL_WIDTH - 1, unroll_full=True
+                                            ):
+                                                cs_v[slot, hv_off + v_idx, w] = sXV[
+                                                    (t + 1 + w) * V + v_idx
+                                                ].to(CONV_DTYPE)
+                                    else:
+                                        cache_pos = j - 1
+                                        for i in cutlass.range(vec_size, unroll_full=True):
+                                            k_idx = i * 32 + in_warp_tid
+                                            g_cache[slot, cache_pos, hk_off + k_idx] = r_decay[i]
+                                            v_cache[slot, cache_pos, hv_off + k_idx] = r_bk[i].to(
+                                                V_CACHE_DTYPE
+                                            )
+                                            cs_v[
+                                                slot, hv_off + k_idx, KERNEL_WIDTH - 1 + cache_pos
+                                            ] = sXV[(t + 3) * V + k_idx].to(CONV_DTYPE)
+                                        if in_warp_tid == 0:
+                                            beta_cache[slot, cache_pos, i_hv] = r_beta_t.to(
+                                                BETA_CACHE_DTYPE
+                                            )
                 if cutlass.const_expr(PROFILE_STAGES):
                     cute.arch.barrier()
                     t_stage1 = read_globaltimer()
