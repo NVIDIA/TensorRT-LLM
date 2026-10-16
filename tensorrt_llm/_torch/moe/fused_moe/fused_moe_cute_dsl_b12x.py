@@ -213,6 +213,11 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
     _PREFILL_VIA_CUTLASS_THRESHOLD = 64
 
     @classmethod
+    def _prefill_uses_cutlass(cls, quant_algo: Optional[QuantAlgo]) -> bool:
+        """NVFP4 prefill uses CUTLASS; W4A16_NVFP4 stays on the B12x kernel."""
+        return quant_algo == QuantAlgo.NVFP4
+
+    @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         sm_version = d.env.sm
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
@@ -245,10 +250,18 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
                 f"CuteDslB12xFusedMoE does not support activation "
                 f"{p.activation}; supported: {supported}",
             )
-        if p.quant_algo == QuantAlgo.NVFP4:
+        if d.moe_lora_enabled:
+            return _reject(
+                MoERejectReason.LORA_UNSUPPORTED,
+                f"{cls.__name__} does not fuse routed-expert LoRA",
+            )
+        if cls._prefill_uses_cutlass(p.quant_algo):
             eligibility = cls._check_build_capabilities(p, d)
             if not eligibility.eligible:
-                return eligibility
+                return replace(
+                    eligibility,
+                    detail="NVFP4 prefill routes through CUTLASS: " + eligibility.detail,
+                )
         # The decode kernel ships in the FlashInfer wheel.
         if not d.env.has_dep(MoEDep.FLASHINFER):
             return _reject(
@@ -326,7 +339,8 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         always stay on the b12x path (which rejects them) so the existing
         error message is preserved."""
         quant_config = getattr(self, "quant_config", None)
-        if quant_config is not None and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+        quant_algo = quant_config.quant_algo if quant_config is not None else None
+        if not self._prefill_uses_cutlass(quant_algo):
             return False
         return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
 

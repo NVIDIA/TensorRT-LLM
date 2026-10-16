@@ -13,6 +13,8 @@ l0_cpu:
       orchestrator: mpi
   tests:
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_resolution
+  - unittest/_torch/moe/test_moe_impl.py::test_b12x_lora_rejection_is_build_independent
+  - unittest/_torch/moe/test_moe_impl.py::test_b12x_cutlass_prefill_routing
   - unittest/_torch/moe/test_moe_impl.py::test_b12x_cutlass_build_mode_resolution
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_dynamic_scale_resolution
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_validation

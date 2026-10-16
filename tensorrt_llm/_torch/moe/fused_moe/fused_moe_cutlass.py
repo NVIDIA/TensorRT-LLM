@@ -214,28 +214,28 @@ class CutlassFusedMoE(MoEImplBase):
             if p.activation_type in (ActivationType.SiTu, ActivationType.Relu2):
                 return _reject(
                     MoERejectReason.ACTIVATION_UNSUPPORTED,
-                    f"CutlassFusedMoE {p.activation} requires a build with "
+                    f"{cls.__name__} {p.activation} requires a build with "
                     "USING_OSS_CUTLASS_MOE_GEMM=ON")
             if quant_algo in (QuantAlgo.MXFP8, QuantAlgo.W4A8_MXFP4_MXFP8,
                               QuantAlgo.W4A16_MXFP4, QuantAlgo.W4A8_AWQ):
                 return _reject(
                     MoERejectReason.QUANT_UNSUPPORTED,
-                    f"CutlassFusedMoE {quant_algo.name} requires a build with "
+                    f"{cls.__name__} {quant_algo.name} requires a build with "
                     "USING_OSS_CUTLASS_MOE_GEMM=ON")
             if quant_algo == QuantAlgo.NVFP4 and d.force_dynamic_quantization:
                 return _reject(
                     MoERejectReason.QUANT_UNSUPPORTED,
-                    "CutlassFusedMoE dynamic FC2 scaling requires a build with "
+                    f"{cls.__name__} dynamic FC2 scaling requires a build with "
                     "USING_OSS_CUTLASS_MOE_GEMM=ON")
             if p.clamp_after_silu:
                 return _reject(
                     MoERejectReason.ACTIVATION_UNSUPPORTED,
-                    "CutlassFusedMoE post-SiLU clamping requires a build with "
+                    f"{cls.__name__} post-SiLU clamping requires a build with "
                     "USING_OSS_CUTLASS_MOE_GEMM=ON")
             if d.moe_lora_enabled:
                 return _reject(
                     MoERejectReason.LORA_UNSUPPORTED,
-                    "CutlassFusedMoE routed-expert LoRA requires a build with "
+                    f"{cls.__name__} routed-expert LoRA requires a build with "
                     "USING_OSS_CUTLASS_MOE_GEMM=ON")
 
         return MoEEligibility.ok()
