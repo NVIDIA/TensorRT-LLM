@@ -3172,10 +3172,6 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return None
 
-    def get_disagg_layer_ids(self, layer_ids: Sequence[int]) -> list[int]:
-        """Return PP-independent transfer identifiers for native KV layers."""
-        return [self.pp_layers[layer] for layer in layer_ids]
-
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
 
@@ -6888,6 +6884,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             raise ValueError("Mixed precision requires NVFP4 history and FP16/BF16/FP8 high KV")
         layers = list(config.layers)
         next_id = max(int(layer.layer_id) for layer in layers) + 1
+        # Pool transfer IDs are fixed at construction, independently of PP placement.
+        self._disagg_layer_ids = {local: 2 * model for local, model in enumerate(self.pp_layers)}
         largest_page = 0
         for layer in config.layers:
             # Native SWA and recurrent-state pools keep their existing lifecycles.
@@ -6912,6 +6910,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                 if role in (Role.KEY, Role.VALUE)
             ]
             self.high_layers[layer_id] = next_id
+            self._disagg_layer_ids[next_id] = self._disagg_layer_ids[layer_id] + 1
             layers.append(
                 AttentionLayerConfig(
                     layer_id=next_id,
@@ -6951,12 +6950,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             tiers.append(tier)
         ratio = self._split_mixed_precision_pool_ratio(config, layers)
         return replace(config, layers=layers, cache_tiers=tiers, initial_pool_ratio=ratio)
-
-    def get_disagg_layer_ids(self, layer_ids: Sequence[int]) -> list[int]:
-        # Transfer IDs distinguish the two stores; Attention keeps its model layer IDs.
-        ids = {local: 2 * model for local, model in enumerate(self.pp_layers)}
-        ids.update({high: ids[low] + 1 for low, high in self.high_layers.items()})
-        return [ids[layer] for layer in layer_ids]
 
     def _split_mixed_precision_pool_ratio(
         self, config: KVCacheManagerConfigPy, layers: Sequence[object]

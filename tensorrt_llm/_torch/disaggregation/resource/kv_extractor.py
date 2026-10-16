@@ -473,7 +473,8 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     local_layer_ids = manager.impl.layer_grouping[lg_idx]
 
     if not hasattr(manager, "_layer_attn_to_layer_id"):
-        return manager.get_disagg_layer_ids(local_layer_ids)
+        layer_ids = getattr(manager, "_disagg_layer_ids", manager.pp_layers)
+        return [layer_ids[lid] for lid in local_layer_ids]
 
     # Virtual layers: build inverse mapping internal_layer_id -> (model_layer, attn_type)
     # and encode as model_layer * num_attn_types + attn_type_value

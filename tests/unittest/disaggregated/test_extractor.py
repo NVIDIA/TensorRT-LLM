@@ -531,7 +531,6 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
     )
-    manager.get_disagg_layer_ids = lambda ids: [manager.pp_layers[i] for i in ids]
     return manager
 
 

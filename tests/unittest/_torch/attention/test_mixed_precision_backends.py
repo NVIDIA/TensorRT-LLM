@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Local GPU QA: exercise the optimized backends, not a reference fallback."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttention
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionRuntimeFeatures,
+    PredefinedAttentionMask,
+)
 from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import encode_high_precision_kv
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
@@ -86,6 +91,13 @@ def test_optimized_two_pool_prefill_and_decode(
             attention._fmha_manager,
         )
     scale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    module = SimpleNamespace(
+        attn=attention,
+        mapping=manager.mapping,
+        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+        qkv_proj=SimpleNamespace(kv_scales=scale, inv_kv_scales=scale.reciprocal()),
+        _use_quantize_output=lambda: False,
+    )
     decode_graph = None
 
     def forward(begin, end, context):
@@ -115,7 +127,16 @@ def test_optimized_two_pool_prefill_and_decode(
         )
 
         def run():
-            return attention.forward(*inputs, metadata, kv_scale_quant_orig=scale)
+            return Attention._attn_impl(
+                module,
+                *inputs,
+                metadata,
+                PredefinedAttentionMask.CAUSAL,
+                None,
+                None,
+                None,
+                None,
+            )[0]
 
         output = run()
         if not context and high_dtype == DataType.BF16:
@@ -413,7 +434,7 @@ def test_mla_uses_independent_rope_and_native_attention(backend):
                 max_num_tokens=512,
                 kv_cache_manager=manager,
                 request_ids=[0],
-                prompt_lens=[512],
+                prompt_lens=[end - begin if begin < 512 else 512],
                 kv_layout="HND",
                 enable_context_mla_with_cached_kv=True,
                 runtime_features=AttentionRuntimeFeatures(

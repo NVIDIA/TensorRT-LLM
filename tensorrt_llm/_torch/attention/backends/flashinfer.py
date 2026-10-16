@@ -2857,14 +2857,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
-        from .mixed_precision_kv_view import MixedPrecisionKVView
-
-        attention_kv = MixedPrecisionKVView.prepare(
-            self,
-            metadata,
-            history_dequant_scale=forward_args.kv_scale_quant_orig)
-        if attention_kv is not None:
-            metadata = attention_kv.metadata
 
         attention_mask_data = forward_args.attention_mask_data
         latent_cache = forward_args.latent_cache
@@ -2906,9 +2898,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
-        original_fp8_kv_cache = self.has_fp8_kv_cache
-        if attention_kv is not None:
-            self.has_fp8_kv_cache = False
         try:
             self.forward_impl(
                 q=q,
@@ -2929,9 +2918,4 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 type(self).__name__, self.layer_idx, metadata,
                 forward_args.attention_window_size, exc)
             raise
-        finally:
-            if attention_kv is not None:
-                self.has_fp8_kv_cache = original_fp8_kv_cache
-        if attention_kv is not None:
-            attention_kv.writeback()
         return output
