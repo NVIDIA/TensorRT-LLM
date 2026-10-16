@@ -171,8 +171,13 @@ Workers can start before the whole plan is written, and every minute they
 wait for it is lost. So write the plan in batches:
 
 - **First batch, before the deep reading.** Read `task.yaml`, the
-  checkpoint's `config.json` and the ModelingV2 README, then write the tasks
-  that need nothing more to be defined, and end the turn. These include:
+  checkpoint's `config.json` and the ModelingV2 README — **nothing else**:
+  not the reference modeling code, the safetensors index, the catalog's
+  entries or the engine's source, and run no code. That is about ten tool
+  calls; workers wait for every one more. Then write the tasks that need
+  nothing more to be defined, and end the turn. A task you can only
+  half-define now (its exact shapes, whether an entry covers it) waits for
+  a later batch. The first batch includes:
   - the execution environment, one task: from `task.yaml` (its
     `slurm-environment` and `implements_tips`), write the wrapper every GPU
     command runs through inside the container — reusing an existing build
@@ -440,6 +445,7 @@ planning: false      # true: the plan is not complete; wake me again at once
 | "This coverage question is unclear; let a worker figure it out" | Read the entry's `CELLS` again. Judging coverage is your job. |
 | "Make every task depend on the previous one, to be safe" | Each spurious edge serializes work that would have run in parallel. |
 | "Read everything first, then write the whole plan" | Workers sit idle meanwhile. Write the first batch now and keep planning while it runs. |
+| "One more look at the HF code or the engine before the first batch" | That reading belongs to the second batch. The first is written from `task.yaml`, `config.json` and the README alone. |
 | "The plan is one chain: ops, target, accuracy, land" | Workers sit idle. Run independent work side by side and fill the rest with `perf` tasks. |
 | "Start the features once the accuracy gate passes" | The gate's fixes join later through a `merge`. Start the feature work now, from the same code. |
 | "One big task: implement the model" | A worker owns one outcome. Split by entry, by module, by gate. |
@@ -479,7 +485,8 @@ def initial_plan_prompt(*, task_yaml: Path, plan: Path, repo: Path, turn_file: P
     """The first planning turn: the first batch of the plan."""
     return (
         f"Plan the run, starting with its first batch (see Plan in batches): no "
-        f"worker starts until you end this turn.\n\n"
+        f"worker starts until you end this turn, so read only `task.yaml`, "
+        f"`config.json` and the ModelingV2 README before writing it.\n\n"
         f"- The user's task: `{task_yaml}`\n"
         f"- The TensorRT-LLM checkout (read only for you): `{repo}`\n\n"
         f"Write the plan to `{plan}`. Every task gets a `### <id>` section and a "
