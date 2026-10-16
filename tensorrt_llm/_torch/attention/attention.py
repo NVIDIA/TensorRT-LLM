@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import threading
 import weakref
-from typing import List, Optional, Tuple, Union
+from typing import (Callable, Generic, List, Optional, ParamSpec, Tuple,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -199,13 +201,43 @@ def _helix_sanitize_empty_kv(
 _HELIX_NCCL_SHAPES: set = set()
 _HELIX_NCCL_LIMIT_REPORTED = False
 
+_HelixArgs = ParamSpec("_HelixArgs")
+_HelixResult = TypeVar("_HelixResult")
+
+
+class _HelixNcclCompile(Generic[_HelixArgs, _HelixResult]):
+    """Keep the helper's compile budget across warmup and executor threads."""
+
+    def __init__(self, fn: Callable[_HelixArgs, _HelixResult]) -> None:
+        self._fn = fn
+        self.recompile_limit = 16
+        self._lock = threading.Lock()
+        self._compiled = torch.compile(fn,
+                                       dynamic=False,
+                                       recompile_limit=self.recompile_limit)
+
+    def __call__(self, *args: _HelixArgs.args,
+                 **kwargs: _HelixArgs.kwargs) -> _HelixResult:
+        # Nested tracing already uses the enclosing compiled region's budget.
+        if torch.compiler.is_compiling():
+            return self._fn(*args, **kwargs)
+        limit = torch._dynamo.config.recompile_limit
+        if limit > self.recompile_limit:
+            with self._lock:
+                if limit > self.recompile_limit:
+                    self._compiled = torch.compile(self._fn,
+                                                   dynamic=False,
+                                                   recompile_limit=limit)
+                    self.recompile_limit = limit
+        return self._compiled(*args, **kwargs)
+
 
 def _helix_note_nccl_specialization(partial_o: torch.Tensor,
                                     softmax_stats: torch.Tensor,
                                     cp_size: int) -> None:
     """Warn once if the Helix NCCL reformat is past dynamo's recompile budget.
 
-    Past ``cache_size_limit`` dynamo stops compiling and runs the frame eagerly
+    Past the helper's recompile limit dynamo runs the frame eagerly
     without raising, which silently gives back the fusion these helpers exist
     for. Report it once per process so the regression is visible in the log
     instead of only in a kernel trace.
@@ -217,24 +249,22 @@ def _helix_note_nccl_specialization(partial_o: torch.Tensor,
     if key in _HELIX_NCCL_SHAPES:
         return
     _HELIX_NCCL_SHAPES.add(key)
-    try:
-        import torch._dynamo as _dynamo
-        limit = getattr(_dynamo.config, "cache_size_limit", None)
-    except ImportError:
-        limit = None
-    if limit is None or len(_HELIX_NCCL_SHAPES) <= limit:
+    limit = max(_helix_nccl_pre_alltoall.recompile_limit,
+                torch._dynamo.config.recompile_limit)
+    if len(_HELIX_NCCL_SHAPES) <= limit:
         return
     _HELIX_NCCL_LIMIT_REPORTED = True
     logger.warning(
         "Helix NCCL all-to-all reformat has seen %d distinct input "
-        "specializations, above torch._dynamo.config.cache_size_limit=%d. "
+        "specializations, above the helper recompile_limit=%d. "
         "Dynamo stops recompiling past that limit and runs these helpers "
         "eagerly without raising, losing the sanitize/transpose fusion. "
         "Reduce the number of CUDA-graph batch buckets or raise "
-        "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
+        "torch._dynamo.config.recompile_limit before warmup.",
+        len(_HELIX_NCCL_SHAPES), limit)
 
 
-@torch.compile(dynamic=False)
+@_HelixNcclCompile
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
@@ -254,7 +284,7 @@ def _helix_nccl_pre_alltoall(
     the same shape, which cancels the win at the collective.
 
     The cost is one specialization per CUDA-graph batch bucket. Exceeding
-    dynamo's ``cache_size_limit`` falls back to eager SILENTLY -- the symptom is
+    the helper's recompile limit falls back to eager SILENTLY -- the symptom is
     ``triton_poi_fused_*`` disappearing from the trace, not an error, so
     ``_helix_note_nccl_specialization`` counts the distinct shapes at the call
     site and says so once.
@@ -269,7 +299,7 @@ def _helix_nccl_pre_alltoall(
     return chunks
 
 
-@torch.compile(dynamic=False)
+@_HelixNcclCompile
 def _helix_nccl_post_alltoall(
         gathered: List[torch.Tensor]) -> List[torch.Tensor]:
     """Reformat the gathered partials into the helix_post_process layout."""
