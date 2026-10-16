@@ -981,7 +981,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_additional_outputs = additional_outputs
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
-        self.d2t = None
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
