@@ -4068,22 +4068,24 @@ def _ring_gate_manager(
 
 
 @pytest.mark.parametrize(
-    ("env", "available", "overrides", "expected", "warns"),
+    ("env", "replay_enabled", "available", "overrides", "expected", "warns"),
     [
-        ("1", True, {}, True, False),
-        ("1", True, {"draft_len": 7}, True, False),
-        (None, True, {}, False, False),
-        ("1", False, {}, False, True),
-        ("1", True, {"ssm_dtype": torch.float32}, False, True),
-        ("1", True, {"conv_dtype": torch.float16}, False, True),
-        ("1", True, {"head_dim": 64}, False, True),
-        ("1", True, {"draft_len": 2}, False, True),
-        ("1", True, {"conv_state_layout": "x_b_c"}, False, True),
+        ("1", True, True, {}, True, False),
+        ("1", True, True, {"draft_len": 7}, True, False),
+        (None, True, True, {}, False, False),
+        ("1", False, True, {}, False, True),
+        ("1", True, False, {}, False, True),
+        ("1", True, True, {"ssm_dtype": torch.float32}, False, True),
+        ("1", True, True, {"conv_dtype": torch.float16}, False, True),
+        ("1", True, True, {"head_dim": 64}, False, True),
+        ("1", True, True, {"draft_len": 2}, False, True),
+        ("1", True, True, {"conv_state_layout": "x_b_c"}, False, True),
     ],
     ids=[
         "eligible_T4",
         "eligible_T8",
         "not_opted_in",
+        "replay_off",
         "kernel_unavailable",
         "fp32_state",
         "fp16_model",
@@ -4092,7 +4094,9 @@ def _ring_gate_manager(
         "x_b_c_layout",
     ],
 )
-def test_gdn_flashinfer_ring_replay_gate(monkeypatch, env, available, overrides, expected, warns):
+def test_gdn_flashinfer_ring_replay_gate(
+    monkeypatch, env, replay_enabled, available, overrides, expected, warns
+):
     if env is None:
         monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", raising=False)
     else:
@@ -4105,7 +4109,7 @@ def test_gdn_flashinfer_ring_replay_gate(monkeypatch, env, available, overrides,
     warning_log = MagicMock()
     monkeypatch.setattr("tensorrt_llm._torch.modules.fla.cache_manager.logger.warning", warning_log)
 
-    assert _use_flashinfer_ring_replay(_ring_gate_manager(**overrides)) is expected
+    assert _use_flashinfer_ring_replay(_ring_gate_manager(**overrides), replay_enabled) is expected
     assert warning_log.called is warns
 
 
@@ -4118,10 +4122,21 @@ def test_gdn_flashinfer_ring_replay_gate_force(monkeypatch, available):
         lambda: available,
     )
     if available:
-        assert _use_flashinfer_ring_replay(_ring_gate_manager()) is True
+        assert _use_flashinfer_ring_replay(_ring_gate_manager(), True) is True
     else:
         with pytest.raises(RuntimeError, match="force"):
-            _use_flashinfer_ring_replay(_ring_gate_manager())
+            _use_flashinfer_ring_replay(_ring_gate_manager(), True)
+
+
+def test_gdn_flashinfer_ring_replay_gate_force_replay_disabled(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: True,
+    )
+    with pytest.raises(RuntimeError, match="requires GDN replay"):
+        _use_flashinfer_ring_replay(_ring_gate_manager(), False)
 
 
 @skip_no_cuda

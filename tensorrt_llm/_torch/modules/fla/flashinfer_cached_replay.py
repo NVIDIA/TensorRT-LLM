@@ -13,6 +13,11 @@ two-buffer layout. Differences from the Triton path that callers must handle:
     otherwise ``len += accepted``.
   * Block-strided state pools need FlashInfer's strided mode, which also
     requires q/k/v to be column slices of one packed buffer.
+
+FlashInfer 0.6.18 exposes no public argument for strided mode. This module
+sets the private module flag ``_STRIDED_QKV`` at import time, because its env
+var ``SGLANG_GDN_WY_STRIDED_QKV`` is only read when FlashInfer is imported.
+Recheck this on FlashInfer upgrades.
 """
 
 from typing import Optional

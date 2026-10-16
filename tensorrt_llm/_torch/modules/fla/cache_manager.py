@@ -637,7 +637,7 @@ def select_gdn_replay_state(
     return GDNReplayState(spec_config.tokens_per_gen_step) if use_replay else None
 
 
-def _use_flashinfer_ring_replay(manager: MambaHybridCacheManagerV2) -> bool:
+def _use_flashinfer_ring_replay(manager: MambaHybridCacheManagerV2, replay_enabled: bool) -> bool:
     """Whether GDN replay should use the FlashInfer ring-buffer kernel.
 
     Decided once at load: the ring and double-buffer history layouts differ,
@@ -649,9 +649,10 @@ def _use_flashinfer_ring_replay(manager: MambaHybridCacheManagerV2) -> bool:
 
     layout = manager._state_layout
     _, head_dim, d_state = layout.ssm_state_shape
-    tokens_per_step = manager.spec_config.tokens_per_gen_step
     reason = None
-    if layout.conv_state_layout != "q_k_v":
+    if not replay_enabled:
+        reason = "requires GDN replay to be enabled"
+    elif layout.conv_state_layout != "q_k_v":
         reason = "requires the q_k_v convolution state layout"
     elif not is_flashinfer_cached_replay_available():
         reason = "needs FlashInfer and an SM90/SM100/SM103 GPU"
@@ -659,8 +660,11 @@ def _use_flashinfer_ring_replay(manager: MambaHybridCacheManagerV2) -> bool:
         reason = "requires bf16 model and SSM state dtypes"
     elif d_state != 128 or head_dim != 128:
         reason = "requires key and value head size 128"
-    elif tokens_per_step not in (4, 8):
-        reason = f"supports 4 or 8 tokens per generation step, got {tokens_per_step}"
+    elif manager.spec_config.tokens_per_gen_step not in (4, 8):
+        reason = (
+            "supports 4 or 8 tokens per generation step, got "
+            f"{manager.spec_config.tokens_per_gen_step}"
+        )
     if reason is None:
         return True
     if is_gdn_flashinfer_replay_required():
@@ -681,8 +685,8 @@ def create_gdn_state(
 ) -> GDNIntermediateState | GDNReplayState:
     """Shared selection for the Qwen3.5 and Qwen4 cache managers."""
     if use_replay is False:
-        return GDNIntermediateState()
-    if use_replay is True:
+        state = None
+    elif use_replay is True:
         if manager.spec_config is None:
             raise ValueError("GDN replay requires speculative decoding")
         state = GDNReplayState(manager.spec_config.tokens_per_gen_step)
@@ -692,12 +696,10 @@ def create_gdn_state(
             ssm_cache_dtype=manager.ssm_state_dtype,
             manager_cls=type(manager),
         )
-        if state is None:
-            return GDNIntermediateState()
-    if allow_flashinfer_ring and _use_flashinfer_ring_replay(manager):
+    if allow_flashinfer_ring and _use_flashinfer_ring_replay(manager, state is not None):
         logger.info("GDN replay kernel: FlashInfer ring buffer")
-        state = GDNReplayState(manager.spec_config.tokens_per_gen_step, use_flashinfer_ring=True)
-    return state
+        return GDNReplayState(manager.spec_config.tokens_per_gen_step, use_flashinfer_ring=True)
+    return state or GDNIntermediateState()
 
 
 def validate_gdn_layout(
