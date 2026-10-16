@@ -17,8 +17,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
+    merge_attention_forward_args,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.kv_cache_conversion import encode_high_precision_kv
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    MixedPrecisionKVCacheManager,
+    Role,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .indexer import (
@@ -152,6 +158,106 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
+    def forward(self, q, k, v, metadata, forward_args=None, **kwargs):
+        if isinstance(metadata.kv_cache_manager, MixedPrecisionKVCacheManager):
+            # Sparse MLA already gathers the selected rows into its native
+            # Attention input; it does not need the dense K/V paged view.
+            return self._forward_impl(
+                q, k, v, metadata, merge_attention_forward_args(forward_args, kwargs)
+            )
+        return super().forward(q, k, v, metadata, forward_args, **kwargs)
+
+    def _high_precision_rows(self, metadata, positions, request_indices):
+        manager = metadata.kv_cache_manager
+        if not isinstance(manager, MixedPrecisionKVCacheManager):
+            return None
+        if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError("Mixed-precision DSA currently requires eager execution")
+        if not self.has_fp4_kv_cache:
+            raise ValueError("Mixed-precision DSA requires the native NVFP4 KV writer")
+        pool, tables = manager.get_high_precision_rows(
+            self.get_local_layer_idx(metadata), Role.KEY, metadata.request_ids
+        )
+        width = max(map(len, tables))
+        table = torch.tensor(
+            [row + [-1] * (width - len(row)) for row in tables],
+            dtype=torch.int64,
+            device=positions.device,
+        )
+        blocks = positions.long() // manager.tokens_per_block
+        pages = table[request_indices.long(), blocks.clamp(0, width - 1)]
+        valid = (positions >= 0) & (blocks < width) & (pages >= 0)
+        return pool, pages, positions.long() % manager.tokens_per_block, valid
+
+    def _store_high_precision_kv(self, latent_cache, metadata, *, is_generation, apply_rope=False):
+        if not isinstance(metadata.kv_cache_manager, MixedPrecisionKVCacheManager):
+            return
+        start = metadata.num_ctx_tokens if is_generation else 0
+        end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
+        request_indices = metadata.req_idx_per_token[start:end].long()
+        lengths = metadata.seq_lens_cuda[: metadata.num_seqs].long()
+        starts = lengths.cumsum(0) - lengths
+        positions = (
+            metadata.kv_lens_cuda[request_indices]
+            - lengths[request_indices]
+            + torch.arange(start, end, device=latent_cache.device)
+            - starts[request_indices]
+        )
+        pool, pages, offsets, valid = self._high_precision_rows(
+            metadata, positions, request_indices
+        )
+        if apply_rope:
+            # The generation writer leaves its input unrotated. Use the same
+            # unfused RoPE op as MLA, then store values before NVFP4 conversion.
+            from tensorrt_llm._torch.custom_ops import (
+                flashinfer_apply_rope_with_cos_sin_cache_inplace,
+            )
+
+            latent_cache = latent_cache.clone()
+            rope = latent_cache[:, self.mla_params.kv_lora_rank :].contiguous()
+            cos_sin = self.rope_params.create_rope_const_params(interleave=False)[1]
+            flashinfer_apply_rope_with_cos_sin_cache_inplace(
+                positions,
+                torch.empty_like(rope),
+                rope,
+                self.mla_params.qk_rope_head_dim,
+                cos_sin.view(self.rope_params.max_positions, -1),
+                False,
+            )
+            latent_cache[:, self.mla_params.kv_lora_rank :] = rope
+        values = encode_high_precision_kv(latent_cache[valid], pool.dtype).unsqueeze(1)
+        pool.view(torch.uint8)[pages[valid], offsets[valid]] = values.view(torch.uint8)
+
+    def mla_rope_generation(self, fused_q, q_pe, latent_cache, metadata, *args, **kwargs):
+        super().mla_rope_generation(fused_q, q_pe, latent_cache, metadata, *args, **kwargs)
+        self._store_high_precision_kv(latent_cache, metadata, is_generation=True, apply_rope=True)
+
+    def _overlay_high_precision_kv(
+        self, metadata, topk_indices, compact_indices, scratch, *, is_generation
+    ):
+        start = metadata.num_ctx_tokens if is_generation else 0
+        end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
+        rows = self._high_precision_rows(
+            metadata, topk_indices, metadata.req_idx_per_token[start:end, None]
+        )
+        if rows is None:
+            return
+        pool, pages, offsets, valid = rows
+        valid &= compact_indices >= 0
+        source = valid.flatten().nonzero().flatten()
+        destinations, inverse = torch.unique(
+            compact_indices.flatten()[source].long(), return_inverse=True
+        )
+        # Context queries can select the same compact row many times. Read
+        # and convert each high-precision row only once.
+        selected = torch.empty_like(destinations).scatter_(0, inverse, source)
+        values = pool.view(torch.uint8)[pages.flatten()[selected], offsets.flatten()[selected]]
+        # Native sparse NVFP4 Attention consumes FP8, including high-pool rows.
+        values = encode_high_precision_kv(values.view(pool.dtype), scratch.dtype)
+        scratch.view(-1, 1, self.head_dim).view(torch.uint8)[destinations] = values.view(
+            torch.uint8
+        )
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -229,6 +335,9 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
+            self._overlay_high_precision_kv(
+                metadata, topk_indices, compact_indices, scratch, is_generation=False
+            )
             metadata.nvfp4_mla_context_fp8_scratch = scratch
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
@@ -258,6 +367,9 @@ class DSATrtllmAttention(TrtllmAttention):
                 local_layer_idx,
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
+            )
+            self._overlay_high_precision_kv(
+                metadata, topk_indices, compact_indices, scratch, is_generation=True
             )
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
@@ -411,3 +523,4 @@ class DSATrtllmAttention(TrtllmAttention):
             beam_width,
             self.quant_mode,
         )
+        self._store_high_precision_kv(latent_cache, metadata, is_generation=is_generation)

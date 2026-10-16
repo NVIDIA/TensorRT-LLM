@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Local GPU QA: exercise the optimized backends, not a reference fallback."""
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -262,3 +263,218 @@ def test_high_fp8_uses_native_saturating_conversion():
     )
     actual = encode_high_precision_kv(values, torch.float8_e4m3fn)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+
+
+def test_flashinfer_staged_metadata_does_not_change_original():
+    from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttentionMetadata
+
+    original = object.__new__(FlashInferAttentionMetadata)
+    original.num_blocks = [2, 1]
+    original._host_paged_kv_indices = torch.tensor([17, 42, 8], dtype=torch.int32)
+    original._paged_kv_indices = original._host_paged_kv_indices
+    wrapper = SimpleNamespace(is_planned=True)
+    original._plan_params_to_wrappers = {"original": wrapper}
+    original._host_pool_indices = {0: original._host_paged_kv_indices}
+    staged = SimpleNamespace(page_counts=[2, 1], pool=torch.empty(0))
+    metadata = original.with_paged_kv_view(staged)
+    assert metadata.kv_cache_manager is staged
+    assert metadata._host_paged_kv_indices.tolist() == [0, 1, 2]
+    assert not metadata._host_pool_indices and not metadata._plan_params_to_wrappers
+    assert original._host_paged_kv_indices.tolist() == [17, 42, 8]
+    assert original._plan_params_to_wrappers["original"] is wrapper and wrapper.is_planned
+
+
+@pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
+def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
+    """GLM/DSA native writer, selected-row gather and sparse Attention; no model weights."""
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionInputType,
+        MLAParams,
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendForwardArgs
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+    from tensorrt_llm.functional import PositionEmbeddingType
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for native DSA Attention")
+    block, width, heads, topk, length = 128, 576, 128, 2048, 640
+    sparse = DeepSeekSparseAttentionConfig(index_n_heads=64, index_head_dim=128, index_topk=topk)
+    manager = MixedPrecisionKVCacheManager.for_manager(DSACacheManagerV2)(
+        KvCacheConfig(max_gpu_total_bytes=128 << 20, enable_block_reuse=True),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=width,
+        tokens_per_block=block,
+        max_seq_len=1024,
+        max_batch_size=1,
+        max_num_tokens=length,
+        mapping=Mapping(),
+        dtype=high_dtype,
+        compute_dtype=torch.bfloat16,
+        first_n=128,
+        last_n=128,
+        sparse_attention_config=sparse,
+        pretrained_config=SimpleNamespace(qk_rope_head_dim=64, num_hidden_layers=1),
+    )
+    attention = DSATrtllmAttention(
+        layer_idx=0,
+        num_heads=heads,
+        num_kv_heads=1,
+        head_dim=width,
+        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj,
+            rope=RopeParams(dim=64, max_positions=1024),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=512,
+            rope_append=True,
+        ),
+        sparse_attention_config=sparse,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    latent = torch.randn(length + 1, width, device="cuda", generator=generator).bfloat16()
+    expected_high = torch.empty_like(latent)
+
+    try:
+        manager.add_dummy_requests([0], [256], is_gen=False)
+        for begin, end, context in (
+            (0, 256, True),
+            (256, length, True),
+            (length, length + 1, False),
+        ):
+            cache = manager.kv_cache_map[0]
+            if begin:
+                assert cache.resize(None, begin)
+                cache.suspend()
+                assert cache.resume(
+                    torch.cuda.current_stream().cuda_stream, is_decoding=not context
+                )
+                assert cache.resize(end)
+                manager._restore_page_index_bufs(0, cache)
+            metadata = attention.Metadata(
+                seq_lens=torch.tensor([end - begin], dtype=torch.int32),
+                request_ids=[0],
+                max_num_requests=1,
+                max_num_tokens=length,
+                num_contexts=int(context),
+                prompt_lens=[length],
+                kv_cache_manager=manager,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[begin]),
+                sparse_attention_config=sparse,
+            )
+            metadata.prepare()
+            inputs = latent[begin:end].clone()
+            query = torch.randn(
+                end - begin, heads * width, device="cuda", generator=generator
+            ).bfloat16()
+            positions = torch.arange(begin, end, device="cuda")
+            reference = inputs.float().clone()
+            cos_sin = attention.rope_params.create_rope_const_params(interleave=False)[1].view(
+                1024, 2, -1
+            )
+            pairs = reference[:, 512:].view(-1, 32, 2).clone()
+            cos, sin = cos_sin[positions, 0], cos_sin[positions, 1]
+            reference[:, 512::2] = pairs[..., 0] * cos - pairs[..., 1] * sin
+            reference[:, 513::2] = pairs[..., 1] * cos + pairs[..., 0] * sin
+            expected_high[begin:end] = reference.to(inputs.dtype)
+            args = dict(
+                attention_input_type=AttentionInputType.context_only
+                if context
+                else AttentionInputType.generation_only,
+                sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+            )
+            if context:
+                # The production prefill writer takes unabsorbed Q; Attention
+                # below consumes absorbed Q with the same rotated RoPE slice.
+                unabsorbed = torch.zeros(end - begin, heads * 192, device="cuda", dtype=query.dtype)
+                unabsorbed.view(-1, heads, 192)[..., 128:] = query.view(-1, heads, width)[..., 512:]
+                attention.mla_rope_append_paged_kv_assign_q(unabsorbed, inputs, metadata)
+                query.view(-1, heads, width)[..., 512:] = unabsorbed.view(-1, heads, 192)[..., 128:]
+                args["q_rope_applied"] = True
+            else:
+                args.update(
+                    cu_q_seqlens=torch.empty(2, dtype=torch.int32, device="cuda"),
+                    cu_kv_seqlens=torch.empty(2, dtype=torch.int32, device="cuda"),
+                    fmha_scheduler_counter=torch.empty(1, dtype=torch.uint32, device="cuda"),
+                    mla_bmm1_scale=torch.empty(2, dtype=torch.float32, device="cuda"),
+                    mla_bmm2_scale=torch.empty(1, dtype=torch.float32, device="cuda"),
+                    quant_q_buffer=torch.empty_like(query, dtype=torch.uint8),
+                )
+                q_pe = query.view(-1, heads, width)[..., 512:].contiguous()
+                attention.mla_rope_generation(
+                    query,
+                    q_pe,
+                    inputs,
+                    metadata,
+                    args["cu_q_seqlens"],
+                    args["cu_kv_seqlens"],
+                    args["fmha_scheduler_counter"],
+                    args["mla_bmm1_scale"],
+                    args["mla_bmm2_scale"],
+                    args["quant_q_buffer"],
+                )
+            pool, tables = manager.get_high_precision_rows(0, Role.KEY, [0])
+            for ordinal, page in enumerate(tables[0]):
+                if page < 0:
+                    continue
+                lo, hi = ordinal * block, min((ordinal + 1) * block, end)
+                expected = encode_high_precision_kv(expected_high[lo:hi], pool.dtype)
+                actual = pool[page, : hi - lo, 0].float()
+                torch.testing.assert_close(actual, expected.float(), atol=0.03125, rtol=0.01)
+            selected = (
+                torch.arange(topk, device="cuda", dtype=torch.int32).expand(end - begin, -1).clone()
+            )
+            selected.masked_fill_(selected > positions[:, None], -1)
+            attention.indexer.forward_from_projected = Mock(return_value=selected)
+            original_overlay = attention._overlay_high_precision_kv
+
+            def checked_overlay(meta, indices, compact, scratch, **kwargs):
+                low = scratch.clone()
+                original_overlay(meta, indices, compact, scratch, **kwargs)
+                token = indices.long()
+                pages = torch.tensor(tables[0], device="cuda")[token.clamp(0, end - 1) // block]
+                valid = (token >= 0) & (compact >= 0)
+                protected = valid & (pages >= 0)
+                actual = scratch.view(-1, width).view(torch.uint8)[compact[protected].long()]
+                expected = (
+                    encode_high_precision_kv(
+                        pool.view(torch.uint8)[pages[protected], token[protected] % block].view(
+                            pool.dtype
+                        ),
+                        scratch.dtype,
+                    )
+                    .view(-1, width)
+                    .view(torch.uint8)
+                )
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                unprotected = compact[valid & (pages < 0)].long()
+                torch.testing.assert_close(
+                    scratch.view(-1, width).view(torch.uint8)[unprotected],
+                    low.view(-1, width).view(torch.uint8)[unprotected],
+                    atol=0,
+                    rtol=0,
+                )
+
+            with patch.object(
+                attention, "_overlay_high_precision_kv", side_effect=checked_overlay
+            ) as overlay:
+                output = attention.forward(query, None, None, metadata, **args)
+            assert overlay.call_count == 1
+            assert output.shape == (end - begin, heads * 512)
+            assert torch.isfinite(output).all()
+            if not context:
+                assert tables[0][0] >= 0 and tables[0][1:3] == [kv.BAD_PAGE_INDEX] * 2
+    finally:
+        manager.shutdown()

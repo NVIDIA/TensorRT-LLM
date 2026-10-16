@@ -638,6 +638,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
 
+    def with_paged_kv_view(self, staged) -> "FlashInferAttentionMetadata":
+        """Use a materialized KV view without changing request lengths or cached plans."""
+        if list(self.num_blocks) != staged.page_counts:
+            raise NotImplementedError(
+                "Mixed-precision staging requires logical page tables")
+        metadata = copy.copy(self)
+        metadata.kv_cache_manager = staged
+        metadata._host_paged_kv_indices = torch.arange(sum(staged.page_counts),
+                                                       dtype=torch.int32)
+        metadata._paged_kv_indices = metadata._host_paged_kv_indices.to(
+            staged.pool.device)
+        metadata._vswa_layer_to_pool = None
+        metadata._vswa_active_pool_id = None
+        metadata._vswa_pool_indices_cache = None
+        metadata._host_pool_indices = {}
+        # Plans contain physical page indices. Do not mutate wrappers shared
+        # with the original metadata, which may still serve other layers.
+        metadata._plan_params_to_wrappers = {}
+        return metadata
+
     def _sanitize_swa_page_indices(self, page_indices: torch.Tensor,
                                    layer_idx: int) -> None:
         """Replace evicted SWA pages with a safe in-range page index."""
@@ -2864,23 +2884,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             v,
             history_dequant_scale=forward_args.kv_scale_quant_orig)
         if staged is not None:
-            metadata = copy.copy(metadata)
-            metadata.kv_cache_manager = staged
-            # Keep the native prepared row lengths, append positions and CSR
-            # boundaries, replacing only the pages consumed by the wrappers.
-            if list(metadata.num_blocks) != staged.page_counts:
-                raise NotImplementedError(
-                    "Mixed-precision staging requires logical page tables")
-            metadata._host_paged_kv_indices = torch.arange(sum(
-                staged.page_counts),
-                                                           dtype=torch.int32)
-            metadata._paged_kv_indices = metadata._host_paged_kv_indices.to(
-                q.device)
-            metadata._vswa_layer_to_pool = None
-            metadata._vswa_active_pool_id = None
-            # Replan with the temporary page indices, retaining the wrappers.
-            for wrappers in metadata._plan_params_to_wrappers.values():
-                wrappers.is_planned = False
+            metadata = metadata.with_paged_kv_view(staged)
 
         attention_mask_data = forward_args.attention_mask_data
         latent_cache = forward_args.latent_cache
