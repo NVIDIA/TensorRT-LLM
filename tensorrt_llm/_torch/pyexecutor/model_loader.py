@@ -41,7 +41,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
-from ...llmapi.llm_args import LoadFormat
+from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
@@ -68,6 +68,7 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
+_SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -393,31 +394,16 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
-_AUTO_CHECKPOINT_IO_POLICY = "auto"
-_NATIVE_CHECKPOINT_IO_POLICY = "native"
-_RANK_STRIPED_CHECKPOINT_IO_POLICY = "rank_striped_read_ahead"
-_SUPPORTED_CHECKPOINT_IO_POLICIES = (
-    _AUTO_CHECKPOINT_IO_POLICY,
-    _NATIVE_CHECKPOINT_IO_POLICY,
-    _RANK_STRIPED_CHECKPOINT_IO_POLICY,
-)
-_SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
-
-
 def _resolve_checkpoint_io_policy(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
     load_format: LoadFormat | str,
-    requested_policy: str,
+    requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
-) -> tuple[str, Optional[str]]:
+) -> tuple[CheckpointIOPolicy, Optional[str]]:
     """Select a safe executable policy before checkpoint loading starts."""
-    if requested_policy not in _SUPPORTED_CHECKPOINT_IO_POLICIES:
-        raise ValueError("checkpoint_io_policy must be one of "
-                         f"{_SUPPORTED_CHECKPOINT_IO_POLICIES}, got "
-                         f"{requested_policy!r}")
-    if requested_policy == _NATIVE_CHECKPOINT_IO_POLICY:
-        return _NATIVE_CHECKPOINT_IO_POLICY, None
+    if requested_policy == CheckpointIOPolicy.NATIVE:
+        return CheckpointIOPolicy.NATIVE, None
 
     reason = None
     if checkpoint_loader is not None:
@@ -451,15 +437,15 @@ def _resolve_checkpoint_io_policy(
     if reason is not None:
         message = ("Checkpoint I/O policy resolved before loading: "
                    f"requested={requested_policy}, "
-                   f"selected={_NATIVE_CHECKPOINT_IO_POLICY}, "
+                   f"selected={CheckpointIOPolicy.NATIVE}, "
                    f"reason={reason}.")
-        if requested_policy == _RANK_STRIPED_CHECKPOINT_IO_POLICY:
+        if requested_policy == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
             logger.warning(message)
         else:
             logger.info(message)
-        return _NATIVE_CHECKPOINT_IO_POLICY, reason
+        return CheckpointIOPolicy.NATIVE, reason
 
-    return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+    return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
 
 
 def _construct_checkpoint_loader(
@@ -467,7 +453,7 @@ def _construct_checkpoint_loader(
     checkpoint_format: Optional[str],
     *,
     mx_config: Optional[ModelExpressConfig] = None,
-    checkpoint_io_policy: str = "native",
+    checkpoint_io_policy: CheckpointIOPolicy = CheckpointIOPolicy.NATIVE,
     load_format: LoadFormat | str = LoadFormat.AUTO,
     partial_model_loading: bool = False,
 ) -> BaseCheckpointLoader:
