@@ -1646,15 +1646,26 @@ class GvrMainKernel:
         # derived constexprs (bit-identical to the CUDA)
         self.hb = nbs
         self.kbig = (kpt >= 2) and (kpt * blk >= 2048)
+        self.sampling_cap = (
+            (8192 if split else 16384) if blk >= 1024 else (8192 if self.kbig else 4096)
+        )
         if cutlass.const_expr(self.det):
             self.scpb = (
                 (8192 if split else (20480 if self.fused_k >= 2048 else 16384))
                 if blk >= 1024
                 else (8192 if self.kbig else 4096)
             )  # DET OVF
+            # Reserve staging headroom for uneven warp counts without changing
+            # the sampling threshold or the unsampled-row cutoff.
+            if blk < 1024 and self.fused_k >= 1024:
+                self.scpb += self.fused_k
         else:
-            self.scpb = (8192 if split else 16384) if blk >= 1024 else (8192 if self.kbig else 4096)
+            self.scpb = self.sampling_cap
         self.cmpb = (4096 if self.kbig else 2048) if blk >= 1024 else 1024
+        if self.det and blk == 256 and self.fused_k >= 2048:
+            # Keep four CTAs within 192 KiB at K=2048. Larger crossing bins
+            # retain the exact narrowing fallback.
+            self.cmpb = 768
         self.shd = not split
         self.vstg = split or blk >= 512
         self.pfd = (u if u < 4 else 4) if minb <= 2 else 0
@@ -1965,7 +1976,7 @@ class GvrMainKernel:
             cute.make_layout((SCPB + 4,)),
         )
         ck_addr = sbase + cutlass.Int32(self.ck_off)
-        if cutlass.const_expr(self.det):
+        if cutlass.const_expr(self.det and self.blk >= 1024):
             if cutlass.const_expr(
                 (self.cmpb + 1) * 8 >= NW * NBS * 4
             ):  # DET WHIST32: u32 counters alias the ck64 buffer when it is large enough
@@ -2127,9 +2138,7 @@ class GvrMainKernel:
                         if cutlass.const_expr(self.r_const > 1):
                             if aim < amin:
                                 aim = amin
-                        scap_c = cutlass.Int32(
-                            16384 if (BLK >= 1024 and not self.split) else SCPB
-                        )  # DET OVF: SCAP unchanged
+                        scap_c = cutlass.Int32(self.sampling_cap)
                         if aim > (scap_c >> cutlass.Int32(1)):
                             aim = scap_c >> cutlass.Int32(1)
                         if aim < k:
@@ -2878,9 +2887,7 @@ class GvrMainKernel:
                     )  # redux.sync.add: one instruction instead of a 5-step scan
                     wany_ovf = cutlass.Int32(C.ballot(wo_ != cutlass.Int32(0)) != cutlass.Int32(0))
                 wdense = cutlass.Int32(0)
-                if cutlass.const_expr(
-                    (not self.split) and self.vstg and self.blk >= 1024
-                ):  # DET OVF
+                if cutlass.const_expr(not self.split):
                     if wany_ovf != cutlass.Int32(0):
                         if myn <= cutlass.Int32(SCPB - alias_res):
                             wdense = cutlass.Int32(1)
@@ -2890,10 +2897,16 @@ class GvrMainKernel:
                         wbase = wsegb
                         wend = wsegb + cute.arch.shuffle_sync(wv_, wid)
                         wovf = cutlass.Int32(0)
-                        z_ = lane
-                        while z_ < cutlass.Int32(NBS):
-                            s_whist[wid * cutlass.Int32(NBS) + z_] = cutlass.Int32(0)
-                            z_ = z_ + cutlass.Int32(32)
+                        # Exact warp prefixes recover a list that fits the total buffer,
+                        # even when an individual fixed segment overflows.
+                        if cutlass.const_expr(self.vstg and self.blk >= 1024):
+                            z_ = lane
+                            while z_ < cutlass.Int32(NBS):
+                                s_whist[wid * cutlass.Int32(NBS) + z_] = cutlass.Int32(0)
+                                z_ = z_ + cutlass.Int32(32)
+                        else:
+                            if tidx < cutlass.Int32(NBS):
+                                s_hist[tidx] = cutlass.Int32(0)
                         cute.arch.barrier()  # ---- barrier (DET OVF reset) ----
                         if cutlass.const_expr(self.pf):
                             fullsl = cutlass.Int32(0)
