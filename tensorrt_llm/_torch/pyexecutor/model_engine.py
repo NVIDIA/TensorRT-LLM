@@ -1015,8 +1015,8 @@ class PyTorchModelEngine(ModelEngine):
         """Run model warmup and record its total wall-clock duration.
 
         Raises:
-            FlashInferArtifactUnavailableError: Warmup failed after FlashInfer
-                could not fetch a kernel artifact.
+            FlashInferArtifactUnavailableError: FlashInfer failed during warmup
+                after it could not fetch a kernel artifact.
         """
         # Warmup drives the runner directly rather than through forward().
         with raise_on_flashinfer_artifact_failure():
@@ -1286,8 +1286,8 @@ class PyTorchModelEngine(ModelEngine):
         """Run one forward step.
 
         Raises:
-            FlashInferArtifactUnavailableError: The step failed after
-                FlashInfer could not fetch a kernel artifact.
+            FlashInferArtifactUnavailableError: FlashInfer failed during the
+                step after it could not fetch a kernel artifact.
         """
         with raise_on_flashinfer_artifact_failure():
             return self._forward_impl(batch, resource_manager,

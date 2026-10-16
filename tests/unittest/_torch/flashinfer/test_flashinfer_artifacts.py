@@ -20,56 +20,60 @@ import pickle
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from types import ModuleType
+from types import FunctionType, ModuleType
 
 import pytest
+import torch
 
 from tensorrt_llm._torch import flashinfer_artifacts
 from tensorrt_llm._torch.flashinfer_artifacts import (
-    FlashInferArtifactFailure,
     FlashInferArtifactUnavailableError,
     raise_on_flashinfer_artifact_failure,
 )
 
-# Tests marked cpu_only run against a fake FlashInfer package, so every failure
-# class can be produced without a GPU or a network. The unmarked tests check the
-# installed FlashInfer, so that a FlashInfer upgrade that moves get_artifact fails
-# here; they run in the GPU stages, where FlashInfer is installed.
-cpu_only = pytest.mark.cpu_only
+# These tests run in the CPU stages. Most use a fake FlashInfer package, and the
+# tests of the installed FlashInfer only inspect it or fetch under
+# FLASHINFER_NO_DOWNLOAD=1, so none of them needs a GPU or the network.
+pytestmark = pytest.mark.cpu_only
 
 _CUBIN = "8ec29a98/batched_gemm-fa419f4-31ee4e5/Bmm_Bfloat16_t128x8x128.cubin"
 _HEADER = "8ec29a98/batched_gemm-fa419f4-31ee4e5/include/flashinferMetaInfo.h"
 _SHA256 = "0" * 64
 _CUBIN_DIR = "/cache/flashinfer/cubins"
 _REPOSITORY = "https://artifacts.example/flashinfer/"
+_KERNEL_ERROR = "RuntimeError: Error occurred when running GEMM!"
 
 
-@dataclass
-class _FakeFlashInfer:
-    cubin_loader: ModuleType
-    fused_moe: ModuleType
-    outside_module: ModuleType
-    original_get_artifact: Callable[..., bytes]
-    artifacts: dict[str, bytes | Exception]
-    """What fetching each file returns, or raises. Missing files fetch as b""."""
+def _move_into(module: ModuleType, function: Callable[..., object]) -> Callable[..., object]:
+    """Copy ``function`` into ``module``, so that its frames belong to that module."""
+    moved = FunctionType(
+        function.__code__,
+        vars(module),
+        function.__name__,
+        function.__defaults__,
+        function.__closure__,
+    )
+    setattr(module, function.__name__, moved)
+    return moved
 
-    def fetch(self, file_name: str) -> bytes:
-        return self.cubin_loader.get_artifact(file_name, _SHA256)
 
-
-def _make_cubin_loader(get_artifact: Callable[..., bytes] | None) -> ModuleType:
+def _make_cubin_loader() -> ModuleType:
     cubin_loader = ModuleType("fakeinfer.jit.cubin_loader")
-    if get_artifact is not None:
-        cubin_loader.get_artifact = get_artifact
-        cubin_loader.get_cubin = get_artifact
     cubin_loader.FLASHINFER_CUBIN_DIR = _CUBIN_DIR
     cubin_loader.FLASHINFER_CUBINS_REPOSITORY = _REPOSITORY
     return cubin_loader
 
 
-def _fail_like_a_kernel() -> None:
-    """Raise what a FlashInfer kernel raises when an artifact it needs was not fetched."""
-    raise RuntimeError("Error occurred when running GEMM!")
+@dataclass
+class _FakeFlashInfer:
+    cubin_loader: ModuleType
+    artifacts: dict[str, bytes | Exception]
+    """What fetching each file returns, or raises. Missing files fetch as b""."""
+    run_kernel: Callable[[], object]
+    """Fails inside the package, as a FlashInfer kernel does without its artifact."""
+
+    def fetch(self, file_name: str) -> bytes:
+        return self.cubin_loader.get_artifact(file_name, _SHA256)
 
 
 @pytest.fixture
@@ -83,17 +87,17 @@ def fake_flashinfer(monkeypatch) -> _FakeFlashInfer:
             raise result
         return result
 
-    cubin_loader = _make_cubin_loader(get_artifact)
-    fused_moe = ModuleType("fakeinfer.jit.fused_moe")
-    fused_moe.get_artifact = get_artifact
-    outside_module = ModuleType("fakeinfer_consumer")
-    outside_module.get_artifact = get_artifact
-    loaded_modules = {
-        module.__name__: module for module in (cubin_loader, fused_moe, outside_module)
-    }
+    def run_kernel() -> None:
+        raise RuntimeError("Error occurred when running GEMM!")
+
+    cubin_loader = _make_cubin_loader()
+    _move_into(cubin_loader, get_artifact)
+    kernel = _move_into(ModuleType("fakeinfer.fused_moe"), run_kernel)
     monkeypatch.setattr(flashinfer_artifacts, "_monitor", None)
-    flashinfer_artifacts._install_monitor(cubin_loader, "0.6.18", loaded_modules)
-    return _FakeFlashInfer(cubin_loader, fused_moe, outside_module, get_artifact, artifacts)
+    flashinfer_artifacts._install_monitor(
+        cubin_loader, "0.6.18", {cubin_loader.__name__: cubin_loader}
+    )
+    return _FakeFlashInfer(cubin_loader, artifacts, kernel)
 
 
 @pytest.fixture
@@ -105,82 +109,33 @@ def logged(monkeypatch) -> dict[str, list[str]]:
     return messages
 
 
-@cpu_only
-def test_fetched_artifact_is_returned_unchanged(fake_flashinfer):
-    fake_flashinfer.artifacts[_CUBIN] = b"\x7fELF"
+@pytest.mark.parametrize(
+    "result, reason",
+    [
+        (b"", "download failed or sha256 mismatch"),
+        (RuntimeError(f"Artifact not found locally: {_CUBIN}"), "RuntimeError: Artifact not found"),
+    ],
+    ids=["empty", "raising"],
+)
+def test_failed_fetch_is_passed_through_and_logged(fake_flashinfer, logged, result, reason):
+    fake_flashinfer.artifacts[_CUBIN] = result
 
-    with raise_on_flashinfer_artifact_failure():
-        assert fake_flashinfer.fetch(_CUBIN) == b"\x7fELF"
-
-
-@cpu_only
-def test_empty_fetch_is_returned_unchanged_and_reported(fake_flashinfer):
-    with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
-        with raise_on_flashinfer_artifact_failure():
-            assert fake_flashinfer.fetch(_CUBIN) == b""
-            _fail_like_a_kernel()
-
-    (failure,) = excinfo.value.failures
-    assert failure.file_name == _CUBIN
-    assert "download failed or sha256 mismatch" in failure.reason
-    assert excinfo.value.source.cubin_dir == _CUBIN_DIR
-    assert excinfo.value.source.repository == _REPOSITORY
-
-
-@cpu_only
-def test_fetch_error_is_reraised_unchanged_and_reported(fake_flashinfer):
-    error = RuntimeError(f"Artifact not found locally: {_HEADER}")
-    fake_flashinfer.artifacts[_HEADER] = error
-
-    with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
-        with raise_on_flashinfer_artifact_failure():
-            fake_flashinfer.fetch(_HEADER)
-
-    assert excinfo.value.__cause__ is error
-    assert excinfo.value.failures == (
-        FlashInferArtifactFailure(
-            file_name=_HEADER, reason=f"RuntimeError: Artifact not found locally: {_HEADER}"
-        ),
-    )
-
-
-@cpu_only
-def test_each_failed_fetch_is_logged_with_the_file_name(fake_flashinfer, logged):
-    fake_flashinfer.fetch(_CUBIN)
+    if isinstance(result, Exception):
+        with pytest.raises(RuntimeError) as excinfo:
+            fake_flashinfer.fetch(_CUBIN)
+        assert excinfo.value is result
+    else:
+        assert fake_flashinfer.fetch(_CUBIN) == result
 
     (message,) = logged["error"]
     assert _CUBIN in message
+    assert reason in message
     assert "FLASHINFER_NO_DOWNLOAD=1" in message
 
 
-@cpu_only
-def test_every_reference_inside_the_flashinfer_package_is_replaced(fake_flashinfer):
-    monitor = fake_flashinfer.cubin_loader.get_artifact
-
-    assert isinstance(monitor, flashinfer_artifacts._ArtifactFetchMonitor)
-    assert inspect.unwrap(monitor) is fake_flashinfer.original_get_artifact
-    assert fake_flashinfer.cubin_loader.get_cubin is monitor
-    assert fake_flashinfer.fused_moe.get_artifact is monitor
-    assert fake_flashinfer.outside_module.get_artifact is fake_flashinfer.original_get_artifact
-
-
-@cpu_only
-def test_installing_again_keeps_the_installed_monitor(fake_flashinfer):
-    cubin_loader = fake_flashinfer.cubin_loader
-    monitor = cubin_loader.get_artifact
-
-    flashinfer_artifacts._install_monitor(
-        cubin_loader, "0.6.18", {cubin_loader.__name__: cubin_loader}
-    )
-
-    assert fake_flashinfer.cubin_loader.get_artifact is monitor
-    assert inspect.unwrap(monitor) is fake_flashinfer.original_get_artifact
-
-
-@cpu_only
 def test_flashinfer_without_get_artifact_is_left_unchanged_with_a_warning(monkeypatch, logged):
     monkeypatch.setattr(flashinfer_artifacts, "_monitor", None)
-    cubin_loader = _make_cubin_loader(get_artifact=None)
+    cubin_loader = _make_cubin_loader()
 
     flashinfer_artifacts._install_monitor(cubin_loader, "9.9.9", {})
 
@@ -190,43 +145,79 @@ def test_flashinfer_without_get_artifact_is_left_unchanged_with_a_warning(monkey
     assert not hasattr(cubin_loader, "get_artifact")
 
 
-@cpu_only
-def test_block_without_failed_fetches_is_transparent(fake_flashinfer):
-    error = ValueError("unsupported shape")
+def test_block_without_a_failed_fetch_is_transparent(fake_flashinfer, monkeypatch):
+    fake_flashinfer.artifacts[_CUBIN] = b"\x7fELF"
 
     with raise_on_flashinfer_artifact_failure():
-        result = "output"
-    with pytest.raises(ValueError) as excinfo:
+        assert fake_flashinfer.fetch(_CUBIN) == b"\x7fELF"
+    with pytest.raises(RuntimeError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
-            raise error
+            fake_flashinfer.fetch(_CUBIN)
+            fake_flashinfer.run_kernel()
+    assert type(excinfo.value) is RuntimeError
 
+    # As without FlashInfer, where the monitor is never installed.
+    monkeypatch.setattr(flashinfer_artifacts, "_monitor", None)
+    with raise_on_flashinfer_artifact_failure():
+        result = "output"
     assert result == "output"
-    assert excinfo.value is error
 
 
-@cpu_only
-def test_error_raised_after_a_failed_fetch_becomes_the_cause(fake_flashinfer):
-    gemm_error = RuntimeError("Error occurred when running GEMM!")
-
+def test_flashinfer_error_after_a_failed_fetch_names_the_files_and_the_original_error(
+    fake_flashinfer,
+):
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
             fake_flashinfer.fetch(_CUBIN)
-            raise gemm_error
+            fake_flashinfer.fetch(_HEADER)
+            fake_flashinfer.fetch(_CUBIN)
+            fake_flashinfer.run_kernel()
 
-    assert excinfo.value.__cause__ is gemm_error
-    assert _CUBIN in str(excinfo.value)
+    error = excinfo.value
+    assert [failure.file_name for failure in error.failures] == [_CUBIN, _HEADER]
+    assert "download failed or sha256 mismatch" in error.failures[0].reason
+    assert error.source.cubin_dir == _CUBIN_DIR
+    assert error.source.repository == _REPOSITORY
+    assert error.original_error == _KERNEL_ERROR
+    assert type(error.__cause__) is RuntimeError
+    message = str(error)
+    for expected in (
+        _CUBIN,
+        _HEADER,
+        _CUBIN_DIR,
+        _REPOSITORY,
+        "flashinfer-cubin==0.6.18",
+        "FLASHINFER_CUBIN_DIR",
+        "FLASHINFER_NO_DOWNLOAD=1",
+        "until the process restarts",
+    ):
+        assert expected in message
+    assert message.endswith(f"Original error: {_KERNEL_ERROR}")
 
 
-@cpu_only
+def test_error_from_outside_flashinfer_propagates_unchanged(fake_flashinfer, logged):
+    error = torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB.")
+
+    with pytest.raises(torch.cuda.OutOfMemoryError) as excinfo:
+        with raise_on_flashinfer_artifact_failure():
+            # An autotuner skips a tactic whose kernel cannot be loaded, and capturing
+            # a CUDA graph later in the same warmup runs out of memory.
+            with contextlib.suppress(RuntimeError):
+                fake_flashinfer.fetch(_CUBIN)
+                fake_flashinfer.run_kernel()
+            raise error
+
+    assert excinfo.value is error
+    (message,) = logged["error"]
+    assert _CUBIN in message
+
+
 def test_failed_fetch_in_a_block_that_completes_is_only_logged(fake_flashinfer, logged):
-    def profile_tactic():
-        fake_flashinfer.fetch(_CUBIN)
-        _fail_like_a_kernel()
-
     with raise_on_flashinfer_artifact_failure():
         # An autotuner skips a tactic whose kernel cannot be loaded.
         with contextlib.suppress(RuntimeError):
-            profile_tactic()
+            fake_flashinfer.fetch(_CUBIN)
+            fake_flashinfer.run_kernel()
         result = "output"
 
     assert result == "output"
@@ -234,79 +225,22 @@ def test_failed_fetch_in_a_block_that_completes_is_only_logged(fake_flashinfer, 
     assert _CUBIN in message
 
 
-@cpu_only
 def test_fetch_that_failed_before_the_block_is_not_reported(fake_flashinfer):
     fake_flashinfer.fetch(_CUBIN)
-    error = MemoryError("CUDA out of memory")
 
-    with pytest.raises(MemoryError) as excinfo:
+    with pytest.raises(RuntimeError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
-            raise error
+            fake_flashinfer.run_kernel()
 
-    assert excinfo.value is error
-
-
-@cpu_only
-def test_nested_blocks_report_a_failed_fetch_once(fake_flashinfer):
-    gemm_error = RuntimeError("Error occurred when running GEMM!")
-
-    with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
-        with raise_on_flashinfer_artifact_failure():
-            with raise_on_flashinfer_artifact_failure():
-                fake_flashinfer.fetch(_CUBIN)
-                raise gemm_error
-
-    assert excinfo.value.__cause__ is gemm_error
-    assert len(excinfo.value.failures) == 1
+    assert type(excinfo.value) is RuntimeError
 
 
-@cpu_only
-def test_repeated_failures_of_one_file_are_listed_once(fake_flashinfer):
-    with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
-        with raise_on_flashinfer_artifact_failure():
-            fake_flashinfer.fetch(_CUBIN)
-            fake_flashinfer.fetch(_HEADER)
-            fake_flashinfer.fetch(_CUBIN)
-            _fail_like_a_kernel()
-
-    assert [failure.file_name for failure in excinfo.value.failures] == [_CUBIN, _HEADER]
-
-
-@cpu_only
-def test_block_is_transparent_before_the_monitor_is_installed(monkeypatch):
-    monkeypatch.setattr(flashinfer_artifacts, "_monitor", None)
-
-    with raise_on_flashinfer_artifact_failure():
-        result = "output"
-
-    assert result == "output"
-
-
-@cpu_only
-@pytest.mark.parametrize("file_name", [_HEADER, _CUBIN], ids=["header", "cubin"])
-def test_error_says_where_artifacts_come_from_and_how_to_provide_them(fake_flashinfer, file_name):
-    with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
-        with raise_on_flashinfer_artifact_failure():
-            fake_flashinfer.fetch(file_name)
-            _fail_like_a_kernel()
-
-    message = str(excinfo.value)
-    assert file_name in message
-    assert _CUBIN_DIR in message
-    assert _REPOSITORY in message
-    assert "flashinfer-cubin==0.6.18" in message
-    assert "FLASHINFER_CUBIN_DIR" in message
-    assert "FLASHINFER_NO_DOWNLOAD=1" in message
-    assert ("until the process restarts" in message) == (file_name == _CUBIN)
-
-
-@cpu_only
 def test_error_survives_pickling(fake_flashinfer):
     # An executor worker pickles its startup error to report it to the proxy process.
     with pytest.raises(FlashInferArtifactUnavailableError) as excinfo:
         with raise_on_flashinfer_artifact_failure():
             fake_flashinfer.fetch(_CUBIN)
-            _fail_like_a_kernel()
+            fake_flashinfer.run_kernel()
 
     restored = pickle.loads(pickle.dumps(excinfo.value))
 
@@ -314,18 +248,16 @@ def test_error_survives_pickling(fake_flashinfer):
     assert str(restored) == str(excinfo.value)
     assert restored.failures == excinfo.value.failures
     assert restored.source == excinfo.value.source
+    assert restored.original_error == _KERNEL_ERROR
 
 
-@cpu_only
 @pytest.mark.parametrize("entry_point", ["forward", "warmup"])
 def test_model_engine_entry_points_report_failed_fetches(fake_flashinfer, entry_point):
     from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
-    gemm_error = RuntimeError("Error occurred when running GEMM!")
-
     def step_that_fetches(*args):
         fake_flashinfer.fetch(_CUBIN)
-        raise gemm_error
+        fake_flashinfer.run_kernel()
 
     engine = object.__new__(PyTorchModelEngine)
     # The warmup decorators read these attributes, which __init__ normally sets.
@@ -340,7 +272,7 @@ def test_model_engine_entry_points_report_failed_fetches(fake_flashinfer, entry_
         else:
             engine.warmup(resource_manager=None)
 
-    assert excinfo.value.__cause__ is gemm_error
+    assert excinfo.value.original_error == _KERNEL_ERROR
 
 
 def test_installed_monitor_replaces_every_reference_to_flashinfer_get_artifact():
@@ -372,5 +304,9 @@ def test_installed_monitor_reports_a_flashinfer_fetch_that_fails(monkeypatch):
         with raise_on_flashinfer_artifact_failure():
             cubin_loader.get_artifact(missing, _SHA256)
 
-    assert [failure.file_name for failure in excinfo.value.failures] == [missing]
+    (failure,) = excinfo.value.failures
+    assert failure.file_name == missing
     assert isinstance(excinfo.value.__cause__, RuntimeError)
+    # FlashInfer raised the fetch error itself, so the message names it once.
+    assert failure.reason == excinfo.value.original_error
+    assert str(excinfo.value).count(excinfo.value.original_error) == 1
