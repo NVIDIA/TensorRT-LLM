@@ -86,9 +86,11 @@ The original request is always valid to send to a worker. The ids only let the w
 Add the ids as the `prompt` of each item's `request`:
 
 ```bash
-curl -s $RENDERER/v1/completions/render -d @request.json \
+curl -s $RENDERER/v1/completions/render -H 'Content-Type: application/json' -d @request.json \
   | jq -c '.[] | .request + {prompt: .token_ids}' \
-  | while read -r body; do curl -s $WORKER/v1/completions -d "$body"; done
+  | while read -r body; do
+      curl -s $WORKER/v1/completions -H 'Content-Type: application/json' -d "$body"
+    done
 ```
 
 ### Chat
@@ -96,9 +98,9 @@ curl -s $RENDERER/v1/completions/render -d @request.json \
 Add the ids as `prompt_token_ids`:
 
 ```bash
-curl -s $RENDERER/v1/chat/completions/render -d @request.json \
+curl -s $RENDERER/v1/chat/completions/render -H 'Content-Type: application/json' -d @request.json \
   | jq '.request + {prompt_token_ids: .token_ids}' \
-  | curl -s $WORKER/v1/chat/completions -d @-
+  | curl -s $WORKER/v1/chat/completions -H 'Content-Type: application/json' -d @-
 ```
 
 ```python
