@@ -836,7 +836,8 @@ class SpecMetadata:
         Both layouts are produced: ``request_*`` with one entry per request,
         and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
         temperatures / top_ks / top_ps / min_ps layout), because the sampling calls
-        take one or the other.
+        take one or the other. Only rejection sampling and its draft sampling
+        read ``request_*``, so without it those buffers are not uploaded.
 
         A request that specified no seed gets ``DEFAULT_SAMPLING_SEED`` and an
         offset window from the counter shared by all unseeded requests. Each of
@@ -899,8 +900,9 @@ class SpecMetadata:
                                                  pin_memory=prefer_pinned()),
                                     non_blocking=True)
 
-        _upload(self.request_seeds, request_seeds)
-        _upload(self.request_offsets, request_offsets)
+        if self.use_rejection_sampling:
+            _upload(self.request_seeds, request_seeds)
+            _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
         _upload(self.offsets, flat_offsets)
 
