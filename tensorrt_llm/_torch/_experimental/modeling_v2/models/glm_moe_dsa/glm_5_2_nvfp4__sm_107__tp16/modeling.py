@@ -52,6 +52,11 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import (
 )
 from tensorrt_llm._torch.speculative import MTPEagleWorker, SpecMetadata
 from tensorrt_llm._torch.speculative.eagle3 import _reset_mtp_index_share
+from tensorrt_llm._torch.speculative.interface import (
+    _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+    _FORCE_ACCEPT_RNG_POOL_SIZE,
+    _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+)
 from tensorrt_llm._torch.utils import EventType
 
 from . import weights as _weights
@@ -106,6 +111,7 @@ from .ops.spec.draft_ehproj_table import glm_draft_ehproj_table
 from .ops.spec.draft_glue_rmsnorm_cat import glm_draft_glue_rmsnorm_cat
 from .ops.spec.draft_sample_glue import glm_draft_sample_glue
 from .ops.spec.gather_last_accepted_rows import glm_gather_last_accepted_rows
+from .ops.spec.verify_head_accept import glm_verify_head_accept
 
 # The deployment this target is written for; route() selects it on the same
 # facts, and the constructor states them again for a direct construction.
@@ -1571,6 +1577,59 @@ class MTPDraftWorker(MTPEagleWorker):
             batch_size,
             num_accepted_tokens,
         )
+
+    def _sample_and_accept_draft_tokens_base(
+        self,
+        logits,
+        draft_tokens,
+        num_contexts,
+        batch_size,
+        spec_metadata,
+    ):
+        """Strict acceptance and the forced accepted-token count in one kernel
+        (``glm_verify_head_accept``) for a step of generation requests only, with the built-in
+        target-token sampling; ragged verification and context requests take the built-in
+        chain. The forced count follows ``_apply_force_accepted_tokens``: none during eager
+        CUDA-graph warm-up, the integer part plus one, and with a fractional part the same pool
+        draw and counter step."""
+        if spec_metadata is None or spec_metadata.is_ragged_verify or num_contexts != 0:
+            return super()._sample_and_accept_draft_tokens_base(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata
+            )
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        tokens_per_request = draft_tokens.shape[-1] + 1
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata, 0, batch_size)
+        mode, base, frac = 0, 0, 0.0
+        warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        if self.force_num_accepted_tokens != 0.0 and not warmup:
+            int_part = int(self.force_num_accepted_tokens)
+            frac = self.force_num_accepted_tokens - int_part
+            base = min(int_part + 1, tokens_per_request)
+            mode = 2 if frac > 0.0 and base < tokens_per_request else 1
+        pool = counter = None
+        if mode == 2:
+            self._ensure_force_accept_rng_state(logits.device)
+            pool, counter = self._force_accept_rng_pool, self._force_accept_rng_counter
+        accepted_tokens = torch.empty(
+            (batch_size, tokens_per_request), dtype=torch.int, device=logits.device
+        )
+        num_accepted_tokens = glm_verify_head_accept(
+            target_tokens,
+            draft_tokens,
+            0,
+            accepted_tokens,
+            pool,
+            counter,
+            mode,
+            base,
+            tokens_per_request,
+            frac,
+            _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+            _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+            _FORCE_ACCEPT_RNG_POOL_SIZE,
+        )
+        return accepted_tokens, num_accepted_tokens
 
     def _forward_linear_draft_loop(
         self,
