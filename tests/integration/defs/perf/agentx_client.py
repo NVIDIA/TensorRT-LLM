@@ -105,6 +105,10 @@ AIPERF_EXTRA_DEPS = [
 # ("Feature type 'Json' not found"). 4.x+ is required.
 MIN_DATASETS_MAJOR = 4
 
+# The aiperf scenario that defines the AgentX workload. Only the agentx-harness
+# build registers it.
+AGENTX_SCENARIO = "inferencex-agentx-mvp"
+
 # PyExecutor's HangDetector is hard-coded at 300 s with no env override, so a
 # multi-minute pip install with zero requests in flight idles the GEN worker
 # into MPI_Abort -- which then presents as a *client* connection failure. A
@@ -174,19 +178,43 @@ def _env_float(name: str, default: float) -> float:
 def aiperf_is_usable() -> bool:
     """Return whether the ambient interpreter already has a working agentx stack.
 
-    Checks importability *and* the datasets major version, since a container
-    with aiperf but datasets 3.x fails only later, when loading the corpus.
+    Checks three things, each of which otherwise fails only once the benchmark
+    starts:
+
+    * the modules import;
+    * the ``aiperf`` found is the agentx-harness fork. The upstream PyPI
+      ``aiperf`` (pinned in requirements-dev.txt) has the same import name but
+      no ``inferencex-agentx-mvp`` scenario, and rejects ``--scenario``;
+    * datasets is 4.x or newer, since datasets 3.x cannot load the corpus.
+
+    The reason for a failed check is logged.
     """
     probe = (
-        "import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson; "
-        f"import sys; sys.exit(0 if int(datasets.__version__.split('.')[0]) >= {MIN_DATASETS_MAJOR} else 1)"
+        "import sys\n"
+        "try:\n"
+        "    import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson\n"
+        "except ImportError as e:\n"
+        "    sys.exit(f'missing module: {e}')\n"
+        "try:\n"
+        "    from aiperf.common.scenario.registry import get_scenario\n"
+        f"    get_scenario({AGENTX_SCENARIO!r})\n"
+        "except Exception as e:\n"
+        f"    sys.exit(f'aiperf is not the agentx-harness build (no {AGENTX_SCENARIO} "
+        "scenario): {type(e).__name__}: {e}')\n"
+        f"if int(datasets.__version__.split('.')[0]) < {MIN_DATASETS_MAJOR}:\n"
+        f"    sys.exit(f'datasets {{datasets.__version__}} < {MIN_DATASETS_MAJOR}')\n"
     )
-    return (
-        subprocess.call(
-            [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        == 0
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=300,
     )
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        _log(f"aiperf stack not usable: {lines[-1] if lines else f'exit {result.returncode}'}")
+    return result.returncode == 0
 
 
 def post_one_token(url: str, model: str, timeout: float) -> "str | None":
@@ -307,7 +335,7 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
         "aiperf",
         "profile",
         "--scenario",
-        "inferencex-agentx-mvp",
+        AGENTX_SCENARIO,
         "-m",
         args.model,
         "--tokenizer-trust-remote-code",
