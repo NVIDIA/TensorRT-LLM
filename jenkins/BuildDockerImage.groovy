@@ -94,6 +94,8 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
@@ -103,6 +105,7 @@ def globalVars = [
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
     // Pre-declared so updateMapWithJson() populates it from the parent: that
     // helper only updates keys already present here, so an absent key is
     // silently dropped -- which for this one would mean running unpinned

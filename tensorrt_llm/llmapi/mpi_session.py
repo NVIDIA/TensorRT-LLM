@@ -32,6 +32,38 @@ if ENABLE_MULTI_DEVICE:
 
 T = TypeVar("T")
 
+# Environment that MpiPoolSession forwards from the parent to its workers.
+_FORWARDED_ENV_PREFIXES = ("TRTLLM", "TLLM")
+_FORWARDED_ENV_NAMES = (*_UNIFIED_CACHE_ENV_VARS, "FLASHINFER_CUBIN_DIR",
+                        "MASTER_ADDR", "MASTER_PORT")
+
+
+def _is_forwarded_env(name: str) -> bool:
+    return (name.startswith(_FORWARDED_ENV_PREFIXES)
+            or name in _FORWARDED_ENV_NAMES)
+
+
+# A spawned worker starts from the environment of the MPI runtime that launches
+# it, which can be older than the parent's current one: a singleton's DVM is
+# forked once, at the process's first spawn, and keeps that environment for
+# every later spawn. ``MPIPoolExecutor(env=...)`` can only add variables, so
+# drop every inherited forwarded variable before the server applies the
+# parent's overlay; the overlay then fully defines them, including variables
+# the parent no longer has.
+_WORKER_ENV_BOOTSTRAP = f"""
+import os
+
+for _name in list(os.environ):
+    if (_name.startswith({_FORWARDED_ENV_PREFIXES!r})
+            or _name in {_FORWARDED_ENV_NAMES!r}):
+        del os.environ[_name]
+"""
+_WORKER_SERVER_MAIN = """
+from mpi4py.futures.server import main
+
+main()
+"""
+
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _FLASHINFER_WORKSPACE_MANAGED_ENV = "TRTLLM_FLASHINFER_WORKSPACE_MANAGED"
@@ -549,10 +581,7 @@ class MpiPoolSession(MpiSession):
 
         env = {
             key: value
-            for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in
-            _UNIFIED_CACHE_ENV_VARS or key in ("FLASHINFER_CUBIN_DIR",
-                                               "MASTER_ADDR", "MASTER_PORT")
+            for key, value in os.environ.items() if _is_forwarded_env(key)
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
@@ -569,6 +598,7 @@ class MpiPoolSession(MpiSession):
             and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
                  (workspace_managed and not explicit_workspace_override)))
+        python_args = ["-c", _WORKER_ENV_BOOTSTRAP + _WORKER_SERVER_MAIN]
         if isolate_workspace:
             env.pop(_FLASHINFER_WORKSPACE_ENV, None)
             if cache_root:
@@ -577,11 +607,13 @@ class MpiPoolSession(MpiSession):
                     "set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 for better "
                     "cache reuse at the risk of concurrent writes.",
                     key="flashinfer_unified_cache_isolation")
+            python_args = [
+                "-c", _WORKER_ENV_BOOTSTRAP + _FLASHINFER_WORKER_BOOTSTRAP,
+                workspace_root
+            ]
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        python_args = (["-c", _FLASHINFER_WORKER_BOOTSTRAP, workspace_root]
-                       if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,

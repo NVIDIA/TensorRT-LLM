@@ -465,6 +465,66 @@ history, process listings, or logs. Eligible configuration fields may also be
 included in usage telemetry; use ``--no-telemetry`` to opt out. See
 :doc:`../../developer-guide/telemetry`.
 
+Editor Validation of YAML Files
+-------------------------------
+
+In VS Code, install `YAML by Red Hat <https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml>`_
+and add this comment to a serving config to enable validation, completion, and hover documentation:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json
+   max_batch_size: 8
+
+Other YAML language-server clients can use the same schema. The editor downloads
+the schema; it does not need a local TensorRT-LLM installation or a running server.
+Replace ``latest`` with the docs version matching your installation, once that
+release publishes schemas. Existing releases are not retroactively updated.
+
+Use ``trtllm-serve-disagg-config.schema.json`` for ``disaggregated --config`` and
+``trtllm-serve-visual-gen-config.schema.json`` for ``--visual_gen_args``, in the same
+schema directory. These describe YAML files, not CLI flags or ``--set`` assignments.
+
+View or download the JSON schemas for this documentation version:
+
+* `Serving schema <../../_static/schemas/trtllm-serve-config.schema.json>`_
+* `Disaggregated serving schema <../../_static/schemas/trtllm-serve-disagg-config.schema.json>`_
+* `VisualGen schema <../../_static/schemas/trtllm-serve-visual-gen-config.schema.json>`_
+
+To save a schema, right-click its link and select **Save link as**.
+
+Schemas check field names, nested structure, types, and declarative constraints.
+Runtime checks still determine model/GPU compatibility, file existence, and
+cross-field validity. Custom Python validators, free-form mappings, and the
+deprecated ``decoding_config`` have limited static validation; live Python
+objects are not configurable in YAML.
+
+For offline use, set ``$schema`` to a local JSON file (an absolute path or a path
+relative to your YAML file):
+
+* Source checkouts include the schemas in ``tensorrt_llm/schemas/``; no build is needed to use them.
+* Release containers expose them at ``/app/tensorrt_llm/schemas/``. The editor must be
+  attached to the container, or otherwise able to access those files.
+* Wheels include the same schemas. To locate them without importing TensorRT-LLM:
+
+.. code-block:: bash
+
+   python3 -c 'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))'
+
+When changing configuration definitions or bumping the package version in
+``tensorrt_llm/version.py``, regenerate and commit the snapshots using a
+TensorRT-LLM build and dependencies matching the checkout. Each schema's ``$id``
+and ``title`` include the package version.
+
+.. code-block:: bash
+
+   python3 scripts/generate_trtllm_serve_schemas.py
+   python3 scripts/generate_trtllm_serve_schemas.py --check
+
+The CPU schema tests reject stale snapshots. Wheel and HTML docs builds publish
+the checked-in files without importing configuration classes. ``--output-dir``
+can be used to generate a separate local preview.
+
 .. _syntax:
 
 Syntax
