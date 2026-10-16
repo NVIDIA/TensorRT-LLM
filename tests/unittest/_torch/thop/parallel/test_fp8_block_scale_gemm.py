@@ -688,18 +688,31 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
     expected_rope = rotated.to(torch.bfloat16).to(torch.float8_e4m3fn)
     expected = torch.cat([expected_nope, expected_rope], dim=-1)
 
-    torch.testing.assert_close(
-        output[..., :nope_dim].float(),
-        expected[..., :nope_dim].float(),
-        rtol=0.25,
-        atol=2.0**-8,
-    )
-    torch.testing.assert_close(
-        output[..., nope_dim:].float(),
-        expected[..., nope_dim:].float(),
-        rtol=0.25,
-        atol=2.0**-5,
-    )
+    def check_output(actual):
+        actual = actual.view(m, num_heads, head_dim)
+        torch.testing.assert_close(
+            actual[..., :nope_dim].float(),
+            expected[..., :nope_dim].float(),
+            rtol=0.25,
+            atol=2.0**-8,
+        )
+        torch.testing.assert_close(
+            actual[..., nope_dim:].float(),
+            expected[..., nope_dim:].float(),
+            rtol=0.25,
+            atol=2.0**-5,
+        )
+
+    check_output(output)
+
+    # The autotuner may pick any registered tactic, so each one must be
+    # numerically correct on its own, not just the one chosen above.
+    tactic_inputs = [
+        a_fp8, b_fp8, a_sf, b_sf, cos_sin_cache, cu_q_seqlens, kv_cache_lengths,
+        position_ids, quant_scale_qkv
+    ]
+    for tactic in CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner._tactics:
+        check_output(runner(tactic_inputs, tactic=tactic, eps=eps))
 
 
 @pytest.mark.skipif(
