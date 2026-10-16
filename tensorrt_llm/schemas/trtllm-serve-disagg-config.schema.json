@@ -556,6 +556,16 @@
       "title": "CapacitySchedulerPolicy",
       "type": "string"
     },
+    "CheckpointIOPolicy": {
+      "description": "Strategy for reading checkpoint weights and transferring them to GPU.",
+      "enum": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "title": "CheckpointIOPolicy",
+      "type": "string"
+    },
     "ColdPageQuantizationCompressionConfig": {
       "additionalProperties": false,
       "description": "Quantize Host and Disk KV pages without changing the active GPU cache.",
@@ -1766,16 +1776,10 @@
           "title": "Checkpoint Format"
         },
         "checkpoint_io_policy": {
+          "$ref": "#/$defs/CheckpointIOPolicy",
           "default": "auto",
           "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-          "enum": [
-            "auto",
-            "native",
-            "rank_striped_read_ahead"
-          ],
-          "status": "prototype",
-          "title": "Checkpoint Io Policy",
-          "type": "string"
+          "status": "prototype"
         },
         "checkpoint_loader": {
           "description": "Live objects require the Python LLM API.",
@@ -8073,16 +8077,10 @@
       "title": "Checkpoint Format"
     },
     "checkpoint_io_policy": {
+      "$ref": "#/$defs/CheckpointIOPolicy",
       "default": "auto",
       "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-      "enum": [
-        "auto",
-        "native",
-        "rank_striped_read_ahead"
-      ],
-      "status": "prototype",
-      "title": "Checkpoint Io Policy",
-      "type": "string"
+      "status": "prototype"
     },
     "checkpoint_loader": {
       "description": "Live objects require the Python LLM API.",

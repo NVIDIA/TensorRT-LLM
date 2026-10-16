@@ -6275,6 +6275,14 @@ class BaseLlmArgs(StrictBaseModel):
         )
 
 
+class CheckpointIOPolicy(StrEnum):
+    """Strategy for reading checkpoint weights and transferring them to GPU."""
+
+    AUTO = "auto"
+    NATIVE = "native"
+    RANK_STRIPED_READ_AHEAD = "rank_striped_read_ahead"
+
+
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -6929,24 +6937,20 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_io_policy: Literal[
-        "auto", "native", "rank_striped_read_ahead"] = Field(
-            default="auto",
-            description=
-            "Controls checkpoint storage I/O independently of checkpoint format. "
-            "'auto' selects rank-striped read-ahead for compatible built-in "
-            "PyTorch/HF loads and selects native I/O otherwise. "
-            "'native' preserves the existing loader. "
-            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
-            "SafeTensors extents while native mapping, materialization, and H2D "
-            "continue. Incompatible configurations select native I/O before "
-            "optimized reader or collective setup. Runtime-ineligible loads fall "
-            "back to native before model mutation.",
-            status="prototype",
-            json_schema_extra={
-                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
-            },
-        )
+    checkpoint_io_policy: CheckpointIOPolicy = Field(
+        default=CheckpointIOPolicy.AUTO,
+        description=
+        "Controls checkpoint storage I/O independently of checkpoint format. "
+        "'auto' selects rank-striped read-ahead for compatible built-in "
+        "PyTorch/HF loads and selects native I/O otherwise. "
+        "'native' preserves the existing loader. "
+        "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+        "SafeTensors extents while native mapping, materialization, and H2D "
+        "continue. Incompatible configurations select native I/O before "
+        "optimized reader or collective setup. Runtime-ineligible loads fall "
+        "back to native before model mutation.",
+        status="prototype",
+    )
 
     @property
     def is_partial_model_loading(self) -> bool:
