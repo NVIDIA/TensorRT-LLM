@@ -2007,6 +2007,8 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
+# DeepSeek-V4-Pro (~806 GB) fits on 4 GPUs only with 288 GB-class memory.
+DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB = 250000
 
 
 @skip_pre_blackwell
@@ -2081,13 +2083,46 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "in the form #### <answer>, using the simplest numeric form without units "
     "or trailing zeros.")
 
+DEEPSEEKV4_PARALLELISM = pytest.mark.parametrize("tp_size,attention_dp",
+                                                 [(4, True), (8, True)],
+                                                 ids=["dp4", "dp8"])
 
-def _deepseekv4_pro_agg_llm_kwargs(**overrides):
+
+def _skip_unless_deepseekv4_tp_size(tp_size, min_device_memory_for_4gpus=None):
+    """Skip unless ``tp_size`` ranks (and, for 4, enough GPU memory) exist.
+
+    ``min_device_memory_for_4gpus`` (MB) skips the 4-GPU case on GPUs that
+    cannot hold the checkpoint, e.g. DeepSeek-V4-Pro needs 288 GB-class GPUs.
+    """
+    # Mirror the skip_less_mpi_world_size gate: an MPI launch bounds the usable
+    # ranks, otherwise the visible devices do.
+    mpi_world_size = get_mpi_world_size()
+    available_ranks = (get_device_count()
+                       if mpi_world_size == 1 else mpi_world_size)
+    if available_ranks < tp_size:
+        pytest.skip(f"Requires at least {tp_size} GPUs")
+    if tp_size == 4 and min_device_memory_for_4gpus is not None:
+        # Query the GPUs directly: get_device_memory() falls back to host memory
+        # when nvidia-smi fails, which says nothing about GPU capacity.
+        local_gpus = min(tp_size, torch.cuda.device_count())
+        if local_gpus == 0:
+            pytest.skip("Cannot determine GPU memory for the 4-GPU DeepSeek-V4 "
+                        "configuration")
+        gpu_memory_mb = min(
+            torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)
+            for i in range(local_gpus))
+        if gpu_memory_mb < min_device_memory_for_4gpus:
+            pytest.skip(
+                f"4 GPUs need at least {min_device_memory_for_4gpus} MB "
+                "each for this DeepSeek-V4 checkpoint")
+
+
+def _deepseekv4_pro_agg_llm_kwargs(tp_size=8, attention_dp=True, **overrides):
     kwargs = dict(
-        tensor_parallel_size=8,
-        moe_expert_parallel_size=8,
+        tensor_parallel_size=tp_size,
+        moe_expert_parallel_size=tp_size,
         moe_config=MoeConfig(backend="TRTLLM"),
-        enable_attention_dp=True,
+        enable_attention_dp=attention_dp,
         max_seq_len=4096,
         max_batch_size=16,
         max_num_tokens=8192,
@@ -2238,9 +2273,11 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              eplb_config,
                              mtp_nextn=mtp_nextn)
 
-    @pytest.mark.skip_less_mpi_world_size(8)
+    @DEEPSEEKV4_PARALLELISM
     @pytest.mark.threadleak(enabled=False)
-    def test_mixed_breakable_cuda_graph(self):
+    def test_mixed_breakable_cuda_graph(self, tp_size, attention_dp):
+        _skip_unless_deepseekv4_tp_size(tp_size)
+
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
@@ -2268,10 +2305,10 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             add_special_tokens=False,
         )
         common_llm_kwargs = dict(
-            tensor_parallel_size=8,
-            moe_expert_parallel_size=8,
+            tensor_parallel_size=tp_size,
+            moe_expert_parallel_size=tp_size,
             moe_config=MoeConfig(backend="TRTLLM"),
-            enable_attention_dp=True,
+            enable_attention_dp=attention_dp,
             max_batch_size=8,
             max_num_tokens=1024,
             max_seq_len=2048,
@@ -2326,7 +2363,6 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
@@ -2337,9 +2373,15 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
         system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
     )
 
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_full_accuracy(self):
-        with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
+    @DEEPSEEKV4_PARALLELISM
+    def test_gsm8k_full_accuracy(self, tp_size, attention_dp):
+        _skip_unless_deepseekv4_tp_size(
+            tp_size,
+            min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+        with LLM(
+                self.MODEL_PATH,
+                **_deepseekv4_pro_agg_llm_kwargs(
+                    tp_size=tp_size, attention_dp=attention_dp)) as llm:
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
@@ -2363,17 +2405,20 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
     )
 
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_dep8_megamoe_deepgemm(self):
+    @DEEPSEEKV4_PARALLELISM
+    def test_gsm8k_megamoe_deepgemm(self, tp_size, attention_dp):
+        _skip_unless_deepseekv4_tp_size(
+            tp_size,
+            min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
         spec_config = DSparkDecodingConfig(max_draft_len=5,
                                            speculative_model=self.MODEL_PATH)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
-                 tensor_parallel_size=8,
-                 moe_expert_parallel_size=8,
-                 enable_attention_dp=True,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=tp_size,
+                 enable_attention_dp=attention_dp,
                  moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
                  max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
@@ -2399,10 +2444,10 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
             acceptance_length = compute_acceptance_length(llm)
-            print(f"[AL] test_gsm8k_dep8_megamoe_deepgemm "
+            print(f"[AL] test_gsm8k_megamoe_deepgemm[dp{tp_size}] "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
-                "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
+                f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
 
 
