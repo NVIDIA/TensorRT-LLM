@@ -16,7 +16,6 @@
 
 import asyncio
 import gc
-import socket
 from types import SimpleNamespace
 
 import pytest
@@ -174,82 +173,6 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
                 finally:
                     stream.cancel()
                     remaining_stream.cancel()
-        finally:
-            await server.stop(grace=0)
-
-    asyncio.run(exercise_server())
-
-
-def test_pod_health_port_does_not_serve_openengine_rpcs() -> None:
-    """The Pod-reachable port must not accept inference or Control calls."""
-    llm = SimpleNamespace(
-        args=SimpleNamespace(guided_decoding_backend=None),
-        llm_id="test-instance",
-        tokenizer=None,
-        _check_health=lambda: True,
-    )
-
-    async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", health_port=0)
-        assert server.health_port != server.port
-        await server.start()
-        try:
-            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.health_port}") as channel:
-                health = health_pb2_grpc.HealthStub(channel)
-                assert (
-                    await health.Check(
-                        health_pb2.HealthCheckRequest(service="inference"), timeout=5
-                    )
-                ).status == health_pb2.HealthCheckResponse.SERVING
-
-                with pytest.raises(grpc.aio.AioRpcError) as control_error:
-                    await channel.unary_unary("/openengine.v1.Control/Abort")(b"", timeout=5)
-                assert control_error.value.code() == grpc.StatusCode.UNIMPLEMENTED
-
-                with pytest.raises(grpc.aio.AioRpcError) as inference_error:
-                    await channel.unary_stream("/openengine.v1.Inference/Generate")(
-                        b"", timeout=5
-                    ).read()
-                assert inference_error.value.code() == grpc.StatusCode.UNIMPLEMENTED
-        finally:
-            await server.stop(grace=0)
-
-    asyncio.run(exercise_server())
-
-
-def test_health_port_is_reachable_on_non_loopback_address() -> None:
-    """A Pod-IP probe reaches Health while the private RPC port stays on loopback."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
-            route.connect(("192.0.2.1", 9))
-            pod_ip = route.getsockname()[0]
-    except OSError:
-        pytest.skip("No non-loopback IPv4 route is available")
-    if pod_ip.startswith("127."):
-        pytest.skip("No non-loopback IPv4 address is available")
-
-    llm = SimpleNamespace(
-        args=SimpleNamespace(guided_decoding_backend=None),
-        llm_id="test-instance",
-        tokenizer=None,
-        _check_health=lambda: True,
-    )
-
-    async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", health_port=0)
-        await server.start()
-        try:
-            async with grpc.aio.insecure_channel(f"{pod_ip}:{server.health_port}") as channel:
-                response = await health_pb2_grpc.HealthStub(channel).Check(
-                    health_pb2.HealthCheckRequest(service="inference"), timeout=5
-                )
-                assert response.status == health_pb2.HealthCheckResponse.SERVING
-            async with grpc.aio.insecure_channel(f"{pod_ip}:{server.port}") as channel:
-                with pytest.raises(grpc.aio.AioRpcError) as private_port:
-                    await health_pb2_grpc.HealthStub(channel).Check(
-                        health_pb2.HealthCheckRequest(service="inference"), timeout=1
-                    )
-                assert private_port.value.code() == grpc.StatusCode.UNAVAILABLE
         finally:
             await server.stop(grace=0)
 

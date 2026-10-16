@@ -95,7 +95,6 @@ class OpenEngineServer:
         port: Port on which the server listens. Use zero to select a free port.
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
-        health_port: Optional Pod-reachable port that serves only gRPC Health.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
@@ -108,7 +107,6 @@ class OpenEngineServer:
         *,
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
-        health_port: int | None = None,
         subagent_affinity_auth_key: str | None = None,
     ) -> None:
         self.host = host
@@ -124,8 +122,6 @@ class OpenEngineServer:
         self._server = grpc.aio.server(options=options)
         self._health = OpenEngineHealthServicer()
         health_pb2_grpc.add_HealthServicer_to_server(self._health, self._server)
-        self._health_server: grpc.aio.Server | None = None
-        self.health_port = health_port
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
             llm,
@@ -162,14 +158,6 @@ class OpenEngineServer:
         bound_port = self._server.add_insecure_port(bind_address)
         if port == 0:
             self.port = bound_port
-        if health_port is not None:
-            if health_port == self.port:
-                raise ValueError("The OpenEngine health port must differ from the inference port")
-            self._health_server = grpc.aio.server(options=[("grpc.so_reuseport", 0)])
-            health_pb2_grpc.add_HealthServicer_to_server(self._health, self._health_server)
-            self.health_port = self._health_server.add_insecure_port(
-                _format_bind_address("0.0.0.0", health_port)  # nosec B104: Pod-IP health probes
-            )
 
     async def start(self) -> None:
         """Start accepting OpenEngine requests."""
@@ -183,12 +171,6 @@ class OpenEngineServer:
         await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
         await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
         await self._server.start()
-        try:
-            if self._health_server is not None:
-                await self._health_server.start()
-        except Exception:
-            await self.stop(grace=0)
-            raise
         await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
         await self._refresh_inference_health()
         self._health_task = asyncio.create_task(self._monitor_inference_health())
@@ -237,10 +219,7 @@ class OpenEngineServer:
         if self._health_task is not None:
             self._health_task.cancel()
             await asyncio.gather(self._health_task, return_exceptions=True)
-        servers = [self._server]
-        if self._health_server is not None:
-            servers.append(self._health_server)
-        await asyncio.gather(*(server.stop(grace=grace) for server in servers))
+        await self._server.stop(grace=grace)
         logger.info("OpenEngine server stopped")
 
     async def wait_for_termination(self) -> None:
@@ -267,7 +246,6 @@ def launch_server(
     served_model_name: str | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
     enable_load_metrics: bool = False,
-    health_port: int | None = None,
     subagent_affinity_auth_key: str | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
@@ -279,7 +257,6 @@ def launch_server(
         served_model_name: Model name accepted by Generate. Defaults to the model path.
         report_failure: Records a child exit before startup readiness.
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
-        health_port: Optional Pod-reachable port that serves only gRPC Health.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
@@ -297,8 +274,6 @@ def launch_server(
         mode = _init_multi_frontend_mode(llm_args, enabled=True)
         if mode.num_frontends > 1 and port == 0:
             raise click.UsageError("Multiple OpenEngine frontends require a fixed --port")
-        if health_port is not None and health_port == port:
-            raise click.UsageError("--openengine-health-port must differ from --port")
         if mode.is_launcher:
             family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]
             try:
@@ -442,7 +417,6 @@ def launch_server(
                 model=model,
                 frontend=frontend,
                 instance_id=instance_id,
-                health_port=None if mode.is_attached_frontend else health_port,
                 subagent_affinity_auth_key=subagent_affinity_auth_key,
             )
             _disable_gc_if_requested()

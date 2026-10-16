@@ -3668,26 +3668,6 @@ class TestServeDefaults:
                 standalone_mode=False,
             )
 
-    @pytest.mark.parametrize(
-        ("options", "message"),
-        [
-            (["--openengine-health-port", "30002"],
-             "--openengine-health-port requires --grpc --grpc-protocol openengine"
-             ),
-            (["--grpc", "--openengine-health-port", "30002"],
-             "--openengine-health-port requires --grpc --grpc-protocol openengine"
-             ),
-            ([
-                "--grpc", "--grpc-protocol", "openengine", "--port", "30002",
-                "--openengine-health-port", "30002"
-            ], "--openengine-health-port must differ from --port"),
-        ],
-    )
-    def test_serve_rejects_invalid_openengine_health_port(
-            self, options: list[str], message: str) -> None:
-        with pytest.raises(click.UsageError, match=message):
-            serve_main(args=["dummy/model", *options], standalone_mode=False)
-
     def test_serve_set_grpc_openengine_uses_multiple_frontends(self) -> None:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
@@ -3698,15 +3678,13 @@ class TestServeDefaults:
             serve_main(
                 args=[
                     "dummy/model", "--grpc", "--grpc-protocol", "openengine",
-                    "--gpus_per_node", "1", "--set", "num_serve_frontends=2",
-                    "--openengine-health-port", "30002"
+                    "--gpus_per_node", "1", "--set", "num_serve_frontends=2"
                 ],
                 standalone_mode=False,
             )
 
         mock_launch_server.assert_called_once()
         assert mock_launch_server.call_args.args[2]["num_serve_frontends"] == 2
-        assert mock_launch_server.call_args.kwargs["health_port"] == 30002
 
     def test_serve_set_does_not_capture_misspelled_options(self) -> None:
         with pytest.raises(click.NoSuchOption):
