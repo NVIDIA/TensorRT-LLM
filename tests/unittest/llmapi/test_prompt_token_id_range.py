@@ -14,7 +14,7 @@
 # limitations under the License.
 """Prompt token ids outside the vocabulary are rejected before submission."""
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -111,25 +111,25 @@ def test_only_replacing_multimodal_content_exempts_prompt_ids(multimodal_params,
 
 
 def _fake_llm(monkeypatch, *, encoder_decoder=False, preprocess=None):
-    """Just enough of a BaseLLM to drive generate_async up to the executor."""
+    """A real BaseLLM, built without __init__, that runs generate_async up to the executor.
+
+    Only the collaborators that need a loaded model are replaced on the
+    instance; every other method is the real one.
+    """
     executor = MagicMock()
     executor.is_shutdown.return_value = False
-    llm = SimpleNamespace(
-        _encode_only=False,
-        _executor=executor,
-        _hf_model_config=SimpleNamespace(vocab_size=_VOCAB),
-        args=SimpleNamespace(return_perf_metrics=False),
-        tokenizer=None,
-        _post_processor_hook=None,
-        _prepare_sampling_params=lambda sampling_params: sampling_params or SamplingParams(),
-        _check_arguments=lambda *args, **kwargs: None,
-        _is_encoder_decoder_model=lambda: encoder_decoder,
-        _get_decoder_prompt_token_ids=lambda sampling_params: [0],
-        _normalize_token_ids=lambda token_ids, name: list(token_ids),
-        _preprocess=preprocess,
-    )
-    llm._prompt_vocab_size = MethodType(BaseLLM._prompt_vocab_size, llm)
-    llm._check_prompt_token_ids = MethodType(BaseLLM._check_prompt_token_ids, llm)
+    llm = BaseLLM.__new__(BaseLLM)
+    llm._encode_only = False
+    llm._executor = executor
+    llm._hf_model_config = SimpleNamespace(vocab_size=_VOCAB, is_encoder_decoder=encoder_decoder)
+    llm.args = SimpleNamespace(return_perf_metrics=False)
+    llm._tokenizer = None
+    llm._post_processor_hook = None
+    llm._prepare_sampling_params = lambda sampling_params: sampling_params or SamplingParams()
+    llm._check_arguments = lambda *args, **kwargs: None
+    llm._get_decoder_prompt_token_ids = lambda sampling_params: [0]
+    if preprocess is not None:
+        llm._preprocess = preprocess
     monkeypatch.setattr(
         llm_module.RequestOutput, "_from_generation_result", lambda *args, **kwargs: "output"
     )
@@ -202,3 +202,38 @@ def test_generate_async_submits_accepted_prompts(monkeypatch, inputs, kwargs):
     llm, executor = _fake_llm(monkeypatch)
     assert BaseLLM.generate_async(llm, inputs, **kwargs) == "output"
     executor.generate_async.assert_called_once()
+
+
+def _fake_encode_llm():
+    """A real BaseLLM in encode-only mode with a stub encoder executor."""
+    encoder = MagicMock()
+    encoder.model_engine = SimpleNamespace(max_seq_len=64, max_num_tokens=256, batch_size=4)
+    encoder.batch_forward.return_value = {"logits": torch.zeros(2, 3)}
+    llm = BaseLLM.__new__(BaseLLM)
+    llm._encode_only = True
+    llm._encoder_executor = encoder
+    llm._hf_model_config = SimpleNamespace(vocab_size=_VOCAB)
+    return llm, encoder
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [[1, _VOCAB], [[0, 1], [2, _VOCAB + 5]], [[0, 1], [-1, 2]]],
+    ids=["single", "batched_above_vocab", "batched_negative"],
+)
+def test_encode_rejects_before_forward(inputs):
+    llm, encoder = _fake_encode_llm()
+    with pytest.raises(RequestError):
+        llm.encode(inputs, return_raw_logits=True)
+    encoder.batch_forward.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "inputs,model_kwargs",
+    [([[0, 1], [2, _VOCAB - 1]], {}), ([[0, 1], [2, _VOCAB + 5]], {"inputs_embeds": object()})],
+    ids=["in_range", "inputs_embeds"],
+)
+def test_encode_forwards_accepted_inputs(inputs, model_kwargs):
+    llm, encoder = _fake_encode_llm()
+    llm.encode(inputs, return_raw_logits=True, **model_kwargs)
+    encoder.batch_forward.assert_called_once()

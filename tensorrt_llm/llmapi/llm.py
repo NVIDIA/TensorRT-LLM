@@ -376,7 +376,7 @@ def _check_prompt_token_id_range(prompt_token_ids: Union[Sequence[int],
     if vocab_size is not None and high >= vocab_size and not allow_out_of_vocab:
         raise RequestError(
             f"Prompt token id {high} is out of range for a vocabulary of "
-            f"{vocab_size} tokens.")
+            f"{vocab_size} tokens (vocab_size from the model config).")
 
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -1363,6 +1363,14 @@ class BaseLLM:
             else:
                 raise TypeError(f"Unsupported input type: {type(inp)}")
 
+        # With inputs_embeds the ids are not looked up in the embedding table.
+        vocab_size = self._prompt_vocab_size()
+        for token_ids in token_ids_list:
+            _check_prompt_token_id_range(token_ids,
+                                         vocab_size,
+                                         allow_out_of_vocab="inputs_embeds"
+                                         in model_kwargs)
+
         # Validate inputs against model capacity
         if sum(sequence_lengths) > max_num_tokens:
             raise ValueError(
@@ -2181,6 +2189,11 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        prompt_vocab_size = self._prompt_vocab_size()
+        if prompt_vocab_size is not None:
+            logger.info(
+                f"Prompt token ids are checked against vocab_size={prompt_vocab_size} "
+                "from the model config.")
         self._capture_usage_startup(pretrained_config=self._hf_model_config)
         self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
