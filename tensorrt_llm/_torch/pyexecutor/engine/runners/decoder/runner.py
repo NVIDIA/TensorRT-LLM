@@ -552,11 +552,10 @@ class DecoderRunner(ScheduledModelRunner):
         widths = self._config.compact_beam_widths
         if not widths:
             return ()
-        # Start with dense models whose forward returns only logits. Other
-        # model families can carry additional token-indexed state or outputs.
+        # Require an explicit declaration on each model class: subclasses may
+        # introduce additional token-indexed state or outputs.
         supported = (
-            type(self.model).__name__
-            in {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+            type(self.model).__dict__.get("supports_compact_beam", False)
             and self._config.attention_backend.Metadata is TrtllmAttentionMetadata
             and self.mapping.world_size == 1
             and not self._config.is_encode_only

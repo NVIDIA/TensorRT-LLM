@@ -699,7 +699,11 @@ class CUDAGraphRunner:
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
-        """Warm up every execution width before capturing any shared workspace."""
+        """Warm up and/or capture each supported execution width.
+
+        DecoderRunner._warmup_and_capture_cuda_graphs sizes shared workspaces
+        for all graph shapes in a separate warmup-only pass before capture.
+        """
         key = KeyType(*key)
         widths = (key.beam_execution_width, )
         if (not key.beam_execution_width and not key.num_contexts

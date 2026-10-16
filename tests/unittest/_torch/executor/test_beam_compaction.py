@@ -9,6 +9,9 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.models.modeling_qwen import Qwen2ForCausalLM
+from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.pyexecutor.beam_compaction import BeamCompaction
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
@@ -45,7 +48,12 @@ def make_metadata(batch, capacity):
 def make_inputs(batch, capacity):
     ids = torch.arange(batch * capacity, device="cuda", dtype=torch.int32)
     return dict(
-        input_ids=ids, position_ids=ids[None, :] + 10, attn_metadata=make_metadata(batch, capacity)
+        input_ids=ids,
+        position_ids=ids[None, :] + 10,
+        attn_metadata=make_metadata(batch, capacity),
+        multimodal_params=[],
+        mrope_delta_read_seq_slots=None,
+        mrope_delta_write_seq_slots=None,
     )
 
 
@@ -271,23 +279,20 @@ def test_config_rejects_width_above_capacity():
         args.validate_compact_beam_widths()
 
 
-@pytest.mark.parametrize("width", [0, -1])
-def test_config_width_schema_requires_positive_integers(width):
+@pytest.mark.parametrize("width", [-1, 0, 1])
+def test_config_width_schema_requires_at_least_two(width):
     from pydantic import TypeAdapter, ValidationError
 
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     schema = TypeAdapter(TorchLlmArgs.model_fields["compact_beam_widths"].annotation)
+    assert schema.json_schema()["items"]["minimum"] == 2
     with pytest.raises(ValidationError):
         schema.validate_python([width])
+    assert schema.validate_python([2, 4]) == [2, 4]
 
 
-def test_config_keeps_width_one_on_capacity_path():
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-    args = TorchLlmArgs.model_construct(max_beam_width=5, compact_beam_widths=[1])
-    with pytest.raises(ValueError, match="at least 2"):
-        args.validate_compact_beam_widths()
+def test_width_one_uses_capacity_path():
     batch = SimpleNamespace(context_requests=[], generation_requests=[request(1)])
     assert BeamCompaction(5, (2, 4)).execution_width(batch, False) == 0
 
@@ -362,3 +367,105 @@ def test_eager_cache_keeps_other_sources_and_widths(graph_enabled: bool) -> None
     compaction.prepare_inputs(other_inputs, 2)
     assert other_inputs["beam_compaction"] is other
     assert other.metadata.kv_lens_cuda.data_ptr() == other_pointer
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["multimodal_params", "mrope_delta_read_seq_slots", "mrope_delta_write_seq_slots"],
+)
+def test_multimodal_and_mrope_inputs_use_capacity(key: str) -> None:
+    inputs = make_inputs(2, 5)
+    compaction = BeamCompaction(5, (2,))
+    compaction.prepare_inputs(inputs, 2)
+    assert "beam_compaction" in inputs
+
+    inputs[key] = [object()] if key == "multimodal_params" else torch.tensor([0, 1])
+    compaction.prepare_inputs(inputs, 2)
+    assert "beam_compaction" not in inputs
+    torch.testing.assert_close(forward(inputs), fake_forward(**inputs), rtol=0, atol=0)
+
+
+def make_compact_runner(model: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=model,
+        _config=SimpleNamespace(
+            compact_beam_widths=(2, 4),
+            attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
+            is_encode_only=False,
+            is_spec_decode=False,
+            use_mrope=False,
+            is_multimodal=False,
+            without_logits=False,
+            torch_compile_enabled=False,
+            enable_in_graph_sampling=False,
+        ),
+        mapping=SimpleNamespace(world_size=1),
+        sparse_attention_config=None,
+    )
+
+
+@pytest.mark.parametrize("model_class", [LlamaForCausalLM, Qwen2ForCausalLM, Qwen3ForCausalLM])
+def test_supported_models_declare_compact_beam(model_class: type) -> None:
+    runner = make_compact_runner(object.__new__(model_class))
+    assert DecoderRunner._supported_compact_beam_widths(runner) == (2, 4)
+
+
+def test_compact_beam_support_is_independent_of_class_name() -> None:
+    class CompactCapableModel:
+        supports_compact_beam = True
+
+    runner = make_compact_runner(CompactCapableModel())
+    assert DecoderRunner._supported_compact_beam_widths(runner) == (2, 4)
+    runner.model = object()
+    assert DecoderRunner._supported_compact_beam_widths(runner) == ()
+
+
+@pytest.mark.parametrize("model_class", [LlamaForCausalLM, Qwen2ForCausalLM, Qwen3ForCausalLM])
+@pytest.mark.parametrize("declaration", [None, False, True])
+def test_model_subclasses_require_explicit_compact_beam_support(
+    model_class: type, declaration: bool | None
+) -> None:
+    attributes = {} if declaration is None else {"supports_compact_beam": declaration}
+    derived = type("DerivedModel", (model_class,), attributes)
+    runner = make_compact_runner(object.__new__(derived))
+    expected = (2, 4) if declaration else ()
+    assert DecoderRunner._supported_compact_beam_widths(runner) == expected
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("compact_beam_widths", ()),
+        ("attention_backend", SimpleNamespace(Metadata=object)),
+        ("is_encode_only", True),
+        ("is_spec_decode", True),
+        ("use_mrope", True),
+        ("is_multimodal", True),
+        ("without_logits", True),
+        ("torch_compile_enabled", True),
+        ("enable_in_graph_sampling", True),
+    ],
+)
+def test_model_capability_preserves_config_guards(field: str, value: object) -> None:
+    runner = make_compact_runner(object.__new__(Qwen3ForCausalLM))
+    setattr(runner._config, field, value)
+    assert DecoderRunner._supported_compact_beam_widths(runner) == ()
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_model_capability_preserves_parallel_and_sparse_guards(distributed: bool) -> None:
+    runner = make_compact_runner(object.__new__(Qwen3ForCausalLM))
+    if distributed:
+        runner.mapping.world_size = 2
+    else:
+        runner.sparse_attention_config = object()
+    assert DecoderRunner._supported_compact_beam_widths(runner) == ()
+
+
+@pytest.mark.parametrize("field,value", [("enable_lora", True), ("lora_config", object())])
+def test_config_rejects_lora_with_compact_beam(field: str, value: object) -> None:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    args = TorchLlmArgs.model_construct(max_beam_width=5, compact_beam_widths=[2], **{field: value})
+    with pytest.raises(ValueError, match="does not support LoRA"):
+        args.validate_compact_beam_widths()

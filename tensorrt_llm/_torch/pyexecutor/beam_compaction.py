@@ -153,16 +153,20 @@ class BeamCompaction:
         return width if width in self.widths else 0
 
     def supports_inputs(self, inputs: dict[str, Any]) -> bool:
-        if not self.widths or any(
-            inputs.get(key) is not None
-            for key in (
-                "inputs_embeds",
-                "spec_metadata",
-                "lora_params",
-                "encoder_hidden_states",
-                "context_requests",
-                "multi_modal_data",
-                "mrope_params",
+        if (
+            not self.widths
+            or inputs.get("multimodal_params")
+            or any(
+                inputs.get(key) is not None
+                for key in (
+                    "inputs_embeds",
+                    "spec_metadata",
+                    "lora_params",
+                    "encoder_hidden_states",
+                    "context_requests",
+                    "mrope_delta_read_seq_slots",
+                    "mrope_delta_write_seq_slots",
+                )
             )
         ):
             return False

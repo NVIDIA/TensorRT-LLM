@@ -14,7 +14,7 @@
 
 import copy
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -1147,6 +1147,8 @@ class LlamaModel(DecoderModel):
 
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
+
+    supports_compact_beam: ClassVar[bool] = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

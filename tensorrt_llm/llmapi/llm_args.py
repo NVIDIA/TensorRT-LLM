@@ -6204,7 +6204,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
-    compact_beam_widths: List[PositiveInt] = Field(
+    compact_beam_widths: List[Annotated[int, Field(ge=2)]] = Field(
         default_factory=list,
         description=
         ("Opt-in execution widths (at least 2) for compact variable-width beam search. "
@@ -6216,8 +6216,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_compact_beam_widths(self) -> 'TorchLlmArgs':
-        if 1 in self.compact_beam_widths:
-            raise ValueError("compact_beam_widths must be at least 2")
         if self.compact_beam_widths and (self.enable_lora
                                          or self.lora_config is not None):
             raise ValueError("compact_beam_widths does not support LoRA")
