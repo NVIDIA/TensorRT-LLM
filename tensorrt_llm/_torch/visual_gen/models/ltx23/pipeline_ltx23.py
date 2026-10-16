@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
 import copy
+import math
 import os
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Union
@@ -445,20 +446,22 @@ class LTX23Pipeline(BasePipeline):
         self.transformer.configure_audio_ulysses(audio_shape.frames)
 
         latents = torch.randn(
-            video_shape.to_torch_shape(),
+            (
+                video_shape.batch,
+                self.video_patchifier.get_token_count(video_shape),
+                video_shape.channels * math.prod(self.video_patchifier.patch_size),
+            ),
             generator=generator,
             device=self.device,
-            dtype=torch.float32,
+            dtype=self.dtype,
         )
-        latents = self.video_patchifier.patchify(latents)
 
         audio_latents = torch.randn(
-            audio_shape.to_torch_shape(),
+            (audio_shape.batch, audio_shape.frames, audio_shape.channels * audio_shape.mel_bins),
             generator=generator,
             device=self.device,
-            dtype=torch.float32,
+            dtype=self.dtype,
         )
-        audio_latents = self.audio_patchifier.patchify(audio_latents)
 
         video_positions = self.video_patchifier.get_patch_grid_bounds(
             video_shape, device=self.device
@@ -467,16 +470,14 @@ class LTX23Pipeline(BasePipeline):
             video_positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True
         )
         video_positions[:, 0, ...] = video_positions[:, 0, ...] / frame_rate
-        video_positions = video_positions.to(self.dtype)
         audio_positions = self.audio_patchifier.get_patch_grid_bounds(
             audio_shape, device=self.device
         )
 
         # Shared sigma schedule; deepcopy so each stream has its own step index.
-        latents_5d = torch.randn(video_shape.to_torch_shape(), device=self.device)
-        self.scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
+        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler.sigmas = self.scheduler.sigmas.to(self.device)
         audio_scheduler = copy.deepcopy(self.scheduler)
-        audio_scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         timesteps = self.scheduler.timesteps
 
         if do_cfg:
