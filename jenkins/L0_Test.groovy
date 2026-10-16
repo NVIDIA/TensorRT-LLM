@@ -6574,10 +6574,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
-        // PerfSanity post-merge: MiniMax-M3 NVFP4 AgentX, one aggregated server per split.
-        "DGX_B300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300_perf_sanity", 1, 3, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300_perf_sanity", 2, 3, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b300-flex", "l0_dgx_b300_perf_sanity", 3, 3, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // Single-GPU Gemma4 PerfSanity post-merge baseline

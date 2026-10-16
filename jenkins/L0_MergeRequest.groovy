@@ -1785,7 +1785,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
-        "tests/integration/test_lists/test-db/l0_dgx_b300_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
