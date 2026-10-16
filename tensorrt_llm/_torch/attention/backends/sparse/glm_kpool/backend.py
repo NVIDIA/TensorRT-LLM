@@ -41,7 +41,13 @@ from ...interface import (
     merge_attention_forward_args,
 )
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
+from .kernels import (
+    append_paged_state_rows,
+    gather_fp8_kv_rows,
+    kpool_expand,
+    kpool_score,
+    kpool_update,
+)
 from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
 from .params import INDEX_SENTINEL, GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
@@ -286,15 +292,24 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         and uses the generation slice of the prepared block tables.
         """
         state = self._cache_state(metadata)
-        if request_ids is not None:
-            # Packed context rows of several requests: row i's page comes from
-            # block table request_ids[i] (no [tokens, max_pages] gather).
-            page_idx = torch.div(positions, state.tokens_per_block, rounding_mode="floor")
-            offset = positions - page_idx * state.tokens_per_block
-            page = state.block_tables[request_ids.long(), page_idx]
-        else:
-            table = state.block_tables[state.num_contexts :]
-            page, offset = paged_slot_indices(table, positions, state.tokens_per_block)
+        if request_ids is None:
+            # Generation rows: one launch computes the slots and writes both pools.
+            append_paged_state_rows(
+                latent,
+                packed,
+                positions,
+                state.block_tables[state.num_contexts :],
+                state.latent_pool,
+                state.index_pool,
+                state.tokens_per_block,
+                self.kv_scale_orig_quant,
+            )
+            return
+        # Packed context rows of several requests: row i's page comes from
+        # block table request_ids[i] (no [tokens, max_pages] gather).
+        page_idx = torch.div(positions, state.tokens_per_block, rounding_mode="floor")
+        offset = positions - page_idx * state.tokens_per_block
+        page = state.block_tables[request_ids.long(), page_idx]
         if state.latent_pool.dtype == torch.float8_e4m3fn:
             quantized = (latent.float() * self.kv_scale_orig_quant).clamp(-448, 448)
             # PyTorch advanced indexing does not implement FP8 payloads. Index
@@ -338,7 +353,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         """Refresh the pool containing each position using compression APE.
 
         positions is [rows]; ape is [kpool, head_dim]. Generation has one position per
-        request. For packed context, request_ids maps each row to a request and only
+        request, or [requests, T] consecutive draft positions (applied as T ordered
+        updates). For packed context, request_ids maps each row to a request and only
         pool-final positions are supplied, avoiding concurrent writes to one pool.
         """
         state = self._cache_state(metadata)

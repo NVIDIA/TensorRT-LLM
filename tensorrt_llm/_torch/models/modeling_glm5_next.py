@@ -1499,10 +1499,9 @@ class Glm5NextSparseAttention(nn.Module):
         )
         # Keep the cached pool keys current, in position order, so a pool
         # spanning several drafts ends up with all of its visible members.
-        for step in range(tokens_per_request):
-            self.attn_backend.update_pool_keys(
-                positions[:, step].contiguous(), self.indexer.index_kpool_compress_ape, metadata
-            )
+        self.attn_backend.update_pool_keys(
+            positions, self.indexer.index_kpool_compress_ape, metadata
+        )
         query = self.q_b_proj(q_resid).view(num_tokens, self.num_heads, self.qk_head_dim)
         # Row i of request b sees its own prefix: visible = position + 1.
         return self._select_and_attend_paged(
