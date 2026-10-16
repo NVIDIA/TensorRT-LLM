@@ -8,8 +8,9 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
-                    Literal, Optional, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
+                    Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
+                    Union)
 
 import torch
 from torch import nn
@@ -19,6 +20,7 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -36,6 +38,12 @@ from ..speculative import SpecMetadata
 from ..utils import split
 from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
+
+if TYPE_CHECKING:
+    # The checkpoints package imports this module, so import its loader base
+    # classes for type checking only.
+    from .checkpoints.base_config_loader import BaseConfigLoader
+    from .checkpoints.base_weight_loader import BaseWeightLoader
 
 
 @contextlib.contextmanager
@@ -1422,7 +1430,7 @@ def register_vision_encoder(
     return wrapper
 
 
-def register_mapper(format: str, name: Optional[str] = None):
+def register_mapper(format: CheckpointFormat | str, name: Optional[str] = None):
 
     def decorator(cls):
         if name is not None:
@@ -1436,7 +1444,7 @@ def register_mapper(format: str, name: Optional[str] = None):
     return decorator
 
 
-def register_checkpoint_weight_loader(name: str):
+def register_checkpoint_weight_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1445,7 +1453,7 @@ def register_checkpoint_weight_loader(name: str):
     return decorator
 
 
-def register_checkpoint_loader(name: str):
+def register_checkpoint_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[name] = cls
@@ -1454,7 +1462,7 @@ def register_checkpoint_loader(name: str):
     return decorator
 
 
-def register_config_loader(name: str):
+def register_config_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1463,13 +1471,14 @@ def register_config_loader(name: str):
     return decorator
 
 
-def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+def get_checkpoint_weight_loader(
+        name: CheckpointFormat | str) -> Type["BaseWeightLoader"]:
     if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default checkpoint weight loader {name} not found.")
     return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
 
 
-def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+def get_config_loader(name: CheckpointFormat | str) -> Type["BaseConfigLoader"]:
     if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default config loader {name} not found.")
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
