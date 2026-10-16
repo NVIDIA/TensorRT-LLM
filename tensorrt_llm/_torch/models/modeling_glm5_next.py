@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from ..._utils import async_tensor_h2d
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
@@ -273,12 +274,12 @@ class Glm5NextContextRows:
             for pos in range(first_final, cached + length, kpool):
                 finals.append(pos)
                 final_ids.append(i)
-        as_dev = lambda vals, dtype: torch.tensor(vals, dtype=dtype, device=device)  # noqa: E731
+        # Pinned non-blocking copies do not wait for the GPU work already queued.
         return cls(
-            positions=as_dev(positions, torch.long),
-            request_ids=as_dev(request_ids, torch.int32),
-            final_positions=as_dev(finals, torch.long),
-            final_request_ids=as_dev(final_ids, torch.int32),
+            positions=async_tensor_h2d(positions, torch.long, device),
+            request_ids=async_tensor_h2d(request_ids, torch.int32, device),
+            final_positions=async_tensor_h2d(finals, torch.long, device),
+            final_request_ids=async_tensor_h2d(final_ids, torch.int32, device),
         )
 
 
