@@ -2856,8 +2856,16 @@ class DecoderRunner(ScheduledModelRunner):
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
+        # The overlap correction below changes kv_lens_cuda and refreshes the metadata after it.
+        refreshed_after_correction = (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+        )
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        if attn_meta is not None and not refreshed_after_correction:
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
