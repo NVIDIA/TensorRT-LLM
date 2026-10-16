@@ -31,8 +31,8 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalEncoderItemMetadata,
                                             MultimodalParams)
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
