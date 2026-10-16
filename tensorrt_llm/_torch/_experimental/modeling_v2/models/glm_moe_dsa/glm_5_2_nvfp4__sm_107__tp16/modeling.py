@@ -1014,17 +1014,24 @@ class DecodeTarget:
         kv_pool = manager.get_unique_primary_pool()
         reuses_selection = pool_rows is not None or positions is not None
         own_indexer = sharded and indexer is not None and not reuses_selection
+        # A layer that attends to the selection of the indexer layer before it gathers its old KV
+        # rows before the flash decode's wait.
+        early_gather = sharded and indexer is None and not reuses_selection
 
         weight = (
             self._fused_a_indexer_weight[layer.layer_idx]
             if own_indexer
             else mla.kv_a_proj_with_mqa.weight
         )
-        l2_prefetch = (
-            self._draft.l2_after_fused_a
-            if reuses_selection
-            else self._l2_after_fused_a[layer.layer_idx]
-        )
+        if reuses_selection:
+            l2_prefetch = self._draft.l2_after_fused_a
+        elif early_gather:
+            # Also the selection the flash decode reads first.
+            l2_prefetch = self._l2_after_fused_a[layer.layer_idx] + [
+                self._hist_buffers["topk"][:num_tokens]
+            ]
+        else:
+            l2_prefetch = self._l2_after_fused_a[layer.layer_idx]
         kv_a = fused_a_gemm(hidden_states, weight, l2_prefetch)
         kv_a = kv_a[:num_tokens]
         q_a = kv_a[:, : mla.q_lora_rank]
@@ -1033,7 +1040,7 @@ class DecodeTarget:
             (num_tokens, mla.num_heads_tp * head_dim), dtype=torch.uint8
         )
 
-        def q_b():
+        def q_b(plan="regular"):
             q_b_fp8_rope(
                 q_a,
                 self._q_b_absorbed[layer.layer_idx],
@@ -1045,10 +1052,10 @@ class DecodeTarget:
                 head_dim,
                 mla.qk_rope_head_dim,
                 seq_len_q,
-                "regular",
+                plan,
             )
 
-        def kv_half():
+        def kv_half(trigger_at_entry=False):
             mla_kv_half_append(
                 kv_a[:, mla.q_lora_rank : latent_end],
                 mla.kv_a_layernorm.weight,
@@ -1066,6 +1073,7 @@ class DecodeTarget:
                 self._bmm1_scale,
                 self._bmm2_scale,
                 mla.softmax_scale,
+                trigger_at_entry,
             )
 
         output = hidden_states.new_empty(
@@ -1073,18 +1081,32 @@ class DecodeTarget:
         )
         q_heads = quant_q.view(num_tokens, mla.num_heads_tp, head_dim)
         if sharded:
+            if own_indexer:
 
-            def select_then_q_b():
-                if own_indexer:
+                def select():
                     self._select_rows(
                         indexer, kv_a, latent_end, q_a, position_ids, attn_metadata, num_tokens, mla
                     )
-                q_b()
 
-            # The KV half on the aux stream beside the indexer and q_b.
-            maybe_execute_in_parallel(
-                select_then_q_b, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
-            )
+                def kv_half_then_q_b():
+                    kv_half()
+                    # Queued after the top-k: 18 CTAs leave the SMs to the indexer beside it.
+                    q_b("beside_topk")
+
+                # The indexer on this stream; the KV half and q_b beside it on the aux stream.
+                maybe_execute_in_parallel(
+                    select, kv_half_then_q_b, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
+                )
+            else:
+                # With the early gather, q_b at split-K 4 leaves room for the flash decode, which
+                # the KV half lets launch at its entry.
+                maybe_execute_in_parallel(
+                    lambda: q_b("early_gather" if early_gather else "regular"),
+                    lambda: kv_half(early_gather),
+                    mla.ln_events[0],
+                    mla.ln_events[1],
+                    mla.aux_stream,
+                )
             if pool_rows is not None:
                 sparse_mla_flash_decode(
                     q_heads,
@@ -1115,8 +1137,7 @@ class DecodeTarget:
                 manager.tokens_per_block,
                 page_index_scale,
                 layer_offset,
-                # The selection of an earlier indexer layer: its rows can load before the wait.
-                positions is None and not own_indexer,
+                early_gather,
             )
             return output
 
