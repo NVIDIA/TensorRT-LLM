@@ -36,6 +36,7 @@ from ._precision import (
     _slice_batch_bundle,
     _uses_reference_precision,
 )
+from .ltx23_core.modality import LTX23Modality
 
 _get_ada_table_ts_pairs = BasicAVTransformerBlock._get_ada_table_ts_pairs
 _get_av_ca_ada_table_ts_pairs = BasicAVTransformerBlock._get_av_ca_ada_table_ts_pairs
@@ -435,7 +436,7 @@ class LTX23Model(LTXModel):
             batch_size = modality.latent.shape[0]
             if batch_size > 1:
                 predictions = [
-                    self.forward(
+                    self._forward_single_batch(
                         video=_slice_batch_bundle(video, index, batch_size)
                         if video is not None
                         else None,
@@ -443,8 +444,6 @@ class LTX23Model(LTXModel):
                         if audio is not None
                         else None,
                         text_cache=_slice_batch_bundle(text_cache, index, batch_size),
-                        timestep=timestep,
-                        step_index=step_index,
                     )
                     for index in range(batch_size)
                 ]
@@ -454,6 +453,16 @@ class LTX23Model(LTXModel):
                     else None
                     for stream in range(2)
                 )
+        return self._forward_single_batch(video, audio, text_cache=text_cache)
+
+    def _forward_single_batch(
+        self,
+        video: LTX23Modality | None,
+        audio: LTX23Modality | None,
+        *,
+        text_cache: TextCache,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Run one batch without re-entering the outer CUDA graph wrapper."""
         video_args, video_prompt_ts = self._prepare_stream(video, text_cache, is_audio=False)
         audio_args, audio_prompt_ts = self._prepare_stream(audio, text_cache, is_audio=True)
 
