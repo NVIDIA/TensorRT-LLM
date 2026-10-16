@@ -34,6 +34,10 @@ _CKPT = dict(
 
 _DECODE = ((0, 1), (1, 1), (31, 1), (32, 1), (33, 1), (63, 1), (64, 1), (95, 1))
 
+#: 32 requests of one MTP7 verify block each (8 rows), at starts that put some blocks across a
+#: page edge and some inside one.
+_MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
+
 
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
@@ -80,6 +84,14 @@ class QsaPagedIndexStore(OpWrapper):
         Cell(
             why="decode MTP: 4 requests x 2 rows, a pair straddling a page",
             spec=_spec(((10, 2), (31, 2), (63, 2), (5, 2)), pages=16),
+        ),
+        Cell(
+            why="decode MTP7: 1 request x 8 rows, a block straddling a page",
+            spec=_spec(((28, 8),), pages=8),
+        ),
+        Cell(
+            why="decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
+            spec=_spec(_MTP7_32, pages=1200, slots=40),
         ),
         Cell(
             why="prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
@@ -156,8 +168,9 @@ class QsaPagedIndexStore(OpWrapper):
     `rows == 0` leaves both planes unchanged.
 
     The 8 launches are launch-bound: ~0.15 ms per call flat from 1 to 1024
-    rows. CUDA-graph capturable; a replay follows positions rewritten in
-    place. Repeating a call is idempotent.
+    rows. CUDA-graph capturable (captured at 4 decode rows and at 256, 32 MTP7
+    verify blocks); a replay follows positions rewritten in place. Repeating a
+    call is idempotent.
 
     Hard limits: torch advanced indexing in int64 -- no int32 boundary inside
     the call; the coordinate wrap above is the plane's dtype.

@@ -292,8 +292,13 @@ _QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.mode
 
 @pytest.mark.parametrize(
     "spec_config",
-    [None, MTPDecodingConfig(max_draft_len=1), MTPDecodingConfig(max_draft_len=3)],
-    ids=["no-spec", "mtp1", "mtp3"],
+    [
+        None,
+        MTPDecodingConfig(max_draft_len=1),
+        MTPDecodingConfig(max_draft_len=3),
+        MTPDecodingConfig(max_draft_len=7),
+    ],
+    ids=["no-spec", "mtp1", "mtp3", "mtp7"],
 )
 def test_qwen4_exp_tp1_matches(spec_config):
     config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
@@ -317,14 +322,14 @@ def _mtp(max_draft_len=3, **attributes):
     "spec_config",
     [
         _NGRAM,
-        MTPDecodingConfig(max_draft_len=4),
+        MTPDecodingConfig(max_draft_len=8),
         MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
         _mtp(max_total_draft_tokens=5),
         _mtp(num_nextn_predict_layers=2),
     ],
     ids=[
         "ngram",
-        "draft4",
+        "draft8",
         "vanilla-mtp",
         "max-total-draft",
         "two-predictors",
@@ -399,6 +404,50 @@ def test_qwen4_exp_runtime_draft_length_falls_back(spec_kwargs):
     would trip the width assert in the first reduced step."""
     spec = MTPDecodingConfig(max_draft_len=3, **spec_kwargs)
     _declined(_model_config(_qwen4_exp_config(), spec_config=spec), match="draft length")
+
+
+@pytest.mark.parametrize("max_draft_len", [4, 7])
+def test_qwen4_exp_draft_beyond_three_needs_the_cached_replay(monkeypatch, max_draft_len):
+    """The legacy per-step recurrent states are certified at up to three drafted tokens and
+    hold one fp32 state per verify row."""
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(
+        _qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=max_draft_len)
+    )
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
+    _declined(config, dict(kv_cache_config=kv_cache_config), match="TRTLLM_USE_GDN_REPLAY=0")
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
+    _claimed(config, dict(kv_cache_config=kv_cache_config))
+
+
+def test_qwen4_exp_legacy_verify_matches_up_to_three_drafted_tokens(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    _claimed(config, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
+
+
+@pytest.mark.parametrize("max_draft_len", [4, 7])
+def test_qwen4_exp_cutedsl_declines_drafts_beyond_three(monkeypatch, max_draft_len):
+    """The CuteDSL expert entries capture up to 128 rows (32 requests of 4 verify rows)."""
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
+    spec = MTPDecodingConfig(max_draft_len=max_draft_len)
+    cutedsl = replace(
+        _model_config(_qwen4_exp_config(), spec_config=spec), moe_backend_requested="CUTEDSL"
+    )
+    _declined(cutedsl, dict(kv_cache_config=kv_cache_config), match="CUTEDSL")
+    _claimed(
+        _model_config(_qwen4_exp_config(), spec_config=spec), dict(kv_cache_config=kv_cache_config)
+    )
+
+
+def test_qwen4_exp_cutedsl_matches_up_to_three_drafted_tokens(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    spec = MTPDecodingConfig(max_draft_len=3)
+    cutedsl = replace(
+        _model_config(_qwen4_exp_config(), spec_config=spec), moe_backend_requested="CUTEDSL"
+    )
+    _claimed(cutedsl, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
 
 
 def test_qwen4_exp_mtp_on_a_bf16_state_cache_falls_back(monkeypatch):

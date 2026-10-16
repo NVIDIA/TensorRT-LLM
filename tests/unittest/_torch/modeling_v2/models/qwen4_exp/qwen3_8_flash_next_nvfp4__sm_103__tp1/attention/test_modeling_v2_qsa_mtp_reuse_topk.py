@@ -260,6 +260,38 @@ def test_boundary_rows_take_the_documented_branch() -> None:
     assert torch.equal(out[6], shared[6]) and torch.equal(out[7], shared[7])
 
 
+def test_fresh_two_rows_take_the_documented_branch() -> None:
+    """Draft steps 4..6 (max_draft_len 7) append up to two groups; read off the output.
+
+    A full row loses its two oldest ids and the survivors shift to the front, a 511-id row
+    loses its oldest id, and a short row keeps every captured id with the new groups right
+    after the prefix. At fresh 1 a full row gives up only the id in slot 0.
+    """
+    spec = _spec_of("8 requests at fresh 2")
+    kwargs = _build(spec, seed=23)["kwargs"]
+    out = op(**kwargs).cpu()
+    shared = kwargs["shared_indices"].cpu()
+    captured = kwargs["shared_visible_blocks"].cpu().tolist()
+    current = kwargs["visible_blocks"].cpu().tolist()
+    # (captured, current) per request: (512, 514) (100, 102) (511, 513) (2046, 2048) (1, 3)
+    # (512, 513) (255, 257) (512, 514)
+    assert [c - a for a, c in zip(captured, current)] == [2, 2, 2, 2, 2, 1, 2, 2]
+    for row in (0, 3, 7):
+        first = captured[row]
+        assert torch.equal(out[row, : K - 2], shared[row, 2:]), "full row: the oldest two go"
+        assert out[row, K - 2 :].tolist() == [first, first + 1], "full row: the two new groups last"
+    assert torch.equal(out[2, : K - 2], shared[2, 1 : K - 1]), "511-id row: the oldest id goes"
+    assert out[2, K - 2 :].tolist() == [511, 512]
+    assert torch.equal(out[1, :100], shared[1, :100]) and out[1, 100:102].tolist() == [100, 101]
+    assert bool((out[1, 102:] == -1).all()), "short row: appended right after the prefix"
+    assert out[4, :3].tolist() == [0, 1, 2] and bool((out[4, 3:] == -1).all())
+    assert torch.equal(out[5, : K - 1], shared[5, 1:]) and out[5, K - 1] == 512, (
+        "fresh 1 on a full row: only the id in slot 0 goes"
+    )
+    assert torch.equal(out[6, :255], shared[6, :255]) and out[6, 255:257].tolist() == [255, 256]
+    assert bool((out[6, 257:] == -1).all())
+
+
 def test_worked_example_small_geometry() -> None:
     """Five rows written out by hand at K = 8, through a permuted request map."""
     shared = torch.tensor(

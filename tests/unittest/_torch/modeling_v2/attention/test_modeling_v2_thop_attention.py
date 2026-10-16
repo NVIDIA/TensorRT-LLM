@@ -175,7 +175,8 @@ exercised:
    within-block mask read out one-hot at P = 2, 3, 4 over a bf16 pool at
    24/2/256 and 24/4/256 and an fp8 one at 24/4/256 (bottom-right causal,
    later siblings bitwise zero, mask_type inert, a page-crossing block,
-   consecutive steps), with the full-block model as the measured rival.
+   consecutive steps), with the full-block model as the measured rival; the
+   entry's cells gate P up to 8 (the target's max_draft_len 7) against `reference`.
 12. qwen4_exp's full-attention cell, GQA 24/2/256 over a bf16 pool on the
    paged-context path: the cached-prefix rival, the sparse / skip-softmax
    group measured bitwise inert, and local_layer_idx over its 48-row mapping
@@ -5895,8 +5896,8 @@ def test_fp8_std_append_race_control() -> None:
 # (its draft chain), token-major. On sm_103 a linear draft leaves every
 # spec_decoding_* tensor None and is_spec_decoding_enabled False, so the
 # within-block mask has to come from predicted_tokens_per_seq alone. The cells
-# gate P = 1..4 against `op.reference`; these read the mask out directly and
-# measure the rival.
+# gate P = 1..8 against `op.reference`; these read the mask out directly and
+# measure the rival at P = 2..4.
 
 # One configuration per pool the cells certify P over: qwen4_exp's 24/2/256
 # over bf16, and 24/4/256 over bf16 and over fp8 at s = 1.0. The weight

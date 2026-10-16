@@ -112,6 +112,43 @@ def test_prefill_capture_takes_chunk_last_row_and_last_accepted_row():
     assert md.qsa_shared_topk_captured_slots == {SLOT}
 
 
+def test_decode_capture_at_draft_seven_takes_row_s_times_8_plus_a_minus_1():
+    """max_draft_len 7: eight rows per request, accepted 1..8, so the captured row is
+    `s * 8 + a - 1` -- the first and the last row of a block included."""
+    p, batch = 8, 4
+    accepted = [1, 8, 5, 3]
+    topk = torch.arange(batch * p * K, dtype=torch.int32, device=DEV).reshape(batch * p, K)
+    visible = torch.arange(300, 300 + batch * p, dtype=torch.int32, device=DEV)
+    md = _metadata(batch, accepted)
+
+    _target(m.DecodeTarget)._capture_selection(md, topk, visible, batch, p)
+
+    rows = [s * p + a - 1 for s, a in enumerate(accepted)]
+    assert rows == [0, 15, 20, 26]
+    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :batch], topk[rows])
+    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :batch], visible[rows])
+    assert torch.all(md.qsa_shared_topk_indices[SLOT, batch:] == -7)
+    assert md.qsa_shared_topk_captured_slots == {SLOT}
+
+
+def test_prefill_capture_at_draft_seven():
+    """A mixed batch at max_draft_len 7: one 5-row context chunk, then three generation
+    requests of 8 rows with 8, 1 and 6 accepted."""
+    seq_lens = [5, 8, 8, 8]
+    accepted = [2, 8, 1, 6]
+    rows_total = sum(seq_lens)
+    topk = torch.arange(rows_total * K, dtype=torch.int32, device=DEV).reshape(rows_total, K)
+    visible = torch.arange(400, 400 + rows_total, dtype=torch.int32, device=DEV)
+    md = _metadata(4, accepted, seq_lens=seq_lens, num_contexts=1)
+
+    _target(m.PrefillTarget)._capture_selection(md, topk, visible)
+
+    rows = [4, 5 + 7, 13 + 0, 21 + 5]
+    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :4], topk[rows])
+    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :4], visible[rows])
+    assert md.qsa_shared_topk_captured_slots == {SLOT}
+
+
 def _reuse_case(fresh: int):
     """A sorted capture of 16 requests and the reuse call's arguments for it."""
     gen = torch.Generator().manual_seed(11 + fresh)

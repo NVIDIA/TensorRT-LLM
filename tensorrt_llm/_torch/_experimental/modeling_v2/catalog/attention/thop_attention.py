@@ -69,6 +69,19 @@ _QWEN4_VISION = dict(
 #: pool sizes as `_QWEN4_DENSE`.
 _QWEN4_FP8 = dict(_QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
 
+#: `_QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
+#: ceiling: one block-offset row per request and pages for 32 histories (the largest cell
+#: needs 133 of the 144).
+_QWEN4_DENSE_G32 = dict(_QWEN4_DENSE, max_num_requests=32, num_blocks=144)
+_QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
+
+
+def _spread(batch: int, longest: int) -> tuple[int, ...]:
+    """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
+    and multi-page sequences in one verify step."""
+    return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
+
+
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
 #: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
@@ -209,7 +222,7 @@ class ThopAttention(OpWrapper):
             ),
         ),
         Cell(
-            why="qwen4_exp MTP verify P=4 (max_draft_len 3): the target's ceiling",
+            why="qwen4_exp MTP verify P=4 (max_draft_len 3)",
             spec=dict(
                 _QWEN4_DENSE,
                 cached=(70, 35),
@@ -217,6 +230,61 @@ class ThopAttention(OpWrapper):
                 num_contexts=0,
                 predicted_tokens_per_seq=4,
             ),
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp MTP verify P={p} (max_draft_len {p - 1})"
+                + (": the target's ceiling" if p == 8 else ""),
+                spec=dict(
+                    _QWEN4_DENSE,
+                    cached=(70, 35),
+                    new=(p, p),
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (5, 6, 7, 8)
+        ),
+        Cell(
+            why="qwen4_exp P=8 G=1: one draft block from row 95, across the page edge at 96",
+            spec=dict(
+                _QWEN4_DENSE,
+                cached=(95,),
+                new=(8,),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        # The trtllm-gen launch picks its generation kernel by batch size at P 5..8, so each P
+        # is also driven at 32 requests and at one batch in 17..20, with histories of every
+        # page shape in the step.
+        *(
+            Cell(
+                why=f"qwen4_exp bf16 batch P={p} G=32: 32 blocks over histories 1..218, "
+                f"{32 * p} q rows",
+                spec=dict(
+                    _QWEN4_DENSE_G32,
+                    cached=_spread(32, 218),
+                    new=(p,) * 32,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (5, 6, 7, 8)
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp bf16 batch P={p} G={g}: {g} blocks over histories 200..1, "
+                f"{g * p} q rows",
+                spec=dict(
+                    _QWEN4_DENSE_G32,
+                    cached=tuple(reversed(_spread(g, 200))),
+                    new=(p,) * g,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p, g in ((5, 17), (6, 18), (7, 19), (8, 20))
         ),
         Cell(
             why="qwen4_exp mixed step: a fresh 20-row context ahead of two P=2 "
@@ -230,6 +298,17 @@ class ThopAttention(OpWrapper):
             ),
         ),
         Cell(
+            why="qwen4_exp mixed step P=8: a fresh 20-row context ahead of two P=8 "
+            "draft blocks over histories 70 and 35",
+            spec=dict(
+                _QWEN4_DENSE,
+                cached=(0, 70, 35),
+                new=(20, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
             why="qwen4_exp hybrid pool: row 47 of the 48-row two-pool mapping "
             "(pool 0, layer-in-pool 11), P=2 verify",
             spec=dict(
@@ -240,6 +319,19 @@ class ThopAttention(OpWrapper):
                 new=(2, 2),
                 num_contexts=0,
                 predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp P=8 hybrid pool: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11), P=8 verify",
+            spec=dict(
+                _QWEN4_DENSE,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
             ),
         ),
         Cell(
@@ -464,7 +556,7 @@ class ThopAttention(OpWrapper):
                     predicted_tokens_per_seq=p,
                 ),
             )
-            for p in (2, 4)
+            for p in (2, 4, 5, 6, 7, 8)
         ),
         Cell(
             why="qwen4_exp fp8 pool mixed step P=3, 24/2/256: a 20-row context ahead "
@@ -478,6 +570,29 @@ class ThopAttention(OpWrapper):
             ),
         ),
         Cell(
+            why="qwen4_exp fp8 pool mixed step P=8, 24/2/256: a 20-row context ahead "
+            "of two P=8 blocks over histories 31 and 64",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 31, 64),
+                new=(20, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        # KV stays within one 128-key tile (histories to 119 plus 8 rows), where the e4m3
+        # probability model of `reference` is the kernel's own at any batch.
+        Cell(
+            why="qwen4_exp fp8 batch P=8 G=32: 32 blocks over histories 1..119, 256 q rows",
+            spec=dict(
+                _QWEN4_FP8_G32,
+                cached=_spread(32, 119),
+                new=(8,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
             why="qwen4_exp fp8 hybrid pool P=2: row 47 of the 48-row two-pool mapping "
             "(pool 0, layer-in-pool 11) over e4m3 slabs",
             spec=dict(
@@ -488,6 +603,19 @@ class ThopAttention(OpWrapper):
                 new=(2, 2),
                 num_contexts=0,
                 predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 hybrid pool P=8: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11) over e4m3 slabs",
+            spec=dict(
+                _QWEN4_FP8,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
             ),
         ),
     )
@@ -521,7 +649,10 @@ class ThopAttention(OpWrapper):
     `is_spec_decoding_enabled` False, which is what sm_103 passes for a linear
     draft, and mask_type 0 and 1 are bitwise identical at P > 1. Nothing checks
     q's row count against P. P reaches the decode kernel as `maxSeqLenQ`: one
-    JIT compile per P.
+    JIT compile per P. P is driven at 1..8 (max_draft_len 1..7) at 24/2/256 over
+    bf16 and fp8 pools. From P = 5 the launch picks its generation kernel by
+    batch size, so P 5..8 is also driven at 32 requests and at one batch in
+    17..20 (bf16), and P = 8 at 32 requests over the fp8 pool.
 
     No KV cache (an encoder): pass `kv_cache_block_offsets`,
     `host_kv_cache_pool_pointers` and `host_kv_cache_pool_mapping` all None,
@@ -544,9 +675,11 @@ class ThopAttention(OpWrapper):
     does not reproduce the kernel's probability rounding.
     quant_mode 384, 1152, 4224 and 4480 are bit-identical to 128 at 24/4/256;
     4352 (the same bits without FP8_KV_CACHE) reads e4m3 slabs as bf16. At
-    24/2/256 only 128 was driven, with KV up to 200 keys: the fp8 kernels round
-    the softmax probabilities against a per-tile max, which the row-max model of
-    `reference(e4m3_probabilities=True)` approximates only that far.
+    24/2/256 only 128 was driven, with KV up to 200 keys at P = 1 and up to
+    127 at P 2..8: the fp8 kernels round the softmax probabilities against a
+    per-tile max, which the row-max model of
+    `reference(e4m3_probabilities=True)` reproduces within one 128-key tile
+    and approximates up to 200 keys.
 
     The sparse / skip-softmax arguments are bitwise inert in the standard
     configuration (nine off-default settings at 24/2/256): passing them does

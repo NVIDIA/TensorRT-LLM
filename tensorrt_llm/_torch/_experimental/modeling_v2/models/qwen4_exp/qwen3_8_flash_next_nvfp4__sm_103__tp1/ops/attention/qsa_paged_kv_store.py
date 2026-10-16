@@ -41,6 +41,10 @@ _F8 = torch.float8_e4m3fn
 
 _DECODE = ((0, 1), (31, 1), (32, 1), (33, 1), (100, 1), (255, 1), (7, 1), (64, 1))
 
+#: 32 requests of one MTP7 verify block each (8 rows), at starts that put some blocks across a
+#: page edge and some inside one.
+_MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
+
 
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
@@ -112,6 +116,19 @@ class QsaPagedKvStore(OpWrapper):
         Cell(
             why="fp8 decode MTP: 4 requests x 2 rows, a pair straddling a page",
             spec=_spec(((0, 2), (31, 2), (63, 2), (95, 2)), pages=32, cache_dtype=_F8),
+        ),
+        # MTP7 verify blocks: 8 rows per request, so one block spans up to two pages.
+        Cell(
+            why="decode MTP7: 1 request x 8 rows, a block straddling a page",
+            spec=_spec(((28, 8),), pages=8),
+        ),
+        Cell(
+            why="decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
+            spec=_spec(_MTP7_32, pages=1200, slots=40),
+        ),
+        Cell(
+            why="fp8 decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
+            spec=_spec(_MTP7_32, pages=1200, slots=40, cache_dtype=_F8),
         ),
         Cell(
             why="fp8 conversion: all 65536 bf16 bit patterns, as torch casts them",
@@ -205,8 +222,9 @@ class QsaPagedKvStore(OpWrapper):
     empty pool or table. `rows == 0` returns before launching.
 
     Strides and the pool/table extents are Triton constexprs: each distinct
-    layout or pool size compiles its own kernel. CUDA-graph capturable; a
-    replay follows positions rewritten in place.
+    layout or pool size compiles its own kernel. CUDA-graph capturable
+    (captured at 8 decode rows and at 256, 32 MTP7 verify blocks); a replay
+    follows positions rewritten in place.
 
     Hard limits: both metadata values are cast to int32 inside the kernel
     (`.to(tl.int32)`); an int64 position at `2^32 + 5` was probed and lands

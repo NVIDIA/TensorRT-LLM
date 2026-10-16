@@ -161,6 +161,19 @@ class NgramTokenHistory(OpWrapper):
                 qsl_from="seq_lens",
                 **_CALL_SITE,
             ),
+            *(
+                _cell(
+                    f"MTP verify p={rows}: {decodes} decode{'s' if decodes > 1 else ''} x "
+                    f"{rows} rows, qsl rebuilt",
+                    (rows,) * decodes,
+                    _scattered(decodes),
+                    (True,) * decodes,
+                    ENGINE_SLOTS,
+                    qsl_from="seq_lens",
+                    **_CALL_SITE,
+                )
+                for rows, decodes in ((5, 8), (6, 32), (7, 8), (8, 1), (8, 32))
+            ),
             _cell(
                 "MTP verify mixed: 37-token context + 8 x 3 rows",
                 (37,) + (3,) * 8,

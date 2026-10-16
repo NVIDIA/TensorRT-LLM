@@ -95,8 +95,11 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     # spec: path ("small": no work items, the kernel commits a wrap itself |
     # "all_layer": work items + use_all_layer_commit, the test then runs the
     # manager's all-layer commit), n sequences x t tokens per verify step,
-    # steps (consecutive verify steps, each followed by a random partial
-    # acceptance 1..t per row), layers (each with its own activations, gates
+    # steps (consecutive verify steps, each followed by an acceptance per row),
+    # accept ("random": 1..t per row, the default | "full": t every step, so from
+    # a fresh slot at t=8 the second step appends at `pnat + t == 16` without
+    # wrapping and every second step after wraps | "one": 1 every step),
+    # layers (each with its own activations, gates
     # and history; one V2-style pool interleaving the layers per slot), slots
     # (the pool's slot count), start ("warm": random pending histories in both
     # halves, a wrap and an append forced at step 0 | "fresh": pnat 0 and
@@ -105,7 +108,8 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     # slot), output (None | "prefix" of a longer buffer | "suffix": its rows
     # after 5 context tokens), packed (False: the q/k/v views over the packed
     # rows without packed_qkv, as a mixed batch passes them), pdl
-    # (launch_with_pdl, default True), ab ("split": separate [n, t, 48]
+    # (launch_with_pdl, default False, the form the target calls: PDL is a constexpr of the
+    # kernel, so True is a separate compile), ab ("split": separate [n, t, 48]
     # projections | "strided": the column halves of one [n*t, 96] projection),
     # dup (rows given the SAME slot, as CUDA-graph padding repeats one dummy slot;
     # only the other rows and slots are held to the reference).
@@ -137,8 +141,8 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             spec=_cell_spec("small", 4, 2, packed=False, steps=12),
         ),
         Cell(
-            why="small n=4 T=4 no PDL: launch_with_pdl=False, as the target calls it",
-            spec=_cell_spec("small", 4, 4, pdl=False),
+            why="small n=4 T=4 PDL on: launch_with_pdl=True, the kernel's other compile",
+            spec=_cell_spec("small", 4, 4, pdl=True),
         ),
         Cell(
             why="small n=5 T=3 strided a/b: halves of [n*t, 96]",
@@ -183,13 +187,66 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             why="all_layer n=16 T=3 mixed-batch form: views, offset out",
             spec=_cell_spec("all_layer", 16, 3, packed=False, output="suffix"),
         ),
+        # ---- MTP draft lengths 4..7: T = 5..8, the kernel's ceiling ----
+        Cell(why="small n=1 T=5: one sequence, MTP-4", spec=_cell_spec("small", 1, 5, steps=10)),
+        Cell(why="small n=8 T=6: MTP-5", spec=_cell_spec("small", 8, 6)),
+        Cell(
+            why="small n=15 T=7: MTP-6, largest batch before the split",
+            spec=_cell_spec("small", 15, 7),
+        ),
+        Cell(why="small n=1 T=8: one sequence, MTP-7", spec=_cell_spec("small", 1, 8, steps=10)),
+        Cell(why="small n=8 T=8: MTP-7", spec=_cell_spec("small", 8, 8)),
+        Cell(
+            why="small n=15 T=8: MTP-7, largest batch before the split",
+            spec=_cell_spec("small", 15, 8),
+        ),
+        Cell(
+            why="small n=8 T=8 S=461: slots 0 and 460 of a 461-slot axis",
+            spec=_cell_spec("small", 8, 8, slots=ENGINE_SLOTS, edge_slots=True),
+        ),
+        Cell(
+            why="small n=4 T=8 full accept: pnat+T==16 appends, then wraps",
+            spec=_cell_spec("small", 4, 8, start="fresh", accept="full", steps=8),
+        ),
+        Cell(
+            why="small n=8 T=8 one accepted: a=1 every step",
+            spec=_cell_spec("small", 8, 8, accept="one", steps=12),
+        ),
+        Cell(
+            why="small n=6 T=8 mixed-batch form: views, offset out, pad",
+            spec=_cell_spec("small", 6, 8, packed=False, output="suffix", pad=(2,)),
+        ),
+        Cell(why="all_layer n=16 T=5: MTP-4 at the threshold", spec=_cell_spec("all_layer", 16, 5)),
+        Cell(
+            why="all_layer n=24 T=6 S=461: MTP-5, slots 0 and 460",
+            spec=_cell_spec("all_layer", 24, 6, slots=ENGINE_SLOTS, edge_slots=True),
+        ),
+        Cell(why="all_layer n=32 T=7: MTP-6 at 32 requests", spec=_cell_spec("all_layer", 32, 7)),
+        Cell(why="all_layer n=16 T=8: MTP-7 at the threshold", spec=_cell_spec("all_layer", 16, 8)),
+        Cell(why="all_layer n=32 T=8: MTP-7, 256 rows", spec=_cell_spec("all_layer", 32, 8)),
+        Cell(
+            why="all_layer n=32 T=8 L=36 S=40: every GDN layer, one commit",
+            spec=_cell_spec("all_layer", 32, 8, layers=NUM_GDN_LAYERS, slots=40, steps=6),
+        ),
+        Cell(
+            why="all_layer n=32 T=8 full accept: commit every second step",
+            spec=_cell_spec("all_layer", 32, 8, start="fresh", accept="full", steps=8),
+        ),
+        Cell(
+            why="all_layer n=16 T=8 mixed-batch form: views, offset out",
+            spec=_cell_spec("all_layer", 16, 8, packed=False, output="suffix"),
+        ),
+        Cell(
+            why="all_layer n=20 T=8 fresh pad: rows 0, 19 at slot -1",
+            spec=_cell_spec("all_layer", 20, 8, start="fresh", pad=(0, 19), output="prefix"),
+        ),
     )
 
     note = """
     Call sites. The engine's GDN mixer (`modules/mamba/gdn_mixer.py`) is the
     reference caller: the target-verify step of a generation-only batch, and the
     decode rows of a mixed context + verify batch -- `N = num_decodes`, `T =
-    runtime_draft_len + 1` (2..4 here). A plain decode step never reaches it. q/k/v
+    runtime_draft_len + 1` (2..8 here: max_draft_len 1..7). A plain decode step never reaches it. q/k/v
     are the `[N, T, 16|48, 128]` views of the post-conv `[N*T, 10240]` rows, plus
     `packed_qkv` = those rows for a generation-only batch (a mixed batch passes the
     views alone and the op copies them contiguous); `g=a`, `beta=b` are the raw
@@ -241,7 +298,14 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     Bit for bit the same call: the in-kernel commit and the partitioned call plus
     the all-layer commit; `packed_qkv` and the separate q/k/v (whose contents are
     never read when `packed_qkv` is given); `launch_with_pdl` on and off; a second
-    run; CUDA-graph replay on new data.
+    run; CUDA-graph replay on new data (the test captures every T = 2..8 at N = 1, 8, 15, 16
+    and 32).
+
+    T = 5..8 share one compiled token tile (`BT = next_pow2(T) = 8`). At
+    T = 8 and history 16 a slot whose every draft is accepted appends rows 8..15 at
+    `pnat + T == 16` without wrapping and wraps on the next step, so it commits every second
+    step; the `accept="full"` cells drive that boundary (in-kernel and all-layer commit), the
+    `accept="one"` cell the slowest fill.
 
     Loud refusals: work items without `use_all_layer_commit` (ValueError) and the
     reverse (ValueError); one of `replay_work_items` / `n_writes` alone
@@ -262,7 +326,8 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
     False`; a bf16 `ssm_states` (a different launch mapping); HV/H other than 3, K
-    or V other than 128; T outside 2..4; `history_size` other than 16; `old_u` /
+    or V other than 128; T outside 2..8 (T = 9 raises: the kernel's bare `assert T <= 8`);
+    `history_size` other than 16; `old_u` /
     `old_k` other than bf16, `old_G` other than fp32; a `scale`; any launch-knob
     override (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`); an output
     dtype other than bf16; int64 `state_indices`; N above 32.

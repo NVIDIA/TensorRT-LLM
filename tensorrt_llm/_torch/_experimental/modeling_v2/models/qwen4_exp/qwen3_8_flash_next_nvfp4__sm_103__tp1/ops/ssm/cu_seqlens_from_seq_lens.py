@@ -22,7 +22,7 @@ _INTEGER_DTYPES = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int6
 
 #: Batch shapes this checkpoint's serving path produces. ``p`` is the trunk's
 #: query rows per generation request: 1 unspeculated, ``1 + runtime_draft_len``
-#: under MTP (2 at this checkpoint's one MTP layer).
+#: under MTP (2..8: `max_draft_len` 1..7).
 BATCHES = {
     "single_prefill": (4096,),
     "decode_p1": (1,) * 32,
@@ -74,6 +74,18 @@ class CuSeqlensFromSeqLens(OpWrapper):
                     out_dtype=torch.int64,
                     layout="prefix",
                 ),
+            ),
+            *(
+                Cell(
+                    why=f"MTP verify p={p}, {requests} requests: prefix int32->int64",
+                    spec=dict(
+                        lengths=(p,) * requests,
+                        in_dtype=torch.int32,
+                        out_dtype=torch.int64,
+                        layout="prefix",
+                    ),
+                )
+                for p, requests in ((5, 8), (6, 32), (7, 8), (8, 32))
             ),
             Cell(
                 why="non-contiguous [::2] seq_lens view",

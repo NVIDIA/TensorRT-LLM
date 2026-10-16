@@ -120,6 +120,17 @@ class DilatedShortConvPaged(OpWrapper):
                 x_form="token_major",
                 qsl_dtype=torch.int64,
             ),
+            *(
+                _ckpt(
+                    f"MTP verify p={p} at 461 slots: {n} rows of {p} tokens",
+                    (p,) * n,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_scattered(n),
+                    x_form="token_major",
+                    qsl_dtype=torch.int64,
+                )
+                for p, n in ((5, 8), (6, 32), (7, 8), (8, 1), (8, 32))
+            ),
         )
         + tuple(
             Cell(
@@ -212,7 +223,9 @@ class DilatedShortConvPaged(OpWrapper):
     dilation 3 (state 9), SiLU on, the whole `[slots, 10240, 9]` pool, int32
     slots, `query_start_loc_long` (int64, rebuilt from `seq_lens` under MTP),
     carry flags covering the whole batch, `pad_slot_id` -1. Certified at 8, 32
-    and 461 slots; at 461 bitwise identical to 8 for the same slot content.
+    and 461 slots; at 461 bitwise identical to 8 for the same slot content. MTP
+    verify batches are certified at 3 and at 5..8 tokens per request, up to 32
+    requests.
 
     Preconditions: `query_start_loc[-1] == x.shape[1]`; a short one indexes
     past the internal history and fires a device-side assert that kills the

@@ -33,6 +33,13 @@ _VISION_SHAPE = (27, 1152, 16, 2, 2560, 2304, (), "gelu_pytorch_tanh")
 # `moe_config.backend` requests the target implements (`_TRUNK_MOE_BACKENDS` in modeling.py).
 _MOE_BACKENDS = ("AUTO", "TRTLLM", "CUTEDSL")
 
+# The longest MTP draft the target runs (`_MAX_VERIFY_WIDTH - 1` in modeling.py); the legacy
+# per-step recurrent states (`_MAX_LEGACY_VERIFY_WIDTH - 1`) and the CUTEDSL experts
+# (`_CUTEDSL_MAX_DRAFT_LEN`) are certified at shorter ones.
+_MAX_DRAFT_LEN = 7
+_MAX_LEGACY_DRAFT_LEN = 3
+_MAX_CUTEDSL_DRAFT_LEN = 3
+
 
 def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> None:
     """Decline what the target's constructor or first forward would refuse.
@@ -63,15 +70,25 @@ def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> 
             f"moe_config.backend={engine.moe_backend!r}; the target runs the trunk's routed "
             f"experts on {', '.join(_MOE_BACKENDS)}"
         )
-    if (
-        spec_config is not None
-        and engine.gdn_replay
-        and engine.mamba_ssm_cache_dtype != torch.float32
-    ):
+    if spec_config is None:
+        return
+    if engine.gdn_replay and engine.mamba_ssm_cache_dtype != torch.float32:
         raise NoTarget(
             f"MTP with a {engine.mamba_ssm_cache_dtype} recurrent-state cache: the engine "
             "verifies with GDN cached replay, which the target runs on an fp32 cache. Set "
             "kv_cache_config.mamba_ssm_cache_dtype to float32 or export TRTLLM_USE_GDN_REPLAY=0"
+        )
+    draft = spec_config.max_draft_len
+    if not engine.gdn_replay and draft > _MAX_LEGACY_DRAFT_LEN:
+        raise NoTarget(
+            f"max_draft_len={draft} with TRTLLM_USE_GDN_REPLAY=0: the legacy per-step recurrent "
+            f"states are certified at max_draft_len up to {_MAX_LEGACY_DRAFT_LEN}; leave "
+            "TRTLLM_USE_GDN_REPLAY unset for a longer draft"
+        )
+    if str(engine.moe_backend).upper() == "CUTEDSL" and draft > _MAX_CUTEDSL_DRAFT_LEN:
+        raise NoTarget(
+            f"max_draft_len={draft} with moe_config.backend=CUTEDSL: the CuteDSL expert "
+            f"pipeline is certified at max_draft_len up to {_MAX_CUTEDSL_DRAFT_LEN}"
         )
 
 
@@ -117,17 +134,16 @@ def route(
     )
 
     # The target implements the one-model MTP-Eagle loop over the checkpoint's
-    # single MTP module, and no other draft path. A draft longer than three
-    # needs predicted_tokens_per_seq past the 1..4 thop_attention certifies,
-    # which the target asserts; declining here falls back instead of crashing.
-    # The draft must also be a linear chain over that one module; the target
-    # asserts each of these at construction, so declining here is what lets
-    # ``auto`` fall back instead of crashing.
+    # single MTP module, and no other draft path. A draft longer than seven needs
+    # more verify rows per request than the GDN cached replay and thop_attention
+    # are certified at. The draft must also be a linear chain over that one
+    # module; the target asserts each of these at construction, so declining here
+    # is what lets ``auto`` fall back instead of crashing.
     mtp_eagle_or_none = spec_config is None or (
         isinstance(spec_config, MTPDecodingConfig)
         and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         and getattr(spec_config, "num_nextn_predict_layers", None) in (None, 1)
-        and 1 <= spec_config.max_draft_len <= 3
+        and 1 <= spec_config.max_draft_len <= _MAX_DRAFT_LEN
         and not getattr(spec_config, "use_dynamic_tree", False)
         and getattr(spec_config, "eagle_choices", None) is None
         and spec_config.max_total_draft_tokens == spec_config.max_draft_len
@@ -158,5 +174,5 @@ def route(
         f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}"
         f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}; "
         "the one qwen4_exp target is Qwen3.8-Flash-Next-NVFP4 on sm103, tp1, with "
-        "one-model MTP-Eagle (max_draft_len 1..3) or no speculative decoding"
+        f"one-model MTP-Eagle (max_draft_len 1..{_MAX_DRAFT_LEN}) or no speculative decoding"
     )

@@ -9,7 +9,8 @@ this checkpoint's GDN geometry, with the cache manager's bookkeeping run in betw
 legacy per-step state promotion, or the cached replay's all-layer commit (partitioned
 batches only) and `_advance_replay_state`.
 
-Three things are checked at every step, with a random partial acceptance:
+Three things are checked at every step, with a random partial acceptance (or, in the
+full-acceptance cases, every draft accepted):
 
 * the replay mode's output against the legacy mode's on identical inputs and identical
   accepted histories: the two modes compute one recurrence with different kernels and
@@ -239,11 +240,28 @@ def _state(gen, cpu, n, t, gating=None):
 
 
 @pytest.mark.parametrize(
-    "n,t",
-    [(1, 2), (8, 4), (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 4), (20, 2), (18, 3)],
+    "n,t,accept",
+    [
+        (1, 2, "random"),
+        (8, 4, "random"),
+        (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 4, "random"),
+        (20, 2, "random"),
+        (18, 3, "random"),
+        # max_draft_len 5..7: T = 6..8, the replay kernel's ceiling.
+        (1, 8, "random"),
+        (8, 8, "random"),
+        (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 8, "random"),
+        (32, 8, "random"),
+        (20, 6, "random"),
+        # Every draft accepted: from a fresh slot at T = 8 the second step appends exactly up
+        # to the history's end (`pnat + T == 16`) and every second step after it wraps --
+        # in-kernel below the partition threshold, through the all-layer commit at and above it.
+        (4, 8, "full"),
+        (24, 8, "full"),
+    ],
     ids=lambda v: str(v),
 )
-def test_replay_verify_tracks_legacy_in_both_targets(n, t):
+def test_replay_verify_tracks_legacy_in_both_targets(n, t, accept):
     gen = torch.Generator(device=DEV).manual_seed(1000 * n + t)
     cpu = torch.Generator().manual_seed(1000 * n + t)
     slots, weights, gating, conv0, ssm0 = _state(gen, cpu, n, t)
@@ -253,9 +271,11 @@ def test_replay_verify_tracks_legacy_in_both_targets(n, t):
     decode = _Mode(True, t, conv0, ssm0, weights, gating, n)
     partitioned = n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
-    wraps = 0
+    wraps = to_the_end = 0
     for step in range(_steps(t)):
-        wraps += int((prefill.pnat[slots.long()] + t > HIST).sum())
+        pending = prefill.pnat[slots.long()]
+        wraps += int((pending + t > HIST).sum())
+        to_the_end += int((pending + t == HIST).sum())
         replays = {id(mode): mode.work(slots, n, t) for mode in (prefill, decode)}
         for layer in range(LAYERS):
             mq, a, b = _rows(gen, n * t)
@@ -274,7 +294,10 @@ def test_replay_verify_tracks_legacy_in_both_targets(n, t):
                 f"step {step} layer {layer}: the prefill and decode targets' replay calls disagree"
             )
             _gate(got_d, want, f"step {step} layer {layer}")
-        accepted = torch.randint(1, t + 1, (n,), generator=cpu, dtype=torch.int32).to(DEV)
+        if accept == "full":
+            accepted = torch.full((n,), t, dtype=torch.int32, device=DEV)
+        else:
+            accepted = torch.randint(1, t + 1, (n,), generator=cpu, dtype=torch.int32).to(DEV)
         for layer in range(LAYERS):
             for mode in (legacy, prefill, decode):
                 _promote(mode.conv[layer], mode.int_conv[layer], slots, accepted)
@@ -287,6 +310,11 @@ def test_replay_verify_tracks_legacy_in_both_targets(n, t):
             assert torch.equal(prefill.conv[layer], legacy.conv[layer])
             assert torch.equal(decode.conv[layer], legacy.conv[layer])
     assert wraps > 0, "the steps never filled a history, so the checkpoint never advanced"
+    if accept == "full":
+        assert wraps >= 3 * n and to_the_end >= 3 * n, (
+            f"full acceptance at T={t} should wrap every row at least 3 times and append up to "
+            f"the history's end as often ({wraps}, {to_the_end})"
+        )
 
 
 def test_a_wrong_partition_drifts_off_legacy():

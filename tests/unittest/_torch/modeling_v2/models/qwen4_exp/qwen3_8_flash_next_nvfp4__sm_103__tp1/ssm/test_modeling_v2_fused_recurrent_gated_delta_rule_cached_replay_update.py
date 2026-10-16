@@ -299,7 +299,7 @@ class _Bench:
             use_qk_l2norm_in_kernel=True,
             A_log=self.a_log[layer],
             dt_bias=self.dt_bias[layer],
-            launch_with_pdl=self.spec.get("pdl", True),
+            launch_with_pdl=self.spec.get("pdl", False),
             replay_work_items=self.work_items,
             n_writes=self.n_writes,
             packed_qkv=act["packed"],
@@ -355,9 +355,15 @@ class _Bench:
             )
 
     def draw_acceptance(self):
-        return torch.randint(
-            1, self.t + 1, (self.live.numel(),), generator=self.cpu, dtype=torch.int32
-        ).to(DEV)
+        """Accepted tokens per live row, bonus token included, by `spec["accept"]`."""
+        mode = self.spec.get("accept", "random")
+        rows = self.live.numel()
+        if mode == "full":
+            return torch.full((rows,), self.t, dtype=torch.int32, device=DEV)
+        if mode == "one":
+            return torch.ones(rows, dtype=torch.int32, device=DEV)
+        assert mode == "random", mode
+        return torch.randint(1, self.t + 1, (rows,), generator=self.cpu, dtype=torch.int32).to(DEV)
 
     def accept(self, accepted):
         _advance_replay_state(self.meta, self.live, accepted)
@@ -365,8 +371,9 @@ class _Bench:
             self.x_pnat[self.live.long()] += accepted
 
     def writes(self):
-        """Where this step's calls append, by the documented rule, and which
-        slots wrap: `[slots, 2, HIST]` mask, wrapping slot ids."""
+        """Where this step's calls append, by the documented rule, which slots wrap, and how
+        many append exactly up to the history's end: `[slots, 2, HIST]` mask, wrapping slot
+        ids, the `pnat + t == HIST` count."""
         s = self.live.long()
         p, b = self.pnat[s].long(), self.buf[s].long()
         wrap = p + self.t > HIST
@@ -374,7 +381,7 @@ class _Bench:
         mask = torch.zeros(self.slots, 2, HIST, dtype=torch.bool, device=DEV)
         for t in range(self.t):
             mask[s, half, start + t] = True
-        return mask, s[wrap]
+        return mask, s[wrap], int((p + self.t == HIST).sum())
 
 
 def _deviation(got, want):
@@ -435,10 +442,11 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         return _check_duplicate_padding_slot(cell)
     bench = _Bench(cell.spec, seed=_seed(cell.why))
     pad = list(cell.spec.get("pad", ()))
-    wraps = appends = 0
+    wraps = appends = to_the_end = 0
     for _ in range(bench.steps):
-        mask, wrapped = bench.writes()
+        mask, wrapped, at_end = bench.writes()
         wraps += wrapped.numel()
+        to_the_end += at_end
         appends += bench.live.numel() - wrapped.numel()
         bench.prepare()
         after_commit = []
@@ -498,16 +506,24 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert wraps > 0 and appends > 0, (
         f"the cell never wrapped or never appended ({wraps}, {appends})"
     )
+    if cell.spec.get("accept") == "full":
+        live = bench.live.numel()
+        assert wraps >= 3 * live and to_the_end >= 3 * live, (
+            f"full acceptance should wrap every row at least 3 times and append up to the "
+            f"history's end as often ({wraps}, {to_the_end} over {live} rows)"
+        )
 
 
 # ── CUDA graphs ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("n, t", ((1, 2), (8, 4), (15, 3), (16, 4), (32, 2)))
+@pytest.mark.parametrize("t", range(2, 9))
+@pytest.mark.parametrize("n", (1, 8, 15, 16, 32))
 def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, t) -> None:
-    """Two layers captured with, from 16 sequences on, the all-layer commit after
-    them; replayed three times on new activations, with acceptance in between,
-    against the same steps run eagerly on a twin state."""
+    """Every T 2..8 (MTP draft lengths 1..7) at the batches either side of the partition
+    threshold and at 1, 8 and 32: two layers captured with, from 16 sequences on, the
+    all-layer commit after them; replayed three times on new activations, with
+    acceptance in between, against the same steps run eagerly on a twin state."""
     assert ALL_LAYER_COMMIT_MIN_BATCH == CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     path = "all_layer" if n >= ALL_LAYER_COMMIT_MIN_BATCH else "small"
     spec = dict(path=path, n=n, t=t, layers=2, slots=40)
@@ -581,10 +597,11 @@ def _drive(bench, fault):
     return None
 
 
+@pytest.mark.parametrize("t", (4, 8))
 @pytest.mark.parametrize(
     "fault", ("none", "commit skipped", "committed twice", "rejected tokens kept")
 )
-def test_the_twin_sees_a_broken_protocol(fault) -> None:
+def test_the_twin_sees_a_broken_protocol(fault, t) -> None:
     """The twin comparison is what certifies the commit and the bookkeeping, so
     it has to fail when either is broken: the partitioned path with the
     manager's commit left out; a 16-row batch called without work items while
@@ -593,12 +610,12 @@ def test_the_twin_sees_a_broken_protocol(fault) -> None:
     the same run passes."""
     path = "small" if fault == "rejected tokens kept" else "all_layer"
     n = 8 if path == "small" else 16
-    bench = _Bench(dict(path=path, n=n, t=4, steps=4), seed=93)
+    bench = _Bench(dict(path=path, n=n, t=t, steps=4), seed=93)
     first = _drive(bench, fault)
     if fault == "none":
         assert first is None
     else:
-        assert first is not None, f"{fault} passed the twin comparison"
+        assert first is not None, f"{fault} passed the twin comparison at T={t}"
 
 
 def test_the_gate_rejects_near_misses() -> None:
@@ -616,7 +633,7 @@ def test_the_gate_rejects_near_misses() -> None:
     p, b = kw["prev_num_accepted_tokens"], kw["cache_buf_idx"]
 
     not_restarted = ref[4].clone()
-    _, wrapped = bench.writes()
+    _, wrapped, _ = bench.writes()
     for s in wrapped.tolist():
         g_start = G[s, b[s].long(), :, p[s].long() - 1]
         not_restarted[s, 1 - b[s].long(), :, : bench.t] += g_start[:, None]
@@ -707,7 +724,7 @@ def test_packed_qkv_supersedes_q_k_v_and_launch_knobs_are_neutral() -> None:
             k=torch.zeros_like(k.contiguous()),
             v=torch.zeros_like(v.contiguous()),
         ),
-        "launch_with_pdl=False": run(launch_with_pdl=False),
+        "launch_with_pdl=True": run(launch_with_pdl=True),
         "second run": run(),
     }
     for name, (out, state) in variants.items():
@@ -837,3 +854,9 @@ def test_op_refuses_what_it_refuses() -> None:
     with pytest.raises(CompilationError, match="K >= 16"):
         with validating(op):
             op(**shallow(8))
+    # Nine rows per sequence (max_draft_len 8) is past the kernel's `T <= 8`, a bare assert
+    # before the launch.
+    wide = _Bench(dict(path="small", n=2, t=9, layers=1), seed=106, exact=False)
+    with pytest.raises(AssertionError):
+        with validating(op):
+            op(**wide.kwargs(0, wide.inputs()))

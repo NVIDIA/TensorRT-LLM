@@ -28,18 +28,30 @@ from _validating import certifying, validating  # noqa: E402,F401
 assert torch.cuda.is_available(), "qsa_prefill_compress requires a CUDA device"
 
 
-def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
-    """Bitwise over the whole cache.
+def _compare(out: torch.Tensor, ref: torch.Tensor, flips: int = 0) -> None:
+    """Bitwise over the whole cache, except for `flips` elements one bf16 step off.
 
-    Measured on sm_103: the kernel matches this fp32 reference on every
-    element of every cell, so there is no tolerance to derive. It has to
-    be bitwise -- a pool accumulated in bf16 instead of fp32 lands only
-    0.03125 away, inside any bf16 band. Comparing every slot, not just the
-    anchors, is the untouched-slot lock.
+    Measured on sm_103: the kernel matches this fp32 reference on every element of every
+    cell but one, so there is no tolerance to derive. It has to be bitwise -- a pool
+    accumulated in bf16 instead of fp32 lands only 0.03125 away, inside any bf16 band.
+    Comparing every slot, not just the anchors, is the untouched-slot lock.
+
+    The exception is the cell of 32 MTP7 verify blocks (64 anchors, `rounding_flips`): the
+    kernel takes `tl.rsqrt`, the hardware approximation, where the reference takes torch's,
+    and the two differ by an fp32 ulp, which moves the bf16 rounding of an element whose fp32
+    value sits on a rounding boundary. One element of its 8192 anchor elements is one bf16
+    step off.
     """
     assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
-    torch.testing.assert_close(out.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
+    if flips == 0:
+        torch.testing.assert_close(out.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
+        return
+    distance = (out.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
+    assert int(distance.max()) <= 1 and int((distance != 0).sum()) <= flips, (
+        f"{int((distance != 0).sum())} elements differ, by up to {int(distance.max())} bf16 "
+        f"steps; at most {flips} may differ by one"
+    )
 
 
 DEV = "cuda"
@@ -140,7 +152,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     ref = op.reference(**args)
     out = op(**args)
     assert out is args["index_cache"]
-    _compare(out, ref)
+    _compare(out, ref, cell.spec.get("rounding_flips", 0))
     changed = (out.view(torch.int16) != before.view(torch.int16)).any(-1).sum()
     assert int(changed) == _anchors(args), "exactly the anchor slots are written"
     if "neighbour" in extras:
@@ -172,9 +184,15 @@ def test_a_second_call_over_the_same_rows_is_not_idempotent() -> None:
     assert int(changed) == _anchors(args)
 
 
-def test_cuda_graph_capture_and_replay() -> None:
+#: The cell of 32 MTP7 verify blocks (256 rows, two anchors each): the segments, pool and table.
+_MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 requests"))
+_MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots", "rounding_flips")}
+
+
+@pytest.mark.parametrize("batch", ({}, _MTP7_BATCH), ids=("prefill", "mtp7-32x8"))
+def test_cuda_graph_capture_and_replay(batch) -> None:
     """The launch grid is fixed by the row count, so it captures and replays."""
-    args = _scene(seed=16)
+    args = _scene(seed=16, **batch)
     cache = args["index_cache"]
     before = cache.clone()
     ref = op.reference(**args)
@@ -194,7 +212,7 @@ def test_cuda_graph_capture_and_replay() -> None:
         cache.copy_(before)
         graph.replay()
         torch.cuda.synchronize()
-        _compare(cache, ref)
+        _compare(cache, ref, batch.get("rounding_flips", 0))
 
 
 def test_stream_ordering_needs_no_explicit_synchronization() -> None:

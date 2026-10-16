@@ -130,6 +130,26 @@ class QsaMtpReuseTopk(OpWrapper):
             why="32 requests, every one 3 positions past its capture",
             spec=_spec(("mixed", 32), drafted=(3,)),
         ),
+        Cell(
+            why="32 requests, every one 4 positions past its capture",
+            spec=_spec(("mixed", 32), drafted=(4,)),
+        ),
+        Cell(
+            why="32 requests, every one 5 positions past its capture",
+            spec=_spec(("mixed", 32), drafted=(5,)),
+        ),
+        Cell(
+            why="32 requests, every one 6 positions past its capture (max_draft_len 7)",
+            spec=_spec(("mixed", 32), drafted=(6,)),
+        ),
+        Cell(
+            why="8 requests at fresh 2: full, 511-id and short rows gain two groups",
+            spec=_spec(
+                ("explicit", (2050, 402, 2046, 8186, 6, 2047, 1022, 2049)),
+                drafted=(5, 6, 5, 6, 6, 4, 5, 6),
+                shared_rows=8,
+            ),
+        ),
         # ---- captured-row fill ---------------------------------------------
         Cell(
             why="32 short contexts: every captured row below 512 ids",
@@ -138,6 +158,14 @@ class QsaMtpReuseTopk(OpWrapper):
         Cell(
             why="32 contexts past 2048 tokens: every captured row full",
             spec=_spec(("full", 32)),
+        ),
+        Cell(
+            why="32 short contexts, 4..6 positions past the capture: fresh up to 2",
+            spec=_spec(("short", 32), drafted=(4, 5, 6)),
+        ),
+        Cell(
+            why="32 full rows, 4..6 positions past the capture: up to 2 oldest ids displaced",
+            spec=_spec(("full", 32), drafted=(4, 5, 6)),
         ),
         # ---- addressing: the request map and the slot -----------------------
         Cell(
@@ -170,6 +198,10 @@ class QsaMtpReuseTopk(OpWrapper):
         Cell(
             why="CUDA graph: captured at 1, 8 and 32 requests, new-data replay",
             spec=_spec(("mixed", 64), graph_batches=(1, 8, 32)),
+        ),
+        Cell(
+            why="CUDA graph, drafted 1..6: captured at 1, 8 and 32 requests, new-data replay",
+            spec=_spec(("mixed", 32), drafted=(1, 2, 3, 4, 5, 6), graph_batches=(1, 8, 32)),
         ),
         # ---- dtypes, layouts, geometry --------------------------------------
         Cell(
@@ -204,9 +236,12 @@ class QsaMtpReuseTopk(OpWrapper):
     It runs in the MTP draft loop's decode steps after the first: no context
     rows, one row per request, so rows = requests, and the request map is the
     row index. Draft step `i` sits `i` positions past the captured row, so
-    `max_draft_len` 1 never reaches this op and 3 reaches 1 and 2 positions.
-    With compress_ratio 4 and at most three positions `fresh` is 0 or 1; the gap
-    cell covers wider gaps.
+    `max_draft_len` 1 never reaches this op, 3 reaches 1 and 2 positions, and 7
+    (the target's ceiling) reaches 1..6. With compress_ratio 4, `fresh =
+    ((p + 1) % 4 + i) // 4` for a capture at position `p`: 0 or 1 up to i = 3
+    and 0, 1 or 2 from i = 4; the gap cell covers wider gaps. In a full row
+    the fresh ids displace the row's oldest ids (one at fresh 1, two at fresh
+    2), and a 511-id row at fresh 2 loses its oldest id.
 
     Preconditions that are values, so not `is_valid` guards:
       - each captured row is prefix-packed (every valid id before every -1), as

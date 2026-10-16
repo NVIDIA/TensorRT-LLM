@@ -80,7 +80,7 @@ def _build(spec, seed):
     rows = spec.get("snapshots", 0)
     window = rows_idx = None
     if rows:
-        steps = 1 if x_form == "2d" else seqlen
+        steps = spec.get("snapshot_steps", 1 if x_form == "2d" else seqlen)
         window = torch.zeros(rows, steps, dim, width - 1, dtype=dtype, device="cuda")
         rows_idx = torch.arange(batch, dtype=torch.int32, device="cuda")
     return [

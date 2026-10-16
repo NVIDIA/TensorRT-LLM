@@ -132,10 +132,12 @@ def test_accumulation_happens_in_the_requested_dtype() -> None:
     assert op(seq_lens, torch.int32).tolist() == [0, 2_000_000_000, -294_967_296]
 
 
-def test_cuda_graph_capture_and_replay() -> None:
+@pytest.mark.parametrize("batch, p", ((8, 2), (32, 8)))
+def test_cuda_graph_capture_and_replay(batch, p) -> None:
     """A captured graph follows lengths rewritten in place: only the shape
-    reaches Python, the values are read on device and never synchronized on."""
-    static_lens = _seq_lens([2] * 8)
+    reaches Python, the values are read on device and never synchronized on. Eight
+    requests of 2 rows, and 32 of 8 (the MTP-7 verify's 256 rows)."""
+    static_lens = _seq_lens([p] * batch)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -147,7 +149,7 @@ def test_cuda_graph_capture_and_replay() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         static_out = op(static_lens, torch.int32)
-    for lengths in ([1] * 8, [2] * 8, [3, 1, 2, 1, 1, 1, 1, 1]):
+    for lengths in ([1] * batch, [p] * batch, [p + 1] + [1] * (batch - 1)):
         static_lens.copy_(_seq_lens(lengths))
         graph.replay()
         torch.cuda.synchronize()

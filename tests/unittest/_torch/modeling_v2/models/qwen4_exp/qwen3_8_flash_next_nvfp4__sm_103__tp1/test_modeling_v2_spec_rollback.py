@@ -240,6 +240,10 @@ CASES = {
     "decode_p2": ((), (0, 31, 64), 2, (1, 2, 1)),
     "mixed": ((7, 3), (12, 29, 95), 4, (2, 1, 3)),
     "mixed_p3": ((40,), (2, 62), 3, (3, 1)),
+    # max_draft_len 7: every acceptance 1..8 once; blocks at 27, 60 and 90 straddle a page,
+    # and an 8-row block completes two compression groups.
+    "decode_p8": ((), (0, 27, 60, 90, 101, 5, 44, 119), 8, (1, 2, 3, 4, 5, 6, 7, 8)),
+    "mixed_p8": ((7, 3), (12, 29, 95), 8, (8, 1, 5)),
 }
 
 
@@ -352,13 +356,27 @@ def _single(b, s):
     return one
 
 
-def test_capture_and_replay_follow_the_accepted_counts():
+#: Per case, the acceptance counts one captured graph is replayed with (the accepted count
+#: of every generation request, bonus token included).
+_REPLAYS = {
+    "decode": [(1, 1, 1, 1), (2, 4, 1, 3), (4, 3, 2, 1), (3, 3, 3, 3)],
+    "decode_p8": [
+        (1,) * 8,
+        (8, 7, 6, 5, 4, 3, 2, 1),
+        (2, 8, 1, 7, 3, 6, 4, 5),
+        (8,) * 8,
+    ],
+}
+
+
+@pytest.mark.parametrize("case", sorted(_REPLAYS))
+def test_capture_and_replay_follow_the_accepted_counts(case):
     """The whole staged step and commit captured once, replayed with the
     accepted counts and the pre-step state rewritten in place."""
-    ctx_lens, gen_starts, p, _ = CASES["decode"]
+    ctx_lens, gen_starts, p, _ = CASES[case]
     b = _Batch(18, ctx_lens, gen_starts, p, _slots(len(gen_starts)))
     rollback = SpeculativeRollback()
-    b.set_accepted((4, 4, 4, 4))
+    b.set_accepted((p,) * len(gen_starts))
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -370,7 +388,7 @@ def test_capture_and_replay_follow_the_accepted_counts():
     with torch.cuda.graph(graph):
         _verify_step(b, rollback)
 
-    for accepted in [(1, 1, 1, 1), (2, 4, 1, 3), (4, 3, 2, 1), (3, 3, 3, 3)]:
+    for accepted in _REPLAYS[case]:
         b.reset()
         b.set_accepted(accepted)
         graph.replay()

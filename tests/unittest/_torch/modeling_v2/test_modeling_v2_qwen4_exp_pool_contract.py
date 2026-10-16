@@ -92,10 +92,13 @@ def test_valid_pools_pass() -> None:
     M.check_legacy_state(
         G, _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32), _ssm()
     )
-    M.check_replay_state(
-        HISTORY, 3, _t(SLOTS, dtype=torch.int32), _t(SLOTS, dtype=torch.int32), _ssm()
-    )
+    for width in (2, 5, M._MAX_VERIFY_WIDTH):
+        M.check_replay_state(
+            HISTORY, width, _t(SLOTS, dtype=torch.int32), _t(SLOTS, dtype=torch.int32), _ssm()
+        )
     M.check_replay_history(G, 3, HISTORY, SLOTS, *_history())
+    for rows in range(1, M._MAX_VERIFY_WIDTH + 1):
+        M.check_verify_width(rows)
     M.check_shared_selection(_t(2, 8, 512, dtype=torch.int32), {3: 1}, 3, 512)
 
 
@@ -202,7 +205,7 @@ def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
         M.check_replay_state(HISTORY, 3, pnat, buf, _ssm().to(torch.bfloat16))
     with pytest.raises(AssertionError, match="replay_history_size"):
         M.check_replay_state(12, 3, pnat, buf, _ssm())
-    for width in (1, 5):
+    for width in (1, M._MAX_VERIFY_WIDTH + 1):
         with pytest.raises(AssertionError, match="replay_step_width"):
             M.check_replay_state(HISTORY, width, pnat, buf, _ssm())
     # The bookkeeping is one int32 per pool slot, so it must cover the whole pool.
@@ -210,6 +213,21 @@ def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
         M.check_replay_state(HISTORY, 3, _t(SLOTS - 1, dtype=torch.int32), buf, _ssm())
     with pytest.raises(AssertionError, match="cache_buf_idx"):
         M.check_replay_state(HISTORY, 3, pnat, buf.to(torch.int64), _ssm())
+
+
+def test_legacy_state_rejects_more_than_the_certified_rows_per_request() -> None:
+    def int_ssm(steps):
+        return _t(SLOTS, steps, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
+
+    M.check_legacy_state(G, int_ssm(M._MAX_LEGACY_VERIFY_WIDTH), _ssm())
+    with pytest.raises(AssertionError, match="TRTLLM_USE_GDN_REPLAY"):
+        M.check_legacy_state(G, int_ssm(M._MAX_LEGACY_VERIFY_WIDTH + 1), _ssm())
+
+
+def test_verify_width_admits_one_to_eight_rows_per_request() -> None:
+    for rows in (0, M._MAX_VERIFY_WIDTH + 1):
+        with pytest.raises(AssertionError, match="predicted_tokens_per_seq"):
+            M.check_verify_width(rows)
 
 
 def test_replay_width_admits_only_the_managers_step_width() -> None:
@@ -262,3 +280,10 @@ def test_shared_selection_rejects_missing_row_and_width() -> None:
 def test_routing_admits_exactly_the_moe_backends_the_target_implements() -> None:
     """`route` declines a backend request the constructor would assert on."""
     assert set(routing._MOE_BACKENDS) == set(M._TRUNK_MOE_BACKENDS)
+
+
+def test_routing_admits_exactly_the_draft_lengths_the_target_implements() -> None:
+    """`route` declines a draft length the constructor or the first bind would assert on."""
+    assert routing._MAX_DRAFT_LEN == M._MAX_VERIFY_WIDTH - 1
+    assert routing._MAX_LEGACY_DRAFT_LEN == M._MAX_LEGACY_VERIFY_WIDTH - 1
+    assert routing._MAX_CUTEDSL_DRAFT_LEN == M._CUTEDSL_MAX_DRAFT_LEN

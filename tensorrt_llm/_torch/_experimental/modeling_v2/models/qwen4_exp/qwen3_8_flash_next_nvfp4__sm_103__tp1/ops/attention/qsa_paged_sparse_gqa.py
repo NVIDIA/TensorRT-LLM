@@ -121,6 +121,18 @@ class QsaPagedSparseGqa(OpWrapper):
             spec=_decode(tuple((100 + (499 * g) % 8000, 2) for g in range(32))),
         ),
         Cell(
+            why="decode MTP7: 1 request x 8 rows, 32-way split-K",
+            spec=_decode(((4000, 8),)),
+        ),
+        Cell(
+            why="decode MTP7: 8 requests x 8 rows, 8-way split-K",
+            spec=_decode(tuple((4000 + 37 * i, 8) for i in range(8))),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
+        ),
+        Cell(
             why="300 rows, no prefill pair: split-K, one split, no merge",
             spec=_decode(((600, 1),) * 300, launches=("splitk",), slots=384),
         ),
@@ -202,6 +214,10 @@ class QsaPagedSparseGqa(OpWrapper):
         ),
         Cell(why="fp8 mixed 257 rows: 1 chunk + 31 MTP decodes", spec=_mixed(32, (195,), **_FP8)),
         Cell(
+            why="fp8 decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32)), **_FP8),
+        ),
+        Cell(
             why="int64 request indices", spec=_decode(((1000, 2),) * 4, request_dtype=torch.int64)
         ),
         Cell(
@@ -245,6 +261,10 @@ class QsaPagedSparseGqa(OpWrapper):
     PDL: `TRTLLM_ENABLE_PDL` (default on) enables programmatic dependent
     launch for multi-split launches of 4 rows or fewer; both launch modes are
     inside the cells. Calls are bitwise deterministic.
+
+    The decode site carries up to 8 rows per request (max_draft_len 7): the
+    cells run 1, 8 and 32 requests of 8 rows, which is 16, 128 and 512
+    `rows * Hkv` programs, so the 32-way, 8-way and 4-way split-K launches.
 
     Not certified: capture in a CUDA graph (the split-K path allocates its
     partials inside the call); head geometries other than 24/2 x 256;

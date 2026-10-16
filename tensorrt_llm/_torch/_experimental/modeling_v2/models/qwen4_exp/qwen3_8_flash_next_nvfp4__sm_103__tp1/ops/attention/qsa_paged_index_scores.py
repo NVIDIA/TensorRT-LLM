@@ -160,6 +160,45 @@ class QsaPagedIndexScores(OpWrapper):
             ),
         ),
         Cell(
+            why="decode MTP7: 1 request x 8 rows across a page edge, visible-only",
+            spec=_spec(
+                layout="decode",
+                gen_positions=(6012,),
+                rows_per_request=8,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+            ),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, visible-only",
+            spec=_spec(
+                layout="decode",
+                gen_positions=tuple(100 + (499 * g) % 8000 for g in range(32)),
+                rows_per_request=8,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+            ),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, -inf padded",
+            spec=_spec(
+                layout="decode",
+                gen_positions=tuple(100 + (499 * g) % 8000 for g in range(32)),
+                rows_per_request=8,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=False,
+                context_rows=False,
+                branch="row_wise",
+            ),
+        ),
+        Cell(
             why="capture: 8191 rows, one request from 0, visible-only",
             spec=_spec(
                 layout="capture",

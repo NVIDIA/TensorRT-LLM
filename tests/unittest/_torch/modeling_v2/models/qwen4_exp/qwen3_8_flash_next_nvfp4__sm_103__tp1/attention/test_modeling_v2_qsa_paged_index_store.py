@@ -247,9 +247,15 @@ def test_repeats_are_stream_ordered_and_idempotent() -> None:
         assert torch.equal(args["position_cache"], first[1])
 
 
-def test_cuda_graph_capture_and_replay() -> None:
+#: The cell of 32 MTP7 verify blocks (256 rows): the segments, pool and table it runs over.
+_MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 requests"))
+_MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
+
+
+@pytest.mark.parametrize("batch", ({}, _MTP7_BATCH), ids=("decode", "mtp7-32x8"))
+def test_cuda_graph_capture_and_replay(batch) -> None:
     """Captured once, replayed against new positions written into the same buffer."""
-    args = _small(seed=52)
+    args = _small(seed=52, **batch)
     positions = args["logical_positions"]
     replayed = positions.clone()
     positions.zero_()

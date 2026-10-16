@@ -360,6 +360,9 @@ _TRUNK_MOE_BACKENDS = {"AUTO": "TRTLLM", "TRTLLM": "TRTLLM", "CUTEDSL": "CUTEDSL
 # The CuteDSL grouped GEMMs' MMA tile M, which is also the tile `moe_sort` pads each
 # expert's rows to: the GEMMs walk the sort's tile tables. sm_103 admits 128 and 256.
 _CUTEDSL_TILE_SIZE = 128
+# The longest MTP draft the CuteDSL pipeline is certified at: its cells capture up to 128 rows
+# (32 requests of 4 verify rows).
+_CUTEDSL_MAX_DRAFT_LEN = 3
 
 # Skip sentinel the conv ops and paged short conv compare `cache_indices` against
 # (the runtime's mamba `PAD_SLOT_ID`). Never a substitution: the scheduler's slot
@@ -442,6 +445,19 @@ _MTP_MOE_USE_UE8M0 = False
 #: `replay_history_size`). The replay entry is certified at 16 only, and a manager that
 #: reports another depth is refused at bind.
 _GDN_REPLAY_HISTORY = 16
+
+#: The most query rows a verify step carries per generation request, `max_draft_len + 1`.
+#: It reaches `thop_attention` as `predicted_tokens_per_seq` and the cached replay as its step
+#: width `T`; the replay kernel asserts `T <= 8` and the engine falls back to the legacy
+#: per-step states above it.
+_MAX_VERIFY_WIDTH = 8
+
+#: The same bound on the legacy verify path (`TRTLLM_USE_GDN_REPLAY=0`): the entries only it
+#: calls (`pack_gdn_decode_qkv`, `fused_gdn_gating`, the multi-token
+#: `fused_recurrent_gated_delta_rule_update`) are certified at up to 4 rows per request, and its
+#: per-step recurrent buffer holds one state per verify row, request and layer (6.75 GiB at 8
+#: rows and 8 requests in fp32).
+_MAX_LEGACY_VERIFY_WIDTH = 4
 
 
 # ----------------------------------------------- KV cache manager binding ---
@@ -602,6 +618,12 @@ def check_legacy_state(g: _PoolGeometry, int_ssm, ssm) -> None:
     )
     ssm_shape = (g.num_v_heads, g.head_v_dim, g.head_k_dim)
     _check_pool(int_ssm, "per-step recurrent buffer", 2, ssm_shape, ssm.dtype)
+    assert int_ssm.shape[1] <= _MAX_LEGACY_VERIFY_WIDTH, (
+        f"the legacy verify path runs {int_ssm.shape[1]} rows per generation request; its entries "
+        f"are certified at up to {_MAX_LEGACY_VERIFY_WIDTH} (max_draft_len "
+        f"{_MAX_LEGACY_VERIFY_WIDTH - 1}). Leave TRTLLM_USE_GDN_REPLAY unset (cached replay) for "
+        "a longer draft"
+    )
 
 
 def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> None:
@@ -614,8 +636,9 @@ def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> Non
     assert history == _GDN_REPLAY_HISTORY, (
         f"replay_history_size {history}; the replay entry is certified at {_GDN_REPLAY_HISTORY}"
     )
-    assert 2 <= width <= 4, (
-        f"replay_step_width {width}; the replay entry is certified at 2..4 verify rows"
+    assert 2 <= width <= min(_MAX_VERIFY_WIDTH, history), (
+        f"replay_step_width {width}; the replay entry is certified at 2..{_MAX_VERIFY_WIDTH} "
+        f"verify rows and never above the history ({history})"
     )
     for name, t in (("prev_num_accepted_tokens", prev_accepted), ("cache_buf_idx", cache_buf_idx)):
         assert t.dim() == 1 and t.shape[0] >= ssm.shape[0] and t.dtype == torch.int32, (
@@ -641,6 +664,15 @@ def check_replay_history(
     _check_pool(old_dt, f"layer {layer}: old_dt", 2, (g.num_v_heads, history), fp32)
     assert old_x.shape[1] == old_B.shape[1] == old_dt.shape[1] == 2, (
         f"layer {layer}: the replay history is not double-buffered"
+    )
+
+
+def check_verify_width(rows: int) -> None:
+    """The rows per generation request one step carries: `max_draft_len + 1` (`runtime_draft_len
+    + 1` at run time), a `thop_attention` `predicted_tokens_per_seq` the entry is certified at."""
+    assert 1 <= rows <= _MAX_VERIFY_WIDTH, (
+        f"predicted_tokens_per_seq {rows} is outside the 1..{_MAX_VERIFY_WIDTH} range "
+        "attention/thop_attention is certified at"
     )
 
 
@@ -1187,14 +1219,18 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 f"the checkpoint; this target carries the weights of "
                 f"{_MTP_NUM_LAYERS} MTP module"
             )
-            # `max_draft_len` becomes `predicted_tokens_per_seq` on every attention
-            # call, certified at 1..4, so attention binds.
+            # `max_draft_len + 1` becomes `predicted_tokens_per_seq` on every attention call
+            # and the cached replay's step width, certified at up to `_MAX_VERIFY_WIDTH`.
             max_draft = spec_config.max_draft_len
-            assert 1 <= max_draft <= 3, (
-                f"max_draft_len={max_draft} needs predicted_tokens_per_seq "
-                f"{max_draft + 1}, and attention/thop_attention certifies that "
-                f"argument at 1..4. A longer draft needs a kernel-verify "
-                f"dispatch, not a bigger number"
+            assert 1 <= max_draft <= _MAX_VERIFY_WIDTH - 1, (
+                f"max_draft_len={max_draft} needs {max_draft + 1} verify rows per request, and "
+                f"attention/thop_attention and the GDN cached replay are certified at up to "
+                f"{_MAX_VERIFY_WIDTH} (max_draft_len {_MAX_VERIFY_WIDTH - 1}); 8 is also the "
+                "replay kernel's ceiling"
+            )
+            assert self.trunk_moe_backend != "CUTEDSL" or max_draft <= _CUTEDSL_MAX_DRAFT_LEN, (
+                f"max_draft_len={max_draft} with moe_config.backend=CUTEDSL: the CuteDSL expert "
+                f"pipeline is certified at max_draft_len up to {_CUTEDSL_MAX_DRAFT_LEN}"
             )
             # A linear tree keeps the Blackwell spec-dec mask surface inert.
             assert not getattr(spec_config, "use_dynamic_tree", False), (
@@ -2894,10 +2930,7 @@ class PrefillTarget:
                 "sized from the second and written from the first"
             )
             # Per-iteration counterpart of the core's `max_draft_len` bound.
-            assert 1 <= gen_p <= 4, (
-                f"predicted_tokens_per_seq {gen_p} is outside the 1..4 range "
-                f"attention/thop_attention certifies"
-            )
+            check_verify_width(gen_p)
             check_replay_width(core._bound.replay, gen_p)
         is_verify = spec_metadata is not None and num_decodes > 0 and gen_p > 1
         step["predicted_tokens_per_seq"] = gen_p
@@ -4078,10 +4111,7 @@ class DecodeTarget:
                 "per-step conv snapshots and the recurrent rollback buffer are "
                 "sized from the second and written from the first"
             )
-            assert 1 <= gen_p <= 4, (
-                f"predicted_tokens_per_seq {gen_p} is outside the 1..4 range "
-                f"attention/thop_attention certifies"
-            )
+            check_verify_width(gen_p)
             check_replay_width(core._bound.replay, gen_p)
         is_verify = spec_metadata is not None and batch > 0 and gen_p > 1
         step["predicted_tokens_per_seq"] = gen_p
