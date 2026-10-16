@@ -11,6 +11,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import (
     QSASparseMetadataParams,
     QSASparseParams,
 )
+from tensorrt_llm._torch.attention.backends.sparse.qsa.cache_manager import QSA_SIDE_PLANES
 from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
     QSAIndexer,
     _position_coordinates,
@@ -1488,12 +1489,39 @@ def test_qsa_side_buffers_use_exact_geometry_and_one_position_role() -> None:
     manager.qsa_index_kv_heads = 1
     manager.qsa_sparse_layer_ids = [7, 11]
     manager.layer_offsets = {7: 2, 11: 4}
+    # bf16 K/V pages of 2 heads x 128 dims: no side page shares their size.
+    manager._main_cache_page_sizes = lambda tokens_per_block: {2 * 128 * 2 * tokens_per_block}
 
     buffers = manager._extra_buffers_per_layer(tokens_per_block=128)
 
     assert buffers[2][0].size == 128 * 2 * 128
     assert len(buffers[2]) == 2
     assert len(buffers[4]) == 1
+    assert manager.qsa_side_planes_size is None
+
+
+def test_qsa_side_buffers_pack_when_a_page_size_matches_the_main_cache() -> None:
+    """An index page the size of a K/V page would coalesce into the K/V pool,
+    so both sparse layers' index pages and the position page become one
+    buffer on the first layer, sized past every main-cache page size."""
+    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager.qsa_index_dim = 128
+    manager.qsa_index_kv_heads = 1
+    manager.qsa_sparse_layer_ids = [7, 11]
+    manager.layer_offsets = {7: 2, 11: 4}
+    index_page, position_page = 128 * 2 * 32, 3 * 4 * 32
+    packed = 2 * index_page + position_page
+    # NVFP4 at 32 tokens per block: K == V == index page; the scale page, and
+    # a page that happens to equal the packed size, force it to grow once.
+    manager._main_cache_page_sizes = lambda tokens_per_block: {index_page, 1024, packed}
+
+    buffers = manager._extra_buffers_per_layer(tokens_per_block=32)
+
+    assert list(buffers) == [2]
+    (packed_buffer,) = buffers[2]
+    assert packed_buffer.role == QSA_SIDE_PLANES
+    assert packed_buffer.size == packed + 128
+    assert manager.qsa_side_planes_size == packed + 128
 
 
 def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
@@ -1510,6 +1538,7 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
 
     manager = object.__new__(QSAMambaHybridCacheManagerV2)
     manager.qsa_position_layer_id = 7
+    manager.qsa_side_planes_size = None
     manager.layer_offsets = {7: 2}
     manager.impl = _Impl()
     manager.tokens_per_block = 128
