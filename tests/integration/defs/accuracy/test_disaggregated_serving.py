@@ -935,7 +935,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
-            "use_kv_cache_manager_v2": False,
+            "use_kv_cache_manager_v2": True,
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -1507,7 +1507,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
-            "use_kv_cache_manager_v2": False,
+            "use_kv_cache_manager_v2": True,
         }
         # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
         # fallback; the Python transceiver requires NIXL.
