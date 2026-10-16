@@ -45,7 +45,6 @@ SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUDA_MAX_GRID_DIM_Z = 65_535
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
-_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
 # Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
 # The Blackwell act-fusion op accepts Optional[float] directly.
@@ -193,10 +192,12 @@ def _get_sm107_nvfp4_default_mma_config(
 
 @functools.lru_cache(maxsize=1)
 def _get_cutedsl_fc2_n_tile_size_override() -> Optional[int]:
-    value = os.environ.get(
-        _CUTEDSL_FC2_N_TILE_SIZE_ENV,
-        str(_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE),
-    )
+    """Return the FC2 N tile pinned by the user, or None to autotune over all of them.
+
+    Unset and ``0`` both autotune. ``128`` or ``256`` pins that tile for shapes
+    where it is known to win end to end.
+    """
+    value = os.environ.get(_CUTEDSL_FC2_N_TILE_SIZE_ENV, "0")
     if value == "0":
         return None
     valid_values = tuple(
