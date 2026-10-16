@@ -669,10 +669,7 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
         globalVars[MAINTENANCE_ENTRIES] = [reason: "", patterns: []]
     } else {
         if (!fileExists(maintenanceSource)) {
-            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-            def changedFileList = githubPrApiUrl != null
-                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
-                : getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, "getChangedFileList")
+            def changedFileList = getMRChangedFile(pipeline, globalVars, "getChangedFileList")
             if (changedFileList.contains(maintenanceConfigPath)) {
                 error "Deleting or renaming ${maintenanceConfigPath} is not allowed."
             }
@@ -1087,9 +1084,16 @@ def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath=
     }
 }
 
-// Changes of a build without a GitHub PR: base_commit..gitlabCommit in the internal Git mirror
-// when the merge queue set base_commit, else the GitLab MR.
-def getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+// Changed files or diffs of this build, from the first source it has:
+//   github_pr_api_url  GitHub PR files API, internal Git mirror as the fallback;
+//   base_commit        internal Git mirror, base_commit..gitlabCommit (merge queue);
+//   otherwise          GitLab MR diffs API.
+// function: getChangedFileList (list of paths), getOneFileChanges (diff of filePath) or
+// getFileChanges (map of path to diff; the Git mirror only diffs the paths in filePaths).
+def getMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    if (globalVars[GITHUB_PR_API_URL] != null) {
+        return getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath, filePaths)
+    }
     if (globalVars[BASE_COMMIT]) {
         return getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
     }
@@ -1153,18 +1157,11 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         return []
     }
 
-    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
     try {
-        def changedFileList = []
-        if (githubPrApiUrl != null) {
-            changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
-        } else {
-            changedFileList = getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, "getChangedFileList")
-        }
+        def changedFileList = getMRChangedFile(pipeline, globalVars, "getChangedFileList")
         def changedFileListStr = changedFileList.join(",\n")
         pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
         globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
@@ -1190,14 +1187,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
         return ""
     }
 
-    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-    def diff = ""
-
-    if (githubPrApiUrl != null) {
-        diff = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getOneFileChanges", filePath)
-    } else {
-        diff = getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, "getOneFileChanges", filePath)
-    }
+    def diff = getMRChangedFile(pipeline, globalVars, "getOneFileChanges", filePath)
     pipeline.echo("The change of ${filePath} is: ${diff}")
     return diff
 }
@@ -1292,12 +1282,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         def diffs = [:]
         if (filesNeedingDiff) {
-            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-            def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFileWithFallback(
-                    pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
-                : getGitlabMROrBaseCommitChangedFile(
-                    pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
+            def fileChanges = getMRChangedFile(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
                 [(filePath): fileChanges[filePath] ?: ""]
