@@ -189,6 +189,20 @@ class TestRouterWriteBack:
         assert ids == self._expected_ids(tokenizer, request)
         assert router._render_fallbacks == 1
 
+    def test_ids_are_not_forwarded_when_a_worker_has_no_server_info(
+        self, router, tokenizer
+    ) -> None:
+        # server2 is active, but fetching its /server_info failed, so it has no entry.
+        self._trust(router, tokenizer, servers=("server1",))
+        request = chat_request()
+
+        with mock.patch("tensorrt_llm.serve.router_utils.logger") as logger:
+            router._tokenize(request)
+
+        assert request.prompt_token_ids is None
+        # The warning names the worker that blocks forwarding.
+        assert "server2" in logger.warning.call_args.args[0]
+
     def test_ids_are_not_forwarded_when_a_worker_renders_differently(
         self, router, tokenizer
     ) -> None:

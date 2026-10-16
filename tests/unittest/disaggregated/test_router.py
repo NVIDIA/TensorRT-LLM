@@ -2410,13 +2410,14 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
                                 tokens_per_block=4)
     tok = _PrefixCacheFakeTokenizer()
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
-        # Tokens are forwarded only to workers that report the router's
-        # rendering fingerprint.
+        # Tokens are forwarded only when every active worker reports the
+        # router's rendering fingerprint.
+        fingerprint = router._render_resources("mock").fingerprint()
         router._server_info = {
-            servers[0]: {
-                "render_fingerprint":
-                router._render_resources("mock").fingerprint()
+            server: {
+                "render_fingerprint": fingerprint
             }
+            for server in servers
         }
         for convo in _grow_conversation():
             req = ChatCompletionRequest(model="mock", messages=convo)

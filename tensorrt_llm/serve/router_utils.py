@@ -335,27 +335,37 @@ class BlockHashMixin:
     def _may_write_back_token_ids(self, model: str) -> bool:
         """Whether prompt ids rendered here may replace the worker's own rendering.
 
-        Only when every worker this router knows reports the same rendering
-        fingerprint as the router. A worker that reports none (an older
-        version) counts as a mismatch. Hashing the vocabulary is slow, so the
+        Only when every active worker reports the same rendering fingerprint as
+        the router. A worker that reports none (an older version) or whose
+        ``/server_info`` could not be fetched counts as a mismatch. Hashing the vocabulary is slow, so the
         router's own fingerprint is computed once per model.
         """
         published = self.__dict__.get("_published_render_fingerprints")
+        servers = list(getattr(self, "_servers", None) or [])
         if published is not None:
             # A coordinator frontend: it never fetches /server_info, so it judges the
             # servers it was told about by the fingerprints the coordinator published.
             # A server the coordinator has not reported yet counts as a mismatch.
-            remote = [published.get(server) for server in getattr(self, "_servers", None) or []]
+            remote = [published.get(server) for server in servers]
         else:
-            servers = getattr(self, "_server_info", None) or {}
-            remote = [info.get("render_fingerprint") for info in servers.values()]
+            # Every active worker, not only those whose /server_info was fetched: a failed
+            # fetch leaves a worker active with no entry, and it must not be skipped.
+            info = getattr(self, "_server_info", None) or {}
+            remote = [(info.get(server) or {}).get("render_fingerprint") for server in servers]
+        self._write_back_blockers = []
         if not remote:
             return False
         cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
         local = cache.get(model)
         if local is None:
             local = cache[model] = self._render_resources(model).fingerprint()
-        return all(fingerprints_match(local, fingerprint) for fingerprint in remote)
+        # Kept for the warning: which workers keep the ids from being forwarded.
+        self._write_back_blockers = [
+            server
+            for server, fingerprint in zip(servers, remote)
+            if not fingerprints_match(local, fingerprint)
+        ]
+        return not self._write_back_blockers
 
     def set_published_render_fingerprints(self, fingerprints: dict[str, Optional[dict]]) -> None:
         """Worker fingerprints (summaries) a disagg coordinator published, by server."""
@@ -394,9 +404,15 @@ class BlockHashMixin:
         else:
             self._render_fallbacks = getattr(self, "_render_fallbacks", 0) + 1
             if self._render_fallbacks == 1:
+                blockers = getattr(self, "_write_back_blockers", None)
+                if reason is None:
+                    reason = (
+                        "rendering fingerprint missing or different on " + ", ".join(blockers)
+                        if blockers
+                        else "no workers are known yet"
+                    )
                 logger.warning(
-                    "Router rendered prompt ids are not forwarded to workers: "
-                    f"{reason or 'worker rendering fingerprint missing or different'}. "
+                    f"Router rendered prompt ids are not forwarded to workers: {reason}. "
                     "Workers render the prompt themselves; routing is based on the router's ids."
                 )
         return rendered.token_ids
