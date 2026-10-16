@@ -40,10 +40,9 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
-    CBAGroupHost, _gather_beam_path, _prepare_beam_history_cba, finalize_beam)
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
-    BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
-    CBAState, _StrategyImpls, beam_search_sampling_batch_cba)
+    BEAM_SEARCH_PAD_TOKEN, BeamSearchEarlyStop, BeamSearchMetadata,
+    BeamSearchParams, BeamSearchStep, CBAGroupHost, CBAState, _gather_beam_path,
+    _prepare_beam_history_cba, beam_search_sampling_batch_cba, finalize_beam)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import \
     LlmRequest as CppLlmRequest
@@ -2037,28 +2036,41 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
             validate(request)
 
 
-def test_beam_strategy_grouping_key_tolerates_trailing_fields():
-    """The grouping key must not depend on the BeamSearch tuple's arity.
+@force_ampere
+def test_beam_groups_split_context_and_generation_rows():
+    """A context and a generation request with the same beam widths are sampled
+    in separate steps.
 
-    strategy_grouping_key() pattern-matches the strategy tuple. It used to
-    match exactly the fields known at the time, so appending row_stride made
-    every beam-search strategy fall through to the "Unsupported strategy"
-    branch and beam search failed for every request. Unit tests missed it
-    because they build the ops and step classes directly, bypassing the
-    grouping layer. Pin that trailing fields are ignored.
+    Under different beam width arrays the two can share (beam_width_in,
+    beam_width_out), while the forward lays out one logits row for the context
+    request and max_beam_width rows for the generation one.
     """
-    from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import \
-        FlashInferGroupedStrategySampler
+    max_beam_width = 2
+    sampler = TorchSampler(
+        TorchSampler.Args(max_seq_len=16,
+                          max_draft_len=0,
+                          max_num_sequences=2,
+                          max_beam_width=max_beam_width,
+                          max_total_draft_tokens=0))
+    context = _vbws_request([2, 2], max_beam_width=max_beam_width)
+    generation = _vbws_request([1, 2], max_beam_width=max_beam_width)
+    generation.py_seq_slot = 1
+    generation.state = LlmRequestState.GENERATION_IN_PROGRESS
+    _set_vbws_iteration(generation, 1)
+    batch = [context, generation]
+    context_params, generation_params = (BeamSearchParams.from_request(r)
+                                         for r in batch)
+    assert context_params[:2] == generation_params[:2] == (1, 2)
+    assert (context_params.row_stride, generation_params.row_stride) == (1, 2)
 
-    strategy = _beam_strategy(early_stopping=BeamSearchEarlyStop.TRUE)
-    key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
-    assert key == ("beam_search", strategy.beam_width_in,
-                   strategy.beam_width_out, BeamSearchEarlyStop.TRUE)
-
-    # row_stride is not part of the key: requests differing only in it still
-    # group together.
-    other = strategy._replace(row_stride=strategy.row_stride + 1)
-    assert FlashInferGroupedStrategySampler.strategy_grouping_key(other) == key
+    sampler._slot_params.admit(
+        batch, torch.tensor([0, 1], dtype=torch.int64, device="cuda"))
+    groups = sampler._group_requests(batch, [0, 1])
+    assert [g.req_indices for g in groups] == [[0], [1]]
+    for group in groups:
+        BeamSearchStep.from_params(group.beam_params,
+                                   torch.device("cuda"),
+                                   return_probs=False)
 
 
 def test_vbws_uniform_array_matches_fixed_width():
@@ -2396,39 +2408,24 @@ def test_finish_beams():
     run_test_with_warmup(_uut_provider, max_sync_s=1)
 
 
-def _beam_strategy(*,
-                   early_stopping: BeamSearchEarlyStop,
-                   beam_width_in: int = 2,
-                   beam_width_out: int = 2,
-                   temperature: float = 1.0,
-                   length_penalty: float = 0.0,
-                   diversity_rate: float = 0.0) -> BeamSearch:
-    return BeamSearch(tag="beam_search",
-                      beam_width_in=beam_width_in,
-                      beam_width_out=beam_width_out,
-                      temperature=temperature,
-                      length_penalty=length_penalty,
-                      diversity_rate=diversity_rate,
-                      early_stopping=early_stopping)
+def _beam_params(*,
+                 early_stopping: BeamSearchEarlyStop,
+                 beam_width_in: int = 2,
+                 beam_width_out: int = 2,
+                 temperature: float = 1.0,
+                 length_penalty: float = 0.0,
+                 diversity_rate: float = 0.0) -> BeamSearchParams:
+    return BeamSearchParams(beam_width_in=beam_width_in,
+                            beam_width_out=beam_width_out,
+                            row_stride=beam_width_in,
+                            temperature=temperature,
+                            length_penalty=length_penalty,
+                            diversity_rate=diversity_rate,
+                            early_stopping=early_stopping)
 
 
-class TestBeamSearchStepFromStrategies:
-    """Cover the strategy-group -> BeamSearchStep construction.
-
-    BeamSearchStep is abstract (`_select_and_update`), so only the concrete
-    subclasses may be instantiated. These tests pin that contract: they fail
-    with `TypeError: Can't instantiate abstract class BeamSearchStep` if the
-    extraction of the shared fields is ever done by constructing the base.
-    """
-
-    @staticmethod
-    def test_base_class_is_abstract():
-        assert "_select_and_update" in _StrategyImpls.BeamSearchStep.__abstractmethods__
-        with pytest.raises(TypeError, match="abstract"):
-            # Deliberately instantiating the abstract base: that is what this
-            # test pins, so mypy's (correct) complaint is expected here.
-            _StrategyImpls.BeamSearchStep(  # type: ignore[abstract]
-                2, 2, 2, torch.ones(1), None, None)
+class TestBeamSearchStepFromParams:
+    """Cover the beam-search group -> BeamSearchStep construction."""
 
     @staticmethod
     @pytest.mark.parametrize(
@@ -2440,49 +2437,46 @@ class TestBeamSearchStepFromStrategies:
         ],
     )
     @_kernel_test
-    def test_from_strategies_builds_concrete_impl(early_stopping):
-        # Every stopping mode runs on the candidate-beams-array step; the mode
-        # only selects the done verdict computed inside it.
-        expected_cls = _StrategyImpls.CBABeamSearchStep
-        strategies = [_beam_strategy(early_stopping=early_stopping)]
-        impl = expected_cls.from_strategies(strategies,
-                                            cuda_device=torch.device("cuda"))
-        assert type(impl) is expected_cls
-        assert impl._beam_width_in == 2
-        assert impl._beam_width_out == 2
+    def test_from_params(early_stopping):
+        step = BeamSearchStep.from_params(
+            [_beam_params(early_stopping=early_stopping)],
+            torch.device("cuda"),
+            return_probs=False)
+        assert step._beam_width_in == 2
+        assert step._beam_width_out == 2
+        assert step._early_stopping is early_stopping
         # Unset length_penalty / diversity_rate stay None so the ops can skip
         # the corresponding work.
-        assert impl._length_penalty is None
-        assert impl._diversity_rate is None
+        assert step._length_penalty is None
+        assert step._diversity_rate is None
 
     @staticmethod
     @_kernel_test
-    def test_from_strategies_carries_optional_fields():
-        strategies = [
-            _beam_strategy(early_stopping=BeamSearchEarlyStop.NEVER,
-                           length_penalty=1.5,
-                           diversity_rate=0.5)
-        ]
-        impl = _StrategyImpls.CBABeamSearchStep.from_strategies(
-            strategies, cuda_device=torch.device("cuda"))
-        assert impl._length_penalty is not None
-        assert impl._diversity_rate is not None
-        torch.testing.assert_close(impl._length_penalty,
+    def test_from_params_carries_optional_fields():
+        step = BeamSearchStep.from_params([
+            _beam_params(early_stopping=BeamSearchEarlyStop.NEVER,
+                         length_penalty=1.5,
+                         diversity_rate=0.5)
+        ],
+                                          torch.device("cuda"),
+                                          return_probs=False)
+        assert step._length_penalty is not None
+        assert step._diversity_rate is not None
+        torch.testing.assert_close(step._length_penalty,
                                    torch.tensor([1.5], device="cuda"))
-        torch.testing.assert_close(impl._diversity_rate,
+        torch.testing.assert_close(step._diversity_rate,
                                    torch.tensor([0.5], device="cuda"))
-        assert impl._early_stopping is BeamSearchEarlyStop.NEVER
 
     @staticmethod
     @_kernel_test
-    def test_common_fields_does_not_instantiate_base():
-        """The shared extraction must return plain fields, not an instance."""
-        strategies = [_beam_strategy(early_stopping=BeamSearchEarlyStop.FALSE)]
-        fields = _StrategyImpls.BeamSearchStep._common_fields(
-            strategies, torch.device("cuda"))
-        assert not isinstance(fields, _StrategyImpls.BeamSearchStep)
-        assert fields.beam_width_in == 2
-        assert fields.beam_width_out == 2
+    def test_from_params_rejects_mixed_row_stride():
+        params = _beam_params(early_stopping=BeamSearchEarlyStop.FALSE)
+        with pytest.raises(ValueError):
+            BeamSearchStep.from_params(
+                [params,
+                 params._replace(row_stride=params.row_stride + 1)],
+                torch.device("cuda"),
+                return_probs=False)
 
 
 @force_ampere  # Save H100 resource

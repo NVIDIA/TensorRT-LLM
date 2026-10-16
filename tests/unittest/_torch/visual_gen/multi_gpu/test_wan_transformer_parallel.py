@@ -33,7 +33,6 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -42,6 +41,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
+from ._worker_pool import run_distributed
 from .tp_shard_utils import copy_tp_parameter
 
 try:
@@ -70,46 +70,15 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size, **kwargs)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    backend = "nccl" if use_cuda else "gloo"
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port, kwargs),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size,
+        test_fn,
+        dist_backend="nccl" if use_cuda else "gloo",
+        preload=("tensorrt_llm",),
+        **kwargs,
     )
 
 

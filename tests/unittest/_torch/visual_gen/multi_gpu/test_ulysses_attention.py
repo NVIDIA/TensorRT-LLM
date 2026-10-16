@@ -15,27 +15,26 @@
 
 """Multi-GPU tests for Ulysses Attention.
 
-These tests use torch.multiprocessing.spawn to launch multiple processes internally.
+Multi-GPU tests run their logic on the rank pool in _worker_pool.py.
 Run with:
     pytest tests/visual_gen/multi_gpu/test_ulysses_attention.py -v
 """
 
 import math
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Callable
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
+
+from ._worker_pool import run_distributed
 
 
 @contextmanager
 def _disable_mpi() -> Iterator[None]:
-    """Temporarily use torch.distributed, preserving the caller's MPI setting."""
+    """Import the torch.distributed code paths with MPI disabled, preserving the caller's setting."""
     with pytest.MonkeyPatch.context() as env:
         env.setenv("TLLM_DISABLE_MPI", "1")
         yield
@@ -51,39 +50,6 @@ with _disable_mpi():
     )
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "gloo", port: int = 29500):
-    """Initialize distributed environment for a worker process."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
-    # Use gloo backend for CPU, nccl for GPU
-    if backend == "nccl" and torch.cuda.is_available():
-        torch.cuda.set_device(rank % torch.cuda.device_count())
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    else:
-        dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    """Clean up distributed environment."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    """Worker function that runs in each process. Module-level for pickling."""
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     """Run a test function in a distributed environment with multiple processes.
 
@@ -95,24 +61,9 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     """
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
-    backend = "nccl" if use_cuda else "gloo"
-
-    # Spawn processes
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    # Spawned workers inherit this setting before importing the test module.
-    with _disable_mpi():
-        from ._visual_gen_dist_utils import spawn_with_retry
-
-        spawn_with_retry(
-            lambda port: mp.spawn(
-                _distributed_worker,
-                args=(world_size, backend, test_fn, port),
-                nprocs=world_size,
-                join=True,
-            )
-        )
+    run_distributed(
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
+    )
 
 
 def test_forward_async_redistributes_vsa_gates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,7 +116,7 @@ def test_forward_async_redistributes_vsa_gates(monkeypatch: pytest.MonkeyPatch) 
 
 
 # =============================================================================
-# Test logic functions (module-level so they can be pickled by mp.spawn)
+# Test logic functions (module-level so the pool can pickle them by reference)
 # =============================================================================
 
 
