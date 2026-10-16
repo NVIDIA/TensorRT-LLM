@@ -37,14 +37,16 @@ from .data import TextPrompt
 from .multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
 from .multimodal import \
     MultimodalEncoderItemMetadata as MultimodalEncoderItemMetadata
-from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+from .multimodal import (MultimodalInput, MultimodalItemMetadata,
+                         _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths)
 from .multimodal import \
     get_multimodal_encoder_item_metadata as get_multimodal_encoder_item_metadata
-from .multimodal import hexdigest_to_int32, validate_mm_inputs
+from .multimodal import (hexdigest_to_int32, normalize_multimodal_item_metadata,
+                         validate_mm_inputs)
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import create_prefix_token_cache
 from .tokenization import tokenize_prompt
@@ -161,6 +163,31 @@ class BaseMultimodalInputProcessor(ABC):
         The default keeps legacy multimodal processors unchanged.
         """
         return None
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        """Describe processed items independently of encoder scheduling support.
+
+        Keep legacy encoder-cost producers at this boundary. Precomputed
+        embeddings and other models can supply order and rows without costs.
+        """
+        if (multimodal_data.get("multimodal_embedding") is None and any(
+                isinstance(multimodal_data.get(m), dict)
+                for m in MEDIA_MODALITIES)):
+            metadata = self.get_mm_encoder_item_metadata(
+                prompt_token_ids, multimodal_data)
+            if metadata is not None:
+                if not isinstance(metadata, MultimodalEncoderItemMetadata):
+                    raise TypeError(
+                        "get_mm_encoder_item_metadata() must return a "
+                        "MultimodalEncoderItemMetadata or None")
+                return MultimodalItemMetadata.from_encoder_metadata(metadata)
+        return normalize_multimodal_item_metadata(multimodal_data,
+                                                  mm_item_order)
 
     def __init__(self,
                  model_path,
@@ -1466,55 +1493,54 @@ def create_input_processor_with_hash(
             return prompt_token_ids, extra_processed_inputs
 
         multimodal_data = extra_processed_inputs.get("multimodal_data")
-        if (not isinstance(multimodal_data, dict)
-                or multimodal_data.get("multimodal_embedding") is not None):
+        if not isinstance(multimodal_data, dict):
             return prompt_token_ids, extra_processed_inputs
-
-        # A processor participates in item scheduling by overriding
-        # `get_mm_encoder_item_metadata`; the base returns `None`, so its
-        # result gates routing without a separate capability flag. `getattr`
-        # because unregistered/text-only models wrap a `DefaultInputProcessor`
-        # that lacks the method entirely.
-        get_item_metadata = getattr(input_processor,
-                                    "get_mm_encoder_item_metadata", None)
-        has_raw_payload = any(
-            isinstance(multimodal_data.get(modality), dict)
-            for modality in MEDIA_MODALITIES)
-        if not has_raw_payload or get_item_metadata is None:
-            return prompt_token_ids, extra_processed_inputs
-
-        item_metadata = get_item_metadata(prompt_token_ids, multimodal_data)
-        if item_metadata is None:
-            # Processor does not emit item metadata for this input; fall back
-            # to the non-item-scheduled path.
-            return prompt_token_ids, extra_processed_inputs
-        if not isinstance(item_metadata, MultimodalEncoderItemMetadata):
-            raise TypeError(
-                "get_mm_encoder_item_metadata() must return a "
-                "MultimodalEncoderItemMetadata or None for raw multimodal "
-                f"payloads, got {type(item_metadata).__name__}")
-        item_metadata.validate()
 
         mm_item_order = inputs.get("mm_item_order")
-        if mm_item_order and item_metadata.item_refs != [
-            (entry["modality"], entry["index"]) for entry in mm_item_order
-        ]:
-            raise ValueError("Multimodal encoder item references do not match "
-                             "the prompt item order")
-
+        get_item_metadata = getattr(input_processor, "get_mm_item_metadata",
+                                    None)
+        if get_item_metadata is not None:
+            item_metadata = get_item_metadata(prompt_token_ids, multimodal_data,
+                                              mm_item_order)
+        else:
+            # Registered processors inherit the generic hook. Accept older
+            # standalone processors at the same boundary.
+            get_encoder_metadata = getattr(input_processor,
+                                           "get_mm_encoder_item_metadata", None)
+            if (get_encoder_metadata is not None
+                    and multimodal_data.get("multimodal_embedding") is None
+                    and any(
+                        isinstance(multimodal_data.get(m), dict)
+                        for m in MEDIA_MODALITIES)):
+                legacy_metadata = get_encoder_metadata(prompt_token_ids,
+                                                       multimodal_data)
+                if legacy_metadata is not None:
+                    if not isinstance(legacy_metadata,
+                                      MultimodalEncoderItemMetadata):
+                        raise TypeError(
+                            "get_mm_encoder_item_metadata() must return a "
+                            "MultimodalEncoderItemMetadata or None")
+                    multimodal_data[
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = legacy_metadata
+            item_metadata = normalize_multimodal_item_metadata(
+                multimodal_data, mm_item_order)
+        if item_metadata is None:
+            return prompt_token_ids, extra_processed_inputs
+        if not isinstance(item_metadata, MultimodalItemMetadata):
+            raise TypeError(
+                "get_mm_item_metadata() must return a MultimodalItemMetadata or None"
+            )
+        item_metadata.validate()
         multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
-        existing_embedding_lengths = multimodal_data.get(
-            "multimodal_embedding_lengths")
-        if existing_embedding_lengths is not None:
-            if not isinstance(existing_embedding_lengths, list):
-                raise TypeError("multimodal_embedding_lengths must be a list")
-            if (existing_embedding_lengths
-                    != item_metadata.output_embedding_lengths):
+        normalize_multimodal_item_metadata(multimodal_data, mm_item_order)
+        embedding_lengths = item_metadata.output_embedding_lengths
+        if embedding_lengths is not None:
+            existing = multimodal_data.get("multimodal_embedding_lengths")
+            if existing is not None and existing != embedding_lengths:
                 raise ValueError(
                     "Computed multimodal encoder embedding lengths "
                     "do not match the existing prompt metadata")
-        multimodal_data[
-            "multimodal_embedding_lengths"] = item_metadata.output_embedding_lengths
+            multimodal_data["multimodal_embedding_lengths"] = embedding_lengths
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

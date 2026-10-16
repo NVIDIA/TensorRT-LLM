@@ -33,10 +33,63 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+)
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.sampling_params import LogprobMode
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_multimodal_payload_broadcast_and_children_keep_the_same_contract():
+    import pickle
+
+    metadata = MultimodalItemMetadata(
+        [("audio", 0), ("image", 0)],
+        output_embedding_lengths=[1, 2],
+        input_partitions={"audio": {"features": MultimodalItemPartition(1, (3,))}},
+    )
+    payload = {
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        "audio": {"features": torch.arange(6).reshape(2, 3)},
+        "image": {},
+        "multimodal_embedding_lengths": [1, 2],
+    }
+    source = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=2,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    source.py_multimodal_data = payload
+    source.py_conversation_params = None
+    objects = RequestBroadcaster._collect_py_objects(None, [RequestQueueItem(42, source)])
+    # Reproduce the existing Python-object rank handoff, without adding the
+    # request aggregate, CUDA event, or cache state to its wire format.
+    restored_objects = pickle.loads(pickle.dumps(objects))
+    restored = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=2,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    queue_items = [RequestQueueItem(42, restored)]
+    attach_py_objects_to_requests(queue_items, restored_objects)
+    request = executor_request_to_llm_request(
+        42, restored, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    params = request.py_multimodal_params
+    child = request.child_requests[0].py_multimodal_params
+    assert params.item_metadata == child.item_metadata == metadata
+    assert child is not params
+    assert child.item_metadata is not params.item_metadata
+    assert params.encoder_state is child.encoder_state is None
+    assert params.multimodal_runtime is child.multimodal_runtime is None
+    assert params.item_metadata.item_refs == [("audio", 0), ("image", 0)]
+    torch.testing.assert_close(
+        child.multimodal_data["audio"]["features"], payload["audio"]["features"]
+    )
 
 
 @pytest.fixture

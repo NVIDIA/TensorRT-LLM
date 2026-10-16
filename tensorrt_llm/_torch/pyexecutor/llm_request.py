@@ -4,9 +4,7 @@
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, Container, Dict, Hashable, Iterable,
-                    List, Optional, Union, cast)
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union, cast
 
 import torch
 
@@ -15,7 +13,13 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.multimodal import get_multimodal_encoder_item_metadata
+from tensorrt_llm.inputs.multimodal import \
+    MultimodalEncoderProgress as MultimodalEncoderProgress
+from tensorrt_llm.inputs.multimodal import \
+    MultimodalEncoderRequestState as MultimodalEncoderRequestState
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            get_multimodal_item_metadata,
+                                            normalize_multimodal_item_metadata)
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
@@ -65,165 +69,10 @@ class MultimodalEncoderRequestError(ValueError):
         self.request_ids = frozenset(request_ids or ())
 
 
-class MultimodalEncoderProgress(Enum):
-    """Python-only progress derived from request-local MM item outputs.
-
-    It summarizes the ready flags of all items. Scheduling is gated by the
-    items the remaining prefill uses instead (`get_mm_pending_items`), because
-    items behind confirmed prefill progress or a reusable KV prefix are
-    released or never encoded."""
-
-    PENDING = auto()
-    """No MM item of the request has an encoder output yet."""
-
-    PARTIAL = auto()
-    """Some but not all items are encoded; the request must continue on the
-    item-scheduling path until every item has an output."""
-
-    READY = auto()
-    """No further encoder work is needed: every item is encoded, a
-    precomputed embedding was supplied, or the request has no MM payload."""
-
-
-class _Unset:
-    """Sentinel for a memo that has not been computed yet.
-
-    Distinct from `None`, which is a real result: the request cannot build
-    stable cache keys and its items always encode.
-    """
-
-
-_UNSET = _Unset()
-
-
 def make_mm_encoder_transient_cache_key(request_id: int,
                                         item_idx: int) -> tuple[str, int, int]:
     """Return a request-local cache key for an item without a stable key."""
     return ("mm_transient", request_id, item_idx)
-
-
-@dataclass
-class MultimodalEncoderRequestState:
-    """Tracks the encoder-cache key for each MM item in a request.
-
-    The state is created when an item-scheduled request enters the executor.
-    Other requests leave `py_mm_encoder_state` as `None`.
-
-    Encoder outputs live only in the model-owned `TensorLRUCache`. This object
-    stores one cache key and one ready flag per item, in prompt order. On the
-    item-scheduled executor, each non-empty slot holds one reference. Two
-    identical items may point to the same cache entry, but each item still
-    holds and releases its own reference. The request does not store another
-    output tensor or combined output buffer.
-
-    Cleanup clears the slots before releasing their references, so repeated
-    request cleanup is safe.
-    """
-
-    embedding_lengths: List[int]
-    """Expected encoder-output rows for each item, in prompt order."""
-
-    encoder_token_lengths: List[int]
-    """Validated encoder attention-token cost of each atomic item.
-
-    Admission copies these values from the request metadata so scheduling
-    never has to re-validate user input inside the scheduler loop.
-    """
-
-    item_ready: List[bool]
-    """Whether each item's bound cache entry is ready, in prompt order."""
-
-    item_cache_keys: List[Optional[Hashable]] = field(default_factory=list)
-    """Cache keys held by this request, in prompt order.
-
-    A non-empty slot holds one reference. `item_ready` tells whether the entry
-    already contains its encoder output.
-    """
-
-    stable_item_cache_keys: "list[Hashable] | _Unset | None" = _UNSET
-    """Cached per-item reuse keys.
-
-    `_UNSET` means the keys have not been computed. `None` means stable keys
-    cannot be built, so this request uses request-local cache keys instead.
-    """
-
-    @classmethod
-    def from_embedding_lengths(
-        cls,
-        embedding_lengths: List[int],
-        *,
-        encoder_token_lengths: Optional[List[int]] = None
-    ) -> "MultimodalEncoderRequestState":
-        if encoder_token_lengths is None:
-            encoder_token_lengths = embedding_lengths
-        return cls(embedding_lengths=list(embedding_lengths),
-                   encoder_token_lengths=list(encoder_token_lengths),
-                   item_ready=[False] * len(embedding_lengths),
-                   item_cache_keys=[None] * len(embedding_lengths))
-
-    def __post_init__(self) -> None:
-        if not self.item_cache_keys:
-            self.item_cache_keys = [None] * len(self.item_ready)
-        if not (len(self.embedding_lengths) == len(self.encoder_token_lengths)
-                == len(self.item_ready) == len(self.item_cache_keys)):
-            raise ValueError("MM encoder token and embedding lengths must have "
-                             "exactly one cache key per item slot")
-
-    @property
-    def num_items(self) -> int:
-        return len(self.item_ready)
-
-    @property
-    def progress(self) -> MultimodalEncoderProgress:
-        if all(self.item_ready):
-            return MultimodalEncoderProgress.READY
-        if any(self.item_ready):
-            return MultimodalEncoderProgress.PARTIAL
-        return MultimodalEncoderProgress.PENDING
-
-    def pending_item_indices(self) -> List[int]:
-        """Indices of items that still need an encoder output, prompt order."""
-        return [
-            item_idx for item_idx, ready in enumerate(self.item_ready)
-            if not ready
-        ]
-
-    def set_item_cache_key(self, item_idx: int, cache_key: Hashable, *,
-                           ready: bool) -> None:
-        """Assign a cache key to one item."""
-        if self.item_cache_keys[item_idx] is not None:
-            raise RuntimeError(f"MM item {item_idx} already has a cache key")
-        self.item_cache_keys[item_idx] = cache_key
-        self.item_ready[item_idx] = ready
-
-    def clear_item_cache_key(self, item_idx: int) -> Hashable:
-        """Clear and return one item's cache key."""
-        cache_key = self.item_cache_keys[item_idx]
-        if cache_key is None:
-            raise RuntimeError(f"MM item {item_idx} has no cache key")
-        self.item_cache_keys[item_idx] = None
-        self.item_ready[item_idx] = False
-        return cache_key
-
-    def mark_cache_key_ready(self, cache_key: Hashable) -> None:
-        """Mark every item using `cache_key` as ready."""
-        self.mark_cache_keys_ready((cache_key, ))
-
-    def mark_cache_keys_ready(self, cache_keys: Container[Hashable]) -> None:
-        """Mark every item using one of `cache_keys` as ready."""
-        for item_idx, bound_cache_key in enumerate(self.item_cache_keys):
-            if bound_cache_key is not None and bound_cache_key in cache_keys:
-                self.item_ready[item_idx] = True
-
-    def pop_all_cache_keys(self) -> List[Hashable]:
-        """Return and clear all cache keys, keeping prompt order and duplicates."""
-        cache_keys = [
-            cache_key for cache_key in self.item_cache_keys
-            if cache_key is not None
-        ]
-        self.item_cache_keys = [None] * len(self.item_cache_keys)
-        self.item_ready = [False] * len(self.item_ready)
-        return cache_keys
 
 
 if TYPE_CHECKING:
@@ -885,9 +734,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         self.py_lora_ckpt_source: str | None = kwargs.pop(
             "py_lora_ckpt_source", None)
-        # Multimodal data
-        self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
-        self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
+        # The request owns one MM aggregate. Compatibility properties below
+        # expose the existing field names without duplicate data or state.
+        mm_data = kwargs.pop("py_multimodal_data", None)
+        mm_item_order = kwargs.pop("py_mm_item_order", None)
+        self.py_multimodal_params: MultimodalParams | None = (
+            MultimodalParams(multimodal_data=mm_data,
+                             mm_item_order=mm_item_order)
+            if mm_data is not None or mm_item_order is not None else None)
         # Per-item MM encoder state, created at admission by
         # `initialize_multimodal_encoder_request` when raw MM payloads must
         # run through the item scheduler; `None` otherwise (also the
@@ -1287,7 +1141,65 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.state = LlmRequestState.GENERATION_COMPLETE
         self.set_finished_reason(reason, beam)
 
+    @property
+    def py_multimodal_data(self) -> dict[str, Any] | None:
+        params = self.py_multimodal_params
+        return params.multimodal_data if params is not None else None
+
+    @py_multimodal_data.setter
+    def py_multimodal_data(self, data: dict[str, Any] | None) -> None:
+        if self.py_multimodal_params is None:
+            if data is not None:
+                self.py_multimodal_params = MultimodalParams(
+                    multimodal_data=data)
+        else:
+            self.py_multimodal_params.multimodal_data = data
+
+    @property
+    def py_mm_item_order(self) -> list[dict[str, Any]] | None:
+        params = self.py_multimodal_params
+        return params.mm_item_order if params is not None else None
+
+    @py_mm_item_order.setter
+    def py_mm_item_order(self, order: list[dict[str, Any]] | None) -> None:
+        if self.py_multimodal_params is None:
+            if order is None:
+                return
+            self.py_multimodal_params = MultimodalParams()
+        self.py_multimodal_params.mm_item_order = order
+
+    @property
+    def py_mm_encoder_state(self) -> MultimodalEncoderRequestState | None:
+        params = self.py_multimodal_params
+        return params.encoder_state if params is not None else None
+
+    @py_mm_encoder_state.setter
+    def py_mm_encoder_state(
+            self, state: MultimodalEncoderRequestState | None) -> None:
+        if self.py_multimodal_params is None:
+            if state is None:
+                return
+            self.py_multimodal_params = MultimodalParams()
+        self.py_multimodal_params.encoder_state = state
+
+    @property
+    def py_mm_encoder_event(self) -> torch.cuda.Event | None:
+        params = self.py_multimodal_params
+        return params.encoder_event if params is not None else None
+
+    @py_mm_encoder_event.setter
+    def py_mm_encoder_event(self, event: torch.cuda.Event | None) -> None:
+        if self.py_multimodal_params is None:
+            if event is None:
+                return
+            self.py_multimodal_params = MultimodalParams()
+        self.py_multimodal_params.encoder_event = event
+
     def create_child_request(self, child_id):
+        if (self.py_mm_encoder_state is not None
+                or self.py_mm_encoder_event is not None):
+            raise RuntimeError(
+                "Child requests must be created before MM encoder admission")
         child = super().create_child_request(child_id)
         py_request = LlmRequest(llm_request=child)
 
@@ -1370,12 +1282,14 @@ def get_multimodal_encoder_token_lengths(
     """Return per-item physical encoder attention-token costs.
 
     Field-level validation happens inside
-    `get_multimodal_encoder_item_metadata`; only the request-level
+    `MultimodalItemMetadata.validate`; only the request-level
     cross-check against `multimodal_embedding_lengths` lives here.
     """
-    item_metadata = get_multimodal_encoder_item_metadata(
-        request.py_multimodal_data)
+    item_metadata = get_multimodal_item_metadata(request.py_multimodal_data)
     if item_metadata is None:
+        return None
+    item_metadata.validate()
+    if item_metadata.encoder_token_lengths is None:
         return None
     embedding_lengths = get_multimodal_embedding_lengths(request)
     if embedding_lengths is None:
@@ -1467,6 +1381,9 @@ def initialize_multimodal_encoder_request(
     (see `get_mm_max_resident_embeddings`).
     """
     mm_data = request.py_multimodal_data
+    if isinstance(mm_data, dict):
+        normalize_multimodal_item_metadata(
+            mm_data, getattr(request, "py_mm_item_order", None))
     has_raw_payload = isinstance(mm_data, dict) and any(
         isinstance(mm_data.get(modality), dict)
         for modality in ("image", "video", "audio"))
