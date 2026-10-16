@@ -26,6 +26,10 @@ STANDARD, MLA_CONTEXT, MLA_GENERATION = 0, 1, 2
 #: quant_mode bit for an fp8 KV cache.
 QM_FP8_KV_CACHE = 128
 
+#: quant_mode bit for an NVFP4 KV cache: e2m1 values in the pool, one e4m3 scale
+#: per 16 values in a second pool, fp32 [3] kv scales (q, K, V).
+QM_NVFP4_KV_CACHE = 8192
+
 #: qwen4_exp's full-attention layer -- the twelve trunk layers and the MTP
 #: module alike: packed-QKV causal GQA over a bf16 pool, rope applied outside,
 #: the paged-context path on (the target serves with block reuse and chunked
@@ -68,6 +72,12 @@ _QWEN4_VISION = dict(
 #: the MTP draft layer pass when the engine serves an fp8 KV cache. Same chosen
 #: pool sizes as `_QWEN4_DENSE`.
 _QWEN4_FP8 = dict(_QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
+
+#: The same call over an NVFP4 pool: e2m1 data and a second pool of e4m3 block
+#: scales, fp32 [3] unit kv scales, `[1, 2, 2]` pool pointers, bf16 output --
+#: what the trunk layers and the MTP draft layer pass when the engine serves an
+#: NVFP4 KV cache. Same chosen pool sizes as `_QWEN4_DENSE`.
+_QWEN4_NVFP4 = dict(_QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
 
 #: `_QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
 #: ceiling: one block-offset row per request and pages for 32 histories (the largest cell
@@ -618,6 +628,68 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=8,
             ),
         ),
+        Cell(
+            why="qwen4_exp nvfp4 pool paged-context prefill, 24/2/256: a fresh 48-row "
+            "sequence beside 33 rows over a 48-token e2m1 prefix",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 48),
+                new=(48, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool decode P=1, 24/2/256: histories 200 and 48",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(200, 48),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool MTP verify P=2, 24/2/256 (max_draft_len 1)",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(70, 35),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool MTP verify P=4, 24/2/256 (max_draft_len 3)",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(70, 35),
+                new=(4, 4),
+                num_contexts=0,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool mixed step P=1: a 20-row context ahead of two "
+            "1-row sequences over histories 31 and 64",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 31, 64),
+                new=(20, 1, 1),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool mixed step P=4: a 20-row context ahead of two 4-row blocks",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 31, 64),
+                new=(20, 4, 4),
+                num_contexts=1,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
     )
 
     note = """
@@ -680,6 +752,20 @@ class ThopAttention(OpWrapper):
     per-tile max, which the row-max model of
     `reference(e4m3_probabilities=True)` reproduces within one 128-key tile
     and approximates up to 200 keys.
+
+    NVFP4 pool (quant_mode 8192): K and V are stored as e2m1 values, two per
+    byte (low nibble = even element), per head page `[tpb, D/2]`, with one e4m3
+    scale per 16 values in a second pool whose pointer is the third axis of
+    `host_kv_cache_pool_pointers` (`[pools, 2, 2]`: primary/secondary x
+    data/scales); K's scales are token-major per head page, V's in four-token
+    groups `[tpb/4, D/16, 4]`. The append quantizes with `kv_scale_orig_quant[1]`
+    / `[2]` as second-level scales (fp32 `[3]`, `[0]` is q's e4m3 scale). One
+    block-offset table addresses both pools, so they must hold the same pages
+    per slot. The kernels are trtllm-gen cubins with e4m3 q and e2m1 K/V and
+    exist for the paged-context path only, which needs the op to enable FP8
+    context FMHA for an FP4 KV cache. Every NVFP4 cell runs the paged-context
+    path at kv scale 1.0 and reads K and V through e4m3, so `reference` runs
+    over the NVFP4 values with `e4m3_inputs` and `e4m3_probabilities`.
 
     The sparse / skip-softmax arguments are bitwise inert in the standard
     configuration (nine off-default settings at 24/2/256): passing them does

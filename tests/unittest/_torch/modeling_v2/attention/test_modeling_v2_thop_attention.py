@@ -190,6 +190,10 @@ exercised:
    arguments that are inert there, the workspace high-water mark over the
    mmmu serving shapes, and the two boundaries (update_kv_cache=False is
    rejected; head_size 72 has no generation phase).
+14. The same full-attention cell over an NVFP4 pool (e2m1 data and e4m3 block
+   scales in a second pool, unit fp32 [3] second-level scales, bf16 output):
+   the pool and its block scales bitwise as the append writes them, and the
+   output against `reference` over the NVFP4 values (the cells).
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
@@ -243,6 +247,7 @@ MASK_CAUSAL = 1  # AttentionMaskType.causal
 MASK_PADDING = 0  # AttentionMaskType.padding: no mask (bidirectional)
 
 QUANT_MODE_FP8_KV_CACHE = 128  # QuantMode.FP8_KV_CACHE (sole bit set)
+QUANT_MODE_NVFP4_KV_CACHE = 8192  # QuantMode.NVFP4_KV_CACHE (sole bit set)
 
 # fp8-e4m3 KV-pool decode tolerance. The reference dequantizes the mirrored
 # e4m3 pool content and puts q through the same e4m3 round-trip the kernel
@@ -291,6 +296,88 @@ FP8_DECODE_RTOL = 2**-4
 # so no claim here rests on it.
 FP8_MLA_ATOL = 2**-3
 FP8_MLA_RTOL = 2**-4
+
+
+# NVFP4: one e4m3 block scale per this many values; e2m1 magnitudes by code
+# and the round-to-nearest-even steps between them (inclusive where the upper
+# neighbour is the even code).
+NVFP4_BLOCK = 16
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_STEPS = ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False))
+E2M1_STEPS += ((3.5, True), (5.0, False))
+
+
+def _nvfp4_quantize(rows: torch.Tensor, global_scale: torch.Tensor):
+    """[n, D] rows -> (packed e2m1 bytes [n, D/2], e4m3 scale bytes [n, D/16]):
+    the attention op's append, in torch (`cvt_warp_fp16_to_fp4`)."""
+    n, d = rows.shape
+    x = rows.float().reshape(n, d // NVFP4_BLOCK, NVFP4_BLOCK)
+    block_max = x.abs().amax(-1)
+    sixth = torch.tensor(6.0, dtype=torch.float32, device=rows.device).reciprocal()
+    code = (global_scale * (block_max * sixth)).to(torch.float8_e4m3fn)
+    out_scale = torch.where(
+        block_max != 0,
+        (code.float() * global_scale.reciprocal()).reciprocal(),
+        torch.zeros_like(block_max),
+    )
+    scaled = x * out_scale[..., None]
+    magnitude = scaled.abs()
+    codes = torch.zeros(scaled.shape, dtype=torch.int32, device=rows.device)
+    for threshold, inclusive in E2M1_STEPS:
+        codes += (magnitude >= threshold if inclusive else magnitude > threshold).to(torch.int32)
+    codes |= torch.signbit(scaled).to(torch.int32) << 3
+    # 0 x inf, in a block whose scale underflows to zero: the conversion makes +6.
+    codes = torch.where(torch.isnan(scaled), torch.full_like(codes, 0x7), codes)
+    codes = codes.reshape(n, d // 2, 2)
+    return (codes[..., 0] | (codes[..., 1] << 4)).to(torch.uint8), code.view(torch.uint8)
+
+
+def _nvfp4_dequantize(packed: torch.Tensor, scales: torch.Tensor, global_scale) -> torch.Tensor:
+    """Inverse of `_nvfp4_quantize`: fp32 [n, D]."""
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    lut = torch.cat([lut, -lut])
+    raw = packed.long()
+    values = torch.stack([lut[raw & 0xF], lut[raw >> 4]], -1).flatten(-2)
+    scale = scales.view(torch.float8_e4m3fn).float().repeat_interleave(NVFP4_BLOCK, -1)
+    return values * scale / global_scale
+
+
+def _nvfp4_roundtrip(kv: torch.Tensor, global_scale) -> torch.Tensor:
+    """[T, Hkv, D] bf16 -> the bf16 values an NVFP4 pool returns for them."""
+    t, h, d = kv.shape
+    packed, scales = _nvfp4_quantize(kv.reshape(t * h, d), global_scale)
+    return _nvfp4_dequantize(packed, scales, global_scale).reshape(t, h, d).to(kv.dtype)
+
+
+def _check_nvfp4_cache(env, request_id: int) -> None:
+    """An NVFP4 pool holds each token's e2m1 bytes and its block scales -- K's
+    token-major, V's in four-token groups -- bitwise as the append writes them."""
+    tpb, hkv, d = env.tokens_per_block, env.num_kv_heads, env.head_dim
+    groups = d // NVFP4_BLOCK
+    for role, history in ((0, env.k_history[request_id]), (1, env.v_history[request_id])):
+        seq = torch.cat(history)
+        total = seq.shape[0]
+        packed, scales = _nvfp4_quantize(
+            seq.reshape(total * hkv, d), env.kv_scale_orig_quant[1 + role]
+        )
+        packed = packed.reshape(total, hkv, d // 2)
+        scales = scales.reshape(total, hkv, groups)
+        for j, page in enumerate(env.pages[request_id]):
+            n = min(tpb, total - j * tpb)
+            if n <= 0:
+                break
+            rows = slice(j * tpb, j * tpb + n)
+            got = env.kv_cache[page, role, :, :n].permute(1, 0, 2)
+            assert torch.equal(got, packed[rows]), f"request {request_id} role {role} page {j}"
+            sf_page = env.kv_block_scales[page, role]
+            if role == 0:
+                got_sf = sf_page[:, :n].permute(1, 0, 2)
+            else:
+                grouped = sf_page.reshape(hkv, tpb // 4, groups, 4).permute(0, 1, 3, 2)
+                got_sf = grouped.reshape(hkv, tpb, groups)[:, :n].permute(1, 0, 2)
+            assert torch.equal(got_sf, scales[rows]), (
+                f"request {request_id} role {role} page {j}: block scales"
+            )
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -354,26 +441,46 @@ class _PagedAttnEnv:
         self.page_ring = page_ring
         self.rings: dict[int, List[int]] = {}
 
-        # Single-layer, single-pool paged KV cache (HND layout).
+        # Single-layer, single-pool paged KV cache (HND layout). An NVFP4 pool
+        # holds e2m1 pairs, and its e4m3 block scales live in a second pool
+        # whose pointer is the third axis of the pool pointers.
+        self.nvfp4 = bool(quant_mode & QUANT_MODE_NVFP4_KV_CACHE)
         self.kv_cache = torch.zeros(
             num_blocks,
             2,
             num_kv_heads,
             tokens_per_block,
-            head_dim,
-            dtype=pool_dtype,
+            head_dim // 2 if self.nvfp4 else head_dim,
+            dtype=torch.uint8 if self.nvfp4 else pool_dtype,
             device="cuda",
         )
-        self.pool_pointers = torch.zeros(1, 2, dtype=torch.int64, device="cpu")
-        self.pool_pointers[0, 0] = self.kv_cache.data_ptr()
+        if self.nvfp4:
+            self.kv_block_scales = torch.zeros(
+                num_blocks,
+                2,
+                num_kv_heads,
+                tokens_per_block,
+                head_dim // NVFP4_BLOCK,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            self.pool_pointers = torch.zeros(1, 2, 2, dtype=torch.int64, device="cpu")
+            self.pool_pointers[0, 0, 0] = self.kv_cache.data_ptr()
+            self.pool_pointers[0, 0, 1] = self.kv_block_scales.data_ptr()
+        else:
+            self.pool_pointers = torch.zeros(1, 2, dtype=torch.int64, device="cpu")
+            self.pool_pointers[0, 0] = self.kv_cache.data_ptr()
         # KV-cache scaling factor s: dequant = quantized * s. Mirrors the
         # production construction (quant_orig = s, orig_quant = 1/s, both
-        # fp32 [1] CUDA); None = unquantized pool, scale args passed as None.
+        # fp32 [1] CUDA, [3] -- q, K, V -- over an NVFP4 pool); None =
+        # unquantized pool, scale args passed as None.
         if kv_scaling_factor is None:
             self.kv_scale_quant_orig: Optional[torch.Tensor] = None
             self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         else:
-            factor = torch.full((1,), kv_scaling_factor, dtype=torch.float32, device="cuda")
+            factor = torch.full(
+                (3 if self.nvfp4 else 1,), kv_scaling_factor, dtype=torch.float32, device="cuda"
+            )
             self.kv_scale_quant_orig = factor
             self.kv_scale_orig_quant = 1.0 / factor
         self.pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu")
@@ -678,7 +785,11 @@ class _PagedAttnEnv:
 
     def check_cache(self, request_id: int) -> None:
         """The paged cache must hold exactly the expected rows, bitwise (the
-        bf16 K/V fed so far, or their scaled e4m3 casts for an fp8 pool)."""
+        bf16 K/V fed so far, or their scaled e4m3 casts for an fp8 pool, or
+        their NVFP4 bytes and block scales for an NVFP4 pool)."""
+        if self.nvfp4:
+            _check_nvfp4_cache(self, request_id)
+            return
         got_k, got_v, exp_k, exp_v = self.cache_pages_content(request_id)
         assert torch.equal(got_k.view(torch.uint8), exp_k.view(torch.uint8)), (
             f"K cache mismatch: request {request_id}"
@@ -5392,8 +5503,12 @@ def _op_reference(
     causal: bool = True,
     e4m3: bool = False,
     layer: Optional[int] = None,
+    nvfp4: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
+
+    nvfp4=True reads K and V as an NVFP4 pool returns them (the history
+    through `_nvfp4_roundtrip`) before the e4m3 arithmetic `e4m3` selects.
 
     Call it after the op call, so each history ends with this call's K/V:
     `reference`'s bottom-right alignment then puts this call's q rows at the
@@ -5404,6 +5519,9 @@ def _op_reference(
     """
     hq, hkv, d = env.num_heads, env.num_kv_heads, env.head_dim
     ks, vs = zip(*(_history(env, rid, layer) for rid in request_ids))
+    if nvfp4:
+        ks = tuple(_nvfp4_roundtrip(k, env.kv_scale_orig_quant[1]) for k in ks)
+        vs = tuple(_nvfp4_roundtrip(v, env.kv_scale_orig_quant[2]) for v in vs)
     return op.reference(
         qkv[:, : hq * d],
         torch.cat(ks).reshape(-1, hkv * d),
@@ -6939,13 +7057,14 @@ def _cell_paged(cell, arm) -> None:
     A first, uncertified context call fills each sequence's `cached` tokens;
     the certified call then appends `new` rows per sequence (P for a generation
     row) and is gated against `op.reference` over the history it should have
-    attended. Over an fp8 pool every operand that call reads went through
+    attended. Over an fp8 or NVFP4 pool every operand that call reads went through
     e4m3, except on the packed context path, which never reads the pool.
     """
     spec = cell.spec
     arm(op)
     _seed(cell)
     fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    nvfp4 = bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
     env = _PagedAttnEnv(
         num_heads=spec["num_heads"],
         num_kv_heads=spec["num_kv_heads"],
@@ -6956,7 +7075,7 @@ def _cell_paged(cell, arm) -> None:
         max_blocks_per_seq=16,
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
-        kv_scaling_factor=spec["kv_scale"] if fp8 else None,
+        kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
@@ -6991,9 +7110,10 @@ def _cell_paged(cell, arm) -> None:
     # One e4m3 flag covers the whole call: the packed path's context rows read
     # bf16, its generation rows e4m3, so a cell never mixes the two there.
     assert not (fp8 and not paged and 0 < nc < len(rids))
-    e4m3 = fp8 and (paged or nc == 0)
+    assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
+    e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3))
+    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
