@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -11,7 +11,11 @@ import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as resource_m
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2 import gen_multimodal_cache_key_tokens
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    ReuseScope,
+    gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -48,6 +52,26 @@ def test_gen_multimodal_cache_key_tokens_uses_token_offset():
     ]
 
 
+def test_multimodal_uuid_metadata_does_not_change_digest_token_identity_or_block_keys():
+    vocab_size = 1000
+    digest = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
+    uuid = "frontend-routing-identity"
+    without_uuid = gen_multimodal_cache_key_tokens(vocab_size, digest, 3)
+    with_uuid = gen_multimodal_cache_key_tokens(vocab_size, digest, 3, uuid=uuid)
+    with_other_uuid = gen_multimodal_cache_key_tokens(
+        vocab_size, digest, 3, uuid="other-routing-identity"
+    )
+
+    assert with_uuid == with_other_uuid == without_uuid
+    assert with_uuid[0].digest == digest
+    assert with_uuid[0].uuid == uuid
+    assert hash(with_uuid[0]) == hash(with_other_uuid[0]) == hash(without_uuid[0])
+    assert len({with_uuid[0], with_other_uuid[0], without_uuid[0]}) == 1
+    assert [key for _, key in sequence_to_blockchain_keys(2, ReuseScope(), with_uuid)] == [
+        key for _, key in sequence_to_blockchain_keys(2, ReuseScope(), without_uuid)
+    ]
+
+
 def test_augment_tokens_for_block_reuse_uses_exact_multimodal_runs():
     vocab_size = 1000
     digest = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
@@ -74,18 +98,22 @@ def test_augment_tokens_for_block_reuse_uses_exact_multimodal_runs():
     assert sliced == [tokens[7], mm_tokens[2], mm_tokens[3]]
 
 
-def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs():
+def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs(monkeypatch):
+    """Keep each item's UUID and token offsets across separated and sliced runs."""
     vocab_size = 1000
     digest_a = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
     digest_b = b"".join(v.to_bytes(4, "big", signed=True) for v in _OTHER_HASH_INTS)
     mm_tokens_a = gen_multimodal_cache_key_tokens(vocab_size, digest_a, 3)
     mm_tokens_b = gen_multimodal_cache_key_tokens(vocab_size, digest_b, 3)
+    generator = Mock(wraps=gen_multimodal_cache_key_tokens)
+    monkeypatch.setattr(resource_manager, "gen_multimodal_cache_key_tokens", generator)
 
     tokens = list(range(16))
     manager = _make_manager(vocab_size)
     req = _make_request(
         tokens,
         multimodal_hashes=[_HASH_INTS, _OTHER_HASH_INTS],
+        multimodal_uuids=["item-a", "item-b"],
         multimodal_positions=[1, 9],
         multimodal_lengths=[3, 3],
         multimodal_item_run_cu_offsets=[0, 2, 4],
@@ -100,16 +128,42 @@ def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs():
     assert augmented[12:14] == mm_tokens_b[1:3]
     assert augmented[3:6] == tokens[3:6]
     assert augmented[10:12] == tokens[10:12]
+    assert augmented[1].uuid == "item-a"
+    assert augmented[9].uuid == "item-b"
+    assert generator.call_args_list == [
+        call(vocab_size, digest_a, 2, token_offset=0, uuid="item-a"),
+        call(vocab_size, digest_a, 1, token_offset=2, uuid="item-a"),
+        call(vocab_size, digest_b, 1, token_offset=0, uuid="item-b"),
+        call(vocab_size, digest_b, 2, token_offset=1, uuid="item-b"),
+    ]
 
+    generator.reset_mock()
     sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=8, end=13)
     assert sliced == [tokens[8], mm_tokens_b[0], tokens[10], tokens[11], mm_tokens_b[1]]
+    assert sliced[1].uuid == "item-b"
+    assert generator.call_args_list == [
+        call(vocab_size, digest_b, 1, token_offset=0, uuid="item-b"),
+        call(vocab_size, digest_b, 1, token_offset=1, uuid="item-b"),
+    ]
+
+    generator.reset_mock()
+    continuation = KVCacheManagerV2._augment_tokens_for_block_reuse(
+        manager, tokens, req, start=2, end=7
+    )
+    assert continuation == [mm_tokens_a[1], *tokens[3:6], mm_tokens_a[2]]
+    assert generator.call_args_list == [
+        call(vocab_size, digest_a, 1, token_offset=1, uuid="item-a"),
+        call(vocab_size, digest_a, 1, token_offset=2, uuid="item-a"),
+    ]
 
 
 def test_augment_tokens_for_block_reuse_skips_out_of_slice_runs(monkeypatch):
     calls = []
 
-    def fake_gen_multimodal_cache_key_tokens(vocab_size, digest, num_tokens, token_offset=0):
-        calls.append((vocab_size, digest, num_tokens, token_offset))
+    def fake_gen_multimodal_cache_key_tokens(
+        vocab_size, digest, num_tokens, token_offset=0, uuid=None
+    ):
+        calls.append((vocab_size, digest, num_tokens, token_offset, uuid))
         return [digest, *range(vocab_size + 1, vocab_size + num_tokens)]
 
     monkeypatch.setattr(
@@ -163,7 +217,7 @@ def test_hash_to_digest_rejects_malformed_hashes():
         resource_manager._hash_to_digest([*_HASH_INTS[:-1], "8"])
 
 
-def test_augment_tokens_for_block_reuse_preserves_supplied_item_digest():
+def test_augment_tokens_for_block_reuse_preserves_supplied_item_digest_and_uuid():
     vocab_size = 1000
     tokens = list(range(8))
     manager = _make_manager(vocab_size)
@@ -188,8 +242,33 @@ def test_augment_tokens_for_block_reuse_preserves_supplied_item_digest():
     content_digest = resource_manager._hash_to_digest(_HASH_INTS)
     assert no_uuid[2:5] == gen_multimodal_cache_key_tokens(vocab_size, content_digest, 3)
     # Input preprocessing owns item identity, including any UUID contribution.
-    # The cache must use that digest without applying another UUID hash.
+    # The cache must use that digest without applying another UUID hash, while
+    # retaining the external identity independently of token equality.
     assert uuid_a == no_uuid == uuid_b
+    assert uuid_a[2].digest == content_digest
+    assert uuid_a[2].uuid == "image-a"
+    assert uuid_b[2].digest == content_digest
+    assert uuid_b[2].uuid == "image-b"
+
+
+def test_augment_tokens_for_block_reuse_handles_partial_uuid_list():
+    vocab_size = 1000
+    tokens = list(range(10))
+    manager = _make_manager(vocab_size)
+    req = _make_request(
+        tokens,
+        multimodal_hashes=[_HASH_INTS, _OTHER_HASH_INTS],
+        multimodal_positions=[1, 6],
+        multimodal_lengths=[2, 2],
+        multimodal_uuids=["first-item"],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+    )
+
+    augmented = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req)
+    assert augmented[1].uuid == "first-item"
+    assert isinstance(augmented[6], bytes)
 
 
 def test_augment_tokens_for_block_reuse_canonicalizes_adjacent_runs():
@@ -214,10 +293,12 @@ def test_augment_tokens_for_block_reuse_canonicalizes_adjacent_runs():
 
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
+    """Preserve UUID context while committing each prefill chunk only once."""
     tokens = list(range(12))
     req = _make_request(
         tokens,
         multimodal_hashes=[_HASH_INTS],
+        multimodal_uuids=["chunked-item"],
         multimodal_positions=[1],
         multimodal_lengths=[8],
         multimodal_item_run_cu_offsets=None,
@@ -247,6 +328,7 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
         py_request_id=req.py_request_id,
         is_dummy_request=False,
         multimodal_hashes=req.multimodal_hashes,
+        multimodal_uuids=req.multimodal_uuids,
         multimodal_positions=req.multimodal_positions,
         multimodal_lengths=req.multimodal_lengths,
         multimodal_item_run_cu_offsets=None,
@@ -268,6 +350,7 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
 
     digest = resource_manager._hash_to_digest(_HASH_INTS)
     assert calls == [[0, digest, 1001, 1002], [1003, 1004, 1005, 1006], [1007, 9, 10, 11]]
+    assert calls[0][1].uuid == "chunked-item"
     assert [call.kwargs for call in manager._augment_tokens_for_block_reuse.call_args_list] == [
         {"start": 0, "end": 4},
         {"start": 4, "end": 8},

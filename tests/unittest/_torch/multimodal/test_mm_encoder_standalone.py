@@ -315,7 +315,7 @@ def _expected_mm_event_hashes(inp: TextPrompt,
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
 @pytest.mark.parametrize("use_uuids", [False, True])
 def test_kv_event_mm_keys_with_uuid(use_uuids, use_kv_cache_manager_v2):
-    """V2 emits item digests; V1 preserves the optional UUID event label."""
+    """V2 emits digest plus UUID; V1 preserves the UUID as its hash label."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -372,6 +372,10 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, use_kv_cache_manager_v2):
     assert len(mm_keys_found) > 0, "Expected mm_keys in stored events"
 
     assert {mm_key["hash"] for mm_key in mm_keys_found} == expected_hashes
+    expected_uuids = {test_uuid
+                      } if use_uuids and use_kv_cache_manager_v2 else set()
+    assert {mm_key["uuid"]
+            for mm_key in mm_keys_found if "uuid" in mm_key} == expected_uuids
 
 
 def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
@@ -448,17 +452,23 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, use_kv_cache_manager_v2):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
     assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == ({uuid
+                             for uuid in uuids if uuid is not None}
+                            if use_kv_cache_manager_v2 else set())
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
@@ -514,22 +524,26 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts(use_kv_cache_manager_v2):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
     assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == (set(uuids) if use_kv_cache_manager_v2 else set())
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
 def test_kv_event_mm_keys_with_very_long_uuid(use_kv_cache_manager_v2):
-    """Long UUIDs remain intact in V1 labels and contribute to V2 digests."""
+    """Long UUIDs remain intact in V1 labels and V2 UUID fields."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -593,17 +607,21 @@ def test_kv_event_mm_keys_with_very_long_uuid(use_kv_cache_manager_v2):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
     assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == (set(uuids) if use_kv_cache_manager_v2 else set())
 
 
 @pytest.fixture(scope="module",

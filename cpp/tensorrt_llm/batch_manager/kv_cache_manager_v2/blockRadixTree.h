@@ -160,8 +160,8 @@ inline auto sequenceToBlockchainKeys(
 }
 
 // Generate multi-modal token IDs (mirrors gen_multimodal_cache_key_tokens in Python).
-std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
-    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset = 0);
+std::vector<TokenIdExt> genMultimodalCacheKeyTokens(int idOffset, std::vector<uint8_t> const& multiModalDataDigest,
+    int numTokens, int tokenOffset = 0, std::optional<std::string> uuid = std::nullopt);
 
 // ---------------------------------------------------------------------------
 // NodeBase — common base for RootBlock and Block (nodes in the radix tree).
@@ -273,10 +273,10 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
         return storage.size();
     }
 
-    //! Latest digest token in this block's prefix, when requested by the event sink.
-    std::shared_ptr<Digest const> const& getLastTokenDigest() const noexcept
+    //! Latest multimodal item context in this block's prefix, when requested by the event sink.
+    std::shared_ptr<MmItemContext const> const& getLastMmItemContext() const noexcept
     {
-        return mLastTokenDigest;
+        return mLastMmItemContext;
     }
 
     bool isFull() const noexcept
@@ -344,7 +344,7 @@ private:
     BlockOrdinal mOrdinal;
     // Share an immutable value through descendants without retaining any ancestor block.
     // Unlike prev, this context remains valid while the block is detached from the tree.
-    std::shared_ptr<Digest const> mLastTokenDigest;
+    std::shared_ptr<MmItemContext const> mLastMmItemContext;
 };
 
 // ---------------------------------------------------------------------------
