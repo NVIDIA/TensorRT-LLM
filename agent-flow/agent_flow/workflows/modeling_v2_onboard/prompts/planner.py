@@ -141,7 +141,7 @@ own git worktree. You run alongside them: every time a worker finishes, you
 are woken to read its result and extend or revise the plan while the other
 workers keep going.
 
-## What to read before planning
+## What to read while planning
 
 1. `task.yaml` — the goal, the checkpoint, the reference code, the
    `completion_criteria` the run must meet, and `implements_tips`.
@@ -164,6 +164,37 @@ workers keep going.
    where the anchor will come from (a written source, or the built-in
    implementation measured under the same protocol) — never an invented
    number.
+
+## Plan in batches
+
+Workers can start before the whole plan is written, and every minute they
+wait for it is lost. So write the plan in batches:
+
+- **First batch, before the deep reading.** Read `task.yaml`, the
+  checkpoint's `config.json` and the ModelingV2 README, then write the tasks
+  that need nothing more to be defined, and end the turn. These include:
+  - setting up the execution environment: the build, the container, the
+    GPU commands for `test_commands.md` and how to monitor long jobs;
+  - reviewing the contracts this target must meet (ModelingV2 entries,
+    CUDA-graph capture, CPU/GPU overlap) against what the checkpoint needs,
+    and recording the gaps in a task result;
+  - reference outputs from the HuggingFace implementation: per-module
+    goldens, the oracle's accuracy run;
+  - a `new_op` task for each computation that plainly has no entry at all
+    (judging whether an existing entry's `CELLS` cover it waits for a
+    later batch).
+  Also write the final task, depending on what the batch has so far; it is
+  held until `FINISH`, so it costs nothing to rewire later.
+- **Next batches, one per turn.** Each turn you write `planning: true`, you
+  are woken again as soon as it is applied. Read on (the checkpoint's
+  tensors, the reference code, the catalog's `CELLS`), add the tasks you
+  have settled and rewire the final task onto them. Workers keep running
+  the earlier batches meanwhile, and their results reach you each turn.
+- **Last batch.** Write `planning: false` once the plan holds everything
+  you can define now; from then on you are woken when workers finish.
+
+A task you add early may later turn out wrong: rewrite it while it is
+pending, or cancel it if it is running. That costs less than idle workers.
 
 ## Task tags
 
@@ -333,7 +364,7 @@ that is still in flight then goes on **beside** the main line instead.
 ## Each turn
 
 You are woken whenever one or more workers finish or a human leaves a
-message, and told which tasks finished, what every task's state is and how
+message, and right after each turn that wrote `planning: true`, and told which tasks finished, what every task's state is and how
 many slots are free.
 
 **Human messages come first.** A message from the human running this run is
@@ -375,8 +406,11 @@ summary: |
   what you changed and why
 retry: []            # FAILED tasks to run again unchanged
 cancel: []           # RUNNING tasks to stop
+planning: false      # true: the plan is not complete; wake me again at once
 ```
 
+- `planning: true` — you are still writing the plan (see Plan in batches).
+  Each such turn must add or change tasks. Not with `FINISH`.
 - `CONTINUE` — keep going.
 - `FINISH` — let shared tasks start as soon as all of their dependencies are
   `DONE`. Decide it when the main line holds every task the run should
@@ -399,6 +433,7 @@ cancel: []           # RUNNING tasks to stop
 |---|---|
 | "This coverage question is unclear; let a worker figure it out" | Read the entry's `CELLS` again. Judging coverage is your job. |
 | "Make every task depend on the previous one, to be safe" | Each spurious edge serializes work that would have run in parallel. |
+| "Read everything first, then write the whole plan" | Workers sit idle meanwhile. Write the first batch now and keep planning while it runs. |
 | "The plan is one chain: ops, target, accuracy, land" | Workers sit idle. Run independent work side by side and fill the rest with `perf` tasks. |
 | "Start the features once the accuracy gate passes" | The gate's fixes join later through a `merge`. Start the feature work now, from the same code. |
 | "One big task: implement the model" | A worker owns one outcome. Split by entry, by module, by gate. |
@@ -434,14 +469,17 @@ def build_planner_system_prompt(*, max_parallel: int) -> str:
     )
 
 
-def initial_plan_prompt(*, task_yaml: Path, plan: Path, repo: Path) -> str:
-    """The first planning turn."""
+def initial_plan_prompt(*, task_yaml: Path, plan: Path, repo: Path, turn_file: Path) -> str:
+    """The first planning turn: the first batch of the plan."""
     return (
-        f"Plan the run.\n\n"
+        f"Plan the run, starting with its first batch (see Plan in batches): no "
+        f"worker starts until you end this turn.\n\n"
         f"- The user's task: `{task_yaml}`\n"
         f"- The TensorRT-LLM checkout (read only for you): `{repo}`\n\n"
         f"Write the plan to `{plan}`. Every task gets a `### <id>` section and a "
-        f"node in the `## Execution Graph` block.\n"
+        f"node in the `## Execution Graph` block. Then end the first batch by "
+        f"writing `{turn_file}`: `decision: CONTINUE` and `planning: true` while "
+        f"more tasks are to come, `planning: false` if this is the whole plan.\n"
     )
 
 
@@ -463,6 +501,7 @@ def planner_turn_prompt(
     feedback: Sequence[str] = (),
     delivered: bool = False,
     side_wait_minutes: float = 60,
+    planning: bool = False,
 ) -> str:
     """One planner turn while the workers run.
 
@@ -486,6 +525,7 @@ def planner_turn_prompt(
         feedback: Messages from the human, oldest first.
         delivered: The final task is DONE.
         side_wait_minutes: How long side tasks may still run once it is.
+        planning: The planner said its plan is not complete yet.
     """
     lines: list[str] = []
     if feedback:
@@ -523,6 +563,13 @@ def planner_turn_prompt(
             "the work to merge (see Side tasks).",
             "",
         ]
+    if planning:
+        lines += [
+            "**You are still planning.** Add the next batch of tasks you have settled "
+            "and rewire the final task onto them; write `planning: true` to be woken "
+            "again at once, or `planning: false` once the plan is complete.",
+            "",
+        ]
     if stalled:
         lines += [
             "**The run is stalled: nothing is running and nothing can start.** Retry, "
@@ -543,7 +590,8 @@ def planner_turn_prompt(
         f"- Every result, including earlier attempts: `{results_dir}`",
         "",
         f"End the turn by writing `{turn_file}` (decision: one of "
-        f"{', '.join(PLANNER_DECISIONS)}; optional `retry` and `cancel` lists).",
+        f"{', '.join(PLANNER_DECISIONS)}; optional `retry` and `cancel` lists and "
+        f"`planning`).",
     ]
     return "\n".join(lines) + "\n"
 

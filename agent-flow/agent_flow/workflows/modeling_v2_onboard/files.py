@@ -62,12 +62,15 @@ class PlannerDecision:
         retry: ``FAILED`` tasks to run again unchanged.
         cancel: ``RUNNING`` tasks to stop; they start over unless the plan
             removes or rewrites them.
+        planning: The plan is not complete yet: the planner gets its next
+            turn as soon as this one is applied, while the workers run.
     """
 
     decision: str
     summary: str
     retry: tuple[str, ...] = ()
     cancel: tuple[str, ...] = ()
+    planning: bool = False
 
 
 @dataclass(frozen=True)
@@ -204,14 +207,19 @@ def parse_planner_decision(text: str) -> PlannerDecision:
 
     Raises:
         HandoffError: When ``decision`` is not one of :data:`PLANNER_DECISIONS`
-            or ``retry``/``cancel`` is not a list of ids.
+            or ``retry``/``cancel`` is not a list of ids, or ``planning`` is
+            not a boolean.
     """
     data = _mapping(text)
+    planning = data.get("planning", False)
+    if not isinstance(planning, bool):
+        raise HandoffError(f"`planning` must be true or false, got {planning!r}")
     return PlannerDecision(
         decision=_choice(data, "decision", PLANNER_DECISIONS),
         summary=str(data.get("summary", "")).strip(),
         retry=_ids(data, "retry"),
         cancel=_ids(data, "cancel"),
+        planning=planning,
     )
 
 

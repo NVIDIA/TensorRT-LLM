@@ -28,15 +28,20 @@ branch in the checkout.
 ## The loop
 
 ```
-plan   planner writes plan.md (errors are sent back until it validates)
+plan   planner writes the first batch of plan.md — the tasks it can define
+       before reading everything — and planner_turns/turn_0.yaml (errors are
+       sent back until both validate)
 run    every task whose dependencies are DONE starts, up to --max-parallel;
        each starts from the merged code of the tasks it depends on, and its
        changes are committed to branch node/<id>
-       whenever workers finish, the planner gets a turn (the others keep
-       running), edits plan.md and writes planner_turns/turn_<n>.yaml:
+       while the planner writes `planning: true`, it gets its next turn as
+       soon as one is applied and adds the next batch; otherwise, whenever
+       workers finish, the planner gets a turn (the others keep running),
+       edits plan.md and writes planner_turns/turn_<n>.yaml:
          decision: CONTINUE | FINISH | ABORT
-         retry:  [FAILED tasks to run again unchanged]
-         cancel: [RUNNING tasks to stop]
+         retry:    [FAILED tasks to run again unchanged]
+         cancel:   [RUNNING tasks to stop]
+         planning: true while the plan is not complete (not with FINISH)
 wrap   the final task is DONE: running side tasks get --side-wait-minutes
        (default 60) to finish, side tasks not started never start, and the
        planner may still chain another landing after the final task
@@ -60,6 +65,10 @@ branch; its earlier results are kept as `task_result_<id>.attempt<k>.md` for
 the next attempt and the planner to read. A turn that still does not validate
 after the errors are sent back three times is discarded (`plan.md` is
 restored) and the planner is told on its next turn.
+
+A planning turn must add or change tasks. A discarded turn ends planning: the
+planner's next turn waits for a worker to finish, and may write
+`planning: true` again.
 
 There is no turn limit. When nothing is running and nothing can start, the
 planner gets a stalled turn; three in a row that start nothing stop the run

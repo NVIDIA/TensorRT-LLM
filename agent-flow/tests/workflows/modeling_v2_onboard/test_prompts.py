@@ -14,6 +14,7 @@ from agent_flow.workflows.modeling_v2_onboard.prompts import (
     WorkerTask,
     build_planner_system_prompt,
     build_worker_system_prompt,
+    initial_plan_prompt,
     planner_turn_prompt,
     worker_turn_prompt,
 )
@@ -187,3 +188,32 @@ def test_planner_turn_prompt_says_when_the_run_has_delivered(tmp_path: Path):
     assert "The final task is DONE" not in planner_turn_prompt(**args)
     text = planner_turn_prompt(**args, delivered=True, side_wait_minutes=30)
     assert "The final task is DONE" in text and "up to 30 minutes" in text
+
+
+def test_the_planner_writes_its_plan_in_batches(tmp_path: Path):
+    system = build_planner_system_prompt(max_parallel=8)
+    assert "## Plan in batches" in system and "planning: false" in system
+    first = initial_plan_prompt(
+        task_yaml=tmp_path / "task.yaml",
+        plan=tmp_path / "plan.md",
+        repo=tmp_path,
+        turn_file=tmp_path / "turn_0.yaml",
+    )
+    assert f"end the first batch by writing `{tmp_path / 'turn_0.yaml'}`" in first
+    args = dict(
+        turn_file=tmp_path / "turn_1.yaml",
+        plan=tmp_path / "plan.md",
+        task_yaml=tmp_path / "task.yaml",
+        results_dir=tmp_path,
+        finished=[],
+        states=[("land", "pending")],
+        running=0,
+        ready=0,
+        max_parallel=8,
+        finish=False,
+        stalled=False,
+        resumed=False,
+        rejected=[],
+    )
+    assert "You are still planning" not in planner_turn_prompt(**args)
+    assert "You are still planning" in planner_turn_prompt(**args, planning=True)

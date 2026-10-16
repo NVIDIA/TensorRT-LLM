@@ -80,7 +80,10 @@ def _workflow(
     )
 
 
-def _plan_path(prompt: str) -> Path:
+def _first_batch(prompt: str, planning: bool = False) -> Path:
+    """Answer the first planning turn; return the plan to write."""
+    turn = Path(re.search(r"end the first batch by writing `([^`]+)`", prompt).group(1))
+    turn.write_text(yaml.safe_dump({"decision": "CONTINUE", "summary": "s", "planning": planning}))
     return Path(re.search(r"Write the plan to `([^`]+)`", prompt).group(1))
 
 
@@ -96,8 +99,8 @@ def _states(prompt: str) -> dict[str, str]:
     return dict(re.findall(r"^- `([^`]+)`: (\w+)", prompt, flags=re.MULTILINE))
 
 
-def _decide(prompt: str, decision: str = "CONTINUE", **lists: list[str]) -> None:
-    _turn_file(prompt).write_text(yaml.safe_dump({"decision": decision, "summary": "s", **lists}))
+def _decide(prompt: str, decision: str = "CONTINUE", **fields) -> None:
+    _turn_file(prompt).write_text(yaml.safe_dump({"decision": decision, "summary": "s", **fields}))
 
 
 def _is_turn(prompt: str) -> bool:
@@ -154,7 +157,7 @@ class _Workers:
 def _planner(on_turn):
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text())
+            _first_batch(prompt).write_text(_plan_text())
         elif _is_turn(prompt):
             await on_turn(agent, prompt)
 
@@ -245,7 +248,7 @@ def test_the_planner_adds_work_while_other_workers_run(tmp_path, tmp_git_repo):
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(graph))
+            _first_batch(prompt).write_text(_plan_text(graph))
             return
         states = _states(prompt)
         if "perf" not in states:
@@ -332,7 +335,7 @@ def test_a_running_task_can_be_cancelled_and_removed(tmp_path, tmp_git_repo):
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(graph))
+            _first_batch(prompt).write_text(_plan_text(graph))
             return
         if "stuck" in _states(prompt):
             _edit_plan(prompt).write_text(_plan_text(without_stuck))
@@ -371,7 +374,7 @@ def test_a_running_task_cannot_be_rewritten_without_cancelling_it(tmp_path, tmp_
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text())
+            _first_batch(prompt).write_text(_plan_text())
         elif _is_turn(prompt):
             await on_turn(agent, prompt)
         else:
@@ -468,7 +471,7 @@ def test_no_more_than_max_parallel_workers_run(tmp_path, tmp_git_repo):
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(graph))
+            _first_batch(prompt).write_text(_plan_text(graph))
         else:
             _finish_when_ready(prompt)
 
@@ -499,7 +502,7 @@ def test_free_slots_go_to_the_most_urgent_ready_task_first(tmp_path, tmp_git_rep
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(graph))
+            _first_batch(prompt).write_text(_plan_text(graph))
         else:
             _finish_when_ready(prompt)
 
@@ -511,10 +514,89 @@ def test_free_slots_go_to_the_most_urgent_ready_task_first(tmp_path, tmp_git_rep
     assert workers.order == ["a", "f", "p", "land"]
 
 
+def test_workers_start_while_the_planner_is_still_planning(tmp_path, tmp_git_repo):
+    first = """\
+  - id: env
+    type: target
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [env]
+"""
+    whole = """\
+  - id: env
+    type: target
+  - id: op
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [env, op]
+"""
+    release = asyncio.Event()
+
+    async def env(agent, prompt, attempt):
+        await release.wait()
+
+    turns: list[str] = []
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _first_batch(prompt, planning=True).write_text(_plan_text(first))
+            return
+        if "cannot be run as written" in prompt:
+            agent.fixes = [*getattr(agent, "fixes", []), prompt]
+            _edit_plan(turns[-1]).write_text(_plan_text(whole))
+            return
+        turns.append(prompt)
+        if len(turns) == 1:
+            # Woken at once, with the first batch already running.
+            assert "You are still planning" in prompt
+            assert _states(prompt)["env"] == "running"
+            release.set()
+            await _until(lambda: _task_state(tmp_path, "env") == "done")
+            # A planning turn that changes nothing is sent back.
+            _decide(prompt, planning=True)
+        elif len(turns) == 2:
+            assert "Finished since your last turn:\n- `env` DONE" in prompt
+            _decide(prompt, planning=False)
+        else:
+            assert "You are still planning" not in prompt
+            _finish_when_ready(prompt)
+
+    factory = FakeFactory(planner=planner, worker=_Workers(env=env))
+    assert _workflow(tmp_path, tmp_git_repo, factory).run() == RunOutcome.SUCCEEDED
+    (planner_agent,) = [a for a in factory.agents if a.name == "planner"]
+    assert "changes nothing" in planner_agent.fixes[0]
+    assert (tmp_git_repo / "op.txt").is_file()
+
+
+def test_planning_cannot_finish(tmp_path, tmp_git_repo):
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _first_batch(prompt).write_text(_plan_text())
+            turn = tmp_path / "ws" / "planner_turns" / "turn_0.yaml"
+            turn.write_text("decision: FINISH\nplanning: true\n")
+        elif "cannot be run as written" in prompt:
+            assert "`planning: true` with `FINISH`" in prompt
+            turn = tmp_path / "ws" / "planner_turns" / "turn_0.yaml"
+            turn.write_text("decision: FINISH\nplanning: false\n")
+        else:
+            _finish_when_ready(prompt)
+
+    workers = _Workers()
+    factory = FakeFactory(planner=planner, worker=workers)
+    assert _workflow(tmp_path, tmp_git_repo, factory).run() == RunOutcome.SUCCEEDED
+    # FINISH in the first batch lets the final task start as soon as it can.
+    assert workers.order[-1] == "land"
+
+
 def test_an_invalid_plan_is_sent_back_until_it_validates(tmp_path, tmp_git_repo):
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            plan = _plan_path(prompt)
+            plan = _first_batch(prompt)
             plan.write_text("# Plan\n\nno graph yet\n")
             agent.plan_path = plan
         elif "cannot be run as written" in prompt:
@@ -617,7 +699,7 @@ def test_a_human_message_wakes_the_planner_and_is_acted_on(tmp_path, tmp_git_rep
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(graph))
+            _first_batch(prompt).write_text(_plan_text(graph))
             return
         turns.append(prompt)
         if "busywork is useless" in prompt:
@@ -691,7 +773,7 @@ def test_side_work_lands_beside_the_run_and_is_listed(tmp_path, tmp_git_repo):
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(_SIDE_GRAPH, notes={"s": "Fuse the MoE."}))
+            _first_batch(prompt).write_text(_plan_text(_SIDE_GRAPH, notes={"s": "Fuse the MoE."}))
         else:
             await _finish_once_done("a")(agent, prompt)
 
@@ -726,7 +808,7 @@ def test_side_work_still_running_is_stopped_after_the_wait(tmp_path, tmp_git_rep
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(_SIDE_GRAPH))
+            _first_batch(prompt).write_text(_plan_text(_SIDE_GRAPH))
         else:
             await _finish_once_done("a")(agent, prompt)
 
@@ -776,7 +858,7 @@ def test_side_work_is_merged_after_landing_when_asked(tmp_path, tmp_git_repo):
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(_plan_text(side_only))
+            _first_batch(prompt).write_text(_plan_text(side_only))
             return
         turns.append(prompt)
         states = _states(prompt)
@@ -830,7 +912,7 @@ def test_a_cancelled_final_task_leaves_the_checkout_as_it_found_it(tmp_path, tmp
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _plan_path(prompt).write_text(
+            _first_batch(prompt).write_text(
                 _plan_text(
                     _SIDE_GRAPH.replace(
                         "  - id: t\n    type: perf\n    depends_on: [s]\n    side: true\n", ""

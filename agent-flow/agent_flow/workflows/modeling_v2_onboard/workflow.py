@@ -3,9 +3,12 @@
 
 """The planner/worker loop: the planner runs alongside the workers.
 
-    plan   planner writes plan.md (re-prompted until it validates)
+    plan   planner writes the first batch of plan.md (re-prompted until it
+           validates): the tasks it can define before reading everything
     run    every task whose dependencies are DONE starts at once, up to
            max_parallel, each with its own worker in its own git worktree.
+           While the planner says it is still planning, it gets its next
+           turn as soon as one is applied and adds the tasks it has settled.
            Whenever workers finish, the planner is woken with their results
            and may, while the others keep running:
              - add tasks, or rewrite, rewire or remove tasks not yet started;
@@ -107,6 +110,8 @@ class _State:
     outcome: str | None = None
     turn: int = 0
     finish: bool = False
+    # The planner is still writing the plan: it gets its next turn at once.
+    planning: bool = False
     tasks: dict[str, NodeState] = field(default_factory=dict)
     # Tasks that finished since the planner's last turn: (id, status, summary).
     finished: list[tuple[str, str, str]] = field(default_factory=list)
@@ -134,6 +139,7 @@ class _State:
             outcome=data.get("outcome"),
             turn=data["turn"],
             finish=data["finish"],
+            planning=data.get("planning", False),
             tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
             finished=[tuple(item) for item in data.get("finished", [])],
             landing_base=data.get("landing_base", {}),
@@ -157,6 +163,13 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
     )
+
+
+def _decision_problems(decision: PlannerDecision) -> list[str]:
+    """What is wrong with a turn file on its own, whatever the task states."""
+    if decision.planning and decision.decision == "FINISH":
+        return ["`planning: true` with `FINISH`: decide FINISH once the plan is complete"]
+    return []
 
 
 def _result_summary(path: Path) -> str | None:
@@ -517,11 +530,25 @@ class ModelingV2OnboardWorkflow:
         return self.layout.plan_path.read_text(encoding="utf-8")
 
     async def _initial_plan(self) -> None:
+        state = self._state
+        turn_file = self.layout.turn_path(0)
+        turn_file.unlink(missing_ok=True)
+
         def check() -> None:
             plan = parse_plan(self._read_plan_md())
+            decision = read_handoff(turn_file, parse_planner_decision)
+            problems = _decision_problems(decision)
+            if decision.retry or decision.cancel:
+                problems.append("`retry` and `cancel`: no task has run yet")
+            if problems:
+                raise PlanError(problems)
             self._adopt(plan)
-            self._state.tasks = {node.id: NodeState.PENDING for node in plan.graph.nodes}
-            self._state.phase = "run"
+            state.tasks = {node.id: NodeState.PENDING for node in plan.graph.nodes}
+            state.planning = decision.planning
+            state.finish = decision.decision == "FINISH"
+            if decision.decision == "ABORT":
+                self._outcome = RunOutcome.ABORTED
+            state.phase = "run"
             self._save()
 
         print_rule("[bold magenta]Plan[/bold magenta]", self._log)
@@ -530,16 +557,18 @@ class ModelingV2OnboardWorkflow:
                 task_yaml=self.layout.task_path,
                 plan=self.layout.plan_path,
                 repo=self.repo_path,
+                turn_file=turn_file,
             ),
             check,
         )
-        print_message(f"plan: {len(self._plan.graph.nodes)} tasks", self._log)
+        more = "; planning continues while they run" if state.planning else ""
+        print_message(f"plan: {len(self._plan.graph.nodes)} tasks{more}", self._log)
 
     def _validate(self, turn_file: Path) -> _Change:
         """Check the planner's turn against the current task states."""
         decision = read_handoff(turn_file, parse_planner_decision)
         tasks = self._state.tasks
-        problems: list[str] = []
+        problems = _decision_problems(decision)
         for tid in decision.cancel:
             if tasks.get(tid) != NodeState.RUNNING:
                 state = tasks[tid].value if tid in tasks else "not in the plan"
@@ -560,6 +589,16 @@ class ModelingV2OnboardWorkflow:
                 plan = parse_plan(text, previous=self._plan, states=effective)
             except PlanError as exc:
                 problems += exc.problems
+        elif (
+            self._state.planning
+            and decision.planning
+            and not decision.retry
+            and not decision.cancel
+        ):
+            problems.append(
+                "`planning: true` but this turn changes nothing: add the tasks you have "
+                "settled, or write `planning: false` if the plan is complete"
+            )
         if problems:
             raise PlanError(problems)
 
@@ -594,6 +633,7 @@ class ModelingV2OnboardWorkflow:
         for node in change.plan.graph.nodes:
             if node.id not in tasks:
                 self._set(node.id, NodeState.PENDING)
+        self._state.planning = change.decision.planning
         if change.decision.decision == "FINISH":
             self._state.finish = True
         if change.decision.decision == "ABORT":
@@ -660,6 +700,7 @@ class ModelingV2OnboardWorkflow:
             ready=len(self._ready()),
             max_parallel=self.max_parallel,
             finish=state.finish,
+            planning=state.planning,
             delivered=self._delivered(),
             side_wait_minutes=self.side_wait_minutes,
             stalled=stalled,
@@ -678,8 +719,11 @@ class ModelingV2OnboardWorkflow:
         try:
             await self._converse(prompt, check)
         except PlanError as exc:
-            # Keep running the current plan; the planner hears why next turn.
+            # Keep running the current plan; the planner hears why next turn,
+            # which waits for a worker to finish even while it was planning.
             self._rejected = exc.problems
+            state.planning = False
+            self._save()
             self.layout.plan_path.write_text(self._plan.text, encoding="utf-8")
             print_message("[yellow]planner turn discarded[/yellow]", self._log)
             return
@@ -721,8 +765,9 @@ class ModelingV2OnboardWorkflow:
                     seconds = self.side_wait_minutes * 60
                     self._deadline = asyncio.create_task(self._stop_side_after(seconds))
             finished = bool(self._state.finished)
-            stalled = self._idle() and not finished and not feedback
-            if not (finished or feedback or stalled or resumed):
+            planning = self._state.planning
+            stalled = self._idle() and not finished and not feedback and not planning
+            if not (finished or feedback or stalled or resumed or planning):
                 self._wake.clear()
                 await self._wake.wait()
                 continue

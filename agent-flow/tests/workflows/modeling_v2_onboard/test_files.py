@@ -44,6 +44,10 @@ def test_planner_decision_is_validated():
         parse_planner_decision("decision: REVISED\n")
     with pytest.raises(HandoffError, match="`cancel` must be a list"):
         parse_planner_decision("decision: CONTINUE\ncancel: p\n")
+    assert not parse_planner_decision("decision: CONTINUE\n").planning
+    assert parse_planner_decision("decision: CONTINUE\nplanning: true\n").planning
+    with pytest.raises(HandoffError, match="`planning` must be true or false"):
+        parse_planner_decision("decision: CONTINUE\nplanning: later\n")
 
 
 def test_missing_handoff_file_is_an_error(tmp_path):
