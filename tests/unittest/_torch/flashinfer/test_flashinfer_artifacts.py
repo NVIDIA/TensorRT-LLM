@@ -18,6 +18,7 @@ import importlib
 import inspect
 import pickle
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import FunctionType, ModuleType
@@ -233,6 +234,20 @@ def test_fetch_that_failed_before_the_block_is_not_reported(fake_flashinfer):
             fake_flashinfer.run_kernel()
 
     assert type(excinfo.value) is RuntimeError
+
+
+def test_fetch_that_failed_in_another_thread_is_not_reported(fake_flashinfer, logged):
+    other_thread = threading.Thread(target=fake_flashinfer.fetch, args=(_CUBIN,))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        with raise_on_flashinfer_artifact_failure():
+            other_thread.start()
+            other_thread.join()
+            fake_flashinfer.run_kernel()
+
+    assert type(excinfo.value) is RuntimeError
+    (message,) = logged["error"]
+    assert _CUBIN in message
 
 
 def test_error_survives_pickling(fake_flashinfer):

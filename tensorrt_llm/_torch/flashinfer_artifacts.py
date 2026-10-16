@@ -164,7 +164,7 @@ class _ArtifactFetchMonitor:
         self._get_artifact = get_artifact
         self._lock = threading.Lock()
         self._failure_count = 0
-        self._recent_failures: collections.deque[tuple[int, FlashInferArtifactFailure]] = (
+        self._recent_failures: collections.deque[tuple[int, int, FlashInferArtifactFailure]] = (
             collections.deque(maxlen=_RECENT_FAILURE_LIMIT)
         )
 
@@ -185,16 +185,22 @@ class _ArtifactFetchMonitor:
             return self._failure_count
 
     def failures_since(self, mark: int) -> tuple[FlashInferArtifactFailure, ...]:
-        """Return the distinct fetches that failed after ``mark`` was taken, oldest first."""
+        """Return the distinct fetches by this thread that failed after ``mark``, oldest first."""
+        thread_id = threading.get_ident()
         with self._lock:
-            failures = [failure for number, failure in self._recent_failures if number > mark]
+            failures = [
+                failure
+                for number, failure_thread_id, failure in self._recent_failures
+                if number > mark and failure_thread_id == thread_id
+            ]
         return tuple(dict.fromkeys(failures))
 
     def _record(self, file_name: str, reason: str) -> None:
         failure = FlashInferArtifactFailure(file_name=file_name, reason=reason)
+        thread_id = threading.get_ident()
         with self._lock:
             self._failure_count += 1
-            self._recent_failures.append((self._failure_count, failure))
+            self._recent_failures.append((self._failure_count, thread_id, failure))
         logger.error(
             f"FlashInfer could not fetch {file_name}: {reason.rstrip('.')}. "
             f"{_describe_source(self.source)}"
@@ -300,10 +306,11 @@ def raise_on_flashinfer_artifact_failure() -> Iterator[None]:
     whose cause it is. Any other error propagates unchanged, so a failure elsewhere,
     such as running out of memory while capturing a CUDA graph, is not blamed on a
     fetch that an autotuner tolerated; the monitor has already logged that fetch.
-    Only fetches inside the block count, so an error is not blamed on a failure
-    from before the block. A block that completes returns normally even if a fetch
-    failed inside it: an autotuner skips a tactic whose kernel cannot be loaded.
-    Does nothing until the monitor is installed.
+    Only fetches that this thread makes inside the block count, so an error is not
+    blamed on a failure from before the block or from another thread. A block that
+    completes returns normally even if a fetch failed inside it: an autotuner skips
+    a tactic whose kernel cannot be loaded. Does nothing until the monitor is
+    installed.
 
     Raises:
         FlashInferArtifactUnavailableError: FlashInfer raised an error in the block
