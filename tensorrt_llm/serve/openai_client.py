@@ -432,6 +432,15 @@ class OpenAIHttpClient(OpenAIClient):
                                 role,
                                 response_metrics,
                             )
+                    if http_response.status >= 400:
+                        error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -454,15 +463,6 @@ class OpenAIHttpClient(OpenAIClient):
                                 lines_yielded += 1
                                 yield line
                     else:
-                        if http_response.status >= 400:
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict

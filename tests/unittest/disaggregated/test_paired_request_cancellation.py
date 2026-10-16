@@ -3,7 +3,6 @@
 
 import asyncio
 from contextlib import AsyncExitStack
-from typing import Literal
 from unittest import mock
 
 import aiohttp
@@ -17,18 +16,14 @@ from starlette.types import Message
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
-from tensorrt_llm.serve.openai_protocol import (
-    CompletionRequest,
-    CompletionResponse,
-    CompletionResponseChoice,
-    DisaggregatedParams,
-    UsageInfo,
-)
+from tensorrt_llm.serve.openai_protocol import CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.responses_utils import UCompletionResponseOrGenerator
 from tensorrt_llm.serve.router import Router
@@ -37,12 +32,21 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("context_outcome", ["error", "cancelled"])
-async def test_context_termination_reaches_paired_worker_abort(
+@pytest.mark.parametrize(
+    ("stream", "failed_role", "sse_error"),
+    [
+        (False, ServerRole.CONTEXT, False),
+        (True, ServerRole.CONTEXT, False),
+        (False, ServerRole.GENERATION, False),
+        (True, ServerRole.GENERATION, False),
+        (True, ServerRole.GENERATION, True),
+    ],
+)
+async def test_http_failure_reaches_paired_worker_abort(
     monkeypatch: pytest.MonkeyPatch,
     stream: bool,
-    context_outcome: Literal["error", "cancelled"],
+    failed_role: ServerRole,
+    sse_error: bool,
 ) -> None:
     """Exercise HTTP disconnect through the worker's real abort entry points.
 
@@ -52,9 +56,9 @@ async def test_context_termination_reaches_paired_worker_abort(
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
     monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
     monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", mock.Mock())
-    gen_started = asyncio.Event()
+    sibling_started = asyncio.Event()
     engine_cancelled = asyncio.Event()
-    gen_finished = asyncio.Event()
+    sibling_finished = asyncio.Event()
     engine = mock.Mock()
     engine.can_enqueue_requests.return_value = True
     engine.cancel_request.side_effect = lambda request_id: engine_cancelled.set()
@@ -62,38 +66,60 @@ async def test_context_termination_reaches_paired_worker_abort(
     worker.doing_shutdown = True
     worker.engine = engine
     worker._client_id_to_request_id = {42: 101}
-    generation_request = GenerationRequest([1], SamplingParams(), streaming=stream)
+    generation_request = GenerationRequest(
+        [1], SamplingParams(), streaming=stream and failed_role == ServerRole.CONTEXT
+    )
     generation_request.id = 42
     promise = GenerationResult(generation_request, executor=worker)
     server = object.__new__(OpenAIServer)
     watchers: list[asyncio.Task[None]] = []
-
-    async def context_handler(http_request: web.Request) -> web.Response:
-        """Return the CTX outcome only after GEN has accepted its request."""
-        await http_request.read()
-        await asyncio.wait_for(gen_started.wait(), timeout=5)
-        if context_outcome == "error":
-            return web.Response(status=500, text="context failed before transfer")
-        response = CompletionResponse(
-            model="test-model",
-            usage=UsageInfo(prompt_tokens=1, completion_tokens=0, total_tokens=1),
-            choices=[
-                CompletionResponseChoice(
-                    index=0,
-                    text="",
-                    finish_reason="cancelled",
-                    disaggregated_params=DisaggregatedParams(
-                        request_type="context_only", disagg_request_id=42, ctx_request_id=42
-                    ),
-                )
-            ],
+    error_message = (
+        "context failed before transfer"
+        if failed_role == ServerRole.CONTEXT
+        else context_length_exceeded_message(2048, 4096)
+    )
+    error_status = 500 if failed_role == ServerRole.CONTEXT else 400
+    error_event = (
+        b"data: "
+        + msgspec.json.encode(
+            {
+                "error": {
+                    "message": "generation executor failed",
+                    "type": "server_error",
+                    "code": None,
+                    "param": None,
+                }
+            }
         )
-        return web.json_response(response.model_dump(mode="json"))
+        + b"\n\n"
+    )
+    done_event = b"data: [DONE]\n\n"
 
-    async def generation_handler(http_request: web.Request) -> web.Response:
+    async def failure_handler(http_request: web.Request) -> web.StreamResponse:
+        """Reject only after the paired worker has accepted its request."""
+        await http_request.read()
+        await asyncio.wait_for(sibling_started.wait(), timeout=5)
+        if sse_error:
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(http_request)
+            await response.write(error_event)
+            # The service must cancel CTX on the error event, not at GEN EOF.
+            await asyncio.wait_for(engine_cancelled.wait(), timeout=5)
+            await response.write(done_event)
+            await response.write_eof()
+            return response
+        if failed_role == ServerRole.CONTEXT:
+            return web.Response(status=error_status, text=error_message)
+        error_response = OpenAIServer.create_error_response(error_message)
+        return web.Response(
+            status=error_status, body=error_response.body, content_type="application/json"
+        )
+
+    async def pending_handler(http_request: web.Request) -> web.Response:
         """Bridge the actual HTTP socket state to Starlette's disconnect API."""
         body = msgspec.msgpack.decode(await http_request.read())
-        assert body["disaggregated_params"]["ctx_request_id"] == 42
+        pairing_key = "ctx_request_id" if failed_role == ServerRole.CONTEXT else "disagg_request_id"
+        assert body["disaggregated_params"][pairing_key] == 42
         transport = http_request.transport
         assert transport is not None
 
@@ -106,12 +132,12 @@ async def test_context_termination_reaches_paired_worker_abort(
         raw_request = Request({"type": "http", "headers": []}, receive=receive)
         watcher = asyncio.create_task(server.await_disconnected(raw_request, promise))
         watchers.append(watcher)
-        gen_started.set()
+        sibling_started.set()
         try:
-            await watcher
+            await asyncio.shield(watcher)
             return web.Response(status=499)
         finally:
-            gen_finished.set()
+            sibling_finished.set()
 
     config = DisaggServerConfig(server_configs=[], schedule_style="generation_first")
     coordinator = DisaggCoordinatorService(config, client_factory=mock.Mock())
@@ -121,12 +147,14 @@ async def test_context_termination_reaches_paired_worker_abort(
     request_task: asyncio.Task[UCompletionResponseOrGenerator] | None = None
     async with AsyncExitStack() as stack:
         session = await stack.enter_async_context(aiohttp.ClientSession())
-        for role, handler, router_attr, client_attr in (
-            (ServerRole.CONTEXT, context_handler, "_ctx_router", "_ctx_client"),
-            (ServerRole.GENERATION, generation_handler, "_gen_router", "_gen_client"),
+        for role, router_attr, client_attr in (
+            (ServerRole.CONTEXT, "_ctx_router", "_ctx_client"),
+            (ServerRole.GENERATION, "_gen_router", "_gen_client"),
         ):
             app = web.Application()
-            app.router.add_post("/v1/completions", handler)
+            app.router.add_post(
+                "/v1/completions", failure_handler if role == failed_role else pending_handler
+            )
             endpoint = await stack.enter_async_context(TestServer(app))
             router = mock.AsyncMock(spec=Router)
             router.get_next_server.return_value = (
@@ -145,18 +173,27 @@ async def test_context_termination_reaches_paired_worker_abort(
                     CompletionRequest(model="test-model", prompt="hello", stream=stream)
                 )
             )
-            if context_outcome == "error":
-                with pytest.raises(aiohttp.ClientResponseError, match="context failed"):
-                    await asyncio.wait_for(asyncio.shield(request_task), timeout=3)
-            else:
+            if sse_error:
                 response = await asyncio.wait_for(asyncio.shield(request_task), timeout=3)
-                if stream:
-                    assert [chunk async for chunk in response] == [b"data: [DONE]\n\n"]
-                else:
-                    assert response.choices[0].finish_reason == "cancelled"
+
+                async def read_stream() -> bytes:
+                    return b"".join([chunk async for chunk in response])
+
+                assert await asyncio.wait_for(read_stream(), timeout=3) == error_event + done_event
+            else:
+                with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+                    await asyncio.wait_for(asyncio.shield(request_task), timeout=3)
+                assert exc_info.value.status == error_status
+                assert error_message in exc_info.value.message
+                if failed_role == ServerRole.GENERATION:
+                    disagg_server = object.__new__(OpenAIDisaggServer)
+                    disagg_server._perf_metrics_collector = mock.Mock()
+                    response = disagg_server._handle_exception(exc_info.value)
+                    assert response.status_code == 400
+                    assert msgspec.json.decode(response.body)["code"] == "context_length_exceeded"
 
             await asyncio.wait_for(engine_cancelled.wait(), timeout=3)
-            await asyncio.wait_for(gen_finished.wait(), timeout=3)
+            await asyncio.wait_for(sibling_finished.wait(), timeout=3)
             engine.cancel_request.assert_called_once_with(101)
             assert promise.aborted()
             assert not promise.finished

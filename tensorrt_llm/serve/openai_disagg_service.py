@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
+import re
 from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
@@ -26,7 +28,9 @@ from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     CompletionRequest,
+    CompletionResponse,
     DisaggregatedParams,
     DisaggScheduleStyle,
     UCompletionRequest,
@@ -43,6 +47,41 @@ from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareR
 # Finish reasons for which a GEN handoff is still pending; any other reason means
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
+
+
+class _SseErrorObserver:
+    """Observe worker error events without changing the forwarded SSE bytes."""
+
+    _EVENT_END = re.compile(rb"\r?\n\r?\n")
+
+    def __init__(self) -> None:
+        """Retain only the incomplete event between network chunks."""
+        self._pending = b""
+
+    def feed(self, chunk: str | bytes) -> bool:
+        """Report a complete top-level error event in LF/CRLF worker SSE.
+
+        Args:
+            chunk: Original stream data, possibly splitting an event or UTF-8 character.
+
+        Returns:
+            Whether a complete event contains the worker's JSON error envelope.
+        """
+        self._pending += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        while match := self._EVENT_END.search(self._pending):
+            event, self._pending = self._pending[: match.start()], self._pending[match.end() :]
+            data = b"\n".join(
+                line[5:].removeprefix(b" ")
+                for line in event.splitlines()
+                if line.startswith(b"data:")
+            )
+            try:
+                payload = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                return True
+        return False
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -421,7 +460,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _send_disagg_request_gen_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> UCompletionResponse:
+    ) -> UCompletionResponseOrGenerator:
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -450,7 +489,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         )
         self._strip_gen_subagent_affinity(gen_req)
 
-        if request.stream and need_ctx:
+        if not need_ctx:
+            return await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+            )
+
+        if request.stream:
             # For streaming gen_first requests, the gen client returns a lazy
             # async generator whose HTTP POST only fires when iterated. The ctx
             # server blocks waiting for the gen server's rx session (gen_first
@@ -465,40 +509,64 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
 
             queue: asyncio.Queue = asyncio.Queue()
+            gen_error: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            error_observer = _SseErrorObserver()
 
             async def _consume_gen():
                 try:
                     async for chunk in gen_response:
                         await queue.put(chunk)
-                except Exception as e:
-                    await queue.put(e)
-                await queue.put(None)  # sentinel
+                        if not gen_error.done() and error_observer.feed(chunk):
+                            gen_error.set_result(None)
+                finally:
+                    queue.put_nowait(None)  # sentinel; the task retains any error
 
             consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
-
-            async def _close_gen_response() -> None:
-                if not consume_task.done():
-                    consume_task.cancel()
-                try:
-                    await consume_task
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    # Cancellation can occur before _consume_gen ever starts,
-                    # so waiting for its task does not necessarily close GEN.
-                    await gen_response.aclose()
-
-            # Now send ctx request — gen server has received its request
-            try:
-                await self._ctx_client.send_request(
+            ctx_task = asyncio.create_task(
+                self._ctx_client.send_request(
                     ctx_req,
                     server=ctx_server,
                     hooks=hooks,
                     req_id=disagg_request_id,
                 )
+            )
+            tasks = (ctx_task, consume_task)
+
+            async def _close_gen_response() -> None:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                try:
+                    # Drain without replacing the error that triggered cleanup.
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    # Cancellation can occur before _consume_gen ever starts,
+                    # so waiting for its task does not necessarily close GEN.
+                    await gen_response.aclose()
+
+            try:
+                completed, _ = await asyncio.wait(
+                    (*tasks, gen_error), return_when=asyncio.FIRST_COMPLETED
+                )
+                if ctx_task in completed:
+                    ctx_task.result()
+                if consume_task in completed:
+                    consume_task.result()
+                if gen_error.done() and not ctx_task.done():
+                    # In-band failure closes CTX, but the original GEN error
+                    # stream still belongs to the caller, including its [DONE].
+                    ctx_task.cancel()
+                    await asyncio.gather(ctx_task, return_exceptions=True)
+                    if not ctx_task.cancelled():
+                        ctx_task.result()
+                else:
+                    # Normal GEN completion does not replace the CTX result.
+                    await ctx_task
             except (Exception, asyncio.CancelledError):
                 await _close_gen_response()
                 raise
+            finally:
+                gen_error.cancel()
 
             async def _yield_from_queue():
                 try:
@@ -507,9 +575,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                     while True:
                         item = await queue.get()
                         if item is None:
+                            await consume_task
                             break
-                        if isinstance(item, Exception):
-                            raise item
                         yield item
                 finally:
                     await _close_gen_response()
@@ -518,29 +585,49 @@ class OpenAIDisaggregatedService(OpenAIService):
             await response.__anext__()
             return response
         else:
-            # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
-            # through generator consumption, so asyncio.gather works fine.
-            tasks = []
-            if need_ctx:
-                tasks.append(
-                    asyncio.create_task(
-                        self._ctx_client.send_request(
-                            ctx_req,
-                            server=ctx_server,
-                            hooks=hooks,
-                            req_id=disagg_request_id,
-                        )
-                    )
-                )
-            tasks.append(
-                asyncio.create_task(
-                    self._gen_client.send_request(
-                        gen_req,
-                        server=gen_server,
-                        hooks=hooks,
-                        req_id=disagg_request_id,
-                    )
+            ctx_task = asyncio.create_task(
+                self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
             )
-            responses = await asyncio.gather(*tasks)
-            return responses[-1]
+            gen_task = asyncio.create_task(
+                self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            )
+            tasks = (ctx_task, gen_task)
+            try:
+                completed, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if gen_task in completed and ctx_task not in completed:
+                    # Preserve prompt GEN failure reporting while CTX is still waiting.
+                    gen_task.result()
+                try:
+                    # Keep caller cancellation distinct from a CTX cleanup error.
+                    # The outer finally still cancels and drains pending work.
+                    await asyncio.shield(ctx_task)
+                except Exception as ctx_error:
+                    if (
+                        not gen_task.done()
+                        or gen_task.cancelled()
+                        or gen_task.exception() is not None
+                    ):
+                        raise
+                    gen_response = gen_task.result()
+                    if not isinstance(gen_response, (CompletionResponse, ChatCompletionResponse)):
+                        raise
+                    # Keep the completed response and its original finish reason;
+                    # HTTP outcome handling does not settle physical KV ownership.
+                    logger.warning(
+                        "CTX request %s failed after GEN returned a complete response: %s",
+                        disagg_request_id,
+                        ctx_error,
+                    )
+                    return gen_response
+                return await gen_task
+            finally:
+                # Closing the HTTP leg requests worker cancellation. It does not
+                # authorize reuse of KV memory still owned by a physical transfer.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
