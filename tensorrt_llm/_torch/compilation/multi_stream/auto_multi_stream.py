@@ -21,8 +21,8 @@ from queue import PriorityQueue
 from typing import Dict, List, Optional
 
 import torch
-from torch._higher_order_ops.auto_functionalize import (
-    auto_functionalized, auto_functionalized_v2)
+from torch._higher_order_ops.auto_functionalize import (auto_functionalized,
+                                                        auto_functionalized_v2)
 from torch.fx import Graph, GraphModule, Node
 
 from tensorrt_llm.logger import logger
@@ -75,7 +75,6 @@ _TRTLLM_OP_COSTS = (
         "fp8_block_scale_moe_runner",
         "mxfp8_block_scale_moe_runner",
         "fused_moe",
-        "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
         "cute_dsl_megamoe_nvfp4_blackwell",
     )),
     (GROUPED_GEMM_COST, (
@@ -127,9 +126,7 @@ _TRTLLM_OP_COSTS = (
         "mnnvl_moe_alltoallv",
         "mnnvl_moe_alltoallv_combine",
     )),
-    (MOE_SORT_COST, (
-        "moe_sort",
-    )),
+    (MOE_SORT_COST, ("moe_sort", )),
     (ROUTING_OP_COST, (
         "renorm_moe_routing_op",
         "default_moe_routing_op",
@@ -611,27 +608,44 @@ def _dump_schedule(dag: "MultiStreamDAG", directory: str) -> None:
             if isinstance(val, torch.Tensor):
                 shape = [str(d) for d in val.shape] + [str(val.dtype)]
             elif isinstance(val, (tuple, list)):
-                shape = [[str(d) for d in t.shape] + [str(t.dtype)]
-                         if isinstance(t, torch.Tensor) else str(t) for t in val]
+                shape = [
+                    [str(d) for d in t.shape] +
+                    [str(t.dtype)] if isinstance(t, torch.Tensor) else str(t)
+                    for t in val
+                ]
             nodes.append({
-                "name": node.name,
-                "op": node.op,
-                "target": target,
-                "shape": shape,
-                "weight": v.weight,
-                "distance": v.distance,
-                "stream": None if v.stream is None else v.stream.id,
-                "end_time": v.end_time,
-                "in_edges": [e.node.name for e in v.in_edges.values() if e.node is not None],
-                "waits_on": [e.node.name for e, _ in v.wait_on if e.node is not None],
+                "name":
+                node.name,
+                "op":
+                node.op,
+                "target":
+                target,
+                "shape":
+                shape,
+                "weight":
+                v.weight,
+                "distance":
+                v.distance,
+                "stream":
+                None if v.stream is None else v.stream.id,
+                "end_time":
+                v.end_time,
+                "in_edges": [
+                    e.node.name for e in v.in_edges.values()
+                    if e.node is not None
+                ],
+                "waits_on":
+                [e.node.name for e, _ in v.wait_on if e.node is not None],
             })
-        fn = os.path.join(
-            directory,
-            f"piece_{os.getpid()}_{_dump_schedule.counter}.json")
+        fn = os.path.join(directory,
+                          f"piece_{os.getpid()}_{_dump_schedule.counter}.json")
         _dump_schedule.counter += 1
         with open(fn, "w") as f:
-            json.dump({"streams": [len(st.nodes) for st in dag.streams],
-                       "nodes": nodes}, f)
+            json.dump(
+                {
+                    "streams": [len(st.nodes) for st in dag.streams],
+                    "nodes": nodes
+                }, f)
         logger.debug(f"multi-stream schedule dumped to {fn}")
     except Exception as e:  # never let a debug dump break compilation
         logger.warning(f"multi-stream schedule dump failed: {e}")
