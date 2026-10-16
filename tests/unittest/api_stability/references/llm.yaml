@@ -139,7 +139,7 @@ methods:
         default: null
         status: prototype
       checkpoint_format:
-        annotation: Optional[str]
+        annotation: Union[tensorrt_llm.checkpoint_format.CheckpointFormat, str, NoneType]
         default: null
         status: prototype
       checkpoint_io_policy:

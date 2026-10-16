@@ -18,12 +18,13 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 from ..base_weight_mapper import BaseWeightMapper
 
 
-@register_mapper("MX")
-@register_mapper("HF")
+@register_mapper(CheckpointFormat.MX)
+@register_mapper(CheckpointFormat.HF)
 class HfWeightMapper(BaseWeightMapper):
 
     def __init__(self):

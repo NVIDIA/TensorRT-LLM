@@ -35,6 +35,7 @@ from tensorrt_llm._torch.weight_sharing import (
     SourceIdentity,
     maybe_write_weight_manifest,
 )
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -63,11 +64,11 @@ def _maybe_write_mx_transfer_manifest(model: "nn.Module", *, rank: int, boundary
         model,
         family="transfer",
         rank=rank,
-        context={"boundary": boundary, "checkpoint_format": "MX"},
+        context={"boundary": boundary, "checkpoint_format": CheckpointFormat.MX.value},
     )
 
 
-@register_checkpoint_loader("MX")
+@register_checkpoint_loader(CheckpointFormat.MX)
 class MXCheckpointLoader(HfCheckpointLoader):
     """Load a TRT-LLM shard through ModelExpress, with native HF fallback."""
 
@@ -84,7 +85,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
             weight_mapper=weight_mapper,
             config_loader=config_loader,
         )
-        self._checkpoint_format = "MX"
+        self._checkpoint_format = CheckpointFormat.MX
         self._mx_server_url = mx_server_url
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
@@ -94,8 +95,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._mx_loader = None
 
     @property
-    def checkpoint_format(self) -> str:
-        return "MX"
+    def checkpoint_format(self) -> CheckpointFormat:
+        return CheckpointFormat.MX
 
     @property
     def mx_server_url(self) -> Optional[str]:

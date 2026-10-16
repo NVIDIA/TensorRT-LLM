@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 from .._torch.async_llm import AsyncLLM
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -69,6 +71,7 @@ __all__ = [
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
     'CheckpointIOPolicy',
+    'CheckpointFormat',
     'QuantConfig',
     'QuantAlgo',
     'CalibConfig',
