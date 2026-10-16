@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from strenum import StrEnum
@@ -67,6 +67,19 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FP4_MLA_TOKENS_PER_BLOCK = 128
+
+
+@dataclass(frozen=True)
+class _RuntimeConstructors:
+    """Explicit internal constructors for a non-serving offline executor.
+
+    Normal serving passes no bundle and retains the ordinary constructors.
+    This is not an LLM argument and cannot enable confidence admission.
+    """
+
+    model_engine: Callable[..., PyTorchModelEngine]
+    executor: type[PyExecutor]
+    kv_cache_creator: type[KvCacheCreator]
 
 
 class _ExecutorMemoryMonitor:
@@ -484,6 +497,7 @@ def _create_py_executor_impl(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
+    runtime_constructors: Optional[_RuntimeConstructors] = None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -515,6 +529,7 @@ def _create_py_executor_impl(
             tokenizer=tokenizer,
             profiling_stage_data=profiling_stage_data,
             resource_governor_queue=resource_governor_queue,
+            runtime_constructors=runtime_constructors,
         )
     py_executor.metrics.update(creation_metrics)
     return py_executor
@@ -528,6 +543,7 @@ def _create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
+    runtime_constructors: Optional[_RuntimeConstructors] = None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
@@ -790,7 +806,9 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        model_engine = PyTorchModelEngine(
+        model_engine_type = (PyTorchModelEngine if runtime_constructors is None
+                             else runtime_constructors.model_engine)
+        model_engine = model_engine_type(
             model_path=checkpoint_dir,
             llm_args=llm_args,
             mapping=mapping,
@@ -1130,7 +1148,9 @@ def _create_py_executor(
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
 
-        kv_cache_creator = KvCacheCreator(
+        kv_cache_creator_type = (KvCacheCreator if runtime_constructors is None
+                                 else runtime_constructors.kv_cache_creator)
+        kv_cache_creator = kv_cache_creator_type(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
@@ -1196,6 +1216,8 @@ def _create_py_executor(
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
         py_executor = create_py_executor_instance(
+            executor_type=None
+            if runtime_constructors is None else runtime_constructors.executor,
             dist=dist,
             resources=resources,
             mapping=mapping,
@@ -1277,6 +1299,8 @@ def _create_py_executor(
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
             gc.collect()
             py_executor = create_py_executor_instance(
+                executor_type=None if runtime_constructors is None else
+                runtime_constructors.executor,
                 dist=dist,
                 resources=resources,
                 mapping=mapping,
@@ -1341,6 +1365,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
+    runtime_constructors: Optional[_RuntimeConstructors] = None,
 ) -> PyExecutor:
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
@@ -1354,6 +1379,7 @@ def create_py_executor(
                 tokenizer=tokenizer,
                 profiling_stage_data=profiling_stage_data,
                 resource_governor_queue=resource_governor_queue,
+                runtime_constructors=runtime_constructors,
             )
     except BaseException:
         current_dwdp_manager = get_global_dwdp_manager()

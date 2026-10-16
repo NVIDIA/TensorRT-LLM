@@ -85,10 +85,21 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+_DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
+_CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
 
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
+                                  estimating_kv_cache: bool) -> int:
+    """Return IndexMapper headroom required by the execution policy."""
+    if getattr(spec_config, "enable_confidence_scheduling", False):
+        return (0 if estimating_kv_cache else
+                _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS)
+    return _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS
 
 
 def _get_initial_lora_data_type(
@@ -3278,6 +3289,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["num_reserved_index_slots"] = (
+            _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
@@ -3984,6 +3997,7 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
     max_num_sequences: Optional[int] = None,
+    executor_type: Optional[type[PyExecutor]] = None,
 ) -> PyExecutor:
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
@@ -4353,7 +4367,8 @@ def create_py_executor_instance(
             executor_max_seq_len = min(executor_max_seq_len,
                                        int(decoder_position_limit))
 
-    return PyExecutor(
+    executor_type = PyExecutor if executor_type is None else executor_type
+    return executor_type(
         resource_manager,
         scheduler,
         model_engine=model_engine,
