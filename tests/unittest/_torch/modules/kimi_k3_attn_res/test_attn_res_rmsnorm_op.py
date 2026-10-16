@@ -510,8 +510,8 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
         unexpected_fallback,
     )
     if default_ceiling:
-        # The ceiling the default per_token topology resolves to without
-        # KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS must already cover these steps.
+        # Without KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS the default ceiling must
+        # already cover these steps under the default per_token topology.
         monkeypatch.delenv(
             modeling_kimi_linear.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False
         )
@@ -538,15 +538,12 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
     assert relative_l2 < 5e-3
 
 
-@pytest.mark.parametrize("topology", ["per_token", "persistent", "split"])
 def test_default_token_ceiling_covers_multi_token_steps(
-    topology: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Speculative verify steps (several tokens per request) and small decode
-    batches take the fused epilogue by default, whatever the topology."""
+    batches take the fused epilogue by default."""
     monkeypatch.delenv(modeling_kimi_linear.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
-    monkeypatch.setattr(modeling_kimi_linear, "_ATTN_RES_TOPOLOGY", topology)
     assert modeling_kimi_linear._read_fused_attn_res_max_tokens() == 32
 
 

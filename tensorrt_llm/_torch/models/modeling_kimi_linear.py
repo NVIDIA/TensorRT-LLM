@@ -356,8 +356,8 @@ KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
 Accepted values:
 
   ``per_token``   one CTA (N<=4) or one 8-CTA cluster (N>=5) per token; the
-                  persistent kernel is never used. This is the default, i.e.
-                  the feature is off and behaviour is unchanged.
+                  persistent kernel is never used. This is the default: the
+                  persistent kernel is off.
   ``persistent``  one CTA per SM looping over tokens, used at every shape the
                   persistent kernel implements (H == 7168 and 2 <= N <= 9).
   ``split``       persistent above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``
