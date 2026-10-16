@@ -6892,8 +6892,8 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         # Page tables are per layer; lengths are shared by the batch. No token/head indices.
         reserve += len(self.high_layers) * 3 * pages * 4
         reserve += 2 * self.max_batch_size * 4
-        # TRTLLM uses at most 64 tokens per staging page and two offsets even for MLA.
-        view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 64))
+        # TRTLLM uses at most 32 tokens per staging page and two offsets even for MLA.
+        view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 32))
         reserve += len(self.high_layers) * self.max_batch_size * 2 * view_pages * 4
         tiers = []
         for tier in config.cache_tiers:

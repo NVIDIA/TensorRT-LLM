@@ -52,7 +52,8 @@ class MixedPrecisionKVView:
         trtllm = isinstance(metadata, TrtllmAttentionMetadata)
         self.layout = "HND" if trtllm else metadata.kv_layout
         self.block_size = manager.tokens_per_block
-        self.tokens_per_block = min(self.block_size, 64) if trtllm else self.block_size
+        # Native BF16 paged-context FMHA uses 32-token pages.
+        self.tokens_per_block = min(self.block_size, 32) if trtllm else self.block_size
         self.history = manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
         (self.high, _), (self.scales, _) = manager.get_mixed_precision_buffers(
             layer_idx, metadata.request_ids, metadata.kv_layout
