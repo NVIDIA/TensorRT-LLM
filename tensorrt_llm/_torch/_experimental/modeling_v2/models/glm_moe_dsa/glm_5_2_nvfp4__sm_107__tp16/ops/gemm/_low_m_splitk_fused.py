@@ -1603,9 +1603,7 @@ class SplitKIndexerQTailGemmKernel(SplitKFusedEpilogueGemmKernel):
                 )
                 if col0 + m4 == 0:
                     mQScaleOut[token, head] = scale
-                    mWOut[token, head] = _mul_rn(
-                        _mul_rn(sW[row], scale), Float32(qt.weight_scale)
-                    )
+                    mWOut[token, head] = _mul_rn(_mul_rn(sW[row], scale), Float32(qt.weight_scale))
 
 
 # ----------------------------------------------------------------------------------- host
@@ -1719,9 +1717,7 @@ def _validate_fused(a, b, out, epilogue, gamma, norm_out, kv_lens, cos_sin, q_sc
     _check(b.shape[0] == k, f"incompatible shapes {tuple(a.shape)} x {tuple(b.shape)}")
     n = b.shape[1]
     _check(tuple(out.shape) == (m, n), f"out must be {(m, n)}, got {tuple(out.shape)}")
-    _check(
-        1 <= m <= 32 and k % _CTA_K == 0 and n % 4 == 0, f"unsupported shape M={m} N={n} K={k}"
-    )
+    _check(1 <= m <= 32 and k % _CTA_K == 0 and n % 4 == 0, f"unsupported shape M={m} N={n} K={k}")
     # a may be a row view of a wider buffer (the raw q_a slice of the fused-A output).
     _check(
         a.stride(1) == 1 and a.stride(0) >= k and (a.stride(0) * 2) % 16 == 0,
@@ -1729,17 +1725,13 @@ def _validate_fused(a, b, out, epilogue, gamma, norm_out, kv_lens, cos_sin, q_sc
     )
     _check(b.t().is_contiguous(), "b must be column-major (the transpose of a contiguous [N, K])")
     _check(out.is_contiguous(), "out must be contiguous")
-    _check(
-        all(t.data_ptr() % 32 == 0 for t in (a, b, out)), "a, b and out must be 32-byte aligned"
-    )
+    _check(all(t.data_ptr() % 32 == 0 for t in (a, b, out)), "a, b and out must be 32-byte aligned")
     if epilogue.fp8_rope:
         _check(out.dtype == _torch.uint8, "fp8_rope writes uint8 (E4M3 bits)")
         _check(
             n % epilogue.head_dim == 0, f"N={n} is not a multiple of head_dim {epilogue.head_dim}"
         )
-        _check(
-            m % epilogue.seq_len == 0, f"M={m} is not a multiple of seq_len {epilogue.seq_len}"
-        )
+        _check(m % epilogue.seq_len == 0, f"M={m} is not a multiple of seq_len {epilogue.seq_len}")
         for t, name, dtype in (
             (kv_lens, "kv_lens", _torch.int32),
             (cos_sin, "cos_sin", _torch.float32),
@@ -1752,9 +1744,7 @@ def _validate_fused(a, b, out, epilogue, gamma, norm_out, kv_lens, cos_sin, q_sc
                 and t.device == a.device,
                 f"fp8_rope needs a contiguous {dtype} {name} on the GEMM's device",
             )
-        _check(
-            kv_lens.numel() >= m // epilogue.seq_len, "kv_lens has fewer entries than sequences"
-        )
+        _check(kv_lens.numel() >= m // epilogue.seq_len, "kv_lens has fewer entries than sequences")
         _check(q_scale.numel() >= 1, "q_scale is empty")
     else:
         _check(out.dtype == _torch.bfloat16, "out must be BF16 without fp8_rope")
@@ -1929,9 +1919,7 @@ def _validate_qtail(
     )
     _check(b.t().is_contiguous(), "b must be column-major (the transpose of a contiguous [N, K])")
     _check(out.is_contiguous() and out.dtype == _torch.uint8, "out must be contiguous uint8")
-    _check(
-        all(t.data_ptr() % 32 == 0 for t in (a, b, out)), "a, b and out must be 32-byte aligned"
-    )
+    _check(all(t.data_ptr() % 32 == 0 for t in (a, b, out)), "a, b and out must be 32-byte aligned")
     _check(
         epilogue.row_rms and not epilogue.rms_out and not epilogue.fp8_rope,
         "the indexer Q tail follows the row_rms epilogue alone",

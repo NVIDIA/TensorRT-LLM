@@ -56,9 +56,7 @@ def run(entry: str) -> None:
     package = importlib.util.find_spec("tensorrt_llm")
     assert package is not None and package.origin is not None, "tensorrt_llm is not importable"
     package_parent = str(Path(package.origin).resolve().parents[1])
-    env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (package_parent, env.get("PYTHONPATH", "")) if p
-    )
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH", "")) if p)
     timeout = _load_launcher_constants(launcher).DEADLINE_S + _LAUNCHER_GRACE_S
     completed = subprocess.run(
         [sys.executable, str(launcher)],

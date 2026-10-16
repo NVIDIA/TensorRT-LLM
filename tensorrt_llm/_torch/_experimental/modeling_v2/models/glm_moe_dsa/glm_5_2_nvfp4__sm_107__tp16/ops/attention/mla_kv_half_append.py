@@ -219,8 +219,10 @@ class GlmMlaKvHalfAppend(OpWrapper):
         rstd = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + kv_norm_eps)
         nope = x * (rstd * kv_norm_weight.float())
 
-        pairs = latent[:, KV_LORA_RANK : KV_LORA_RANK + ROPE_DIM].float().reshape(
-            num_tokens, ROPE_DIM // 2, 2
+        pairs = (
+            latent[:, KV_LORA_RANK : KV_LORA_RANK + ROPE_DIM]
+            .float()
+            .reshape(num_tokens, ROPE_DIM // 2, 2)
         )
         table = rotary_cos_sin.reshape(-1, ROPE_DIM, 2)[positions.clamp(min=0), : ROPE_DIM // 2]
         cos, sin = table[..., 0], table[..., 1]
@@ -229,11 +231,7 @@ class GlmMlaKvHalfAppend(OpWrapper):
             dim=-1,
         ).reshape(num_tokens, ROPE_DIM)
 
-        rows = (
-            torch.cat((nope, roped), dim=-1)
-            .clamp(-_E4M3_MAX, _E4M3_MAX)
-            .to(torch.float8_e4m3fn)
-        )
+        rows = torch.cat((nope, roped), dim=-1).clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
         scale = torch.tensor(softmax_scale, dtype=torch.float32, device=device)
         log2e = torch.tensor(_LOG2E, dtype=torch.float32, device=device)
         bmm1 = torch.stack((scale, scale * log2e))

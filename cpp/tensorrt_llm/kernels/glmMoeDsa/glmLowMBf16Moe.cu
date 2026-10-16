@@ -372,9 +372,9 @@ __device__ __forceinline__ void warpSum2(float& a, float& b)
 // the two overlap; each consumer warp reduces its shares with shuffles into shared memory, and each unit's SwiGLU adds
 // the 8 warp sums in a fixed order.
 template <typename BiasT>
-__global__ void __launch_bounds__(kFc1Threads, 2) lowMBf16MoeFc1Kernel(Bf16* __restrict__ act,
-    Bf16 const* __restrict__ x, float const* __restrict__ routerLogits, BiasT const* __restrict__ bias,
-    Bf16 const* __restrict__ w3w1, int hiddenSize, int interSize, int numStages)
+__global__ void __launch_bounds__(kFc1Threads, 2)
+    lowMBf16MoeFc1Kernel(Bf16* __restrict__ act, Bf16 const* __restrict__ x, float const* __restrict__ routerLogits,
+        BiasT const* __restrict__ bias, Bf16 const* __restrict__ w3w1, int hiddenSize, int interSize, int numStages)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __align__(128) uint8_t smem[];
@@ -490,8 +490,8 @@ __global__ void __launch_bounds__(kFc1Threads, 2) lowMBf16MoeFc1Kernel(Bf16* __r
         {
             if (i < piecesPerThread)
             {
-                unpackPiece(__ldcg(reinterpret_cast<uint4 const*>(x) + threadIdx.x + i * kFc1ConsumerThreads),
-                    xValues[i]);
+                unpackPiece(
+                    __ldcg(reinterpret_cast<uint4 const*>(x) + threadIdx.x + i * kFc1ConsumerThreads), xValues[i]);
             }
         }
         // Wait at the barrier, without polling the ring, while the producer selects the experts and issues the first
@@ -574,9 +574,9 @@ __global__ void __launch_bounds__(kFc1Threads, 2) lowMBf16MoeFc1Kernel(Bf16* __r
 // that wait, from the router logits and the bias staged by bulk copies, without FP64 instructions. After the wait every
 // warp stages its expert's SwiGLU outputs itself.
 template <typename BiasT, int kTiles>
-__global__ void __launch_bounds__(kFc2Threads, 2) lowMBf16MoeFc2Kernel(Bf16* __restrict__ out,
-    Bf16 const* __restrict__ act, float const* __restrict__ routerLogits, BiasT const* __restrict__ bias,
-    Bf16 const* __restrict__ w2, int hiddenSize, int interSize, RoutingScale scale)
+__global__ void __launch_bounds__(kFc2Threads, 2)
+    lowMBf16MoeFc2Kernel(Bf16* __restrict__ out, Bf16 const* __restrict__ act, float const* __restrict__ routerLogits,
+        BiasT const* __restrict__ bias, Bf16 const* __restrict__ w2, int hiddenSize, int interSize, RoutingScale scale)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     constexpr int kRows = kTiles * kMmaRows;
@@ -712,8 +712,7 @@ __global__ void __launch_bounds__(kFc2Threads, 2) lowMBf16MoeFc2Kernel(Bf16* __r
             for (int tileIdx = 0; tileIdx < kTiles; ++tileIdx)
             {
                 uint4 const lo = *reinterpret_cast<uint4 const*>(slice + (tileIdx * kMmaRows + g) * interSize + j);
-                uint4 const hi
-                    = *reinterpret_cast<uint4 const*>(slice + (tileIdx * kMmaRows + g + 8) * interSize + j);
+                uint4 const hi = *reinterpret_cast<uint4 const*>(slice + (tileIdx * kMmaRows + g + 8) * interSize + j);
                 mmaStep(acc[tileIdx][half], lo, hi, av);
             }
         }
@@ -773,8 +772,8 @@ RoutingScale makeRoutingScale(double routedScalingFactor)
 }
 
 template <typename BiasT, int kTiles>
-void launchFc2(Bf16* out, Bf16 const* act, float const* routerLogits, BiasT const* bias, Bf16 const* w2,
-    int hiddenSize, int interSize, double routedScalingFactor, cudaStream_t stream)
+void launchFc2(Bf16* out, Bf16 const* act, float const* routerLogits, BiasT const* bias, Bf16 const* w2, int hiddenSize,
+    int interSize, double routedScalingFactor, cudaStream_t stream)
 {
     int const rows = kTiles * kMmaRows;
     size_t const smemBytes = static_cast<size_t>(kTopK) * (rows + 1) * interSize * sizeof(Bf16);
@@ -806,12 +805,12 @@ void invokeLowMBf16Moe(Bf16* out, Bf16* act, Bf16 const* x, float const* routerL
     int const rowBytes = hiddenSize * static_cast<int>(sizeof(Bf16));
     int const numStages = std::min(kMaxStages, kFc1RingBytes / rowBytes);
     int const maxRows = 2 * ((numUnits + fc1Grid - 1) / fc1Grid);
-    size_t const fc1SmemBytes = static_cast<size_t>(numStages) * rowBytes
-        + static_cast<size_t>(maxRows) * kFc1ConsumerWarps * sizeof(float);
+    size_t const fc1SmemBytes
+        = static_cast<size_t>(numStages) * rowBytes + static_cast<size_t>(maxRows) * kFc1ConsumerWarps * sizeof(float);
     auto* fc1 = &lowMBf16MoeFc1Kernel<BiasT>;
     setSharedMemoryAttributes(fc1, fc1SmemBytes);
-    common::launchWithPdlWhenEnabled("lowMBf16MoeFc1", fc1, dim3(fc1Grid), dim3(kFc1Threads), fc1SmemBytes, stream,
-        act, x, routerLogits, bias, w3w1, hiddenSize, interSize, numStages);
+    common::launchWithPdlWhenEnabled("lowMBf16MoeFc1", fc1, dim3(fc1Grid), dim3(kFc1Threads), fc1SmemBytes, stream, act,
+        x, routerLogits, bias, w3w1, hiddenSize, interSize, numStages);
 
     // Two 16-row tiles per FC2 CTA where the 8 weight slices fit in shared memory, else one.
     if (interSize <= kMaxInterSize / 2)

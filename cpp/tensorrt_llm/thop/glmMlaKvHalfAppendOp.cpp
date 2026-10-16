@@ -76,8 +76,8 @@ void glmMlaKvHalfAppend(th::Tensor const& latent, th::Tensor const& kvNormWeight
         "latent rows must be 16-byte aligned (row stride a multiple of 8 elements), got row stride ", latent.stride(0));
     int64_t const numTokens = latent.size(0);
     TORCH_CHECK(numTokens <= kInt32Max, "too many latent rows");
-    TORCH_CHECK(seqLenQ > 0 && numTokens % seqLenQ == 0,
-        "seq_len_q must be positive and divide the latent rows; got ", seqLenQ, " for ", numTokens, " rows");
+    TORCH_CHECK(seqLenQ > 0 && numTokens % seqLenQ == 0, "seq_len_q must be positive and divide the latent rows; got ",
+        seqLenQ, " for ", numTokens, " rows");
     int64_t const numGenerations = numTokens / seqLenQ;
 
     TORCH_CHECK(kvNormWeight.scalar_type() == th::kBFloat16 && kvNormWeight.is_contiguous()

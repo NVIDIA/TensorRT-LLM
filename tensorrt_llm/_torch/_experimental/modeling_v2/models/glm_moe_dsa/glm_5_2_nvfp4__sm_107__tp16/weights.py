@@ -23,7 +23,9 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3WeightLoade
 from tensorrt_llm._torch.modules.linear import TensorParallelMode, load_weight_shard
 
 
-def normalize_model_config(model_config: ModelConfig[PretrainedConfig]) -> ModelConfig[PretrainedConfig]:
+def normalize_model_config(
+    model_config: ModelConfig[PretrainedConfig],
+) -> ModelConfig[PretrainedConfig]:
     """The two config rewrites the built-in implementation applies before building modules.
 
     - Legacy checkpoints name the fused q_a / kv_a projection ``fused_a`` in their

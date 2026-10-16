@@ -946,8 +946,7 @@ def _register_fake():
           force_counter: Optional[torch.Tensor], force_mode: int,
           force_base: int, force_max: int, force_frac: float,
           counter_stride: int, slot_stride: int, pool_size: int):
-        return draft_tokens.new_empty(
-            (num_contexts + draft_tokens.shape[0], ))
+        return draft_tokens.new_empty((num_contexts + draft_tokens.shape[0], ))
 
     @torch.library.register_fake("trtllm::glm_draft_sample_glue")
     def _(logits, exchange_buffer, exchange_flags, group_size, draft_tokens,
@@ -956,8 +955,8 @@ def _register_fake():
           seq_lens, fill_seq_lens, kv_lens, kv_update, rewind_accepted,
           draft_len, block_offsets, dsa_layout, req_idx_per_token,
           slot_mapping_fp8, slot_mapping_scale, gen_kv_indptr,
-          gen_cached_token_indptr, accepted_tokens, batch_indices,
-          num_accepted, next_new_tokens):
+          gen_cached_token_indptr, accepted_tokens, batch_indices, num_accepted,
+          next_new_tokens):
         return None
 
     @torch.library.register_fake("trtllm::glm_draft_ehproj_table")
@@ -1030,12 +1029,13 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::glm_fused_a_gemm")
     def _(hidden_states, weight, l2_prefetch):
-        return hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
+        return hidden_states.new_empty(
+            (hidden_states.shape[0], weight.shape[0]))
 
     @torch.library.register_fake("trtllm::glm_router_gemm")
     def _(hidden_states, weight):
-        return hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]),
-                                       dtype=torch.float32)
+        return hidden_states.new_empty(
+            (hidden_states.shape[0], weight.shape[0]), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::glm_mnnvl_hop")
     def _(input, residual, gamma, epsilon, comm_buffer, buffer_flags,

@@ -203,8 +203,8 @@ void launchRouterGemm(
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,
-        router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kRouterNumExperts, kRouterHiddenSize>, logits,
-        hiddenStates, weight));
+        router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kRouterNumExperts, kRouterHiddenSize>, logits, hiddenStates,
+        weight));
 }
 
 // Launches the instance of numTokens, one of kNumTokens..kRouterMaxTokens.

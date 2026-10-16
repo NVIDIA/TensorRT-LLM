@@ -121,9 +121,14 @@ add_th_common_family(
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
 # because moe/utils/moeUtilOp.cpp depends on OSS-specific MoE utility types and
 # function signatures.
-add_th_common_family(th_common_moe fusedTopkSoftmax.cpp llama4MinLatency.cpp
-                     noAuxTcOp.cpp dsv3RouterGemmOp.cpp glmRouterGemmOp.cpp
-                     glmLowMBf16MoeOp.cpp)
+add_th_common_family(
+  th_common_moe
+  fusedTopkSoftmax.cpp
+  llama4MinLatency.cpp
+  noAuxTcOp.cpp
+  dsv3RouterGemmOp.cpp
+  glmRouterGemmOp.cpp
+  glmLowMBf16MoeOp.cpp)
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
 # th_common_moe with target_sources() so the list stays next to the files.

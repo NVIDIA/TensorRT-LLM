@@ -496,7 +496,8 @@ __global__ void __launch_bounds__(kBlockSize) draftSampleGlueKernel(DraftSampleG
         {
             int64_t const token = sTokens[row];
             bool const valid = token >= 0 && token < p.vocabSize;
-            normRowWindow(valid ? reinterpret_cast<uint4 const*>(p.embedTable + token * kDraftSampleGlueHidden) : nullptr,
+            normRowWindow(
+                valid ? reinterpret_cast<uint4 const*>(p.embedTable + token * kDraftSampleGlueHidden) : nullptr,
                 sWeights[0], p.eps, lo, hi, p.glueOut + row * p.glueOutStride, group, sGroupSums);
         }
     }
@@ -942,10 +943,11 @@ void invokeDraftSampleGlue(DraftSampleGlueParams const& params, cudaStream_t str
             || (params.colLo >= 0 && params.colLo < params.colHi && params.colHi <= 2 * kDraftSampleGlueHidden
                 && params.colLo % 8 == 0 && params.colHi % 8 == 0),
         "draft sample glue: invalid eh_proj input window [%d, %d)", params.colLo, params.colHi);
-    TLLM_CHECK_WITH_INFO(params.glueOut == nullptr || params.colLo >= kDraftSampleGlueHidden
-            || params.embedTable != nullptr,
+    TLLM_CHECK_WITH_INFO(
+        params.glueOut == nullptr || params.colLo >= kDraftSampleGlueHidden || params.embedTable != nullptr,
         "draft sample glue: the window needs the embedding table");
-    TLLM_CHECK_WITH_INFO(params.glueOut == nullptr || params.colHi <= kDraftSampleGlueHidden || params.hidden != nullptr,
+    TLLM_CHECK_WITH_INFO(
+        params.glueOut == nullptr || params.colHi <= kDraftSampleGlueHidden || params.hidden != nullptr,
         "draft sample glue: the window needs the hidden rows");
     TLLM_CHECK_WITH_INFO(params.reqIdxPerToken == nullptr || (params.seqLens != nullptr && params.kvLens != nullptr),
         "draft sample glue: the DSA metadata needs the sequence and KV lengths");
@@ -989,7 +991,7 @@ void invokeDraftEhprojTable(DraftEhprojTableParams const& params, cudaStream_t s
     config.numAttrs = 2;
     // Up to TP8 the kernel keeps eight rank slots (registers of the polled rows); TP16 takes sixteen.
     auto* const kernel = s.tpSize <= kTableTp8RankSlots ? &draftEhprojTableKernel<kTableTp8RankSlots>
-                                                         : &draftEhprojTableKernel<kDraftEhprojTableMaxRanks>;
+                                                        : &draftEhprojTableKernel<kDraftEhprojTableMaxRanks>;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params));
 }
 

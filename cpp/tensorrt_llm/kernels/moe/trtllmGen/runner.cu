@@ -916,8 +916,8 @@ void Runner::run(
         = Routing::getMaxNumCgasInBatchDim(args.num_tokens, totalExpertsPerToken, totalLocalExperts, mTileTokensDim);
     // gemm2K128 covers the FC2 of the NVFP4 MoE at intermediate size 128 and tile N 8 (for example GLM-5 decode at MoE
     // TP16): the same output rows as the Gemm2 cubin, bitwise (see Gemm2K128.cu).
-    if (args.prefer_gemm2_k128 && mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1
-        && !mUseDeepSeekFp8 && !mUseFineGrained && mTileTokensDim == 8 && args.num_fused_shared_experts == 0
+    if (args.prefer_gemm2_k128 && mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1 && !mUseDeepSeekFp8
+        && !mUseFineGrained && mTileTokensDim == 8 && args.num_fused_shared_experts == 0
         && args.intermediate_size == 128
         && args.valid_intermediate_size.value_or(args.intermediate_size) == args.intermediate_size
         && args.valid_hidden_size.value_or(args.hidden_size) == gemm2HiddenSize && args.gemm2_bias == nullptr

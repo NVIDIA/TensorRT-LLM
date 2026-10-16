@@ -34,9 +34,9 @@ def test_table_is_the_token_half_of_eh_proj(tp_size, tp_rank) -> None:
     """
     g = torch.Generator(device="cuda").manual_seed(tp_size * 100 + tp_rank)
     vocab_shard = 96
-    weight = (
-        torch.randn(HIDDEN, 2 * HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5
-    ).to(torch.bfloat16)
+    weight = (torch.randn(HIDDEN, 2 * HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5).to(
+        torch.bfloat16
+    )
     embed = torch.randn(vocab_shard * tp_size, HIDDEN, generator=g, device="cuda").to(
         torch.bfloat16
     )

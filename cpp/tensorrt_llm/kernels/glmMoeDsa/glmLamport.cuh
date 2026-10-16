@@ -98,8 +98,7 @@ public:
         for (uint32_t stage = 0; stage < mDirtyBufferLayout.numStages; stage++)
         {
             uint32_t const fillBoundary = (mBytesToClear[stage] + sizeof(PackedType) - 1) / sizeof(PackedType);
-            auto* dirty
-                = static_cast<PackedType*>(mDirtyBufferLayout.getStagePtr(bufferBasePtr, mDirtyIndex, stage));
+            auto* dirty = static_cast<PackedType*>(mDirtyBufferLayout.getStagePtr(bufferBasePtr, mDirtyIndex, stage));
             for (uint32_t packedIdx = globalTid; packedIdx < fillBoundary; packedIdx += numThreads)
             {
                 dirty[packedIdx] = fillValue;

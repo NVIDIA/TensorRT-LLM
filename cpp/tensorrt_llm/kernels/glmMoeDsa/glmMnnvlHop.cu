@@ -266,15 +266,15 @@ __device__ __forceinline__ float clusterSumOfSquaresFast(float threadSum)
     if (laneId < numBlocks)
     {
         // Lane l sends to CTA l.
-        uint32_t const slot = static_cast<uint32_t>(__cvta_generic_to_shared(
-            reinterpret_cast<float*>(storage.warpSums) + blockRank * kMaxWarps + warpId));
+        uint32_t const slot = static_cast<uint32_t>(
+            __cvta_generic_to_shared(reinterpret_cast<float*>(storage.warpSums) + blockRank * kMaxWarps + warpId));
         uint32_t peerSlot;
         uint32_t peerBarrier;
         asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(peerSlot) : "r"(slot), "r"(laneId));
         asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(peerBarrier) : "r"(barrier), "r"(laneId));
         asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(peerSlot),
-            "r"(__float_as_uint(warpSum)), "r"(peerBarrier)
-            : "memory");
+                     "r"(__float_as_uint(warpSum)), "r"(peerBarrier)
+                     : "memory");
     }
     uint32_t complete = 0;
     while (!complete)
@@ -379,9 +379,9 @@ __device__ __forceinline__ void hopEpilogue(HopKernelParams const& params, GlmLa
 #pragma unroll
     for (int i = 0; i < kEltsPerThread; i++)
     {
-        packedAccum.elements[i] = cuda_cast<__nv_bfloat16, float>(
-            cuda_cast<float, __nv_bfloat16>(packedAccum.elements[i]) * rcpRms
-            * cuda_cast<float, __nv_bfloat16>(gamma.elements[i]));
+        packedAccum.elements[i]
+            = cuda_cast<__nv_bfloat16, float>(cuda_cast<float, __nv_bfloat16>(packedAccum.elements[i]) * rcpRms
+                * cuda_cast<float, __nv_bfloat16>(gamma.elements[i]));
     }
     reinterpret_cast<float4*>(&params.normOut[threadOffset])[0] = packedAccum.packed;
     if (rotationPending)
@@ -508,8 +508,8 @@ __global__ void __launch_bounds__(kMaxThreads) mnnvlHopKernel(HopKernelParams pa
 // grid launches because FC1 and FC2 trigger their dependents only after their own waits. The launch bound lets the
 // eight FC2 rows of a thread be in flight in registers.
 template <int WorldSize>
-__global__ void __launch_bounds__(kMaxThreads) mnnvlMoeFinalizeHopKernel(
-    HopKernelParams params, MoeFinalizeKernelParams moe)
+__global__ void __launch_bounds__(kMaxThreads)
+    mnnvlMoeFinalizeHopKernel(HopKernelParams params, MoeFinalizeKernelParams moe)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
@@ -610,8 +610,8 @@ __global__ void __launch_bounds__(kMaxThreads) mnnvlMoeFinalizeHopKernel(
     // ==================== Reduction ====================
     bool rotationPending = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
     uint32_t arrivals = 0;
-    PackedBf16x8 const packedAccum = reduceOneshotPollAll<WorldSize, true, true>(val, params.rank, stagePtrLocal,
-        token, params.tokenDim, packedIdx, rotationPending ? flag.arrivalCounter() : nullptr, &arrivals);
+    PackedBf16x8 const packedAccum = reduceOneshotPollAll<WorldSize, true, true>(val, params.rank, stagePtrLocal, token,
+        params.tokenDim, packedIdx, rotationPending ? flag.arrivalCounter() : nullptr, &arrivals);
     uint4 const bytesToClear{
         static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * sizeof(__nv_bfloat16)), 0, 0, 0};
     rotateIfAllArrived(flag, rotationPending, arrivals, bytesToClear);

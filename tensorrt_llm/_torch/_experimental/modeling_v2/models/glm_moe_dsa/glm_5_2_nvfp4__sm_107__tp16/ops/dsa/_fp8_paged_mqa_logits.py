@@ -101,9 +101,7 @@ def _compile(
     q_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (n, head_dim, sym_b), stride_order=(1, 0, 2)
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (n, sym_b), stride_order=(0, 1)
-    )
+    w_fake = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (n, sym_b), stride_order=(0, 1))
     logits_fake = cute.runtime.make_fake_tensor(
         cutlass.Float32, (cute.sym_int(), max_ctx), stride=(cute.sym_int64(), 1)
     )

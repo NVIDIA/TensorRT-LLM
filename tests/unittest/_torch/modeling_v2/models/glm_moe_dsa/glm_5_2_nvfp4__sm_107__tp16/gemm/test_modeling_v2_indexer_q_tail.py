@@ -51,9 +51,7 @@ def _build(spec: dict, seed: int) -> dict:
     weight = (torch.randn(heads * head_dim, k, generator=g, device="cuda") * 2.0 * k**-0.5).to(
         torch.bfloat16
     )
-    positions = torch.randint(
-        0, _POSITIONS, (m,), generator=g, device="cuda", dtype=torch.int32
-    )
+    positions = torch.randint(0, _POSITIONS, (m,), generator=g, device="cuda", dtype=torch.int32)
     q_fp8 = torch.full((m, heads, head_dim), _E4M3_NAN, dtype=torch.uint8, device="cuda")
     return dict(
         q_a=fused_a[:, :k],

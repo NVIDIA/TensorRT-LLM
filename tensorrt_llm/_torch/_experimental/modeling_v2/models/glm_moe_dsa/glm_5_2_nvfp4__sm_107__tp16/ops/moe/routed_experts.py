@@ -111,23 +111,17 @@ class GlmRoutedExperts(OpWrapper):
         Cell(
             why="the c1 verify step: 8 rows routed by the fused router GEMV, the input joined "
             "right before FC1, FC2 at K = 128, unfinalized for the post-MoE hop",
-            spec=dict(
-                tokens=8, fused_router=True, late_join=True, gemm2_k128=True, **_GLM_TP16
-            ),
+            spec=dict(tokens=8, fused_router=True, late_join=True, gemm2_k128=True, **_GLM_TP16),
         ),
         Cell(
             why="one row, a step without MTP: the fused router's single-token instance and "
             "FC2 at K = 128 over 8 token tiles",
-            spec=dict(
-                tokens=1, fused_router=True, late_join=True, gemm2_k128=True, **_GLM_TP16
-            ),
+            spec=dict(tokens=1, fused_router=True, late_join=True, gemm2_k128=True, **_GLM_TP16),
         ),
         Cell(
             why="32 rows (4 requests x 8), past the fused router: routed from the router "
             "GEMM's logits, FC2 back on the Gemm2 cubin",
-            spec=dict(
-                tokens=32, fused_router=False, late_join=False, gemm2_k128=True, **_GLM_TP16
-            ),
+            spec=dict(tokens=32, fused_router=False, late_join=False, gemm2_k128=True, **_GLM_TP16),
         ),
     )
 

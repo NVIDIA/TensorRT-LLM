@@ -80,8 +80,8 @@ tensorrt_llm::runtime::McastDeviceMemory* hopWorkspace(
     TORCH_CHECK(hopShapeSupported(numTokens, hiddenSize, nRanks), op, ": unsupported shape: ", numTokens,
         " tokens, hidden ", hiddenSize, ", ", nRanks, " ranks");
     int64_t const bufferBytes = comm_buffer.size(1) * comm_buffer.element_size();
-    int64_t const hopBytes = glm::mnnvlHopBufferBytes(
-        static_cast<int>(numTokens), static_cast<int>(hiddenSize), static_cast<int>(nRanks));
+    int64_t const hopBytes
+        = glm::mnnvlHopBufferBytes(static_cast<int>(numTokens), static_cast<int>(hiddenSize), static_cast<int>(nRanks));
     TORCH_CHECK(hopBytes <= bufferBytes, op, ": ", hopBytes, " bytes of Lamport data exceed the Lamport buffer of ",
         bufferBytes, " bytes");
     return mcastMem;

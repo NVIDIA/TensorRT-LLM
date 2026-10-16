@@ -123,9 +123,7 @@ def _stack():
         gt_p, gt_c, gt_s = _rand_nvfp4(EXPERTS, INTER, HIDDEN, gen)
         dn_p, dn_c, dn_s = _rand_nvfp4(EXPERTS, HIDDEN, INTER, gen)
         fc1_perm = _interleave_perm(2 * INTER)[_blk32_perm(2 * INTER)]
-        w1, s1 = _prepare(
-            torch.cat([up_p, gt_p], dim=1), torch.cat([up_s, gt_s], dim=1), fc1_perm
-        )
+        w1, s1 = _prepare(torch.cat([up_p, gt_p], dim=1), torch.cat([up_s, gt_s], dim=1), fc1_perm)
         w2, s2 = _prepare(dn_p, dn_s, _blk32_perm(HIDDEN))
         _STACK = dict(
             gemm1_weights=w1,
@@ -464,9 +462,7 @@ def test_gemm2_k128_matches_the_cubin(tokens) -> None:
     """FC2 at K = 128 writes the Gemm2 cubin's rows, bitwise, and runs where
     its gate says it does."""
     case = _case(tokens, seed=4200 + tokens)
-    common = dict(
-        hidden_states=case["xq"], hidden_states_scale=case["xsf"], fused_router=False
-    )
+    common = dict(hidden_states=case["xq"], hidden_states_scale=case["xsf"], fused_router=False)
     k128 = _call(case, gemm2_k128=True, **common)
     cubin = _call(case, gemm2_k128=False, **common)
     _assert_same(k128, cubin, f"{tokens} rows")

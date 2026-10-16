@@ -349,9 +349,7 @@ def _draft_loop_specs(draft_len: int = 7):
     table_steps = []
     for step in range(draft_len - 1):
         table_steps.append(
-            table_op.CELLS[0].spec
-            if step == 0
-            else dict(table_op.CELLS[1].spec, step=step)
+            table_op.CELLS[0].spec if step == 0 else dict(table_op.CELLS[1].spec, step=step)
         )
     glue_step = dict(glue_op.CELLS[0].spec, step=draft_len - 1)
     return table_steps, glue_step
@@ -441,9 +439,7 @@ def check_guards_refuse() -> None:
     spec = dict(glue_op.CELLS[0].spec)
     logits = [_logits(spec, seed, r) for r in range(WORLD)]
     kwargs, _ = _glue_call(spec, seed, logits, None)
-    wide = torch.zeros(
-        spec["rows"], spec["draft_len"] + 2, dtype=torch.int32, device="cuda"
-    )
+    wide = torch.zeros(spec["rows"], spec["draft_len"] + 2, dtype=torch.int32, device="cuda")
     try:
         with validating(glue_op):
             glue_op(**dict(kwargs, next_new_tokens=wide))
@@ -569,9 +565,7 @@ def _spawn_ranks(entry: str, expected_cells: int) -> None:
         TLLM_DISABLE_MPI="1",
     )
     # The children rendezvous through torch.distributed's env://, not the launching step's PMI namespace.
-    env = {
-        k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))
-    }
+    env = {k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))}
     print(f"[launcher] spawning {world_size} ranks for {entry}, rendezvous on :{port}", flush=True)
     children = [
         subprocess.Popen(

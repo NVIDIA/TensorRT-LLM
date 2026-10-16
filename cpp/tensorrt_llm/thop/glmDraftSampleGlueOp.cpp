@@ -60,11 +60,11 @@ int64_t setDraftStepExchange(tk::DraftSampleGlueParams& params, char const* op, 
     TORCH_CHECK(logits.size(1) % 8 == 0 && isAligned16(logits), op,
         ": logits rows must be 16-byte aligned and a multiple of 8 columns");
     int64_t const bufferBytes = exchange_buffer.numel() * exchange_buffer.element_size() / 3;
-    TORCH_CHECK(bufferBytes >= rows * group_size * slotBytes, op, ": the Lamport buffer is too small for ", rows,
-        " rows");
+    TORCH_CHECK(
+        bufferBytes >= rows * group_size * slotBytes, op, ": the Lamport buffer is too small for ", rows, " rows");
     CHECK_INPUT(draft_tokens, at::ScalarType::Int);
-    TORCH_CHECK(draft_tokens.dim() == 2 && draft_tokens.size(0) == rows && draft_step >= 0
-            && draft_step < draft_tokens.size(1),
+    TORCH_CHECK(
+        draft_tokens.dim() == 2 && draft_tokens.size(0) == rows && draft_step >= 0 && draft_step < draft_tokens.size(1),
         op, ": draft_tokens must be [rows, draft_len] with draft_step inside");
 
     params.logits = reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr());
@@ -211,8 +211,8 @@ void glmDraftSampleGlue(at::Tensor const& logits, at::Tensor& exchange_buffer, a
         for (at::Tensor const& weight : {enorm_weight.value(), hnorm_weight.value()})
         {
             CHECK_INPUT(weight, at::ScalarType::BFloat16);
-            TORCH_CHECK(weight.numel() == kHidden && isAligned16(weight),
-                "glm_draft_sample_glue: norm weights must be [6144]");
+            TORCH_CHECK(
+                weight.numel() == kHidden && isAligned16(weight), "glm_draft_sample_glue: norm weights must be [6144]");
         }
         TORCH_CHECK(glue_out->scalar_type() == at::ScalarType::BFloat16 && glue_out->dim() == 2
                 && glue_out->size(0) == rows && glue_out->size(1) == col_hi - col_lo && glue_out->stride(1) == 1

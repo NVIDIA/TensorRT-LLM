@@ -206,8 +206,8 @@ __device__ __forceinline__ void mmaBf16(
 //! Two MMAs of one step and row tile: MMA A takes contraction elements 0..3 of the thread's 8-element vectors, MMA B
 //! elements 4..7. Fragments: a0/a2 = weight row "group", a1/a3 = weight row "group + 8", b0/b1 = activation row
 //! "group".
-__device__ __forceinline__ void mmaStep(float (&accA)[4], float (&accB)[4], uint4 const& wLo, uint4 const& wHi,
-    uint4 const& xv)
+__device__ __forceinline__ void mmaStep(
+    float (&accA)[4], float (&accB)[4], uint4 const& wLo, uint4 const& wHi, uint4 const& xv)
 {
     mmaBf16(accA, wLo.x, wHi.x, wLo.y, wHi.y, xv.x, xv.y);
     mmaBf16(accB, wLo.z, wHi.z, wLo.w, wHi.w, xv.z, xv.w);
@@ -256,8 +256,8 @@ __device__ __forceinline__ int weightRow(int tile, int t, int r, int inter)
 
 //! x [numRows, kDim], weight [*, kDim]; out: gate/up h [numRows, outDim] (outDim = inter), down out [numRows, outDim].
 template <typename T>
-__global__ void __launch_bounds__(T::kThreads, 1) denseMlpSmallMKernel(Bf16 const* __restrict__ x,
-    Bf16 const* __restrict__ weight, Bf16* __restrict__ out, int numRows, int outDim)
+__global__ void __launch_bounds__(T::kThreads, 1) denseMlpSmallMKernel(
+    Bf16 const* __restrict__ x, Bf16 const* __restrict__ weight, Bf16* __restrict__ out, int numRows, int outDim)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     constexpr int kDim = T::kKDim;
@@ -432,8 +432,8 @@ __global__ void __launch_bounds__(T::kThreads, 1) denseMlpSmallMKernel(Bf16 cons
                 }
                 else
                 {
-                    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(
-                                     peerSlot),
+                    asm volatile(
+                        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(peerSlot),
                         "r"(__float_as_uint(v0)), "r"(peerBar)
                         : "memory");
                 }
@@ -468,8 +468,8 @@ __global__ void __launch_bounds__(T::kThreads, 1) denseMlpSmallMKernel(Bf16 cons
 }
 
 template <typename T>
-cudaError_t launchTiling(Bf16 const* in, Bf16 const* weight, Bf16* out, int numRows, int outDim, bool enablePdl,
-    cudaStream_t stream)
+cudaError_t launchTiling(
+    Bf16 const* in, Bf16 const* weight, Bf16* out, int numRows, int outDim, bool enablePdl, cudaStream_t stream)
 {
     auto const kernel = &denseMlpSmallMKernel<T>;
     if constexpr (T::kSmemBytes > 48 * 1024)
@@ -521,8 +521,7 @@ bool tilingSupported(int tiling, int numRows, int kDim, int outDim)
         if (tiling == I)
         {
             using T = std::tuple_element_t<I, Tilings>;
-            return numRows >= 1 && numRows <= kMaxRows && kDim == T::kKDim && outDim > 0
-                && outDim % T::kOutCols == 0;
+            return numRows >= 1 && numRows <= kMaxRows && kDim == T::kKDim && outDim > 0 && outDim % T::kOutCols == 0;
         }
         return tilingSupported<Tilings, I + 1>(tiling, numRows, kDim, outDim);
     }
@@ -540,8 +539,7 @@ cudaError_t launchTilingIndex(int tiling, Bf16 const* in, Bf16 const* weight, Bf
     {
         if (tiling == I)
         {
-            return launchTiling<std::tuple_element_t<I, Tilings>>(
-                in, weight, out, numRows, outDim, enablePdl, stream);
+            return launchTiling<std::tuple_element_t<I, Tilings>>(in, weight, out, numRows, outDim, enablePdl, stream);
         }
         return launchTilingIndex<Tilings, I + 1>(tiling, in, weight, out, numRows, outDim, enablePdl, stream);
     }
@@ -593,8 +591,8 @@ cudaError_t launchGateUpSwiglu(Bf16 const* x, Bf16 const* gateUpWeight, Bf16* h,
     return launchTilingIndex<GateUpTilings>(resolved, x, gateUpWeight, h, numRows, inter, enablePdl, stream);
 }
 
-cudaError_t launchDown(Bf16 const* h, Bf16 const* downWeight, Bf16* out, int numRows, int inter, int hidden,
-    int tiling, bool enablePdl, cudaStream_t stream)
+cudaError_t launchDown(Bf16 const* h, Bf16 const* downWeight, Bf16* out, int numRows, int inter, int hidden, int tiling,
+    bool enablePdl, cudaStream_t stream)
 {
     int const resolved = resolveTiling<DownTilings>(tiling, numRows, inter, hidden);
     if (resolved < 0)

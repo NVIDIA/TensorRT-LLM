@@ -67,11 +67,11 @@ inline __device__ uint2 toFp8x8(float const (&v)[kEltsPerVec])
 // kTriggerAtEntry: the PDL dependents may launch at kernel entry instead of after the stores; they read this kernel's
 // outputs only after their own grid-dependency wait.
 template <int kBlockThreads, bool kTriggerAtEntry>
-__global__ void __launch_bounds__(kBlockThreads) glmMlaKvHalfAppendKernel(__nv_bfloat16 const* __restrict__ latent,
-    int latentRowStride, KVBlockArray kvCache, float2 const* __restrict__ cosSinCache,
-    __nv_bfloat16 const* __restrict__ kvNormWeight, float kvNormEps, int numTokens, int seqLenQ,
-    int32_t const* __restrict__ kvLens, float* __restrict__ bmm1Scale, float* __restrict__ bmm2Scale,
-    float softmaxScale)
+__global__ void __launch_bounds__(kBlockThreads)
+    glmMlaKvHalfAppendKernel(__nv_bfloat16 const* __restrict__ latent, int latentRowStride, KVBlockArray kvCache,
+        float2 const* __restrict__ cosSinCache, __nv_bfloat16 const* __restrict__ kvNormWeight, float kvNormEps,
+        int numTokens, int seqLenQ, int32_t const* __restrict__ kvLens, float* __restrict__ bmm1Scale,
+        float* __restrict__ bmm2Scale, float softmaxScale)
 {
     constexpr int kRowsPerBlock = kBlockThreads / kWarpSize;
     int const lane = threadIdx.x % kWarpSize;
@@ -219,8 +219,8 @@ void invokeGlmMlaKvHalfAppend(__nv_bfloat16 const* latent, int32_t latentRowStri
 
     constexpr int kRowsPerBlock = kBlockSize / kWarpSize;
     dim3 const grid(static_cast<int>(tensorrt_llm::common::divUp(std::max(numTokens, 1), kRowsPerBlock)));
-    auto const kernel = triggerAtEntry ? glmMlaKvHalfAppendKernel<kBlockSize, true>
-                                       : glmMlaKvHalfAppendKernel<kBlockSize, false>;
+    auto const kernel
+        = triggerAtEntry ? glmMlaKvHalfAppendKernel<kBlockSize, true> : glmMlaKvHalfAppendKernel<kBlockSize, false>;
     tensorrt_llm::common::launchWithPdlWhenEnabled("glmMlaKvHalfAppend", kernel, grid, kBlockSize, 0, stream, latent,
         static_cast<int>(latentRowStride), kvCache, cosSinCache, kvNormWeight, kvNormEps, static_cast<int>(numTokens),
         static_cast<int>(seqLenQ), kvLens, bmm1Scale, bmm2Scale, softmaxScale);

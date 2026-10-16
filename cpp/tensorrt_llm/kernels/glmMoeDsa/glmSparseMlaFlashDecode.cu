@@ -144,8 +144,8 @@ __device__ __forceinline__ void mbarrierWaitCluster(uint32_t bar, uint32_t parit
 __device__ __forceinline__ void bulkCopyGlobalToShared(uint32_t dst, void const* src, uint32_t bytes, uint32_t bar)
 {
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(dst),
-        "l"(src), "r"(bytes), "r"(bar)
-        : "memory");
+                 "l"(src), "r"(bytes), "r"(bar)
+                 : "memory");
 }
 
 // Two floats into the shared memory of a CTA of the cluster; the bytes complete on that CTA's barrier.
@@ -160,11 +160,10 @@ __device__ __forceinline__ void storeRemote(uint32_t remoteAddr, float a, float 
 // Sixteen bytes into the shared memory of a CTA of the cluster; the bytes complete on that CTA's barrier.
 __device__ __forceinline__ void storeRemote16(uint32_t remoteAddr, uint4 value, uint32_t remoteBar)
 {
-    asm volatile(
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];\n" ::"r"(
-            remoteAddr),
-        "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w), "r"(remoteBar)
-        : "memory");
+    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];\n" ::"r"(
+                     remoteAddr),
+                 "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w), "r"(remoteBar)
+                 : "memory");
 }
 
 __device__ __forceinline__ uint32_t mapToRank(uint32_t addr, uint32_t rank)
@@ -249,8 +248,8 @@ __device__ __forceinline__ void mmaE4m3AsF16(
     float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t const (&bh)[4])
 {
     mmaF16(d, e4m3x2ToHalf2(a0), e4m3x2ToHalf2(a1), e4m3x2ToHalf2(a2), e4m3x2ToHalf2(a3), bh[0], bh[1]);
-    mmaF16(d, e4m3x2ToHalf2(a0 >> 16), e4m3x2ToHalf2(a1 >> 16), e4m3x2ToHalf2(a2 >> 16), e4m3x2ToHalf2(a3 >> 16),
-        bh[2], bh[3]);
+    mmaF16(d, e4m3x2ToHalf2(a0 >> 16), e4m3x2ToHalf2(a1 >> 16), e4m3x2ToHalf2(a2 >> 16), e4m3x2ToHalf2(a3 >> 16), bh[2],
+        bh[3]);
 }
 
 __device__ __forceinline__ uint8_t toE4m3(float x)
@@ -280,8 +279,8 @@ struct EarlyGatherRow
 // Lane l < 16 of the warp maps index slot `slot` of query token `tokenQ` (a position) to its pool row with the remap
 // arithmetic, and bulk-copies the row unless it holds one of this step's tokens. Masked lanes copy row 0, as after the
 // wait. Every read here (indices, block table, KV length, rows of earlier steps) precedes this grid's launch.
-__device__ __forceinline__ EarlyGatherRow gatherRowBeforeWait(GlmSparseMlaFlashDecodeParams const& params, int tokenQ,
-    int slot, int lane, uint32_t dst, uint32_t barGather)
+__device__ __forceinline__ EarlyGatherRow gatherRowBeforeWait(
+    GlmSparseMlaFlashDecodeParams const& params, int tokenQ, int slot, int lane, uint32_t dst, uint32_t barGather)
 {
     int position = -1;
     if (lane < kTokensPerWarp && slot < params.topK)
@@ -311,8 +310,8 @@ __device__ __forceinline__ EarlyGatherRow gatherRowBeforeWait(GlmSparseMlaFlashD
     __syncwarp();
     if (lane < kTokensPerWarp && !out.fresh)
     {
-        bulkCopyGlobalToShared(dst, static_cast<uint8_t const*>(params.kvPool) + out.row * kRowBytes, kRowBytes,
-            barGather);
+        bulkCopyGlobalToShared(
+            dst, static_cast<uint8_t const*>(params.kvPool) + out.row * kRowBytes, kRowBytes, barGather);
     }
     return out;
 }

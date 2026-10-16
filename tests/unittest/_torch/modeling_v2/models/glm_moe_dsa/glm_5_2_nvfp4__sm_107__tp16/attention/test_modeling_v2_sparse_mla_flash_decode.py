@@ -196,8 +196,7 @@ def _build(spec: dict, seed: int) -> _Case:
         mla_bmm1_scale=torch.stack((scale, scale * torch.tensor(_LOG2E))).cuda(),
         mla_bmm2_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         v_b_proj=(
-            torch.randn(NUM_HEADS, V_HEAD_DIM, KV_LORA_RANK, generator=gen, device="cuda")
-            * _VB_STD
+            torch.randn(NUM_HEADS, V_HEAD_DIM, KV_LORA_RANK, generator=gen, device="cuda") * _VB_STD
         ).to(torch.bfloat16),
         output=torch.full(
             (num_tokens + _SPARE_ROWS, NUM_HEADS * V_HEAD_DIM),
@@ -411,9 +410,7 @@ class _DsaEnv:
         metadata.num_contexts = 0
         metadata.request_ids = request_ids
         metadata.prompt_lens = cached
-        metadata.kv_cache_params = KVCacheParams(
-            use_cache=True, num_cached_tokens_per_seq=cached
-        )
+        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached)
         metadata.prepare()
         return metadata
 
@@ -478,9 +475,9 @@ def test_reads_the_rows_the_kv_append_writes_in_the_dsa_pool() -> None:
 
         fused_a = torch.randn(num_tokens, 2624, generator=gen, device="cuda").to(torch.bfloat16)
         latent = fused_a[:, LATENT_OFFSET : LATENT_OFFSET + HEAD_DIM_QK]
-        kv_norm_weight = (
-            1.0 + 0.1 * torch.randn(KV_LORA_RANK, generator=gen, device="cuda")
-        ).to(torch.bfloat16)
+        kv_norm_weight = (1.0 + 0.1 * torch.randn(KV_LORA_RANK, generator=gen, device="cuda")).to(
+            torch.bfloat16
+        )
         bmm1 = torch.full((2,), float("nan"), dtype=torch.float32, device="cuda")
         bmm2 = torch.full((1,), float("nan"), dtype=torch.float32, device="cuda")
         append_args = (
@@ -519,8 +516,7 @@ def test_reads_the_rows_the_kv_append_writes_in_the_dsa_pool() -> None:
             torch.randn(num_tokens, NUM_HEADS, HEAD_DIM_QK, generator=gen, device="cuda") * _Q_STD
         ).to(torch.float8_e4m3fn)
         v_b_proj = (
-            torch.randn(NUM_HEADS, V_HEAD_DIM, KV_LORA_RANK, generator=gen, device="cuda")
-            * _VB_STD
+            torch.randn(NUM_HEADS, V_HEAD_DIM, KV_LORA_RANK, generator=gen, device="cuda") * _VB_STD
         ).to(torch.bfloat16)
         output = torch.empty(
             num_tokens, NUM_HEADS * V_HEAD_DIM, dtype=torch.bfloat16, device="cuda"

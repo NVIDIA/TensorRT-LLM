@@ -13,7 +13,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
-from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401 — needs the path declared above
+from _validating import (  # noqa: E402,F401 — needs the path declared above
+    assert_within_ulp,
+    certifying,
+    validating,
+)
 
 pytestmark = pytest.mark.skipif(
     get_sm_version() != 107, reason="the GLM-5.2 tp16 target's ops are certified on sm_107"
@@ -59,9 +63,7 @@ def _build(spec, seed):
     elif routing == "ties":
         # Half-integer logits in [-2, 2] and no bias: about 28 experts share the top key, so which 8 of them are
         # selected, and in which order, is the tie-break.
-        logits = (
-            torch.randint(-4, 5, (1, NUM_EXPERTS), generator=g, device="cuda").float() / 2.0
-        )
+        logits = torch.randint(-4, 5, (1, NUM_EXPERTS), generator=g, device="cuda").float() / 2.0
         bias = torch.zeros(NUM_EXPERTS, device="cuda")
     else:
         assert routing == "tiny"

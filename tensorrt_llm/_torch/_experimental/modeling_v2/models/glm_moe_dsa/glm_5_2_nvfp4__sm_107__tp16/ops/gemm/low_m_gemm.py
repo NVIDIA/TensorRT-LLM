@@ -14,12 +14,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 )
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-from ._low_m_splitk import (
-    device_limits,
-    operands_overlap,
-    run_splitk_dense,
-    splitk_default_tactic,
-)
+from ._low_m_splitk import device_limits, operands_overlap, run_splitk_dense, splitk_default_tactic
 
 
 class GlmLowMGemm(OpWrapper):

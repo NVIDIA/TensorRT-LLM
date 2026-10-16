@@ -125,9 +125,7 @@ class _DsaEnv:
         metadata.num_contexts = 0
         metadata.request_ids = request_ids
         metadata.prompt_lens = cached
-        metadata.kv_cache_params = KVCacheParams(
-            use_cache=True, num_cached_tokens_per_seq=cached
-        )
+        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached)
         metadata.prepare()
         return metadata
 

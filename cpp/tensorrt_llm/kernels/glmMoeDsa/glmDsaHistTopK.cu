@@ -117,6 +117,7 @@ enum DebugSlot : int32_t
     kDbgBndCount = 42,
     kDbgLocalCut = 43
 };
+
 static_assert(kDbgLocalCut < kDebugSlots, "debug slots");
 
 // Shared memory (32-bit words). Peers never read this CTA's shared memory: the cluster's exchanges are pushes
@@ -132,14 +133,14 @@ constexpr int32_t kSmemCoarse = kSmemSlots + kBins;                 // [kMaxRank
 constexpr int32_t kSmemFine = kSmemCoarse + kMaxRanks * kMaxGroups; // [kMaxRanks][kGroupBins]
 constexpr int32_t kSmemGsum = kSmemFine + kMaxRanks * kGroupBins;   // [2][kMaxGroups] group totals (all, lower ranks)
 constexpr int32_t kPreRow = kGroupBins + 4; // the group's kGroupBins + 1 suffix sums, padded to 16-byte pushes
-constexpr int32_t kSmemPre = kSmemGsum + 2 * kMaxGroups;            // [kLevels][kCtas][kPreRow] CTAs' suffix sums
+constexpr int32_t kSmemPre = kSmemGsum + 2 * kMaxGroups;               // [kLevels][kCtas][kPreRow] CTAs' suffix sums
 constexpr int32_t kSmemScratch = kSmemPre + kLevels * kCtas * kPreRow; // [256] scan scratch
-constexpr int32_t kSmemCut = kSmemScratch + 256;                    // [32] the cut of the current level
-constexpr int32_t kSmemOffs = kSmemCut + 32;                        // [8] this CTA's offsets (warp 0)
-constexpr int32_t kSmemMisc = kSmemOffs + 8;                        // [16]
-constexpr int32_t kSmemSmall = kSmemMisc + 16;                      // [2 * kSmallRank]
-constexpr int32_t kSmemBar = kSmemSmall + 2 * kSmallRank;           // [2 * kLevels] uint64 barriers
-constexpr int32_t kSmemDbg = kSmemBar + 4 * kLevels;                // [kDebugSlots] int64 (debug only)
+constexpr int32_t kSmemCut = kSmemScratch + 256;                       // [32] the cut of the current level
+constexpr int32_t kSmemOffs = kSmemCut + 32;                           // [8] this CTA's offsets (warp 0)
+constexpr int32_t kSmemMisc = kSmemOffs + 8;                           // [16]
+constexpr int32_t kSmemSmall = kSmemMisc + 16;                         // [2 * kSmallRank]
+constexpr int32_t kSmemBar = kSmemSmall + 2 * kSmallRank;              // [2 * kLevels] uint64 barriers
+constexpr int32_t kSmemDbg = kSmemBar + 4 * kLevels;                   // [kDebugSlots] int64 (debug only)
 constexpr int32_t kSmemWords = kSmemDbg + 2 * kDebugSlots;
 constexpr size_t kSmemBytes = size_t{kSmemWords} * sizeof(uint32_t);
 // The stage area holds, for a cut on the first digit, the level-0 buckets: 16-bit key indices of this CTA (the key at
@@ -148,8 +149,7 @@ constexpr int32_t kSmemBucket = kSmemStageArea; // [kKeys * kThreads] uint16
 constexpr int32_t kSmemStage = kSmemStageArea;  // [kTopK] selected tokens
 static_assert(kTopK <= kStageWords && kKeys * kThreads <= 65536, "16-bit bucket indices, the stage in the buckets");
 static_assert(kSmemKeys % 4 == 0 && kSmemStage % 4 == 0 && kSmemSlots % 4 == 0 && kSmemFine % 4 == 0
-        && kSmemPre % 4 == 0 && kSmemScratch % 4 == 0
-        && kSmemBar % 2 == 0 && kSmemDbg % 2 == 0,
+        && kSmemPre % 4 == 0 && kSmemScratch % 4 == 0 && kSmemBar % 2 == 0 && kSmemDbg % 2 == 0,
     "aligned arrays");
 // Below the 132 KB carveout: L1 keeps the register spills of 1024 threads.
 static_assert(kSmemBytes <= 131 * 1024, "shared memory");
@@ -182,7 +182,7 @@ enum OffsSlot : int32_t
 
 enum MiscSlot : int32_t
 {
-    kMiscLevelBin = 0, // [kLevels] the cut bin of each level
+    kMiscLevelBin = 0,  // [kLevels] the cut bin of each level
     kMiscSmallCount = 4,
     kMiscBucketBin = 5, // the lowest bin of the level-0 buckets
     kMiscRec = 6,       // [3] the previous exchange launch's record of the row (levels, output words, boundary pairs)
@@ -347,8 +347,8 @@ __device__ __forceinline__ void fenceBarInit()
 // 16 bytes into a peer's shared memory, completing on the peer's barrier.
 __device__ __forceinline__ void pushV4(uint32_t remote, uint4 v, uint32_t remoteBar)
 {
-    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.u32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(
-                     remote),
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.u32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(remote),
         "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "r"(remoteBar)
         : "memory");
 }
@@ -371,8 +371,7 @@ __device__ __forceinline__ int64_t outOff(int32_t buf, int32_t row)
 
 __device__ __forceinline__ int64_t bndOff(int32_t buf, int32_t row)
 {
-    return int64_t{buf} * kBufferWords + kLevels * kHistRegionWords + kOutRegionWords
-        + int64_t{row} * kBoundaryCap * 2;
+    return int64_t{buf} * kBufferWords + kLevels * kHistRegionWords + kOutRegionWords + int64_t{row} * kBoundaryCap * 2;
 }
 
 struct WaitCtx
@@ -548,8 +547,8 @@ __device__ __forceinline__ uint32_t blockExclusiveSuffix(uint32_t v, uint32_t* w
 // flagged in mask a and in mask b (bit 4 k + j): the position of this thread's first flagged key of float4 k is
 // ba[k] (bb[k]), the next ones follow. Also the block counts of both. One block scan (16-bit fields: a CTA flags at
 // most 4 keys per thread and float4).
-__device__ __forceinline__ void positionBases(uint32_t ma, uint32_t mb, uint32_t* ws, uint32_t (&ba)[kVecs],
-    uint32_t (&bb)[kVecs], uint32_t& na, uint32_t& nb)
+__device__ __forceinline__ void positionBases(
+    uint32_t ma, uint32_t mb, uint32_t* ws, uint32_t (&ba)[kVecs], uint32_t (&bb)[kVecs], uint32_t& na, uint32_t& nb)
 {
     static_assert(kVecs == 3, "three float4 counts per mask");
     uint32_t const v[3] = {nibbleCount(ma, 0) | (nibbleCount(ma, 1) << 16),
@@ -855,8 +854,8 @@ __device__ void receiveCut(HistTopKParams const& p, uint32_t const* ucLevel, uin
     int32_t const t = threadIdx.x;
     int32_t const world = p.worldSize;
     int32_t const rank = p.rank;
-    int32_t const ngroups = nbins / kGroupBins; // 64 or 32
-    int32_t const vecsPerRank = ngroups / 4;    // 16 or 8
+    int32_t const ngroups = nbins / kGroupBins;  // 64 or 32
+    int32_t const vecsPerRank = ngroups / 4;     // 16 or 8
     uint32_t* const gAllSum = gsum;              // [kMaxGroups] all ranks
     uint32_t* const gLowSum = gsum + kMaxGroups; // [kMaxGroups] the lower ranks
     if (t == 0)
@@ -942,7 +941,7 @@ __device__ void receiveCut(HistTopKParams const& p, uint32_t const* ucLevel, uin
         // No group holds the need-th key: the ranks' inputs disagree, nothing exact can follow.
         abortKernel(wc, 200 + what);
     }
-    uint32_t const needIn = need - cut[kCutGroupAbove];
+    uint32_t const needInGroup = need - cut[kCutGroupAbove];
     stamp(dbg, kDbgGroup);
     // Warps 2..8 (idle in steps 3 and 4): this CTA's suffix sums over the group's bins and the bin above them
     // (vectors 0..8 of four, the last three words padding) to every CTA of the row, one destination per warp: the 9
@@ -1046,7 +1045,7 @@ __device__ void receiveCut(HistTopKParams const& p, uint32_t const* ucLevel, uin
         }
         uint32_t const aAbove = xa - all;
         uint32_t const lAbove = xl - low;
-        uint32_t const holder = __ballot_sync(kFull, aAbove < needIn && needIn <= aAbove + all);
+        uint32_t const holder = __ballot_sync(kFull, aAbove < needInGroup && needInGroup <= aAbove + all);
         if (holder != 0u)
         {
             int32_t const w = lowBit(holder);
@@ -1060,7 +1059,7 @@ __device__ void receiveCut(HistTopKParams const& p, uint32_t const* ucLevel, uin
             }
             uint32_t const bndRankOff = __reduce_add_sync(kFull, t < rank ? bc : 0u);
             // When the bin is the exact key: rank r takes what the higher ranks leave of the bin's need.
-            uint32_t const needBin = needIn - aAboveW;
+            uint32_t const needBin = needInGroup - aAboveW;
             uint32_t xs = bc;
 #pragma unroll
             for (int32_t o = 1; o < kMaxRanks; o <<= 1)
@@ -1091,7 +1090,8 @@ __device__ void receiveCut(HistTopKParams const& p, uint32_t const* ucLevel, uin
             stamp(dbg, kDbgCut);
             // When this is the final cut (as the main loop decides it), this CTA's offsets at once.
             uint32_t const needAfter = need - aboveAll;
-            int32_t const mode = needAfter == allW ? kModeFull
+            int32_t const mode = needAfter == allW
+                ? kModeFull
                 : (level == kLevels - 1 ? kModeTies
                                         : (allW <= static_cast<uint32_t>(kBoundaryCap) ? kModeCand : kModeNext));
             if (mode != kModeNext)
@@ -1954,8 +1954,8 @@ void invokeDsaHistShardMeta(int32_t const* kvLens, int32_t const* blockTable, in
     {
         throw std::invalid_argument("glm_dsa_hist_shard_meta: unsupported group or page size");
     }
-    dsaHistShardMetaKernel<<<1, 256, 0, stream>>>(kvLens, blockTable, blockTableWidth, worldSize, rank,
-        tokensPerBlock, shardCtx, shardBlockTable, shardBlockTableWidth);
+    dsaHistShardMetaKernel<<<1, 256, 0, stream>>>(kvLens, blockTable, blockTableWidth, worldSize, rank, tokensPerBlock,
+        shardCtx, shardBlockTable, shardBlockTableWidth);
     cudaError_t const err = cudaGetLastError();
     if (err != cudaSuccess)
     {

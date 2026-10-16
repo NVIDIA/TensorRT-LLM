@@ -31,9 +31,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     AttentionMetadata,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
-    forward_generation_sparse_attn,
-)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.module import forward_generation_sparse_attn
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareMetadata
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
@@ -341,12 +339,14 @@ class DecodeTarget:
         """Assert the layer's MLA weights and KV cache are the layout the kernels take."""
         mla = layer.self_attn
         assert not mla.apply_rotary_emb and not mla.mapping.has_cp_helix()
-        assert tuple(mla.kv_a_proj_with_mqa.weight.shape) == (
-            FUSED_A_OUT_FEATURES,
-            self.hidden_size,
-        ) and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16, (
-            f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
-        )
+        assert (
+            tuple(mla.kv_a_proj_with_mqa.weight.shape)
+            == (
+                FUSED_A_OUT_FEATURES,
+                self.hidden_size,
+            )
+            and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+        ), f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
         assert (
             getattr(mla.mqa, "has_fp8_kv_cache", False)
             and mla.kv_cache_dtype != "fp8_ds_mla"
@@ -1095,9 +1095,7 @@ class DecodeTarget:
                     self.index_topk,
                 )
                 return output
-            page_index_scale, layer_offset = manager.get_primary_pool_page_index_params(
-                local_layer
-            )
+            page_index_scale, layer_offset = manager.get_primary_pool_page_index_params(local_layer)
             sparse_mla_flash_decode(
                 q_heads,
                 self._kv_pool,
@@ -1119,9 +1117,7 @@ class DecodeTarget:
             return output
 
         # The built-in indexer over the whole context, then the selection as cache rows.
-        maybe_execute_in_parallel(
-            q_b, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream
-        )
+        maybe_execute_in_parallel(q_b, kv_half, mla.ln_events[0], mla.ln_events[1], mla.aux_stream)
         indexer_intermediates = None
         if indexer is not None:
             qr = mla.q_a_layernorm(q_a)
@@ -1426,10 +1422,11 @@ class DecodeTarget:
         indexer_intermediates = None
         if indexer is not None:
             indexer_intermediates = [
-                t[:num_tokens]
-                for t in indexer.pre_indexer_proj(qr, hidden_states, position_ids)
+                t[:num_tokens] for t in indexer.pre_indexer_proj(qr, hidden_states, position_ids)
             ]
-            indexer._update_k_cache(indexer_intermediates[1], indexer_intermediates[2], attn_metadata)
+            indexer._update_k_cache(
+                indexer_intermediates[1], indexer_intermediates[2], attn_metadata
+            )
         output = hidden_states.new_empty([hidden_states.shape[0], mla.attention_output_hidden_size])
         forward_generation_sparse_attn(
             mla,
@@ -1520,9 +1517,7 @@ class MTPDraftWorker(MTPEagleWorker):
         mapping,
         decode_target,
     ) -> None:
-        super().__init__(
-            spec_config, model_config, use_separate_draft_kv_cache, mapping=mapping
-        )
+        super().__init__(spec_config, model_config, use_separate_draft_kv_cache, mapping=mapping)
         # The core's per-step lookup of the decode target (a bound method rather than the
         # core itself, which belongs to the shell and is no submodule of this worker).
         self._decode_target = decode_target
@@ -1776,9 +1771,7 @@ class ModelingV2Glm52Nvfp4Sm107Tp16(
     """GLM-5.2-NVFP4, sm107, tp16."""
 
     @classmethod
-    def get_preferred_kv_cache_manager_version(
-        cls, pretrained_config: Any = None
-    ) -> Literal["V2"]:
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
         """The KV cache manager the context server's built-in implementation prefers."""
         return "V2"
 

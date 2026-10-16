@@ -53,8 +53,7 @@ at::Tensor glmLowmBf16Moe(at::Tensor const& x, at::Tensor const& routerLogits, a
     CHECK_INPUT(w2, at::ScalarType::BFloat16);
     TORCH_CHECK(eScoreCorrectionBias.scalar_type() == at::ScalarType::Float
             || eScoreCorrectionBias.scalar_type() == at::ScalarType::BFloat16,
-        "glm_lowm_bf16_moe expects an FP32 or BF16 e_score_correction_bias, got ",
-        eScoreCorrectionBias.scalar_type());
+        "glm_lowm_bf16_moe expects an FP32 or BF16 e_score_correction_bias, got ", eScoreCorrectionBias.scalar_type());
     for (at::Tensor const* t : {&routerLogits, &eScoreCorrectionBias, &w3W1, &w2})
     {
         TORCH_CHECK(t->device() == x.device(), "glm_lowm_bf16_moe: all tensors must be on the device of x");
@@ -66,10 +65,10 @@ at::Tensor glmLowmBf16Moe(at::Tensor const& x, at::Tensor const& routerLogits, a
     int64_t const hiddenSize = x.size(1);
     int64_t const numExperts = w3W1.size(0);
     int64_t const interSize = w2.size(2);
-    TORCH_CHECK(numExperts == tk::kLowMBf16MoeNumExperts, "glm_lowm_bf16_moe is built for ",
-        tk::kLowMBf16MoeNumExperts, " experts, got ", numExperts);
-    TORCH_CHECK(topK == tk::kLowMBf16MoeTopK, "glm_lowm_bf16_moe is built for top-", tk::kLowMBf16MoeTopK,
-        ", got top-", topK);
+    TORCH_CHECK(numExperts == tk::kLowMBf16MoeNumExperts, "glm_lowm_bf16_moe is built for ", tk::kLowMBf16MoeNumExperts,
+        " experts, got ", numExperts);
+    TORCH_CHECK(
+        topK == tk::kLowMBf16MoeTopK, "glm_lowm_bf16_moe is built for top-", tk::kLowMBf16MoeTopK, ", got top-", topK);
     TORCH_CHECK(w3W1.size(1) == 2 * interSize && w3W1.size(2) == hiddenSize, "glm_lowm_bf16_moe: w3_w1 of shape ",
         w3W1.sizes(), " does not match x ", x.sizes(), " and w2 ", w2.sizes());
     TORCH_CHECK(w2.size(0) == numExperts && w2.size(1) == hiddenSize, "glm_lowm_bf16_moe: w2 of shape ", w2.sizes(),

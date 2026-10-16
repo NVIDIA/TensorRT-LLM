@@ -35,20 +35,20 @@ constexpr int kMnnvlHopMoeTopK = 8;
 //! value; the workspace of the one-shot MNNVL all-reduce).
 struct MnnvlHopParams
 {
-    int nRanks;              //!< Ranks of the group: 2, 4, 8 or 16
-    int rank;                //!< This rank
-    int numTokens;           //!< Rows
-    int tokenDim;            //!< Elements per row
-    void** bufferPtrsDev;    //!< Unicast addresses of every rank's workspace (a device array)
-    void* multicastPtr;      //!< Multicast address of the workspace
-    uint32_t* bufferFlags;   //!< Lamport flags of the workspace
-    void const* input;       //!< This rank's partial rows [numTokens, tokenDim]; not read when shardPublished
-    void const* residualIn;  //!< [numTokens, tokenDim]
-    void const* gamma;       //!< RMSNorm weight [tokenDim]
-    float epsilon;           //!< RMSNorm epsilon
-    void* residualOut;       //!< Rows summed over the ranks plus residualIn [numTokens, tokenDim]
-    void* normOut;           //!< RMSNorm of residualOut times gamma [numTokens, tokenDim]
-    bool shardPublished;     //!< The producer of input already stored this rank's rows into the workspace
+    int nRanks;             //!< Ranks of the group: 2, 4, 8 or 16
+    int rank;               //!< This rank
+    int numTokens;          //!< Rows
+    int tokenDim;           //!< Elements per row
+    void** bufferPtrsDev;   //!< Unicast addresses of every rank's workspace (a device array)
+    void* multicastPtr;     //!< Multicast address of the workspace
+    uint32_t* bufferFlags;  //!< Lamport flags of the workspace
+    void const* input;      //!< This rank's partial rows [numTokens, tokenDim]; not read when shardPublished
+    void const* residualIn; //!< [numTokens, tokenDim]
+    void const* gamma;      //!< RMSNorm weight [tokenDim]
+    float epsilon;          //!< RMSNorm epsilon
+    void* residualOut;      //!< Rows summed over the ranks plus residualIn [numTokens, tokenDim]
+    void* normOut;          //!< RMSNorm of residualOut times gamma [numTokens, tokenDim]
+    bool shardPublished;    //!< The producer of input already stored this rank's rows into the workspace
     cudaStream_t stream;
 };
 

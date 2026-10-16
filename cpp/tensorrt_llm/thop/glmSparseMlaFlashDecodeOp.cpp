@@ -133,12 +133,13 @@ void glmSparseMlaFlashDecode(th::Tensor const& q, th::Tensor const& kvPool, th::
     if (blockTable.has_value())
     {
         auto const& table = blockTable.value();
-        TORCH_CHECK(table.is_cuda() && table.device() == device && table.scalar_type() == th::kInt32
-                && table.dim() == 2 && table.stride(1) == 1 && table.size(0) >= numSeqs && table.size(1) > 0
-                && table.size(1) <= kInt32Max && table.stride(0) >= table.size(1),
+        TORCH_CHECK(table.is_cuda() && table.device() == device && table.scalar_type() == th::kInt32 && table.dim() == 2
+                && table.stride(1) == 1 && table.size(0) >= numSeqs && table.size(1) > 0 && table.size(1) <= kInt32Max
+                && table.stride(0) >= table.size(1),
             "block_table must be an int32 CUDA [sequences, max_blocks] tensor with unit column stride");
-        TORCH_CHECK(tokensPerBlock > 0 && pageIndexScale > 0 && layerOffset >= 0, "invalid block_table geometry: ",
-            "tokens_per_block ", tokensPerBlock, ", page_index_scale ", pageIndexScale, ", layer_offset ", layerOffset);
+        TORCH_CHECK(tokensPerBlock > 0 && pageIndexScale > 0 && layerOffset >= 0,
+            "invalid block_table geometry: ", "tokens_per_block ", tokensPerBlock, ", page_index_scale ",
+            pageIndexScale, ", layer_offset ", layerOffset);
         int64_t const strideFactor = pageIndexScale * tokensPerBlock;
         int64_t const rowOffset = layerOffset * tokensPerBlock;
         TORCH_CHECK(strideFactor <= kInt32Max && rowOffset <= kInt32Max, "block_table rows must be int32-addressable");

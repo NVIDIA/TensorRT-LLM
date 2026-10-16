@@ -136,8 +136,8 @@ __device__ __forceinline__ void tmaLoad2d(void* dst, void const* map, int x, int
 
 __device__ __forceinline__ void bulkLoad(void* dst, void const* src, uint32_t bytes, uint64_t* bar)
 {
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
-                     smemU32(dst)),
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(smemU32(dst)),
         "l"(src), "r"(bytes), "r"(smemU32(bar))
         : "memory");
 }
@@ -539,8 +539,7 @@ __global__ void __launch_bounds__(kThreads, 1) gemm2K128Kernel(const __grid_cons
         {
             if (j < numSlots)
             {
-                *reinterpret_cast<uint4*>(smemAct + j * kActBytes + r8 * 64 + ((cnk ^ ((r8 >> 1) & 3)) << 4))
-                    = actV[j];
+                *reinterpret_cast<uint4*>(smemAct + j * kActBytes + r8 * 64 + ((cnk ^ ((r8 >> 1) & 3)) << 4)) = actV[j];
                 *reinterpret_cast<uint4*>(smemSfb + j * kSfbBytes + lane * 16) = make_uint4(sf0[j], 0u, sf1[j], 0u);
             }
         }
@@ -620,8 +619,8 @@ void encodeWeightMap(CUtensorMap* map, void const* weights, uint64_t rows, uint3
 bool isSupported(int32_t hiddenSize, int32_t maxNumCtas)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
-    if (sm < 100 || sm >= 110 || hiddenSize % kTileRows != 0 || hiddenSize / kTileRows < kMaxUnits
-        || maxNumCtas < 1 || maxNumCtas > kMaxTokenTiles)
+    if (sm < 100 || sm >= 110 || hiddenSize % kTileRows != 0 || hiddenSize / kTileRows < kMaxUnits || maxNumCtas < 1
+        || maxNumCtas > kMaxTokenTiles)
     {
         return false;
     }

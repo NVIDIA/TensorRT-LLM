@@ -16,12 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from ._low_m_splitk import operands_overlap
-from ._low_m_splitk_fused import (
-    IndexerQTail,
-    SplitKEpilogue,
-    idx_qtail_plan,
-    run_splitk_idx_qtail,
-)
+from ._low_m_splitk_fused import IndexerQTail, SplitKEpilogue, idx_qtail_plan, run_splitk_idx_qtail
 
 #: GLM-5.2's DSA indexer (replicated on every rank): 32 heads of 128, RoPE on the first 64
 #: columns as GPT-J pairs, UE8M0 scales, weight scale 128 ** -0.5 * 32 ** -0.5; q_lora_rank 2048

@@ -266,6 +266,7 @@ class GlmDraftEhprojTable(OpWrapper):
             dsa_layout,
             req_idx_per_token,
         )
+
         # x is stored row by row while the cluster still reads the token table for the later rows, and the norm
         # after the last one: an output overlapping an input, or the other output, replaces values the kernel has
         # yet to read or to return.

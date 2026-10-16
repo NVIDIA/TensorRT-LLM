@@ -53,9 +53,7 @@ def block_row(positions: torch.Tensor, pool_pages: int, gen: torch.Generator) ->
     return row
 
 
-def slot_mappings(
-    positions: torch.Tensor, row: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def slot_mappings(positions: torch.Tensor, row: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """(fp8 slots, scale slots) int64 flat byte offsets of each position's K row, the metadata's
     ``_compute_slot_mappings`` for one request."""
     pos = positions.long().cpu()

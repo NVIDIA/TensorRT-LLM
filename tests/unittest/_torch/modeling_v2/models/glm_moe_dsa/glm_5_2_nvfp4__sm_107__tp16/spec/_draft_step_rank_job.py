@@ -45,9 +45,7 @@ def run(entry: str, expected_cells: int) -> None:
     package = importlib.util.find_spec("tensorrt_llm")
     assert package is not None and package.origin is not None, "tensorrt_llm is not importable"
     package_parent = str(Path(package.origin).resolve().parents[1])
-    env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (package_parent, env.get("PYTHONPATH", "")) if p
-    )
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH", "")) if p)
     spec = importlib.util.spec_from_file_location(launcher.stem, launcher)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

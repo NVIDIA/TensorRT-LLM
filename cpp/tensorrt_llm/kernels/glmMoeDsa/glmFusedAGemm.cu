@@ -107,8 +107,8 @@ __device__ void prefetch_ranges_l2(FusedAL2Prefetch const& ranges, int local_tid
 // Tensor copies completing on an mbarrier, ldmatrix and HMMA on shared addresses.
 __device__ __forceinline__ void mma8_expect_tx(uint64_t* smem_barrier, uint32_t bytes)
 {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
-                     __nvvm_get_smem_pointer(smem_barrier)),
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(__nvvm_get_smem_pointer(smem_barrier)),
         "r"(bytes)
         : "memory");
 }
@@ -252,8 +252,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_mma8_kernel(bf16_t* outpu
 #pragma unroll
         for (int j = 0; j < 2; j++)
         {
-            mma8_tma_load_3d(smem_b + (2 * warp + j) * a_tile_bytes, &tma_a, 0, m0,
-                (warp + warp_cnt * (j + 1)) * boxes, staged + warp);
+            mma8_tma_load_3d(smem_b + (2 * warp + j) * a_tile_bytes, &tma_a, 0, m0, (warp + warp_cnt * (j + 1)) * boxes,
+                staged + warp);
         }
     }
     uint4 a_reg[2][pair_cnt][2];
@@ -424,8 +424,8 @@ void launchFusedAMma8(bf16_t* output, bf16_t const* hiddenStates, bf16_t const* 
     CUtensorMap const tmaA = makeFusedAMma8Map(weight, gemm_m, kFusedAHiddenSize, kFusedARowsPerCta, true);
     CUtensorMap const tmaB
         = makeFusedAMma8Map(hiddenStates, numTokens, kFusedAHiddenSize, numTokens, numTokens == kFusedAMaxTokens);
-    auto* kernel = l2Prefetch != nullptr ? &fused_a_gemm_mma8_kernel<gemm_m, true>
-                                         : &fused_a_gemm_mma8_kernel<gemm_m, false>;
+    auto* kernel
+        = l2Prefetch != nullptr ? &fused_a_gemm_mma8_kernel<gemm_m, true> : &fused_a_gemm_mma8_kernel<gemm_m, false>;
     TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
     cudaLaunchConfig_t config;
     config.gridDim = dim3(gemm_m / kFusedARowsPerCta, 1, 1);
@@ -437,8 +437,8 @@ void launchFusedAMma8(bf16_t* output, bf16_t const* hiddenStates, bf16_t const* 
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, output, numTokens,
-        l2Prefetch != nullptr ? *l2Prefetch : FusedAL2Prefetch{}, tmaA, tmaB));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, kernel, output, numTokens, l2Prefetch != nullptr ? *l2Prefetch : FusedAL2Prefetch{}, tmaA, tmaB));
 }
 
 } // namespace

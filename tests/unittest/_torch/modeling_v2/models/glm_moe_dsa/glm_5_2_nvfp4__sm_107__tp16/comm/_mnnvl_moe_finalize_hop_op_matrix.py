@@ -177,8 +177,7 @@ def check_empty_slots_and_wide_rows() -> None:
     for rows, pitch, empty in ((8, HIDDEN, True), (8, HIDDEN + 128, False), (3, HIDDEN + 64, True)):
         seed = 2000 + rows + pitch
         per_rank = [
-            _moe_inputs(rows, seed, r, "top8", pitch=pitch, empty_slots=empty)
-            for r in range(WORLD)
+            _moe_inputs(rows, seed, r, "top8", pitch=pitch, empty_slots=empty) for r in range(WORLD)
         ]
         residual = _residual(rows, seed)
         norm, residual_out = _fused(per_rank[RANK], residual, gamma)

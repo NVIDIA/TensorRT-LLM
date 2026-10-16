@@ -59,15 +59,15 @@ constexpr int kNumExperts = 256;
 constexpr int kTopK = 8;
 constexpr int kMaxTokens = 8;
 constexpr int kHiddenDim = 6144;
-constexpr int kEltsPerVec = 8;                                  // bf16 per 16-byte load, as in the router GEMV
-constexpr int kKIterElts = kEltsPerVec * 128;                   // elements per k-iteration of the router GEMV
-constexpr int kKIters = kHiddenDim / kKIterElts;                // 6
-constexpr int kSlices = 4;                                      // warps per expert in the router GEMV
+constexpr int kEltsPerVec = 8;                                         // bf16 per 16-byte load, as in the router GEMV
+constexpr int kKIterElts = kEltsPerVec * 128;                          // elements per k-iteration of the router GEMV
+constexpr int kKIters = kHiddenDim / kKIterElts;                       // 6
+constexpr int kSlices = 4;                                             // warps per expert in the router GEMV
 constexpr int kExpertsPerCta = 8;
-constexpr int kNumGemvCtas = kNumExperts / kExpertsPerCta * kSlices; // 128
+constexpr int kNumGemvCtas = kNumExperts / kExpertsPerCta * kSlices;   // 128
 constexpr int kNumThreads = 256;
-constexpr int kSliceVecs = kKIters * WarpSize;                  // 16-byte vectors of one token's slice
-constexpr int kActBytes = kMaxTokens * kSliceVecs * 16;         // 24 KB
+constexpr int kSliceVecs = kKIters * WarpSize;                         // 16-byte vectors of one token's slice
+constexpr int kActBytes = kMaxTokens * kSliceVecs * 16;                // 24 KB
 constexpr int kPartBytes = WarpSize * kExpertsPerCta * kMaxTokens * 4; // 8 KB
 constexpr int kSmemBytes = kActBytes + kPartBytes;
 constexpr int kExchangeFloats = kMaxTokens * kNumExperts * kSlices;
@@ -100,9 +100,7 @@ __device__ __forceinline__ void gridDependencyWait()
 __device__ __forceinline__ uint4 loadWeight16(void const* ptr)
 {
     uint4 v;
-    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(ptr));
+    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr));
     return v;
 }
 
@@ -398,9 +396,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) routingFusedRouterKernel(Fused
         return rank;
     };
     auto tileRows = [&](int32_t n)
-    {
-        return params.mIsPow2 ? mulLog2<int32_t>(n, params.mPaddingLog2) : mulTileN<int32_t>(n, params.mTileTokensDim);
-    };
+    { return params.mIsPow2 ? mulLog2<int32_t>(n, params.mPaddingLog2) : mulTileN<int32_t>(n, params.mTileTokensDim); };
 
     {
         int32_t const expert = threadIdx.x;
@@ -455,8 +451,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) routingFusedRouterKernel(Fused
     cudaTriggerProgrammaticLaunchCompletion();
 }
 #else
-__global__ void __launch_bounds__(kNumThreads, 1) routingFusedRouterKernel(
-    FusedRouterParams const __grid_constant__ /* p */)
+__global__ void __launch_bounds__(kNumThreads, 1)
+    routingFusedRouterKernel(FusedRouterParams const __grid_constant__ /* p */)
 {
     assert(false && "routingFusedRouterKernel is only supported on SM100+ architectures");
 }
@@ -482,9 +478,9 @@ void launchFusedRouter(FusedRouterParams const& params, bool usePdl, cudaStream_
 
 bool supportsFusedRouter(Data const& data, int32_t hiddenDim)
 {
-    return hiddenDim == kHiddenDim && data.mNumExperts == kNumExperts && data.mTopK == kTopK
-        && data.mNumTokens >= 1 && data.mNumTokens <= kMaxTokens && data.mNumTokens <= data.mTileTokensDim
-        && data.mLocalExpertsStrideLog2 == 0 && data.mPreprocessType == RoutingPreprocessType::SigmoidBias
+    return hiddenDim == kHiddenDim && data.mNumExperts == kNumExperts && data.mTopK == kTopK && data.mNumTokens >= 1
+        && data.mNumTokens <= kMaxTokens && data.mNumTokens <= data.mTileTokensDim && data.mLocalExpertsStrideLog2 == 0
+        && data.mPreprocessType == RoutingPreprocessType::SigmoidBias
         && data.mPostprocessType == RoutingPostprocessType::ScaledSumNormalize
         && data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mPtrTopKWeights != nullptr
         && data.mPtrRoutingBias != nullptr && data.mPtrTopKIds == nullptr;

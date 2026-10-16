@@ -47,8 +47,8 @@ bool isDownSupported(int numRows, int inter, int hidden, int tiling = kDefaultTi
 //! \param x activations [numRows, hidden], row-major, BF16, 16-byte aligned.
 //! \param gateUpWeight [2 * inter, hidden], row-major, BF16 (rows [0, inter) gate, [inter, 2 * inter) up).
 //! \param h output [numRows, inter], row-major, BF16.
-cudaError_t launchGateUpSwiglu(__nv_bfloat16 const* x, __nv_bfloat16 const* gateUpWeight, __nv_bfloat16* h,
-    int numRows, int hidden, int inter, int tiling, bool enablePdl, cudaStream_t stream);
+cudaError_t launchGateUpSwiglu(__nv_bfloat16 const* x, __nv_bfloat16 const* gateUpWeight, __nv_bfloat16* h, int numRows,
+    int hidden, int inter, int tiling, bool enablePdl, cudaStream_t stream);
 
 //! Down projection: out[m, n] = bf16(sum_k h[m, k] * W[n, k]) with FP32 sums.
 //! \param h activations [numRows, inter], row-major, BF16, 16-byte aligned.
