@@ -740,22 +740,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             make_side_stream_copier=self._make_side_stream_copier,
         )
 
-    @staticmethod
-    def _is_draft_batch(requests: list[LlmRequest]) -> bool:
-        """Whether this batch belongs to the draft model.
-
-        Batches are homogeneous by construction: a drafter builds all-draft
-        batches for its sample_async/update_requests calls on this shared
-        sampler, and PyExecutor's batches are all-target. The pending-steps
-        accounting relies on this to skip draft batches wholesale; assert it so
-        a mixed batch fails loudly instead of silently corrupting the counters.
-        """
-        is_draft: bool = requests[0].py_is_draft
-        assert all(r.py_is_draft == is_draft for r in requests), (
-            "sampler batch must be homogeneous (all-draft or all-target)"
-        )
-        return is_draft
-
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
@@ -835,15 +819,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         ``_forward_step`` has returned, so sampling in-graph would read unmasked
         logits and emit a token they were meant to forbid, while their output is
         discarded. Any future post-forward logits mutator belongs here too.
-
-        Draft requests are excluded as well: the draft engine registers neither
-        hook yet shares this sampler, so a draft batch must not be served from
-        state staged for its target.
         """
-        return (
-            request.py_guided_decoding_params is not None
-            or bool(getattr(request, "py_logits_post_processors", None))
-            or bool(getattr(request, "py_is_draft", False))
+        return request.py_guided_decoding_params is not None or bool(
+            getattr(request, "py_logits_post_processors", None)
         )
 
     def get_sample_type(self, requests: list[LlmRequest]) -> SampleType:
@@ -1219,7 +1197,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         context_new_requests = [
             request
             for request in scheduled_requests.context_requests_last_chunk
-            if not request.is_finished and not request.py_is_draft
+            if not request.is_finished
         ]
         adp_dummy_generation_requests = [
             request
@@ -1356,7 +1334,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if not state.requests:
             return
 
-        if self._track_pending_steps and not self._is_draft_batch(state.requests):
+        if self._track_pending_steps:
             for req in state.requests:
                 slot = req.py_seq_slot
                 if slot is not None and self._pending_steps[slot] > 0:
@@ -1627,11 +1605,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
-        # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by a drafter's prepare_draft_tokens(), for the draft model. In the former
-        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-        #     latter case, there is always only 1 token per request because draft
-        #     tokens are sampled one-by-one.
+        # NB: There are 1 + get_draft_token_length(request) tokens per request.
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
@@ -1641,9 +1615,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # update_requests. Must happen before _process_requests, which
             # reads the counters for bad-words staleness.
             for r in scheduled_requests.context_requests:
-                if not r.py_is_draft:
-                    assert r.py_seq_slot is not None
-                    self._pending_steps[r.py_seq_slot] = 0
+                assert r.py_seq_slot is not None
+                self._pending_steps[r.py_seq_slot] = 0
 
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.
@@ -1662,7 +1635,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_context_logits_prefix_sum,
         )
 
-        if self._track_pending_steps and requests and not self._is_draft_batch(requests):
+        if self._track_pending_steps and requests:
             for r in requests:
                 assert r.py_seq_slot is not None
                 self._pending_steps[r.py_seq_slot] += 1
@@ -1676,17 +1649,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if requests:
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
-            # Prepare stop word handling
-            # Draft requests need to be ignored for stop word handling as they never set up
-            # their buffers in the store.
-            # Assume that either all requests are drafts or none are drafts
-            is_draft_batch = requests[0].py_is_draft
             if not single_step_greedy:
                 assert seq_lens_host is not None
                 assert seq_lens_cuda is not None
                 finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
                     seq_slots_host=seq_slots_host,
-                    is_draft_batch=is_draft_batch,
                     seq_slots_cuda=seq_slots_cuda,
                     seq_lens_cuda=seq_lens_cuda,
                     new_tokens_cuda=new_tokens,
@@ -2140,10 +2107,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Length-based bans (min_length) add it back to recover the real generated
         length. Unlike the suffix-rule staleness this needs no device-side
         lookup, so it is not restricted to the single-step / single-beam case.
-        Returns None when the overlap scheduler is off, on a draft batch, or
-        when nothing is pending, so callers can skip the correction entirely.
+        Returns None when the overlap scheduler is off or when nothing is
+        pending, so callers can skip the correction entirely.
         """
-        if not self._track_pending_steps or self._is_draft_batch(requests):
+        if not self._track_pending_steps:
             return None
         pending = [
             self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
@@ -2160,9 +2127,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         speculative decoding or beam search the missing history cannot be
         recovered, so bans are matched against the lagging host history and may
         be enforced one step late (warned once). Returns None when the overlap
-        scheduler is off, on a draft batch, or when nothing is pending.
+        scheduler is off or when nothing is pending.
         """
-        if not self._track_pending_steps or self._is_draft_batch(requests):
+        if not self._track_pending_steps:
             return None
         pending = [
             self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
@@ -2362,17 +2329,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #
         # Staging happened before the forward, so verify the staged buffers
         # really describe this batch: a forward that was skipped, repeated or
-        # replaced (context-only steps, draft batches, eager fallbacks) would
+        # replaced (context-only steps, eager fallbacks) would
         # otherwise be sampled against another batch's destinations.
         if self._current_sample_type is not SampleType.FULL:
             live_requests = [request for request in generation_requests if not request.is_dummy]
             staged_matches_batch = (
                 self._in_graph_staged
                 and self._in_graph_dest_indices is not None
-                # A draft request reuses its target's py_request_id, so the id
-                # list alone cannot tell a drafter batch from the target batch
-                # that staged it.
-                and not any(request.py_is_draft for request in live_requests)
                 and [request.py_request_id for request in live_requests]
                 == self._in_graph_request_ids
             )
@@ -2427,11 +2390,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if single_step_greedy
                     else new_tokens_cuda
                 )
-                # Consumption is one-shot. The id list is not a unique key for a
-                # batch -- a draft request reuses its target's py_request_id and
-                # the drafter shares this sampler -- so leaving the state staged
-                # would let a later drafter step with the same ids be served
-                # these tokens as draft tokens. The next forward restages.
+                # Consumption is one-shot; the next forward restages.
                 self._consume_in_graph_staging()
                 return (
                     live_requests,
@@ -2536,9 +2495,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams=(
                 beam_search_store.predecessor_beams if beam_search_store is not None else None
             ),
-            # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
-            # anyway, so short-circuit rather than index into it.
-            is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
         )
 
         has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)

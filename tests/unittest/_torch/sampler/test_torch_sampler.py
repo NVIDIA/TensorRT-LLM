@@ -69,14 +69,12 @@ class TestSetupSamplerStepRequestSelection:
         *,
         is_attention_dp_dummy: bool = False,
         is_finished: bool = False,
-        py_is_draft: bool = False,
     ) -> LlmRequest:
         return cast(
             LlmRequest,
             SimpleNamespace(
                 is_attention_dp_dummy=is_attention_dp_dummy,
                 is_finished=is_finished,
-                py_is_draft=py_is_draft,
             ),
         )
 
@@ -85,34 +83,27 @@ class TestSetupSamplerStepRequestSelection:
 
         context_request = self._make_request()
         finished_context_request = self._make_request(is_finished=True)
-        draft_context_request = self._make_request(py_is_draft=True)
         adp_dummy_generation_request = self._make_request(is_attention_dp_dummy=True)
         regular_generation_request = self._make_request()
         finished_adp_dummy_generation_request = self._make_request(
             is_attention_dp_dummy=True, is_finished=True
         )
-        draft_adp_dummy_generation_request = self._make_request(
-            is_attention_dp_dummy=True, py_is_draft=True
-        )
 
         scheduled_requests.context_requests_last_chunk = [
             context_request,
             finished_context_request,
-            draft_context_request,
         ]
         scheduled_requests.generation_requests = [
             adp_dummy_generation_request,
             regular_generation_request,
             finished_adp_dummy_generation_request,
-            draft_adp_dummy_generation_request,
         ]
 
         collected = TorchSampler._collect_new_requests_for_setup(scheduled_requests)
-        assert len(collected) == 4
+        assert len(collected) == 3
         assert collected[0] is context_request
         assert collected[1] is adp_dummy_generation_request
         assert collected[2] is finished_adp_dummy_generation_request
-        assert collected[3] is draft_adp_dummy_generation_request
 
 
 @force_ampere
@@ -806,9 +797,8 @@ def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.Mon
             sampling_config=SamplingConfig(),
             seq_slot=seq_slot,
             is_streaming=False,
-            is_draft=is_draft,
         )
-        for seq_slot, is_draft in ((0, False), (1, True))
+        for seq_slot in (0, 1)
     ]
 
     for seq_slot, request in enumerate(requests):
@@ -1125,7 +1115,6 @@ class TestFinishReasons:
                 ).T
                 sampler.store.new_tokens[:, seq_slots_cuda, cls.BEAM] = new_tokens_cuda
 
-                is_draft_batch = False
                 # Capture return value of write_finish_reasons for use after _uut() runs.
                 write_finish_reasons_result: list[torch.Tensor] = []
 
@@ -1133,7 +1122,6 @@ class TestFinishReasons:
                     with extra_context() if extra_context is not None else nullcontext():
                         result = sampler._finish_reasons_handler.write_finish_reasons(
                             seq_slots_host=seq_slots_host,
-                            is_draft_batch=is_draft_batch,
                             seq_slots_cuda=seq_slots_cuda,
                             seq_lens_cuda=seq_lens_cuda,
                             new_tokens_cuda=sampler.store.new_tokens,
@@ -3118,7 +3106,6 @@ class TestRequestSeed:
                 SimpleNamespace(
                     py_seq_slot=0,
                     py_request_id=request_id,
-                    py_is_draft=False,
                     sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
                 ),
             )
@@ -3130,75 +3117,6 @@ class TestRequestSeed:
 
         assert first.seed.tolist() == second.seed.tolist() == [42]
         assert first.offset.item() != second.offset.item()
-
-    def test_draft_batch_does_not_disturb_target_seed_state(self):
-        """Draft slots come from a different SeqSlotManager over the same range.
-
-        Observing a draft batch must not look like a change of occupant for the
-        target request holding that slot number, which would reset its offset
-        and make it replay part of its stream.
-        """
-        manager = _SeedManager(max_num_sequences=4, global_seed=42)
-        device = torch.device("cpu")
-
-        target = cast(
-            LlmRequest,
-            SimpleNamespace(
-                py_seq_slot=0,
-                py_request_id=100,
-                py_is_draft=False,
-                sampling_config=SamplingConfig(SamplingParams(seed=1234)._get_sampling_config()),
-            ),
-        )
-        manager.observe([target])
-        assert manager.take_row_seeds([0], device=device).seed.tolist() == [1234]
-        offset_before = manager._offsets[0].item()
-
-        # A draft request lands on slot 0, owned by `target` above.
-        draft = cast(
-            LlmRequest,
-            SimpleNamespace(
-                py_seq_slot=0,
-                py_request_id=200,
-                py_is_draft=True,
-                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
-            ),
-        )
-        manager.observe([draft])
-        # Draft rows draw from the global seed, not the target's stream.
-        assert manager.take_row_seeds([0], device=device).seed.tolist() == [42]
-        assert manager._offsets[0].item() == offset_before
-        assert manager._slot_owner[0] == 100  # still the target request
-
-        # The target is unchanged when it comes back around.
-        manager.observe([target])
-        assert manager._offsets[0].item() == offset_before
-
-    def test_draft_batch_advances_unseeded_offsets(self):
-        manager = _SeedManager(max_num_sequences=4, global_seed=42)
-        device = torch.device("cpu")
-
-        def request(request_id: int, is_draft: bool) -> LlmRequest:
-            return cast(
-                LlmRequest,
-                SimpleNamespace(
-                    py_seq_slot=0,
-                    py_request_id=request_id,
-                    py_is_draft=is_draft,
-                    sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
-                ),
-            )
-
-        target = request(100, is_draft=False)
-        manager.observe([target])
-        before = manager.take_row_seeds([0], device=device)
-        manager.observe([request(200, is_draft=True)])
-        during = manager.take_row_seeds([0], device=device)
-        manager.observe([target])
-        after = manager.take_row_seeds([0], device=device)
-
-        assert before.seed.tolist() == during.seed.tolist() == after.seed.tolist() == [42]
-        assert before.offset.item() < during.offset.item() < after.offset.item()
 
     def test_multi_row_offsets_do_not_overlap(self):
         """Speculative decoding draws several rows per request per step.
