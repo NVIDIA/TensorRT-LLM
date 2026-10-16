@@ -264,6 +264,10 @@ String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
 @Field
 def GITHUB_PR_API_URL = "github_pr_api_url"
+// Used to read the git changes when there is no PR or MR to read the changes from (i.e., when trigger from merge queue):
+// the changes are base_commit..gitlabCommit, read from `git diff` in the internal Git mirror.
+@Field
+def BASE_COMMIT = "base_commit"
 @Field
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
@@ -328,6 +332,7 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
+    (BASE_COMMIT): gitlabParamsFromBot.get('base_commit', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
@@ -667,7 +672,7 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
             def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
             def changedFileList = githubPrApiUrl != null
                 ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
-                : getGitlabMRChangedFile(pipeline, "getChangedFileList")
+                : getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, "getChangedFileList")
             if (changedFileList.contains(maintenanceConfigPath)) {
                 error "Deleting or renaming ${maintenanceConfigPath} is not allowed."
             }
@@ -995,9 +1000,13 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 }
 
 def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
-    def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
     def headCommit = env.gitlabCommit?.toString()
-    def baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
+    // The merge queue names the base commit; for a PR, the wrapper pushed the base to the mirror.
+    def baseRef = globalVars[BASE_COMMIT]
+    if (!baseRef) {
+        def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
+        baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
+    }
     pipeline.withEnv(["GIT_DIFF_BASE_REF=${baseRef}"]) {
         withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
             pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin \"\${GIT_DIFF_BASE_REF}\""
@@ -1078,6 +1087,15 @@ def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath=
     }
 }
 
+// Changes of a build without a GitHub PR: base_commit..gitlabCommit in the internal Git mirror
+// when the merge queue set base_commit, else the GitLab MR.
+def getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    if (globalVars[BASE_COMMIT]) {
+        return getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+    }
+    return getGitlabMRChangedFile(pipeline, function, filePath)
+}
+
 // Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
 // Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
 // both label existence and that the labeler is an active team member.
@@ -1145,7 +1163,7 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         if (githubPrApiUrl != null) {
             changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
         } else {
-            changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
+            changedFileList = getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, "getChangedFileList")
         }
         def changedFileListStr = changedFileList.join(",\n")
         pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
@@ -1178,7 +1196,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     if (githubPrApiUrl != null) {
         diff = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getOneFileChanges", filePath)
     } else {
-        diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
+        diff = getGitlabMROrBaseCommitChangedFile(pipeline, globalVars, "getOneFileChanges", filePath)
     }
     pipeline.echo("The change of ${filePath} is: ${diff}")
     return diff
@@ -1278,7 +1296,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             def fileChanges = githubPrApiUrl != null
                 ? getGithubMRChangedFileWithFallback(
                     pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
-                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+                : getGitlabMROrBaseCommitChangedFile(
+                    pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
                 [(filePath): fileChanges[filePath] ?: ""]
