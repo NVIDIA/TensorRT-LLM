@@ -10,8 +10,7 @@ task=$1
 echo "Starting remote MPI session test with task: $task"
 echo "MPI processes: 2"
 
-# Allow time for worker startup and shutdown as well as the remote task.
-timeout_seconds=120
+timeout_seconds=60
 
 # mpirun does not forward the environment it was given to launched ranks, so
 # the ALLOW_RUN_AS_ROOT pair Open MPI 5's PRRTE needs has to be named

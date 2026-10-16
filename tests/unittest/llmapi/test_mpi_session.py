@@ -23,10 +23,6 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
 
 
 def task0():
-    from mpi4py import MPI
-
-    # Hold each worker until every worker owns one task in this wave.
-    MPI.COMM_WORLD.barrier()
     if MPINodeState.state is None:
         MPINodeState.state = 0
     MPINodeState.state += 1
