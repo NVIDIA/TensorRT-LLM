@@ -434,6 +434,10 @@ def test_kimi_k3_shared_allreduce_ordering(
     runtime.moe_latent_ready_event = None
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    # maybe_execute_in_parallel records the aux outputs on the calling stream
+    # after the join; keep that query and lookup off the CUDA runtime too.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: is_compiling)
 

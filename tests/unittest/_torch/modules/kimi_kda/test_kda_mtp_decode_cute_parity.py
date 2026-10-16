@@ -1292,7 +1292,17 @@ def test_commit_pending_drafts_replays_the_per_token_records():
     unread = torch.empty(0, device="cuda")
 
     commit_kda_pending_drafts(
-        state, conv_pool, *cs, unread, unread, unread, slots, accepted, state_tok=state_tok
+        state,
+        conv_pool,
+        *cs,
+        # k / g / v / beta replay caches: unread with per-token states.
+        unread,
+        unread,
+        unread,
+        unread,
+        slots,
+        accepted,
+        state_tok=state_tok,
     )
 
     for slot, count in zip(slots.tolist(), accepted.tolist()):
