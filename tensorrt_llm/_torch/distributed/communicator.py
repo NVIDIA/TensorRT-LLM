@@ -1683,11 +1683,11 @@ class TorchDist(Distributed):
         if vote_pg is None:
             return super().tp_allgather_int64(values)
         vec = torch.from_numpy(
-            np.ascontiguousarray(np.asarray(values, dtype=np.int64).reshape(-1)))
+            np.ascontiguousarray(
+                np.asarray(values, dtype=np.int64).reshape(-1)))
         rows = self._cuda_allgather_cpu_tensor(vec, vote_pg)
-        return torch.stack(rows).numpy().astype(np.int64,
-                                                 copy=False).reshape(
-                                                     len(rows), -1)
+        return torch.stack(rows).numpy().astype(np.int64, copy=False).reshape(
+            len(rows), -1)
 
     @log_op
     def tp_gather(self, obj, dst=0):

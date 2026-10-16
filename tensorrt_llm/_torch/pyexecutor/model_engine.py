@@ -1270,10 +1270,9 @@ class PyTorchModelEngine(ModelEngine):
                 self._torch_compile_piecewise_cuda_graph
                 and (self._compile_only_piecewise_graphs
                      or not self.model.use_fx_for_pcg_fallback))
-            self.model.model = (PrefillCompiledModel(eager_model,
-                                                     compiled_model)
-                                if self._torch_compile_prefill_only else
-                                compiled_model)
+            self.model.model = (PrefillCompiledModel(
+                eager_model, compiled_model) if self._torch_compile_prefill_only
+                                else compiled_model)
         elif callable(apply_llm_torch_compile):
             # Avoid nesting a new wrapper around the previous compile.
             llm = getattr(self.model, "llm", None)

@@ -214,17 +214,21 @@ def test_control_request_wait_pauses_detector():
     executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
 
     def complete_control_action():
-        executor.control_request_barrier.wait()
-        time.sleep(2.0)
-        executor.control_action_done.set()
-        executor.control_request_barrier.clear()
+        # Bounded: if the control request fails before it sets the barrier, an unbounded wait
+        # would leave this thread alive and hang the test process.
+        if executor.control_request_barrier.wait(timeout=30):
+            time.sleep(2.0)
+            executor.control_action_done.set()
+            executor.control_request_barrier.clear()
 
-    completion_thread = threading.Thread(target=complete_control_action)
+    completion_thread = threading.Thread(target=complete_control_action, daemon=True)
     completion_thread.start()
-    with patch("torch.cuda.synchronize"), executor.hang_detector:
-        executor.hang_detector.checkpoint()
-        executor._handle_control_request()
-    completion_thread.join()
+    try:
+        with patch("torch.cuda.synchronize"), executor.hang_detector:
+            executor.hang_detector.checkpoint()
+            executor._handle_control_request()
+    finally:
+        completion_thread.join(timeout=35)
 
     assert fired == []
     assert executor.control_requests == []

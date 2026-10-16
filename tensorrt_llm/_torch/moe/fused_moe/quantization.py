@@ -555,12 +555,11 @@ class FusedMoEMethodBase(ABC):
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
         if allow_partial_loading:
-            if not isinstance(self,
-                              (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
-                               NVFP4FusedMoEMethod,
-                               MXFP8CutlassFusedMoEMethod)):
+            if not isinstance(
+                    self, (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           NVFP4FusedMoEMethod, MXFP8CutlassFusedMoEMethod)):
                 raise NotImplementedError(
                     f"Partial loading is not supported for {type(self).__name__}"
                 )
@@ -6668,7 +6667,8 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                 w1_sf, w3_sf, w2_sf = None, None, None
                 gate_up_sf = weights.get("gate_up_proj_weight_scale")
                 if gate_up_sf is not None:
-                    w1_w3_sf = gate_up_sf[expert_id].transpose(0, 1).contiguous()
+                    w1_w3_sf = gate_up_sf[expert_id].transpose(0,
+                                                               1).contiguous()
                     w1_sf, w3_sf = w1_w3_sf.chunk(2, dim=0)
                 down_sf = weights.get("down_proj_weight_scale")
                 if down_sf is not None:

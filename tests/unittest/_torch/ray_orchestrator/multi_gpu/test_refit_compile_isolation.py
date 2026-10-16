@@ -67,27 +67,28 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
-from safetensors import safe_open
-from transformers import AutoTokenizer
 
 # The tests tree is not a package (no __init__.py); imports are rooted at
 # tests/unittest, which the runner puts on PYTHONPATH.
 from _torch.ray_orchestrator.multi_gpu.test_llm_update_weights_multi_gpu import (
     _QWEN35_35B_TP8,
     Qwen35_35BTP8WorkerExtension,
+    RefQwen35MXFP8ModelWithIPCHandles,
     _attach_to_tp8_ray_cluster,
     _mxfp8_397b_model_dir,
     _qwen35_35b_model_kwargs,
     _qwen35_35b_selected_checkpoint_names,
     _qwen35_35b_weight_group,
     _return_local_weight,
-    RefQwen35MXFP8ModelWithIPCHandles,
 )
+from safetensors import safe_open
+from transformers import AutoTokenizer
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm import LLM
@@ -101,9 +102,10 @@ from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 # the work has already succeeded.
 pytestmark = [pytest.mark.threadleak(enabled=False)]
 
-ARTIFACT_DIR = os.environ.get(
-    "TLLM_REFIT_ISOLATION_ARTIFACT_DIR",
-    "/lustre/fsw/coreai_mlperf_training/erinh/pcg-test/artifacts",
+# Per-run temporary directory unless overridden: the report test reads the artifacts the
+# decode tests wrote earlier in the same session, and must not pick up stale ones.
+ARTIFACT_DIR = os.environ.get("TLLM_REFIT_ISOLATION_ARTIFACT_DIR") or tempfile.mkdtemp(
+    prefix="refit_isolation_"
 )
 
 # Full 60-layer/512-expert 397B by default -- the reduced 4-layer shape produces
@@ -315,12 +317,9 @@ class _RefitIsolationExtension(Qwen35_35BTP8WorkerExtension):
                 ext = _rl_nccl_extension()
                 if ext is not None:
                     ext._restore_compiled_model_after_refit(self)
-                    print("[REFIT_ISO] used RL_3 _restore_compiled_model_after_refit",
-                          flush=True)
+                    print("[REFIT_ISO] used RL_3 _restore_compiled_model_after_refit", flush=True)
                 else:
-                    model_engine.restore_compiled_model_after_refit(
-                        self.engine.resource_manager
-                    )
+                    model_engine.restore_compiled_model_after_refit(self.engine.resource_manager)
             if hasattr(model, "_nemo_rl_style_begun"):
                 delattr(model, "_nemo_rl_style_begun")
             return
@@ -335,10 +334,12 @@ class _RefitIsolationExtension(Qwen35_35BTP8WorkerExtension):
                 ext = _rl_nccl_extension()
                 if ext is not None:
                     # The real RL_3 implementation, not a copy of it.
-                    fn = getattr(ext, "_unwrap_compiled_model_for_refit", None) or ext._release_compiled_model_for_refit
+                    fn = (
+                        getattr(ext, "_unwrap_compiled_model_for_refit", None)
+                        or ext._release_compiled_model_for_refit
+                    )
                     fn(self)
-                    print("[REFIT_ISO] used RL_3 unwrap helper",
-                          flush=True)
+                    print("[REFIT_ISO] used RL_3 unwrap helper", flush=True)
                 else:
                     model_engine.unwrap_compiled_model_for_refit()
             model_engine.model_loader.begin_update_weights()
@@ -506,7 +507,9 @@ def _sampling_params() -> SamplingParams:
 #  Engine spec
 # --------------------------------------------------------------------------- #
 class _Engine:
-    def __init__(self, refit: bool, compile_kind: Optional[str], rows: List[Tuple[str, Optional[bool]]]):
+    def __init__(
+        self, refit: bool, compile_kind: Optional[str], rows: List[Tuple[str, Optional[bool]]]
+    ):
         self.refit = refit
         self.compile_kind = compile_kind  # None | "compile" | "pcg"
         self.rows = rows  # (artifact_tag, pcg_replay_override or None)
@@ -591,8 +594,11 @@ def _report_param_identity(before: dict, after: dict) -> None:
         f"address_moved={len(moved)} object_rebound={len(rebound)} resized={len(resized)}",
         flush=True,
     )
-    for label, names in (("address_moved", moved), ("object_rebound", rebound),
-                         ("resized", resized)):
+    for label, names in (
+        ("address_moved", moved),
+        ("object_rebound", rebound),
+        ("resized", resized),
+    ):
         if names:
             kinds = {}
             for n in names:
@@ -660,18 +666,23 @@ def _run_engine(engine: _Engine) -> None:
         refit_cycles = int(os.environ.get("TLLM_REFIT_ISO_CYCLES", "1"))
         if engine.refit:
             groups = sorted({_weight_group(n) for n in _selected_checkpoint_names(model_dir)})
-            print(f"[REFIT_ISO] refit buckets: {len(groups)} cycles: {refit_cycles}",
-                  flush=True)
+            print(f"[REFIT_ISO] refit buckets: {len(groups)} cycles: {refit_cycles}", flush=True)
             if os.environ.get("TLLM_REFIT_ISO_NEMO_RL_STYLE"):
                 # Demonstrate the production refit sequence, which never calls
                 # the TensorRT-LLM refit lifecycle (see the method docstring).
                 rpc = "update_weights_nemo_rl_style"
             elif _REDUCED:
-                rpc = ("update_mxfp8_weights_from_local_checkpoint" if _MXFP8
-                       else "update_weights_from_local_checkpoint")
+                rpc = (
+                    "update_mxfp8_weights_from_local_checkpoint"
+                    if _MXFP8
+                    else "update_weights_from_local_checkpoint"
+                )
             else:
-                rpc = ("update_mxfp8_weights_from_full_checkpoint" if _MXFP8
-                       else "update_weights_from_full_checkpoint")
+                rpc = (
+                    "update_mxfp8_weights_from_full_checkpoint"
+                    if _MXFP8
+                    else "update_weights_from_full_checkpoint"
+                )
             # Match NeMo-RL: capture over the dummy model before refit.
             llm.generate(prompts, sampling_params)
             for cycle in range(refit_cycles):
@@ -707,8 +718,7 @@ def _run_engine(engine: _Engine) -> None:
                     # in a bad state shows up here rather than being masked by
                     # the next refit repairing it.
                     ids, _ = _generate(llm, prompts, sampling_params)
-                    print(f"[REFIT_ISO] after cycle {cycle} first8={ids[0][:8]}",
-                          flush=True)
+                    print(f"[REFIT_ISO] after cycle {cycle} first8={ids[0][:8]}", flush=True)
 
         for tag, replay in engine.rows:
             if replay is not None:
@@ -846,4 +856,6 @@ def test_refit_isolation_report():
             for tag, reports in table.items()
             if any(r["pos0_rel_l2"] > threshold or r["pos0_cosine"] < 0.9 for r in reports)
         }
-        assert not bad, f"rows exceed {threshold:.3g} pos0_rel_l2 or cosine<0.9: {json.dumps(bad, indent=2)}"
+        assert not bad, (
+            f"rows exceed {threshold:.3g} pos0_rel_l2 or cosine<0.9: {json.dumps(bad, indent=2)}"
+        )

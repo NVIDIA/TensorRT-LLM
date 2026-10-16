@@ -62,8 +62,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1884,8 +1886,8 @@ std::vector<torch::Tensor> allreduce_pg_by_name(torch::Tensor const& input,
 #endif
 }
 
-torch::Tensor allreduce_pg_warmup_by_name(torch::Tensor const& token, torch::List<int64_t> const& group_,
-    int64_t rank, std::string const& group_name)
+torch::Tensor allreduce_pg_warmup_by_name(
+    torch::Tensor const& token, torch::List<int64_t> const& group_, int64_t rank, std::string const& group_name)
 {
 #if ENABLE_MULTI_DEVICE
     std::set<int> group;
@@ -1902,8 +1904,8 @@ torch::Tensor allreduce_pg_warmup_by_name(torch::Tensor const& token, torch::Lis
     // Run the ProcessGroup topology metadata exchanges before Dynamo/PCG
     // capture. The normal named allreduce then reuses this cached topology
     // and continues through its existing optimized native implementation.
-    AllreduceOp op(group, process_group, tensorrt_llm::DataType::kFLOAT,
-        AllReduceStrategyType::AUTO, AllReduceFusionOp::NONE, 0.0F);
+    AllreduceOp op(group, process_group, tensorrt_llm::DataType::kFLOAT, AllReduceStrategyType::AUTO,
+        AllReduceFusionOp::NONE, 0.0F);
     op.initialize();
 
     // ``initialize`` discovers topology but does not launch the c10d NCCL
@@ -1912,8 +1914,8 @@ torch::Tensor allreduce_pg_warmup_by_name(torch::Tensor const& token, torch::Lis
     // the exact c10d path once, eagerly, with a private one-element tensor.
     TORCH_CHECK(token.is_cuda() && token.numel() > 0 && token.scalar_type() == torch::kFloat,
         "allreduce_pg_warmup_by_name requires a non-empty CUDA float32 token");
-    AllreduceOp nccl_warmup(group, process_group, tensorrt_llm::DataType::kFLOAT,
-        AllReduceStrategyType::NCCL, AllReduceFusionOp::NONE, 0.0F);
+    AllreduceOp nccl_warmup(group, process_group, tensorrt_llm::DataType::kFLOAT, AllReduceStrategyType::NCCL,
+        AllReduceFusionOp::NONE, 0.0F);
     nccl_warmup.initialize();
     (void) nccl_warmup.run(token, std::nullopt, std::nullopt, std::nullopt, std::nullopt, true, std::nullopt);
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
@@ -2265,7 +2267,15 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         char const* env = std::getenv("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES");
         if (env != nullptr && *env != '\0')
         {
-            return static_cast<size_t>(std::strtoull(env, nullptr, 10));
+            // Reject anything that is not a plain non-negative integer: strtoull would return 0 for
+            // "1MB" (always two-shot) and wrap a negative value, while the Python side raises on a
+            // non-numeric value, so the two sides must not parse the same string differently.
+            char* end = nullptr;
+            errno = 0;
+            unsigned long long const value = std::strtoull(env, &end, 10);
+            TORCH_CHECK(errno == 0 && end != env && *end == '\0' && *env != '-',
+                "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got '", env, "'");
+            return static_cast<size_t>(value);
         }
         return 64 * 1024 * 8 * 2;
     }();
