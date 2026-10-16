@@ -114,6 +114,8 @@ Then, start the server with the configuration file:
    trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
        --config ./config.yml
 
+For Cosmos3 Reasoner text, image and video requests, see the `Cosmos3 Reasoner serving examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/cosmos3>`_. Start with ``trtllm-serve <model>`` without VisualGen flags. For static-FP8 Nano and Super checkpoints, include the root ``hf_quant_config.json`` alongside the checkpoint weights.
+
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
 
