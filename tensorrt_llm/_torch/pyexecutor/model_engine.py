@@ -40,7 +40,7 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..speculative.utils import get_static_draft_len
@@ -277,7 +277,7 @@ class PyTorchModelEngine(ModelEngine):
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
 
-        self.moe_load_balancer: Optional[MoeLoadBalancer] = None
+        self.moe_load_balancer: Optional[BaseMoeLoadBalancer] = None
         self.model_loader: Optional[ModelLoader] = None
         if model is None:
             lora_config: Optional[LoraConfig] = llm_args.lora_config
@@ -296,7 +296,7 @@ class PyTorchModelEngine(ModelEngine):
             # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
-            if isinstance(moe_load_balancer, MoeLoadBalancer):
+            if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
@@ -893,11 +893,6 @@ class PyTorchModelEngine(ModelEngine):
         set_moe_comm_warmup(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
-        moe_load_balancer = self.moe_load_balancer
-        if moe_load_balancer is not None:
-            set_warmup = getattr(moe_load_balancer, "set_warmup", None)
-            if callable(set_warmup):
-                set_warmup(value)
 
     @property
     def moe_load_balancer_iter_info(self):
