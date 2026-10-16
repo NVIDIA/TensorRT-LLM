@@ -83,15 +83,6 @@ def get_ucx_tls():
     return "^ib,gdr_copy"
 
 
-def cleanup_output_files():
-    """Clean up output files from previous runs."""
-    for file in ['output.json', 'output_streaming.json']:
-        try:
-            os.remove(file)
-        except FileNotFoundError:
-            pass
-
-
 # Fatal patterns whose presence in worker/server logs after a stress run
 # indicates the cluster did not stay healthy and the test should be failed.
 # Only genuinely fatal conditions belong here — transient request-level errors
@@ -502,11 +493,19 @@ def run_client_tests(example_dir,
                      server_url,
                      workers_proc,
                      server_proc,
+                     client_output_dir,
                      use_ray=False,
                      client_test_set=None):
-    """Run client tests against the disaggregated server."""
+    """Run client tests against the disaggregated server.
+
+    Client outputs go to client_output_dir, not to the cwd: concurrent QA jobs
+    run from one shared checkout and can overwrite each other's files there.
+    """
     if client_test_set is None:
         client_test_set = get_client_test_set(test_desc)
+
+    def output_path(file_name):
+        return os.path.join(client_output_dir, file_name)
 
     client_dir = f"{example_dir}/clients"
     for _ in range(num_iters):
@@ -536,25 +535,30 @@ def run_client_tests(example_dir,
 
         # Run completion test (non-streaming)
         if client_test_set.completion:
-            check_call(client_cmd, env=env, poll_procs=poll_procs)
+            completion_output = output_path('output.json')
+            completion_client_cmd = client_cmd + ['-o', completion_output]
+            check_call(completion_client_cmd, env=env, poll_procs=poll_procs)
 
         # Streaming client run
         if client_test_set.completion_streaming:
+            streaming_output = output_path('output_streaming.json')
             streaming_client_cmd = client_cmd + [
-                '--streaming', '-o', 'output_streaming.json'
+                '--streaming', '-o', streaming_output
             ]
             check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run chat completion test
         if client_test_set.chat:
-            chat_output = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_file_name = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_output = output_path(chat_file_name)
             chat_client_cmd = client_cmd + ['-e', 'chat', '-o', chat_output]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run streaming chat completion test
         if client_test_set.chat_streaming:
+            streaming_chat_output = output_path('output_streaming_chat.json')
             streaming_chat_client_cmd = client_cmd + [
-                '-e', 'chat', '--streaming', '-o', 'output_streaming_chat.json'
+                '-e', 'chat', '--streaming', '-o', streaming_chat_output
             ]
             check_call(streaming_chat_client_cmd,
                        env=env,
@@ -586,7 +590,7 @@ def run_client_tests(example_dir,
             continue
 
         for output_file in output_files:
-            with open(output_file, 'r') as f:
+            with open(output_path(output_file), 'r') as f:
                 content = f.read()
                 if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
                     expected_strings = [
@@ -1087,6 +1091,7 @@ def run_disaggregated_test(example_dir,
             server_url,
             all_worker_procs,
             disagg_server.process,
+            client_output_dir=work_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
@@ -2497,7 +2502,6 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
@@ -3694,7 +3698,6 @@ def run_disaggregated_mixed_stress(example_dir: str,
     if profiles is None:
         profiles = _DEFAULT_MIXED_STRESS_PROFILES
 
-    cleanup_output_files()
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
@@ -3850,7 +3853,6 @@ def run_disaggregated_cancel_test(example_dir,
                                   model_path=None,
                                   cwd=None):
     """Run disaggregated test with request cancellation stress test."""
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
 
