@@ -30,10 +30,10 @@ from ..ltx2.transformer_ltx2 import (
     LTXModel,
     TransformerConfig,
 )
+from ._precision import _make_mlp, _slice_batch_bundle, _uses_reference_precision
 
 _get_ada_table_ts_pairs = BasicAVTransformerBlock._get_ada_table_ts_pairs
 _get_av_ca_ada_table_ts_pairs = BasicAVTransformerBlock._get_av_ca_ada_table_ts_pairs
-_make_mlp = BasicAVTransformerBlock._make_mlp
 
 
 class LTX23TransformerBlock(nn.Module):
@@ -55,8 +55,10 @@ class LTX23TransformerBlock(nn.Module):
             raise NotImplementedError("Two-stage topology is not supported for LTX-2.3.")
         self.idx = idx
         self.norm_eps = norm_eps
-        self._fuse_adaln = (video is None or is_fused_adaln_supported_dim(video.dim)) and (
-            audio is None or is_fused_adaln_supported_dim(audio.dim)
+        self._fuse_adaln = (
+            (video is None or is_fused_adaln_supported_dim(video.dim))
+            and (audio is None or is_fused_adaln_supported_dim(audio.dim))
+            and not _uses_reference_precision(config)
         )
         dense_config = config
         if config is not None and config.attention.quant_attention_config is not None:
@@ -64,7 +66,7 @@ class LTX23TransformerBlock(nn.Module):
             dense_config = config.model_copy(update={"attention": attention})
 
         def attn(name, query_dim, context_dim, kv, gated, model_config=dense_config):
-            return LTX2Attention(
+            module = LTX2Attention(
                 query_dim=query_dim,
                 context_dim=context_dim,
                 heads=kv.heads,
@@ -77,6 +79,11 @@ class LTX23TransformerBlock(nn.Module):
                 module_name=f"transformer_blocks.{idx}.{name}",
                 enable_sequence_parallel=False,
             )
+            if _uses_reference_precision(config):
+                module.fuse_qk_norm_rope = False
+                module.norm_q = nn.RMSNorm(module.q_dim, eps=norm_eps, dtype=config.torch_dtype)
+                module.norm_k = nn.RMSNorm(module.kv_dim, eps=norm_eps, dtype=config.torch_dtype)
+            return module
 
         if video is not None:
             gated_v = video.apply_gated_attention
@@ -418,6 +425,30 @@ class LTX23Model(LTXModel):
         timestep: torch.Tensor | None = None,
         step_index=None,
     ):
+        modality = video if video is not None else audio
+        if modality is not None and _uses_reference_precision(self.model_config):
+            batch_size = modality.latent.shape[0]
+            if batch_size > 1:
+                predictions = [
+                    self.forward(
+                        video=_slice_batch_bundle(video, index, batch_size)
+                        if video is not None
+                        else None,
+                        audio=_slice_batch_bundle(audio, index, batch_size)
+                        if audio is not None
+                        else None,
+                        text_cache=_slice_batch_bundle(text_cache, index, batch_size),
+                        timestep=timestep,
+                        step_index=step_index,
+                    )
+                    for index in range(batch_size)
+                ]
+                return tuple(
+                    torch.cat([prediction[stream] for prediction in predictions])
+                    if predictions[0][stream] is not None
+                    else None
+                    for stream in range(2)
+                )
         video_args, video_prompt_ts = self._prepare_stream(video, text_cache, is_audio=False)
         audio_args, audio_prompt_ts = self._prepare_stream(audio, text_cache, is_audio=True)
 
