@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-    DeepseekV4TrtllmAttentionMetadata,
-)
 from tensorrt_llm._torch.attention.kv_cache_conversion import encode_high_precision_kv
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
@@ -191,21 +188,11 @@ def test_short_sequence_uses_high_values_for_every_page(manager):
         cache.close()
 
 
-@pytest.mark.parametrize("family", ("dsa", "deepseek_v4"))
 @pytest.mark.parametrize("high_dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
-def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
+def test_dsa_manager_layout_and_high_precision_rows(high_dtype):
     """Exercise native allocation and row selection, not full model inference."""
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
-        DeepseekV4CacheManager,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
-        DeepseekV4AttentionType,
-    )
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
-    from tensorrt_llm.llmapi.llm_args import (
-        DeepSeekSparseAttentionConfig,
-        DeepSeekV4SparseAttentionConfig,
-    )
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 
     kwargs = dict(
         kv_cache_config=KvCacheConfig(
@@ -222,26 +209,11 @@ def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
         max_batch_size=2,
         max_num_tokens=1024,
         mapping=Mapping(),
+        num_layers=1,
+        head_dim=576,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+        pretrained_config=SimpleNamespace(qk_rope_head_dim=64, num_hidden_layers=1),
     )
-    if family == "dsa":
-        manager_cls = DSACacheManagerV2
-        kwargs.update(
-            num_layers=1,
-            head_dim=576,
-            sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
-            pretrained_config=SimpleNamespace(qk_rope_head_dim=64, num_hidden_layers=1),
-        )
-    else:
-        manager_cls = DeepseekV4CacheManager
-        kwargs.update(
-            num_layers=3,
-            head_dim=512,
-            vocab_size=1024,
-            max_input_len=1024,
-            sparse_attn_config=DeepSeekV4SparseAttentionConfig(
-                index_head_dim=128, window_size=128, compress_ratios=[1, 4, 128]
-            ),
-        )
 
     def layout(layers):
         return [
@@ -255,13 +227,13 @@ def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
             for layer in layers
         ]
 
-    reference = manager_cls(dtype=DataType.NVFP4, **kwargs)
+    reference = DSACacheManagerV2(dtype=DataType.NVFP4, **kwargs)
     try:
         original = layout(reference.kv_cache_manager_py_config.layers)
     finally:
         reference.shutdown()
 
-    mixed_cls = MixedPrecisionKVCacheManager.for_manager(manager_cls)
+    mixed_cls = MixedPrecisionKVCacheManager.for_manager(DSACacheManagerV2)
     manager = mixed_cls(
         dtype=high_dtype,
         low_dtype=DataType.NVFP4,
@@ -272,14 +244,6 @@ def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
     )
 
     def row_locations(layer_id, role, rows):
-        if family != "dsa":
-            layer_idx, _ = manager._manager_layer_id_to_layer_attn[layer_id, role]
-            metadata = SimpleNamespace(
-                kv_cache_manager=manager, request_ids=[0], is_cuda_graph=False
-            )
-            return DeepseekV4TrtllmAttentionMetadata.get_high_precision_kv_indices(
-                metadata, layer_idx, torch.zeros_like(rows), rows
-            )
         pool, tables = manager.get_high_precision_rows(layer_id, role, [0])
         blocks = rows // pool.shape[1]
         pages = torch.tensor(tables[0], device="cuda")[blocks.clamp(0, len(tables[0]) - 1)]
@@ -288,24 +252,19 @@ def test_model_manager_layouts_and_high_precision_rows(family, high_dtype):
 
     cache = None
     try:
-        assert isinstance(manager, manager_cls)
-        assert mixed_cls.prepare_context_cache is manager_cls.prepare_context_cache
+        assert isinstance(manager, DSACacheManagerV2)
+        assert mixed_cls.prepare_context_cache is DSACacheManagerV2.prepare_context_cache
         configured = manager.kv_cache_manager_py_config.layers
         assert layout(configured[: len(original)]) == original
-        assert len(manager.high_layouts) == (1 if family == "dsa" else 2)
+        assert len(manager.high_layouts) == 1
         cache = manager.impl.create_kv_cache(None, [])
         assert cache.resume(torch.cuda.current_stream().cuda_stream) and cache.resize(640)
         manager.kv_cache_map[0] = cache
         written = []
         for layer_id, spec in manager.high_layouts.items():
-            if family == "dsa":
-                assert spec.roles == (Role.KEY,)
-                assert spec.rows_per_block == 128
-                assert spec.head_dim == 576
-            else:
-                assert spec.roles == (DeepseekV4AttentionType.COMPRESS.role,)
-                assert spec.rows_per_block in (32, 1)
-                assert spec.head_dim == 512
+            assert spec.roles == (Role.KEY,)
+            assert spec.rows_per_block == 128
+            assert spec.head_dim == 576
             high_id = manager.high_layers[layer_id]
             high = configured[high_id]
             assert high.reuse_policy == kv.AttentionReusePolicy.REQUIRED

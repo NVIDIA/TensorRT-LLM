@@ -49,8 +49,6 @@ class MixedPrecisionKVView:
         if not isinstance(manager, MixedPrecisionKVCacheManager):
             return None
         layer_idx = attention.layer_idx
-        if manager.kv_factor == 1 and manager._uses_native_mixed_precision_rows:
-            return None
         if manager.layer_offsets[layer_idx] not in manager.high_layers:
             return None
         if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():

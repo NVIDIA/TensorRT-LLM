@@ -10,10 +10,8 @@ from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
 from .indexer import DeepseekV4Indexer
@@ -42,39 +40,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-    def get_high_precision_kv_indices(
-        self, layer_idx: int, requests: torch.Tensor, rows: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Locate compressed KV rows retained by the native high-precision SWA pool.
-
-        Requests and logical compressed-row indices must be broadcastable CUDA
-        tensors. Return the pool, flat page/row indices and a valid-row mask.
-        """
-        manager = self.kv_cache_manager
-        if not isinstance(manager, MixedPrecisionKVCacheManager):
-            return None
-        layer_id = int(manager._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS])
-        if layer_id not in manager.high_layers:
-            return None
-        if self.is_cuda_graph or torch.cuda.is_current_stream_capturing():
-            raise NotImplementedError("Mixed-precision row selection requires eager execution")
-        pool, tables = manager.get_high_precision_rows(
-            layer_id, DeepseekV4AttentionType.COMPRESS.role, self.request_ids
-        )
-        width = max(1, max((len(row) for row in tables), default=0))
-        table = torch.tensor(
-            [row + [BAD_PAGE_INDEX] * (width - len(row)) for row in tables]
-            or [[BAD_PAGE_INDEX] * width],
-            dtype=torch.int64,
-            device=pool.device,
-        )
-        requests, rows = torch.broadcast_tensors(requests, rows)
-        requests, rows = requests.reshape(-1).long(), rows.reshape(-1).long()
-        blocks = rows // pool.shape[1]
-        valid = (requests >= 0) & (requests < len(tables)) & (rows >= 0) & (blocks < width)
-        pages = table[requests.clamp(0, table.shape[0] - 1), blocks.clamp(0, width - 1)]
-        return pool, pages, rows % pool.shape[1], valid & (pages >= 0)
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         """Invalidate request- and token-prefix buffers derived from sequence lengths."""
