@@ -3656,7 +3656,8 @@ def test_v2_kda_replay_allocates_single_kug_history():
         assert mgr.intermediate_ssm_states is None
         assert mgr.intermediate_conv_states.shape[:3] == (2, 4, 3)
         assert mgr.intermediate_state_indices.shape == (4,)
-        assert not mgr.use_replay_state_update
+        assert mgr.use_replay_state_update
+        assert mgr.use_kda_replay_update
 
         layer_cache = mgr.mamba_layer_cache(0)
         cache_size = layer_cache.temporal.shape[0]
@@ -3738,7 +3739,10 @@ def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
         _build_v2_hybrid_with_mamba_layer(
             spec_config=MTPDecodingConfig(max_draft_len=2),
             conv_state_layout="q_k_v",
+            mamba_d_state=128,
             mamba_n_groups=4,
+            mamba_head_dim=128,
+            mamba_cache_dtype=torch.bfloat16,
             mamba_ssm_cache_dtype=torch.float32,
             kda_replay_num_spec=2,
             enable_kv_pool_rebalance=True,
@@ -4134,6 +4138,7 @@ def _kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec):
             history_len=mgr.prev_num_accepted_tokens,
             output=output,
             candidate_x=mgr.intermediate_conv_states[layer_offset],
+            history_window=mgr.replay_history_size,
         )
         outputs.append(output)
     return torch.stack(outputs)
