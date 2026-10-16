@@ -878,14 +878,7 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_embedding_batcher()
             self.register_embedding_routes()
         else:
-            if self._launcher_forwarder is not None:
-                # Registered first so they shadow the local handlers below
-                # (FastAPI matches in registration order).
-                for method, path in FORWARDED_ROUTES:
-                    self.app.add_api_route(path,
-                                           self._launcher_forwarder.forward,
-                                           methods=[method],
-                                           include_in_schema=False)
+            self._register_launcher_forwarding_routes()
             self.register_routes()
 
         if self._collect_perf_metrics:
@@ -1700,6 +1693,20 @@ class OpenAIServer(_VideoRoutesMixin):
             "data_transceiver_state":
             base64.b64encode(state).decode("utf-8")
         })
+
+    def _register_launcher_forwarding_routes(self) -> None:
+        """On an attached frontend, hand launcher-owned routes to the launcher.
+
+        Must run before register_routes(): FastAPI matches in registration
+        order, so these shadow the local handlers of the same routes.
+        """
+        if self._launcher_forwarder is None:
+            return
+        for method, path in FORWARDED_ROUTES:
+            self.app.add_api_route(path,
+                                   self._launcher_forwarder.forward,
+                                   methods=[method],
+                                   include_in_schema=False)
 
     def _on_launcher_lost(self, error: BaseException) -> None:
         """Watchdog callback of an attached frontend: fail fast, then shut down.
