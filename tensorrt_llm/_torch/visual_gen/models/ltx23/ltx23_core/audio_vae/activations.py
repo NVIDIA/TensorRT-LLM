@@ -149,4 +149,4 @@ class SnakeBeta(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         alpha = self.alpha.exp().view(1, -1, 1)
         beta = self.beta.exp().view(1, -1, 1)
-        return x + torch.sin(x * alpha).pow(2) / (beta + self.eps)
+        return x + (1.0 / (beta + self.eps)) * torch.sin(x * alpha).pow(2)
