@@ -680,6 +680,9 @@ if(ENABLE_UCX)
       # Version and MD5 follow rapids-cmake's cpm/detail/download.cmake. If an
       # upgraded rapids-cmake uses another CPM version, it ignores this file and
       # downloads its own, no side effect.
+      #
+      # Update the version and MD5 when the ucxx git_tag in
+      # 3rdparty/fetch_content.json changes.
       set(ucxx_cpm_file "${CMAKE_BINARY_DIR}/ucxx/build/cmake/CPM_0.40.0.cmake")
       file(
         DOWNLOAD
