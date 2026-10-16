@@ -138,19 +138,27 @@ l0_b300:
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
   # qwen4_exp target: gsm8k, and gsm8k with the trunk's routed experts on CuteDSL;
   # gsm8k with MTP plus the acceptance-length floor, the only gate that sees a
-  # miscomputed draft layer, at one draft over bf16 and fp8 KV and at three drafts
-  # alone and over CuteDSL experts; 3k-6k-token pass key prompts, the only cases that run
-  # the sparse attention path (IndexShare over bf16 KV, fp8 KV); the recurrent-state
-  # verify path that TRTLLM_USE_GDN_REPLAY=0 selects; mmmu with MTP and synthetic videos,
-  # the only gates that reach the vision tower.
+  # miscomputed draft layer, at one draft over bf16 and fp8 KV, at three drafts
+  # alone and over CuteDSL experts, and at five and seven drafts (the verify step's
+  # six and eight rows per request); 3k-6k-token pass key prompts, the only cases that
+  # run the sparse attention path (IndexShare over bf16 KV, fp8 KV), and 3k-12k-token ones
+  # at seven drafts; seven drafts all rejected and all accepted by forced acceptance at
+  # batch 32 over long prompts; the recurrent-state verify path that
+  # TRTLLM_USE_GDN_REPLAY=0 selects; mmmu with MTP and synthetic videos, the only gates
+  # that reach the vision tower.
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_cutedsl_moe
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_fp8_kv_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp5_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[index_share]
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[fp8_kv]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_rejected]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_accepted]
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gdn_legacy_verify
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_video

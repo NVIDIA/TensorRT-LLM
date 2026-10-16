@@ -108,6 +108,10 @@ def _acceptance_length_from_requests(outputs, draft_len: int) -> float:
 # target and of its MTP draft layer takes the sparse attention path.
 
 _PASSKEY_LENGTHS = (3000, 4000, 5000, 6000)
+_PASSKEY_LENGTHS_LONG = (3000, 6000, 9000, 12000)
+# 33 prompts, each past the indexer's budget, 32 of which one batch carries.
+_FORCED_LENGTHS = tuple(range(2200, 6400, 400))
+_FORCED_TOKENS = 64
 _PASSKEY_DEPTHS = (0.15, 0.5, 0.85)
 _PASSKEY_MAX_TOKENS = 160
 
@@ -167,8 +171,8 @@ def _section(rng: random.Random, number: int) -> str:
     return heading + "\n\n" + " ".join(sentences)
 
 
-def _passkey_prompts(tokenizer) -> list[tuple[str, str]]:
-    """``(chat prompt, passkey)`` pairs over ``_PASSKEY_LENGTHS`` x ``_PASSKEY_DEPTHS``.
+def _passkey_prompts(tokenizer, lengths=_PASSKEY_LENGTHS) -> list[tuple[str, str]]:
+    """``(chat prompt, passkey)`` pairs over ``lengths`` x ``_PASSKEY_DEPTHS``.
 
     Each prompt is a generated document of about that many tokens with one pass key sentence
     at that relative depth, the same bytes in every run.
@@ -180,7 +184,7 @@ def _passkey_prompts(tokenizer) -> list[tuple[str, str]]:
         "that appear in the document, in order."
     )
     prompts = []
-    for length in _PASSKEY_LENGTHS:
+    for length in lengths:
         for depth in _PASSKEY_DEPTHS:
             key = str(rng.randint(100000, 999999))
             sections, tokens = [], 0
@@ -380,6 +384,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     # `max_draft_len` times.
     MTP1 = MTPDecodingConfig(max_draft_len=1)
     MTP3 = MTPDecodingConfig(max_draft_len=3)
+    MTP5 = MTPDecodingConfig(max_draft_len=5)
+    MTP7 = MTPDecodingConfig(max_draft_len=7)
 
     # Acceptance-length anchors in references/acceptance_length.yaml, keyed by
     # target and variant.
@@ -387,6 +393,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     ACCEPTANCE_KEY_FP8_KV = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_fp8_kv"
     ACCEPTANCE_KEY_MTP3 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3"
     ACCEPTANCE_KEY_MTP3_CUTEDSL = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl"
+    ACCEPTANCE_KEY_MTP5 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp5"
+    ACCEPTANCE_KEY_MTP7 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7"
+    ACCEPTANCE_KEY_MTP7_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_long_context"
     ACCEPTANCE_KEY_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_long_context"
     ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT = (
         "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_fp8_kv_long_context"
@@ -504,30 +513,41 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             "mtp3 cutedsl",
         )
 
-    @pytest.mark.parametrize(
-        "fp8_kv, index_share, key_name",
-        [
-            pytest.param(False, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
-            pytest.param(True, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"),
-        ],
-    )
     @skip_not_sm103
-    def test_mtp3_long_context_passkey(self, monkeypatch, fp8_kv, index_share, key_name):
-        """Pass key retrieval over 3k-6k-token prompts, where the sparse attention path runs.
+    def test_mtp5_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """MTP with five drafts: the MTP row of references/gsm8k.yaml, and a length floor.
 
-        The gsm8k cases never leave the dense path (their prompts are under the indexer's
-        2048-token budget), so this is the only case that runs the target's QSA selection, the
-        draft layer's selection and, with ``fp8_kv``, the fp8 sparse kernels end to end. A pass
-        key stated back correctly needs the right blocks selected at every depth.
+        Six verify rows per request, a width that no other case runs: the cached replay at
+        ``T = 6`` and ``thop_attention`` at ``predicted_tokens_per_seq`` 6, with the all-layer
+        commit from 16 requests on.
+        """
+        self._gsm8k_with_acceptance(
+            mocker, monkeypatch, self.ENGINE, self.MTP5, self.ACCEPTANCE_KEY_MTP5, "mtp5"
+        )
 
-        ``index_share`` makes the draft loop reuse the selection of its first step; the
-        acceptance length then must not fall below the floor taken from the same prompts
-        with the draft layer selecting on every step, and the reuse op must have run. Two
-        identical requests in one batch must produce the same tokens, which fails if a request's
-        shared selection leaks into another slot.
+    @skip_not_sm103
+    def test_mtp7_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """MTP with seven drafts, the longest the target runs: the MTP row and a length floor.
+
+        Eight verify rows per request is the cached replay kernel's ceiling (``T = 8``, history
+        16): a slot that accepts every draft fills its history every other step, so the
+        checkpoint commit, in-kernel below 16 requests and all-layer from there on, runs twice
+        as often as at three drafts. The engine captures a CUDA graph for every batch size up
+        to 32, so every captured step carries up to 256 verify rows.
+        """
+        self._gsm8k_with_acceptance(
+            mocker, monkeypatch, self.ENGINE, self.MTP7, self.ACCEPTANCE_KEY_MTP7, "mtp7"
+        )
+
+    def _long_context_passkey(
+        self, monkeypatch, speculative_config, engine, index_share, lengths, key_name, label
+    ):
+        """Pass key retrieval over prompts past the indexer's budget, at ``speculative_config``.
 
         Runs with the executor in this process to read the draft layer's op calls; the
-        acceptance length comes from the requests' own metrics.
+        acceptance length comes from the requests' own metrics. Two identical requests in one
+        batch must produce the same tokens, which fails if a request's shared selection leaks
+        into another slot.
         """
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
         reuse_calls = []
@@ -539,20 +559,19 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
 
         monkeypatch.setattr(target_modeling, "qsa_mtp_reuse_topk", counting_reuse)
         engine = dict(
-            self.ENGINE,
-            kv_cache_config=self.KV_CACHE_FP8 if fp8_kv else self.KV_CACHE,
+            engine,
             sparse_attention_config=QSASparseAttentionConfig(
                 index_share_for_mtp_iteration=index_share
             ),
         )
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
-        prompts = _passkey_prompts(tokenizer)
+        prompts = _passkey_prompts(tokenizer, lengths)
         # One prompt twice, far apart in the batch, so the two copies hold different slots.
         texts = [prompt for prompt, _ in prompts] + [prompts[len(prompts) // 2][0]]
 
         with LLM(
             self.MODEL_PATH,
-            speculative_config=self.MTP3,
+            speculative_config=speculative_config,
             **engine,
             **_require_target(monkeypatch, **_VALIDATE),
         ) as llm:
@@ -577,9 +596,115 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             assert reuse_calls, "IndexShare is on and the reuse op never ran"
         else:
             assert not reuse_calls, "IndexShare is off and the reuse op ran"
-        acceptance_length = _acceptance_length_from_requests(outputs, self.MTP3.max_draft_len)
-        print(f"[AL] mtp3 long context fp8_kv={fp8_kv} acceptance_length = {acceptance_length:.3f}")
+        acceptance_length = _acceptance_length_from_requests(
+            outputs, speculative_config.max_draft_len
+        )
+        print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(getattr(self, key_name), acceptance_length)
+
+    @pytest.mark.parametrize(
+        "fp8_kv, index_share, key_name",
+        [
+            pytest.param(False, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
+            pytest.param(True, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"),
+        ],
+    )
+    @skip_not_sm103
+    def test_mtp3_long_context_passkey(self, monkeypatch, fp8_kv, index_share, key_name):
+        """Pass key retrieval over 3k-6k-token prompts, where the sparse attention path runs.
+
+        The gsm8k cases never leave the dense path (their prompts are under the indexer's
+        2048-token budget), so this is the only case that runs the target's QSA selection, the
+        draft layer's selection and, with ``fp8_kv``, the fp8 sparse kernels end to end. A pass
+        key stated back correctly needs the right blocks selected at every depth.
+
+        ``index_share`` makes the draft loop reuse the selection of its first step; the
+        acceptance length then must not fall below the floor taken from the same prompts
+        with the draft layer selecting on every step, and the reuse op must have run.
+        """
+        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_FP8 if fp8_kv else self.KV_CACHE)
+        self._long_context_passkey(
+            monkeypatch,
+            self.MTP3,
+            engine,
+            index_share,
+            _PASSKEY_LENGTHS,
+            key_name,
+            f"mtp3 long context fp8_kv={fp8_kv}",
+        )
+
+    @skip_not_sm103
+    def test_mtp7_long_context_passkey(self, monkeypatch):
+        """Pass key retrieval over 3k-12k-token prompts with seven drafts and IndexShare on.
+
+        Seven drafts run the sparse path with eight rows per request in the verify step and
+        draft decode steps that reuse the first step's selection up to six positions past it,
+        where the groups completed since the capture displace two of its ids. 12k tokens past
+        the 8k default needs ``max_seq_len`` 16384.
+        """
+        engine = dict(self.ENGINE, max_seq_len=16384)
+        self._long_context_passkey(
+            monkeypatch,
+            self.MTP7,
+            engine,
+            True,
+            _PASSKEY_LENGTHS_LONG,
+            "ACCEPTANCE_KEY_MTP7_LONG_CONTEXT",
+            "mtp7 long context",
+        )
+
+    @pytest.mark.parametrize(
+        "forced, accepted_rows",
+        [
+            pytest.param("1e-9", 1, id="all_rejected"),
+            pytest.param("7", 8, id="all_accepted"),
+        ],
+    )
+    @skip_not_sm103
+    def test_mtp7_forced_acceptance_extremes(self, monkeypatch, forced, accepted_rows):
+        """Seven drafts with every draft rejected, then with every draft accepted, at batch 32.
+
+        ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` overrides the sampler's acceptance:
+        a vanishing fraction accepts the target's own token and nothing else, ``7`` accepts
+        the seven drafts as well. 32 requests over 2k-6k-token prompts run the sparse path,
+        the all-layer replay commit and the CUDA graph at 32 x 8 = 256 verify rows with the
+        most rows rolled back at every step (seven) and with none rolled back, a history that
+        then fills to its end every second step. The acceptance length, read from the
+        requests' own metrics, must be exactly the forced row count: the acceptance
+        bookkeeping of the verify step moved by the number of rows forced, not by what the
+        drafts say.
+
+        The text under forced acceptance is not compared with anything: the drafts a forced
+        step accepts are not the target's tokens, and a run's tokens depend on the verify
+        step's row count through the GEMM and attention kernel selection, so a run with
+        another draft length or none differs from this one even with every draft rejected.
+        The rolled-back state itself is pinned bitwise by ``test_modeling_v2_spec_rollback``.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        prompts = [prompt for prompt, _ in _passkey_prompts(tokenizer, _FORCED_LENGTHS)][:32]
+        env = {"TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS": forced}
+
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=self.MTP7,
+            **self.ENGINE,
+            **_require_target(monkeypatch, **env, **_VALIDATE),
+        ) as llm:
+            outputs = llm.generate(
+                prompts,
+                SamplingParams(
+                    max_tokens=_FORCED_TOKENS,
+                    temperature=0,
+                    ignore_eos=True,
+                    return_perf_metrics=True,
+                ),
+                use_tqdm=False,
+            )
+
+        assert [len(o.outputs[0].token_ids) for o in outputs] == [_FORCED_TOKENS] * len(prompts)
+        acceptance_length = _acceptance_length_from_requests(outputs, self.MTP7.max_draft_len)
+        print(f"[AL] mtp7 forced acceptance of {accepted_rows} rows: {acceptance_length:.3f}")
+        assert acceptance_length == pytest.approx(accepted_rows, abs=0.05)
 
     @skip_not_sm103
     def test_mtp1_gdn_legacy_verify(self, monkeypatch):
