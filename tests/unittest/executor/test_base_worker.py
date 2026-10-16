@@ -14,20 +14,113 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
+from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
+from tensorrt_llm.executor.result import LogProbsResult
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.sampling_params import LogprobParams, SamplingParams
 
 default_model_name = "Qwen3/Qwen3-0.6B"
 model_path = llm_models_root() / default_model_name
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("drop_context_logits", [False, True])
+@pytest.mark.parametrize("simple", [False, True])
+def test_prompt_logprobs_computation_and_streaming_cache(
+        monkeypatch, streaming, drop_context_logits, simple):
+    prompt_logprobs = [-0.5, -0.25, -0.125] if simple else [{11: "logprob"}]
+    logits = object()
+    calls = []
+
+    def compute(k, context_logits, prompt_token_ids, *, simple_prompt_logprobs):
+        calls.append(
+            (k, context_logits, prompt_token_ids, simple_prompt_logprobs))
+        return LogProbsResult(prompt=prompt_logprobs)
+
+    monkeypatch.setattr(base_worker, "compute_prompt_logprobs", compute)
+    generation_result = SimpleNamespace(
+        _logprob_params=LogprobParams(prompt_logprobs=0,
+                                      drop_context_logits=drop_context_logits,
+                                      prompt_logprobs_simple_format=simple),
+        _streaming=streaming,
+        _generation_request=SimpleNamespace(prompt_token_ids=[10, 11, 12]))
+    generation_result.clear_logprob_params = lambda: delattr(
+        generation_result, "_logprob_params")
+    worker = SimpleNamespace(_results={1: generation_result})
+
+    def make_response(context_logits):
+        result = SimpleNamespace(
+            context_logits=context_logits,
+            is_final=False,
+            get_result=lambda: SimpleNamespace(output_token_ids=[[13]]))
+        return SimpleNamespace(client_id=1,
+                               result=result,
+                               clear_context_logits=lambda: setattr(
+                                   result, "context_logits", None))
+
+    response = make_response(logits)
+    assert base_worker._get_logprobs(worker, response).prompt == prompt_logprobs
+    assert calls == [(0, logits, [11, 12, 13], simple)]
+    assert response.result.context_logits is (None if drop_context_logits else
+                                              logits)
+
+    if streaming:
+        # Later streaming chunks do not carry the original context logits.
+        response = make_response(None)
+        assert base_worker._get_logprobs(worker,
+                                         response).prompt == prompt_logprobs
+        assert len(calls) == 1
+
+    if not streaming:
+        response = make_response(logits)
+    response.result.is_final = True
+    assert base_worker._get_logprobs(worker, response).prompt == prompt_logprobs
+    assert not hasattr(generation_result, "_logprob_params")
+
+
+@pytest.mark.cpu_only
+def test_generation_logprobs_do_not_recompute_logits(monkeypatch):
+
+    def unexpected_compute(*args, **kwargs):
+        pytest.fail("Generation logprobs must come from the sampler")
+
+    monkeypatch.setattr(base_worker, "compute_prompt_logprobs",
+                        unexpected_compute)
+    generation_result = SimpleNamespace(
+        _logprob_params=None,
+        clear_logprob_params=lambda: delattr(generation_result,
+                                             "_logprob_params"))
+    worker = SimpleNamespace(_results={1: generation_result})
+    response = SimpleNamespace(client_id=1,
+                               result=SimpleNamespace(is_final=True))
+    assert base_worker._get_logprobs(worker, response) is None
+    assert not hasattr(generation_result, "_logprob_params")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("logprobs", [None, 0, 2])
+@pytest.mark.parametrize("prompt_logprobs", [None, 0, 2])
+@pytest.mark.parametrize("return_context_logits", [False, True])
+def test_output_config_preserves_sampler_and_prompt_logprobs(
+        logprobs, prompt_logprobs, return_context_logits):
+    params = SamplingParams(logprobs=logprobs,
+                            prompt_logprobs=prompt_logprobs,
+                            return_context_logits=return_context_logits)
+    config = params._get_output_config()
+    assert config.return_log_probs == (logprobs is not None)
+    assert config.return_context_logits == (return_context_logits
+                                            or prompt_logprobs is not None)
+
+
+@pytest.mark.cpu_only
 def test_get_startup_metrics_promotes_model_engine_stages() -> None:
     """Verify startup metrics promote saved engine stages while retaining executor metrics."""
     worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
     worker.engine = SimpleNamespace(
         metrics={
             "worker_start_seconds": 0.5,
@@ -84,11 +177,6 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
 @pytest.mark.cpu_only
 def test_enqueue_request_wraps_lora_load_error():
 
-    class LoraManager:
-
-        def is_adapter_in_cpu_cache(self, adapter_id):
-            return False
-
     def raise_load_error(lora_request):
         raise RuntimeError("bad adapter")
 
@@ -96,7 +184,8 @@ def test_enqueue_request_wraps_lora_load_error():
     # GC-time __del__ -> shutdown() reads this; __init__ is bypassed here, so
     # seed it to keep teardown a clean no-op.
     worker.doing_shutdown = False
-    worker._lora_manager = LoraManager()
+    worker.engine = None
+    worker._lora_manager = object()
     worker._load_lora_adapter = raise_load_error
     request = type(
         "Request", (), {
@@ -104,7 +193,8 @@ def test_enqueue_request_wraps_lora_load_error():
             "lora_request": type("LoraRequest", (), {"adapter_id": 999})(),
         })()
 
-    with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
+    with pytest.raises(RequestError,
+                       match="Failed to load LoRA adapter: bad adapter"):
         worker._enqueue_request(request)
 
 
@@ -252,6 +342,7 @@ class TestRpcWorkerBaseTP2:
     def test_create_executor(self):
         futures = self.session.submit(
             TestRpcWorkerBaseTP2.create_executor,
+            engine=model_path,
             llm_args=self.llm_args,
         )
         # Wait for completion
@@ -329,7 +420,6 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
         if not simple:
             assert entry[token].rank == 4 - token
     assert len(result.prompt) == len(expected_tokens)
-    assert result.generation is None
     assert (response_result.context_logits is None) == drop_context_logits
 
     if streaming:
@@ -342,12 +432,9 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
 @pytest.mark.cpu_only
 def test_generation_logprobs_need_no_worker_recomputation():
     from tensorrt_llm.executor.base_worker import _get_logprobs
-    from tensorrt_llm.sampling_params import LogprobParams
 
     worker = SimpleNamespace(
-        _results={
-            7: SimpleNamespace(_logprob_params=LogprobParams(logprobs=2))
-        })
+        _results={7: SimpleNamespace(_logprob_params=None)})
     # No logits or result accessor is needed: generation logprobs come
     # directly from the sampler's response tensors.
     assert _get_logprobs(worker, SimpleNamespace(client_id=7)) is None

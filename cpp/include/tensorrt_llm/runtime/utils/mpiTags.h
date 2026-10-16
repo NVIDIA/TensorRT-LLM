@@ -44,10 +44,7 @@ enum class MpiTag : int
     kCancelledRequestsNumReq = 13,
     kCancelledRequestsIds = 14,
 
-    // RequestWithIdAsyncSend
-    kRequestWithIdNumReq = 15,
-    kRequestWithIdVecSize = 16,
-    kRequestWithIdPacked = 17,
+    // Values 15-17 are retired; do not reuse.
 
     // Executor
     kExecutorNumActiveRequests = 18,

@@ -32,7 +32,7 @@ from .._torch.peft.lora.manager import LoraManager
 from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
+from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
@@ -40,16 +40,15 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..runtime import ModelConfig
-from ..sampling_params import BatchedLogitsProcessor, SamplingParams
-from .executor import GenerationExecutor, IterationResultQueue
-from .ipc import FusedIpcQueue, IpcQueue
+from ..sampling_params import SamplingParams
+from .executor import GenerationExecutor
+from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict)
-from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    bucket_responses_by_frontend,
+from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
@@ -92,7 +91,6 @@ class BaseWorker(GenerationExecutor):
 
     def __init__(
         self,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         hf_model_dir: Optional[Path] = None,
@@ -112,8 +110,6 @@ class BaseWorker(GenerationExecutor):
         self.postproc_config = postproc_config
 
         # inputs
-        self._batched_logits_processor = batched_logits_processor
-        self._postproc_worker_config = postproc_worker_config
         self._is_llm_executor = is_llm_executor
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
@@ -143,17 +139,10 @@ class BaseWorker(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
-    def _get_comm_ranks_device_id(self):
+    def _configure_device(self):
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = global_mpi_rank()
-        comm_ranks = mpi_comm().allgather(global_rank)
-        device_ids = mpi_comm().allgather(device_id)
-
         configure_cpu_affinity(device_id)
-
-        return comm_ranks, device_ids
 
     def setup_engine(self):
         """
@@ -170,7 +159,7 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
             create_py_executor
 
-        self._get_comm_ranks_device_id()
+        self._configure_device()
         self.mapping = self.llm_args.parallel_config.to_mapping()
         self.checkpoint_loader = _construct_checkpoint_loader(
             self.llm_args.checkpoint_loader,
@@ -289,14 +278,6 @@ class BaseWorker(GenerationExecutor):
         assert self.postproc_queues is None
         self.frontend_result_queues = queues
 
-    def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
-                                    queue: Union[Queue, FusedIpcQueue,
-                                                 IntraProcessQueue]):
-        assert not it_result_queue.is_initialized, "Iteration result queue should not already be initialized."
-        it_result_queue.is_initialized = True
-        it_result_queue.queue = queue
-        it_result_queue.aqueue = None
-
     def return_queue(self, client_id: int):
         """Return the queue used to deliver responses for ``client_id``.
 
@@ -319,9 +300,6 @@ class BaseWorker(GenerationExecutor):
                 return
             self.engine.cancel_request(request_id)
 
-    def _engine_response_callback(self, response: tllm.Response):
-        return response
-
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
 
@@ -335,16 +313,13 @@ class BaseWorker(GenerationExecutor):
         raise NotImplementedError(
             "start method is not implemented in BaseWorker")
 
-    def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
-        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+    def _load_lora_adapter(self, lora_request: LoRARequest) -> None:
+        """Ensure the adapter is loaded into the local cache."""
         adapter_id = str(lora_request.adapter_id)
-        newly_loaded_uids = self._lora_manager.load_from_ckpt(
-            [lora_request.path],
-            model_config=self._runtime_model_config if
-            self._runtime_model_config is not None else self._lora_model_config,
-            uids=[adapter_id],
-            ckpt_source=lora_request.ckpt_source)
-        return adapter_id in newly_loaded_uids
+        self._lora_manager.load_from_ckpt([lora_request.path],
+                                          model_config=self._lora_model_config,
+                                          uids=[adapter_id],
+                                          ckpt_source=lora_request.ckpt_source)
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
@@ -360,11 +335,8 @@ class BaseWorker(GenerationExecutor):
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             try:
-                # PyTorch backend: don't embed weights in the request.
-                # Each rank loads independently from disk via py_lora_path
-                # in PeftCacheManager.add_request_peft().
-                # Pre-load on rank 0 to warm the LoRA manager cache so that
-                # add_request_peft finds the adapter already loaded.
+                # Each rank loads independently from disk via py_lora_path in
+                # PeftCacheManager.add_request_peft(). Warm rank 0's cache here.
                 self._load_lora_adapter(request.lora_request)
                 uid = str(request.lora_request.adapter_id)
                 lora_config = tllm.LoraConfig(
@@ -488,8 +460,7 @@ class BaseWorker(GenerationExecutor):
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
                 request.sampling_params.end_id,
-                output_config=request.sampling_params._get_output_config(
-                    is_pytorch_backend=True),
+                output_config=request.sampling_params._get_output_config(),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
                 return_all_generated_tokens=False,
                 guided_decoding_params=request.sampling_params.
@@ -1340,11 +1311,8 @@ class AwaitResponseHelper:
 
     def process_responses(
             self, responses: List[tllm.Response]) -> List[tllm.Response]:
-        """Apply engine callbacks and append deferred submission errors."""
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
+        """Filter empty engine responses, then append deferred submission errors."""
+        responses = [response for response in responses if response is not None]
 
         # Drain with get_nowait(): this may run concurrently from the
         # ManagedThread and RPC fetch_responses(), and empty()+get() can

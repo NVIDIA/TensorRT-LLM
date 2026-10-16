@@ -33,7 +33,6 @@ from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
-from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
@@ -64,7 +63,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         hf_model_dir: Optional[Path] = None,
@@ -74,7 +72,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         hmac_key: bytes = b"",
     ) -> None:
         super().__init__(
-            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
@@ -235,7 +232,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 def worker_main(
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
-    batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
     _torch_external_model_modules: Optional[dict] = None,
@@ -445,7 +441,6 @@ def worker_main(
 
     try:
         worker: GenerationExecutorWorker = worker_cls(
-            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,

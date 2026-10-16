@@ -18,11 +18,6 @@ import torch.nn.functional as F
 
 from tensorrt_llm.llmapi import tracing
 
-try:
-    pass
-except ModuleNotFoundError:
-    pass
-
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
@@ -68,9 +63,8 @@ SimpleTokenLogprobs: TypeAlias = list[float]
 
 
 class LogProbsResult(NamedTuple):
-    """Optional log probability outputs computed post runtime."""
+    """Optional prompt log probabilities computed post runtime."""
     prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
-    generation: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
 class _SpecDecCounters(NamedTuple):
@@ -95,11 +89,6 @@ class ResponseWrapper:
         self._response = response
         self.logprobs = logprobs
         self.request_perf_metrics = request_perf_metrics
-
-    @property
-    def _is_llm_response(self):
-        response = object.__getattribute__(self, '_response')
-        return isinstance(response, tllm.Response)
 
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
@@ -1155,9 +1144,6 @@ class GenerationResult(GenerationResultBase):
         # for a cleaner external-facing output.
         if hasattr(self, "_logprob_params"):
             del self._logprob_params
-
-    def _handle_ray_response(self, response: Any):
-        return response
 
     def _result_step(self, timeout: Optional[float] = None):
         # Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor

@@ -33,7 +33,6 @@ set(SRCS
     promptTuningConfig.cpp
     request.cpp
     requestUtils.cpp
-    requestWithId.cpp
     response.cpp
     serialization.cpp
     tensor.cpp)

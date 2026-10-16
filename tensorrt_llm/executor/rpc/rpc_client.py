@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import concurrent.futures
 import os
@@ -125,9 +128,6 @@ class RPCClient:
         self._loop = None
         self._loop_thread = None
         self._reader_asyncio_task = None  # Track the asyncio task for proper cancellation
-        self._loop_lock = threading.Lock(
-        )  # Lock to protect event loop initialization
-
         # Eagerly create the background event loop so that all subsequent
         # RPC calls (sync or streaming) can assume it exists.  This removes a
         # race between the first streaming call (which previously created the
