@@ -3,9 +3,8 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 """LTX-2.3 channel-reducing decoder blocks and overlap-aware tiled encoding."""
 
+import itertools
 import logging
-from collections.abc import Callable
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -20,19 +19,16 @@ from ...ltx2.ltx2_core.video_vae.enums import NormLayerType, PaddingModeType
 from ...ltx2.ltx2_core.video_vae.ops import PerChannelStatistics
 from ...ltx2.ltx2_core.video_vae.sampling import DepthToSpaceUpsample
 from ...ltx2.ltx2_core.video_vae.tiling import (
-    DEFAULT_MAPPING_OPERATION,
     DEFAULT_SPLIT_OPERATION,
-    DimensionIntervals,
     Tile,
     TilingConfig,
-    compute_rectangular_mask_1d,
-    create_tiles,
+    compute_trapezoidal_mask_1d,
 )
 from ...ltx2.ltx2_core.video_vae.video_vae import VideoDecoder as LTX2VideoDecoder
 from ...ltx2.ltx2_core.video_vae.video_vae import VideoEncoder as LTX2VideoEncoder
 from ...ltx2.ltx2_core.video_vae.video_vae import (
     _make_decoder_block,
-    make_mapping_operation,
+    split_temporal_latents,
     split_with_symmetric_overlaps,
 )
 
@@ -143,63 +139,71 @@ class _LTX23PerChannelStatistics(PerChannelStatistics):
         self.register_buffer("mean-of-means", torch.empty(latent_channels))
 
 
-def _split_temporal_frames(tile_size: int, overlap: int) -> Callable[[int], DimensionIntervals]:
-    non_causal_split = split_with_symmetric_overlaps(tile_size, overlap)
-
-    def split(dimension_size: int) -> DimensionIntervals:
-        if dimension_size <= tile_size:
-            return DEFAULT_SPLIT_OPERATION(dimension_size)
-        intervals = non_causal_split(dimension_size)
-        ends = list(intervals.ends)
-        ends[:-1] = [end + 1 for end in ends[:-1]]
-        return replace(intervals, ends=ends, right_ramps=[0] * len(ends))
-
-    return split
-
-
-def _map_temporal_interval(
-    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int
-) -> tuple[slice, torch.Tensor]:
-    start = begin // scale
-    stop = (end - 1) // scale + 1
-    left = 0 if left_ramp == 0 else 1 + (left_ramp - 1) // scale
-    right = right_ramp // scale
-    if right:
-        raise ValueError(f"LTX-2.3 encode tiles require a zero right ramp; got {right_ramp}")
-    return slice(start, stop), compute_rectangular_mask_1d(stop - start, left, right)
-
-
-def _map_spatial_interval(
-    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int
-) -> tuple[slice, torch.Tensor]:
-    start = begin // scale
-    stop = end // scale
-    return slice(start, stop), compute_rectangular_mask_1d(
-        stop - start,
-        max(0, left_ramp // scale - 1),
-        0 if right_ramp == 0 else 1,
-    )
-
-
 def _prepare_encode_tiles(
     video: torch.Tensor,
     tiling_config: TilingConfig,
     scales: SpatioTemporalScaleFactors,
 ) -> list[Tile]:
-    splitters = [DEFAULT_SPLIT_OPERATION] * video.ndim
-    mappers = [DEFAULT_MAPPING_OPERATION] * video.ndim
+    """Split on the latent grid and map causal temporal tiles back to pixels."""
+    latent_shape = (
+        (video.shape[2] - 1) // scales.time + 1,
+        video.shape[3] // scales.height,
+        video.shape[4] // scales.width,
+    )
+    splitters = [DEFAULT_SPLIT_OPERATION] * 3
     if tiling_config.spatial_config is not None:
         config = tiling_config.spatial_config
         overlap = max(config.tile_overlap_in_pixels, _MIN_SPATIAL_OVERLAP_PIXELS)
-        for axis, scale in ((3, scales.height), (4, scales.width)):
-            splitters[axis] = split_with_symmetric_overlaps(config.tile_size_in_pixels, overlap)
-            mappers[axis] = make_mapping_operation(_map_spatial_interval, scale=scale)
+        for axis, scale in ((1, scales.height), (2, scales.width)):
+            latent_overlap = overlap // scale
+            size = max(2, latent_overlap + 1, config.tile_size_in_pixels // scale)
+            splitters[axis] = split_with_symmetric_overlaps(size, latent_overlap)
     if tiling_config.temporal_config is not None:
         config = tiling_config.temporal_config
         overlap = max(config.tile_overlap_in_frames, _MIN_TEMPORAL_OVERLAP_FRAMES)
-        splitters[2] = _split_temporal_frames(config.tile_size_in_frames, overlap)
-        mappers[2] = make_mapping_operation(_map_temporal_interval, scale=scales.time)
-    return create_tiles(video.shape, splitters, mappers)
+        latent_overlap = overlap // scales.time
+        size = max(2, latent_overlap + 1, config.tile_size_in_frames // scales.time)
+        splitters[0] = split_temporal_latents(size, latent_overlap)
+    intervals = [
+        list(zip(value.starts, value.ends, value.left_ramps, value.right_ramps, strict=True))
+        for value in (split(length) for split, length in zip(splitters, latent_shape, strict=True))
+    ]
+    tiles = []
+    for axes in itertools.product(*intervals):
+        inputs = [slice(None), slice(None)]
+        outputs = [slice(None), slice(None)]
+        masks = [torch.ones(1), torch.ones(1)]
+        for axis, ((start, stop, left, right), scale) in enumerate(zip(axes, scales, strict=True)):
+            pixel_stop = 1 + (stop - 1) * scale if axis == 0 else stop * scale
+            inputs.append(slice(start * scale, pixel_stop))
+            outputs.append(slice(start, stop))
+            masks.append(compute_trapezoidal_mask_1d(stop - start, left, right, axis == 0))
+        tiles.append(Tile(tuple(inputs), tuple(outputs), tuple(masks)))
+    return tiles
+
+
+def _encode_masks_are_complementary(tiles: list[Tile], shape: torch.Size) -> bool:
+    for axis in range(2, len(shape)):
+        weights = torch.zeros(shape[axis], dtype=torch.float32, device="cpu")
+        seen = set()
+        for tile in tiles:
+            region = tile.out_coords[axis]
+            key = (region.start, region.stop)
+            if key not in seen:
+                weights[region] += tile.masks_1d[axis].float().cpu()
+                seen.add(key)
+        if not torch.allclose(weights, torch.ones_like(weights), atol=1e-5, rtol=0.0):
+            return False
+    return True
+
+
+def _apply_encode_masks(latent: torch.Tensor, tile: Tile) -> torch.Tensor:
+    result = latent.float()
+    for axis, mask in enumerate(tile.masks_1d):
+        view = [1] * latent.ndim
+        view[axis] = -1
+        result = result * mask.to(device=latent.device, dtype=torch.float32).view(view)
+    return result
 
 
 class LTX23VideoEncoder(LTX2VideoEncoder):
@@ -255,13 +259,19 @@ class LTX23VideoEncoder(LTX2VideoEncoder):
             width=width // scales.width,
         )
         latents = torch.zeros(latent_shape.to_torch_shape(), device=device, dtype=dtype)
-        weights = torch.zeros_like(latents)
-        for tile in _prepare_encode_tiles(video, tiling_config, scales):
+        tiles = _prepare_encode_tiles(video, tiling_config, scales)
+        weights = (
+            None
+            if _encode_masks_are_complementary(tiles, latents.shape)
+            else torch.zeros_like(latents)
+        )
+        for tile in tiles:
             latent_tile = self(video[tile.in_coords].to(device=device, dtype=dtype))
-            mask = tile.blend_mask(device, dtype)
-            latents[tile.out_coords] += latent_tile * mask
-            weights[tile.out_coords] += mask
-        return latents / weights.clamp(min=1e-8)
+            latents[tile.out_coords] += _apply_encode_masks(latent_tile, tile)
+            if weights is not None:
+                strength = torch.ones_like(latent_tile, dtype=torch.float32)
+                weights[tile.out_coords] += _apply_encode_masks(strength, tile)
+        return latents if weights is None else latents / weights.clamp(min=1e-8)
 
 
 class LTX23VideoEncoderConfigurator:
