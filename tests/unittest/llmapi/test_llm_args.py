@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -105,6 +106,26 @@ def test_iter_perf_stats_interval_defaults_and_validation() -> None:
 
 
 @pytest.mark.cpu_only
+def test_checkpoint_format_accepts_builtin_and_custom_strings() -> None:
+    assert public_llmapi.CheckpointFormat is CheckpointFormat
+    # A built-in format string becomes the enum member with that value.
+    # "mistral" is not the member name MISTRAL, so this checks a value lookup.
+    args = TorchLlmArgs(model=llama_model_path, checkpoint_format="mistral")
+    assert args.checkpoint_format is CheckpointFormat.MISTRAL
+    assert json.loads(args.model_dump_json(include={"checkpoint_format"})) == {
+        "checkpoint_format": "mistral"
+    }
+    # A custom registered format stays a plain string.
+    args = TorchLlmArgs(model=llama_model_path,
+                        checkpoint_format="custom_format")
+    assert type(args.checkpoint_format) is str
+    assert args.checkpoint_format == "custom_format"
+    # A value that is not a string is still rejected.
+    with pytest.raises(ValidationError, match="checkpoint_format"):
+        TorchLlmArgs(model=llama_model_path, checkpoint_format=123)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("policy", list(CheckpointIOPolicy))
 @pytest.mark.parametrize("as_string", [False, True])
 def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
@@ -120,7 +141,8 @@ def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
         args.model_dump_json(include={"checkpoint_io_policy"})) == {
             "checkpoint_io_policy": policy.value
         }
-    assert args.checkpoint_format == "HF"
+    # The default checkpoint format is the enum member, not a plain string.
+    assert args.checkpoint_format is CheckpointFormat.HF
 
 
 @pytest.mark.cpu_only

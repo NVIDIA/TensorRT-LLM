@@ -29,6 +29,7 @@ from tensorrt_llm._torch.weight_sharing import (
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
@@ -396,7 +397,7 @@ def get_rank_model_storage(model):
 
 def _resolve_checkpoint_io_policy(
     checkpoint_loader: Optional[BaseCheckpointLoader],
-    checkpoint_format: Optional[str],
+    checkpoint_format: CheckpointFormat | str | None,
     load_format: LoadFormat | str,
     requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
@@ -408,9 +409,9 @@ def _resolve_checkpoint_io_policy(
     reason = None
     if checkpoint_loader is not None:
         reason = "an explicit checkpoint loader was provided"
-    elif checkpoint_format != "HF":
+    elif checkpoint_format != CheckpointFormat.HF:
         reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
-                  f"(received {checkpoint_format!r})")
+                  f"(received '{checkpoint_format}')")
     else:
         normalized_load_format = getattr(load_format, "name", load_format)
         if str(normalized_load_format).lower() != "auto":
@@ -428,10 +429,11 @@ def _resolve_checkpoint_io_policy(
             CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
             get_checkpoint_weight_loader)
 
-        if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get("HF")
+        if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get(CheckpointFormat.HF)
                 is not HfCheckpointLoader):
             reason = "the registered HF checkpoint loader is not the built-in loader"
-        elif get_checkpoint_weight_loader("HF") is not HfWeightLoader:
+        elif get_checkpoint_weight_loader(
+                CheckpointFormat.HF) is not HfWeightLoader:
             reason = "the registered HF weight loader is not the built-in loader"
 
     if reason is not None:
@@ -450,7 +452,7 @@ def _resolve_checkpoint_io_policy(
 
 def _construct_checkpoint_loader(
     checkpoint_loader: Optional[BaseCheckpointLoader],
-    checkpoint_format: Optional[str],
+    checkpoint_format: CheckpointFormat | str | None,
     *,
     mx_config: Optional[ModelExpressConfig] = None,
     checkpoint_io_policy: CheckpointIOPolicy = CheckpointIOPolicy.NATIVE,
@@ -498,7 +500,7 @@ def _construct_checkpoint_loader(
 
     # Pass extra kwargs for format-specific loaders (e.g. MX).
     extra_kwargs: dict = {}
-    if checkpoint_format == "MX":
+    if checkpoint_format == CheckpointFormat.MX:
         if mx_config is not None:
             extra_kwargs["mx_server_url"] = mx_config.server_url
 
@@ -868,7 +870,7 @@ class ModelLoader:
         only by MX (pre-transfer fallback gate) and GMS (pre-materialize
         strict gate), so default HF/AUTO paths should not even build one.
         """
-        return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
+        return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
 
     @staticmethod
     def _build_source_identity(
@@ -968,7 +970,7 @@ class ModelLoader:
             # AUTO may still resolve to MX, so check the resolved format too.
             uses_standard_hf_loader = (load_format == LoadFormat.AUTO
                                        and checkpoint_loader.checkpoint_format
-                                       != "MX")
+                                       != CheckpointFormat.MX)
             if requires_standard_hf_loading and not uses_standard_hf_loader:
                 raise ValueError(
                     "Host-resident model weights currently require the standard "
@@ -1004,7 +1006,8 @@ class ModelLoader:
                         post_transform_qualification.transform_abi_id),
                     fallback_on_artifact_error=(
                         load_format != LoadFormat.GMS
-                        and checkpoint_loader.checkpoint_format == "MX"),
+                        and checkpoint_loader.checkpoint_format
+                        == CheckpointFormat.MX),
                 )
 
             memo: dict[torch.Tensor, torch.Tensor] = {}
@@ -1099,7 +1102,7 @@ class ModelLoader:
                     # Generic loaders ignore it; MXCheckpointLoader pops it.
                     "source_identity": self._source_identity,
                 }
-                if checkpoint_loader.checkpoint_format == "MX":
+                if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
                     load_weights_kwargs["model_config"] = config
                     load_weights_kwargs["load_config"] = self.llm_args
                     load_weights_kwargs[
@@ -1206,7 +1209,7 @@ class ModelLoader:
                                 "model": model,
                                 "source_identity": self._source_identity,
                             }
-                            if checkpoint_loader.checkpoint_format == "MX":
+                            if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
                                 load_weights_kwargs["model_config"] = config
                                 load_weights_kwargs[
                                     "load_config"] = self.llm_args
@@ -1497,7 +1500,7 @@ class ModelLoader:
         that combination, so this post-load branch should never see an unsafe
         post-transform receiver in normal use.
         """
-        if checkpoint_loader.checkpoint_format != "MX" or not weights_preloaded:
+        if checkpoint_loader.checkpoint_format != CheckpointFormat.MX or not weights_preloaded:
             return False
 
         method = getattr(type(checkpoint_loader),
@@ -1561,7 +1564,7 @@ class ModelLoader:
         MTP weights use the draft's quantization and MoE backend.
         """
         draft_load_kwargs = {}
-        if checkpoint_loader.checkpoint_format == "MX":
+        if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
             # This loader instance still owns the target model's MX session.
             # Preserve it while the native loader reads the auxiliary draft
             # checkpoint so the finalized target can publish through it.
@@ -1661,7 +1664,7 @@ class ModelLoader:
             "checkpoint_dir": checkpoint_dir,
             "weights_preloaded": weights_preloaded,
         }
-        if checkpoint_loader.checkpoint_format == "MX":
+        if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
             if not qualification.qualified:
                 if not weights_preloaded:
                     unsupported_runtime_dimensions = ",".join(
