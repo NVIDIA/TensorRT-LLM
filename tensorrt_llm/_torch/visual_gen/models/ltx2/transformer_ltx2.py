@@ -312,11 +312,9 @@ class LTX2Attention(Attention):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        # All cross-attn K-norm paths (with or without RoPE) go through the
-        # split-fuse kernels. Fallback only kicks in for unsupported head_dim
-        # — the fused kernel template covers {64, 128}; mini-config tests use
-        # head_dim=32 and must take the eager branch.
-        if self.qk_norm and self.head_dim in (64, 128):
+        # Projected K uses the same fusion switch as Q. Unsupported head
+        # dimensions also fall back to eager normalization and RoPE.
+        if self.fuse_qk_norm_rope and self.qk_norm and self.head_dim in (64, 128):
             self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
         else:
             if self.qk_norm:
