@@ -21,7 +21,7 @@ Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen c
 
 ## Health checks
 
-OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as Inference and Control. Keep that listener on `127.0.0.1` when a sidecar in the same Pod is its only client.
+OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as Inference and Control.
 
 `Check` returns the current status. `Watch` sends the current status and later status changes. Rapid changes can merge into one update. The empty service has the same status as `inference`. Use these named services for health probes:
 
@@ -32,14 +32,33 @@ OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC 
 
 The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. Both services report `NOT_SERVING` during graceful shutdown. Each `Watch` ends after this final status. A stopped or failed server cannot answer the probe.
 
-For a Pod with a Dynamo sidecar, use one loopback listener:
+For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
 
 ```bash
 trtllm-serve <model> --grpc --grpc-protocol openengine \
-  --host 127.0.0.1 --port 30001
+  --host 0.0.0.0 --port 30001
 ```
 
-The sidecar can call `Health.Check` and `Health.Watch` on port 30001. Kubernetes native gRPC probes connect to the Pod IP, so they cannot reach this loopback listener. Use an exec probe that calls `Health.Check` on loopback if Kubernetes needs to probe it. Binding OpenEngine to the Pod IP would make Inference and Control reachable on that same port; review network restrictions and the unauthenticated RPC exposure before doing so.
+The sidecar can use `127.0.0.1:30001`. Kubernetes probes connect to the Pod IP on that same port:
+
+```yaml
+startupProbe:
+  grpc:
+    port: 30001
+    service: inference
+  periodSeconds: 10
+  failureThreshold: 60
+readinessProbe:
+  grpc:
+    port: 30001
+    service: inference
+livenessProbe:
+  grpc:
+    port: 30001
+    service: liveness
+```
+
+Set `failureThreshold * periodSeconds` to cover the longest expected model startup. The listener has no general client authentication or encryption, and Inference and Control are reachable through the Pod IP along with Health. Review that exposure for the deployment. If only same-Pod clients need access, bind to `127.0.0.1` and use exec probes instead.
 
 OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
