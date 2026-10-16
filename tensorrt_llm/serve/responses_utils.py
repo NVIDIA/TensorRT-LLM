@@ -777,31 +777,30 @@ def _responses_part_to_chat_part(part: Any) -> Any:
 
 def _input_content_to_chat_content(
         content: list) -> Union[str, list[dict[str, Any]]]:
-    """Convert the content parts of a Responses message to chat content.
+    """Convert the content parts of a typed Responses message to chat content.
 
-    Text-only content becomes a single string. Content that carries media
-    becomes an ordered list of chat parts, so the chat parser loads every
-    image and places it where the client put it. Content this server cannot
-    serve is rejected rather than dropped, since a model that never sees it
-    still answers as if it had.
+    Each part is translated as in an untyped message, and a plain string is a
+    text part. Text-only content becomes a single string, its parts joined as
+    written. Content that carries media becomes an ordered list of chat parts,
+    so the chat parser loads every image and places it where the client put
+    it. Content this server cannot serve is rejected rather than dropped,
+    since a model that never sees it still answers as if it had.
     """
     chat_parts: list[dict[str, Any]] = []
-    has_media = False
     for part in content:
-        if not isinstance(part, dict):
-            part = {"text": getattr(part, "text", None)}
-        part_type = part.get("type")
-        if part_type == "input_image":
-            chat_parts.append(_input_image_to_chat_part(part))
-            has_media = True
-        elif part_type in _CHAT_MEDIA_PART_TYPES:
+        if isinstance(part, str):
+            part = {"type": "text", "text": part}
+        elif not isinstance(part, dict):
+            text = getattr(part, "text", None)
+            if text is None:
+                raise ValueError(f"Unsupported message content part: {part!r}")
+            part = {"type": "text", "text": text}
+        part = _responses_part_to_chat_part(part)
+        if part.get("type") in _CHAT_MEDIA_PART_TYPES:
             chat_parts.append(part)
-            has_media = True
-        elif part_type == "input_file":
-            raise ValueError(_INPUT_FILE_UNSUPPORTED)
         elif part.get("text"):
             chat_parts.append({"type": "text", "text": part["text"]})
-    if not has_media:
+    if all(part["type"] == "text" for part in chat_parts):
         return "".join(part["text"] for part in chat_parts)
     return chat_parts
 

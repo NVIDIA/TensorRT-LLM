@@ -475,6 +475,30 @@ def test_untyped_chat_content_reads_as_in_a_chat_request(content):
     assert _chat_text(message) == "First\nSecond"
 
 
+def test_typed_message_keeps_plain_string_parts():
+    """A plain string is a text part; skipping it erased the prompt without an error."""
+    item = _user_item("first ", {"type": "input_text", "text": "second"})
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": "user",
+        "content": "first second",
+    }
+    assert _messages({"input": [item]}) == [{"role": "user", "content": "first second"}]
+
+
+def test_typed_message_keeps_plain_string_parts_beside_media():
+    image = {"type": "input_image", "image_url": _IMAGE_URL}
+    msg = _response_output_item_to_chat_completion_message(_user_item("Describe it.", image))
+    assert msg["content"] == [
+        {"type": "text", "text": "Describe it."},
+        {"type": "image_url", "image_url": {"url": _IMAGE_URL}},
+    ]
+
+
+def test_typed_message_rejects_a_part_without_text():
+    with pytest.raises(ValueError, match="Unsupported message content part"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, 42))
+
+
 def test_input_image_accepts_the_chat_url_object():
     image = {"type": "input_image", "image_url": {"url": _IMAGE_URL}}
     msg = _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
