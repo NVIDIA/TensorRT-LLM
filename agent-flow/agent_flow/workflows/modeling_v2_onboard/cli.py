@@ -35,13 +35,19 @@ def make_agent_factory(backend: str, model: str | None) -> AgentFactory:
     if model is None:
         model = CODEX_DEFAULT_MODEL if backend == "codex" else CLAUDE_CODE_DEFAULT_MODEL
 
-    def factory(name: str, system_prompt: str, cwd: Path, session_mode: str) -> AgentLayer:
+    def factory(
+        name: str,
+        system_prompt: str,
+        cwd: Path,
+        session_mode: str,
+        fork_from: str | None = None,
+    ) -> AgentLayer:
         return AgentLayer(
             AgentLayerConfig(
                 name=name,
                 system_prompt=system_prompt,
                 backend=BackendConfig(kind=backend, model=model, cwd=Path(cwd)),
-                session=SessionConfig(mode=session_mode),
+                session=SessionConfig(mode=session_mode, fork_from=fork_from),
             )
         )
 
@@ -86,6 +92,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=60,
         help="Once the final task is done, how long side tasks still running may take to "
         "finish before they are stopped (default: 60).",
+    )
+    parser.add_argument(
+        "--no-primer",
+        action="store_true",
+        help="Start every new_op and perf worker afresh instead of as a fork of the op "
+        "primer session (the Codex backend always does).",
     )
     message = parser.add_mutually_exclusive_group()
     message.add_argument(
@@ -140,6 +152,7 @@ def main(argv: list[str] | None = None) -> None:
             agent_factory=make_agent_factory(args.backend, args.model),
             max_parallel=args.max_parallel,
             side_wait_minutes=args.side_wait_minutes,
+            primer=args.backend != "codex" and not args.no_primer,
         )
         if args.clean:
             workflow.clean()

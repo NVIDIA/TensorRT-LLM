@@ -8,11 +8,15 @@ worker prompt plus the block of each of the task's tags, runs the task in a
 single turn, and ends by writing ``task_result_<id>.md``. The task's outcome is
 that file's ``status``; a worker that leaves no valid file gets one follow-up
 turn to write it, and the task is ``FAILED`` if it still does not.
+
+A worker given a :class:`Primer` starts as a fork of the primer's session; if
+that session cannot start, the worker starts afresh instead.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -21,7 +25,7 @@ from agent_flow.orchestration import Node
 from .files import HandoffError, Layout, TaskResult, parse_task_result, read_handoff
 from .prompts import WorkerTask, build_worker_system_prompt, worker_retry_prompt, worker_turn_prompt
 
-__all__ = ["Agent", "AgentFactory", "RunTask", "make_run_task", "write_failure"]
+__all__ = ["Agent", "AgentFactory", "Primer", "RunTask", "make_run_task", "write_failure"]
 
 
 class Agent(Protocol):
@@ -32,12 +36,45 @@ class Agent(Protocol):
     async def __aexit__(self, exc_type, exc, tb) -> None: ...
 
 
-# ``(name, system_prompt, cwd, session_mode) -> Agent``. Injected so tests can
-# substitute scripted agents for real backends.
-AgentFactory = Callable[[str, str, Path, str], Agent]
+class AgentFactory(Protocol):
+    """Builds an agent; injected so tests can substitute scripted agents.
 
-# ``(node, worktree, tags, is_final, side) -> result``.
-RunTask = Callable[[Node, Path, tuple[str, ...], bool, bool], Awaitable[TaskResult]]
+    ``fork_from`` starts the agent as a fork of that earlier session.
+    """
+
+    def __call__(
+        self,
+        name: str,
+        system_prompt: str,
+        cwd: Path,
+        session_mode: str,
+        fork_from: str | None = None,
+    ) -> Agent: ...
+
+
+@dataclass(frozen=True)
+class Primer:
+    """A briefing session that workers start as forks of.
+
+    Attributes:
+        session_id: The backend's id of the session.
+        repo: The checkout it read.
+        commit: The commit it read there.
+    """
+
+    session_id: str
+    repo: Path
+    commit: str
+
+
+# ``(node, worktree, tags, is_final, side, primer) -> result``.
+RunTask = Callable[
+    [Node, Path, tuple[str, ...], bool, bool, "Primer | None"], Awaitable[TaskResult]
+]
+
+
+def _existing(path: Path) -> Path | None:
+    return path if path.is_file() else None
 
 
 def write_failure(
@@ -84,7 +121,12 @@ def make_run_task(
     """
 
     async def run_task(
-        node: Node, cwd: Path, tags: tuple[str, ...], is_final: bool, side: bool
+        node: Node,
+        cwd: Path,
+        tags: tuple[str, ...],
+        is_final: bool,
+        side: bool,
+        primer: Primer | None = None,
     ) -> TaskResult:
         result_path = layout.result_path(node.id)
         # A result left by an interrupted turn of this same attempt is stale.
@@ -106,13 +148,30 @@ def make_run_task(
             previous_attempts=tuple(layout.previous_attempts(node.id)),
             test_commands=layout.test_commands_path if slurm else None,
             gpu_run=gpu_run,
+            knowledge=_existing(layout.knowledge_path("op")) if primer is None else None,
         )
-        agent = agent_factory(
-            f"worker[{node.id}]",
-            build_worker_system_prompt(tags, slurm=slurm, gpu_pool=gpu_run is not None),
-            Path(cwd),
-            "persistent",
-        )
+        system_prompt = build_worker_system_prompt(tags, slurm=slurm, gpu_pool=gpu_run is not None)
+        if primer is not None:
+            agent = agent_factory(
+                f"worker[{node.id}]",
+                system_prompt,
+                Path(cwd),
+                "persistent",
+                fork_from=primer.session_id,
+            )
+            primed = replace(task, primed_repo=primer.repo, primed_commit=primer.commit)
+            try:
+                return await _run_worker(agent, worker_turn_prompt(primed), result_path)
+            except Exception:
+                if result_path.is_file():
+                    return write_failure(
+                        result_path, "The worker's session raised after writing its result."
+                    )
+                # The fork did not start or broke: start afresh in the same worktree.
+            finally:
+                await agent.__aexit__(None, None, None)
+            task = replace(task, knowledge=_existing(layout.knowledge_path("op")))
+        agent = agent_factory(f"worker[{node.id}]", system_prompt, Path(cwd), "persistent")
         try:
             return await _run_worker(agent, worker_turn_prompt(task), result_path)
         except Exception as exc:

@@ -97,6 +97,15 @@ class Layout:
         return self.workspace / ".state.json"
 
     @property
+    def primers_path(self) -> Path:
+        """The primer sessions this run built, by kind."""
+        return self.workspace / "primers.json"
+
+    def knowledge_path(self, kind: str) -> Path:
+        """The summary a primer of ``kind`` wrote for workers not forked from it."""
+        return self.workspace / "knowledge" / f"{kind}.md"
+
+    @property
     def gpu_pool_dir(self) -> Path:
         """The run's GPU pool: its holder script, locks, queue and logs."""
         return self.workspace / "gpu_pool"

@@ -66,6 +66,7 @@ def _workflow(
     factory: FakeFactory,
     max_parallel: int = 4,
     side_wait_minutes: float = 60,
+    primer: bool = False,
     **task,
 ) -> ModelingV2OnboardWorkflow:
     task_path = tmp_path / "task.yaml"
@@ -78,6 +79,7 @@ def _workflow(
         agent_factory=factory,
         max_parallel=max_parallel,
         side_wait_minutes=side_wait_minutes,
+        primer=primer,
     )
 
 
@@ -638,6 +640,124 @@ def test_a_bad_gpu_pool_is_refused(tmp_path, tmp_git_repo):
     slurm = {"slurm_partition": "p", "docker_image": "/i.sqsh", "gpu_pool": {"nodes": 1}}
     with pytest.raises(WorkflowError, match="gpu_pool.account"):
         _workflow(tmp_path, tmp_git_repo, FakeFactory(), **{"slurm-environment": slurm})
+
+
+def _summary_path(prompt: str) -> Path:
+    return Path(re.search(r"Then write `([^`]+)`", prompt).group(1))
+
+
+def test_op_workers_start_as_forks_of_the_primer(tmp_path, tmp_git_repo):
+    async def primer(agent, prompt):
+        _summary_path(prompt).write_text("what entry workers need\n")
+        agent.session_id = "primer-1"
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            # The primer reads while the planner plans.
+            await _until(lambda: any(a.name == "primer[op]" for a in factory.agents))
+            _first_batch(prompt).write_text(_plan_text())
+        else:
+            _finish_when_ready(prompt)
+
+    factory = FakeFactory(planner=planner, worker=_Workers(), primer=primer)
+    workflow = _workflow(tmp_path, tmp_git_repo, factory, primer=True)
+    assert workflow.run() == RunOutcome.SUCCEEDED
+
+    (primer_agent,) = [a for a in factory.agents if a.name == "primer[op]"]
+    assert primer_agent.cwd == tmp_git_repo.absolute() and primer_agent.closed
+    head = _git(tmp_git_repo, "rev-list", "--max-parents=0", "HEAD").strip()
+    assert f"(commit `{head}`)" in primer_agent.prompts[0]
+    for op in ("a", "b"):
+        (worker,) = factory.workers(op)
+        assert worker.fork_from == "primer-1"
+        assert worker.prompts[0].startswith("**You are now a worker")
+    for other in ("c", "land"):
+        (worker,) = factory.workers(other)
+        assert worker.fork_from is None
+    recorded = json.loads(Layout(tmp_path / "ws").primers_path.read_text())["op"]
+    assert (recorded["session_id"], recorded["commit"]) == ("primer-1", head)
+
+
+def test_op_workers_start_afresh_from_the_summary_when_the_primer_fails(tmp_path, tmp_git_repo):
+    async def primer(agent, prompt):
+        _summary_path(prompt).write_text("partial notes\n")
+        raise RuntimeError("primer session died")
+
+    factory = FakeFactory(
+        planner=_planner(_finish_when_ready_async), worker=_Workers(), primer=primer
+    )
+    assert _workflow(tmp_path, tmp_git_repo, factory, primer=True).run() == RunOutcome.SUCCEEDED
+    (worker,) = factory.workers("a")
+    assert worker.fork_from is None
+    knowledge = Layout(tmp_path / "ws").knowledge_path("op")
+    assert f"read it first: `{knowledge}`" in worker.prompts[0]
+    assert not Layout(tmp_path / "ws").primers_path.exists()
+
+
+def test_a_resumed_run_reuses_its_primer(tmp_path, tmp_git_repo):
+    from agent_flow.workflows.modeling_v2_onboard.prompts import primer_version
+
+    layout = Layout(tmp_path / "ws")
+    layout.workspace.mkdir(parents=True)
+    record = {"session_id": "earlier", "commit": "c0ffee", "version": primer_version()}
+    layout.primers_path.write_text(json.dumps({"op": record}))
+
+    async def primer(agent, prompt):
+        raise AssertionError("the recorded primer is reused")
+
+    factory = FakeFactory(
+        planner=_planner(_finish_when_ready_async), worker=_Workers(), primer=primer
+    )
+    workflow = _workflow(tmp_path, tmp_git_repo, factory, primer=True)
+    # A fresh run: the workspace holds only the primer record.
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    (worker,) = factory.workers("a")
+    assert worker.fork_from == "earlier"
+    assert "at commit `c0ffee`" in worker.prompts[0]
+
+
+def test_op_workers_wait_for_the_primer_only_so_long(tmp_path, tmp_git_repo, monkeypatch):
+    from agent_flow.workflows.modeling_v2_onboard import workflow as workflow_module
+
+    monkeypatch.setattr(workflow_module, "PRIMER_WAIT_MINUTES", 0.001)
+    stuck = asyncio.Event()
+
+    async def primer(agent, prompt):
+        await stuck.wait()
+
+    factory = FakeFactory(
+        planner=_planner(_finish_when_ready_async), worker=_Workers(), primer=primer
+    )
+    assert _workflow(tmp_path, tmp_git_repo, factory, primer=True).run() == RunOutcome.SUCCEEDED
+    (worker,) = factory.workers("a")
+    assert worker.fork_from is None
+    (primer_agent,) = [a for a in factory.agents if a.name == "primer[op]"]
+    # The run does not leave the primer behind.
+    assert primer_agent.closed
+
+
+def test_clean_deletes_the_primer_and_worker_sessions(tmp_path, tmp_git_repo, monkeypatch):
+    from agent_flow.workflows.modeling_v2_onboard.workflow import _session_dir
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    workflow = _workflow(tmp_path, tmp_git_repo, FakeFactory())
+    layout = workflow.layout
+    layout.workspace.mkdir(parents=True)
+    layout.primers_path.write_text(json.dumps({"op": {"session_id": "p1"}}))
+    primer_file = _session_dir(workflow.repo_path) / "p1.jsonl"
+    other_file = _session_dir(workflow.repo_path) / "planner.jsonl"
+    worker_dir = _session_dir(layout.worktrees_dir / "op-a")
+    for path in (primer_file, other_file, worker_dir / "w.jsonl"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+    workflow.clean()
+    assert not primer_file.exists() and not worker_dir.exists()
+    assert other_file.exists()
+    assert not layout.primers_path.exists()
+
+
+async def _finish_when_ready_async(agent, prompt):
+    _finish_when_ready(prompt)
 
 
 def test_an_invalid_plan_is_sent_back_until_it_validates(tmp_path, tmp_git_repo):

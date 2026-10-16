@@ -17,6 +17,7 @@ Bring up a new model, or a new target of an existing model, in ModelingV2
 modeling-v2-onboard --task task.yaml --workspace /scratch/me/qwen3-onboard
 modeling-v2-onboard ... --backend codex          # every agent on Codex
 modeling-v2-onboard ... --max-parallel 4         # at most 4 workers at once
+modeling-v2-onboard ... --no-primer              # op workers start afresh
 modeling-v2-onboard --workspace /scratch/me/qwen3-onboard \
     --feedback "Drop the regression tasks; they are not needed."   # steer a running run
 ```
@@ -84,6 +85,25 @@ seconds and wakes the planner, whose next turn shows it first and is told to
 act on it before anything else. The message moves to `inbox/consumed/` once a
 turn that saw it has been applied, so a discarded turn or a crash hands it to
 the planner again.
+
+## The op primer
+
+Every worker that writes or speeds up an entry starts by reading the same
+things: the README, the `OpWrapper` contract, a few entries and their tests,
+how GPU tests run here. On the Claude backend, a **primer** session reads them
+once, in the checkout, while the planner writes its first batch, and writes a
+summary to `knowledge/op.md`. Each `new_op` or `perf` worker then starts as a
+fork of the primer's session — with that reading already in its history, in
+its own worktree, under its own system prompt — and is told at which commit
+the reading was done, to check what changed since before relying on it.
+
+A task that is ready before the primer waits for it up to 20 minutes. If the
+primer is not ready by then, failed, or a fork cannot start, the worker starts
+afresh and reads `knowledge/op.md` first when it exists. The primer's session
+is recorded in `primers.json` and reused when the run resumes; `--no-primer`
+(and the Codex backend, which cannot fork sessions) starts every worker afresh.
+`--clean` also deletes the primer's and the workers' Claude Code session
+files.
 
 ## GPU pool
 
@@ -182,6 +202,7 @@ The planner's plan is checked before it runs (`plan.py`):
 | `nodes/<id>/` | a task's notes and `jobs.json` (detached jobs) |
 | `worktrees/<id>/` | a running task's git worktree |
 | `test_commands.md` | Slurm commands the workers verified (Slurm runs only) |
+| `primers.json`, `knowledge/op.md` | the op primer's session and the summary it wrote |
 | `gpu_pool/` | the GPU pool's `pool.json`, holder script, GPU locks, wait queue and holder logs |
 | `gpu_priorities.json` | each task's GPU priority class, rewritten whenever the plan changes |
 | `.state.json`, `.running_plan.md` | task states and the plan being run, for resume |

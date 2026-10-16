@@ -191,7 +191,10 @@ class CodexBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
+        if fork_from is not None:
+            raise NotImplementedError("the codex backend cannot fork a session")
         if self._transport is None:
             raise RuntimeError("CodexBackend must be entered before creating clients.")
         session_cwd = (cwd or Path.cwd()).resolve()

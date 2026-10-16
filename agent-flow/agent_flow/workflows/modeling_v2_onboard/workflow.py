@@ -26,6 +26,11 @@ A run that lands keeps every side task's branch as
 ``<landed branch>-unmerged/<id>`` and commits ``UNMERGED_OPTIMIZATIONS.md``
 listing them, so a human can merge any of them later.
 
+With ``primer`` on, an op primer session reads what every ``new_op`` and
+``perf`` worker needs while the planner plans; those workers then start as
+forks of it (waiting up to ``PRIMER_WAIT_MINUTES`` for it), and start afresh
+from its written summary when it is not there.
+
 When ``task.yaml`` asks for a GPU pool, its holder jobs are submitted before
 the planner starts, kept submitted while the run goes on, and cancelled when it
 ends; workers run their GPU commands in it.
@@ -47,6 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,13 +81,17 @@ from .files import (
     read_inbox,
 )
 from .gpu_pool import GpuPool, PoolConfigError, pool_config
-from .node_runner import Agent, AgentFactory, make_run_task, write_failure
+from .node_runner import Agent, AgentFactory, Primer, make_run_task, write_failure
 from .plan import PRIORITIES, PlanError, PlanSpec, parse_plan
 from .prompts import (
+    PRIMED_TAGS,
     build_planner_system_prompt,
+    build_primer_system_prompt,
     initial_plan_prompt,
     plan_fix_prompt,
     planner_turn_prompt,
+    primer_prompt,
+    primer_version,
 )
 
 __all__ = ["ModelingV2OnboardWorkflow", "RunOutcome", "WorkflowError"]
@@ -91,6 +102,8 @@ MAX_PLAN_FIXES = 3
 MAX_STALLED_TURNS = 3
 # How often the orchestrator looks for human messages in the inbox.
 INBOX_POLL_SECONDS = 10
+# How long a task that starts from the op primer waits for it to be ready.
+PRIMER_WAIT_MINUTES = 20
 # The file a landed run commits to list the side tasks it did not merge.
 UNMERGED_FILE = "UNMERGED_OPTIMIZATIONS.md"
 
@@ -178,6 +191,12 @@ def _decision_problems(decision: PlannerDecision) -> list[str]:
     return []
 
 
+def _session_dir(cwd: Path) -> Path:
+    """Where Claude Code keeps the session files of agents run in ``cwd``."""
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
+    return home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
 def _result_summary(path: Path) -> str | None:
     try:
         return read_handoff(path, parse_task_result).summary
@@ -197,6 +216,8 @@ class ModelingV2OnboardWorkflow:
         max_parallel: The most workers that run at once.
         side_wait_minutes: How long side tasks still running when the final
             task is DONE may take to finish before they are stopped.
+        primer: Whether ``new_op`` and ``perf`` workers start as forks of an
+            op primer session; needs a backend that can fork sessions.
     """
 
     def __init__(
@@ -208,6 +229,7 @@ class ModelingV2OnboardWorkflow:
         agent_factory: AgentFactory,
         max_parallel: int = 8,
         side_wait_minutes: float = 60,
+        primer: bool = False,
     ) -> None:
         self.layout = Layout(Path(workspace).absolute())
         self.task_path = Path(task_path)
@@ -216,6 +238,7 @@ class ModelingV2OnboardWorkflow:
         self.agent_factory = agent_factory
         self.max_parallel = max_parallel
         self.side_wait_minutes = side_wait_minutes
+        self.primer = primer
         self.isolation = GitWorktreeIsolation(
             repo_path=self.repo_path, worktrees_root=self.layout.worktrees_dir
         )
@@ -287,6 +310,7 @@ class ModelingV2OnboardWorkflow:
         """Delete this workflow's state, task worktrees and task branches."""
         layout = self.layout
         self._drop_task_branches()
+        self._drop_sessions()
         if self.gpu_pool is not None:
             self.gpu_pool.release()
         shutil.rmtree(layout.gpu_pool_dir, ignore_errors=True)
@@ -296,6 +320,7 @@ class ModelingV2OnboardWorkflow:
             layout.running_plan_path,
             layout.priorities_path,
             layout.test_commands_path,
+            layout.primers_path,
         ):
             path.unlink(missing_ok=True)
         for directory in (
@@ -303,8 +328,28 @@ class ModelingV2OnboardWorkflow:
             layout.turns_dir,
             layout.nodes_dir,
             layout.worktrees_dir,
+            layout.knowledge_path("op").parent,
         ):
             shutil.rmtree(directory, ignore_errors=True)
+
+    def _drop_sessions(self) -> None:
+        """Delete the session files of the run's primer and of its workers."""
+        recorded = self._primers().get("op", {})
+        session = recorded.get("session_id")
+        for root in {self.repo_path, self.repo_path.resolve()}:
+            if session:
+                (_session_dir(root) / f"{session}.jsonl").unlink(missing_ok=True)
+        for root in {self.layout.worktrees_dir, self.layout.worktrees_dir.resolve()}:
+            prefix = _session_dir(root)
+            if prefix.parent.is_dir():
+                for directory in prefix.parent.glob(f"{prefix.name}-*"):
+                    shutil.rmtree(directory, ignore_errors=True)
+
+    def _primers(self) -> dict:
+        try:
+            return json.loads(self.layout.primers_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
 
     def _drop_task_branches(self) -> None:
         repo, root = self.repo_path, self.layout.worktrees_dir.resolve()
@@ -434,8 +479,9 @@ class ModelingV2OnboardWorkflow:
             if dep_nodes:
                 await self._git(self.isolation.prepare, node, dep_nodes, path)
             try:
+                primer = await self._primer_for(node)
                 result = await self._run_task(
-                    node, path, plan.tags[node.id], landing, node.id in plan.side
+                    node, path, plan.tags[node.id], landing, node.id in plan.side, primer
                 )
             except asyncio.CancelledError:
                 if node.id not in self._overdue:
@@ -445,6 +491,63 @@ class ModelingV2OnboardWorkflow:
         finally:
             await self._git(self.isolation.release, node)
         return result
+
+    async def _primer_for(self, node: Node) -> Primer | None:
+        """The op primer, for a task that starts from it, once it is ready."""
+        primer = self._op_primer
+        if primer is None or not PRIMED_TAGS & set(self._plan.tags[node.id]):
+            return None
+        if not primer.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(primer), PRIMER_WAIT_MINUTES * 60)
+            except TimeoutError:
+                return None
+        return primer.result()
+
+    async def _prime(self) -> Primer | None:
+        """Build the op primer, or reuse the one an earlier session of the run built."""
+        layout = self.layout
+        version = primer_version()
+        recorded = self._primers().get("op")
+        if recorded and recorded.get("version") == version:
+            return Primer(recorded["session_id"], self.repo_path, recorded["commit"])
+        commit = _git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
+        summary = layout.knowledge_path("op")
+        summary.parent.mkdir(parents=True, exist_ok=True)
+        print_message("op primer: reading for the op workers", self._log)
+        agent = self.agent_factory(
+            "primer[op]", build_primer_system_prompt(), self.repo_path, "persistent"
+        )
+        try:
+            await agent.aforward(
+                primer_prompt(
+                    repo=self.repo_path,
+                    commit=commit,
+                    task_yaml=layout.task_path,
+                    test_commands=layout.test_commands_path,
+                    summary=summary,
+                )
+            )
+            session_id = getattr(agent, "session_id", None)
+        except Exception as exc:
+            print_message(
+                f"[yellow]op primer failed ({exc!r}); op workers start afresh[/yellow]",
+                self._log,
+            )
+            return None
+        finally:
+            await agent.__aexit__(None, None, None)
+        if not session_id:
+            print_message(
+                "[yellow]op primer: the backend reported no session; op workers start "
+                "afresh[/yellow]",
+                self._log,
+            )
+            return None
+        record = {"session_id": session_id, "commit": commit, "version": version}
+        layout.primers_path.write_text(json.dumps({"op": record}, indent=1), encoding="utf-8")
+        print_message(f"op primer: ready (session {session_id})", self._log)
+        return Primer(session_id, self.repo_path, commit)
 
     def _overdue_result(self, task_id: str) -> TaskResult:
         """The result of a side task stopped at the deadline: its own, if it wrote one."""
@@ -902,6 +1005,10 @@ class ModelingV2OnboardWorkflow:
         # Side tasks stopped at the deadline, and the deadline's timer.
         self._overdue: set[str] = set()
         self._deadline: asyncio.Task[None] | None = None
+        # The op primer reads while the planner plans.
+        self._op_primer: asyncio.Task[Primer | None] | None = None
+        if self.primer:
+            self._op_primer = asyncio.create_task(self._prime())
         # GPUs are asked for first: holder jobs queue while the planner plans.
         self._pool_keeper: asyncio.Task[None] | None = None
         if self.gpu_pool is not None:
@@ -931,6 +1038,9 @@ class ModelingV2OnboardWorkflow:
         finally:
             await self._stop_workers()
             await self._planner.__aexit__(None, None, None)
+            if self._op_primer is not None and not self._op_primer.done():
+                self._op_primer.cancel()
+                await asyncio.gather(self._op_primer, return_exceptions=True)
             if self._pool_keeper is not None:
                 self._pool_keeper.cancel()
                 if self._state.phase != "done":

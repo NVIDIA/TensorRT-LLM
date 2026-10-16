@@ -20,6 +20,7 @@ from ._common import (
     SOURCE_BOUNDARY,
     tidy,
 )
+from .primer import primed_preamble
 from .tags import TAG_PROMPTS
 
 __all__ = ["WorkerTask", "build_worker_system_prompt", "worker_retry_prompt", "worker_turn_prompt"]
@@ -130,6 +131,10 @@ class WorkerTask:
         test_commands: The Slurm command cache, when the run uses Slurm.
         gpu_run: The command prefix that runs a command in the run's GPU pool,
             when it has one.
+        primed_repo: The checkout the session this worker was forked from
+            read, when it was forked from the op primer.
+        primed_commit: The commit that session read there.
+        knowledge: The op primer's summary, for a worker not forked from it.
     """
 
     task_id: str
@@ -146,11 +151,17 @@ class WorkerTask:
     test_commands: Path | None = None
     side: bool = False
     gpu_run: str | None = None
+    primed_repo: Path | None = None
+    primed_commit: str | None = None
+    knowledge: Path | None = None
 
 
 def worker_turn_prompt(task: WorkerTask) -> str:
     """The single prompt a worker's task starts with."""
-    lines = [
+    lines = []
+    if task.primed_commit is not None:
+        lines += [primed_preamble(repo=task.primed_repo, commit=task.primed_commit).rstrip(), ""]
+    lines += [
         f"Your task: `{task.task_id}` (tags: {', '.join(task.tags)}).",
         "",
         f"- Worktree — edit code here: `{task.worktree}`",
@@ -159,6 +170,8 @@ def worker_turn_prompt(task: WorkerTask) -> str:
         f"- Your notes directory: `{task.notes_dir}` (keep `notes.md` there)",
         f"- Your detached-job registry: `{task.jobs}`",
     ]
+    if task.knowledge is not None:
+        lines.append(f"- What every entry worker needs to know — read it first: `{task.knowledge}`")
     if task.test_commands is not None:
         lines.append(f"- Verified Slurm commands: `{task.test_commands}`")
     if task.gpu_run is not None:

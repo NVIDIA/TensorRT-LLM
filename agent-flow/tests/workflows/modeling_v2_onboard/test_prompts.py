@@ -13,9 +13,12 @@ from agent_flow.workflows.modeling_v2_onboard.prompts import (
     TAG_SUMMARIES,
     WorkerTask,
     build_planner_system_prompt,
+    build_primer_system_prompt,
     build_worker_system_prompt,
     initial_plan_prompt,
     planner_turn_prompt,
+    primer_prompt,
+    primer_version,
     worker_turn_prompt,
 )
 from agent_flow.workflows.modeling_v2_onboard.prompts._common import SLURM_ENVIRONMENT
@@ -217,3 +220,18 @@ def test_the_planner_writes_its_plan_in_batches(tmp_path: Path):
     )
     assert "You are still planning" not in planner_turn_prompt(**args)
     assert "You are still planning" in planner_turn_prompt(**args, planning=True)
+
+
+def test_the_primer_only_reads_and_leaves_a_summary(tmp_path: Path):
+    system = build_primer_system_prompt()
+    assert "you only read" in system and "## ModelingV2: where things live" in system
+    text = primer_prompt(
+        repo=tmp_path,
+        commit="abc123",
+        task_yaml=tmp_path / "task.yaml",
+        test_commands=tmp_path / "test_commands.md",
+        summary=tmp_path / "knowledge" / "op.md",
+    )
+    assert "(commit `abc123`)" in text and "catalog/_op.py" in text
+    assert f"Then write `{tmp_path / 'knowledge' / 'op.md'}`" in text
+    assert primer_version() == primer_version() and len(primer_version()) == 12

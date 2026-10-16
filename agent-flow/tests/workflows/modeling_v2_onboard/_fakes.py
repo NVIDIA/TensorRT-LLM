@@ -31,8 +31,10 @@ class FakeAgent:
     cwd: Path
     session_mode: str
     script: Callable[[FakeAgent, str], Awaitable[None]]
+    fork_from: str | None = None
     prompts: list[str] = field(default_factory=list)
     closed: bool = False
+    session_id: str | None = None
 
     async def aforward(self, content: str) -> str:
         self.prompts.append(content)
@@ -49,12 +51,25 @@ class FakeFactory:
 
     planner: Callable[[FakeAgent, str], Awaitable[None]] | None = None
     worker: Callable[[FakeAgent, str], Awaitable[None]] | None = None
+    primer: Callable[[FakeAgent, str], Awaitable[None]] | None = None
     agents: list[FakeAgent] = field(default_factory=list)
 
-    def __call__(self, name: str, system_prompt: str, cwd: Path, session_mode: str) -> FakeAgent:
-        script = self.planner if name == "planner" else self.worker
+    def __call__(
+        self,
+        name: str,
+        system_prompt: str,
+        cwd: Path,
+        session_mode: str,
+        fork_from: str | None = None,
+    ) -> FakeAgent:
+        if name == "planner":
+            script = self.planner
+        elif name.startswith("primer["):
+            script = self.primer
+        else:
+            script = self.worker
         assert script is not None, name
-        agent = FakeAgent(name, system_prompt, Path(cwd), session_mode, script)
+        agent = FakeAgent(name, system_prompt, Path(cwd), session_mode, script, fork_from)
         self.agents.append(agent)
         return agent
 
