@@ -27,6 +27,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -185,6 +186,7 @@ def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1
     model_config = model_config_lib.ModelConfig(
         pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
         disable_mm_encoder=True,
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
     )
 
     with MetaInitMode():
