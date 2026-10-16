@@ -41,6 +41,7 @@ from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CacheTransceiverConfig, CalibConfig,
+                                          CheckpointIOPolicy,
                                           ContextChunkingPolicy,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
@@ -104,13 +105,21 @@ def test_iter_perf_stats_interval_defaults_and_validation() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("policy",
-                         ["auto", "native", "rank_striped_read_ahead"])
+@pytest.mark.parametrize("policy", list(CheckpointIOPolicy))
+@pytest.mark.parametrize("as_string", [False, True])
 def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
-        policy: str) -> None:
-    assert TorchLlmArgs(model=llama_model_path).checkpoint_io_policy == "auto"
-    args = TorchLlmArgs(model=llama_model_path, checkpoint_io_policy=policy)
-    assert args.checkpoint_io_policy == policy
+        policy: CheckpointIOPolicy, as_string: bool) -> None:
+    assert public_llmapi.CheckpointIOPolicy is CheckpointIOPolicy
+    assert TorchLlmArgs(
+        model=llama_model_path).checkpoint_io_policy is CheckpointIOPolicy.AUTO
+    args = TorchLlmArgs(
+        model=llama_model_path,
+        checkpoint_io_policy=policy.value if as_string else policy)
+    assert args.checkpoint_io_policy is policy
+    assert json.loads(
+        args.model_dump_json(include={"checkpoint_io_policy"})) == {
+            "checkpoint_io_policy": policy.value
+        }
     assert args.checkpoint_format == "HF"
 
 
