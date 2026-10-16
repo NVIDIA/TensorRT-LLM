@@ -41,8 +41,8 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
-    MultimodalFieldLayout,
     MultimodalInput,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
     select_multimodal_fields,
@@ -394,7 +394,7 @@ class MultimodalModelMixin:
     * A partially cached `MultimodalParams` is handled by encoding only its miss items
       and interleaving cached items back in original per-item order. The default
       `build_multimodal_encoder_input` selects fields declared by
-      `get_multimodal_field_layout`. Undeclared models retain legacy stacked/packed inference.
+      `get_multimodal_item_partitions`. Undeclared models retain legacy stacked/packed inference.
     """
 
     supports_encoder_cache: ClassVar[bool] = False
@@ -815,11 +815,11 @@ class MultimodalModelMixin:
         # them as extra embeds without changing the base flow.
         return active_embeddings, ()
 
-    def get_multimodal_field_layout(
+    def get_multimodal_item_partitions(
         self,
         param: MultimodalParams,
         modality: str,
-    ) -> dict[str, MultimodalFieldLayout] | None:
+    ) -> dict[str, MultimodalItemPartition] | None:
         """Declare how items occupy each field of one modality's payload.
 
         Models declare batched axes, packed item lengths, and shared values.
@@ -854,11 +854,11 @@ class MultimodalModelMixin:
             raise TypeError(
                 f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
             )
-        field_layout = self.get_multimodal_field_layout(param, modality)
-        if field_layout is None:
+        item_partitions = self.get_multimodal_item_partitions(param, modality)
+        if item_partitions is None:
             sliced = self._select_legacy_multimodal_fields(modality_data, modality, item_indices)
         else:
-            sliced = select_multimodal_fields(modality_data, field_layout, item_indices)
+            sliced = select_multimodal_fields(modality_data, item_partitions, item_indices)
 
         # Metadata slicing must not rewrite the original request's hashes.
         residual_input = (

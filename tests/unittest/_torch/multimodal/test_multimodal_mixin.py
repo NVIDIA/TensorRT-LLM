@@ -278,7 +278,7 @@ def test_declared_qwen_fields_reuse_host_costs_for_device_grids():
     )
 
     class QwenModel(DummyMultimodalModel):
-        get_multimodal_field_layout = Qwen3VLModelBase.get_multimodal_field_layout
+        get_multimodal_item_partitions = Qwen3VLModelBase.get_multimodal_item_partitions
 
     pixels = torch.arange(10, device="cuda").reshape(5, 2)
     grids = torch.tensor([[1, 1, 2], [1, 1, 3]], device="cuda")
