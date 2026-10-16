@@ -32,7 +32,6 @@ set(SRCS
     multimodalInput.cpp
     promptTuningConfig.cpp
     request.cpp
-    requestUtils.cpp
     response.cpp
     serialization.cpp
     tensor.cpp)
