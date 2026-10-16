@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 import warnings
 from collections.abc import Generator
 from typing import List, Optional
@@ -104,6 +105,10 @@ def redact_kwargs(kwargs):
     return new_kw
 
 
+# Environment variable carrying the unique token of each subprocess launch. It
+# lets the cleanup recognize processes of that launch that were re-parented away.
+LAUNCH_TOKEN_ENV = "TRTLLM_TEST_LAUNCH_TOKEN"
+
 general_logger = logging.getLogger("general")
 general_logger.setLevel(logging.CRITICAL)
 
@@ -162,9 +167,126 @@ if is_linux():
 
         return pids
 
+    def list_gpu_compute_pids() -> set:
+        """Return pids of all processes holding a CUDA context, per NVML.
+
+        Returns an empty set when NVML is unavailable (e.g. CPU-only stages).
+        """
+        try:
+            import pynvml
+        except ImportError:
+            return set()
+
+        pids = set()
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError:
+            return pids
+        try:
+            for i in range(pynvml.nvmlDeviceGetCount()):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                    pids.add(proc.pid)
+        except pynvml.NVMLError:
+            pass
+        finally:
+            with contextlib.suppress(pynvml.NVMLError):
+                pynvml.nvmlShutdown()
+        return pids
+
+    def tag_launch(kwargs: dict):
+        """Return ``(kwargs, token)`` with a unique launch token in ``env``.
+
+        Every descendant inherits the token through its environment, so it
+        identifies the processes of one launch even after they are re-parented
+        to init. Tokens of enclosing launches are kept so that nested harness
+        invocations do not hide a process from the outer sweep.
+        """
+        token = uuid.uuid4().hex
+        env = kwargs.get("env")
+        env = dict(os.environ if env is None else env)
+        outer = env.get(LAUNCH_TOKEN_ENV)
+        env[LAUNCH_TOKEN_ENV] = f"{outer}:{token}" if outer else token
+        return {**kwargs, "env": env}, token
+
+    def _has_launch_token(proc: psutil.Process, token: str) -> bool:
+        """Whether ``proc`` or one of its ancestors carries ``token``."""
+        for candidate in (proc, *proc.parents()):
+            try:
+                tokens = candidate.environ().get(LAUNCH_TOKEN_ENV, "")
+            except psutil.Error:
+                continue
+            if token in tokens.split(":"):
+                return True
+        return False
+
+    def _holds_gpu(pid: int) -> bool:
+        """Whether ``pid`` has an NVIDIA device node open in this namespace.
+
+        NVML can report host pids that alias unrelated processes inside a
+        container; those do not hold the device here.
+        """
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            return False
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                if os.readlink(f"{fd_dir}/{fd}").startswith("/dev/nvidia"):
+                    return True
+        return False
+
+    def kill_orphaned_gpu_processes(launch_token: str):
+        """Kill GPU processes of one launch that escaped its process tree.
+
+        When pytest-timeout fires with --timeout-method=thread it calls
+        os._exit(), so the test never shuts down its MPI workers. They are
+        spawned through an Open MPI daemon living in its own session and end up
+        re-parented to init, which the session/children scan cannot see.
+        A GPU process is killed only if it is owned by the current user, holds
+        an NVIDIA device node open, and it or one of its ancestors carries
+        ``launch_token``; processes of other jobs on the node, or host pids
+        that alias them in a container, never carry the token.
+        """
+        me = os.getpid()
+        current_uid = os.getuid()
+        victims = []
+        for pid in sorted(list_gpu_compute_pids()):
+            if pid <= 1 or pid == me:
+                continue
+            try:
+                proc = psutil.Process(pid)
+                if proc.uids().real != current_uid:
+                    continue
+                if me in (parent.pid for parent in proc.parents()):
+                    continue  # already covered by the descendant sweep
+                if not _holds_gpu(pid) or not _has_launch_token(
+                        proc, launch_token):
+                    continue
+                victims.append((pid, redact_args(proc.cmdline())))
+            except psutil.Error:
+                continue
+
+        if not victims:
+            return
+        warnings.warn("Found leftover GPU processes outside the session tree: "
+                      f"{victims}")
+        for pid, _ in victims:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
     def cleanup_process_tree(p: subprocess.Popen,
                              has_session=False,
-                             verbose_message=False):
+                             verbose_message=False,
+                             launch_token: Optional[str] = None):
+        """Kill the process tree of ``p``.
+
+        Given ``launch_token``, also kill GPU processes of that launch that
+        escaped the tree.
+        """
         target_pids = set()
         if has_session:
             # Session ID is the pid of the leader process
@@ -228,10 +350,17 @@ if is_linux():
                 pass
         p.kill()
 
+        if launch_token is not None:
+            kill_orphaned_gpu_processes(launch_token)
+
 elif is_windows():
     import pywintypes
     import win32api
     import win32job
+
+    def tag_launch(kwargs: dict):
+        """No launch token on Windows; processes are tracked by a job object."""
+        return kwargs, None
 
     class MyHandle:
 
@@ -258,7 +387,11 @@ elif is_windows():
                 p.job_handle = None
         return p
 
-    def cleanup_process_tree(p: subprocess.Popen, has_session=False):
+    def cleanup_process_tree(p: subprocess.Popen,
+                             has_session=False,
+                             verbose_message=False,
+                             launch_token: Optional[str] = None):
+        """Kill the process tree of ``p`` and terminate its job object."""
         target_pids = []
         try:
             target_pids = [
@@ -291,17 +424,30 @@ def popen(*popenargs,
           start_new_session=True,
           suppress_output_info=False,
           **kwargs) -> Generator[subprocess.Popen]:
+    """Start a subprocess and kill its whole process tree when done.
+
+    Processes that escaped the tree (e.g. MPI workers left behind when the test
+    process was killed by pytest-timeout) are also killed if they use the GPU,
+    but only when the subprocess failed.
+    """
     if not suppress_output_info:
         print(f"Start subprocess with popen({redact_popenargs(popenargs)}, "
               f"{redact_kwargs(kwargs)})")
 
+    kwargs, launch_token = tag_launch(kwargs)
     with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
         try:
             yield p
             if start_new_session:
-                cleanup_process_tree(p, True, True)
+                cleanup_process_tree(
+                    p,
+                    True,
+                    True,
+                    launch_token=launch_token if p.poll() != 0 else None)
         except Exception as e:
-            cleanup_process_tree(p, start_new_session)
+            cleanup_process_tree(p,
+                                 start_new_session,
+                                 launch_token=launch_token)
             if isinstance(e, subprocess.TimeoutExpired):
                 print("Process timed out.")
                 stdout, stderr = p.communicate()
@@ -353,8 +499,14 @@ def check_call(*popenargs, **kwargs):
 
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
+    """Run a command and return its stdout, cleaning up its process tree.
+
+    Like ``popen``, GPU processes that escaped the tree are killed only when
+    the command failed.
+    """
     print(f"Start subprocess with check_output({redact_popenargs(popenargs)}, "
           f"{redact_kwargs(kwargs)})")
+    kwargs, launch_token = tag_launch(kwargs)
     with Popen(*popenargs,
                stdout=subprocess.PIPE,
                start_new_session=start_new_session,
@@ -362,18 +514,25 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
         try:
             stdout, stderr = process.communicate(None, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            cleanup_process_tree(process, start_new_session)
+            cleanup_process_tree(process,
+                                 start_new_session,
+                                 launch_token=launch_token)
             if is_windows():
                 exc.stdout, exc.stderr = process.communicate()
             else:
                 process.wait()
             raise
         except:
-            cleanup_process_tree(process, start_new_session)
+            cleanup_process_tree(process,
+                                 start_new_session,
+                                 launch_token=launch_token)
             raise
         retcode = process.poll()
         if start_new_session:
-            cleanup_process_tree(process, True, True)
+            cleanup_process_tree(process,
+                                 True,
+                                 True,
+                                 launch_token=launch_token if retcode else None)
         if retcode:
             raise subprocess.CalledProcessError(retcode,
                                                 process.args,
