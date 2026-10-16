@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 1-GPU Qwen-Image 2.1 BF16 baseline VisualGenArgs config.
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+# Production model id: qwen-image-2.1 / Qwen/Qwen-Image-2.1.
+# Generation manifest default_num_inference_steps: 30 when the source does not
+# provide an explicit denoising-step count; the example script accepts
+# VISUALGEN_NUM_INFERENCE_STEPS or NUM_INFERENCE_STEPS for reproducible E2E.
+# Checkpoint/download policy is recorded in run artifacts such as
+# validation/container_cache_preflight.json and baseline/baseline_manifest.yaml;
+# this YAML intentionally contains only VisualGenArgs-supported runtime fields.
+# The native transformer/scheduler run in TRTLLM; the image VAE currently uses
+# the declared Diffusers AutoencoderKLQwenImage21 fallback recorded in the model
+# enablement manifest and M8 performance evidence.
+# Production wiring coverage:
+# - examples/visual_gen/models/qwen_image_21.py
+# - docs/source/examples/visual_gen/qwen-image-2.1.md
+# - tests/unittest/visual_gen/test_qwen_image_21_production_artifacts.py
+# - tests/unittest/_torch/visual_gen/test_qwen_image_21_*.py
+# - tests/scripts/perf-sanity/visual_gen/qwen_image_21_blackwell.yaml
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false
+torch_compile_config:
+  enable: false

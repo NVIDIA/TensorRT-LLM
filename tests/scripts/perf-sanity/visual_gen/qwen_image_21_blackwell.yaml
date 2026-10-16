@@ -1,0 +1,39 @@
+# Production perf-sanity coverage for Qwen-Image 2.1 on Blackwell.
+# The TRTLLM candidate owns the scheduler, transformer/attention, and pipeline;
+# the image VAE fallback is the declared diffusers.AutoencoderKLQwenImage21
+# boundary covered by the enablement manifest and M8 performance evidence.
+metadata:
+  model_name: qwen-image-2.1
+  hf_model_id: Qwen/Qwen-Image-2.1
+  example_entrypoint: examples/visual_gen/models/qwen_image_21.py
+  supported_gpus:
+    - B200
+hardware:
+  gpus_per_node: 1
+environment:
+  server_env_var: TLLM_LOG_LEVEL=info
+  client_env_var: ""
+server_configs:
+  - name: qwen_image_21_bf16_vanilla_cfg1
+    model_path: Qwen/Qwen-Image-2.1
+    visual_gen_args_path: examples/visual_gen/configs/qwen-image-2.1-bf16-1gpu.yaml
+    server_config:
+      attention_config:
+        backend: VANILLA
+      parallel_config:
+        cfg_size: 1
+        ulysses_size: 1
+      cuda_graph_config:
+        enable: false
+      torch_compile_config:
+        enable: false
+    client_configs:
+      - name: 1024x1024_1f_40s_con1
+        prompt: A tiny astronaut hatching from an egg on the moon
+        backend: openai-images
+        generation_mode: t2i
+        size: 1024x1024
+        num_inference_steps: 40
+        seed: 42
+        max_concurrency: 1
+        num_prompts: 1

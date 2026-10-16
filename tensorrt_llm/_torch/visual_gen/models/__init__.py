@@ -40,6 +40,7 @@ from .hunyuan_video1_5 import HunyuanVideo15Pipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
 from .minimax_h3 import MiniMaxH3Pipeline
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
+from .qwen_image_21 import QwenImage21Pipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
 from .wan import WanDMDPipeline, WanImageToVideoPipeline, WanPipeline
 
@@ -50,6 +51,7 @@ __all__ = [
     "Flux2Pipeline",
     "GlmImagePipeline",
     "MiniMaxH3Pipeline",
+    "QwenImage21Pipeline",
     "QwenImageEditPlusPipeline",
     "QwenImageLayeredPipeline",
     "QwenImagePipeline",
