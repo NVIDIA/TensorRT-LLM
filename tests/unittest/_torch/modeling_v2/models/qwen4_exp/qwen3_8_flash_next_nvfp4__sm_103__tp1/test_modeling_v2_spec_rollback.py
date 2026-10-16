@@ -55,9 +55,10 @@ class _Batch:
     generation requests of `p` rows each, at `starts` cached tokens, in the
     recurrent `slots` given (contexts first). Generation request `s` reuses the
     block-table row of request `dup_of[s]` when given -- the CUDA-graph padding
-    dummy, repeated."""
+    dummy, repeated. With `shared_page` the live index and position planes are strided
+    views of one per-slot buffer, as an NVFP4 KV cache's manager serves them."""
 
-    def __init__(self, seed, ctx_lens, gen_starts, p, slots, dup_of=None):
+    def __init__(self, seed, ctx_lens, gen_starts, p, slots, dup_of=None, shared_page=False):
         g = torch.Generator().manual_seed(seed)
         self.ctx_lens = list(ctx_lens)
         self.num_contexts = len(ctx_lens)
@@ -115,8 +116,11 @@ class _Batch:
         # Live state the step mutates.
         self.ngram = self.ngram0.clone()
         self.conv = self.conv0.clone()
-        self.index = [t.clone() for t in self.index0]
-        self.position = self.position0.clone()
+        if shared_page:
+            self.index, self.position = _shared_planes(self.index0, self.position0)
+        else:
+            self.index = [t.clone() for t in self.index0]
+            self.position = self.position0.clone()
         self.accepted = torch.ones(self.num_contexts + self.n, dtype=torch.int32, device=DEV)
 
     def reset(self):
@@ -132,6 +136,26 @@ class _Batch:
         self.gen_accepted = list(gen_accepted)
         values = [1] * self.num_contexts + list(gen_accepted)
         self.accepted.copy_(torch.tensor(values, dtype=torch.int32))
+
+
+def _shared_planes(index0, position0):
+    """Live copies of the planes as views of one byte buffer per page: every layer's index-K
+    page, then the position page (what the QSA cache manager packs when an NVFP4 pool's data
+    and scale pages would otherwise absorb them)."""
+    index_bytes = TPB * INDEX_DIM * 2
+    page = torch.zeros(PAGES, LAYERS * index_bytes + TPB * 3 * 4, dtype=torch.uint8, device=DEV)
+    index = [
+        page[:, layer * index_bytes : (layer + 1) * index_bytes]
+        .view(torch.bfloat16)
+        .view(PAGES, TPB, 1, INDEX_DIM)
+        for layer in range(LAYERS)
+    ]
+    position = page[:, LAYERS * index_bytes :].view(torch.int32).view(PAGES, TPB, 3)
+    assert index[0].stride(0) == page.stride(0) // 2 and not index[0].is_contiguous()
+    for live, pre in zip(index, index0):
+        live.copy_(pre)
+    position.copy_(position0)
+    return index, position
 
 
 def _qsl(lengths):
@@ -255,6 +279,21 @@ def _slots(num):
 def test_commit_matches_the_accepted_prefix(case):
     ctx_lens, gen_starts, p, gen_accepted = CASES[case]
     b = _Batch(11, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
+    b.set_accepted(gen_accepted)
+    _verify_step(b, SpeculativeRollback())
+    _assert_state(b, _reference(b), case)
+
+
+@pytest.mark.parametrize("case", ["mixed", "decode_p8"])
+def test_commit_over_the_strided_planes_of_a_shared_page(case):
+    """The handler stages and restores the index and position planes by advanced indexing, so
+    planes that are strided views of one buffer (an NVFP4 KV cache's side planes) roll back
+    like contiguous ones, and the bytes of the other layers' pages in the same buffer stay as
+    the step wrote them."""
+    ctx_lens, gen_starts, p, gen_accepted = CASES[case]
+    b = _Batch(
+        13, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)), shared_page=True
+    )
     b.set_accepted(gen_accepted)
     _verify_step(b, SpeculativeRollback())
     _assert_state(b, _reference(b), case)

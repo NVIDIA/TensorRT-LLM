@@ -40,9 +40,12 @@ G = M._PoolGeometry(
     ngram_context_len=3,
     dtype=torch.bfloat16,
     kv_dtype=torch.bfloat16,
+    kv_width=256,
 )
 # The same pools under an fp8 KV cache: K/V are e4m3, every other plane keeps its type.
 G_FP8 = G._replace(kv_dtype=torch.float8_e4m3fn)
+# Under NVFP4 the K/V pool is uint8 e2m1 pairs, half a head wide.
+G_NVFP4 = G._replace(kv_dtype=torch.uint8, kv_width=128)
 SLOTS = 6
 HISTORY = 16
 
@@ -79,6 +82,9 @@ def test_valid_pools_pass() -> None:
         _t(9, 32, 1, 128),
         _t(9, 2, G.heads_kv, G.tokens_per_block, G.head_dim, dtype=torch.float8_e4m3fn),
     )
+    nvfp4_kv = _t(9, 2, G.heads_kv, G.tokens_per_block, 128, dtype=torch.uint8)
+    M.check_attention_pools(G_NVFP4, 3, _t(9, 32, 1, 128), nvfp4_kv)
+    M.check_kv_scale_planes(G_NVFP4, 3, nvfp4_kv, _t(9, 2, 2, 32, 16, dtype=torch.uint8))
     for dtype in (torch.float32, torch.bfloat16):
         M.check_recurrent_pools(G, _conv(), _ssm(dtype))
     M.check_ple_pools(
@@ -154,6 +160,60 @@ def test_attention_pools_reject_the_other_storage_dtype() -> None:
     # The index plane is a kernel contract, not KV storage: bf16 under either algorithm.
     with pytest.raises(AssertionError, match="QSA index plane"):
         M.check_attention_pools(G_FP8, 3, index.to(torch.float8_e4m3fn), fp8_kv)
+
+
+def test_attention_pools_reject_the_wrong_nvfp4_width() -> None:
+    """An NVFP4 pool is half a head wide: a full-width uint8 pool is the other storage."""
+    index = _t(9, 32, 1, 128)
+    with pytest.raises(AssertionError, match="paged K/V"):
+        M.check_attention_pools(
+            G_NVFP4, 3, index, _t(9, 2, G.heads_kv, G.tokens_per_block, 256, dtype=torch.uint8)
+        )
+    with pytest.raises(AssertionError, match="paged K/V"):
+        M.check_attention_pools(
+            G, 3, index, _t(9, 2, G.heads_kv, G.tokens_per_block, 128, dtype=torch.uint8)
+        )
+
+
+def _strided(shape, slot_stride, dtype=torch.uint8):
+    """A view of `shape` whose slot stride is `slot_stride`, as a manager's role planes of a
+    lifecycle slot holding several layers' pages are."""
+    pages = shape[0] * slot_stride
+    flat = torch.empty(pages, dtype=dtype, device="meta")
+    return flat.as_strided(shape, (slot_stride, *torch.empty(shape[1:], device="meta").stride()))
+
+
+def test_kv_scale_planes_must_hold_the_data_pools_pages_per_slot() -> None:
+    """The attention op addresses the scale pages with the data pages' block table, so a
+    scale pool with another number of pages per slot would be read at other slots' scales.
+    The engine's trunk holds 24 data role pages per slot (12 layers x K, V): 196608 bytes
+    against 24576 of scales."""
+    data = _strided((9, 2, G.heads_kv, G.tokens_per_block, 128), 24 * 8192)
+    scales = _strided((9, 2, G.heads_kv, G.tokens_per_block, 16), 24 * 1024)
+    M.check_kv_scale_planes(G_NVFP4, 3, data, scales)
+    # A side page coalesced into the data pool: 36 pages per slot against 24.
+    coalesced = _strided((9, 2, G.heads_kv, G.tokens_per_block, 128), 36 * 8192)
+    with pytest.raises(AssertionError, match="36 pages per slot.*24"):
+        M.check_kv_scale_planes(G_NVFP4, 3, coalesced, scales)
+    with pytest.raises(AssertionError, match="whole number"):
+        M.check_kv_scale_planes(G_NVFP4, 3, data, _strided((9, 2, 2, 32, 16), 24 * 1024 + 1))
+
+
+@pytest.mark.parametrize(
+    "scales, match",
+    [
+        (None, "did not allocate"),
+        (_t(9, 2, 2, 32, 16), "torch.uint8"),
+        (_t(9, 2, 2, 32, 8, dtype=torch.uint8), "NVFP4 block scales"),
+        (_t(9, 2, 4, 32, 16, dtype=torch.uint8), "NVFP4 block scales"),
+        (_t(9, 3, 2, 32, 16, dtype=torch.uint8), "same slots"),
+        (_t(8, 2, 2, 32, 16, dtype=torch.uint8), "same slots"),
+    ],
+)
+def test_kv_scale_planes_reject(scales, match) -> None:
+    data = _t(9, 2, G.heads_kv, G.tokens_per_block, 128, dtype=torch.uint8)
+    with pytest.raises(AssertionError, match=match):
+        M.check_kv_scale_planes(G_NVFP4, 3, data, scales)
 
 
 def test_recurrent_pools_reject_wrong_key_dim_order_and_dtype() -> None:

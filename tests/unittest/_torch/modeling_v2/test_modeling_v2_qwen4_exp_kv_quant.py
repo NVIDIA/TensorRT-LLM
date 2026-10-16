@@ -3,8 +3,9 @@
 """qwen4_exp derives its KV storage from the engine's `kv_cache_quant_algo`.
 
 `None` keeps the checkpoint's bf16 K/V with the attention op's `quant_mode` 0 and no KV
-scales; `FP8` stores K/V as e4m3 under `QM_FP8_KV_CACHE` with unit fp32 `[1]` scales; any
-other algorithm is refused at construction. The core is built on the meta device from the
+scales; `FP8` stores K/V as e4m3 under `QM_FP8_KV_CACHE` with unit fp32 `[1]` scales; `NVFP4`
+stores e2m1 pairs as uint8 half a head wide under `QM_NVFP4_KV_CACHE` with unit fp32 `[3]`
+scales; any other algorithm is refused at construction. The core is built on the meta device from the
 checkpoint's text and vision config values, so nothing here touches a device; the
 `post_load_weights` cases stub out everything that reads weight values.
 """
@@ -189,10 +190,27 @@ def test_fp8_kv_cache_stores_e4m3_under_the_fp8_quant_mode() -> None:
     assert geometry.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("algo", [QuantAlgo.NVFP4, QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
+def test_nvfp4_kv_cache_stores_e2m1_pairs_under_the_nvfp4_quant_mode() -> None:
+    core = _core(QuantAlgo.NVFP4)
+    assert core.quant_mode == M.QM_NVFP4_KV_CACHE
+    # An NVFP4 byte holds two values: the pool is uint8, half a head wide.
+    assert core.kv_pool_dtype == torch.uint8
+    geometry = core._pool_geometry(32)
+    assert geometry.kv_dtype == torch.uint8
+    assert geometry.kv_width == core.head_dim // 2
+    assert geometry.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("algo", [None, QuantAlgo.FP8])
+def test_unquantized_and_fp8_pools_are_a_full_head_wide(algo) -> None:
+    core = _core(algo)
+    assert core._pool_geometry(32).kv_width == core.head_dim
+
+
+@pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
 def test_other_kv_cache_algorithms_are_refused(algo) -> None:
-    """The QSA backend serves its sparse path over half, bf16 and fp8 pools and falls back to
-    dense for any other, so a pool of another storage must not be accepted."""
+    """The QSA backend serves its sparse path over half, bf16, fp8 and NVFP4 pools and falls
+    back to dense for any other, so a pool of another storage must not be accepted."""
     with pytest.raises(AssertionError, match="kv_cache_quant_algo"):
         _core(algo)
 
@@ -207,6 +225,18 @@ def test_fp8_kv_cache_scales_are_unit_fp32_single_elements(monkeypatch) -> None:
         assert scale is not None
         assert scale.dtype == torch.float32 and tuple(scale.shape) == (1,)
         assert torch.equal(scale, torch.ones(1))
+
+
+def test_nvfp4_kv_cache_scales_are_unit_fp32_triples(monkeypatch) -> None:
+    """The attention op reads the q, K and V second-level scales out of one fp32 `[3]` tensor,
+    and the QSA NVFP4 store and sparse GQA take the same tensor, so every writer and reader
+    applies the one value, 1.0 (the checkpoint has no KV scales)."""
+    core = _core(QuantAlgo.NVFP4)
+    _load(core, monkeypatch)
+    for scale in (core.kv_scale_orig_quant, core.kv_scale_quant_orig):
+        assert scale is not None
+        assert scale.dtype == torch.float32 and tuple(scale.shape) == (3,)
+        assert torch.equal(scale, torch.ones(3))
 
 
 def test_bf16_kv_cache_builds_no_scales(monkeypatch) -> None:

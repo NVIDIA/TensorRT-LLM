@@ -63,10 +63,10 @@ def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> 
         return
     if engine.torch_dtype != torch.bfloat16:
         raise NoTarget(f"the engine runs the model in {engine.torch_dtype}; the target is bf16")
-    if engine.kv_cache_quant_algo not in (None, QuantAlgo.FP8):
+    if engine.kv_cache_quant_algo not in (None, QuantAlgo.FP8, QuantAlgo.NVFP4):
         raise NoTarget(
             f"the engine resolved kv_cache_quant_algo {engine.kv_cache_quant_algo}; the target "
-            "stores K/V as the checkpoint's bf16 or as FP8"
+            "stores K/V as the checkpoint's bf16, as FP8 or as NVFP4"
         )
     if str(engine.moe_backend).upper() not in _MOE_BACKENDS:
         raise NoTarget(

@@ -31,7 +31,14 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    NoTarget,
+    engine_facts,
+    modeling_v2_resolve,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import (
+    routing as qwen4_exp_routing,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import (
@@ -41,6 +48,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -369,14 +377,16 @@ def _claimed(config, llm_args_kwargs=None):
     assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
 
 
-@pytest.mark.parametrize("algo", ["nvfp4"])
-def test_qwen4_exp_kv_cache_dtype_nvfp4_falls_back(algo):
-    config = _model_config(_qwen4_exp_config())
-    _declined(config, dict(kv_cache_config=KvCacheConfig(dtype=algo)), match="kv_cache_quant_algo")
+@pytest.mark.parametrize("algo", ["fp8", "nvfp4"])
+def test_qwen4_exp_quantized_kv_cache_dtypes_match(algo):
+    _claimed(_model_config(_qwen4_exp_config()), dict(kv_cache_config=KvCacheConfig(dtype=algo)))
 
 
-def test_qwen4_exp_kv_cache_dtype_fp8_matches():
-    _claimed(_model_config(_qwen4_exp_config()), dict(kv_cache_config=KvCacheConfig(dtype="fp8")))
+@pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
+def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
+    facts = engine_facts(_model_config(_qwen4_exp_config()), _llm_args("auto"))
+    with pytest.raises(NoTarget, match="kv_cache_quant_algo"):
+        qwen4_exp_routing._check_engine(None, facts._replace(kv_cache_quant_algo=algo))
 
 
 def test_qwen4_exp_piecewise_prefill_cuda_graph_falls_back():
