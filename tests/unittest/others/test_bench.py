@@ -204,7 +204,7 @@ def test_acceptance_length_weighted_by_iterations():
     assert stats.acceptance_length_percentiles.average == pytest.approx(stats.acceptance_length)
 
 
-def _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype):
+def _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype, dtype):
     """trtllm-bench model config with the NVIDIA-Nemotron-Nano-12B-v2 geometry."""
     return NemotronHybridConfig(
         name="nvidia/NVIDIA-Nemotron-Nano-12B-v2",
@@ -221,17 +221,18 @@ def _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype):
         mamba_num_heads=128,
         mamba_head_dim=80,
         n_groups=8,
+        dtype=dtype,
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
     )
 
 
-def test_calc_engine_setting_treats_unset_ssm_cache_dtype_as_auto(monkeypatch):
-    """An unset mamba_ssm_cache_dtype is sized like "auto"."""
+def test_calc_engine_setting_sizes_unset_ssm_cache_dtype_from_model_dtype(monkeypatch):
+    """An unset mamba_ssm_cache_dtype is sized like the model dtype."""
     monkeypatch.setattr(heuristics, "get_device_memory", lambda: 80.0)
 
-    def engine_setting(mamba_ssm_cache_dtype):
+    def engine_setting(mamba_ssm_cache_dtype, dtype):
         return heuristics.calc_engine_setting(
-            _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype),
+            _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype, dtype),
             QuantConfig(),
             tp_size=1,
             pp_size=1,
@@ -239,6 +240,9 @@ def test_calc_engine_setting_treats_unset_ssm_cache_dtype_as_auto(monkeypatch):
             target_output_len=128,
         )
 
-    auto_setting = engine_setting("auto")
-    assert engine_setting(None) == auto_setting
-    assert engine_setting("float32")[0] < auto_setting[0]
+    bf16_setting = engine_setting("bfloat16", "bfloat16")
+    fp32_setting = engine_setting("float32", "float32")
+    assert fp32_setting[0] < bf16_setting[0]
+    for unset in (None, "auto"):
+        assert engine_setting(unset, "bfloat16") == bf16_setting
+        assert engine_setting(unset, "float32") == fp32_setting
