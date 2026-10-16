@@ -133,20 +133,24 @@ streams. A stream change for an active cache intentionally synchronizes the
 new stream with the old one.
 
 `batchedLockPages()` takes an explicit destination per page and restores cold
-pages before locking, deduplicating pages shared by multiple owners. Resume,
-prefetch, and prefix rebasing preserve host-resident sparse history. A partial
-prefix copies from the source's actual tier into a private GPU page without
-moving a shared host source. Rollback records the original lock level, and
-`ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
-offload requires a separate transfer and GPU-slot ownership handoff.
+pages before locking. Sparse GPU pages belong to one request. Full prefix reuse
+copies a GPU source owned by another request, or retained host backing, into a
+private GPU destination. Resume and prefetch follow the same ownership rule;
+prefill rebasing retains the request's computed GPU slot and associates it with
+the immutable prefix's host-backing record. Suspension releases a clean GPU copy
+when retained host backing can serve the next resume. Dense pages retain shared locking.
+GPU capacity estimates count sparse prefixes separately for each request while
+preserving prompt sharing among beams of that request.
+A partial sparse prefix uses a storage pin as its copy source and receives one
+private writable GPU destination, without installing the source in its execution
+mapping. Rollback records the original lock level, and `ScratchSlotLock` remains
+GPU-only.
 
-Prefill admission, prefetch, and rebasing promote a host-locked sparse page into
-one shared GPU slot. Promotion waits for all owners' prior work and finished
-readers, updates every owner's page indices and metadata version, and releases
-the source host slot with a copy-completion fence. Allocation or copy failure
-preserves host ownership. Decoding owners retain deferred-offload work so that
-`Batch.publish()` retries demotion after the prefill owner enters decode,
-suspends, or closes, even without history growth.
+Complete sparse decode history binds to level-1 host storage. The request copies
+only blocks that lack host backing and releases its private GPU slots after its
+own reads and copies complete. Other requests' prefill work does not gate that
+handoff. A matching host copy remains reusable while its D2H is in flight; host
+consumers wait for payload readiness separately from GPU-slot reclamation.
 
 ## Ownership and lifetime
 
@@ -198,6 +202,13 @@ Eviction controller
 - `CommittedPage::numTokensInBlock` can be smaller than its block's token span.
   For attention it describes a reusable prefix; for SSM it is an exact state
   checkpoint. Do not assume every page covers its whole block.
+- A sparse `CommittedPage` can be a detached request-private GPU copy. Its weak
+  request owner prevents cross-request GPU locking; `SparsePageBacking` retains
+  a host storage pin for the immutable full prefix. Copies share that record
+  even before host storage exists, so either request can supply it and close
+  without losing backing needed by the others. The record references its tree
+  block weakly, and the canonical host page does not retain the record, avoiding
+  ownership cycles. A partial writable prefix never inherits full-block backing.
 - `Block::prev`, `Block::storage`, `CommittedPage::block`, and page manager
   pointers are observer/back-reference links with lifetime invariants, not
   ownership. Explicit unlinking and teardown order keep them valid.
