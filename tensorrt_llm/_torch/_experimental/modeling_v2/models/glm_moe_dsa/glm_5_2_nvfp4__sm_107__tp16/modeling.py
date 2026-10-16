@@ -176,25 +176,8 @@ class DecodeTarget:
         self.index_topk = config.index_topk
         layers = core.layers[: core.num_hidden_layers]
         for layer in layers:
-            mla = layer.self_attn
             assert layer.allreduce is not None and layer.next_layer_layernorm is not None
-            assert not mla.apply_rotary_emb and not mla.mapping.has_cp_helix()
-            assert tuple(mla.kv_a_proj_with_mqa.weight.shape) == (
-                FUSED_A_OUT_FEATURES,
-                config.hidden_size,
-            ) and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16, (
-                f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
-            )
-            assert (
-                getattr(mla.mqa, "has_fp8_kv_cache", False)
-                and mla.kv_cache_dtype != "fp8_ds_mla"
-                and mla.k_b_proj_trans.dtype == torch.bfloat16
-                and mla.v_b_proj.dtype == torch.bfloat16
-                and mla.v_b_proj.is_contiguous()
-                and mla.q_b_proj.weight.dtype == torch.bfloat16
-                and mla.o_proj.weight.dtype == torch.bfloat16
-            ), f"layer {layer.layer_idx}: unexpected MLA weights or KV cache layout"
-            assert layer.input_layernorm.nvfp4_scale is None, "kv_a_proj is not NVFP4"
+            self._check_attention(layer)
             if isinstance(layer.mlp, GatedMLP):
                 assert (
                     layer.mlp_tp_size == _TP
@@ -210,15 +193,7 @@ class DecodeTarget:
                     and layer.fusion_config.POST_MOE_FUSION
                     and layer.mapping.is_multi_node()
                 ), f"layer {layer.layer_idx}: unexpected MoE-layer configuration"
-                shared = layer.mlp.shared_experts
-                assert (
-                    shared is not None
-                    and layer.mlp.shared_output_scale is None
-                    and shared._is_plain_swiglu()
-                    and shared.swiglu_limit is None
-                    and shared.gate_up_proj.weight.dtype == torch.bfloat16
-                    and shared.down_proj.weight.dtype == torch.bfloat16
-                ), f"layer {layer.layer_idx}: the shared expert is not a plain BF16 SwiGLU MLP"
+                self._check_shared_expert(layer)
                 backend = getattr(layer.mlp.experts, "backend", layer.mlp.experts)
                 assert (
                     backend.has_nvfp4
@@ -228,56 +203,13 @@ class DecodeTarget:
                     and backend.w3_w1_weight.shape[-1] * 2 == config.hidden_size
                 ), f"layer {layer.layer_idx}: routed experts are not unpadded TRTLLM-Gen NVFP4"
 
-        # q_b with k_b absorbed and the q_a norm weight folded, per layer: for head h, rows
-        # [h * 576, h * 576 + 512) are k_b_trans[h] @ W_q_b[h, :qk_nope] and the next 64 rows
-        # W_q_b[h, qk_nope:], every column times gamma_q_a; FP64, rounded to BF16 once.
+        # The attention operands the kernels read, per layer index (_fold_attention_weights).
         self._q_b_absorbed = {}
-        for layer in layers:
-            mla = layer.self_attn
-            qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
-            w = mla.q_b_proj.weight.view(mla.num_heads_tp, qk_head_dim, mla.q_lora_rank).double()
-            nope = torch.bmm(mla.k_b_proj_trans.double(), w[:, : mla.qk_nope_head_dim])
-            absorbed = torch.cat([nope, w[:, mla.qk_nope_head_dim :]], 1)
-            absorbed = absorbed * mla.q_a_layernorm.weight.double()
-            self._q_b_absorbed[layer.layer_idx] = (
-                absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
-            )
-
-        # The indexer layers' fused-A weight: kv_a_proj_with_mqa's rows, then the indexer's wk and
-        # weights_proj rows (BF16), in one tensor whose first rows the built-in kv_a_proj and
-        # the indexer's projections then view, so nothing is stored twice. Their indexer Q
-        # comes from wq_b with the q_a norm weight folded into its columns.
         self._fused_a_indexer_weight = {}
         self._wq_b_folded = {}
-        for layer in layers:
-            mla = layer.self_attn
-            indexer = mla.mqa.indexer
-            if indexer is None:
-                continue
-            assert (
-                indexer.wk.weight.dtype == torch.bfloat16
-                and indexer.weights_proj.weight.dtype == torch.bfloat16
-            ), "the indexer's wk and weights_proj must be BF16 (TRTLLM_DSA_INDEXER_BF16=1)"
-            kv_a = mla.kv_a_proj_with_mqa.weight
-            wk = indexer.wk.weight
-            extended = torch.cat([kv_a, wk, indexer.weights_proj.weight]).contiguous()
-            assert extended.shape[0] == FUSED_A_INDEXER_OUT_FEATURES
-            mla.kv_a_proj_with_mqa.weight.data = extended[: kv_a.shape[0]]
-            indexer.wk.weight.data = extended[kv_a.shape[0] : kv_a.shape[0] + wk.shape[0]]
-            indexer.weights_proj.weight.data = extended[kv_a.shape[0] + wk.shape[0] :]
-            self._fused_a_indexer_weight[layer.layer_idx] = extended
-            self._wq_b_folded[layer.layer_idx] = (
-                indexer.wq_b.weight.double() * mla.q_a_layernorm.weight.double()
-            ).to(torch.bfloat16)
-        # What fused-A prefetches into L2 while it waits for its input: the weights of the
-        # attention GEMMs that follow it.
         self._l2_after_fused_a = {}
         for layer in layers:
-            mla = layer.self_attn
-            prefetch = [self._q_b_absorbed[layer.layer_idx], mla.v_b_proj, mla.o_proj.weight]
-            if layer.layer_idx in self._wq_b_folded:
-                prefetch.insert(1, self._wq_b_folded[layer.layer_idx])
-            self._l2_after_fused_a[layer.layer_idx] = [t for t in prefetch if t.is_contiguous()]
+            self._fold_attention_weights(layer)
         # The key-sharded top-k exchanges histograms over the TP group's MNNVL workspace
         # (created here, on every rank in the same order).
         self._hist_workspace = (
@@ -310,6 +242,85 @@ class DecodeTarget:
         self._quant_fork = torch.cuda.Event()
         self._quant_ready = torch.cuda.Event()
         self._fast_rows = {}
+
+    def _check_attention(self, layer) -> None:
+        """Assert the layer's MLA weights and KV cache are the layout the kernels take."""
+        mla = layer.self_attn
+        assert not mla.apply_rotary_emb and not mla.mapping.has_cp_helix()
+        assert tuple(mla.kv_a_proj_with_mqa.weight.shape) == (
+            FUSED_A_OUT_FEATURES,
+            self.hidden_size,
+        ) and mla.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16, (
+            f"layer {layer.layer_idx}: kv_a_proj_with_mqa is not the BF16 [q_a; kv_a] weight"
+        )
+        assert (
+            getattr(mla.mqa, "has_fp8_kv_cache", False)
+            and mla.kv_cache_dtype != "fp8_ds_mla"
+            and mla.k_b_proj_trans.dtype == torch.bfloat16
+            and mla.v_b_proj.dtype == torch.bfloat16
+            and mla.v_b_proj.is_contiguous()
+            and mla.q_b_proj.weight.dtype == torch.bfloat16
+            and mla.o_proj.weight.dtype == torch.bfloat16
+        ), f"layer {layer.layer_idx}: unexpected MLA weights or KV cache layout"
+        assert layer.input_layernorm.nvfp4_scale is None, "kv_a_proj is not NVFP4"
+
+    @staticmethod
+    def _check_shared_expert(layer) -> None:
+        """Assert the MoE layer's shared expert is the plain BF16 SwiGLU MLP the kernels run."""
+        shared = layer.mlp.shared_experts
+        assert (
+            shared is not None
+            and layer.mlp.shared_output_scale is None
+            and shared._is_plain_swiglu()
+            and shared.swiglu_limit is None
+            and shared.gate_up_proj.weight.dtype == torch.bfloat16
+            and shared.down_proj.weight.dtype == torch.bfloat16
+        ), f"layer {layer.layer_idx}: the shared expert is not a plain BF16 SwiGLU MLP"
+
+    def _fold_attention_weights(self, layer) -> None:
+        """The layer's attention operands in the forms the kernels read, by layer index."""
+        mla = layer.self_attn
+        index = layer.layer_idx
+        # q_b with k_b absorbed and the q_a norm weight folded: for head h, rows
+        # [h * 576, h * 576 + 512) are k_b_trans[h] @ W_q_b[h, :qk_nope] and the next 64 rows
+        # W_q_b[h, qk_nope:], every column times gamma_q_a; FP64, rounded to BF16 once.
+        qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
+        w = mla.q_b_proj.weight.view(mla.num_heads_tp, qk_head_dim, mla.q_lora_rank).double()
+        nope = torch.bmm(mla.k_b_proj_trans.double(), w[:, : mla.qk_nope_head_dim])
+        absorbed = torch.cat([nope, w[:, mla.qk_nope_head_dim :]], 1)
+        absorbed = absorbed * mla.q_a_layernorm.weight.double()
+        self._q_b_absorbed[index] = (
+            absorbed.to(torch.bfloat16).reshape(-1, mla.q_lora_rank).contiguous()
+        )
+
+        # A layer that runs the indexer gets its fused-A weight: kv_a_proj_with_mqa's rows,
+        # then the indexer's wk and weights_proj rows (BF16), in one tensor whose first rows
+        # the built-in kv_a_proj and the indexer's projections then view, so nothing is stored
+        # twice. Its indexer Q comes from wq_b with the q_a norm weight folded into its columns.
+        indexer = mla.mqa.indexer
+        if indexer is not None:
+            assert (
+                indexer.wk.weight.dtype == torch.bfloat16
+                and indexer.weights_proj.weight.dtype == torch.bfloat16
+            ), "the indexer's wk and weights_proj must be BF16 (TRTLLM_DSA_INDEXER_BF16=1)"
+            kv_a = mla.kv_a_proj_with_mqa.weight
+            wk = indexer.wk.weight
+            extended = torch.cat([kv_a, wk, indexer.weights_proj.weight]).contiguous()
+            assert extended.shape[0] == FUSED_A_INDEXER_OUT_FEATURES
+            mla.kv_a_proj_with_mqa.weight.data = extended[: kv_a.shape[0]]
+            indexer.wk.weight.data = extended[kv_a.shape[0] : kv_a.shape[0] + wk.shape[0]]
+            indexer.weights_proj.weight.data = extended[kv_a.shape[0] + wk.shape[0] :]
+            self._fused_a_indexer_weight[index] = extended
+            self._wq_b_folded[index] = (
+                indexer.wq_b.weight.double() * mla.q_a_layernorm.weight.double()
+            ).to(torch.bfloat16)
+
+        # What fused-A prefetches into L2 while it waits for its input: the weights of the
+        # attention GEMMs that follow it.
+        prefetch = [self._q_b_absorbed[index], mla.v_b_proj, mla.o_proj.weight]
+        if index in self._wq_b_folded:
+            prefetch.insert(1, self._wq_b_folded[index])
+        self._l2_after_fused_a[index] = [t for t in prefetch if t.is_contiguous()]
 
     def _fast(self, rows: int) -> bool:
         """Whether every kernel of the step serves this many rows (decided once per shape)."""
@@ -744,18 +755,9 @@ class DecodeTarget:
                 True,
             )
 
-        def shared() -> torch.Tensor:
-            expert = mlp.shared_experts
-            gate_up = expert.gate_up_proj.weight
-            h = low_m_gemm(hidden_states, gate_up, hidden_states.new_empty(rows, gate_up.shape[0]))
-            h = swiglu(h)
-            return low_m_gemm(
-                h, expert.down_proj.weight, hidden_states.new_empty(rows, self.hidden_size)
-            )
-
         (fc2_output, expert_weights, permuted_rows), shared_output = maybe_execute_in_parallel(
             routed,
-            shared,
+            lambda: self._shared_expert(mlp, hidden_states),
             mlp.event_dict[EventType.Main],
             mlp.event_dict[EventType.MoeShared],
             mlp.aux_stream,
@@ -772,6 +774,17 @@ class DecodeTarget:
             norm.variance_epsilon,
             comm_buffer,
             buffer_flags,
+        )
+
+    def _shared_expert(self, mlp, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's partial sum of the shared expert: two split-K GEMMs around SwiGLU."""
+        expert = mlp.shared_experts
+        rows = hidden_states.shape[0]
+        gate_up = expert.gate_up_proj.weight
+        h = low_m_gemm(hidden_states, gate_up, hidden_states.new_empty(rows, gate_up.shape[0]))
+        h = swiglu(h)
+        return low_m_gemm(
+            h, expert.down_proj.weight, hidden_states.new_empty(rows, self.hidden_size)
         )
 
     @staticmethod
