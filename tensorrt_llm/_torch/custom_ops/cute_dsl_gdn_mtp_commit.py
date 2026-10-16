@@ -816,3 +816,325 @@ def gdn_mtp_commit(
         _CACHE[key] = fn
 
     fn(*args, cutlass.Int32(grid), stream)
+
+
+@cute.kernel
+def _flush_kernel(
+    STATE_BASE: cutlass.Int64,
+    DESC_BASE: cutlass.Int64,
+    U_BASE: cutlass.Int64,
+    K_BASE: cutlass.Int64,
+    G_BASE: cutlass.Int64,
+    LEN_BASE: cutlass.Int64,
+    IDX_BASE: cutlass.Int64,
+    B: cutlass.Int32,
+    L: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    HV: cutlass.Constexpr,
+    CAP: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    INDIRECT: cutlass.Constexpr,
+    LAYER_STRIDE: cutlass.Constexpr,
+    SLOT_STRIDE: cutlass.Constexpr,
+):
+    item, layer, hv = cute.arch.block_idx()
+    tid, _, _ = cute.arch.thread_idx()
+    f32, bf16 = cutlass.Float32, cutlass.BFloat16
+    irow0, chunk = tid // NCH, tid % NCH
+    indices = cute.make_tensor(
+        cute.make_ptr(cutlass.Int64, IDX_BASE, AddressSpace.gmem, assumed_align=8),
+        cute.make_layout(B),
+    )
+    lengths = cute.make_tensor(
+        cute.make_ptr(cutlass.Int32, LEN_BASE, AddressSpace.gmem, assumed_align=16),
+        cute.make_layout(S),
+    )
+    slot = indices[item]
+    length = lengths[slot]
+    smem = utils.SmemAllocator()
+    acc_ptr = smem.allocate_tensor(bf16, cute.make_layout(DIM * PAD), byte_alignment=16)
+    u_ptr = smem.allocate_tensor(bf16, cute.make_layout(W * PAD), byte_alignment=16)
+    k_ptr = smem.allocate_tensor(bf16, cute.make_layout(W * PAD), byte_alignment=16)
+    sAcc = cute.make_tensor(
+        acc_ptr.iterator, cute.make_layout((NSTRIP, DIM, STRIPW), stride=(STRIPW, PAD, 1))
+    )
+    sAccVec = cute.make_tensor(
+        acc_ptr.iterator, cute.make_layout((DIM, NCH, VEC), stride=(PAD, VEC, 1))
+    )
+    sU = cute.make_tensor(u_ptr.iterator, cute.make_layout((DIM, W), stride=(1, PAD)))
+    sUVec = cute.make_tensor(u_ptr.iterator, cute.make_layout((W, NCH, VEC), stride=(PAD, VEC, 1)))
+    sK = cute.make_tensor(
+        k_ptr.iterator, cute.make_layout((NSTRIP, STRIPW, W), stride=(STRIPW, 1, PAD))
+    )
+    sKVec = cute.make_tensor(k_ptr.iterator, cute.make_layout((W, NCH, VEC), stride=(PAD, VEC, 1)))
+
+    if length > 0:
+        state_addr = (
+            STATE_BASE
+            + (cutlass.Int64(layer) * LAYER_STRIDE + cutlass.Int64(slot) * SLOT_STRIDE) * 2
+        )
+        if cutlass.const_expr(INDIRECT):
+            descriptors = cute.make_tensor(
+                cute.make_ptr(cutlass.Int64, DESC_BASE, AddressSpace.gmem, assumed_align=16),
+                cute.make_layout((L, 2), stride=(2, 1)),
+            )
+            state_addr = descriptors[layer, 0] + slot * descriptors[layer, 1] * 2
+        state_addr += cutlass.Int64(hv) * DIM * DIM * 2
+        state = cute.make_tensor(
+            cute.make_ptr(bf16, state_addr, AddressSpace.gmem, assumed_align=16),
+            cute.make_layout((DIM, NCH, VEC), stride=(DIM, VEC, 1)),
+        )
+        layer_slot = cutlass.Int64(layer) * S + slot
+        history_u = cute.make_tensor(
+            cute.make_ptr(
+                bf16, U_BASE + layer_slot * CAP * HV * DIM * 2, AddressSpace.gmem, assumed_align=16
+            ),
+            cute.make_layout((CAP, HV, NCH, VEC), stride=(HV * DIM, DIM, VEC, 1)),
+        )
+        history_k = cute.make_tensor(
+            cute.make_ptr(
+                bf16, K_BASE + layer_slot * CAP * H * DIM * 2, AddressSpace.gmem, assumed_align=16
+            ),
+            cute.make_layout((CAP, H, NCH, VEC), stride=(H * DIM, DIM, VEC, 1)),
+        )
+        history_G = cute.make_tensor(
+            cute.make_ptr(
+                f32, G_BASE + layer_slot * HV * CAP * 4, AddressSpace.gmem, assumed_align=16
+            ),
+            cute.make_layout((HV, CAP), stride=(CAP, 1)),
+        )
+        end_G = history_G[hv, length - 1]
+        saved = [cute.make_rmem_tensor((VEC,), bf16) for _ in range(NJ)]
+        for jj in cutlass.range_constexpr(NJ):
+            cute.autovec_copy(state[irow0 + MSTEP * jj, chunk, None], saved[jj])
+        for wb in cutlass.range_constexpr(W // MSTEP):
+            row = irow0 + wb * MSTEP
+            key = cute.make_rmem_tensor((VEC,), bf16)
+            update = cute.make_rmem_tensor((VEC,), bf16)
+            key.fill(0.0)
+            update.fill(0.0)
+            if row < length:
+                cute.autovec_copy(history_k[row, hv // (HV // H), chunk, None], key)
+                cute.autovec_copy(history_u[row, hv, chunk, None], update)
+                decay = cute.exp2((end_G - history_G[hv, row]) * LOG2E, approx=True, ftz=True)
+                update.store((update.load().to(f32) * decay).to(bf16))
+            cute.autovec_copy(key, sKVec[row, chunk, None])
+            cute.autovec_copy(update, sUVec[row, chunk, None])
+        scale = cute.exp2(end_G * LOG2E, approx=True, ftz=True)
+        cute.arch.barrier()
+
+        mma = warp.MmaF16BF16Op(bf16, f32, (16, 8, 16))
+        tiled_mma = cute.make_tiled_mma(
+            mma, cute.make_layout((MW, NW, 1)), permutation_mnk=(64, 32, 16)
+        )
+        thread_mma = tiled_mma.get_slice(tid)
+        load_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(True, 4), bf16)
+        copy_a = cute.make_tiled_copy_A(load_atom, tiled_mma)
+        copy_b = cute.make_tiled_copy_B(load_atom, tiled_mma)
+        thread_a, thread_b = copy_a.get_slice(tid), copy_b.get_slice(tid)
+        store_atom = cute.make_copy_atom(warp.StMatrix8x8x16bOp(False, 4), bf16)
+        store_c = cute.make_tiled_copy_C_atom(store_atom, tiled_mma)
+        store_copy = cute.make_tiled_copy_S(store_atom, store_c)
+        thread_store = store_copy.get_slice(tid)
+        fragment_a = tiled_mma.make_fragment_A(thread_mma.partition_A(sU))
+        cute.copy(copy_a, thread_a.partition_S(sU), thread_a.retile(fragment_a))
+        for strip in cutlass.range_constexpr(NSTRIP):
+            operand_b = sK[strip, None, None]
+            fragment_b = tiled_mma.make_fragment_B(thread_mma.partition_B(operand_b))
+            cute.copy(copy_b, thread_b.partition_S(operand_b), thread_b.retile(fragment_b))
+            acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C((DIM, STRIPW)), f32)
+            acc.fill(0.0)
+            for kb in cutlass.range_constexpr(cute.size(fragment_a, mode=[2])):
+                cute.gemm(
+                    tiled_mma, acc, fragment_a[None, None, kb], fragment_b[None, None, kb], acc
+                )
+            result_fragment = store_copy.retile(acc)
+            rounded = cute.make_rmem_tensor(result_fragment.shape, bf16)
+            rounded.store(result_fragment.load().to(bf16))
+            cute.copy(store_copy, rounded, thread_store.partition_D(sAcc[strip, None, None]))
+        cute.arch.barrier()
+        for jj in cutlass.range_constexpr(NJ):
+            row = irow0 + MSTEP * jj
+            accumulated = cute.make_rmem_tensor((VEC,), bf16)
+            cute.autovec_copy(sAccVec[row, chunk, None], accumulated)
+            saved[jj].store(
+                (saved[jj].load().to(f32) * scale + accumulated.load().to(f32)).to(bf16)
+            )
+            cute.autovec_copy(saved[jj], state[row, chunk, None])
+
+
+@cute.jit
+def _launch_flush(
+    STATE_BASE: cutlass.Int64,
+    DESC_BASE: cutlass.Int64,
+    U_BASE: cutlass.Int64,
+    K_BASE: cutlass.Int64,
+    G_BASE: cutlass.Int64,
+    LEN_BASE: cutlass.Int64,
+    IDX_BASE: cutlass.Int64,
+    B: cutlass.Int32,
+    L: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    HV: cutlass.Constexpr,
+    CAP: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    INDIRECT: cutlass.Constexpr,
+    LAYER_STRIDE: cutlass.Constexpr,
+    SLOT_STRIDE: cutlass.Constexpr,
+    stream,
+):
+    _flush_kernel(
+        STATE_BASE,
+        DESC_BASE,
+        U_BASE,
+        K_BASE,
+        G_BASE,
+        LEN_BASE,
+        IDX_BASE,
+        B,
+        L,
+        S,
+        H,
+        HV,
+        CAP,
+        W,
+        INDIRECT,
+        LAYER_STRIDE,
+        SLOT_STRIDE,
+    ).launch(
+        grid=[B, L, HV],
+        block=[NT, 1, 1],
+        stream=stream,
+        min_blocks_per_mp=CTAS_PER_SM,
+        preferred_smem_carveout=100,
+    )
+
+
+_FLUSH_CACHE = {}
+
+
+@torch.no_grad()
+def gdn_mtp_flush(
+    ssm_states: torch.Tensor,
+    history_u: torch.Tensor,
+    history_k: torch.Tensor,
+    history_G: torch.Tensor,
+    history_len: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    history_window: int,
+    ssm_state_descriptors: torch.Tensor | None = None,
+) -> None:
+    """Flush selected slots' accepted histories into every recurrent checkpoint.
+
+    U/K have shapes [L,S,CAP,HV,128] and [L,S,CAP,H,128]; G is FP32
+    [L,S,HV,CAP]. The BF16 checkpoint uses the normal commit's affine or
+    indirect V2 layout, with descriptor strides in BF16 elements.
+    Distinct int64 state_indices select slots with accepted lengths at most
+    history_window. Conv and rejected candidates are not accessed.
+    """
+    if state_indices.numel() == 0:
+        return
+    if history_u.ndim != 5 or history_k.ndim != 5:
+        raise ValueError("GDN flush K/U histories must have five dimensions")
+    layers, slots, capacity, value_heads, value_dim = history_u.shape
+    key_heads = history_k.shape[3]
+    if value_dim != DIM or history_k.shape != (layers, slots, capacity, key_heads, DIM):
+        raise ValueError("GDN flush histories have inconsistent dimensions")
+    if key_heads <= 0 or value_heads <= 0 or value_heads % key_heads != 0:
+        raise ValueError("value_heads must be divisible by key_heads")
+    if history_window not in (16, 32) or not 1 <= capacity - history_window <= 8:
+        raise ValueError("GDN flush requires history 16 or 32 plus 1..8 candidates")
+    if not 1 <= layers <= 128:
+        raise ValueError("GDN flush supports 1..128 layers")
+    if history_G.shape != (layers, slots, value_heads, capacity):
+        raise ValueError("GDN flush cumulative-G history has an unexpected shape")
+    if history_u.dtype != torch.bfloat16 or history_k.dtype != torch.bfloat16:
+        raise TypeError("GDN flush K/U histories must be BF16")
+    if history_G.dtype != torch.float32:
+        raise TypeError("GDN flush cumulative-G history must be FP32")
+    if history_len.shape != (slots,) or history_len.dtype != torch.int32:
+        raise ValueError("GDN flush history_len must be int32 with shape [slots]")
+    if state_indices.ndim != 1 or state_indices.dtype != torch.int64:
+        raise ValueError("GDN flush state_indices must be a rank-1 int64 tensor")
+    if ssm_states.dtype != torch.bfloat16:
+        raise TypeError("GDN flush recurrent checkpoints must be BF16")
+    if ssm_states.stride()[-3:] != (DIM * DIM, DIM, 1):
+        raise ValueError("GDN flush checkpoint inner dimensions must be dense")
+    indirect = ssm_state_descriptors is not None
+    if indirect:
+        if ssm_states.shape != (slots, value_heads, DIM, DIM):
+            raise ValueError("Indirect GDN state must be the first rank-4 layer view")
+        if (
+            ssm_state_descriptors.shape != (layers, 2)
+            or ssm_state_descriptors.dtype != torch.int64
+            or not ssm_state_descriptors.is_contiguous()
+        ):
+            raise ValueError("SSM descriptors must be contiguous int64 [layers,2]")
+        layer_stride = slot_stride = 0
+        descriptors = ssm_state_descriptors
+    else:
+        if ssm_states.shape != (slots, layers, value_heads, DIM, DIM):
+            raise ValueError("Affine GDN state must have shape [S,L,HV,128,128]")
+        layer_stride = ssm_states.stride(1) if layers > 1 else 0
+        slot_stride = ssm_states.stride(0)
+        descriptors = _dummy_descriptors(ssm_states.device)
+    tensors = (history_u, history_k, history_G, history_len, state_indices, descriptors)
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("GDN flush histories, indices, and descriptors must be contiguous")
+    if any(
+        not tensor.is_cuda or tensor.device != ssm_states.device
+        for tensor in (*tensors, ssm_states)
+    ):
+        raise ValueError("GDN flush tensors must be on the same CUDA device")
+    args = tuple(
+        cutlass.Int64(tensor.data_ptr())
+        for tensor in (
+            ssm_states,
+            descriptors,
+            history_u,
+            history_k,
+            history_G,
+            history_len,
+            state_indices,
+        )
+    )
+    from cuda.bindings import driver as _drv
+
+    key = (
+        ssm_states.device.index,
+        layers,
+        slots,
+        key_heads,
+        value_heads,
+        capacity,
+        history_window,
+        indirect,
+        layer_stride,
+        slot_stride,
+    )
+    with torch.cuda.device(ssm_states.device):
+        stream = _drv.CUstream(torch.cuda.current_stream().cuda_stream)
+        fn = _FLUSH_CACHE.get(key)
+        if fn is None:
+            fn = cute.compile(
+                _launch_flush,
+                *args,
+                cutlass.Int32(state_indices.numel()),
+                layers,
+                slots,
+                key_heads,
+                value_heads,
+                capacity,
+                history_window,
+                indirect,
+                layer_stride,
+                slot_stride,
+                stream,
+            )
+            _FLUSH_CACHE[key] = fn
+        fn(*args, cutlass.Int32(state_indices.numel()), stream)
+        # Every layer/head must finish reading the length before it is reset.
+        history_len.index_fill_(0, state_indices, 0)

@@ -4679,7 +4679,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend the request's KV cache with its whole KDA state in V2.
+        """Flush replay state before suspending the request's V2 pages.
 
         The drafts the last verify accepted are pending in the slot's KDA
         replay buffers, and so is the conv window, which the fused verify does
@@ -4688,6 +4688,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         pages are released, so the suspended state is self-contained in the
         recurrent state; the request's next generation step re-seeds the
         replay buffers of whichever slot it resumes in from them.
+
+        GDN replay commits Conv each round, but its accepted K/U/G history
+        must likewise be flushed into the recurrent checkpoint before the
+        slot can be released.
         """
         request_id = req.py_request_id
         kv_cache = self.kv_cache_map.get(request_id)
@@ -4709,6 +4713,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 self._commit_kda_pending_drafts(slot)
             del self._request_id_to_state_index[request_id]
             self._kda_replay_suspended.add(request_id)
+        elif (self.use_gdn_mtp_replay and slot >= 0 and kv_cache is not None
+              and kv_cache.is_active):
+            self._flush_gdn_mtp_replay(slot)
+            # A resumed request uses its restored V2 state with no history,
+            # even if another request has overwritten the old slot meanwhile.
+            del self._request_id_to_state_index[request_id]
         super().suspend_request(req)
 
     @contextmanager
@@ -4765,6 +4775,41 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
                 )
             self.prev_num_accepted_tokens[slot] = 0
+
+    def _flush_gdn_mtp_replay(self, slot: int) -> None:
+        """Flush accepted recurrent updates without advancing committed Conv.
+
+        The post-verification accepted-prefix commit must already be enqueued.
+        V2 page migration is ordered against the KV-cache stream.
+        """
+        from tensorrt_llm._torch.custom_ops.cute_dsl_gdn_mtp_commit import \
+            gdn_mtp_flush
+
+        if (not self.all_ssm_states
+                or (self._gdn_mtp_replay_state_descriptors is None
+                    and self._gdn_mtp_replay_state_view is None)
+                or self.old_x is None or self.old_B is None
+                or self.old_dt is None or self.prev_num_accepted_tokens is None
+                or self.replay_history_size is None):
+            raise RuntimeError(
+                "GDN flush requires V2 state views and replay buffers")
+        with self._on_kv_cache_stream():
+            slots = torch.full((1, ),
+                               slot,
+                               dtype=torch.long,
+                               device=self.prev_num_accepted_tokens.device)
+            state_view = self._gdn_mtp_replay_state_view
+            gdn_mtp_flush(
+                ssm_states=(state_view if state_view is not None else
+                            self.all_ssm_states[0]),
+                history_u=self.old_x,
+                history_k=self.old_B,
+                history_G=self.old_dt,
+                history_len=self.prev_num_accepted_tokens,
+                state_indices=slots,
+                history_window=self.replay_history_size,
+                ssm_state_descriptors=self._gdn_mtp_replay_state_descriptors,
+            )
 
     def _reset_gdn_mtp_replay_slots(
         self,
