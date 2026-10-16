@@ -10,12 +10,12 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.attention.kv_cache_conversion import (
+from tensorrt_llm._torch.attention.backends.mixed_precision_kv_view import (
     dequantize_nvfp4_kv,
     encode_high_precision_kv,
     quantize_nvfp4_kv,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -249,8 +249,9 @@ def test_nvfp4_conversion_kernels(dtype, width):
     )
     torch.testing.assert_close(packed, native_packed, rtol=0, atol=0)
     torch.testing.assert_close(scales.flatten(), native_scales, rtol=0, atol=0)
-    decoded = dequantize_nvfp4_kv(packed, scales, scale, dtype)
-    expected = _reference_dequant(packed, scales, scale).to(dtype)
+    compute_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    decoded = dequantize_nvfp4_kv(packed, scales, scale, compute_dtype)
+    expected = _reference_dequant(packed, scales, scale).to(compute_dtype)
     torch.testing.assert_close(decoded.float(), expected.float(), rtol=0, atol=0)
 
 

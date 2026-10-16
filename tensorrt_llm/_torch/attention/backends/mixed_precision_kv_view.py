@@ -15,9 +15,9 @@ import torch
 
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
-from ..kv_cache_conversion import dequantize_nvfp4_kv, encode_high_precision_kv, quantize_nvfp4_kv
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionBackend, AttentionMetadata
@@ -30,6 +30,46 @@ class _TokenLocations(NamedTuple):
     high: torch.Tensor
 
 
+def quantize_nvfp4_kv(
+    values: torch.Tensor, dequant_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the existing quantizer with linear, per-head NVFP4 block scales."""
+    packed, scales = torch.ops.trtllm.fp4_quantize(
+        values.contiguous(), dequant_scale.reciprocal(), NVFP4_SF_VEC_SIZE, False, False
+    )
+    return packed, scales.view(*values.shape[:-1], values.shape[-1] // NVFP4_SF_VEC_SIZE)
+
+
+def dequantize_nvfp4_kv(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    dequant_scale: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Restore dense rows directly to the Attention computation dtype."""
+    from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
+
+    width = packed.shape[-1] * 2
+    output = dequant_nvfp4_2d_triton(
+        packed.contiguous().view(torch.uint8).view(-1, width // 2),
+        scales.contiguous().view(torch.uint8).view(-1, width // NVFP4_SF_VEC_SIZE),
+        dequant_scale,
+        target_dtype=dtype,
+        sf_vec_size=NVFP4_SF_VEC_SIZE,
+    )
+    return output.view(*packed.shape[:-1], width)
+
+
+def encode_high_precision_kv(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Store the high copy without passing it through NVFP4."""
+    if dtype == torch.float8_e4m3fn and values.dtype != dtype:
+        values, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            values.contiguous(), torch.ones(1, dtype=torch.float32, device=values.device)
+        )
+        return values
+    return values.to(dtype)
+
+
 class MixedPrecisionKVView:
     """Present temporary paged KV to Attention and return new writes to its pools."""
 
@@ -39,8 +79,6 @@ class MixedPrecisionKVView:
         attention: "AttentionBackend",
         metadata: "AttentionMetadata",
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         *,
         history_dequant_scale: torch.Tensor | None = None,
         max_page_size: int | None = None,
@@ -55,19 +93,8 @@ class MixedPrecisionKVView:
             raise NotImplementedError(
                 "Mixed-precision paged-cache staging requires eager execution"
             )
-        if metadata.is_cross or manager.kv_factor != 2:
-            raise NotImplementedError("Mixed-precision staging requires single-beam dense self K/V")
         if q.dtype != manager.compute_dtype:
             raise ValueError("Attention input dtype differs from its reserved mixed-precision view")
-        fused_qkv = (
-            attention.support_fused_qkv()
-            and k is None
-            and v is None
-            and q.shape[-1]
-            == (attention.num_heads + 2 * attention.num_kv_heads) * attention.head_dim
-        )
-        if not (fused_qkv or (k is not None and v is not None)):
-            raise ValueError("Mixed-precision staging requires new K/V inputs")
         return cls(metadata, layer_idx, q.dtype, history_dequant_scale, max_page_size)
 
     def __init__(

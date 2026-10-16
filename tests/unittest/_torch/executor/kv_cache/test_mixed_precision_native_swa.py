@@ -3,6 +3,7 @@
 """Local GPU QA for the unchanged native full-history + SWA reuse contract."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -13,7 +14,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     MixedPrecisionKVCacheManager,
     Role,
 )
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import binding_to_torch_dtype, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -73,6 +74,67 @@ def test_extra_pool_uses_existing_dtype_layout(manager):
         assert manager.impl.get_page_stride(high.layer_id, buffer.role) >= expected
     has_scales = any(buffer.role == Role.KEY_BLOCK_SCALE for buffer in high.buffers)
     assert has_scales == (manager.high_dtype == DataType.NVFP4)
+
+
+@pytest.mark.parametrize("dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
+def test_native_swa_and_shared_kv_keep_original_storage(dtype):
+    """Only the ordinary full-history layer receives low/high KV pools."""
+    config = KvCacheConfig(
+        max_tokens=65536,
+        enable_block_reuse=True,
+        max_attention_window=[1024, 513, 1024, 1024],
+        pool_ratio=[0.5, 0.5],
+    )
+    args = dict(
+        num_layers=4,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=128,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=dtype,
+        # The last layer reads full Attention KV from layer 2, as in Gemma4.
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=4,
+            num_kv_shared_layers=1,
+            layer_types=["full_attention", "sliding_attention", "full_attention", "full_attention"],
+        ),
+    )
+    native = KVCacheManagerV2(config, CacheType.SELF, **args)
+    mixed = None
+    try:
+        mixed = MixedPrecisionKVCacheManager(
+            config,
+            CacheType.SELF,
+            compute_dtype=torch.bfloat16,
+            high_low_pool_ratio=1,
+            first_n=128,
+            last_n=128,
+            **args,
+        )
+        assert mixed.dtype == native.dtype == dtype
+        assert mixed.high_layers == {0: 4}
+        assert mixed.get_buffers(0).dtype == torch.uint8
+        assert mixed.get_buffers(0).shape[-1] == 32
+        assert mixed.get_cache_bytes_per_token() == sum(
+            mixed.get_layer_bytes_per_token(layer, Role.ALL) for layer in range(4)
+        )
+        for layer in (1, 2, 3):
+            original = native.kv_cache_manager_py_config.layers[layer]
+            retained = mixed.kv_cache_manager_py_config.layers[layer]
+            assert retained.sliding_window_size == original.sliding_window_size
+            assert retained.reuse_policy == original.reuse_policy
+            assert [(b.role, b.size) for b in retained.buffers] == [
+                (b.role, b.size) for b in original.buffers
+            ]
+            buffer = mixed.get_buffers(layer)
+            assert buffer.dtype == binding_to_torch_dtype(dtype)
+            assert buffer.shape[1:] == native.get_buffers(layer).shape[1:]
+    finally:
+        if mixed is not None:
+            mixed.shutdown()
+        native.shutdown()
 
 
 @pytest.mark.parametrize("manager", ["per_request"], indirect=True)

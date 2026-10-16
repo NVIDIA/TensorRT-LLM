@@ -2169,8 +2169,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self,
             metadata,
             q,
-            k,
-            v,
             max_page_size=64,
             history_dequant_scale=(forward_args.kv_scale_quant_orig
                                    if forward_args.kv_scale_quant_orig

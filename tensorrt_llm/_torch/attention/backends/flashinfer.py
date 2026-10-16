@@ -2880,8 +2880,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self,
             metadata,
             q,
-            k,
-            v,
             history_dequant_scale=forward_args.kv_scale_quant_orig)
         if staged is not None:
             metadata = metadata.with_paged_kv_view(staged)
