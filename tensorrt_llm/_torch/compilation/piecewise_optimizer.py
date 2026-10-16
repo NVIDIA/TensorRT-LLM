@@ -14,7 +14,6 @@ from torch.fx import GraphModule, Interpreter
 from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
-from tensorrt_llm.logger import logger
 
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
@@ -344,11 +343,5 @@ def piecewise_optimizer(
     )
 
     interpreter.run(*example_inputs)
-
-    if max_num_streams > 1:
-        logger.info(
-            f"piecewise multi-stream schedule: {len(interpreter.runners)} pieces, "
-            f"max_num_streams={max_num_streams}, events={interpreter.num_events}, "
-            f"dump={os.environ.get('TLLM_MULTI_STREAM_DUMP') or 'off'}")
 
     return gm, interpreter.num_events, interpreter.runners
