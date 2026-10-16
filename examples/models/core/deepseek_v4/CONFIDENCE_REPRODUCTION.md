@@ -1,97 +1,162 @@
-# Confidence calibration and a fair static/enabled comparison
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 
-These commands have completed a bounded full-model GPU integration for physical
-K3 and global BS512 (G64 across eight attention-DP ranks) in an earlier, separately
-recorded Python/native environment: whole-step cost profiling/export, genuine
-paired calibration collection/fitting, and independent static and enabled-compact
-generation with output and natural-shutdown checks. A newer source composition
-has separately passed native/API compatibility and a same-source, same-node
-static/enabled-compact comparison at physical K3, global BS512 and G64 across
-eight attention-DP ranks, with 512 requests of 32 output tokens. Both independent
-model lifetimes completed source/native/artifact/input/output/routing, public
-comparison and natural-shutdown checks. The original calibration and costs were
-reused; exact generated token sequences were not equal. These are distinct
-evidence scopes, not fresh current-source cost/calibration measurements, an
-exact-source native rebuild, task accuracy, sustained-serving performance or
-global clean-install qualification. Original source/native provenance is
-preserved. The tools take explicit model, input, K, batch-size and output
-arguments, with no private harness, cluster, account or node requirement.
+# DSpark confidence scheduling and reproduction
 
-The two routes are distinct:
+Use this guide to run confidence scheduling with existing artifacts or generate
+your own. Ordinary inference and benchmarking use the normal TensorRT LLM APIs,
+runtime YAML and CLI; no reproduction wrapper or particular cluster is required.
 
-- Reuse a structurally valid supplied calibration/cost table, preserving their
-  original measurements and provenance. Once confidence is explicitly enabled,
-  reuse is the default and warnings explain that predictions may be stale.
-- Generate new calibration and measured whole-step costs using the offline
-  commands below. Optional freshness/economic validation is a separate choice;
-  it is not required before reusing valid artifacts.
+Confidence scheduling is experimental and **off by default**. When enabled, it
+still proposes the full draft block and uses normal target verification and
+sampling; it may choose a smaller measured verification layout.
 
-Confidence scheduling remains off by default. Target verification, sampling,
-KV/graph contracts, kernel guards and fatal errors are not relaxed by reuse.
-Poor cost/calibration estimates can choose a slower verifier shape; reuse is
-not a performance guarantee.
+## 1. Choose your inputs and runtime
 
-## 1. Build or reuse an ordinary compatible runtime
+Start from the [DeepSeek-V4 Quick Start](README.md#quick-start) and the ordinary
+[installation/build instructions](../../../../docs/source/installation/build-from-source.md).
+Use a compatible installed runtime containing these tools; an unrelated Python
+change does not by itself require rebuilding native TensorRT LLM.
 
-Start from a complete public checkout containing these tools, the configurable
-cost-profile adapter, and the default-reuse consumer. Use the repository's
-[source-build instructions](../../../../docs/source/installation/build-from-source.md)
-or its supported precompiled/editable installation route for compatible native
-artifacts. Unrelated Python changes do not force native recompilation. Preserve
-the original native provenance; the tools separately record loaded Python bytes.
+You need a supported embedded DSpark checkpoint with **trained confidence-head
+weights**, enough GPU/KV capacity, and a workload prepared with its tokenizer.
+Temperature calibration does not train or replace those weights.
 
-Use your cluster's ordinary allocation/container/MPI launch procedure and model
-mounts. Keep the intended precision, attention backend, fused/prenorm paths,
-parallelism and original startup/model/shutdown budget. Do not change numerical
-configuration or disable failed hardware/operator checks to make a command run.
-The code neither repairs machines nor changes cluster/security policy.
+Choose these inputs once and use them consistently:
 
-Optional developer constructor regression checks do not construct a model.
-Run them in a matching installed native runtime; some imports still require an
-available driver. They are not a required colleague pre-run gate or a
-driverless/native GPU qualification:
+| Input | Meaning |
+| --- | --- |
+| Physical `K` | `speculative_config.max_draft_len` in YAML; `--physical-k` in offline/helper commands. It must match the checkpoint/runtime. Dynamic compact scheduling needs K > 1; K1 resolves to static. |
+| Global `BS` (offline/helper) | `--batch-size` selects the helper's fixed request cohort. For that cohort with attention DP, rank-local `G = BS / attention-DP size`; otherwise G is the global batch. |
+| Ordinary benchmark load | `--max_batch_size` is rank-local with attention DP; `--concurrency` is global concurrent load and `--num_requests` is total submitted work. These are separate controls, not aliases for helper BS. |
+| Graph ladder | `cuda_graph_config.batch_sizes` contains rank-local G values covered by the physical-K-specific cost table. Runtime request/token/KV limits must accommodate them. |
+| Model and data | Your checkpoint and workload paths; keep precision, backend, sampling and output work fixed for comparisons. |
+| Artifacts and outputs | A supplied or self-generated cost table; optional temperature JSON; fresh writable output paths. Inputs can remain read-only. |
 
-```bash
-python -m pytest -q tests/unittest/executor/test_dspark_reproduction_factory.py
+The interfaces accept the previously used BS128/256/512/1024/1536/2048 grid and
+smaller points when supported by the actual graph/K/cost/capacity configuration.
+This is not a validation claim for every point. The example below uses K3 and
+G64 on eight attention-DP ranks; adjust the declared inputs for your workload.
+Other route restrictions are in the [reference](CONFIDENCE_VALIDATION.md#supported-routes-and-configuration).
+
+## 2. Reuse artifacts and enable confidence in normal YAML
+
+Start with your working DeepSeek-V4 runtime YAML. Keep its model, topology,
+precision, KV and backend settings. For this example, use padded graphs and
+replace its speculative configuration with:
+
+```yaml
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [64]
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 3
+  enable_confidence_scheduling: true
+  confidence_sps_table_path: /path/to/artifacts/costs.json
 ```
 
-This exercises the actual public argument validator and the existing internal
-factory seam without constructing a model. Internal `executor_cls` is not a
-public LLM argument and remains rejected. Passing this check is not a native
-GPU/operator/model result.
+Save this as `dynamic.yaml`. For `static.yaml`, keep the same numerical/runtime
+settings but set `enable_confidence_scheduling: false` and **omit all
+confidence-only artifact, freshness, mixed-evidence and fused-scheduler fields**.
+Do not replace the checkpoint's full model configuration with this YAML fragment.
 
-Prepare tokenized JSONL inputs: each line has a nonempty integer
-`prompt_token_ids` list. Model weights, inputs and raw observations stay in
-access-controlled storage; they are not published with the tooling. The selected
-first `--batch-size` rows form one fixed request cohort. Each request generates
-the same requested output length with greedy sampling and EOS ignored. The
-original sequence-length limit must contain prompt plus output.
+The cost table is required for dynamic scheduling. It must contain finite
+positive native/compact measurements compatible with physical K, captured graph
+sizes and layouts. Default reuse allows a configured subset of a measured graph
+ladder; any priced drain tail must still be measured and captured. Missing
+coverage is an error, not a silently timed static result.
 
-Use a YAML accepted by `TorchLlmArgs`: matching physical K, intended topology,
-enough rank-local request/token/KV capacity and padded decode graphs. Aggregate
-PP=1/CP=1 generation is supported by this initial driver. Guided decoding,
-LoRA, custom logits processing, disaggregated transfer, in-graph sampling and
-resource-governor control are not part of this bounded fixed-cohort workflow.
-No alternative attention backend is selected by the tool.
+Temperature calibration is optional. Omit `confidence_sts_path` to use raw
+confidence probabilities, equivalent to unit temperatures. To reuse a fitted
+vector, add `confidence_sts_path: /path/to/artifacts/calibration.json` under
+`speculative_config`.
 
-## 2. Reuse supplied artifacts, if that is your choice
+By default, structurally valid artifacts can be reused across source revisions
+and nodes with warnings that predictions may be stale. Their original provenance
+is retained; different kernels or hardware can change prediction quality and
+performance. New profiling is your choice, not a prerequisite to every run.
+Strict freshness/workload-admission validation is an
+[optional advanced mode](CONFIDENCE_VALIDATION.md#optional-strict-freshness-and-admission).
 
-Set `--cost-table` and optionally `--calibration` for the dynamic command in
-step 5. No new cost profiling, forged live fingerprint or admission receipt is
-needed first. The normal loader still validates table structure, physical K,
-legal captured graph cells, finite costs and calibration geometry. Missing or
-incompatible cost coverage cannot be reported as dynamic throughput. Default
-reuse permits a configured subset of the originally measured graph ladder while
-validating the complete original table and fingerprint. Any drain-guard tail
-must remain both measured and captured.
+## 3. Run ordinary inference or benchmarks
 
-`validate_confidence_artifact_freshness` stays at its public default `False`.
-Users who choose `True` must supply the corresponding genuine destination
-fingerprint and workload-admission artifacts; this driver does not fabricate
-them. Original cost/calibration hashes are recorded separately from the runtime
-actually used for a new comparison.
+Pass `dynamic.yaml` through the normal `LLM` configuration or
+`trtllm-serve --config` interface described in [Serving](README.md#serving).
+No calibration-collection/comparison helper is required for ordinary use.
 
-## 3. Generate calibration from real native full-K proposals
+For benchmarking, follow [DeepSeek-V4 Benchmarking](README.md#benchmarking) and
+the [benchmarking guide](../../../../docs/source/developer-guide/perf-benchmarking.md#preparing-a-dataset)
+to prepare a standard benchmark dataset. It uses `task_id`, `input_ids` or
+`prompt`, and `output_tokens` on each JSONL line.
+
+For an explicit greedy, fixed-output comparison, save this as `sampler.yaml`:
+
+```yaml
+temperature: 0.0
+top_k: 1
+ignore_eos: true
+```
+
+Run each arm in its own process/model lifetime, changing only the configuration
+and report paths:
+
+```bash
+trtllm-bench --model <MODEL_ID> --model_path /path/to/checkpoint throughput \
+  --tp 8 --ep 8 --dataset /path/to/benchmark.jsonl \
+  --max_batch_size 64 --max_num_tokens 8192 --max_seq_len 4096 \
+  --concurrency 512 --num_requests 512 --warmup 512 \
+  --sampler_options /path/to/sampler.yaml --config /path/to/static.yaml \
+  --report_json /path/to/results/static.json
+
+trtllm-bench --model <MODEL_ID> --model_path /path/to/checkpoint throughput \
+  --tp 8 --ep 8 --dataset /path/to/benchmark.jsonl \
+  --max_batch_size 64 --max_num_tokens 8192 --max_seq_len 4096 \
+  --concurrency 512 --num_requests 512 --warmup 512 \
+  --sampler_options /path/to/sampler.yaml --config /path/to/dynamic.yaml \
+  --report_json /path/to/results/dynamic.json
+```
+
+Both YAML files must include your intended `enable_attention_dp: true` and
+matching topology for this example. With attention DP, `--max_batch_size` is
+rank-local whereas `--concurrency` is global. Match the dataset output lengths
+and ensure prompt plus output fits the sequence limit. Explicit CLI settings
+override YAML values. Use your site's normal allocation/container procedure;
+do not launch multiple competing copies on the same GPUs.
+
+This ordinary confidence benchmark recipe has been checked against the public
+source interfaces, **not GPU-validated as a new recipe**. Standard benchmark
+reports use their own load/timing protocol and do not establish compact routing
+by themselves. For a controlled routing-checked comparison, use the optional
+helper below. Neither protocol is interchangeable with historical plateau TPS.
+
+## 4. Generate new artifacts when useful
+
+You can regenerate either artifact independently. Confidence scheduling does not
+require temperature fitting before cost profiling or benchmarking.
+
+### Whole-step costs
+
+Follow [Offline cost profiling](COST_PROFILING.md) and
+[Cost export](COST_EXPORT.md). Declare native V0 and legal compact cells at the
+chosen K and rank-local graph ladder, enable `enable_iter_perf_stats: true` in
+the profiling YAML, and collect with `--cost-scope whole-step`. Reduce the
+completed all-rank observations, then export the schema-v2 runtime table with
+`dspark_cost_export.py`.
+
+Use directly measured complete-loop costs; graph-replay medians are diagnostics,
+not serving prices. The current whole-step exporter supports attention-DP fanout
+or a single rank, not multi-rank attention-DP-off export. The linked guides give
+the grid, sample floors, output files and exact commands.
+
+### Optional temperature calibration
+
+The paired collector uses a separate tokenized input format:
+each JSONL line has a nonempty integer `prompt_token_ids` list. Set the shell
+variables below to the inputs chosen in step 1; `RUNTIME_YAML` is the matching
+runtime YAML with overlap scheduling enabled. `SOURCE_ROOT` is your checkout,
+`RUN_ROOT` is private writable storage, and the timeout reserves the full
+startup/model/shutdown budget.
 
 ```bash
 mpirun -n "$RANKS" python tensorrt_llm/tools/dspark_reproduction.py run \
@@ -105,56 +170,19 @@ python tensorrt_llm/tools/dspark_calibration.py \
   --physical-k "$K" --output "$RUN_ROOT/calibration.json"
 ```
 
-The current collector supports the original overlap scheduler input seam;
-`disable_overlap_scheduler: False` must already be your intended configuration.
-It runs native full-K verification and evaluates the existing confidence head.
-There is no confidence-selected shortening and no loaded cost table. Real
-warm-up cohorts may contribute calibration observations, but never benchmark
-timing. The fitter's default sample floor is 1000 genuine paired rows; collect
-enough requests/output tokens rather than weakening that floor for real use.
+The collector runs native full-K verification and joins real confidence logits
+to the later accepted-prefix labels for the same proposal and request lifetime.
+The fitter requires at least 1000 genuine paired rows by default and produces
+per-position temperatures. Collection/fitting is not head training or task
+accuracy evaluation. See the [pairing and output contract](CONFIDENCE_VALIDATION.md#paired-collection-and-developer-checks).
 
-Pairing is not by arrival order. Step n's confidence and newly proposed tokens
-describe the proposal verified later, usually at n+1. The adapter binds that
-later forward to the exact original input `SampleState.device` object. It
-snapshots verification-input proposals before persistent buffers can be reused,
-and captures the producing confidence row and draft stamp before the normal
-sampler records its existing event. It reads those host copies only after the
-original sampler's normal synchronization/update. Request incarnation, source
-proposal content, worker-local confidence row, sampler slot and full-K extent
-must agree. Prefill placeholders, retired requests and unscored bootstrap rows
-are counted, not fitted as genuine observations. Wrong-step/stale/censored
-pairs fail; the current live confidence is never substituted.
+## 5. Optional controlled comparison and routing checks
 
-Expected files are `rank-N-pairs.pt`, `rank-N-run.json` and the fitted JSON with
-`sts_temperatures`/`temperatures`. Each shard has logits `[rows,K]`, cumulative
-accepted-prefix labels, exact join metadata and actual source/runtime identity.
-These observations do not establish downstream task accuracy by themselves.
-
-## 4. Generate directly measured costs
-
-Follow [Offline cost profiling](COST_PROFILING.md) and
-[Whole-step export](COST_EXPORT.md). Declare native V0 plus legal compact cells
-for your configurable physical K and resolved rank-local graph tiers. Use the
-`--cost-scope whole-step` producer and export its actual completed measurements
-to the schema-v2 table consumed by `confidence_sps_table_path`.
-
-Do not substitute graph-only timing, sum overlapping components or invent
-serving prices from calibration samples. The whole-step producer reuses the
-original executor-loop timing boundary; profile-only forced cells cannot serve
-ordinary traffic or prove automatic-policy gains. Keep measured confidence-head
-and policy cost boundaries explicit. This candidate benchmark measures actual
-online policy in its E2E time; it does not manufacture a separate overhead or
-economic-admission receipt from that result.
-
-For attention DP on, global BS determines rank-local G through the attention-DP
-fanout. The current schema-v2 cost exporter supports this fanout or one rank;
-multi-rank attention-DP-off costs need their separate schema decision. This
-restriction belongs to this cost export, not to generic DSpark support.
-
-## 5. Benchmark ordinary static and genuinely enabled execution
-
-Each command is an independent model lifetime. Use the same original inputs,
-physical K, runtime YAML, output work, warm-up count and full feasible budget:
+`dspark_reproduction.py` is for paired collection and controlled fixed-cohort
+experiments. It is not a required serving launcher. Its `compare` command
+consumes its **own** `rank-N-run.json` records, not `trtllm-bench` reports.
+To use it, run its own independent static and dynamic lifetimes with the same
+inputs, configuration, output work, warm-up count and budget:
 
 ```bash
 mpirun -n "$RANKS" python tensorrt_llm/tools/dspark_reproduction.py run \
@@ -167,7 +195,7 @@ mpirun -n "$RANKS" python tensorrt_llm/tools/dspark_reproduction.py run \
   --mode dynamic --model "$MODEL_DIR" --config "$RUNTIME_YAML" \
   --inputs "$INPUTS_JSONL" --source-root "$SOURCE_ROOT" \
   --physical-k "$K" --batch-size "$BS" --output-tokens "$OUTPUT_TOKENS" \
-  --cost-table "$COST_TABLE_JSON" --calibration "$CALIBRATION_JSON" \
+  --cost-table "$COST_TABLE_JSON" \
   --timeout "$FULL_BUDGET_SECONDS" --output "$RUN_ROOT/dynamic"
 
 python tensorrt_llm/tools/dspark_reproduction.py compare \
@@ -175,27 +203,16 @@ python tensorrt_llm/tools/dspark_reproduction.py compare \
   --output "$RUN_ROOT/comparison.json"
 ```
 
-This uses the normal worker/request/executor/automatic confidence policy, not
-the prescribed profile-only engine. Benchmark arms make no calibration copies.
-Actual completed decode graph keys are recorded. Warm-up routing is reset before
-the retained cohort; requested flags alone do not prove enabled execution.
-The comparison requires both resolved config and runtime enabled status, actual
-compact replay in the retained dynamic cohort, unchanged numerical runtime/input
-work, completed outputs and natural shutdown. An enabled policy that only chose
-native is a valid execution, but this consumer refuses to label it a reproduced
-compact/dynamic gain.
+Calibration is deliberately omitted above; optionally add
+`--calibration "$CALIBRATION_JSON"` to the dynamic command. The helper records
+resolved/runtime enablement, native/compact replay, source/artifact identity,
+outputs and shutdown. An enabled policy may legally choose native throughout;
+`compare` refuses to call that a reproduced compact gain.
 
-Reported TPS is global fixed-cohort enqueue-to-final-response throughput,
-including prefill and final drain. It is not measured TPOT, sustained-refill
-throughput, isolated verifier time or the historical plateau measurement.
-No confidence interval is fabricated. Repeat in balanced order with fresh
-lifetimes if you need a stable estimate; feed equal numbers of static and dynamic
-records to `compare`. Exact output-token equality is reported separately and is
-not silently substituted for the model's original task-accuracy tests.
+Its TPS covers fixed-cohort enqueue through final response, including prefill
+and drain. Use balanced fresh-lifetime repetitions for a stable estimate and
+equal static/dynamic record counts for `compare`. Token equality is reported
+diagnostically, not substituted for task-accuracy tests.
 
-All previously tried batch sizes 128/256/512/1024/1536/2048 and source-backed
-smaller points use the same CLI, with compatible configured graph/K/cost coverage.
-K is an input, not fixed to K3. K1 native calibration/static execution is legal
-but cannot demonstrate compact dynamic scheduling. There is no new broad BS
-validation sweep implied: existing and freshly tested points must be labeled
-truthfully, with unperformed points listed as prepared, not validated.
+See [Validation and developer reference](CONFIDENCE_VALIDATION.md) for the
+completed evidence scopes, advanced mixed/freshness contracts and optional tests.
