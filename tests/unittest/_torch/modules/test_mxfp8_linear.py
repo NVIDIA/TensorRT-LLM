@@ -798,7 +798,19 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
 
 
 def _even_rows(rows: int, rank: int, tp_size: int) -> tuple[int, int]:
+    """Row range of `rank` when `rows` are split evenly over `tp_size` ranks."""
     return rank * rows // tp_size, (rank + 1) * rows // tp_size
+
+
+def test_mxfp8_fused_scales_missing_shard_scale_names_the_shard() -> None:
+    """A fused load fails when one shard carries no scale, naming that shard."""
+    module = Mock(spec=Linear)
+    module.load_shard = Mock(side_effect=lambda weights, label, device, name: weights.get(label))
+    scale = torch.ones(32, 8, dtype=torch.uint8)
+    weights = [{"weight_scale_inv": scale}, {}, {"weight_scale_inv": scale}]
+    with pytest.raises(ValueError, match="weight_scale_inv for shard 'k'"):
+        MXFP8LinearMethod()._load_fused_weight_scales(module, weights, ("q", "k", "v"))
+    assert [c.kwargs["name"] for c in module.load_shard.call_args_list] == ["q", "k"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 Linear load path requires CUDA")
