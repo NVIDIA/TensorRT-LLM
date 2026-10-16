@@ -4,8 +4,9 @@
 
 The first indexed in-place call per autotune key in a process must be as correct as a
 warm one: the state kernel's autotuner restores the indexed state its benchmark launches
-write. "First call in the process" is a property of the process, so the cold-call tests
-re-run this file as a child: `python <this file> <mode>`.
+write, and the pool's dtype is part of the key. "First call in the process" is a property
+of the process, so the cold-call tests re-run this file as a child:
+`python <this file> <mode>`.
 """
 
 import os
@@ -110,11 +111,13 @@ def _operands(
     return q, k, v, g, beta, cu_seqlens
 
 
-def _pool(num_slots: int, seed: int, num_v_heads: int = NUM_V_HEADS) -> torch.Tensor:
-    """An fp32 recurrent-state pool, `[slots, H, V, K]` (K innermost)."""
+def _pool(
+    num_slots: int, seed: int, num_v_heads: int = NUM_V_HEADS, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """A recurrent-state pool, `[slots, H, V, K]` (K innermost), at `dtype`."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
     shape = (num_slots, num_v_heads, HEAD_V_DIM, HEAD_K_DIM)
-    return torch.randn(shape, generator=gen, device=DEV) * 0.1
+    return (torch.randn(shape, generator=gen, device=DEV) * 0.1).to(dtype)
 
 
 def _gate_output(o: torch.Tensor, ref: tuple) -> None:
@@ -137,15 +140,16 @@ def _build(spec, seed):
         normalize_qk=spec.get("normalize_qk", True),
     )
     num_seqs = q.shape[0] if cu_seqlens is None else len(cu_seqlens) - 1
+    pool_dtype = spec.get("pool_dtype", torch.float32)
     initial, indices, inplace = None, None, False
     if spec["initial"] == "indexed":
-        initial = _pool(spec["slots"], seed=seed + 1)
+        initial = _pool(spec["slots"], seed=seed + 1, dtype=pool_dtype)
         indices = torch.tensor(
             spec.get("indices", tuple(range(num_seqs))), dtype=torch.int32, device=DEV
         )
         inplace = True
     elif spec["initial"] == "positional":
-        initial = _pool(num_seqs, seed=seed + 1)
+        initial = _pool(num_seqs, seed=seed + 1, dtype=pool_dtype)
     wide, output = None, None
     shape_o = (q.shape[0], q.shape[1], NUM_V_HEADS, HEAD_V_DIM)
     if spec.get("output") == "buffer":
@@ -306,9 +310,9 @@ def _state_kernel_autotuner():
     raise AssertionError("no triton autotuner found around the chunked state kernel")
 
 
-def _checkpoint_case(seed: int = 101):
+def _checkpoint_case(seed: int = 101, pool_dtype: torch.dtype = torch.float32):
     q, k, v, g, beta, cu = _operands(CHILD_SEQLENS, seed=seed)
-    pool = _pool(4, seed=seed + 1)
+    pool = _pool(4, seed=seed + 1, dtype=pool_dtype)
     indices = torch.tensor([2, 0], dtype=torch.int32, device=DEV)
     buf = torch.empty(
         1, sum(CHILD_SEQLENS), NUM_V_HEADS, HEAD_V_DIM, device=DEV, dtype=torch.bfloat16
@@ -316,10 +320,10 @@ def _checkpoint_case(seed: int = 101):
     return (q, k, v, g, beta, None, pool, indices, True, False, cu, False, buf)
 
 
-def _child_cold_call() -> None:
+def _child_cold_call(pool_dtype: torch.dtype = torch.float32) -> None:
     autotuner = _state_kernel_autotuner()
     assert not autotuner.cache, "the child must be the first indexed call in its process"
-    args = _checkpoint_case()
+    args = _checkpoint_case(pool_dtype=pool_dtype)
     ref = op.reference(*args)
     o, _ = op(*args)
     assert len(autotuner.cache) == 1, "the call must have benchmarked exactly one key"
@@ -344,6 +348,7 @@ def _child_cold_call_odd_heads() -> None:
 
 _CHILD_MODES = {
     "cold-call": _child_cold_call,
+    "cold-call-bf16-pool": lambda: _child_cold_call(torch.bfloat16),
     "cold-call-odd-heads": _child_cold_call_odd_heads,
 }
 
@@ -372,6 +377,11 @@ def test_cold_indexed_call_at_this_checkpoints_geometry() -> None:
     """The first indexed call of a process at 16 / 48 heads, K = V = 128, in the
     mixer's shape (256 + 96 packed, by slot, into `output=`), matches the reference."""
     _run_child("cold-call")
+
+
+def test_cold_indexed_call_over_a_bf16_pool() -> None:
+    """The same call over a bf16 pool, the autotune key an fp32 pool never touches."""
+    _run_child("cold-call-bf16-pool")
 
 
 def test_cold_indexed_call_at_an_unused_head_geometry() -> None:

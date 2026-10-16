@@ -77,8 +77,10 @@ DT_BIAS_STATS = (-4.411, 1.732, (-11.4375, 2.53125))
 _ELEMENT_ULPS = 4.0
 #: Relative-RMS gate of the output, in bf16 ulps.
 _OUTPUT_RMS_ULPS = 1.5
-#: Element gate of the checkpoint state, relative to its (slot, head) scale.
+#: Element gate of an fp32 checkpoint state, relative to its (slot, head) scale.
 _STATE_TOL = 2.0**-13
+#: Element gate of a bf16 checkpoint state, in bf16 ulps of its (slot, head) scale.
+_BF16_STATE_ULPS = 2.0
 #: Gate of the stored cumulative log-decays: |dG| <= atol + rtol * |G|.
 _G_ATOL, _G_RTOL = 2.0**-11, 2.0**-18
 
@@ -114,11 +116,14 @@ def _compare(out: tuple, ref: tuple) -> None:
     stores the output and the history's u and k in bf16. So the output, `old_u`
     and `old_k` are gated per block -- one token's `[heads, dim]` -- at 4 bf16
     ulps of the block's absmax, which keeps a near-silent head from turning
-    rounding into relative noise, and the output's relative RMS at 1.5 ulps. The
+    rounding into relative noise, and the output's relative RMS at 1.5 ulps. An fp32
     checkpoint state is fp32 by construction: the commit splits the decayed
     history update into a bf16 hi and lo part, ~16 significant bits per term, and
     up to 16 terms each within 2^-17 give the 2^-13 gate, relative to one (slot,
-    head) state's absmax. `G` only ever enters as exp(G_t - G_j), so an absolute
+    head) state's absmax. A bf16 checkpoint is that fp32 commit rounded once, as the
+    reference's is, so the two stored values are equal or adjacent, and adjacent bf16
+    values are at most 2 bf16 ulps of their head's absmax apart: the bf16 gate is one
+    representable step. `G` only ever enters as exp(G_t - G_j), so an absolute
     error is a relative decay error: the kernel's softplus runs on approximate
     transcendentals whose fp32 sum drops exp(x)'s low bits; atol 2^-11 is an
     eighth of a bf16 ulp of the u it scales, and rtol 2^-18 covers the cumulative
@@ -138,7 +143,8 @@ def _compare(out: tuple, ref: tuple) -> None:
         if name == "old_G":
             torch.testing.assert_close(got, want, rtol=_G_RTOL, atol=_G_ATOL, msg=name)
         elif name == "ssm_states":
-            _gate(name, got, want, _STATE_TOL)
+            bf16 = got.dtype == torch.bfloat16
+            _gate(name, got, want, _BF16_STATE_ULPS * BF16_ULP if bf16 else _STATE_TOL)
         else:
             rms = _OUTPUT_RMS_ULPS * BF16_ULP if name == "output" else None
             _gate(name, got, want, _ELEMENT_ULPS * BF16_ULP, rms)
@@ -205,7 +211,9 @@ class _Bench:
 
         # [slots, layers, HV, V, K]: each layer's state is a slot-strided view,
         # the affine layout whose strides the all-layer commit is handed.
-        self.backing = self._randn(S, L, HV, V, K) * 0.5
+        self.backing = (self._randn(S, L, HV, V, K) * 0.5).to(
+            spec.get("state_dtype", torch.float32)
+        )
         self.pool = [self.backing[:, i] for i in range(L)]
         self.old_x = torch.zeros(L, S, 2, HIST, HV, V, device=DEV, dtype=torch.bfloat16)
         self.old_B = torch.zeros(L, S, 2, HIST, H, K, device=DEV, dtype=torch.bfloat16)
@@ -517,16 +525,25 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 # ── CUDA graphs ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("t", range(2, 9))
-@pytest.mark.parametrize("n", (1, 8, 15, 16, 32))
-def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, t) -> None:
-    """Every T 2..8 (MTP draft lengths 1..7) at the batches either side of the partition
-    threshold and at 1, 8 and 32: two layers captured with, from 16 sequences on, the
-    all-layer commit after them; replayed three times on new activations, with
-    acceptance in between, against the same steps run eagerly on a twin state."""
+_GRAPH_CASES = [(n, t, torch.float32) for t in range(2, 9) for n in (1, 8, 15, 16, 32)] + [
+    (n, t, torch.bfloat16) for t in (2, 4, 8) for n in (1, 15, 16, 32)
+]
+
+
+@pytest.mark.parametrize(
+    "n,t,state_dtype",
+    _GRAPH_CASES,
+    ids=[f"{n}-{t}-{'fp32' if d is torch.float32 else 'bf16'}" for n, t, d in _GRAPH_CASES],
+)
+def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, t, state_dtype) -> None:
+    """Every T 2..8 (MTP draft lengths 1..7) over an fp32 checkpoint, and T 2, 4 and 8 over a
+    bf16 one, at the batches either side of the partition threshold and at 1, 8 and 32: two
+    layers captured with, from 16 sequences on, the all-layer commit after them; replayed
+    three times on new activations, with acceptance in between, against the same steps run
+    eagerly on a twin state."""
     assert ALL_LAYER_COMMIT_MIN_BATCH == CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     path = "all_layer" if n >= ALL_LAYER_COMMIT_MIN_BATCH else "small"
-    spec = dict(path=path, n=n, t=t, layers=2, slots=40)
+    spec = dict(path=path, n=n, t=t, layers=2, slots=40, state_dtype=state_dtype)
     seed = 7000 + 10 * n + t
     eager, graph, warm = (_Bench(spec, seed, exact=False) for _ in range(3))
     acts = [warm.inputs() for _ in range(2)]
@@ -618,11 +635,12 @@ def test_the_twin_sees_a_broken_protocol(fault, t) -> None:
         assert first is not None, f"{fault} passed the twin comparison at T={t}"
 
 
-def test_the_gate_rejects_near_misses() -> None:
+@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16), ids=("fp32", "bf16"))
+def test_the_gate_rejects_near_misses(state_dtype) -> None:
     """`_compare` against plausible wrong answers, each the entry's own
     reference driven on transformed inputs, at a call where one row wraps (and
-    commits) and the others append."""
-    bench = _Bench(dict(path="small", n=8, t=4), seed=91, exact=False)
+    commits) and the others append -- at each checkpoint dtype's own state gate."""
+    bench = _Bench(dict(path="small", n=8, t=4, state_dtype=state_dtype), seed=91, exact=False)
     kw = bench.kwargs(0, bench.inputs())
     pool, u, k, G = (x.clone() for x in bench.state(0))
     base = dict(kw, ssm_states=pool, old_u=u, old_k=k, old_G=G)
@@ -671,10 +689,14 @@ def _restore_state(bench, saved):
         getattr(bench, name).copy_(value)
 
 
-def test_the_two_commit_paths_are_bitwise_interchangeable() -> None:
+@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16), ids=("fp32", "bf16"))
+def test_the_two_commit_paths_are_bitwise_interchangeable(state_dtype) -> None:
     """The same 16 rows through the in-kernel commit, and through the
-    partitioned call plus the manager's all-layer commit: bit for bit."""
-    bench = _Bench(dict(path="all_layer", n=16, t=4, layers=2), seed=95, exact=False)
+    partitioned call plus the manager's all-layer commit: bit for bit, at either
+    checkpoint dtype."""
+    bench = _Bench(
+        dict(path="all_layer", n=16, t=4, layers=2, state_dtype=state_dtype), seed=95, exact=False
+    )
     acts = [bench.inputs() for _ in range(2)]
     saved = _clone_state(bench)
     small = [

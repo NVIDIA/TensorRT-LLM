@@ -55,8 +55,8 @@ def _conv(**kw):
     return _t(SLOTS, G.conv_dim, G.conv_kernel - 1, **kw)
 
 
-def _ssm(**kw):
-    return _t(SLOTS, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
+def _ssm(dtype=torch.float32):
+    return _t(SLOTS, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=dtype)
 
 
 def _history(slots=SLOTS, history=HISTORY):
@@ -79,7 +79,8 @@ def test_valid_pools_pass() -> None:
         _t(9, 32, 1, 128),
         _t(9, 2, G.heads_kv, G.tokens_per_block, G.head_dim, dtype=torch.float8_e4m3fn),
     )
-    M.check_recurrent_pools(G, _conv(), _ssm())
+    for dtype in (torch.float32, torch.bfloat16):
+        M.check_recurrent_pools(G, _conv(), _ssm(dtype))
     M.check_ple_pools(
         G,
         _t(SLOTS, G.stream, G.ple_state_len),
@@ -89,13 +90,19 @@ def test_valid_pools_pass() -> None:
     M.check_step_buffers(
         G, _t(SLOTS, 2, G.conv_dim, G.conv_kernel - 1), _conv(), _t(SLOTS, dtype=torch.int32)
     )
-    M.check_legacy_state(
-        G, _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32), _ssm()
-    )
-    for width in (2, 5, M._MAX_VERIFY_WIDTH):
-        M.check_replay_state(
-            HISTORY, width, _t(SLOTS, dtype=torch.int32), _t(SLOTS, dtype=torch.int32), _ssm()
+    for dtype in (torch.float32, torch.bfloat16):
+        M.check_legacy_state(
+            G, _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=dtype), _ssm(dtype)
         )
+    for dtype in (torch.float32, torch.bfloat16):
+        for width in (2, 5, M._MAX_VERIFY_WIDTH):
+            M.check_replay_state(
+                HISTORY,
+                width,
+                _t(SLOTS, dtype=torch.int32),
+                _t(SLOTS, dtype=torch.int32),
+                _ssm(dtype),
+            )
     M.check_replay_history(G, 3, HISTORY, SLOTS, *_history())
     for rows in range(1, M._MAX_VERIFY_WIDTH + 1):
         M.check_verify_width(rows)
@@ -156,6 +163,9 @@ def test_recurrent_pools_reject_wrong_key_dim_order_and_dtype() -> None:
         )
     with pytest.raises(AssertionError, match="conv state pool"):
         M.check_recurrent_pools(G, _conv(dtype=torch.float32), _ssm())
+    # The engine accepts an fp16 pool; no recurrence entry the target binds is certified at it.
+    with pytest.raises(AssertionError, match="recurrent state pool"):
+        M.check_recurrent_pools(G, _conv(), _ssm(torch.float16))
 
 
 def test_ple_pools_reject_slot_mismatch_and_int32_history() -> None:
@@ -201,8 +211,8 @@ def test_legacy_state_rejects_missing_rank_and_dtype_drift() -> None:
 def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
     pnat = _t(SLOTS, dtype=torch.int32)
     buf = _t(SLOTS, dtype=torch.int32)
-    with pytest.raises(AssertionError, match="fp32 checkpoint"):
-        M.check_replay_state(HISTORY, 3, pnat, buf, _ssm().to(torch.bfloat16))
+    with pytest.raises(AssertionError, match="fp32 or a bf16 checkpoint"):
+        M.check_replay_state(HISTORY, 3, pnat, buf, _ssm(torch.float16))
     with pytest.raises(AssertionError, match="replay_history_size"):
         M.check_replay_state(12, 3, pnat, buf, _ssm())
     for width in (1, M._MAX_VERIFY_WIDTH + 1):
@@ -287,3 +297,7 @@ def test_routing_admits_exactly_the_draft_lengths_the_target_implements() -> Non
     assert routing._MAX_DRAFT_LEN == M._MAX_VERIFY_WIDTH - 1
     assert routing._MAX_LEGACY_DRAFT_LEN == M._MAX_LEGACY_VERIFY_WIDTH - 1
     assert routing._MAX_CUTEDSL_DRAFT_LEN == M._CUTEDSL_MAX_DRAFT_LEN
+
+
+def test_routing_admits_exactly_the_state_dtypes_the_target_serves() -> None:
+    assert routing._SSM_STATE_DTYPES == M._SSM_STATE_DTYPES

@@ -40,6 +40,9 @@ _MAX_DRAFT_LEN = 7
 _MAX_LEGACY_DRAFT_LEN = 3
 _MAX_CUTEDSL_DRAFT_LEN = 3
 
+# Recurrent-state cache dtypes the target serves (`_SSM_STATE_DTYPES` in modeling.py).
+_SSM_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
 
 def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> None:
     """Decline what the target's constructor or first forward would refuse.
@@ -70,14 +73,13 @@ def _check_engine(spec_config: Optional[Any], engine: Optional[EngineFacts]) -> 
             f"moe_config.backend={engine.moe_backend!r}; the target runs the trunk's routed "
             f"experts on {', '.join(_MOE_BACKENDS)}"
         )
+    if engine.mamba_ssm_cache_dtype not in _SSM_STATE_DTYPES:
+        raise NoTarget(
+            f"a {engine.mamba_ssm_cache_dtype} recurrent-state cache; the target serves "
+            "float32 or bfloat16 (kv_cache_config.mamba_ssm_cache_dtype)"
+        )
     if spec_config is None:
         return
-    if engine.gdn_replay and engine.mamba_ssm_cache_dtype != torch.float32:
-        raise NoTarget(
-            f"MTP with a {engine.mamba_ssm_cache_dtype} recurrent-state cache: the engine "
-            "verifies with GDN cached replay, which the target runs on an fp32 cache. Set "
-            "kv_cache_config.mamba_ssm_cache_dtype to float32 or export TRTLLM_USE_GDN_REPLAY=0"
-        )
     draft = spec_config.max_draft_len
     if not engine.gdn_replay and draft > _MAX_LEGACY_DRAFT_LEN:
         raise NoTarget(

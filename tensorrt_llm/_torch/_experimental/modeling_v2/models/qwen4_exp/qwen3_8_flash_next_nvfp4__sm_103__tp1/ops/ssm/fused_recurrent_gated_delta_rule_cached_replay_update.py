@@ -46,6 +46,12 @@ def _cell_spec(path, n, t, **spec) -> dict:
     return dict(path=path, n=n, t=t, **spec)
 
 
+def _bf16_cell(why, path, n, t, **spec) -> Cell:
+    return Cell(
+        why=f"bf16 state {why}", spec=_cell_spec(path, n, t, state_dtype=torch.bfloat16, **spec)
+    )
+
+
 class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     """One verify step of `N` sequences x `T` tokens through one GDN layer, for
     the cached-replay state layout. Per live row (`slot = state_indices[n] >= 0`),
@@ -99,6 +105,8 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     # accept ("random": 1..t per row, the default | "full": t every step, so from
     # a fresh slot at t=8 the second step appends at `pnat + t == 16` without
     # wrapping and every second step after wraps | "one": 1 every step),
+    # state_dtype (the checkpoint pool's dtype: fp32 | bf16, as
+    # `mamba_ssm_cache_dtype` allocates it; fp32 by default),
     # layers (each with its own activations, gates
     # and history; one V2-style pool interleaving the layers per slot), slots
     # (the pool's slot count), start ("warm": random pending histories in both
@@ -240,6 +248,68 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             why="all_layer n=20 T=8 fresh pad: rows 0, 19 at slot -1",
             spec=_cell_spec("all_layer", 20, 8, start="fresh", pad=(0, 19), output="prefix"),
         ),
+        # ---- a bf16 checkpoint pool (`mamba_ssm_cache_dtype=bfloat16`) ----
+        _bf16_cell("small n=1 T=2: one sequence, MTP-1", "small", 1, 2, steps=12),
+        _bf16_cell("small n=8 T=4", "small", 8, 4),
+        _bf16_cell("small n=15 T=3: largest batch before the split", "small", 15, 3),
+        _bf16_cell("small n=8 T=4 fresh: first verify after prefill", "small", 8, 4, start="fresh"),
+        _bf16_cell(
+            "small n=6 T=3 pad: rows 1, 4 at slot -1, prefix output",
+            "small",
+            6,
+            3,
+            pad=(1, 4),
+            output="prefix",
+        ),
+        _bf16_cell(
+            "small n=8 T=4 S=461: slots 0 and 460 of a 461-slot axis",
+            "small",
+            8,
+            4,
+            slots=ENGINE_SLOTS,
+            edge_slots=True,
+        ),
+        _bf16_cell("small n=1 T=5: MTP-4", "small", 1, 5, steps=10),
+        _bf16_cell("small n=1 T=8: MTP-7, one sequence", "small", 1, 8, steps=10),
+        _bf16_cell("small n=8 T=8: MTP-7", "small", 8, 8),
+        _bf16_cell(
+            "small n=4 T=8 full accept: pnat+T==16 appends, then wraps",
+            "small",
+            4,
+            8,
+            start="fresh",
+            accept="full",
+            steps=8,
+        ),
+        _bf16_cell("all_layer n=16 T=4: the partition threshold", "all_layer", 16, 4),
+        _bf16_cell("all_layer n=24 T=6: MTP-5", "all_layer", 24, 6),
+        _bf16_cell("all_layer n=32 T=8: MTP-7, 256 rows", "all_layer", 32, 8),
+        _bf16_cell(
+            "all_layer n=32 T=3 L=36 S=40: every GDN layer, one commit",
+            "all_layer",
+            32,
+            3,
+            layers=NUM_GDN_LAYERS,
+            slots=40,
+            steps=6,
+        ),
+        _bf16_cell(
+            "all_layer n=32 T=8 full accept: commit every second step",
+            "all_layer",
+            32,
+            8,
+            start="fresh",
+            accept="full",
+            steps=8,
+        ),
+        _bf16_cell(
+            "all_layer n=16 T=8 mixed-batch form: views, offset out",
+            "all_layer",
+            16,
+            8,
+            packed=False,
+            output="suffix",
+        ),
     )
 
     note = """
@@ -251,9 +321,9 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     `packed_qkv` = those rows for a generation-only batch (a mixed batch passes the
     views alone and the op copies them contiguous); `g=a`, `beta=b` are the raw
     bf16 `[N, T, 48]` projections, with the layer's fp32 `[48]` `A_log` and
-    `dt_bias`; `ssm_states` is the layer's fp32 pool view `[S, 48, 128, 128]` (V2
-    interleaves the layers inside each slot, so the slot stride is a multiple of one
-    state); `state_indices` the decode rows' int32 slots; `old_u, old_k, old_G,
+    `dt_bias`; `ssm_states` is the layer's pool view `[S, 48, 128, 128]`, fp32 or bf16 as
+    `mamba_ssm_cache_dtype` allocated it (V2 interleaves the layers inside each slot, so
+    the slot stride is a multiple of one state); `state_indices` the decode rows' int32 slots; `old_u, old_k, old_G,
     old_beta` the layer's `old_x, old_B, old_dt, old_dA_cumsum` from
     `mamba_layer_cache(layer)`; `cache_buf_idx`, `prev_num_accepted_tokens`,
     `history_size` from `get_replay_state_update_metadata()` (16 here);
@@ -290,10 +360,14 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     * the conv state is not this op's: under replay the conv still writes its
       per-step window and the manager promotes it.
 
-    With an fp32 state the launch is one V tile, `num_warps=4`, `num_stages=1`, grid
-    `(1, N * 48)`; the tuned mappings key on a bf16 state and never engage here.
-    `FLA_USE_FAST_OPS=1` at import switches the kernel's `exp` to the approximate
-    one; the cells run with it unset.
+    The launch is one V tile, `num_warps=4`, `num_stages=1`, grid `(1, N * 48)`: the
+    tuned mappings need HV = 2H or 4H and never engage at HV/H = 3. The checkpoint's dtype
+    is the kernel's `STATE_FP32` specialization and nothing else below N = 128: an fp32
+    checkpoint enters the history rebuild's tensor-core dots as a bf16 hi/lo pair, a bf16
+    one as stored, and every commit is computed in fp32 and rounded once to the pool's
+    dtype. From N = 128 a bf16 state alone also turns on the L2-streaming mapping
+    (`main_num_stages=3`, a 5-stage commit), which no cell drives. `FLA_USE_FAST_OPS=1` at
+    import switches the kernel's `exp` to the approximate one; the cells run with it unset.
 
     Bit for bit the same call: the in-kernel commit and the partitioned call plus
     the all-layer commit; `packed_qkv` and the separate q/k/v (whose contents are
@@ -325,9 +399,9 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     harmless: the entry's input guard makes it contiguous.
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
-    False`; a bf16 `ssm_states` (a different launch mapping); HV/H other than 3, K
-    or V other than 128; T outside 2..8 (T = 9 raises: the kernel's bare `assert T <= 8`);
-    `history_size` other than 16; `old_u` /
+    False`; an `ssm_states` other than fp32 or bf16, or a bf16 one at N >= 128; HV/H other
+    than 3, K or V other than 128; T outside 2..8 (T = 9 raises: the kernel's bare
+    `assert T <= 8`), at either `ssm_states` dtype; `history_size` other than 16; `old_u` /
     `old_k` other than bf16, `old_G` other than fp32; a `scale`; any launch-knob
     override (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`); an output
     dtype other than bf16; int64 `state_indices`; N above 32.

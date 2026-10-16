@@ -52,6 +52,14 @@ resolves ``kv_cache_quant_algo: FP8`` (``kv_cache_config.dtype: fp8``): a lossy 
 the checkpoint's KV is bf16 and the fp8 attention kernels run q, K, V and the softmax
 probabilities through e4m3. The QSA index and position planes keep their own types under both.
 
+**Recurrent-state storage.** The Gated-DeltaNet recurrent pool holds the checkpoint's fp32
+(``mamba_ssm_dtype``) or bf16 when ``kv_cache_config.mamba_ssm_cache_dtype`` asks for it, which
+is also what ``auto`` resolves to for this checkpoint (`_SSM_STATE_DTYPES`): a lossy
+substitution, since the state is rounded to bf16 once per decode token, once per prefill call and
+at every cached-replay checkpoint commit. The conv, PLE and replay-history buffers keep their own
+types under both. A bf16 pool makes the decode step call its recurrence without ``cu_seqlens``;
+see ``DecodeTarget._gdn_block``.
+
 **Host offload.** By default the PLE table lives in host memory the device
 addresses (`weights._host_resident_empty`), and the gather reads it unchanged;
 ``TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD=0`` restores the resident declaration. Output
@@ -459,6 +467,11 @@ _MAX_VERIFY_WIDTH = 8
 #: rows and 8 requests in fp32).
 _MAX_LEGACY_VERIFY_WIDTH = 4
 
+#: The recurrent-state pool dtypes this target serves (`kv_cache_config.mamba_ssm_cache_dtype`):
+#: the checkpoint's fp32, or bf16, which rounds the state to bf16 once per decode token, once
+#: per prefill call and at every cached-replay checkpoint commit. The engine also accepts fp16.
+_SSM_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
 
 # ----------------------------------------------- KV cache manager binding ---
 #
@@ -584,6 +597,10 @@ def check_recurrent_pools(g: _PoolGeometry, conv, ssm) -> None:
     _check_pool(conv, "conv state pool", 1, (g.conv_dim, g.conv_kernel - 1), g.dtype)
     # Key dim innermost.
     _check_pool(ssm, "recurrent state pool", 1, (g.num_v_heads, g.head_v_dim, g.head_k_dim))
+    assert ssm.dtype in _SSM_STATE_DTYPES, (
+        f"the recurrent state pool is {ssm.dtype}; this target serves "
+        f"{' or '.join(str(d) for d in _SSM_STATE_DTYPES)} (kv_cache_config.mamba_ssm_cache_dtype)"
+    )
 
 
 def check_ple_pools(g: _PoolGeometry, ple_conv, ple_ngram, conv) -> None:
@@ -629,9 +646,9 @@ def check_legacy_state(g: _PoolGeometry, int_ssm, ssm) -> None:
 def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> None:
     """Cached replay, manager-wide: the geometry the replay entry is certified at, and the
     per-slot bookkeeping, which must cover every pool slot."""
-    assert ssm.dtype == torch.float32, (
-        f"the recurrent pool is {ssm.dtype}; the replay entry is certified at an fp32 checkpoint. "
-        "Set mamba_ssm_cache_dtype to float32 or export TRTLLM_USE_GDN_REPLAY=0"
+    assert ssm.dtype in _SSM_STATE_DTYPES, (
+        f"the recurrent pool is {ssm.dtype}; the replay entry is certified at an fp32 or a "
+        "bf16 checkpoint"
     )
     assert history == _GDN_REPLAY_HISTORY, (
         f"replay_history_size {history}; the replay entry is certified at {_GDN_REPLAY_HISTORY}"
@@ -3946,25 +3963,55 @@ class DecodeTarget:
                 conv_state_indices=si_all,
                 pad_slot_id=_PAD_SLOT_ID,
             )
-            # q/k/v stay views over the conv output (native strides, no copy).
-            qv, kv, vv = torch.split(mixed_qkv, [core.key_dim, core.key_dim, core.value_dim], 1)
-            out = fused_sigmoid_gating_delta_rule_update(
-                A_log=L.a_log,
-                a=a,
-                dt_bias=L.dt_bias,
-                softplus_beta=_SOFTPLUS_BETA,
-                softplus_threshold=_SOFTPLUS_THRESHOLD,
-                q=torch.reshape(qv, [1, num_tokens, core.num_k_heads, core.head_k_dim]),
-                k=torch.reshape(kv, [1, num_tokens, core.num_k_heads, core.head_k_dim]),
-                v=torch.reshape(vv, [1, num_tokens, core.num_v_heads, core.head_v_dim]),
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=si_all,
-                scale=None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=qsl_long,
-                output=None,
-            )
+            if ssm_states.dtype == torch.bfloat16:
+                # Over a bf16 pool a call with `cu_seqlens` reaches FlashInfer's CuTe-DSL
+                # decode, whose kernel changes with the batch size and so changes a row's
+                # last bits; without `cu_seqlens` the entry runs its Triton kernel, one program
+                # per (row, head). That form finds row n's tokens at `n * q.stride(1)`, so q/k/v
+                # must be split from the whole contiguous `[T, 10240]` block reshaped to
+                # `[T, 1, 80, 128]` (K and V heads are both 128 wide), where the size-1 token
+                # axis carries the row stride; a/b are contiguous `[T, 48]`.
+                qkv = torch.reshape(mixed_qkv, [num_tokens, 1, -1, core.head_k_dim])
+                q, k, v = torch.split(
+                    qkv, [core.num_k_heads, core.num_k_heads, core.num_v_heads], 2
+                )
+                out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=L.a_log,
+                    a=torch.reshape(a, [num_tokens, 1, core.num_v_heads]),
+                    dt_bias=L.dt_bias,
+                    softplus_beta=_SOFTPLUS_BETA,
+                    softplus_threshold=_SOFTPLUS_THRESHOLD,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=torch.reshape(b, [num_tokens, 1, core.num_v_heads]),
+                    initial_state_source=ssm_states,
+                    initial_state_indices=si_all,
+                    scale=None,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=None,
+                    output=None,
+                )
+            else:
+                # q/k/v stay views over the conv output (native strides, no copy).
+                qv, kv, vv = torch.split(mixed_qkv, [core.key_dim, core.key_dim, core.value_dim], 1)
+                out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=L.a_log,
+                    a=a,
+                    dt_bias=L.dt_bias,
+                    softplus_beta=_SOFTPLUS_BETA,
+                    softplus_threshold=_SOFTPLUS_THRESHOLD,
+                    q=torch.reshape(qv, [1, num_tokens, core.num_k_heads, core.head_k_dim]),
+                    k=torch.reshape(kv, [1, num_tokens, core.num_k_heads, core.head_k_dim]),
+                    v=torch.reshape(vv, [1, num_tokens, core.num_v_heads, core.head_v_dim]),
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=si_all,
+                    scale=None,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=qsl_long,
+                    output=None,
+                )
         return self._gdn_epilogue(out, z, L, num_tokens)
 
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:

@@ -27,8 +27,8 @@ NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 16, 48, 128, 128
 #: Rows of the engine's per-step buffer (`max_num_sequences`), as the
 #: runtime-value dumps record `intermediate_ssm_states`: [32, p, 48, 128, 128].
 ENGINE_VERIFY_ROWS = 32
-#: The recurrent pool's slot count the cache manager allocates (10 .. 461 over
-#: the dumps). The target gathers a batch-scoped copy before this call, so the
+#: A recurrent-pool slot count of a full-size engine run (a bf16 pool holds more slots in
+#: the same memory). The target gathers a batch-scoped copy before this call, so the
 #: write-back mode is bracketed here rather than driven.
 ENGINE_SLOTS = 461
 #: Pool and buffer rows of the small cells.
@@ -92,6 +92,32 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
                 qkv="contiguous",
             )
             for n, p in ((1, 2), (8, 2), (16, 2), (32, 2), (8, 3), (8, 4))
+        )
+        + tuple(
+            _verify(
+                n,
+                p,
+                f"bf16 state: target verify n={n} p={p}, n-row gather, 32-row buffer",
+                pool_slots=n,
+                cache_rows=ENGINE_VERIFY_ROWS,
+                beta="bf16",
+                qkv="contiguous",
+                pool_dtype=torch.bfloat16,
+                cache_dtype=torch.bfloat16,
+            )
+            for n, p in ((1, 2), (8, 2), (16, 2), (32, 2), (8, 3), (8, 4))
+        )
+        + (
+            _verify(
+                4,
+                2,
+                "bf16 state: verify, -1-padded rows naming 31 and 0",
+                pool_slots=ENGINE_VERIFY_ROWS,
+                cache_rows=ENGINE_VERIFY_ROWS,
+                slots=(31, -1, 0, -1),
+                pool_dtype=torch.bfloat16,
+                cache_dtype=torch.bfloat16,
+            ),
         )
         + (
             _verify(
@@ -168,16 +194,16 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     note = """
     Metadata consumed: none; every piece of state is an argument.
 
-    Call site (`_gdn_verify`), all positional: `(q, k, v, g, beta, src,
-    int_idx, None, True, None, True, False, int_ssm, p, None)` -- q/k/v the
-    contiguous `[n, p, 16|48, 128]` reshapes of `pack_gdn_decode_qkv`'s
-    outputs (so the in-kernel L2 norm is required), `g` fp32 from
-    `fused_gdn_gating`, `beta = sigmoid(b)` bf16, `src` an `[n, 48, 128, 128]`
-    fp32 gather of the live slots, `int_idx = intermediate_state_indices[:n]`
-    (int32 arange), `int_ssm` the layer's `[32, p, 48, 128, 128]` per-step
-    buffer. The buffer's rows are the batch rows `update_mamba_states` reads,
-    not slot ids, and its step axis is `tokens_per_gen_step`: `p` (as
-    `cache_steps`) must equal it.
+    Call site (`_gdn_verify`, the legacy verify path of `TRTLLM_USE_GDN_REPLAY=0`, `p` up
+    to 4), all positional: `(q, k, v, g, beta, src, int_idx, None, True, None, True, False,
+    int_ssm, p, None)` -- q/k/v the contiguous `[n, p, 16|48, 128]` reshapes of
+    `pack_gdn_decode_qkv`'s outputs (so the in-kernel L2 norm is required), `g` fp32 from
+    `fused_gdn_gating`, `beta = sigmoid(b)` bf16, `src` an `[n, 48, 128, 128]` gather of
+    the live slots and `int_ssm` the layer's `[32, p, 48, 128, 128]` per-step buffer, both
+    at the pool's dtype (fp32 or bf16, as `mamba_ssm_cache_dtype` allocated it; the buffer's
+    states are rounded once to it), `int_idx = intermediate_state_indices[:n]` (int32
+    arange). The buffer's rows are the batch rows `update_mamba_states` reads, not slot
+    ids, and its step axis is `tokens_per_gen_step`: `p` (as `cache_steps`) must equal it.
 
     Preconditions not checkable from metadata: `HV % H == 0` (q/k heads are
     repeat_interleaved, not tiled); indices in `[0, S)` and `[0, S')` or

@@ -302,11 +302,11 @@ _QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.mode
 )
 def test_qwen4_exp_tp1_matches(spec_config):
     config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
-    # MTP is verified by GDN cached replay unless TRTLLM_USE_GDN_REPLAY=0, on an fp32
-    # recurrent-state cache.
-    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
-    target = modeling_v2_resolve(config, _llm_args("require", kv_cache_config=kv_cache_config))
-    assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
+    # The recurrent-state cache at either dtype the target serves; `auto` is bf16 here.
+    for dtype in ("float32", "bfloat16", "auto"):
+        kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype=dtype)
+        target = modeling_v2_resolve(config, _llm_args("require", kv_cache_config=kv_cache_config))
+        assert _qualified(target).startswith(_QWEN4_EXP_TARGET), dtype
 
 
 def _mtp(max_draft_len=3, **attributes):
@@ -450,19 +450,30 @@ def test_qwen4_exp_cutedsl_matches_up_to_three_drafted_tokens(monkeypatch):
     _claimed(cutedsl, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
 
 
-def test_qwen4_exp_mtp_on_a_bf16_state_cache_falls_back(monkeypatch):
-    """The engine verifies with GDN cached replay by default, which the target runs
-    on an fp32 recurrent-state cache; `auto` resolves to bf16 for this checkpoint."""
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "auto"])
+def test_qwen4_exp_mtp_matches_a_float32_or_bfloat16_state_cache(monkeypatch, dtype):
+    """GDN cached replay runs on either checkpoint dtype; `auto` resolves to bf16 here."""
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
-    _declined(config, match="recurrent-state cache")
+    _claimed(config, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype=dtype)))
 
 
-def test_qwen4_exp_mtp_on_an_fp32_state_cache_matches(monkeypatch):
+@pytest.mark.parametrize(
+    "spec_config", [None, MTPDecodingConfig(max_draft_len=3)], ids=["no-spec", "mtp3"]
+)
+def test_qwen4_exp_declines_a_float16_state_cache(monkeypatch, spec_config):
+    """The engine's replay gate accepts fp16; the target's pool contract does not."""
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float16")
+    _declined(config, dict(kv_cache_config=kv_cache_config), match="recurrent-state cache")
+
+
+def test_qwen4_exp_mtp_on_a_float16_state_cache_declines_with_replay_off(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
     config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
-    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
-    _claimed(config, dict(kv_cache_config=kv_cache_config))
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float16")
+    _declined(config, dict(kv_cache_config=kv_cache_config), match="recurrent-state cache")
 
 
 def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch):
@@ -471,6 +482,6 @@ def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch
     _claimed(config)
 
 
-def test_qwen4_exp_no_speculation_ignores_the_state_cache_dtype(monkeypatch):
+def test_qwen4_exp_no_speculation_matches_the_default_state_cache(monkeypatch):
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     _claimed(_model_config(_qwen4_exp_config()))

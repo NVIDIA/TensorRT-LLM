@@ -22,9 +22,9 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
 #: The pool width the bulk of the cells run at, from the old test: a width the
 #: engine never allocates, kept because its cells were certified there.
 SLOTS = 24
-#: Largest slot count the cache manager was seen to allocate the recurrent pool
-#: at for this checkpoint (10 .. 461 over twelve runtime-value dumps, batch never
-#: above 32). The target passes the layer's whole pool unsliced.
+#: A recurrent-pool slot count of a full-size engine run. The kernels address a slot by
+#: its index alone, so a pool of another size (a bf16 pool holds more slots in the same
+#: memory) takes the same path. The target passes the layer's whole pool unsliced.
 ENGINE_SLOTS = 461
 
 
@@ -67,7 +67,10 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     # of a longer buffer, as the stock mixer passes), ab ("packed": column
     # halves of a [T, 96] projection | "separate": two contiguous [T, 48], as
     # the target's two matmuls make them), layout ("varlen" | "layer_view":
-    # pool[1] of a [3, slots, ...] cache | "batched": cu_seqlens None).
+    # pool[1] of a [3, slots, ...] cache | "batched": cu_seqlens None,
+    # contiguous copies | "rows": cu_seqlens None, one token per row, q/k/v
+    # [N, 1, heads, 128] views of the packed [N, 10240] block whose token
+    # stride is the row stride, and a/b [N, 1, 48] -- the target's bf16 call).
     CELLS: tuple[Cell, ...] = (
         tuple(
             Cell(
@@ -90,6 +93,43 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
                     slots=ENGINE_SLOTS,
                     indices=(0, -1, ENGINE_SLOTS - 1, -1),
                     ab="separate",
+                ),
+            ),
+        )
+        + tuple(
+            Cell(
+                why=f"target bf16 decode call, rows form N={n}, 461-slot pool",
+                spec=dict(
+                    seq_lens=(1,) * n,
+                    slots=ENGINE_SLOTS,
+                    indices=_scattered(n),
+                    ab="separate",
+                    layout="rows",
+                    pool_dtype=torch.bfloat16,
+                ),
+            )
+            for n in (1, 3, 10, 11, 16, 32)
+        )
+        + (
+            Cell(
+                why="bf16 rows form, pad rows (-1) between slot 0 and 460",
+                spec=dict(
+                    seq_lens=(1, 1, 1, 1),
+                    slots=ENGINE_SLOTS,
+                    indices=(0, -1, ENGINE_SLOTS - 1, -1),
+                    ab="separate",
+                    layout="rows",
+                    pool_dtype=torch.bfloat16,
+                ),
+            ),
+            Cell(
+                why="fp32 pool, rows form N=8, 461-slot pool",
+                spec=dict(
+                    seq_lens=(1,) * 8,
+                    slots=ENGINE_SLOTS,
+                    indices=_scattered(8),
+                    ab="separate",
+                    layout="rows",
                 ),
             ),
         )
@@ -171,20 +211,35 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     note = """
     Metadata consumed: none.
 
-    Call site (`_gdn_block` decode): `(a_log, a, dt_bias, 1.0, 20.0, q, k, v,
-    b, ssm_states, si_all, None, True, qsl_long, None)` -- q/k/v reshaped
-    column views of the conv output `[T, 10240]` (read through `stride(1)`, no
-    repack), `a`/`b` two contiguous `[T, 48]` projections, the layer's whole
-    fp32 pool `[slots, 48, 128, 128]`, int32 slots, int64 `cu_seqlens`, one
-    token per sequence. Certified at 24 and 461 slots; at 461 output and state
-    are bitwise identical to 24 for the same slot content.
+    Call sites (`_gdn_block` decode), one token per sequence, int32 slots, the
+    layer's whole pool `[slots, 48, 128, 128]` at `mamba_ssm_cache_dtype`:
+    - fp32 pool: `(a_log, a, dt_bias, 1.0, 20.0, q, k, v, b, ssm_states,
+      si_all, None, True, qsl_long, None)` -- q/k/v `[1, T, heads, 128]`
+      reshaped column views of the conv output `[T, 10240]` (read through
+      `stride(1)`, no repack), `a`/`b` two contiguous `[T, 48]` projections,
+      int64 `cu_seqlens`;
+    - bf16 pool: the rows form, `cu_seqlens` None -- q/k/v `[T, 1, heads,
+      128]` split from the whole `[T, 10240]` block reshaped to `[T, 1, 80,
+      128]`, so the token stride is the row stride (`is_valid` refuses other
+      strides), `a`/`b` `[T, 1, 48]`.
+    Certified at 24 and 461 slots; at 461 output and state are bitwise
+    identical to 24 for the same slot content. The rows form is bitwise the
+    packed Triton call at either pool dtype and runs inside a CUDA graph.
 
-    Branch: the callable takes a FlashInfer CuTe-DSL kernel when the pool is
-    bf16, `cu_seqlens` is given and `T == N` (head dims 128, supported arch);
-    everything else -- every fp32-pool call, i.e. this target's
-    `--mamba_ssm_cache_dtype=float32` -- runs the vendored Triton kernel. Only
-    the Triton branch is certified; the test proves the fp32 pool never
-    reaches FlashInfer and that the witness is not blind.
+    Branch: the callable takes a FlashInfer CuTe-DSL kernel
+    (`gdn_decode_bf16_state.gated_delta_rule`) when the pool is bf16,
+    `cu_seqlens` is given and `T == N` (head dims 128, supported arch);
+    everything else runs the vendored Triton kernel, and only the Triton
+    branch is certified. The target's two forms both stay on it, which the
+    test proves with the FlashInfer arm armed to raise. The bf16 call takes
+    the rows form because FlashInfer is not batch-invariant: at 48 value
+    heads it runs one kernel up to N = 10 and another from N = 11, and one
+    fixed row's single-step output and state differ between the two, so a
+    row's tokens would depend on its batch. The Triton rows are one program
+    per (row, head); the test shows a fixed row's output and state bitwise
+    equal across batch sizes 1..32. FlashInfer also differs from `reference`
+    in reading and writing a negative slot as slot 0 (Triton gives a zero
+    state and no write) and in its L2-norm epsilon.
 
     Preconditions not checked by anything:
     - `HV % H == 0`.
@@ -207,8 +262,8 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     not measured: N > 1365 at this geometry).
 
     Not certified: the FlashInfer branch, K or V other than 128, fp16/fp32
-    operands, `softplus_beta`/`softplus_threshold` other than 1.0/20.0,
-    `B > 1` with `cu_seqlens`.
+    operands, an fp16 pool, `softplus_beta`/`softplus_threshold` other than
+    1.0/20.0, `B > 1` with `cu_seqlens`.
 
     Hard limits
       none probed.
@@ -338,6 +393,16 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
             f"{tuple(output.shape)} -- the kernel writes it with packed "
             "[NK, B, T, HV, V] arithmetic, misplacing values and clobbering the gaps"
         )
+        if cu_seqlens is None:
+            # q/k/v reshaped to [N, 1, heads, 128] from column slices of the packed
+            # [N, 10240] block carry stride(1) = heads * 128, not the row stride: they are
+            # accepted and read other rows' columns.
+            for name, t in (("q", q), ("k", k), ("v", v), ("a", a), ("b", b)):
+                assert t.dim() < 3 or t.stride(0) == t.shape[1] * t.stride(1), (
+                    f"{name} {tuple(t.shape)} has strides {t.stride()}: without "
+                    "cu_seqlens the kernel finds row n's tokens at n * T * stride(1), "
+                    "so stride(0) must equal T * stride(1)"
+                )
 
 
 fused_sigmoid_gating_delta_rule_update = FusedSigmoidGatingDeltaRuleUpdate()
