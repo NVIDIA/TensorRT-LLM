@@ -1529,3 +1529,49 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
                 for name, constructor in constructors.items()
                 if name != selected
             )
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+@pytest.mark.parametrize("sm", [120, 121])
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
+@pytest.mark.parametrize("activation", ["Relu2", "Swiglu"])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, dynamic):
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+
+    report = resolve_moe_impl(
+        ModelConfig(moe_backend="CUTEDSL"),
+        problem=MoEProblem(
+            quant=canonical_quant(quant_algo),
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            activation=activation,
+        ),
+        deployment=MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            force_dynamic_quantization=dynamic,
+            env=MoEEnvironment(sm=sm, oss_cutlass_moe=is_oss, available_deps=(MoEDep.FLASHINFER,)),
+        ),
+    )
+    rejection = not is_oss and quant_algo == QuantAlgo.NVFP4 and (activation == "Relu2" or dynamic)
+    if rejection:
+        assert report.winner is None
+        b12x_rejection = next(
+            r for r in report.rejected if r.legacy_backend == "CuteDslB12xFusedMoE"
+        )
+        expected = (
+            MoERejectReason.ACTIVATION_UNSUPPORTED
+            if activation == "Relu2"
+            else MoERejectReason.QUANT_UNSUPPORTED
+        )
+        assert b12x_rejection.reason is expected
+        assert "USING_OSS_CUTLASS_MOE_GEMM=ON" in b12x_rejection.detail
+    else:
+        assert impl_class_for(report) is CuteDslB12xFusedMoE

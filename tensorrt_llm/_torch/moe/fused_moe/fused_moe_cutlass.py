@@ -206,15 +206,10 @@ class CutlassFusedMoE(MoEImplBase):
     """
 
     @classmethod
-    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """Cutlass grouped-GEMM MoE: the widest quant and SM coverage there is.
-
-        Per-algorithm SM and dtype support lives in ``_QUANT_SUPPORT_TABLE``;
-        this method is only the interpreter for it.
-        """
-        sm_version = d.env.sm
+    def _check_build_capabilities(cls, p: MoEProblem,
+                                  d: MoEDeployment) -> MoEEligibility:
+        """Check capabilities required by callers of the CUTLASS execution path."""
         quant_algo = p.quant_algo
-
         if not d.env.oss_cutlass_moe:
             if p.activation_type in (ActivationType.SiTu, ActivationType.Relu2):
                 return _reject(
@@ -242,6 +237,22 @@ class CutlassFusedMoE(MoEImplBase):
                     MoERejectReason.LORA_UNSUPPORTED,
                     "CutlassFusedMoE routed-expert LoRA requires a build with "
                     "USING_OSS_CUTLASS_MOE_GEMM=ON")
+
+        return MoEEligibility.ok()
+
+    @classmethod
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Cutlass grouped-GEMM MoE: the widest quant and SM coverage there is.
+
+        Per-algorithm SM and dtype support lives in ``_QUANT_SUPPORT_TABLE``;
+        this method is only the interpreter for it.
+        """
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
+
+        eligibility = cls._check_build_capabilities(p, d)
+        if not eligibility.eligible:
+            return eligibility
 
         # Check minimum SM version for Cutlass backend
         if sm_version < 80:
