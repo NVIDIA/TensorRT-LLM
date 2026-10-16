@@ -2295,10 +2295,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   speculative decoding is not validated. Both settings use V2
         #   with the default use_kv_cache_manager_v2=True. The "auto"
         #   setting follows the model preference and can resolve to V1.
-        # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
-        #   rejects the MLA (576, 512) generation kernel (marked slower) and
-        #   the fallback C++ path requires num_heads % 64 == 0, which K3's
-        #   96 query heads violate.
+        # - tokens_per_block=64: keep the validated K3 page size. Earlier
+        #   releases needed it to avoid a legacy MLA fallback that could not
+        #   serve attention-DP's 96 query heads. The current FlashInfer
+        #   TRTLLM-Gen backend declines H=96 at either page size, allowing
+        #   the updated legacy TRTLLM-Gen autotuner to select a Q16 kernel.
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,
