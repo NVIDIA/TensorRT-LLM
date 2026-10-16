@@ -227,14 +227,15 @@ def setup_mm_encoder_attn_metadata(
         encoder_max_seq_len = max_seq_len
         if attention_metadata_capacity is not None:
             setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
-        graph_config = module._encoder_cuda_graph_config
+        graph_config = module.encoder_cuda_graph_config
         if graph_config is not None:
             graph_tokens = (
                 max(tokens for tokens, _ in graph_config.buckets)
                 if graph_config.buckets is not None
-                else graph_config.max_num_tokens or encoder_max_num_tokens
+                else graph_config.max_num_tokens
             )
-            encoder_max_seq_len = max(max_seq_len, graph_tokens)
+            if graph_tokens is not None:
+                encoder_max_seq_len = max(max_seq_len, graph_tokens)
         module.setup_attn_metadata(**setup_kwargs)
         module.set_attn_max_seq_len(encoder_max_seq_len)
 
