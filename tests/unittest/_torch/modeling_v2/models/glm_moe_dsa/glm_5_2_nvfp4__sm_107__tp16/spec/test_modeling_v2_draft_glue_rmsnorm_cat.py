@@ -31,10 +31,11 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     reference's correctly rounded one): together a few 1e-7 relative on the scale factor, which moves the BF16
     rounding of an output only when it lies that close to a rounding midpoint, by one ulp of that element.
 
-    So: 1 ulp element-wise against the row scale, 0.25 ulp of relative RMS. A wrong row, column or weight is off by
-    the size of the values themselves.
+    One BF16 ulp of an element in the row maximum's binade is up to twice the band's unit (2**-8 of the row
+    maximum). So: 2 ulp element-wise against the row scale, 0.25 ulp of relative RMS. A wrong row, column or weight
+    is off by the size of the values themselves.
     """
-    assert_within_ulp(out, ref, element_ulp=1.0, rms_ulp=0.25)
+    assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.25)
 
 
 def _build(spec, seed):

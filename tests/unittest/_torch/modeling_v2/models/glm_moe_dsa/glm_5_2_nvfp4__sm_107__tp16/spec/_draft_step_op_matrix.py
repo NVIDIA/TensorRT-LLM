@@ -192,14 +192,15 @@ def _compare(
 
     The RMSNorm outputs (`normed_out`, `glue_out`) differ from the FP32 reference in the order of the 6144
     squares and in the kernel's approximate reciprocal square root: a few 1e-7 relative on the scale, one BF16
-    ulp on the rare element that close to a rounding midpoint. So 1 ulp against the row scale and 0.25 ulp of
-    relative RMS, as for the step-0 glue kernel.
+    ulp on the rare element that close to a rounding midpoint, which is up to twice the band's unit (2**-8 of the
+    row maximum) in the maximum's binade. So 2 ulp against the row scale and 0.25 ulp of relative RMS, as for the
+    step-0 glue kernel.
     """
     for name, ref in expected.items():
         out = actual[name]
         if name in ("normed_out", "glue_out"):
             try:
-                assert_within_ulp(out, ref, element_ulp=1.0, rms_ulp=0.25)
+                assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.25)
             except AssertionError as exc:
                 raise AssertionError(f"{where}: {name}: {exc}") from exc
         else:
