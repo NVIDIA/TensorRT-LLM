@@ -5596,47 +5596,13 @@
         "load_balancer": {
           "anyOf": [
             {
-              "additionalProperties": false,
-              "description": "Pydantic configuration model for the Mixture of Experts (MoE) load balancer.\n\nThis model holds configuration data (`num_slots`, etc.) as well as\nruntime state (`_ep_rank`, `_ep_size`) which must be set via the\n`setup()` method before use.",
-              "properties": {
-                "initial_global_assignments": {
-                  "anyOf": [
-                    {
-                      "additionalProperties": {
-                        "items": {
-                          "type": "integer"
-                        },
-                        "type": "array"
-                      },
-                      "type": "object"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Initial Global Assignments"
-                },
-                "layer_updates_per_iter": {
-                  "default": 0,
-                  "title": "Layer Updates Per Iter",
-                  "type": "integer"
-                },
-                "num_slots": {
-                  "anyOf": [
-                    {
-                      "type": "integer"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Num Slots"
-                }
-              },
-              "title": "MoeLoadBalancerConfig",
-              "type": "object"
+              "$ref": "#/$defs/MoeLoadBalancerConfig"
+            },
+            {
+              "$ref": "#/$defs/MoePerLayerDynamicLoadBalancerConfig",
+              "required": [
+                "mode"
+              ]
             },
             {
               "type": [
@@ -5644,7 +5610,10 @@
                 "null"
               ]
             }
-          ]
+          ],
+          "default": null,
+          "description": "Configuration for standard or per-layer dynamic EPLB.",
+          "title": "Load Balancer"
         },
         "max_num_tokens": {
           "anyOf": [
@@ -5667,6 +5636,95 @@
         }
       },
       "title": "MoeConfig",
+      "type": "object"
+    },
+    "MoeLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure the standard asynchronous EPLB implementation.",
+      "properties": {
+        "initial_global_assignments": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial expert placement keyed by MoE layer index. Each value has `num_slots` entries, gives the expert ID held by each global slot, and covers every expert.",
+          "title": "Initial Global Assignments"
+        },
+        "layer_updates_per_iter": {
+          "default": 0,
+          "description": "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB.",
+          "title": "Layer Updates Per Iter",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "standard",
+          "default": "standard",
+          "description": "EPLB mode. `standard` is static EPLB when `layer_updates_per_iter` is 0 and online EPLB otherwise. Configs without `mode` use `standard`.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots.",
+          "title": "Num Slots"
+        }
+      },
+      "title": "MoeLoadBalancerConfig",
+      "type": "object"
+    },
+    "MoePerLayerDynamicLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure per-layer dynamic EPLB with Halo-Q scheduling.",
+      "properties": {
+        "auxiliary_sms": {
+          "default": 8,
+          "description": "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the HALO-Q scheduler and the in-switch copy kernel, which run one after the other on the copy stream. Must be smaller than the device SM count.",
+          "maximum": 128,
+          "minimum": 8,
+          "status": "prototype",
+          "title": "Auxiliary Sms",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "per_layer_dynamic",
+          "default": "per_layer_dynamic",
+          "description": "EPLB mode. `per_layer_dynamic` replicates each MoE layer's hot experts into helper slots in every forward pass, planned from that layer's current routing.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and greater than the number of experts. Each rank keeps its `num_experts / ep_size` resident experts and adds `(num_slots - num_experts) / ep_size` helper slots. Unlike standard EPLB, the helper slots are not per-layer replica weights: they are two shared helper banks that all MoE layers alternate between and refill in every forward pass.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_slots"
+      ],
+      "title": "MoePerLayerDynamicLoadBalancerConfig",
       "type": "object"
     },
     "MooncakeStoreConfig": {
