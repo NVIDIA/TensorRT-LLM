@@ -34,13 +34,13 @@ from typing import Dict, List
 import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.quantization import \
-    MXFP8CutlassFusedMoEMethod
+from tensorrt_llm._torch.moe.fused_moe.quantization import MXFP8CutlassFusedMoEMethod
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -54,8 +54,9 @@ BLOCK_SIZE = 32
 
 requires_mxfp8_moe = pytest.mark.skipif(
     not torch.cuda.is_available()
+    or getSMVersion() < 100
     or not hasattr(torch.ops.trtllm, "block_scale_interleave"),
-    reason="MXFP8 MoE scale staging requires CUDA + block_scale_interleave",
+    reason="MXFP8 MoE scale staging requires Blackwell + block_scale_interleave",
 )
 
 
@@ -92,10 +93,10 @@ def _rlhf_finalize(module) -> None:
     # every eligible module.
     for mod in module.modules():
         if hasattr(mod, "process_weights_after_loading") and not getattr(
-                mod, "_weights_removed", False):
+            mod, "_weights_removed", False
+        ):
             mod.process_weights_after_loading()
-        if hasattr(mod, "post_load_weights") and not getattr(
-                mod, "_weights_removed", False):
+        if hasattr(mod, "post_load_weights") and not getattr(mod, "_weights_removed", False):
             mod.post_load_weights()
 
 
@@ -103,8 +104,7 @@ def _refit(module, buckets: List[Dict[str, torch.Tensor]]) -> None:
     # Mirrors rlhf_utils.WorkerExtension.update_weights: one pre_reload_weights
     # walk, then one partial load per bucket, then a single finalize.
     for mod in module.modules():
-        if hasattr(mod, "pre_reload_weights") and not getattr(
-                mod, "_weights_removed", False):
+        if hasattr(mod, "pre_reload_weights") and not getattr(mod, "_weights_removed", False):
             mod.pre_reload_weights()
     for bucket in buckets:
         module.load_weights([dict(bucket)], allow_partial_loading=True)
@@ -120,8 +120,7 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     in float8_e4m3fn and NaN != NaN, so identical buffers would compare unequal
     purely because of the payload bytes.
     """
-    return t.view(torch.uint8) if t.dtype.itemsize == 1 else t.contiguous().view(
-        torch.uint8)
+    return t.view(torch.uint8) if t.dtype.itemsize == 1 else t.contiguous().view(torch.uint8)
 
 
 def _snapshot(module):
@@ -147,7 +146,8 @@ def _assert_matches(module, expected, label):
     for name, g, e in zip(names, got, expected):
         assert torch.equal(g, e), (
             f"{label}: {name} after bucketed refit differs from single-shot load "
-            f"(swizzle applied a wrong number of times)")
+            f"(swizzle applied a wrong number of times)"
+        )
 
 
 def _mxfp8_expert_weights(generator: torch.Generator):
@@ -158,16 +158,24 @@ def _mxfp8_expert_weights(generator: torch.Generator):
     """
     weights: Dict[str, torch.Tensor] = {}
     for e in range(NUM_EXPERTS):
-        for leaf, shape in (("w1", (INTERMEDIATE_SIZE, HIDDEN_SIZE)),
-                            ("w3", (INTERMEDIATE_SIZE, HIDDEN_SIZE)),
-                            ("w2", (HIDDEN_SIZE, INTERMEDIATE_SIZE))):
-            w = torch.randint(0, 240, shape, generator=generator, device="cuda",
-                              dtype=torch.uint8).view(torch.float8_e4m3fn)
+        for leaf, shape in (
+            ("w1", (INTERMEDIATE_SIZE, HIDDEN_SIZE)),
+            ("w3", (INTERMEDIATE_SIZE, HIDDEN_SIZE)),
+            ("w2", (HIDDEN_SIZE, INTERMEDIATE_SIZE)),
+        ):
+            w = torch.randint(
+                0, 240, shape, generator=generator, device="cuda", dtype=torch.uint8
+            ).view(torch.float8_e4m3fn)
             # UE8M0 exponents; keep them in a sane range so the values are
             # representative rather than denormal/inf.
-            sf = torch.randint(110, 140, (shape[0], shape[1] // BLOCK_SIZE),
-                               generator=generator, device="cuda",
-                               dtype=torch.uint8)
+            sf = torch.randint(
+                110,
+                140,
+                (shape[0], shape[1] // BLOCK_SIZE),
+                generator=generator,
+                device="cuda",
+                dtype=torch.uint8,
+            )
             weights[f"{e}.{leaf}.weight"] = w
             weights[f"{e}.{leaf}.weight_scale_inv"] = sf
     return weights
@@ -205,8 +213,7 @@ def test_mxfp8_bucketed_refit_matches_single_shot(bucket_order):
         "w3w1_then_w2": [_split(weights, {"w1", "w3"}), _split(weights, {"w2"})],
         "w2_then_w3w1": [_split(weights, {"w2"}), _split(weights, {"w1", "w3"})],
         "single_bucket": [weights],
-        "per_leaf": [_split(weights, {"w1"}), _split(weights, {"w3"}),
-                     _split(weights, {"w2"})],
+        "per_leaf": [_split(weights, {"w1"}), _split(weights, {"w3"}), _split(weights, {"w2"})],
     }[bucket_order]
 
     module = _make_module()
@@ -248,9 +255,11 @@ def test_mxfp8_pending_slots_drained_after_finalize():
     backend = _backend(module)
     module.load_weights([_split(weights, {"w1", "w3"})], allow_partial_loading=True)
     assert backend._mxfp8_w3_w1_sf_pending_slots, (
-        "staging w3/w1 scales must arm the w3_w1 pending set")
+        "staging w3/w1 scales must arm the w3_w1 pending set"
+    )
     assert not backend._mxfp8_w2_sf_pending_slots, (
-        "a w3/w1-only bucket must NOT arm the w2 pending set")
+        "a w3/w1-only bucket must NOT arm the w2 pending set"
+    )
 
     module.load_weights([_split(weights, {"w2"})], allow_partial_loading=True)
     assert backend._mxfp8_w2_sf_pending_slots
