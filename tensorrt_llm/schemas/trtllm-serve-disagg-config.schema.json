@@ -7265,7 +7265,7 @@
             }
           ],
           "default": null,
-          "description": "The dynamic batch config to use. This only applies for the TensorRT backend and cannot currently be used with the PyTorch backend."
+          "description": "The dynamic batch configuration used by the scheduler to adjust batch size and token limits at runtime. This option currently has no effect since the scheduler does not support dynamic batch adjustments in the pytorch backend."
         },
         "enable_prefix_aware_scheduling": {
           "default": true,
