@@ -815,6 +815,8 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
+        self.one_shot_max_bytes = _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+        self.early_trigger = False
         if dtype not in MNNVLAllReduce.get_supported_dtypes() or (
                 mapping.has_cp()):
             # This is safe as we always capture the exception when create this object
@@ -856,12 +858,16 @@ class MNNVLAllReduce(nn.Module):
         return supported and (explicitly_requested or mapping.is_multi_node())
 
     @staticmethod
-    def get_required_workspace_size(num_tokens: int, hidden_dim: int,
-                                    group_size: int, dtype: torch.dtype) -> int:
+    def get_required_workspace_size(
+            num_tokens: int,
+            hidden_dim: int,
+            group_size: int,
+            dtype: torch.dtype,
+            one_shot_max_bytes: int = _MNNVL_ONE_SHOT_THRESHOLD_BYTES) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
         # This should match the heuristic in allreduceOp.cpp.
         is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
-                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
+                       <= one_shot_max_bytes)
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
             workspace_size = num_tokens * hidden_dim * group_size * elem_size
@@ -942,6 +948,7 @@ class MNNVLAllReduce(nn.Module):
         self,
         input: torch.Tensor,
         all_reduce_params: AllReduceParams,
+        one_shot_max_bytes: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Forward pass for MNNVL AllReduce.
 
@@ -955,12 +962,15 @@ class MNNVLAllReduce(nn.Module):
             NVFP4 scale-factor output is 1-D).
         """
 
+        if one_shot_max_bytes is None:
+            one_shot_max_bytes = self.one_shot_max_bytes
         fusion_op = all_reduce_params.fusion_op
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
 
         workspace_size_bytes = self.get_required_workspace_size(
-            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
+            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype,
+            one_shot_max_bytes)
 
         # We use uint32_t to store workspace size related info. Safeguard against overflow.
         if workspace_size_bytes >= 2**32 - 1:
@@ -995,6 +1005,8 @@ class MNNVLAllReduce(nn.Module):
             is_fusion,  # rmsnorm_fusion
             all_reduce_params.scale,  # scale
             int(fusion_op),
+            one_shot_max_bytes,
+            self.early_trigger,
         )
         return tuple(outputs) if is_fusion else outputs[0]
 

@@ -68,6 +68,7 @@ struct AllReduceFusionParams
     void* scaleOut = nullptr;           //!< NVFP4 scale-factor output (used by NVFP4 fusion patterns)
     float const* scaleFactor = nullptr; //!< Quantization scale factor
     QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED; //!< NVFP4 scale-factor layout
+    bool earlyTrigger = false;
     cudaStream_t stream;                                          //!< CUDA stream for asynchronous kernel execution
 
     //! @}

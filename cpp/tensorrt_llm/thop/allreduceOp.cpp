@@ -2061,7 +2061,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
-    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
+    int64_t one_shot_max_bytes, bool early_trigger)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -2186,12 +2187,11 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    allreduce_params.earlyTrigger = early_trigger;
 
-    // Threshold to switch between one-shot and two-shot allreduce kernel.
-    // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    TORCH_CHECK(one_shot_max_bytes >= 0, "[mnnvlFusionAllReduce] one_shot_max_bytes must be non-negative");
 
-    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
+    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= static_cast<size_t>(one_shot_max_bytes))
     {
         tensorrt_llm::kernels::mnnvl::oneshotAllreduceFusionOp(allreduce_params);
     }
@@ -2314,7 +2314,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
         "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
-        "Tensor? scale=None, int fusion_op=0) -> "
+        "Tensor? scale=None, int fusion_op=0, int one_shot_max_bytes=1048576, bool early_trigger=False) -> "
         "Tensor[]");
     m.def(
         "allreduce("

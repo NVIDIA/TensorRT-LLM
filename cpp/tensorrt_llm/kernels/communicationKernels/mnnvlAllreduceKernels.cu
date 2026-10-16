@@ -336,6 +336,7 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    bool earlyTrigger;
 };
 
 template <typename PackedType, typename T>
@@ -590,6 +591,10 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
 
     cudaGridDependencySynchronize();
+    if (params.earlyTrigger)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #else
     int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
@@ -843,7 +848,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            false, params.layout};
+            false, params.layout, params.earlyTrigger};
 
         switch (params.nRanks)
         {
