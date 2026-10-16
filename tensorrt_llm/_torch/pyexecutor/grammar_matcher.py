@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from abc import ABC, abstractmethod
 
@@ -41,11 +44,20 @@ class GrammarMatcherFactory(ABC):
 
 class XGrammarMatcher(GrammarMatcher):
 
-    def __init__(self, matcher: xgrammar.GrammarMatcher):
+    def __init__(self, matcher: xgrammar.GrammarMatcher,
+                 tokenizer_vocab_size: int):
         super().__init__()
         self._matcher = matcher
+        self._tokenizer_vocab_size = tokenizer_vocab_size
 
     def accept_token(self, token_id: int) -> bool:
+        # Ids from the tokenizer's vocabulary size up to the padded LM-head
+        # size have no token, so no grammar accepts them; a drafter can still
+        # propose one. xgrammar before 0.2.6 rejects them too, but reads past
+        # its decoded vocabulary while logging the rejection, which can crash
+        # the process.
+        if token_id >= self._tokenizer_vocab_size:
+            return False
         return self._matcher.accept_token(token_id)
 
     def rollback(self, num_tokens: int) -> None:
@@ -90,6 +102,7 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
             cache_limit_bytes=cache_limit_bytes,
         )
         self.max_num_draft_tokens = max_num_draft_tokens
+        self._tokenizer_vocab_size = len(guided_decoding_config.encoded_vocab)
 
     def create(self,
                guided_decoding_params: GuidedDecodingParams) -> XGrammarMatcher:
@@ -115,7 +128,7 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
 
         matcher = xgrammar.GrammarMatcher(
             compiled_grammar, max_rollback_tokens=self.max_num_draft_tokens)
-        return XGrammarMatcher(matcher)
+        return XGrammarMatcher(matcher, self._tokenizer_vocab_size)
 
 
 class LLGuidanceMatcher(GrammarMatcher):

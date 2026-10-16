@@ -22,7 +22,7 @@ The configuration walkthrough focuses on the validated aggregated serving deploy
 
 * A complete Hugging Face-format Muse Spark Open checkpoint and tokenizer, e.g. `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` (`model_type: muse_spark`, architecture `MuseSparkForConditionalGeneration`). The checkpoint ships the routed-expert weights pre-quantized to NVFP4; no additional quantization step is needed.
 
-The examples below use `/path/to/musespark-open-checkpoint` — replace it with your local path (or the Hub id once published).
+The examples below use `/path/to/musespark-open-checkpoint` — replace it with your local path or the Hub id. The Hub repository is gated: request access on its Hugging Face page and set `HF_TOKEN` before serving it by id.
 
 ## Feature Support Notes
 
