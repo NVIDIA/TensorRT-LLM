@@ -1099,7 +1099,7 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
-        verify_offsets: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        verify_offsets: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
     ) -> torch.Tensor:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
@@ -1214,7 +1214,7 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
-        verify_offsets: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        verify_offsets: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
     ) -> torch.Tensor:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
@@ -1255,14 +1255,19 @@ class KimiKDALinearAttention(nn.Module):
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
 
-        if verify_offsets is not None and verify_offsets[1].shape[0] == num_generations + 1:
-            # Precomputed once for all KDA layers of this forward.
-            pending, cu_seqlens = verify_offsets
-        else:
+        if verify_offsets is None:
             pending = layer_cache.prev_num_accepted_tokens[
                 slot_indices
             ]  # accepted drafts of the previous round, per req
             cu_seqlens = kda_verify_cu_seqlens(pending, num_steps)
+        else:
+            # Precomputed once for all KDA layers of this forward by the model,
+            # from the same metadata, so a mismatch is a bug in the model.
+            pending, cu_seqlens, offset_steps = verify_offsets
+            assert cu_seqlens.shape[0] == num_generations + 1 and offset_steps == num_steps, (
+                f"precomputed KDA verify offsets cover {cu_seqlens.shape[0] - 1} requests x "
+                f"{offset_steps} steps, but the batch has {num_generations} x {num_steps}"
+            )
 
         out = self._dispatch.mtp_verify(
             x_q=x_q,

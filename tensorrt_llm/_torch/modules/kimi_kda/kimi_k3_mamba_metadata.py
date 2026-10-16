@@ -57,10 +57,10 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             max_batch_size, dtype=torch.int32, device="cuda"
         )
         self.generation_state_indices: torch.Tensor | None = None
-        # Optional per-forward ``(pending_drafts, cu_seqlens)`` for fused KDA
+        # Optional per-forward ``(pending_drafts, cu_seqlens, num_steps)`` for fused KDA
         # verification, shared by every KDA layer of the forward. A model may
         # set it before its layers run; layers compute their own otherwise.
-        self.kda_verify_offsets: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.kda_verify_offsets: tuple[torch.Tensor, torch.Tensor, int] | None = None
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()

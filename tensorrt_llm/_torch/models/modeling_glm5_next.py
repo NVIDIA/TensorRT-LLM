@@ -1962,7 +1962,7 @@ class Glm5NextModel(DecoderModel):
             start = runtime_ctx.num_contexts
             slots = mamba_metadata.state_indices[start : start + runtime_ctx.num_generations]
         pending = layer_cache.prev_num_accepted_tokens[slots]
-        mamba_metadata.kda_verify_offsets = (pending, kda_verify_cu_seqlens(pending, steps))
+        mamba_metadata.kda_verify_offsets = (pending, kda_verify_cu_seqlens(pending, steps), steps)
 
     def _fused_hc_ok(self) -> bool:
         """Whether every decoder layer is local (no PP pruning) for the fused loop."""

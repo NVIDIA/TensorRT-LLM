@@ -309,7 +309,7 @@ def test_fused_vs_sequential_two_rounds(
     )
     core2_fused = x2.new_empty(B * T, num_heads, K)
     pending = cache_fused.prev_num_accepted_tokens[slot_indices]
-    offsets = (pending, kda_verify_cu_seqlens(pending, T)) if model_offsets else None
+    offsets = (pending, kda_verify_cu_seqlens(pending, T), T) if model_offsets else None
     with with_multi_stream(True):
         result2_fused = rt_fused.forward_verify(
             x2,
