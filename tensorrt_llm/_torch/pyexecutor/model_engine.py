@@ -35,6 +35,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
@@ -500,6 +501,32 @@ class PyTorchModelEngine(ModelEngine):
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
+                if mpi_disabled() and self.mapping.world_size > 1:
+                    # Resolve the device-mesh dims the compiled forward reads
+                    # (mapping.tp_group & friends) while still eager: the
+                    # DeviceMesh resolver is compiler-disabled and must never
+                    # run under tracing; once memoized these reads trace as
+                    # constants.
+                    _ = self.mapping.tp_group
+                    _ = self.mapping.pp_group
+                    _ = self.mapping.cp_group
+                    if self.mapping.moe_ep_size > 1:
+                        _ = self.mapping.moe_tp_group
+                        _ = self.mapping.moe_ep_group
+                # torch.compile traces AllReduce.forward, whose lazy MNNVL
+                # workspace rescale cannot allocate inside the traced region -
+                # grow the workspaces to the engine maximum up front.
+                num_mnnvl_allreduces = 0
+                for module in self.model.modules():
+                    if isinstance(module, MNNVLAllReduce):
+                        module.prescale_workspace(self.max_num_tokens,
+                                                  self.model.config.hidden_size)
+                        num_mnnvl_allreduces += 1
+                if num_mnnvl_allreduces:
+                    logger.info(f"Pre-scaled the MNNVL allreduce workspace for "
+                                f"{num_mnnvl_allreduces} modules to cover "
+                                f"max_num_tokens={self.max_num_tokens} before "
+                                "torch.compile.")
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
