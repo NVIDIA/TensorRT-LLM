@@ -936,6 +936,90 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
     torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)
 
 
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE
+                    or get_sm_version() not in (100, 103, 107),
+                    reason="Requires SM100/SM103/SM107 CuTe DSL")
+@pytest.mark.parametrize("m", [1, 128])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_nvfp4_gemm_cutedsl(m, with_bias, monkeypatch, tmp_path):
+    from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile
+    from tensorrt_llm._torch.custom_ops import (cute_dsl_custom_ops,
+                                                torch_custom_ops)
+
+    sm_version = get_sm_version()
+    if sm_version == 107 and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("Requires Rubin CuTe DSL helpers")
+    torch.manual_seed(19999)
+    dtype = torch.bfloat16
+    x = torch.randn(m, 128, dtype=dtype, device="cuda")
+    w = torch.randn(256, 128, dtype=dtype, device="cuda")
+    x_scale = 2688 / x.abs().max().float()
+    w_scale = 2688 / w.abs().max().float()
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, x_scale, 16, False)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_scale, 16, False)
+    # Match Linear.alpha's [1] shape: compiled CuTe DSL kernels are cached per
+    # process, and a 0-d alpha cannot reuse a kernel compiled for [1].
+    alpha = (1 / (x_scale * w_scale)).reshape(1)
+    inputs = [x_fp4, w_fp4, x_sf, w_sf, alpha]
+    bias = torch.randn(256, dtype=dtype, device="cuda") if with_bias else None
+    reference = torch.ops.trtllm.nvfp4_gemm_cutlass(*inputs, dtype)
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.reset_statistics()
+    monkeypatch.setattr(tuner, "warmup", 1)
+    monkeypatch.setattr(tuner, "repeat", 1)
+    monkeypatch.setattr(tuner, "stream_delay_micro_secs", 10)
+    op = torch.ops.trtllm.nvfp4_gemm
+    kwargs = {"allowed_backends": "cutedsl", "bias": bias}
+    with torch.inference_mode():
+        # Exercise the uncached fallback through the public dispatcher.
+        fallback_no_bias = op(*inputs, dtype, allowed_backends="cutedsl")
+        torch.testing.assert_close(fallback_no_bias,
+                                   reference,
+                                   rtol=1e-2,
+                                   atol=0.15)
+        fallback = op(*inputs, dtype, **kwargs)
+        expected = (fallback_no_bias +
+                    bias if bias is not None else fallback_no_bias)
+        torch.testing.assert_close(fallback, expected, rtol=0, atol=0)
+        runner = torch_custom_ops.NVFP4GemmUnifiedRunner(0, dtype, ["cutedsl"])
+        tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
+        assert tactics and all(backend == "cutedsl" for backend, _ in tactics)
+        runner_type = (cute_dsl_custom_ops.CuteDSLNVFP4RubinLinear
+                       if sm_version == 107 else
+                       cute_dsl_custom_ops.CuteDSLNVFP4BlackwellRunner)
+        # Profile one real tactic to keep the dispatcher regression fast.
+        monkeypatch.setattr(runner_type, "get_valid_tactics",
+                            lambda self, inputs, profile: [tactics[0][1]])
+        with autotune(cache_path=str(tmp_path / "nvfp4_dispatch.json")):
+            tuned = op(*inputs, dtype, **kwargs)
+        op_name = "trtllm::nvfp4_gemm::gemm"
+        assert tuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
+        assert not tuner.stats.failed_profiling_count.get(op_name, set())
+        cached = op(*inputs, dtype, **kwargs)
+        cached_no_bias = op(*inputs, dtype, allowed_backends="cutedsl")
+        torch.testing.assert_close(cached_no_bias,
+                                   reference,
+                                   rtol=1e-2,
+                                   atol=0.15)
+        expected = (cached_no_bias +
+                    bias if bias is not None else cached_no_bias)
+        for result in (tuned, cached):
+            assert result.shape == (m, 256)
+            assert result.dtype == dtype
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = op(*inputs, dtype, **kwargs)
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, cached, rtol=0, atol=0)
+    tuner.clear_cache()
+
+
 def _skip_if_no_locality_domain():
     if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         pytest.skip("CuTe DSL package with Rubin support is not available")
@@ -1401,33 +1485,3 @@ def test_fp4_linear_locality_domain_weight_lifecycle_and_global_bias(
     assert all("bias" not in shard for shard in second_shards)
     torch.testing.assert_close(linear.bias.cpu(), second_bias)
     check_output(second_weight, second_scale, second_scale_global)
-
-
-@pytest.mark.skipif(get_sm_version() != 107
-                    or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
-                    reason="Requires Rubin CuTe DSL")
-def test_cute_dsl_nvfp4_non_inplace_rubin():
-    torch.manual_seed(47)
-    x, x_scale = _create_fp4_input(8, 128, torch.bfloat16)
-    w, w_sf, _, w_scale = _create_fp4_weights(256, 128, torch.bfloat16)
-    alpha = 1.0 / (x_scale * w_scale)
-    args = (x.fp4_tensor, w, x.scaling_factor, w_sf, alpha, torch.bfloat16)
-    expected = torch.ops.trtllm.nvfp4_gemm_cutlass(*args)
-    op = torch.ops.trtllm.cute_dsl_nvfp4_gemm_rubin
-    output = op(*args)
-    torch.testing.assert_close(output, expected, rtol=1e-2, atol=0.15)
-    assert output.shape == (8, 256)
-    assert output.dtype == torch.bfloat16
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = op(*args)
-    captured.fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(captured, expected, rtol=1e-2, atol=0.15)
-
-    with pytest.raises(ValueError, match="partition_id must be -1"):
-        op(*args, partition_id=0)
-    with pytest.raises(ValueError, match="must use"):
-        op(*args, output_tensor=output)

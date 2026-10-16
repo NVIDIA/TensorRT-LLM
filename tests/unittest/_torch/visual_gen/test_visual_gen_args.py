@@ -584,6 +584,48 @@ class TestParallelConfigValidation:
         assert pc.seq_parallel_size == 8
 
 
+class TestTokenShardedTPConfig:
+    """parallel_config.tp_layout validation and round trips."""
+
+    @pytest.mark.parametrize("tp_size,layout", [(1, None), (1, "replicated"), (2, "replicated")])
+    def test_off_unless_token_sharded(self, tp_size, layout):
+        # "replicated" is a truthy string: callers must test the property, not the field.
+        assert ParallelConfig(tp_size=tp_size, tp_layout=layout).token_sharded_tp is False
+
+    def test_requires_tp(self):
+        with pytest.raises(ValidationError, match=r"requires tp_size > 1 \(got tp_size=1\)"):
+            ParallelConfig(tp_layout="token_sharded")
+
+    @pytest.mark.parametrize(
+        "seq_kwargs",
+        [{"ulysses_size": 2}, {"ring_size": 2}, {"attn2d_size": (2, 1)}],
+        ids=["ulysses", "ring", "attn2d"],
+    )
+    def test_rejects_sequence_sharding(self, seq_kwargs):
+        with pytest.raises(ValidationError, match="cannot be combined with ulysses_size"):
+            ParallelConfig(tp_size=2, tp_layout="token_sharded", **seq_kwargs)
+
+    def test_composes_with_cfg(self):
+        pc = ParallelConfig(cfg_size=2, tp_size=2, tp_layout="token_sharded")
+        assert pc.token_sharded_tp is True
+        assert pc.n_workers == 4
+
+    def test_yaml_roundtrip(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "parallel_config:\n"
+            "  cfg_size: 2\n"
+            "  tp_size: 2\n"
+            "  tp_layout: token_sharded\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert args.parallel_config.token_sharded_tp is True
+        dumped = args.model_dump()
+        assert dumped["parallel_config"]["tp_layout"] == "token_sharded"
+        assert VisualGenArgs(**dumped).parallel_config == args.parallel_config
+
+
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
 
