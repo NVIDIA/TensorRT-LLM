@@ -3686,7 +3686,8 @@ def test_v2_kda_replay_allocates_single_kug_history():
         assert mgr.intermediate_ssm_states is None
         assert mgr.intermediate_conv_states.shape[:3] == (2, 4, 3)
         assert mgr.intermediate_state_indices.shape == (4,)
-        assert not mgr.use_replay_state_update
+        assert mgr.use_replay_state_update
+        assert mgr.use_kda_replay_update
 
         layer_cache = mgr.mamba_layer_cache(0)
         cache_size = layer_cache.temporal.shape[0]
@@ -4168,6 +4169,7 @@ def _kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec):
             history_len=mgr.prev_num_accepted_tokens,
             output=output,
             candidate_x=mgr.intermediate_conv_states[layer_offset],
+            history_window=mgr.replay_history_size,
         )
         outputs.append(output)
     return torch.stack(outputs)

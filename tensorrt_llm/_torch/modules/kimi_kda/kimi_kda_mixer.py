@@ -479,7 +479,8 @@ class KimiKDALinearAttention(nn.Module):
                 cores.append(prefill_core)
         if num_decodes > 0:
             decode_rows = num_tokens - num_ctx_tokens
-            if decode_rows == num_decodes:
+            has_kda_replay = self._has_kda_replay_caches(layer_cache)
+            if decode_rows == num_decodes and not has_kda_replay:
                 decode_core = self.forward_decode(
                     hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
@@ -502,7 +503,7 @@ class KimiKDALinearAttention(nn.Module):
                 )
                 replay_metadata = None
                 replay_dummy_mask = None
-                if self._has_kda_replay_caches(layer_cache):
+                if has_kda_replay:
                     cache_manager = attn_metadata.kv_cache_manager
                     replay_metadata = cache_manager.get_replay_state_update_metadata()
                     dummy_mask = cache_manager.get_replay_dummy_request_mask()
@@ -1184,11 +1185,12 @@ class KimiKDALinearAttention(nn.Module):
         if replay_metadata is None or is_dummy is None:
             raise RuntimeError("KDA replay requires metadata and a dummy mask")
         if (
-            num_steps != replay_metadata.replay_step_width
+            num_steps > replay_metadata.replay_step_width
             or replay_metadata.replay_history_size not in (16, 32)
         ):
             raise RuntimeError(
-                "KDA replay requires the configured replay width and a history window of 16 or 32"
+                "KDA replay requires a runtime width no larger than the configured "
+                "width and a history window of 16 or 32"
             )
         if self.conv_size != 4 or self.gate_lower_bound != -5.0:
             raise RuntimeError("KDA replay requires Conv4 and gate_lower_bound=-5")
@@ -1228,6 +1230,7 @@ class KimiKDALinearAttention(nn.Module):
             dt_bias=self._dt_bias_f32,
             output=replay_output,
             candidate_x=layer_cache.intermediate_conv_window,
+            history_window=replay_metadata.replay_history_size,
         )
         core = self._output_gate(x, replay_output, onorm_g)
         # Can be removed once attention writes the core in place.

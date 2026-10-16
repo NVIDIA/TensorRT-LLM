@@ -113,14 +113,18 @@ def _replay_reference(
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strong_decay", [False, True], ids=["weak-decay", "strong-decay"])
+@pytest.mark.parametrize(
+    ("width", "strong_decay"),
+    [(1, False), (3, False), (7, True)],
+    ids=["single-token", "weak-decay", "strong-decay"],
+)
 @torch.no_grad()
-def test_kda_mtp_replay_matches_reference(state_dtype, strong_decay):
+def test_kda_mtp_replay_matches_reference(state_dtype, width, strong_decay):
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
 
     torch.manual_seed(7)
     batch, slots, heads = 3, 6, 3
-    width = 7 if strong_decay else 3
+    token_capacity = 8
     channels = 3 * heads * DIM
     physical_width = 4 * heads * DIM
     raw_values = _randn((batch, width, channels), 0.09).to(torch.bfloat16)
@@ -136,7 +140,7 @@ def test_kda_mtp_replay_matches_reference(state_dtype, strong_decay):
     raw_g = _randn((batch, width, heads, DIM), 0.85, -0.36).to(torch.bfloat16)
     raw_beta = _randn((batch, width, heads), 1.0, 2.7).to(torch.bfloat16)
     checkpoint = _randn((slots, heads, DIM, DIM), 0.012).to(state_dtype)
-    capacity = WINDOW + width
+    capacity = WINDOW + token_capacity
     raw_history_k = _randn((slots, heads, capacity, DIM), 0.09)
     history_k = (
         raw_history_k
@@ -185,7 +189,7 @@ def test_kda_mtp_replay_matches_reference(state_dtype, strong_decay):
     )
     output = torch.empty_like(reference_output)
     candidate_x = torch.full(
-        (batch, width, channels), torch.nan, device="cuda", dtype=torch.bfloat16
+        (batch, token_capacity, channels), torch.nan, device="cuda", dtype=torch.bfloat16
     )
     checkpoint_before = checkpoint.clone()
     conv_before = conv_state.clone()
@@ -207,11 +211,13 @@ def test_kda_mtp_replay_matches_reference(state_dtype, strong_decay):
         dt_bias,
         output,
         candidate_x,
+        history_window=WINDOW,
     )
 
     live = ~is_dummy
     torch.testing.assert_close(output[live], reference_output[live], rtol=2e-2, atol=5e-3)
-    torch.testing.assert_close(candidate_x[live], raw_x[live], rtol=0, atol=0)
+    torch.testing.assert_close(candidate_x[live, :width], raw_x[live], rtol=0, atol=0)
+    assert torch.isnan(candidate_x[:, width:]).all()
     torch.testing.assert_close(history_k, reference_k, rtol=1e-2, atol=1.5e-3)
     torch.testing.assert_close(history_u, reference_u, rtol=2e-2, atol=5e-3)
     torch.testing.assert_close(history_G, reference_G, rtol=1e-5, atol=1e-5)
