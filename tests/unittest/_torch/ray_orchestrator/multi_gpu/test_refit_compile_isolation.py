@@ -89,7 +89,7 @@ from _torch.ray_orchestrator.multi_gpu.test_llm_update_weights_multi_gpu import 
 )
 from safetensors import safe_open
 from transformers import AutoTokenizer
-from utils.util import skip_pre_blackwell
+from utils.util import skip_pre_rubin
 
 from tensorrt_llm import LLM
 from tensorrt_llm._ray_utils import control_action_decorator
@@ -732,7 +732,7 @@ def _run_engine(engine: _Engine) -> None:
 
 
 @pytest.mark.high_cuda_memory
-@skip_pre_blackwell
+@skip_pre_rubin
 @pytest.mark.parametrize("engine_key", list(_ENGINES))
 def test_refit_isolation_engine(monkeypatch, engine_key):
     """Build one engine for ``engine_key`` and persist its greedy outputs."""

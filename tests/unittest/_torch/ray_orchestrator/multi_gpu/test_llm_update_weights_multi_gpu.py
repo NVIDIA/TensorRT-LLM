@@ -26,7 +26,7 @@ from transformers import (
 )
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
-from utils.util import skip_pre_blackwell, skip_pre_hopper
+from utils.util import skip_pre_blackwell, skip_pre_hopper, skip_pre_rubin
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
@@ -1431,8 +1431,12 @@ def _run_qwen35_397b_bf16_tp8_multinode(
     if not os.path.isdir(model_dir):
         pytest.skip(f"Model directory {model_dir} does not exist")
 
-    groups = sorted({_qwen35_35b_weight_group(name)
-                     for name in _qwen35_35b_selected_checkpoint_names(model_dir)})
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
     del tokenizer
@@ -1454,8 +1458,9 @@ def _run_qwen35_397b_bf16_tp8_multinode(
         max_batch_size=2,
         max_seq_len=256,
         max_num_tokens=256,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.05,
-                                      mamba_ssm_cache_dtype="float32"),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False, free_gpu_memory_fraction=0.05, mamba_ssm_cache_dtype="float32"
+        ),
         model_kwargs=_qwen35_35b_model_kwargs(),
         moe_config=MoeConfig(backend="CUTLASS"),
         enable_chunked_prefill=True,
@@ -1466,12 +1471,14 @@ def _run_qwen35_397b_bf16_tp8_multinode(
         for group in groups:
             llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, group))
         llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, None))
-        return [output.outputs[0].generation_logits.detach().cpu()
-                for output in llm.generate(prompts, sampling_params)]
+        return [
+            output.outputs[0].generation_logits.detach().cpu()
+            for output in llm.generate(prompts, sampling_params)
+        ]
 
 
 @pytest.mark.high_cuda_memory
-@skip_pre_blackwell
+@skip_pre_rubin
 def test_llm_update_weights_qwen35_397b_bf16_tp8_compiled_no_pcg(monkeypatch):
     """BF16 control: eager and torch.compile TP8 refits must agree without PCG."""
     _attach_to_tp8_ray_cluster(monkeypatch)
@@ -1483,7 +1490,7 @@ def test_llm_update_weights_qwen35_397b_bf16_tp8_compiled_no_pcg(monkeypatch):
 
 
 @pytest.mark.high_cuda_memory
-@skip_pre_blackwell
+@skip_pre_rubin
 def test_llm_update_weights_qwen35_397b_mxfp8_tp8_piecewise_cuda_graph(
     monkeypatch,
 ):
@@ -1499,7 +1506,7 @@ def test_llm_update_weights_qwen35_397b_mxfp8_tp8_piecewise_cuda_graph(
 
 
 @pytest.mark.high_cuda_memory
-@skip_pre_blackwell
+@skip_pre_rubin
 def test_llm_update_weights_qwen35_397b_mxfp8_tp8_eager_repeat(
     monkeypatch,
 ):
