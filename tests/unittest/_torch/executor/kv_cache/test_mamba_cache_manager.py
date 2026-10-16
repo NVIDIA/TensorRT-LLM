@@ -2395,11 +2395,8 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
-<<<<<<< HEAD
     enable_kv_pool_rebalance=False,
-=======
     use_flashinfer_ring_replay=False,
->>>>>>> 8e05dceb3c ([TRTLLM-16320][feat] Add FlashInfer ring-buffer replay for GDN MTP)
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
