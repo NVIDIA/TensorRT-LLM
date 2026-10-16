@@ -850,6 +850,29 @@ WindowBlockManager::~WindowBlockManager()
     TLLM_LOG_DEBUG("%s - reused tokens:                       %.0f ", mLogPrefix.c_str(), mReusedTokens);
     TLLM_LOG_DEBUG("%s - reused tokens percentage (%%):        %.2f ", mLogPrefix.c_str(),
         mTotalInputTokens == 0.0 ? 0.0 : 100.0 * mReusedTokens / mTotalInputTokens);
+
+    // A block and its lookup node own each other: the trie stores the block as its value and
+    // the block stores the node in mLookupNode, both with shared_ptr. mAllBlocksById is the
+    // real owner, so that cycle only keeps blocks and nodes alive past this manager. Detach
+    // what is still attached. detachFromLookupNode() returns early when there is nothing to
+    // detach, so this is a no-op for blocks that already left the tree.
+    //
+    // The tree outlives this call: BlockManager declares mLookupTree before
+    // mWindowBlockManagers, so the managers are destroyed first.
+    for (auto const& blocks : {std::cref(mAllBlocksById), std::cref(mAllPlaceholderBlocksById)})
+    {
+        for (auto const& block : blocks.get())
+        {
+            if (block)
+            {
+                block->detachFromLookupNode();
+            }
+        }
+    }
+    if (mCachedBlocksRoot)
+    {
+        mCachedBlocksRoot->detachFromLookupNode();
+    }
 }
 
 bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
