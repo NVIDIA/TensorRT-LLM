@@ -2166,25 +2166,23 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         from .mixed_precision_kv_view import MixedPrecisionKVView
 
         staged = MixedPrecisionKVView.create(
+            self,
             metadata,
-            self.layer_idx,
-            q.dtype,
+            q,
+            k,
+            v,
             max_page_size=64,
             history_dequant_scale=(forward_args.kv_scale_quant_orig
                                    if forward_args.kv_scale_quant_orig
                                    is not None else self.kv_scale_quant_orig))
         if staged is None:
             return self._forward_impl(q, k, v, metadata, forward_args)
-        if self.is_mla_enable or self.sparse_params is not None:
+        if self.sparse_params is not None:
             raise NotImplementedError(
                 "Mixed-precision staging requires dense K/V Attention")
         if metadata.kv_layout != "HND":
             raise NotImplementedError(
                 "TRTLLM mixed-precision writes require HND layout")
-        if k is None and v is None and q.shape[
-                -1] == self.num_heads * self.head_dim:
-            raise NotImplementedError(
-                "Mixed-precision staging requires new K/V inputs")
         metadata = copy.copy(metadata)
         metadata.kv_cache_manager = staged
         metadata.kv_cache_block_offsets = staged.block_offsets()

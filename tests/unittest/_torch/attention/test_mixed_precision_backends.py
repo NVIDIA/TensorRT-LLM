@@ -67,8 +67,11 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
         num_heads=heads,
         head_dim=width,
         num_kv_heads=heads,
-        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+        quant_config=QuantConfig(
+            kv_cache_quant_algo="FP8" if high_dtype == DataType.FP8 else "NVFP4"
+        ),
     )
+    original_fp8_kv_cache = attention.has_fp8_kv_cache
     if backend is TrtllmAttention:
         original_state = (
             attention.quant_mode,
@@ -120,9 +123,12 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
         if backend is TrtllmAttention:
             selection_cache = attention._unquantized_fmha_manager
             assert selection_cache is not None
-            with patch.object(attention, "_forward_impl", side_effect=RuntimeError("test failure")):
-                with pytest.raises(RuntimeError, match="test failure"):
-                    forward(0, length, True)
+        implementation = "_forward_impl" if backend is TrtllmAttention else "forward_impl"
+        with patch.object(attention, implementation, side_effect=RuntimeError("test failure")):
+            with pytest.raises(RuntimeError, match="test failure"):
+                forward(0, length, True)
+        assert attention.has_fp8_kv_cache == original_fp8_kv_cache
+        if backend is TrtllmAttention:
             assert (
                 attention.quant_mode,
                 attention.has_fp8_kv_cache,
@@ -130,9 +136,9 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
                 attention.local_layer_idx,
                 attention._fmha_manager,
             ) == original_state
-            torch.testing.assert_close(
-                manager.get_buffers(0, kv_layout="HND"), history_before, rtol=0, atol=0
-            )
+        torch.testing.assert_close(
+            manager.get_buffers(0, kv_layout="HND"), history_before, rtol=0, atol=0
+        )
         for request_id in request_ids:
             cache = manager.kv_cache_map[request_id]
             assert cache.resize(None, length)
@@ -142,6 +148,7 @@ def test_optimized_two_pool_prefill_and_decode(backend, high_dtype, compute_dtyp
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
         assert manager._staging_buffer.data_ptr() == arena
+        assert attention.has_fp8_kv_cache == original_fp8_kv_cache
         if backend is TrtllmAttention:
             assert attention._unquantized_fmha_manager is selection_cache
             assert (

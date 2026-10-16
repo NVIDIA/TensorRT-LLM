@@ -21,7 +21,7 @@ from ...pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheMana
 from ..kv_cache_conversion import dequantize_nvfp4_kv, encode_high_precision_kv, quantize_nvfp4_kv
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionBackend, AttentionMetadata
 
 
 class _TokenLocations(NamedTuple):
@@ -40,9 +40,11 @@ class MixedPrecisionKVView:
     @classmethod
     def create(
         cls,
+        attention: "AttentionBackend",
         metadata: "AttentionMetadata",
-        layer_idx: int,
-        dtype: torch.dtype,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
         *,
         history_dequant_scale: torch.Tensor | None = None,
         max_page_size: int | None = None,
@@ -50,6 +52,7 @@ class MixedPrecisionKVView:
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
             return None
+        layer_idx = attention.layer_idx
         if manager.kv_factor == 1 and manager._uses_native_mixed_precision_rows:
             return None
         if manager.layer_offsets[layer_idx] not in manager.high_layers:
@@ -60,9 +63,18 @@ class MixedPrecisionKVView:
             )
         if metadata.is_cross or manager.kv_factor != 2:
             raise NotImplementedError("Mixed-precision staging requires single-beam dense self K/V")
-        if dtype != manager.compute_dtype:
+        if q.dtype != manager.compute_dtype:
             raise ValueError("Attention input dtype differs from its reserved mixed-precision view")
-        return cls(metadata, layer_idx, dtype, history_dequant_scale, max_page_size)
+        fused_qkv = (
+            attention.support_fused_qkv()
+            and k is None
+            and v is None
+            and q.shape[-1]
+            == (attention.num_heads + 2 * attention.num_kv_heads) * attention.head_dim
+        )
+        if not (fused_qkv or (k is not None and v is not None)):
+            raise ValueError("Mixed-precision staging requires new K/V inputs")
+        return cls(metadata, layer_idx, q.dtype, history_dequant_scale, max_page_size)
 
     def __init__(
         self,

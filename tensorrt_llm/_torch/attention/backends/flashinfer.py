@@ -2708,7 +2708,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # Key and Value
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
-        has_fp8_kv_cache = kv_cache.dtype == torch.float8_e4m3fn
 
         # VSWA: swap in the correct pool's page indices for this layer
         # before both the KV cache append and the attention plan/run.
@@ -2718,7 +2717,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-            if has_fp8_kv_cache:
+            if self.has_fp8_kv_cache:
+                assert kv_cache.dtype == torch.float8_e4m3fn, (
+                    f"KV cache should have fp8 dtype, but get {kv_cache.dtype}")
                 k = k.to(torch.float8_e4m3fn)
                 v = v.to(torch.float8_e4m3fn)
             assert k.dtype == v.dtype == kv_cache.dtype, (
@@ -2740,7 +2741,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # (QkvE4m3OBfloat16) can be used.  trtllm-gen context cubins
         # require same Q/KV dtype; only decode cubins support mixed dtypes.
         # Guard on flashinfer_backend to avoid affecting fa2/fa3 paths.
-        if (self.flashinfer_backend == "trtllm-gen" and has_fp8_kv_cache
+        if (self.flashinfer_backend == "trtllm-gen" and self.has_fp8_kv_cache
                 and q.dtype != kv_cache.dtype):
             q = q.to(kv_cache.dtype)
 
@@ -2856,17 +2857,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         from .mixed_precision_kv_view import MixedPrecisionKVView
 
         staged = MixedPrecisionKVView.create(
+            self,
             metadata,
-            self.layer_idx,
-            q.dtype,
+            q,
+            k,
+            v,
             history_dequant_scale=forward_args.kv_scale_quant_orig)
         if staged is not None:
-            if self.is_mla_enable:
-                raise NotImplementedError(
-                    "Mixed-precision staging requires dense K/V Attention")
-            if k is None or v is None:
-                raise NotImplementedError(
-                    "Mixed-precision staging requires new K/V inputs")
             metadata = copy.copy(metadata)
             metadata.kv_cache_manager = staged
             # Keep the native prepared row lengths, append positions and CSR
@@ -2925,6 +2922,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
+        original_fp8_kv_cache = self.has_fp8_kv_cache
+        if staged is not None:
+            self.has_fp8_kv_cache = False
         try:
             self.forward_impl(
                 q=q,
@@ -2945,6 +2945,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 type(self).__name__, self.layer_idx, metadata,
                 forward_args.attention_window_size, exc)
             raise
+        finally:
+            if staged is not None:
+                self.has_fp8_kv_cache = original_fp8_kv_cache
         if staged is not None:
             staged.writeback()
         return output
