@@ -20,8 +20,8 @@ import importlib
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, ClassVar, Dict, List, Mapping, NamedTuple,
-                    Optional, Protocol, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, Mapping, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -34,13 +34,17 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
-                         _as_cpu_tensor, _compute_mm_masks,
+from .multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+from .multimodal import \
+    MultimodalEncoderItemMetadata as MultimodalEncoderItemMetadata
+from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths,
-                         hexdigest_to_int32, validate_mm_inputs)
+                         default_hasher, find_mm_token_lengths)
+from .multimodal import \
+    get_multimodal_encoder_item_metadata as get_multimodal_encoder_item_metadata
+from .multimodal import hexdigest_to_int32, validate_mm_inputs
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import create_prefix_token_cache
 from .tokenization import tokenize_prompt
@@ -58,77 +62,6 @@ def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
     except (TypeError, ValueError, RuntimeError):
         return None
     return hasher.hexdigest()
-
-
-class MultimodalEncoderItemMetadata(NamedTuple):
-    """Prompt-ordered metadata for atomic multimodal encoder items."""
-
-    item_refs: List[Tuple[str, int]]
-    """``(modality, local index)`` per atomic item, in prompt order.
-
-    ``modality`` is ``"image"``/``"video"``/``"audio"`` and the local index
-    identifies the item within that modality's processed payload (for
-    example, its row range in ``pixel_values``), so an item can be sliced
-    out for a single-item encoder call.
-
-    Shared by item scheduling and full-request encoder output assembly.
-    `MultimodalParams.mm_item_order` remains a fallback for legacy processors
-    that do not emit this metadata.
-    """
-
-    encoder_token_lengths: List[int]
-    """Physical encoder attention-token cost of each item.
-
-    This is what one encoder forward actually attends over (for example,
-    pre-merger patch tokens for Qwen ViTs) and is the unit the scheduler
-    charges against ``encoder_max_num_tokens``.
-    """
-
-    output_embedding_lengths: List[int]
-    """Embedding rows each item contributes to the LLM prompt.
-
-    Must equal the item's placeholder span in the prompt (the
-    ``multimodal_embedding_lengths`` contract); used to size and split the
-    encoder output back into per-item tensors.
-    """
-
-    def validate(self) -> None:
-        """Enforce the cross-field contract on producer-supplied metadata."""
-        if not all(isinstance(values, list) for values in self):
-            raise TypeError(
-                "Multimodal encoder item metadata fields must be lists")
-        lengths = (self.encoder_token_lengths + self.output_embedding_lengths)
-        if not all(isinstance(length, int) for length in lengths):
-            raise TypeError(
-                "Multimodal encoder item lengths must contain only integers")
-        if not (len(self.item_refs) == len(self.encoder_token_lengths) == len(
-                self.output_embedding_lengths)):
-            raise ValueError(
-                "Multimodal encoder item references and lengths must align")
-        if any(length <= 0 for length in self.encoder_token_lengths):
-            raise ValueError(
-                "Multimodal encoder token lengths must be positive")
-        if any(length <= 0 for length in self.output_embedding_lengths):
-            raise ValueError(
-                "Multimodal encoder output embedding lengths must be positive")
-
-
-def get_multimodal_encoder_item_metadata(
-    multimodal_data: Optional[Dict[str, Any]],
-) -> Optional[MultimodalEncoderItemMetadata]:
-    """Return typed atomic-item metadata from Python multimodal data."""
-    if multimodal_data is None:
-        return None
-    if not isinstance(multimodal_data, dict):
-        raise TypeError("multimodal_data must be a dict")
-    metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
-    if metadata is None:
-        return None
-    if not isinstance(metadata, MultimodalEncoderItemMetadata):
-        raise TypeError(f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a "
-                        "MultimodalEncoderItemMetadata")
-    metadata.validate()
-    return metadata
 
 
 class InputProcessor(Protocol):
