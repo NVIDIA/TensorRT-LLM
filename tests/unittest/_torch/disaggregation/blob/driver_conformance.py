@@ -27,6 +27,7 @@ from host_memory import HostBuffer
 from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverRejected,
+    Hint,
     OpHandle,
     ProbeStatus,
     RegionHandle,
@@ -153,8 +154,9 @@ class Harness:
         self.ops.append(op)
         return op
 
-    def get(self, rows: Sequence[RowIO]) -> OpHandle:
-        op = self.driver.get(rows)
+    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
+        # Without a hint the call keeps its old shape, as the backend's does.
+        op = self.driver.get(rows) if hint is None else self.driver.get(rows, hint)
         self.ops.append(op)
         return op
 

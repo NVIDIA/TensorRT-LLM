@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     MISS,
     DriverCapabilities,
     DriverRejected,
+    Hint,
     OpHandle,
     ProbeStatus,
     RegionHandle,
@@ -129,6 +130,17 @@ def _run(target: Callable[..., object], *args: object) -> threading.Thread:
     return worker
 
 
+class _HintFreeSignatures(MemoryDriver):
+    """A driver written before hints existed: ``get`` and ``probe`` take no hint. With
+    ``hints`` undeclared the backend never passes one, so it stays a valid driver."""
+
+    def get(self, rows: Sequence[RowIO]) -> MemoryOp:  # type: ignore[override]
+        return super().get(rows)
+
+    def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:  # type: ignore[override]
+        return super().probe(keys, budget_s)
+
+
 class TestMemoryDriverConformance(DriverConformance):
     driver_cls: type[MemoryDriver] = MemoryDriver
     capabilities = DEFAULT_CAPABILITIES
@@ -140,6 +152,10 @@ class TestMemoryDriverConformance(DriverConformance):
         store = GatedStore(held={KEY_A})
         store.gate.clear()
         return self.driver_cls(store, capabilities=self.capabilities), KEY_A, store.gate.set
+
+
+class TestHintFreeDriverConformance(TestMemoryDriverConformance):
+    driver_cls = _HintFreeSignatures
 
 
 class TestMemoryDriver:
@@ -560,6 +576,37 @@ class TestMemoryDriver:
         self._shutdown(driver)
         assert driver.probes_in_flight() == 0
 
+    def test_memory_driver_rejects_a_hint_it_cannot_read_before_any_effect(self) -> None:
+        """The backend rejects such hints before dispatch; this driver also refuses them itself,
+        so a backend bug cannot make it read with a hint it silently dropped."""
+        driver = self.make()
+        self._publish(driver, {"A": b"aaaaaaaa"})
+        reader = Endpoint(driver, ["A"], fill=0x2D)
+        with pytest.raises(DriverRejected):
+            driver.get(reader.rows(), {"source": "worker-7"})
+        assert reader.read_row(0) == b"-" * SLOT
+        with pytest.raises(DriverRejected):
+            driver.probe([KEY_A], TIMEOUT, {"source": "worker-7"})
+        assert statuses(driver, driver.get(reader.rows())) == [RowStatus.READY]
+        assert driver.hints_seen == []
+
+    def test_a_hint_reaches_a_driver_that_declares_hints_unchanged(self) -> None:
+        hinted = DriverCapabilities(
+            get=True, put=True, cancel=True, probe=True, max_rows_per_op=None, hints=True
+        )
+        driver = self.make(capabilities=hinted)
+        self._publish(driver, {"A": b"aaaaaaaa"})
+        reader = Endpoint(driver, ["A"], fill=0x2D)
+        hint = {"source": "worker-7"}
+        op = driver.get(reader.rows(), hint)
+        assert statuses(driver, op) == [RowStatus.READY]
+        assert reader.read_row(0) == b"aaaaaaaa"
+        assert driver.probe([KEY_A], TIMEOUT, hint) == (ProbeStatus.HIT,)
+        assert driver.hints_seen == [hint, hint]
+        assert all(seen is hint for seen in driver.hints_seen)  # the same object, not a copy
+        assert statuses(driver, driver.get(reader.rows())) == [RowStatus.READY]
+        assert len(driver.hints_seen) == 2  # no hint, nothing recorded
+
     def test_probe_unknown_switch(self) -> None:
         driver = self.make()
         self._publish(driver, {"A": b"aaaaaaaa"})
@@ -770,10 +817,10 @@ class _AcceptsDuplicateKeys(MemoryDriver):
 
 
 class _TouchesMemoryBeforeChecking(MemoryDriver):
-    def get(self, rows: Sequence[RowIO]) -> MemoryOp:
+    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
         for io in rows:
             ctypes.memset(io.payload.address, 0, io.payload.nbytes)
-        return super().get(rows)
+        return super().get(rows, hint)
 
 
 class _MissTouchesTheDestination(MemoryDriver):
@@ -827,9 +874,11 @@ class _ChangesItsCapabilities(MemoryDriver):
 
 
 class _ProbeTakesItsTime(MemoryDriver):
-    def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
+    def probe(
+        self, keys: Sequence[str], budget_s: float, hint: Hint = None
+    ) -> tuple[ProbeStatus, ...]:
         time.sleep(budget_s + 0.8)
-        return super().probe(keys, budget_s)
+        return super().probe(keys, budget_s, hint)
 
 
 class _KeepsAcceptingWhileDraining(MemoryDriver):
@@ -892,20 +941,29 @@ class _CallsDeclinedAFault(MemoryDriver):
 
 
 class _ProbeIgnoresTheBudget(MemoryDriver):
-    def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
+    def probe(
+        self, keys: Sequence[str], budget_s: float, hint: Hint = None
+    ) -> tuple[ProbeStatus, ...]:
         return tuple(self.store.presence(key) for key in keys)
 
 
 class _ProbesWithoutLimit(MemoryDriver):
-    def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
+    def probe(
+        self, keys: Sequence[str], budget_s: float, hint: Hint = None
+    ) -> tuple[ProbeStatus, ...]:
         with self._lock:
             self._probes = self._probes[: MAX_PROBES_IN_FLIGHT - 1]
-        return super().probe(keys, budget_s)
+        return super().probe(keys, budget_s, hint)
 
 
 class _ReportsAccessEndedEarly(MemoryDriver):
     def access_ended(self, op: OpHandle) -> bool:
         return True
+
+
+class _AcceptsHintsItCannotRead(MemoryDriver):
+    def _check_hint(self, hint: Hint) -> None:
+        pass
 
 
 class _ExecutesWithTheControls(MemoryDriver):
@@ -1022,6 +1080,10 @@ BROKEN_MEMORY = {
     "no room is declined": (
         _CallsDeclinedAFault,
         "test_a_row_the_store_has_no_room_for_is_declined_not_faulted",
+    ),
+    "an unreadable hint is refused": (
+        _AcceptsHintsItCannotRead,
+        "test_memory_driver_rejects_a_hint_it_cannot_read_before_any_effect",
     ),
     "a submission racing a drain keeps its handle": (
         _ExecutesWithTheControls,

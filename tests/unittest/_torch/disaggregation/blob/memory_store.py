@@ -37,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     READY,
     DriverCapabilities,
     DriverRejected,
+    Hint,
     OpHandle,
     ProbeStatus,
     RegionHandle,
@@ -182,6 +183,7 @@ class MemoryOp:
 
     kind: Kind
     rows: list[_Row]
+    hint: Hint = None
     access_ended: bool = False
     unprovable: bool = False
 
@@ -215,6 +217,7 @@ class MemoryDriver:
         self._probe_unknown = False
         self._register_failure: tuple[str, bool] | None = None
         self._unregister_failures: dict[int, str] = {}
+        self.hints_seen: list[Hint] = []  # every hint a get or probe was given, in order
 
     # The StoreDriver protocol.
 
@@ -260,8 +263,8 @@ class MemoryDriver:
     def put(self, rows: Sequence[RowIO]) -> MemoryOp:
         return self._submit("put", rows)
 
-    def get(self, rows: Sequence[RowIO]) -> MemoryOp:
-        return self._submit("get", rows)
+    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
+        return self._submit("get", rows, hint)
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
         with self._lock:
@@ -280,7 +283,14 @@ class MemoryDriver:
             if self._cancel_effective:
                 self._cancel_unstarted(self._op(op))
 
-    def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:
+    def probe(
+        self, keys: Sequence[str], budget_s: float, hint: Hint = None
+    ) -> tuple[ProbeStatus, ...]:
+        with self._lock:
+            self._require_not_closed()
+            self._check_hint(hint)
+            if hint is not None:
+                self.hints_seen.append(hint)
         answers: dict[str, ProbeStatus] = {}
         errors: list[Exception] = []
         finished = threading.Event()
@@ -299,7 +309,6 @@ class MemoryDriver:
         # The store may block; the budget bounds this call, not the store. Registration and
         # start happen under the lock, so close and drain see every worker.
         with self._lock:
-            self._require_not_closed()
             self._probes = [probe for probe in self._probes if not probe.finished.is_set()]
             if self._draining or self._probe_unknown or len(self._probes) >= MAX_PROBES_IN_FLIGHT:
                 return tuple(ProbeStatus.UNKNOWN for _ in keys)
@@ -469,6 +478,10 @@ class MemoryDriver:
         if len(set(keys)) != len(keys):
             raise DriverRejected("a key appears more than once in the operation")
 
+    def _check_hint(self, hint: Hint) -> None:
+        if hint is not None and not self._capabilities.hints:
+            raise DriverRejected("this driver reads no hints")
+
     def _check_registered(self, rows: Sequence[RowIO]) -> None:
         for io in rows:
             if not self._registered(io.payload):
@@ -504,16 +517,19 @@ class MemoryDriver:
 
     # Internals.
 
-    def _submit(self, kind: Kind, rows: Sequence[RowIO]) -> MemoryOp:
+    def _submit(self, kind: Kind, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
         with self._lock:
             self._require_accepting()
             self._check_direction(kind)
             self._check_not_draining()
+            self._check_hint(hint)
             self._check_row_limit(rows)
             self._check_unique_keys(rows)
             self._check_registered(rows)
-            op = MemoryOp(kind, [_Row(io) for io in rows])
+            op = MemoryOp(kind, [_Row(io) for io in rows], hint)
             self._ops.append(op)
+            if hint is not None:
+                self.hints_seen.append(hint)
         if not self.controlled:
             self._before_execute(op)
             self._execute(op)
