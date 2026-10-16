@@ -1546,15 +1546,8 @@ def initialize_multimodal_encoder_request(
 
 
 def get_mm_context_chunk_start(request: LlmRequest) -> int:
-    """Return where the next context chunk starts in the prompt.
-
-    The KV cache V1 scheduler leaves a first chunk at its current position and
-    records the reusable prefix it expects separately.
-    """
-    begin = request.context_current_position
-    if request.is_first_context_chunk:
-        begin = max(begin, request.estimated_reusable_tokens)
-    return begin
+    """Return confirmed prefill progress, including actually reused KV tokens."""
+    return request.context_current_position
 
 
 def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
@@ -1593,8 +1586,8 @@ def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
 def get_mm_pending_items(request: LlmRequest) -> List[int]:
     """Return items the remaining prefill uses whose outputs are not ready.
 
-    Items wholly inside the estimated reusable KV prefix or behind confirmed
-    prefill progress are never needed again, so they are not pending.
+    Items wholly inside a confirmed reusable KV prefix or behind completed
+    prefill progress are not pending. Estimated reuse cannot skip encoder work.
     """
     state = request.py_mm_encoder_state
     if state is None:
@@ -1610,7 +1603,7 @@ def is_mm_context_chunk_ready(request: LlmRequest,
                               begin: Optional[int] = None) -> bool:
     """Return whether the MM outputs the next context chunk uses are ready.
 
-    The chunk starts at `begin`, or where the scheduler expects it to start.
+    The chunk starts at `begin`, or at the request's confirmed KV position.
     """
     state = request.py_mm_encoder_state
     if state is None:

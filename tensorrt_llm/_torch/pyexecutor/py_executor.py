@@ -3873,7 +3873,7 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
         elif getattr(self, "_mm_encoder_item_scheduling_enabled", False):
-            self.resource_manager.release_unused_mm_contexts([])
+            self.resource_manager.release_unused_contexts([])
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""
@@ -4674,7 +4674,7 @@ class PyExecutor:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._mm_encoder_item_scheduling_enabled:
-                    self.resource_manager.release_unused_mm_contexts(
+                    self.resource_manager.release_unused_contexts(
                         scheduled_batch.context_requests)
 
                 if self._is_kv_manager_v2:
@@ -5547,7 +5547,7 @@ class PyExecutor:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._mm_encoder_item_scheduling_enabled:
-                    self.resource_manager.release_unused_mm_contexts(
+                    self.resource_manager.release_unused_contexts(
                         scheduled_batch.context_requests)
 
                 if self._is_kv_manager_v2:

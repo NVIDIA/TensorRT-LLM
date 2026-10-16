@@ -50,7 +50,8 @@ from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+                          rewind_context_after_cache_drop)
 from .scheduler import ScheduledRequests
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
@@ -235,6 +236,21 @@ class BaseResourceManager(ABC):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
+
+    def prepare_context_resources(self, requests: list[LlmRequest]) -> None:
+        """Reserve contexts early when resources determine their prompt windows.
+
+        Managers with deferred context allocation override this method. Normal
+        ``prepare_resources`` must consume accepted reservations without
+        allocating them again.
+        """
+
+    def release_unused_contexts(self, keep_request_ids: set[int]) -> None:
+        """Discard unexecuted context reservations outside the accepted batch.
+
+        The owning manager releases its resources and rewinds any request
+        state it changed, without publishing uncomputed data for reuse.
+        """
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -1181,7 +1197,9 @@ class KVCacheManager(BaseResourceManager):
         return req.prompt_len
 
     def prepare_context_resources(self, requests: List[LlmRequest]) -> None:
-        """Claim first-chunk KV before selecting multimodal encoder outputs."""
+        """Resolve actual reuse and recompute before exposing a prompt window."""
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            return
         contexts = [
             req for req in requests
             if self._context_seq_len(req, is_cross=False) is not None
@@ -1196,19 +1214,21 @@ class KVCacheManager(BaseResourceManager):
         self._preprepared_context_requests.update(
             (req.py_request_id, req) for req in contexts)
 
-    def release_unused_contexts(self,
-                                keep_request_ids: set[int]) -> List[LlmRequest]:
+    def release_unused_contexts(self, keep_request_ids: set[int]) -> None:
         """Undo first-chunk KV claims that will not reach a forward pass."""
         if not self._preprepared_context_requests:
-            return []
+            return
         released = [
             req
             for request_id, req in self._preprepared_context_requests.items()
             if request_id not in keep_request_ids
         ]
-        for req in released:
-            self.free_resources(req)
-        return released
+        batch = ScheduledRequests()
+        batch.reset_context_requests(released)
+        with request_context(self.is_draft, batch):
+            for req in released:
+                self.free_resources(req)
+                rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
@@ -3222,34 +3242,18 @@ class ResourceManager:
                                                     "maybe_fit_token_budget"):
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
 
-    def prepare_mm_context_resources(
-            self, context_requests: List[LlmRequest]) -> None:
-        """Resolve native KV reuse before multimodal item selection."""
-        contexts = [
-            req for req in context_requests
-            if req.py_mm_encoder_state is not None
-        ]
+    def prepare_context_resources(self,
+                                  context_requests: List[LlmRequest]) -> None:
+        """Resolve context windows through each manager's reservation interface."""
         for manager in self.resource_managers.values():
-            if isinstance(manager, KVCacheManager):
-                manager.prepare_context_resources(contexts)
-        for req in contexts:
-            req.estimated_reusable_tokens = req.context_current_position
+            manager.prepare_context_resources(context_requests)
 
-    def release_unused_mm_contexts(self,
-                                   context_requests: List[LlmRequest]) -> None:
-        """Release unused native KV claims without losing encoder outputs."""
+    def release_unused_contexts(self,
+                                context_requests: List[LlmRequest]) -> None:
+        """Let each manager discard reservations absent from the accepted batch."""
         keep_request_ids = {req.py_request_id for req in context_requests}
-        released: dict[int, tuple[LlmRequest, int]] = {}
         for manager in self.resource_managers.values():
-            if isinstance(manager, KVCacheManager):
-                for req in manager.release_unused_contexts(keep_request_ids):
-                    released[req.py_request_id] = (req,
-                                                   manager.tokens_per_block)
-        for req, tokens_per_block in released.values():
-            req.set_prepopulated_prompt_len(0, tokens_per_block)
-            req.context_current_position = 0
-            req.context_chunk_size = req.context_remaining_length
-            req.estimated_reusable_tokens = 0
+            manager.release_unused_contexts(keep_request_ids)
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
