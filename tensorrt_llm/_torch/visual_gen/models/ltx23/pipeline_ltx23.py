@@ -317,9 +317,16 @@ class LTX23Pipeline(BasePipeline):
         eps: float = 1e-6,
     ) -> torch.Tensor:
         """LTX-2.3 packs Gemma states with per-token RMS normalization."""
-        rms = torch.sqrt(text_hidden_states.float().pow(2).mean(dim=2, keepdim=True) + eps)
-        normalized = (text_hidden_states.float() / rms).to(text_hidden_states.dtype)
-        return normalized.flatten(2, 3)
+        variance = text_hidden_states.pow(2).mean(dim=2, keepdim=True)
+        normalized = (text_hidden_states * torch.rsqrt(variance + eps)).flatten(2, 3)
+        positions = torch.arange(text_hidden_states.shape[1], device=text_hidden_states.device)
+        if padding_side == "left":
+            mask = positions[None, :] >= text_hidden_states.shape[1] - sequence_lengths[:, None]
+        elif padding_side == "right":
+            mask = positions[None, :] < sequence_lengths[:, None]
+        else:
+            raise ValueError(f"Unsupported text padding side: {padding_side!r}")
+        return torch.where(mask[..., None], normalized, torch.zeros_like(normalized))
 
     def _process_connectors(self, prompt_embeds: torch.Tensor, attention_mask: torch.Tensor):
         """Feature extractor, then video and audio connectors. Mask is shared."""
