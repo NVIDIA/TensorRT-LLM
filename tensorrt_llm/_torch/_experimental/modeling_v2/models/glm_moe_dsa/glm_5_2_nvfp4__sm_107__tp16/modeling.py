@@ -1455,6 +1455,7 @@ class Glm52Nvfp4Sm107Tp16Core(DeepseekV3Model):
         self._prefill: Optional[PrefillTarget] = None
         self._decode: Optional[DecodeTarget] = None
 
+    @torch.no_grad()
     def post_load_weights(self) -> None:
         """Build the targets once the weights are final. Reached more than once
         (the shell and the loader's module walk), so it only builds once."""
