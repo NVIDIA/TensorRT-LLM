@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Multimodal conformance tests against a real TensorRT-LLM VLM engine."""
+"""Multimodal conformance tests against real TensorRT-LLM engines."""
 
 import asyncio
 import base64
+from pathlib import Path
 
 import pytest
 
@@ -18,15 +19,34 @@ from tensorrt_llm import LLM  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2, model_pb2  # noqa: E402
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
-from tensorrt_llm.llmapi import KvCacheConfig  # noqa: E402
+from tensorrt_llm.llmapi import KvCacheConfig, SchedulerConfig  # noqa: E402
 
 MODEL_NAME = "Qwen3/Qwen3-VL-2B-Instruct"
+WHISPER_MODEL_NAME = "openai/whisper-tiny"
+_WHISPER_OUTPUT_TOKEN_IDS = [
+    1939,
+    613,
+    4598,
+    8028,
+    389,
+    3011,
+    582,
+    259,
+    1570,
+    365,
+    1454,
+    813,
+    38675,
+    3378,
+    13,
+    50257,
+]
 
-# The engine owns background executor threads for the lifetime of this module.
+# The engines own background executor threads while each test runs.
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def vlm():
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU to run a real VLM engine")
@@ -37,6 +57,53 @@ def vlm():
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
         max_batch_size=1,
         max_seq_len=2048,
+    )
+    try:
+        yield engine
+    finally:
+        engine.shutdown()
+
+
+def _whisper_model_path() -> Path:
+    root = llm_models_root(check=True)
+    candidates = [
+        root / "whisper-models/whisper-tiny",
+        root / "whisper/whisper-tiny",
+        root / "whisper-tiny",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    pytest.skip(f"whisper-tiny not found under {root}")
+
+
+def _whisper_audio_path() -> Path:
+    root = llm_models_root(check=True)
+    for checkpoint in ("large-v3", "large-v2"):
+        candidate = root / f"whisper-models/{checkpoint}/1221-135766-0002.wav"
+        if candidate.exists():
+            return candidate
+    pytest.skip(f"Whisper test audio not found under {root}/whisper-models")
+
+
+@pytest.fixture
+def whisper():
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU to run a real Whisper engine")
+    engine = LLM(
+        model=str(_whisper_model_path()),
+        disable_overlap_scheduler=True,
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.2,
+            cross_kv_cache_fraction=0.5,
+            use_kv_cache_manager_v2=True,
+        ),
+        max_batch_size=1,
+        max_input_len=1500,
+        max_num_tokens=1500,
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
     )
     try:
         yield engine
@@ -133,3 +200,52 @@ def test_image_and_video_capabilities_agree_with_generate(vlm, tmp_path):
     video_finished = [response for response in video_responses if response.HasField("finished")]
     assert len(video_finished) == 1
     assert video_finished[0].usage.prompt_tokens > len(video_request.token_ids.ids)
+
+
+def test_audio_capability_agrees_with_generate(whisper):
+    inference = OpenEngineInferenceServicer(whisper, WHISPER_MODEL_NAME)
+    control = OpenEngineControlServicer(whisper, WHISPER_MODEL_NAME, inference)
+    info = asyncio.run(
+        control.GetModelInfo(
+            model_pb2.GetModelInfoRequest(model=WHISPER_MODEL_NAME),
+            FakeServicerContext(),
+        )
+    )
+
+    assert info.supports_multimodal is True
+    assert list(info.extra["trtllm_supported_modalities"]) == ["audio"]
+
+    audio_uri = (
+        "data:audio/wav;base64," + base64.b64encode(_whisper_audio_path().read_bytes()).decode()
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="openengine-audio-conformance",
+        model=WHISPER_MODEL_NAME,
+        prompt="",
+        sampling=generation_pb2.SamplingParams(temperature=0.0),
+        stopping=generation_pb2.StoppingOptions(max_tokens=96),
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                data_uri=audio_uri,
+                uuid="librispeech-1221-135766-0002",
+            )
+        ],
+    )
+
+    async def collect_audio():
+        return [response async for response in inference.Generate(request, FakeServicerContext())]
+
+    responses = asyncio.run(collect_audio())
+    assert not any(response.HasField("error") for response in responses)
+    token_ids = [
+        token.token_id
+        for response in responses
+        if response.HasField("token")
+        for token in response.token.tokens
+    ]
+    assert token_ids[0] in (1939, 10890)
+    assert token_ids[1:] == _WHISPER_OUTPUT_TOKEN_IDS[1:]
+    finished = [response for response in responses if response.HasField("finished")]
+    assert len(finished) == 1
+    assert finished[0].usage.completion_tokens == len(token_ids)
