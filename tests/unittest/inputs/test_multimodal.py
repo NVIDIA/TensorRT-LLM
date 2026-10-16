@@ -16,6 +16,7 @@ from tensorrt_llm.inputs.multimodal import (
     DisaggPrefillMultimodalInputs,
     MultimodalEncoderItemMetadata,
     MultimodalInput,
+    MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
@@ -180,7 +181,7 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
 
     multimodal_data = extra["multimodal_data"]
     item_metadata = multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    assert item_metadata == MultimodalEncoderItemMetadata(
+    assert item_metadata == MultimodalItemMetadata(
         item_refs=[("image", 0)],
         encoder_token_lengths=[4],
         output_embedding_lengths=[2],
@@ -193,7 +194,7 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
     params.to_handle("multimodal_data")
     assert isinstance(
         params.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY],
-        MultimodalEncoderItemMetadata,
+        MultimodalItemMetadata,
     )
 
 
@@ -205,9 +206,8 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
 
 
 def test_mm_item_metadata_none_falls_back_to_non_item_path():
-    # A processor whose get_mm_encoder_item_metadata returns None does not
-    # participate in item scheduling; routing falls through with no item
-    # metadata attached (no capability flag drives this).
+    # Generic item order does not imply that physical encoder costs or
+    # item scheduling are supported.
     class NoMetadataProcessor(_ItemMetadataFakeProcessor):
         def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
             return None
@@ -216,7 +216,10 @@ def test_mm_item_metadata_none_falls_back_to_non_item_path():
 
     _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
 
-    assert MULTIMODAL_ENCODER_ITEM_METADATA_KEY not in extra["multimodal_data"]
+    metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == [("image", 0)]
+    assert metadata.encoder_token_lengths is None
+    assert metadata.output_embedding_lengths == [2]
 
 
 def test_mm_item_metadata_rejects_wrong_return_type():
@@ -280,6 +283,104 @@ def test_mm_item_metadata_legacy_import_and_pickle() -> None:
     legacy_class = pickle.loads(b"ctensorrt_llm.inputs.registry\nMultimodalEncoderItemMetadata\n.")
     metadata = legacy_class([("audio", 0)], [8], [2])
     assert pickle.loads(pickle.dumps(metadata)) == metadata
+
+
+@pytest.mark.parametrize("indices", [[3, 0, 2], [2, 0], [-1, 0], [], [1, 1]])
+def test_item_metadata_selection_keeps_partitions_in_payload_order(indices) -> None:
+    metadata = MultimodalItemMetadata(
+        [("image", 1), ("audio", 0), ("image", 0), ("audio", 1)],
+        output_embedding_lengths=[3, 1, 2, 4],
+        input_partitions={
+            "image": {"pixels": MultimodalItemPartition(item_lengths=(2, 3))},
+            "audio": {
+                "features": MultimodalItemPartition(1, (1, 4)),
+                "shared": MultimodalItemPartition(item_axis=None),
+            },
+        },
+    )
+    metadata.validate()
+    values = {"image": torch.arange(5), "audio": torch.arange(10).reshape(2, 5)}
+    selected = metadata.select(indices)
+    selected.validate()
+    assert selected.encoder_token_lengths is None
+    assert metadata.input_partitions["image"]["pixels"].item_lengths == (2, 3)
+    assert metadata.input_partitions["audio"]["features"].item_lengths == (1, 4)
+    for modality, partitions in selected.input_partitions.items():
+        local_indices = [
+            metadata.item_refs[i][1] for i in indices if metadata.item_refs[i][0] == modality
+        ]
+        name = "pixels" if modality == "image" else "features"
+        source_partition = metadata.input_partitions[modality][name]
+        value = source_partition.select(values[modality], local_indices)
+        # A second selection uses the view's local item indices and lengths.
+        first = partitions[name].select(value, [0])
+        expected = source_partition.select(values[modality], local_indices[:1])
+        torch.testing.assert_close(first, expected)
+
+
+def test_unknown_item_costs_and_rows_remain_explicit() -> None:
+    metadata = MultimodalItemMetadata([("audio", 0)])
+    metadata.validate()
+    params = MultimodalParams(multimodal_data={MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata})
+    assert params.item_metadata is metadata
+    assert params.item_metadata.encoder_token_lengths is None
+    with pytest.raises(ValueError, match="requires item output embedding lengths"):
+        params.get_item_layout()
+
+
+def test_item_metadata_roundtrips_with_shared_tensor_handles() -> None:
+    import pickle
+
+    values = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+    metadata = MultimodalItemMetadata(
+        [("audio", 0), ("audio", 1)],
+        output_embedding_lengths=[2, 3],
+        input_partitions={"audio": {"features": MultimodalItemPartition(1, (2, 3))}},
+    )
+    params = MultimodalParams(
+        multimodal_data={
+            "audio": {"features": values},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        }
+    )
+    params.to_handle("multimodal_data")
+    assert params.item_metadata is metadata
+    restored = pickle.loads(pickle.dumps(params))
+    restored.to_tensor("multimodal_data")
+    torch.testing.assert_close(restored.multimodal_data["audio"]["features"], values)
+    assert restored.item_metadata == metadata
+    assert restored.encoder_state is None
+
+
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_generic_metadata_normalizes_mixed_order_without_encoder_costs(precomputed) -> None:
+    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+
+    class Processor(_ItemMetadataFakeProcessor):
+        get_mm_item_metadata = BaseMultimodalInputProcessor.get_mm_item_metadata
+
+        def __call__(self, inputs, sampling_params):
+            return [101, 102], {
+                "multimodal_data": {
+                    "image": {},
+                    "audio": {},
+                    "multimodal_embedding_lengths": [1, 1],
+                    **({"multimodal_embedding": torch.zeros(2, 4)} if precomputed else {}),
+                }
+            }
+
+        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+            assert not precomputed
+            return None
+
+    order = [{"modality": "audio", "index": 0}, {"modality": "image", "index": 0}]
+    _, extra = create_input_processor_with_hash(Processor(None))(
+        {"prompt": "unused", "mm_item_order": order}, None
+    )
+    metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == [("audio", 0), ("image", 0)]
+    assert metadata.encoder_token_lengths is None
+    assert metadata.output_embedding_lengths == [1, 1]
 
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
@@ -637,7 +738,7 @@ def test_multimodal_input_contract_snapshot(
     assert cumsum.tolist() == expected_cumsum
     assert data["mm_bidirectional_blocks"] is True
     assert data["multimodal_embedding_lengths"] == [2] * num_items
-    assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalEncoderItemMetadata(
+    assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalItemMetadata(
         item_refs, [4] * num_items, [2] * num_items
     )
     if not hashing_enabled:

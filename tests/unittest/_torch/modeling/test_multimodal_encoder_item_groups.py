@@ -9,6 +9,7 @@ rows and order as encoding those items in the full request.
 """
 
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,7 +25,9 @@ from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
+    MultimodalEncoderRequestState,
     MultimodalInput,
+    MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
@@ -35,6 +38,84 @@ pytestmark = pytest.mark.cpu_only
 # Rows the encoder emits per patch-grid item. Distinct values catch splits that
 # happen to line up only for uniform sizes.
 ITEM_ROWS = {"image": [2, 3], "video": [4]}
+
+
+def test_qwen_processor_produces_prompt_order_and_packed_partitions():
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+
+    processor = object.__new__(Qwen3VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        image_token_id=10,
+        video_token_id=11,
+        vision_start_token_id=12,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    data = {
+        "image": {"pixel_values": torch.zeros(8, 2), "image_grid_thw": torch.tensor([[1, 2, 4]])},
+        "video": {
+            "pixel_values_videos": torch.zeros(16, 2),
+            "video_grid_thw": torch.tensor([[2, 2, 4]]),
+        },
+    }
+    metadata = processor.get_mm_item_metadata([12, 11, 13, 12, 10, 13], data)
+    metadata.validate()
+    assert metadata.item_refs == [("video", 0), ("image", 0)]
+    assert metadata.encoder_token_lengths == [16, 8]
+    assert metadata.output_embedding_lengths == [4, 2]
+    assert metadata.input_partitions["image"]["pixel_values"].item_lengths == (8,)
+    assert metadata.input_partitions["video"]["pixel_values_videos"].item_lengths == (16,)
+
+
+def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
+    processor = object.__new__(Gemma4InputProcessor)
+    data = {
+        "image": {"pixel_values": torch.zeros(1, 4, 6), "image_position_ids": torch.zeros(1, 4, 2)},
+        "audio": {"audio_features": torch.zeros(1, 5, 8), "audio_features_mask": torch.ones(1, 5)},
+        "multimodal_embedding_lengths": [2, 4],
+    }
+    order = [{"modality": "audio", "index": 0}, {"modality": "image", "index": 0}]
+    metadata = processor.get_mm_item_metadata([], data, order)
+    metadata.validate()
+    assert metadata.item_refs == [("audio", 0), ("image", 0)]
+    assert metadata.encoder_token_lengths is None
+    assert metadata.input_partitions["audio"]["audio_features_mask"].item_axis == 0
+    assert metadata.input_partitions["image"]["image_position_ids"].item_axis == 0
+
+
+def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+        NemotronHMultimodalInputProcessor,
+    )
+
+    processor = object.__new__(NemotronHMultimodalInputProcessor)
+    audio = {
+        "input_audio_features": torch.arange(30).reshape(3, 5, 2),
+        "feature_attention_mask": torch.ones(3, 5),
+        "audio_num_clips": torch.tensor([2, 1]),
+    }
+    data = {"audio": audio, "multimodal_embedding_lengths": [4, 2]}
+    metadata = processor.get_mm_item_metadata([], data)
+    metadata.validate()
+    params = MultimodalParams(multimodal_data=data)
+    selected = MultimodalModelMixin().build_multimodal_encoder_input(params, [1, 0], "audio")
+    MultimodalModelMixin._apply_metadata_slice(selected, params, [1, 0])
+    assert selected.item_metadata.encoder_token_lengths is None
+    partition = selected.item_metadata.input_partitions["audio"]["input_audio_features"]
+    assert partition.item_lengths == (1, 2)
+    torch.testing.assert_close(
+        selected.multimodal_data["audio"]["input_audio_features"],
+        audio["input_audio_features"][[2, 0, 1]],
+    )
+    assert selected.encoder_state is None
+    video = {"audio": audio, "video_size": [[2, 1, 32, 32]]}
+    video_data = {"video": video, "multimodal_embedding_lengths": [6]}
+    video_metadata = processor.get_mm_item_metadata([], video_data)
+    assert video_metadata.item_refs == [("video", 0)]
+    assert "audio" not in video_metadata.input_partitions
+    assert video_data["video"]["audio"] is audio
 
 
 def _grid_for_rows(rows: int) -> list[int]:
@@ -201,7 +282,7 @@ def test_declared_audio_layout_selects_packed_frames_on_a_nonzero_axis():
     torch.testing.assert_close(residual.multimodal_data["audio"]["mask"], mask[[5, 0, 1]])
     assert residual.multimodal_data["audio"]["frame_counts"] == [1, 2]
     assert residual.multimodal_data["audio"]["shared_stats"] is shared
-    assert residual.item_metadata == MultimodalEncoderItemMetadata(
+    assert residual.item_metadata == MultimodalItemMetadata(
         [("audio", 0), ("audio", 1)], [1, 2], [1, 1]
     )
     assert request.item_metadata.item_refs == [("audio", 0), ("audio", 1), ("audio", 2)]
@@ -212,11 +293,17 @@ def test_sliced_items_survive_the_grouped_encoder_path():
     grouped path splits to zero rows and returns nothing for every item."""
     model = _GroupedEncoderModel()
     request = _make_request(["image", "image"])
+    owner = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
+    owner.set_item_cache_key(0, ("owned", 0), ready=True)
+    request.encoder_state = owner
     selected = [(request, 0), (request, 1)]
 
-    outputs, _ = _run_items(model, selected)
+    outputs, encoder_inputs = _run_items(model, selected)
 
     assert len(outputs) == 2
+    assert request.encoder_state is owner
+    assert owner.item_cache_keys == [("owned", 0), None]
+    assert all(param.encoder_state is None for param, _, _ in encoder_inputs)
     for item_idx, output in enumerate(outputs):
         expected = _expected_rows(request, item_idx)
         assert output.shape == expected.shape
@@ -287,7 +374,7 @@ def test_metadata_is_rebased_for_partial_and_reordered_items() -> None:
     assert len(encoder_inputs) == 1
     residual = encoder_inputs[0][0]
     metadata = residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    assert metadata == MultimodalEncoderItemMetadata([("image", 0), ("image", 1)], [3, 2], [3, 2])
+    assert metadata == MultimodalItemMetadata([("image", 0), ("image", 1)], [3, 2], [3, 2])
     assert residual.multimodal_data["multimodal_embedding_lengths"] == [3, 2]
     assert request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] is original
     torch.testing.assert_close(outputs[0], _expected_rows(request, 2), rtol=0, atol=0)
@@ -336,7 +423,7 @@ def test_partial_cache_uses_prompt_refs_and_lengths(metadata_format, reversed_or
     request = _make_request(["image", "image"])
     metadata = request.item_metadata
     if reversed_order:
-        metadata = MultimodalEncoderItemMetadata([("image", 1), ("image", 0)], [3, 2], [3, 2])
+        metadata = MultimodalItemMetadata([("image", 1), ("image", 0)], [3, 2], [3, 2])
         request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
     lengths = metadata.output_embedding_lengths
     request.multimodal_data["multimodal_embedding_lengths"] = lengths
@@ -425,23 +512,23 @@ def test_partial_cache_batches_mixed_vision_and_audio_misses():
         torch.testing.assert_close(model._multimodal_encoder_cache.get(key), rows, rtol=0, atol=0)
 
 
-def test_alternating_item_selection_validates_each_request_once(monkeypatch):
+def test_alternating_item_selection_reuses_validated_request_metadata(monkeypatch):
     model = _GroupedEncoderModel()
     requests = [_make_request(["image", "video"] * 4) for _ in range(2)]
     validated = []
-    validate = MultimodalEncoderItemMetadata.validate
+    validate = MultimodalItemMetadata.validate
 
     def record_validation(metadata):
         validated.append(metadata)
         validate(metadata)
 
-    monkeypatch.setattr(MultimodalEncoderItemMetadata, "validate", record_validation)
+    monkeypatch.setattr(MultimodalItemMetadata, "validate", record_validation)
 
     model.prepare_multimodal_encoder_inputs(
         [(request, i) for request in requests for i in range(8)]
     )
 
-    assert len(validated) == len(requests)
+    assert not validated
 
 
 @pytest.mark.parametrize("shared_vision_encoder", [False, True])
