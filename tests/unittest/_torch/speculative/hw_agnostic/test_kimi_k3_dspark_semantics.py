@@ -956,14 +956,18 @@ def test_plain_dflash_trtllm_block_decode_matches_full_attention_reference(
         f"batch {batch_size} took the wrong attention form: {calls}"
     )
     # The bf16 max-abs error grows with the number of outputs compared, so
-    # bound the relative L2 error and allow a few bf16 ulps in the tail. A
-    # wrong page, mask or request index shows up as O(1) errors and still fails.
+    # bound it in bf16 ulps at the largest expected magnitude and bound the
+    # relative L2 error. A wrong page, mask or request index shows up as O(1)
+    # errors and still fails.
     err = out - expected
     diff = err.abs().max().item()
     rel_l2 = (err.norm() / expected.norm()).item()
-    assert diff < 0.0625 and rel_l2 < 1e-2, (
+    expected_max = expected.abs().max().item()
+    ulp = torch.finfo(torch.bfloat16).eps * 2.0 ** math.floor(math.log2(expected_max))
+    assert diff <= 8 * ulp and rel_l2 < 1e-2, (
         f"TRTLLM {kernel} parity failed at batch {batch_size}: "
-        f"max abs diff {diff}, relative L2 {rel_l2}, max |expected| {expected.abs().max().item()}"
+        f"max abs diff {diff} ({diff / ulp:.1f} bf16 ulp at max |expected| {expected_max}, "
+        f"limit 8), relative L2 {rel_l2} (limit 1e-2)"
     )
 
 
