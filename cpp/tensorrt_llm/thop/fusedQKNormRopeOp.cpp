@@ -47,10 +47,17 @@ int64_t validateFusedQKNormRopeInputs(torch::Tensor const& qkv, torch::Tensor co
     TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
     TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
 
-    CHECK_INPUT(qkv, torch::kBFloat16);
+    CHECK_TH_CUDA(qkv);
+    CHECK_CONTIGUOUS(qkv);
+    TORCH_CHECK(qkv.scalar_type() == torch::kFloat16 || qkv.scalar_type() == torch::kBFloat16,
+        "QKV tensor must have float16 or bfloat16 dtype");
     CHECK_INPUT(position_ids, torch::kInt32);
-    CHECK_INPUT(q_weight, torch::kBFloat16);
-    CHECK_INPUT(k_weight, torch::kBFloat16);
+    CHECK_TH_CUDA(q_weight);
+    CHECK_CONTIGUOUS(q_weight);
+    CHECK_TYPE(q_weight, qkv.scalar_type());
+    CHECK_TH_CUDA(k_weight);
+    CHECK_CONTIGUOUS(k_weight);
+    CHECK_TYPE(k_weight, qkv.scalar_type());
 
     int64_t num_tokens = qkv.size(0);
     TORCH_CHECK(position_ids.size(-1) == num_tokens, "Number of tokens in position_ids must match QKV");
@@ -167,11 +174,11 @@ void fused_qk_norm_rope(
 
     auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
-    tensorrt_llm::kernels::launchFusedQKNormRope(reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
-        static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
-        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<int>(rotary_dim),
-        static_cast<float>(eps), reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()), static_cast<float>(base),
+    bool const isBfloat16 = qkv.scalar_type() == torch::kBFloat16;
+    tensorrt_llm::kernels::launchFusedQKNormRope(qkv.data_ptr(), static_cast<int>(num_tokens),
+        static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
+        static_cast<int>(head_dim), static_cast<int>(rotary_dim), static_cast<float>(eps), q_weight.data_ptr(),
+        k_weight.data_ptr(), isBfloat16, static_cast<float>(base),
         !is_neox, // interleave
         reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
         static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm, use_gemma, use_mrope,
@@ -186,6 +193,7 @@ torch::Tensor fused_qk_norm_rope_to_fp8(torch::Tensor const& qkv, // [num_tokens
     torch::Tensor const& position_ids, double factor, double low, double high, double attention_factor, bool is_qk_norm,
     bool use_gemma, bool use_mrope, int64_t mrope_section1, int64_t mrope_section2)
 {
+    TORCH_CHECK(qkv.scalar_type() == torch::kBFloat16, "FP8 output requires a bfloat16 QKV input");
     int64_t num_tokens = validateFusedQKNormRopeInputs(
         qkv, position_ids, q_weight, k_weight, num_heads_q, num_heads_k, num_heads_v, head_dim, use_mrope);
 

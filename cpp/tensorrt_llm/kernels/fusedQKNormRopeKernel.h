@@ -39,6 +39,7 @@ void launchFusedQKNormRope(
     float const eps,         // Epsilon for RMS normalization
     void const* q_weight,    // RMSNorm weights for query [head_dim]
     void const* k_weight,    // RMSNorm weights for key [head_dim]
+    bool is_bfloat16,        // Whether QKV and weights use bfloat16 (otherwise float16)
     float const base,        // Base for RoPE computation
     bool const interleave,   // Whether RoPE is applied in interleave mode (non-Neox style)
     int const* position_ids, // Position IDs for RoPE [num_tokens]
