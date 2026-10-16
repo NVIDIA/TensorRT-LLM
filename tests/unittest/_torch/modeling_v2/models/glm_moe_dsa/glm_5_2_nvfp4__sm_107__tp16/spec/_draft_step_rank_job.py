@@ -41,13 +41,12 @@ def run(entry: str, expected_cells: int) -> None:
     """Run the matrix for `entry` over WORLD_SIZE devices, expecting it to drive `expected_cells` cells."""
     launcher = Path(__file__).resolve().with_name("_draft_step_op_matrix.py")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
-    # The ranks import tensorrt_llm absolutely, and a source checkout is not necessarily installed.
-    repo_root = Path(__file__).resolve().parents[8]
-    assert (repo_root / "tensorrt_llm").is_dir(), (
-        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there"
-    )
+    # The ranks import tensorrt_llm absolutely: the package this process imports, installed or not.
+    package = importlib.util.find_spec("tensorrt_llm")
+    assert package is not None and package.origin is not None, "tensorrt_llm is not importable"
+    package_parent = str(Path(package.origin).resolve().parents[1])
     env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p
+        p for p in (package_parent, env.get("PYTHONPATH", "")) if p
     )
     spec = importlib.util.spec_from_file_location(launcher.stem, launcher)
     module = importlib.util.module_from_spec(spec)

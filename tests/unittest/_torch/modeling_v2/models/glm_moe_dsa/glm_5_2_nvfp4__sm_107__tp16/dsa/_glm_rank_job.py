@@ -74,15 +74,12 @@ def run(entry: str) -> None:
     launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
 
-    # The ranks import tensorrt_llm absolutely, and a source checkout is not
-    # necessarily installed.
-    # tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/<target>/dsa -> repo root.
-    repo_root = Path(__file__).resolve().parents[8]
-    assert (repo_root / "tensorrt_llm").is_dir(), (
-        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
-        f"this file moved without its parents[] index following"
-    )
-    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p)
+    # The ranks import tensorrt_llm absolutely: the package this process
+    # imports, installed or not.
+    package = importlib.util.find_spec("tensorrt_llm")
+    assert package is not None and package.origin is not None, "tensorrt_llm is not importable"
+    package_parent = str(Path(package.origin).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH", "")) if p)
 
     # Read the budget off the entry rather than restating it: an entry that
     # raises its own deadline would otherwise be killed by this one first,
