@@ -138,6 +138,7 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend == "pytorch"
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        # Maps adapter ID to (canonical path, checkpoint source).
         self._lora_adapter_identities: dict[str, tuple[str, str]] = {}
         self._lora_adapter_lock = Lock()
         self._resource_governor_queue = None

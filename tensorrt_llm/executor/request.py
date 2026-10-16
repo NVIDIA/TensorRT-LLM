@@ -1,5 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,16 +32,7 @@ DEFAULT_REQUEST_PRIORITY: float = 0.5
 
 @dataclass(slots=True)
 class LoRARequest:
-    """Request for a LoRA adapter from a trusted caller.
-
-    Within a worker, a successfully loaded nonempty path binds the ID to that
-    canonical path and checkpoint source. Failed loads bind only if the loader
-    has published data for the ID. Use a new ID for a different adapter.
-    The name is only a label; an empty path retains ID-only cache
-    lookup. An ID successfully used without a path cannot later be assigned one.
-    IDs are not access credentials: callers must be authorized by the
-    application to use the worker's adapters, including through serving APIs.
-    """
+    """ Request for a LoRA adapter. """
     lora_name: str
     lora_int_id: int
     lora_path: str = ""
