@@ -13,13 +13,79 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
+from ..base_weight_loader import ConsumableWeightsDict
 from ..base_weight_mapper import BaseWeightMapper
+
+_COMPRESSED_TENSORS_NVFP4_SUFFIXES = (".weight_packed", ".weight_global_scale",
+                                      ".input_global_scale")
+
+
+def _invert_compressed_tensors_global_scale(value) -> torch.Tensor:
+    """Convert a compressed-tensors global scale to TRT-LLM's divisor form.
+
+    A global scale of 0 marks an expert that saw no calibration data. It is
+    kept as 0 rather than inverted to Inf, which would otherwise win the MoE
+    per-layer max-reduction over experts and corrupt every expert's
+    input_scale; a 0 entry is harmless there and silences the dead expert.
+    """
+    t = value if isinstance(value, torch.Tensor) else value[...]
+    t = t.to(torch.float32)
+    out = torch.where(t > 0,
+                      1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
+                      torch.zeros_like(t))
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+
+
+def convert_compressed_tensors_nvfp4_weights(
+        weights: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Rename llm-compressor "compressed-tensors" NVFP4 tensors to TRT-LLM's.
+
+    compressed-tensors stores
+      weight_packed        (uint8, packed FP4)
+      weight_scale         (FP8 per-group)
+      weight_global_scale  (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_weight)
+      input_global_scale   (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_input)
+    while TRT-LLM's NVFP4 Linear and MoE loaders expect
+      weight               (uint8 view of float4_e2m1x2)
+      weight_scale         (FP8, same)
+      weight_scale_2       (FP32 scalar = amax_weight/(FP8_MAX*FP4_MAX))
+      input_scale          (FP32 scalar = amax_input/(FP8_MAX*FP4_MAX))
+    so the global scales are inverted on the way through.
+
+    Args:
+        weights: checkpoint weights keyed by checkpoint name; a plain dict or
+            a ``ConsumableWeightsDict``.
+
+    Returns:
+        ``weights`` itself when it holds no compressed-tensors NVFP4 names.
+        Otherwise a converted mapping of the same kind; other keys are passed
+        through unchanged and the caller must not use ``weights`` afterwards
+        (see ``ConsumableWeightsDict.take_ownership``).
+    """
+    if not any(
+            name.endswith(_COMPRESSED_TENSORS_NVFP4_SUFFIXES)
+            for name in weights.keys()):
+        return weights
+
+    converted = {}
+    for name, value in weights.items():
+        if name.endswith(".weight_packed"):
+            name = name[:-len(".weight_packed")] + ".weight"
+        elif name.endswith(".weight_global_scale"):
+            name = name[:-len(".weight_global_scale")] + ".weight_scale_2"
+            value = _invert_compressed_tensors_global_scale(value)
+        elif name.endswith(".input_global_scale"):
+            name = name[:-len(".input_global_scale")] + ".input_scale"
+            value = _invert_compressed_tensors_global_scale(value)
+        converted[name] = value
+    return ConsumableWeightsDict.take_ownership(weights, converted)
 
 
 @register_mapper("MX")
