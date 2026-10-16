@@ -72,10 +72,13 @@ trtllm-serve ${MODEL} \
     --reasoning_parser musespark
 ```
 
-Acceptance is strict, so speculation changes serving speed, not what the
-model outputs. At temperature 0, near-tied logits may rarely resolve
-differently than with speculation off (the same variability class as
-ordinary batching); this disappears at temperature > 0.
+Acceptance is strict: an accepted draft token is exactly the token the target
+model emits at that position. At temperature 0, completions still often differ
+from a run with speculation off: draft verification runs the target through a
+different attention path, and small numeric differences flip near-tied tokens,
+which are common in this model's reasoning text. KV-cache prefix reuse and
+batching change temperature-0 completions the same way; at temperature > 0
+this disappears into ordinary sampling variation.
 
 Model-free suffix-automaton (SA) drafting is also available; see the
 [speculative-decoding guide](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md)

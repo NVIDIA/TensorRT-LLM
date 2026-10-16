@@ -2,11 +2,12 @@
 # Muse Spark Open. Merge these keys into the serving YAML (or append them
 # to a copy of serve_config.yaml) before launching trtllm-serve.
 #
-# Acceptance is strict — an accepted draft token is exactly the token the
-# target model emits — so speculation changes speed, not model output.
-# At temperature 0, near-tied logits may rarely resolve differently than
-# with speculation off (same variability class as ordinary batching);
-# this disappears at temperature > 0.
+# Acceptance is strict: an accepted draft token is exactly the token the
+# target model emits at that position. At temperature 0, completions still
+# often differ from a run with speculation off, because draft verification
+# runs the target through a different attention path and small numeric
+# differences flip near-tied tokens (KV-cache prefix reuse and batching do
+# the same); at temperature > 0 this disappears into sampling variation.
 speculative_config:
   decoding_type: DFlash
   max_draft_len: 7
