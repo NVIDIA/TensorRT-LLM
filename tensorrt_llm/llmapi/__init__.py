@@ -11,7 +11,7 @@ from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BlockReuseConfig,
                        CacheTransceiverConfig, CalibConfig,
-                       CapacitySchedulerPolicy,
+                       CapacitySchedulerPolicy, CheckpointIOPolicy,
                        ColdPageQuantizationCompressionConfig,
                        ContextChunkingPolicy, CudaGraphConfig,
                        DecodeCudaGraphConfig, DeepSeekSparseAttentionConfig,
@@ -67,6 +67,7 @@ __all__ = [
     'MTPDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
+    'CheckpointIOPolicy',
     'QuantConfig',
     'QuantAlgo',
     'CalibConfig',
