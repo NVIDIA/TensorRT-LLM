@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the target's MTP IndexShare plumbing.
 
-The draft layer's selection sort, the capture of each request's draft-extend row
+The target's canonical selection, the capture of each request's draft-extend row
 into the shared buffers (decode and mixed-batch forms), and the reuse entry's
-order preservation over sorted captures. The targets are built without weights:
+order preservation over canonical captures. The targets are built without weights:
 the capture methods read only their arguments, the metadata and the core's
 draft binding.
 """
@@ -15,6 +15,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as m,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_canonical_selection import (  # noqa: E501
+    qsa_canonical_selection as canonical,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_mtp_reuse_topk import (  # noqa: E501
     qsa_mtp_reuse_topk as reuse,
@@ -47,32 +50,38 @@ def _metadata(batch: int, accepted, seq_lens=None, num_contexts: int = 0):
     )
 
 
-def _selection_rows(rows: int, gen: torch.Generator) -> torch.Tensor:
-    """Rows as `qsa_topk_select` leaves them: distinct ids in any order, then -1."""
-    out = torch.full((rows, K), -1, dtype=torch.int32)
-    for r in range(rows):
-        visible = int(torch.randint(0, 3 * K, (1,), generator=gen))
-        take = min(visible, K)
-        out[r, :take] = torch.randperm(max(visible, 1), generator=gen)[:take].to(torch.int32)
-    return out.to(DEV)
+COLS = 2080
 
 
-def test_sort_selection_orders_ids_and_keeps_padding_last():
+def _scores_and_windows(rows: int, gen: torch.Generator):
+    """Relu-shaped scores (half zeros: ties at the budget's last score whenever fewer than
+    K are positive) over windows of 0 to 3K groups; the columns past a window are NaN."""
+    ends = torch.randint(0, COLS + 1, (rows,), generator=gen).to(torch.int32).to(DEV)
+    scores = torch.relu(torch.randn(rows, COLS, generator=gen)).to(DEV)
+    scores = scores * (torch.rand(rows, COLS, generator=gen).to(DEV) < 0.3)
+    outside = torch.arange(COLS, device=DEV)[None, :] >= ends[:, None]
+    scores.masked_fill_(outside, float("nan"))
+    return scores, torch.zeros(rows, dtype=torch.int32, device=DEV), ends
+
+
+def _select(scores, starts, ends) -> torch.Tensor:
+    out = torch.empty((scores.shape[0], K), dtype=torch.int32, device=DEV)
+    m._select(SimpleNamespace(block_topk=K), scores, starts, ends, out)
+    return out
+
+
+def test_select_is_the_canonical_row_ascending_with_padding_last():
     gen = torch.Generator().manual_seed(3)
-    rows = _selection_rows(64, gen)
-    # Holes as well: the sort must pack them, not just order a packed prefix.
-    rows[5, 3] = -1
-    rows[9, 0] = -1
-    expected = []
-    for row in rows.cpu().tolist():
-        ids = sorted(i for i in row if i >= 0)
-        expected.append(ids + [-1] * (K - len(ids)))
-    out = rows.clone()
+    scores, starts, ends = _scores_and_windows(64, gen)
 
-    m._sort_selection(out)
+    out = _select(scores, starts, ends)
 
     assert out.dtype == torch.int32
-    assert out.cpu().tolist() == expected
+    assert torch.equal(out, canonical.reference(scores, starts, ends, out))
+    for row, end in zip(out.cpu().tolist(), ends.tolist()):
+        ids = [i for i in row if i >= 0]
+        assert ids == sorted(ids) and len(set(ids)) == len(ids) == min(end, K)
+        assert row == ids + [-1] * (K - len(ids)), "padding must stay last"
 
 
 def test_decode_capture_takes_each_request_last_accepted_row():
@@ -150,16 +159,12 @@ def test_prefill_capture_at_draft_seven():
 
 
 def _reuse_case(fresh: int):
-    """A sorted capture of 16 requests and the reuse call's arguments for it."""
+    """A canonical capture of 16 requests and the reuse call's arguments for it."""
     gen = torch.Generator().manual_seed(11 + fresh)
     batch = 16
-    captured_visible = torch.randint(0, 3 * K, (batch,), generator=gen).to(torch.int32)
-    captured = torch.full((batch, K), -1, dtype=torch.int32)
-    for r, vis in enumerate(captured_visible.tolist()):
-        take = min(vis, K)
-        captured[r, :take] = torch.randperm(max(vis, 1), generator=gen)[:take].to(torch.int32)
-    captured = captured.to(DEV)
-    m._sort_selection(captured)
+    scores, starts, ends = _scores_and_windows(batch, gen)
+    captured_visible = ends.cpu()
+    captured = _select(scores, starts, ends)
     shared = torch.full((8, 32, K), -1, dtype=torch.int32, device=DEV)
     shared[SLOT, :batch] = captured
     shared_visible = torch.zeros((8, 32), dtype=torch.int32, device=DEV)
@@ -174,8 +179,8 @@ def _reuse_case(fresh: int):
     return args, captured_visible
 
 
-def test_reuse_of_a_sorted_capture_stays_sorted():
-    """A sorted capture plus the groups completed since is still ascending: appended ids
+def test_reuse_of_a_canonical_capture_stays_ascending():
+    """A canonical capture plus the groups completed since is still ascending: appended ids
     are newer than every captured one, and a full row gives up its oldest ids to them, so
     the newest captured groups -- the ones next to the new ones -- are kept."""
     for fresh in (0, 1, 2):

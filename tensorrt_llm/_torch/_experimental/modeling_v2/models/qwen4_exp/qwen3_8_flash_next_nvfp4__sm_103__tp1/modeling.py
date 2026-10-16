@@ -108,6 +108,7 @@ from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
 from .ops.activation.gelu_erf import gelu_erf
 from .ops.activation.gelu_tanh import gelu_tanh
+from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
 from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
@@ -425,10 +426,6 @@ _QSA_INDEX_HEAD_TO_ROTARY_RATIO = 2
 # To flip, set the config's `(s0, s1, s2)` and `_QSA_INDEX_USE_MROPE = True`.
 _QSA_MROPE_SECTION = None
 _QSA_INDEX_USE_MROPE = False
-
-#: The key a padding slot (`-1`) sorts under when a row's selected groups are put in
-#: ascending order: past every group id, so padding stays last.
-_SELECTION_PAD_KEY = torch.iinfo(torch.int32).max
 
 # ---------------------------------------------------------------- MTP ------
 
@@ -1999,18 +1996,40 @@ def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
     )
 
 
-def _sort_selection(topk_indices: torch.Tensor) -> None:
-    """Put each row's selected group ids in ascending order, padding last, in place.
+def _select(core, scores, row_starts, row_ends, topk_indices, live_cols=None) -> None:
+    """Select each row's top-`block_topk` groups into `topk_indices` with `qsa_topk_select`,
+    then rewrite the row canonically, in place.
 
-    `qsa_topk_select` compacts a row's picks through a shared-memory atomic, so the set
-    comes back in a launch-dependent order; the expansion keeps that order and the sparse
-    GQA reduces in it, so an unsorted row past the dense threshold is not reproducible
-    run to run. A sorted row is also prefix-packed, which the expansion and the IndexShare
-    reuse require, and the reuse keeps the order: groups completed since the capture are
-    larger than every captured id."""
-    keyed = torch.where(topk_indices < 0, _SELECTION_PAD_KEY, topk_indices)
-    ordered = torch.sort(keyed, dim=1).values
-    topk_indices.copy_(torch.where(ordered == _SELECTION_PAD_KEY, -1, ordered))
+    The radix engine compacts its picks through a shared-memory atomic, so the order is
+    launch-dependent, and where the tie class at the budget's last score straddles the
+    budget -- every zero-score group of a row with fewer positive scores than the budget,
+    on this checkpoint's relu scores -- which tied groups are kept can be too. The
+    expansion keeps the row's order and the sparse GQA reduces in it, so a raw row past the
+    dense threshold is not reproducible run to run. `qsa_canonical_selection` rewrites it
+    into the window's canonical selection -- the groups strictly above the budget's last
+    score, then the highest-index (most recent) ties, ascending, `-1` last -- a function of
+    the scores alone, and the engine's own set in ascending order wherever the budget's
+    last score is untied. A canonical row is prefix-packed, which the expansion and the
+    IndexShare capture and reuse require.
+
+    `index_topk` is the block budget: the entry's default (2048) is 4x the buffer width and
+    the op ignores the row stride, so it mis-writes silently.
+
+    The rewrite reads every column it is given, and `scores` is as wide as the block table,
+    not the live window. A caller that knows a host-side bound on the rows' windows passes
+    it as `live_cols`: the rewrite then reads only those columns and returns the same rows."""
+    qsa_topk_select(scores, row_starts, row_ends, topk_indices, index_topk=core.block_topk)
+    if live_cols is not None:
+        scores = scores[:, :live_cols]
+    qsa_canonical_selection(scores, row_starts, row_ends, topk_indices)
+
+
+def _live_score_columns(core, md, batch: int) -> int:
+    """A host-side bound on every row's selection window in a step with context rows: the
+    longest sequence's compressed length, with the verify width as slack for the draft
+    rows that sit past the host's KV lengths."""
+    longest = int(md.kv_lens_runtime[:batch].max()) if batch > 0 else 0
+    return (longest + _MAX_VERIFY_WIDTH) // core.compress_ratio + 1
 
 
 def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay) -> torch.Tensor:
@@ -2342,6 +2361,7 @@ class PrefillTarget:
             pos3,
             coords,
             sparse,
+            live_cols,
         ) = qsa
         num_tokens = x.shape[0]
 
@@ -2475,12 +2495,7 @@ class PrefillTarget:
                 only_visible_blocks=True,
                 context_rows=True,
             )
-            # `index_topk` is the block budget: the entry's default (2048) is 4x the
-            # buffer width and the op ignores the row stride, so it mis-writes silently.
-            qsa_topk_select(
-                scores, topk_row_starts, visible_blocks, topk_indices, index_topk=core.block_topk
-            )
-            _sort_selection(topk_indices)
+            _select(core, scores, topk_row_starts, visible_blocks, topk_indices, live_cols)
             selected = qsa_expand_block_indices(
                 topk_indices,
                 logical,
@@ -3023,6 +3038,7 @@ class PrefillTarget:
             pos3,
             coords,
             sparse,
+            _live_score_columns(core, md, batch),
         )
 
         # A verify step's generation rows write the PLE pools and the QSA side caches for
@@ -3433,14 +3449,14 @@ class PrefillTarget:
             )
             topk_indices = md.qsa_topk_indices[:rows]
             visible_blocks = md.qsa_visible_blocks[:rows]
-            qsa_topk_select(
+            _select(
+                core,
                 scores,
                 md.qsa_topk_row_starts[:rows],
                 visible_blocks,
                 topk_indices,
-                index_topk=core.block_topk,
+                _live_score_columns(core, md, batch),
             )
-            _sort_selection(topk_indices)
             if share:
                 self._capture_selection(md, topk_indices, visible_blocks)
             selected = qsa_expand_block_indices(
@@ -3825,11 +3841,7 @@ class DecodeTarget:
                 only_visible_blocks=True,
                 context_rows=False,
             )
-            # `index_topk` is the block budget (see PrefillTarget).
-            qsa_topk_select(
-                scores, topk_row_starts, visible_blocks, topk_indices, index_topk=core.block_topk
-            )
-            _sort_selection(topk_indices)
+            _select(core, scores, topk_row_starts, visible_blocks, topk_indices)
             selected = qsa_expand_block_indices(
                 topk_indices,
                 logical,
@@ -4610,14 +4622,7 @@ class DecodeTarget:
                     only_visible_blocks=True,
                     context_rows=False,
                 )
-                qsa_topk_select(
-                    scores,
-                    md.qsa_topk_row_starts[:rows],
-                    visible_blocks,
-                    topk_indices,
-                    index_topk=core.block_topk,
-                )
-                _sort_selection(topk_indices)
+                _select(core, scores, md.qsa_topk_row_starts[:rows], visible_blocks, topk_indices)
                 if share:
                     self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
             selected = qsa_expand_block_indices(
@@ -4936,8 +4941,8 @@ class MTPLayer:
     skips the index branch and rebuilds its selection from that capture with
     `qsa_mtp_reuse_topk`, which appends the groups completed since; a full row gives up
     its oldest ids to them. The expansion adds the incomplete tail, so the tokens drafted
-    since the capture stay visible. Every selection is sorted first (padding last), so
-    the reuse keeps the order.
+    since the capture stay visible. Every selection is canonical first (ascending,
+    padding last), so the reuse keeps the order.
 
     Not an `nn.Module`: the weights live in the core's `ParameterDict`, and a second
     registration would break the weight load's both-directions coverage assert."""

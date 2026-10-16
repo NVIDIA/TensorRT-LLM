@@ -78,7 +78,7 @@ class QsaMtpReuseTopk(OpWrapper):
     Every slot of `output[:rows]` is written and nothing else; returns `output`.
     The inputs are read-only. Nothing is sorted, compacted or de-duplicated and
     the ranking is not recomputed: the captured row is taken as ascending (the
-    target sorts it), so the displaced ids are the oldest groups, not the
+    target makes it canonical), so the displaced ids are the oldest groups, not the
     lowest-scored ones, and the result is ascending again.
 
     Fusion boundary: the copy-and-append only. Capturing each request's row
