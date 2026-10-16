@@ -38,22 +38,11 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
             "final_model_engine": {
                 "total_warmup_seconds": 3.5
             },
-            "initial_draft_model_engine": {
-                "total_warmup_seconds": 1.0
-            },
-            "final_draft_model_engine": {
-                "total_warmup_seconds": 1.25
-            },
         },
         model_engine=SimpleNamespace(
             metrics={"must_not_be_reported": 1.0},
             model_loader=SimpleNamespace(
                 metrics={"total_model_loading_seconds": 1.5}),
-        ),
-        draft_model_engine=SimpleNamespace(
-            metrics={"must_not_be_reported": 1.0},
-            model_loader=SimpleNamespace(
-                metrics={"total_model_loading_seconds": 0.75}),
         ),
     )
 
@@ -64,20 +53,11 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
         "final_model_engine": {
             "total_warmup_seconds": 3.5
         },
-        "initial_draft_model_engine": {
-            "total_warmup_seconds": 1.0
-        },
-        "final_draft_model_engine": {
-            "total_warmup_seconds": 1.25
-        },
         "py_executor": {
             "worker_start_seconds": 0.5
         },
         "model_loader": {
             "total_model_loading_seconds": 1.5
-        },
-        "draft_model_loader": {
-            "total_model_loading_seconds": 0.75
         },
     }
 

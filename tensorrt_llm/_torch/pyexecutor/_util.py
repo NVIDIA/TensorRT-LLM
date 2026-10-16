@@ -857,7 +857,6 @@ class KvCacheCreator:
         self,
         *,
         model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
         mapping: Mapping,
         net_max_seq_len: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -877,7 +876,6 @@ class KvCacheCreator:
         skip_est: bool = False,
     ):
         self._model_engine = model_engine
-        self._draft_model_engine = draft_model_engine
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
@@ -1203,17 +1201,6 @@ class KvCacheCreator:
             # fields would silently drop it.
             return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
-        if self._draft_model_engine is not None:
-            draft_model_config = self._draft_model_engine.model.model_config
-            draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-                self._draft_model_engine, kv_cache_config)
-            return scaled(
-                self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    draft_model_config,
-                    kv_cache_config,
-                    mapping=draft_mapping,
-                    include_request_cost=include_request_cost))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -1752,8 +1739,7 @@ class KvCacheCreator:
                 # get kv cache stats for both model and draft model
                 kv_stats = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
-                # Get draft KV cache stats if present (either from two-model mode or one-model
-                # mode with separate draft KV cache)
+                # Get draft KV cache stats if present (one-model mode with a separate draft KV cache)
                 draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
                 kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
@@ -2435,7 +2421,6 @@ class KvCacheCreator:
         successful split (which already sizes both managers) is unaffected.
         """
         if (not self._is_kv_cache_manager_v2
-                or self._draft_model_engine is not None
                 or not self._should_create_separate_draft_kv_cache()
                 or target_kv_cache_config.max_tokens is not None):
             return draft_kv_cache_config
@@ -2845,9 +2830,8 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        has_separate_one_model_draft = (
-            self._draft_model_engine is None
-            and self._should_create_separate_draft_kv_cache())
+        has_separate_one_model_draft = self._should_create_separate_draft_kv_cache(
+        )
         # One term per axis: a draft pool exists to pair with, block reuse is on,
         # and the span is known. Anything outside keeps its unpaired path.
         self._joint_kv_cache_reuse = (has_separate_one_model_draft and
@@ -2865,11 +2849,8 @@ class KvCacheCreator:
                 cross_kv_cache_config)
 
         # Split combined KV cache budgets before creating managers.
-        has_draft = (
-            self._draft_model_engine is not None  # two-model
-            or has_separate_one_model_draft)  # one-model
         draft_kv_cache_config = None
-        if has_draft:
+        if has_separate_one_model_draft:
             # The GPU split applies when each manager sizes its pools from
             # max_gpu_total_bytes (V2 and V1 VSWA). V1 non-VSWA and estimation
             # size GPU pools from a shared max_tokens instead.
@@ -2912,32 +2893,13 @@ class KvCacheCreator:
         if not estimating_kv_cache and kv_cache_manager is not None:
             kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
 
-        if (not estimating_kv_cache and self._kv_connector_manager is not None
-                and self._draft_model_engine is not None):
-            raise NotImplementedError(
-                "Connector manager is not supported for draft model.")
-
         draft_kv_cache_manager = None
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Two-model speculative decoding: draft model has separate engine
-        if self._draft_model_engine is not None:
-            if (self._is_kv_cache_manager_v2
-                    and draft_kv_cache_config is not None):
-                # Offload budgets are divided per manager, GPU budgets are not.
-                assert (draft_kv_cache_config.max_gpu_total_bytes ==
-                        self_kv_cache_config.max_gpu_total_bytes), (
-                            "KVCacheManagerV2 does not support two-model "
-                            "speculative decoding with separate draft GPU "
-                            "budgets.")
-            draft_kv_cache_manager = self._create_kv_cache_manager(
-                self._draft_model_engine,
-                estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
         # One-model speculative decoding with different KV layouts
-        elif self._should_create_separate_draft_kv_cache():
+        if has_separate_one_model_draft:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 original_max_seq_len,
                 estimating_kv_cache,

@@ -475,10 +475,6 @@ class GuidedDecoder:
     def rollback_rejected_tokens(self) -> None:
         self._rollback_rejected_tokens(self.requests)
 
-    @nvtx_range("GuidedDecoder.rollback_draft_tokens")
-    def rollback_draft_tokens(self) -> None:
-        self._rollback_draft_tokens(self.requests)
-
     def _init_disagg_gen_requests(self, requests: GuidedRequests) -> None:
         """Initialize the grammar matchers for disagg gen requests.
         """

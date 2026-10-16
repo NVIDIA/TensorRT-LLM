@@ -1547,7 +1547,6 @@ class TestFailFastDuringBenchmarkFill:
         ex._disagg_pp_termination_handler = None
         ex.resource_manager = Mock(spec=["free_resources"])
         ex.model_engine = None
-        ex.draft_model_engine = None
         requests = [
             _gen_only_request(request_id)
             for request_id in range(1, num_init_requests + num_ready_requests + 1)

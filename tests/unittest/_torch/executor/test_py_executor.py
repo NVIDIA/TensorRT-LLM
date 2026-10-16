@@ -582,12 +582,8 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
     target = types.SimpleNamespace(
         prepare_disagg_generation_request=lambda req: events.append(("target", req))
     )
-    draft = types.SimpleNamespace(
-        prepare_disagg_generation_request=lambda req: events.append(("draft", req))
-    )
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=target, enable_spec_decode=False),
-        draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=types.SimpleNamespace(
             resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
         ),
@@ -604,16 +600,15 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         executor, types.SimpleNamespace(generation_requests=[request])
     )
     if accepted:
-        assert events == [("first_token", 17, 0), ("target", request), ("draft", request)]
+        assert events == [("first_token", 17, 0), ("target", request)]
     else:
         assert events == []
 
 
-def test_free_request_resources_releases_target_and_draft_model_state() -> None:
-    target, draft = Mock(), Mock()
+def test_free_request_resources_releases_model_state() -> None:
+    target = Mock()
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=target),
-        draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=Mock(),
         _prefetched_request_ids={41},
         disagg=Mock(),
@@ -621,7 +616,6 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     request = types.SimpleNamespace(py_request_id=41)
     PyExecutor._free_request_resources(executor, request)
     target.release_request_state.assert_called_once_with(41)
-    draft.release_request_state.assert_called_once_with(41)
     assert not executor._prefetched_request_ids
 
 

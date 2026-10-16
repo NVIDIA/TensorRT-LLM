@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 from ..pyexecutor.config_utils import (is_nemotron_hybrid,
                                        match_nemotron_h_layer_types)
-from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
@@ -542,7 +541,7 @@ def seat_pool_or_none(model_engine) -> Optional[int]:
     return getattr(model_engine, "max_num_seq_slots", None)
 
 
-def get_spec_resource_manager(model_engine, draft_model_engine=None):
+def get_spec_resource_manager(model_engine):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -678,11 +677,7 @@ def get_spec_decoder(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine,
-                     draft_model_engine,
-                     sampler,
-                     spec_resource_manager,
-                     guided_decoder: Optional[GuidedDecoder] = None):
+def get_spec_drafter(model_engine, spec_resource_manager):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None

@@ -262,7 +262,6 @@ def _make_reserve_creator(
     )
     return KvCacheCreator(
         model_engine=model_engine,
-        draft_model_engine=None,
         mapping=Mapping(),
         net_max_seq_len=1,
         kv_connector_manager=None,
@@ -1227,7 +1226,6 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     ):
         creator = KvCacheCreator(
             model_engine=model_engine,
-            draft_model_engine=None,
             mapping=Mock(cp_config={}),
             net_max_seq_len=max_seq_len,
             kv_connector_manager=None,

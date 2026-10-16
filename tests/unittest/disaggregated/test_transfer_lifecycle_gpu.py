@@ -544,7 +544,6 @@ def _worker(args: argparse.Namespace) -> None:
     # No model, scheduler loop, response transport, or async-send manager is initialized.
     executor = object.__new__(PyExecutor)
     executor.model_engine = None
-    executor.draft_model_engine = None
     executor.kv_cache_transceiver = transceiver
     executor.kv_cache_manager = manager
     executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})

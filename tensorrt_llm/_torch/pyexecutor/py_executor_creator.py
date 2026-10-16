@@ -87,53 +87,35 @@ class _ExecutorMemoryMonitor:
         return bytes / (1024)**3
 
     memory_type_friendly_names = {
-        ExecutorMemoryType.SAMPLER:
-        "Sampler",
-        ExecutorMemoryType.DRAFTER:
-        "Drafter",
-        ExecutorMemoryType.GUIDED_DECODER:
-        "Guided Decoder",
-        ExecutorMemoryType.SPEC_RESOURCES:
-        "Speculative decoding resources",
+        ExecutorMemoryType.SAMPLER: "Sampler",
+        ExecutorMemoryType.DRAFTER: "Drafter",
+        ExecutorMemoryType.GUIDED_DECODER: "Guided Decoder",
+        ExecutorMemoryType.SPEC_RESOURCES: "Speculative decoding resources",
         ExecutorMemoryType.INIT_KV_CACHE:
         "Initial KV Cache (temporary for KV cache size estimation)",
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
         "Additional executor resources (temporary for KV cache size estimation)",
-        ExecutorMemoryType.MODEL_EXTRA:
-        "Model resources created during usage",
-        ExecutorMemoryType.EXTRA_RESOURCES:
-        "Additional executor resources",
-        ExecutorMemoryType.KV_CACHE:
-        "KV cache",
-        ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        "Model",
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
-        "Draft model for speculative decoding",
+        ExecutorMemoryType.MODEL_EXTRA: "Model resources created during usage",
+        ExecutorMemoryType.EXTRA_RESOURCES: "Additional executor resources",
+        ExecutorMemoryType.KV_CACHE: "KV cache",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "Model",
     }
 
     creation_stage_metric_names = {
-        ExecutorMemoryType.SAMPLER:
-        "sampler_creation_seconds",
-        ExecutorMemoryType.DRAFTER:
-        "speculative_drafter_creation_seconds",
-        ExecutorMemoryType.GUIDED_DECODER:
-        "guided_decoder_creation_seconds",
+        ExecutorMemoryType.SAMPLER: "sampler_creation_seconds",
+        ExecutorMemoryType.DRAFTER: "speculative_drafter_creation_seconds",
+        ExecutorMemoryType.GUIDED_DECODER: "guided_decoder_creation_seconds",
         ExecutorMemoryType.SPEC_RESOURCES:
         "speculative_decoding_resource_manager_creation_seconds",
-        ExecutorMemoryType.INIT_KV_CACHE:
-        "initial_kv_cache_creation_seconds",
+        ExecutorMemoryType.INIT_KV_CACHE: "initial_kv_cache_creation_seconds",
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
         "initial_py_executor_creation_seconds_for_kv_cache_estimation",
         ExecutorMemoryType.MODEL_EXTRA:
         "kv_cache_capacity_configuration_seconds",
         ExecutorMemoryType.EXTRA_RESOURCES:
         "final_py_executor_creation_seconds",
-        ExecutorMemoryType.KV_CACHE:
-        "final_kv_cache_creation_seconds",
-        ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        "model_engine_creation_seconds",
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
-        "draft_model_engine_creation_seconds",
+        ExecutorMemoryType.KV_CACHE: "final_kv_cache_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "model_engine_creation_seconds",
     }
 
     # Suggestion to reduce component memory usage
@@ -149,9 +131,6 @@ class _ExecutorMemoryMonitor:
         ExecutorMemoryType.INIT_KV_CACHE:
         "reduce max_num_tokens",
         ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
-         "pipeline and/or tensor parallelism"),
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
         ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
          "pipeline and/or tensor parallelism"),
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
@@ -460,21 +439,12 @@ def log_memory_usage(stage: str):
     )
 
 
-def _move_model_engine_metrics(
-        py_executor: PyExecutor,
-        model_engine: PyTorchModelEngine,
-        stage: str,
-        draft_model_engine: Optional[PyTorchModelEngine] = None) -> None:
-    """Move model-engine metrics and optional draft-model-engine metrics into the
-    executor under a startup stage.
-    """
+def _move_model_engine_metrics(py_executor: PyExecutor,
+                               model_engine: PyTorchModelEngine,
+                               stage: str) -> None:
+    """Move model-engine metrics into the executor under a startup stage."""
     py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
     model_engine.metrics.clear()
-
-    if draft_model_engine is not None:
-        py_executor.metrics[f"{stage}_draft_model_engine"] = dict(
-            draft_model_engine.metrics)
-        draft_model_engine.metrics.clear()
 
 
 def _create_py_executor_impl(
@@ -816,8 +786,6 @@ def _create_py_executor(
                     dist=dist)
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
-    draft_model_engine = None
-
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
@@ -862,8 +830,7 @@ def _create_py_executor(
                     "FP4 MLA cached-context attention is not supported yet; "
                     "disabling KV cache block reuse.")
                 kv_cache_config.enable_block_reuse = False
-                _set_model_engines_cache_reuse(
-                    [model_engine, draft_model_engine], False)
+                _set_model_engines_cache_reuse([model_engine], False)
         elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
@@ -888,8 +855,7 @@ def _create_py_executor(
                            f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
                            f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
+            _set_model_engines_cache_reuse([model_engine], False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         nvfp4_sparse_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
@@ -906,8 +872,7 @@ def _create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
+            _set_model_engines_cache_reuse([model_engine], False)
         if (enable_chunked_context and sm_version
                 not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
             logger.warning("Chunked Prefill for MLA can only be enabled on "
@@ -915,8 +880,6 @@ def _create_py_executor(
                            f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
-            if draft_model_engine is not None:
-                draft_model_engine.attn_runtime_features.chunked_prefill = False
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
@@ -969,7 +932,7 @@ def _create_py_executor(
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
-                    # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
+                    # GuidedDecoder is applicable to non-speculative decoding and drafter-based speculative decoding.
                     guided_decoder = GuidedDecoder(**kwargs)
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
@@ -1132,7 +1095,6 @@ def _create_py_executor(
 
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
-            draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
             kv_connector_manager=kv_connector_manager,
@@ -1172,8 +1134,7 @@ def _create_py_executor(
     # to provide a resource manager if required.
 
     with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
-        spec_resource_manager = get_spec_resource_manager(
-            model_engine, draft_model_engine)
+        spec_resource_manager = get_spec_resource_manager(model_engine)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
@@ -1181,14 +1142,9 @@ def _create_py_executor(
     # Drafter for speculative decoding
     with allocation_scope(ExecutorMemoryType.DRAFTER):
         drafter = get_spec_drafter(model_engine,
-                                   draft_model_engine,
-                                   sampler,
-                                   spec_resource_manager=spec_resource_manager,
-                                   guided_decoder=guided_decoder)
+                                   spec_resource_manager=spec_resource_manager)
 
-    for engine in (model_engine, draft_model_engine):
-        if engine is not None:
-            engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+    model_engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -1229,8 +1185,7 @@ def _create_py_executor(
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
-        _move_model_engine_metrics(py_executor, model_engine, "initial",
-                                   draft_model_engine)
+        _move_model_engine_metrics(py_executor, model_engine, "initial")
         # record initial metrics as py_executor will be deleted later
         initial_model_engine_metrics = dict(py_executor.metrics)
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
@@ -1253,9 +1208,7 @@ def _create_py_executor(
             # configure_kv_cache_capacity shuts down the Phase-1 executor, which
             # releases its CUDA graphs before its resource managers. Only the
             # profiling attention metadata remains to be discarded here.
-            for eng in [model_engine, draft_model_engine]:
-                if eng is not None:
-                    eng.attn_metadata = None
+            model_engine.attn_metadata = None
 
             del py_executor  # free before constructing new
             gc.collect()
@@ -1268,9 +1221,7 @@ def _create_py_executor(
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
 
-        for engine in (model_engine, draft_model_engine):
-            if engine is not None:
-                engine._warmup_timer.purpose = "final_executor"
+        model_engine._warmup_timer.purpose = "final_executor"
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1328,8 +1279,7 @@ def _create_py_executor(
         raise
 
     py_executor.metrics.update(initial_model_engine_metrics)
-    _move_model_engine_metrics(py_executor, model_engine, "final",
-                               draft_model_engine)
+    _move_model_engine_metrics(py_executor, model_engine, "final")
 
     return py_executor
 

@@ -113,7 +113,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
-                               ResourceManagerType, request_context)
+                               ResourceManagerType)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -548,8 +548,6 @@ class PyExecutor:
             model_engine.register_sample_in_graph_callable(
                 self._sample_in_graph)
         self.drafter = drafter
-        self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
-                                          None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
@@ -903,8 +901,6 @@ class PyExecutor:
         with torch.cuda.stream(self.execution_stream), \
                 _distributed_warmup_guard(self.dist, self.dist.mapping):
             self.model_engine.warmup(self.resource_manager)
-            if self.draft_model_engine is not None:
-                self.draft_model_engine.warmup(self.resource_manager)
             self._initialize_remote_tail_adp()
 
         # Ensure the default stream waits for execution_stream to complete
@@ -1542,8 +1538,6 @@ class PyExecutor:
         self._is_warmup = value
         # Set warmup flag in model engine to trigger torch compile and avoid moe load balancer statistics update
         self.model_engine.is_warmup = value
-        if self.draft_model_engine is not None:
-            self.draft_model_engine.is_warmup = value
 
     def _validate_moe_a2a_checkpoint_support(self) -> None:
         """Reject sleep/wakeup up front when a MoE resource cannot checkpoint.
@@ -2008,9 +2002,8 @@ class PyExecutor:
         # empty_cache), the subsequent CUDA graph teardown can trigger a
         # device-wide cudaErrorIllegalAddress when the driver touches metadata
         # for the now-freed memory regions.
-        for engine in (self.model_engine, self.draft_model_engine):
-            if engine is not None and hasattr(engine, '_release_cuda_graphs'):
-                engine._release_cuda_graphs()
+        if hasattr(self.model_engine, '_release_cuda_graphs'):
+            self.model_engine._release_cuda_graphs()
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
@@ -2029,8 +2022,6 @@ class PyExecutor:
         # (when the executor's reference is dropped), which is sufficient for
         # the GMS daemon registry eviction the cleanup hook was added for.
         del self.model_engine
-        if self.draft_model_engine is not None:
-            del self.draft_model_engine
         if self.virtual_memory_pools is not None:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
@@ -3741,8 +3732,6 @@ class PyExecutor:
         selected_engines = []
         if ExecutorMemoryType.MODEL_ENGINE_MAIN in tags:
             selected_engines.append(self.model_engine)
-        if ExecutorMemoryType.MODEL_ENGINE_DRAFT in tags and self.draft_model_engine is not None:
-            selected_engines.append(self.draft_model_engine)
 
         resources: list[CheckpointableCommunication] = []
         seen = set()
@@ -4354,7 +4343,7 @@ class PyExecutor:
             # populating the draft-token count here it under-reserves and, under chunked
             # prefill + overlap scheduler, the forward's uniform (1 + runtime_draft_len)
             # build overshoots max_num_tokens (total_num_tokens > max_num_tokens). Mirror the
-            # two-model normalization so scheduling reserves the correct token budget.
+            # drafter normalization above so scheduling reserves the correct token budget.
             # model_engine is guarded first so partially-constructed executors in unit tests
             # (which may not set model_engine) do not raise AttributeError.
             rejection_on = (
@@ -4939,7 +4928,6 @@ class PyExecutor:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 if can_queue:
-                    # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None:
                         self.guided_decoder.add_batch(scheduled_batch)
@@ -4949,25 +4937,20 @@ class PyExecutor:
                     if self.drafter is not None and self.use_spec_decode:
                         if self.guided_decoder is not None:
                             self.guided_decoder.rollback_rejected_tokens()
-                        with request_context(
-                                is_draft=self.draft_model_engine is not None,
-                                scheduled_requests=scheduled_batch):
-                            self.execution_stream.wait_stream(
-                                torch.cuda.current_stream())
-                            with torch.cuda.stream(self.execution_stream):
-                                self.drafter.prepare_draft_tokens(
-                                    scheduled_batch, self.resource_manager)
-                                # Pad draft tokens to the max draft length and extend KV cache
-                                # capacity to match. This is for CUDA graph compatibility.
-                                self.drafter.pad_draft_tokens_for_cuda_graph(
-                                    scheduled_batch, self.resource_manager)
-                            torch.cuda.current_stream().wait_stream(
-                                self.execution_stream)
-                        # add_batch must be called again to restore to target requests with updated draft tokens.
+                        self.execution_stream.wait_stream(
+                            torch.cuda.current_stream())
+                        with torch.cuda.stream(self.execution_stream):
+                            self.drafter.prepare_draft_tokens(
+                                scheduled_batch, self.resource_manager)
+                            # Pad draft tokens to the max draft length and extend KV cache
+                            # capacity to match. This is for CUDA graph compatibility.
+                            self.drafter.pad_draft_tokens_for_cuda_graph(
+                                scheduled_batch, self.resource_manager)
+                        torch.cuda.current_stream().wait_stream(
+                            self.execution_stream)
+                        # add_batch must be called again to pick up the updated draft tokens.
                         if self.guided_decoder is not None:
                             self.guided_decoder.add_batch(scheduled_batch)
-                            if hasattr(self.drafter, "guided_decoder"):
-                                self.guided_decoder.rollback_draft_tokens()
 
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
@@ -8078,11 +8061,10 @@ class PyExecutor:
             for beam in range(0, beam_width):
                 req.add_new_token(first_gen_tokens[beam], beam)
 
-            for engine in (self.model_engine, self.draft_model_engine):
-                prepare = getattr(getattr(engine, "model", None),
-                                  "prepare_disagg_generation_request", None)
-                if prepare is not None:
-                    prepare(req)
+            prepare = getattr(getattr(self.model_engine, "model", None),
+                              "prepare_disagg_generation_request", None)
+            if prepare is not None:
+                prepare(req)
 
             self._maybe_prepend_logprobs_and_logits(req, beam_width)
 
@@ -8872,11 +8854,10 @@ class PyExecutor:
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
-        for engine in (self.model_engine, self.draft_model_engine):
-            release = getattr(getattr(engine, "model", None),
-                              "release_request_state", None)
-            if release is not None:
-                release(request.py_request_id)
+        release = getattr(getattr(self.model_engine, "model", None),
+                          "release_request_state", None)
+        if release is not None:
+            release(request.py_request_id)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
         self._free_request_resources(request)
@@ -9431,22 +9412,20 @@ class PyExecutor:
     def _handle_speculative_decoding(
             self, scheduled_batch, previous_tensors,
             target_inputs) -> Optional[SampleStateTensorsSpec]:
-        with request_context(is_draft=self.draft_model_engine is not None,
-                             scheduled_requests=scheduled_batch):
-            target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
-            assert target_outputs is not None, "target_outputs should not be None"
-            new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
-                scheduled_batch=scheduled_batch,
-                target_inputs=target_inputs,
-                target_outputs=target_outputs)
+        target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
+        assert target_outputs is not None, "target_outputs should not be None"
+        new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
+            scheduled_batch=scheduled_batch,
+            target_inputs=target_inputs,
+            target_outputs=target_outputs)
 
-            self.drafter.generate_draft_tokens_with_overlap(
-                scheduled_batch, self.resource_manager,
-                previous_tensors.device if previous_tensors else None,
-                new_target_inputs, num_accepted_tokens_device)
+        self.drafter.generate_draft_tokens_with_overlap(
+            scheduled_batch, self.resource_manager,
+            previous_tensors.device if previous_tensors else None,
+            new_target_inputs, num_accepted_tokens_device)
 
-            # Pad draft tokens to the max draft length for CUDA graph compatibility
-            self.has_previous_draft_tokens = new_target_inputs is not None and new_target_inputs.next_draft_tokens is not None
+        # Pad draft tokens to the max draft length for CUDA graph compatibility
+        self.has_previous_draft_tokens = new_target_inputs is not None and new_target_inputs.next_draft_tokens is not None
 
         return new_target_inputs
 
