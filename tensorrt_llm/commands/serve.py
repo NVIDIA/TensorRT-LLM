@@ -467,12 +467,14 @@ def _bind_failure(kind: str, host: str, port: int,
                   error: OSError) -> RuntimeError:
     """Log a failed listener bind and return the exception to raise.
 
-    A name-resolution failure (``socket.gaierror``) is an ``OSError`` too, but
+    An address lookup failure (``socket.gaierror``) is an ``OSError`` too, but
     no port was ever tried, so it is reported as such instead of being
-    diagnosed as a port conflict.
+    diagnosed as a port conflict. It covers both a name that does not resolve
+    and an address of a family the socket cannot use, such as an IPv6 literal
+    on an IPv4-only listener.
     """
     if isinstance(error, socket.gaierror):
-        reason = f"cannot resolve host {host!r}: {error}"
+        reason = f"address lookup failed for host {host!r}: {error}"
         logger.error(f"Failed to bind {kind} socket to {host}:{port} "
                      f"(pid={os.getpid()}): {reason}")
         return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")

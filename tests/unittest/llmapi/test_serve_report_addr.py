@@ -244,7 +244,8 @@ def test_bind_failure_reports_an_unresolvable_host(monkeypatch: pytest.MonkeyPat
 
     assert isinstance(raised, RuntimeError)
     assert str(raised) == (
-        f"Failed to bind socket to nvl72049-T03:0: cannot resolve host 'nvl72049-T03': {error}"
+        "Failed to bind socket to nvl72049-T03:0: "
+        f"address lookup failed for host 'nvl72049-T03': {error}"
     )
     assert "Port holder" not in str(raised)
     assert diagnosed_ports == []
@@ -260,13 +261,18 @@ def test_bind_failure_reports_an_unresolvable_host(monkeypatch: pytest.MonkeyPat
 )
 def test_listeners_report_an_unresolvable_host(monkeypatch: pytest.MonkeyPatch, launch) -> None:
     """The lookup that picks the address family fails before any bind is tried."""
+    # Under a multi-rank launcher (RANK/WORLD_SIZE, SLURM_NTASKS) the VisualGen
+    # entrypoint would otherwise act on that launch before reaching the lookup.
+    import tensorrt_llm._torch.visual_gen.executor as visual_gen_executor
+
+    monkeypatch.setattr(visual_gen_executor, "_detect_external_launch", lambda: None)
 
     def unresolvable(host, *args, **kwargs):
         raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
     monkeypatch.setattr(serve_module.socket, "getaddrinfo", unresolvable)
 
-    with pytest.raises(RuntimeError, match="cannot resolve host 'nvl72049-T03'"):
+    with pytest.raises(RuntimeError, match="address lookup failed for host 'nvl72049-T03'"):
         launch("nvl72049-T03")
 
 
