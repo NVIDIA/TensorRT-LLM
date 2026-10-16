@@ -2212,6 +2212,9 @@ def _check_locality_domain_side_inputs(metadata, forward_args) -> None:
     missing locality.
     """
     unsupported = []
+    # The scoped view clears block_ids_per_seq, which is the FlashMLA block table.
+    if getattr(metadata, "enable_flash_mla", False):
+        unsupported.append("FlashMLA")
     if metadata.beam_width != 1:
         unsupported.append(f"beam_width={metadata.beam_width}")
     if metadata.is_cross or forward_args.cross_kv is not None:
@@ -2491,6 +2494,29 @@ def _slice_cu_seqlens(cu_seqlens: torch.Tensor, start: int,
                       end: int) -> torch.Tensor:
     sliced = cu_seqlens[start:end + 1] - cu_seqlens[start]
     return sliced.contiguous()
+
+
+def _slice_locality_domain_cu_seqlens(cu_seqlens, ld_slice,
+                                      attention_input_type,
+                                      num_contexts) -> torch.Tensor:
+    """Per-domain view of a full-batch cumulative length tensor.
+
+    The full tensor is indexed by request in batch order. Generation-only
+    calls carry generation requests only, so their indices drop the context
+    offset; mixed calls splice the domain's context and generation ranges.
+    """
+    if attention_input_type == AttentionInputType.generation_only:
+        return _slice_cu_seqlens(cu_seqlens,
+                                 ld_slice["gen_req_start"] - num_contexts,
+                                 ld_slice["gen_req_end"] - num_contexts)
+    if attention_input_type == AttentionInputType.context_only:
+        return _slice_cu_seqlens(cu_seqlens, ld_slice["ctx_req_start"],
+                                 ld_slice["ctx_req_end"])
+    ctx = _slice_cu_seqlens(cu_seqlens, ld_slice["ctx_req_start"],
+                            ld_slice["ctx_req_end"])
+    gen = _slice_cu_seqlens(cu_seqlens, ld_slice["gen_req_start"],
+                            ld_slice["gen_req_end"])
+    return torch.cat((ctx, gen[1:] + ctx[-1]))
 
 
 def _prepare_locality_domain_mla_gen_state_from_full(
@@ -3469,23 +3495,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                         forward_args.quant_q_buffer[ld_slice["gen_token_start"]:
                                                     ld_slice["gen_token_end"]])
             else:
-                num_seqs = ld_slice["num_seqs"]
-                if forward_args.cu_q_seqlens is not None:
-                    cu_q = torch.zeros(num_seqs + 1,
-                                       dtype=torch.int32,
-                                       device=q.device)
-                    cu_q[1:] = ld_slice["prompt_lengths_cpu"].to(
-                        q.device).int().cumsum(0)
-                    ld_overrides["cu_q_seqlens"] = cu_q
-                if forward_args.cu_kv_seqlens is not None:
-                    cu_kv = torch.zeros(num_seqs + 1,
-                                        dtype=torch.int32,
-                                        device=q.device)
-                    cu_kv[1:] = ld_slice["sequence_lengths"].to(
-                        q.device).int().cumsum(0)
-                    ld_overrides["cu_kv_seqlens"] = cu_kv
+                # Slice the incoming offsets rather than rebuilding them from
+                # prompt lengths: for generation rows the prompt length is the
+                # history, not the number of packed Q rows.
+                for name in ("cu_q_seqlens", "cu_kv_seqlens"):
+                    cu = getattr(forward_args, name)
+                    if cu is not None:
+                        ld_overrides[name] = _slice_locality_domain_cu_seqlens(
+                            cu, ld_slice, forward_args.attention_input_type,
+                            metadata.num_contexts)
                 if forward_args.fmha_scheduler_counter is not None:
-                    ld_overrides["fmha_scheduler_counter"] = torch.empty_like(
+                    ld_overrides["fmha_scheduler_counter"] = torch.zeros_like(
                         forward_args.fmha_scheduler_counter)
                 if forward_args.quant_q_buffer is not None:
                     ld_overrides["quant_q_buffer"] = cat(
@@ -3953,7 +3973,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 fmha_scheduler_counter,
                 mla_bmm1_scale,
                 mla_bmm2_scale,
-                fused_q.shape[0],
+                latent_cache.shape[0],
             )
 
     def _fp4_mla_rope_generation(

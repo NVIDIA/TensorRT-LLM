@@ -1229,6 +1229,42 @@ def _spec_recompute_claim_limit(
     return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
+def resolve_fork_join_attn(
+    num_locality_domains: int,
+    enable_locality_domains: bool,
+    *,
+    runtime_enabled: bool,
+    mock_localization: bool,
+) -> bool:
+    """Whether attention forks one stream per locality domain.
+
+    A localized KV cache needs the locality domain runtime to fork; mock
+    localization keeps the split cache on one stream, and a disabled runtime
+    with the flag on is a configuration error rather than a silent downgrade.
+    """
+    if num_locality_domains <= 1 or not enable_locality_domains:
+        return False
+    if runtime_enabled:
+        # Balanced generation dispatch splits rows in half (runner.py).
+        if num_locality_domains != 2:
+            raise ValueError(
+                "fork-join attention supports exactly 2 locality domains; "
+                f"got {num_locality_domains}"
+            )
+        return True
+    if mock_localization:
+        logger.info(
+            "Mock localization: KV cache split across %d domains, attention stays on one stream",
+            num_locality_domains,
+        )
+        return False
+    raise RuntimeError(
+        "enable_locality_domains=True, but locality domain execution is disabled on this "
+        "device (DISABLE_LOCALITY_DOMAINS=1 or no runtime support), so the KV cache would "
+        "be localized without matching streams"
+    )
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
@@ -1820,27 +1856,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self.impl = candidate
         # Cached at construction so the per-locality-domain metadata invariants
         # stay stable for the manager's lifetime.
-        self._fork_join_attn = False
-        if self.num_locality_domains > 1 and enable_locality_domains:
-            if is_locality_domain_enabled():
-                # Balanced generation dispatch splits rows in half (runner.py).
-                assert self.num_locality_domains == 2, (
-                    "fork-join attention supports exactly 2 locality domains; "
-                    f"got {self.num_locality_domains}"
-                )
-                self._fork_join_attn = True
-            elif os.environ.get("TRT_LLM_MOCK_LOCALIZATION_SUPPORT") == "1":
-                logger.info(
-                    "Mock localization: KV cache split across %d domains, "
-                    "attention stays on one stream",
-                    self.num_locality_domains,
-                )
-            else:
-                raise RuntimeError(
-                    "enable_locality_domains=True, but locality domain execution is "
-                    "disabled on this device (DISABLE_LOCALITY_DOMAINS=1 or no runtime "
-                    "support), so the KV cache would be localized without matching streams"
-                )
+        self._fork_join_attn = resolve_fork_join_attn(
+            self.num_locality_domains,
+            enable_locality_domains,
+            runtime_enabled=is_locality_domain_enabled(),
+            mock_localization=os.environ.get("TRT_LLM_MOCK_LOCALIZATION_SUPPORT") == "1",
+        )
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(

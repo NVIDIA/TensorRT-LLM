@@ -3218,32 +3218,26 @@ class SpecWorkerBase(nn.Module, ABC):
         draft_manager_supports_locality_domain_forkjoin = getattr(
             draft_kv_cache_manager, 'fork_join_attn', False)
         using_separate_draft_cache = saved_state is not None
-        if attn_metadata.locality_domain_enabled:
-            if not enable_draft_locality_domain_forkjoin:
-                patch_locality_metadata('locality_domain_enabled', False)
-            elif using_separate_draft_cache:
-                if draft_manager_supports_locality_domain_forkjoin:
-                    draft_locality_domain_block_offsets = (
-                        attn_metadata.
-                        draft_locality_domain_kv_cache_block_offsets)
-                    if draft_locality_domain_block_offsets is None:
-                        restore_attn_metadata_after_draft_replay(
-                            attn_metadata, saved_state)
-                        raise RuntimeError(
-                            "locality domain fork-join is enabled for the draft KV "
-                            "cache, but draft_locality_domain_kv_cache_block_offsets "
-                            "was not prepared.")
-                    patch_locality_metadata(
-                        'locality_domain_kv_cache_block_offsets',
-                        draft_locality_domain_block_offsets)
-                else:
-                    patch_locality_metadata('locality_domain_enabled', False)
-
-        if saved_state is None and not saved_locality_attrs:
-            yield attn_metadata
-            return
-
         try:
+            if attn_metadata.locality_domain_enabled:
+                if not enable_draft_locality_domain_forkjoin:
+                    patch_locality_metadata('locality_domain_enabled', False)
+                elif using_separate_draft_cache:
+                    if draft_manager_supports_locality_domain_forkjoin:
+                        draft_locality_domain_block_offsets = (
+                            attn_metadata.
+                            draft_locality_domain_kv_cache_block_offsets)
+                        if draft_locality_domain_block_offsets is None:
+                            raise RuntimeError(
+                                "locality domain fork-join is enabled for the draft KV "
+                                "cache, but draft_locality_domain_kv_cache_block_offsets "
+                                "was not prepared.")
+                        patch_locality_metadata(
+                            'locality_domain_kv_cache_block_offsets',
+                            draft_locality_domain_block_offsets)
+                    else:
+                        patch_locality_metadata('locality_domain_enabled',
+                                                False)
             yield attn_metadata
         finally:
             for name, value in reversed(saved_locality_attrs):

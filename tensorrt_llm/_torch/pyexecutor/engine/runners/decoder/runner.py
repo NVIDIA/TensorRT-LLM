@@ -4929,6 +4929,9 @@ class DecoderRunner(ScheduledModelRunner):
             # fresh final-context row would skip its cache-slot reset.
             and not self._model_uses_ple_recurrent_state
             and self.mapping.cp_size == 1
+            # Promoted rows are re-sorted by domain with the generation rows,
+            # while sampling still walks the semantic batch in its own order.
+            and not _locality_domain_forkjoin_enabled(kv_cache_manager)
         ):
             graph_requests, promoted_context_request_ids = _make_single_token_context_graph_batch(
                 scheduled_requests, self._is_final_multimodal_context_decode_compatible

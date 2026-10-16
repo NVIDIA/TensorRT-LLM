@@ -104,6 +104,8 @@ public:
     SharedPtr<Page> remove(NodeRef node);
 
     SlotCount size() const noexcept;
+    // Pages whose slot lives in the given locality domain; the total when nullopt.
+    SlotCount size(std::optional<int> localityDomainId) const noexcept;
 
     bool empty() const noexcept
     {
@@ -144,9 +146,12 @@ public:
 
 private:
     LRUEvictionPolicy& getOrCreate(Priority p);
+    void count(Page const& page, SlotCount delta) noexcept;
 
     // std::map keeps keys sorted. We evict from the lowest-priority key first.
     std::map<Priority, LRUEvictionPolicy> mPolicies;
+    // Indexed by locality domain id so a domain-filtered count never walks the queues.
+    std::vector<SlotCount> mDomainCounts;
 };
 
 // ---------------------------------------------------------------------------
