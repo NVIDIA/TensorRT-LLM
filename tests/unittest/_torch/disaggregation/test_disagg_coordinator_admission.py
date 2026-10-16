@@ -252,7 +252,7 @@ def _cp_dist(peer_admitted_ids, cp_size=2) -> SimpleNamespace:
     """This CP rank's dist: ``cp_allgather`` returns its own ids followed by
     each peer's admitted ids, and records every payload it was given."""
 
-    def cp_allgather(ids):
+    def cp_allgather(ids, *, small_payload=False):
         dist.gathered.append(list(ids))
         return [ids, *peer_admitted_ids]
 

@@ -334,8 +334,9 @@ class DisaggTransferCoordinator:
         """Keep only the gen-init requests that every CP rank of the group admitted.
 
         In async-transfer mode ``receive_gen_init`` ends with the gen transfer
-        status collective, entered only on ranks that admitted something, so
-        the CP ranks must admit the same requests in the same iteration. Equal
+        status collective, entered only on ranks that admitted something, and in
+        sync mode with the failure gather (``_align_sync_receive_failures_across_cp``),
+        so the CP ranks must admit the same requests in the same iteration. Equal
         KV capacity does not guarantee that: KV cache manager V1 deals helix
         blocks round-robin from CP rank 0, so that rank can hold one more block
         per request, and a client cancel or a transfer timeout retires a request
@@ -352,7 +353,8 @@ class DisaggTransferCoordinator:
             return admitted
         local_ids = [request.py_request_id for request in admitted]
         common_ids = set(local_ids)
-        for peer_ids in self._dist.cp_allgather(local_ids):
+        # small_payload: at most one iteration's gen-init request ids.
+        for peer_ids in self._dist.cp_allgather(local_ids, small_payload=True):
             common_ids.intersection_update(peer_ids)
         if len(common_ids) == len(local_ids):
             return admitted
@@ -395,6 +397,7 @@ class DisaggTransferCoordinator:
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in admitted:
                 self._transceiver.request_and_receive_sync(req)
+            self._align_sync_receive_failures_across_cp(admitted)
             self._check_transfer_errors("generation requests")
             return
 
@@ -417,6 +420,52 @@ class DisaggTransferCoordinator:
             self._stamp_gen_transfer_start(admitted)
 
         self.reap_gen_receives(0)
+
+    def _align_sync_receive_failures_across_cp(self, admitted: List[LlmRequest]) -> None:
+        """Fail on this CP rank every request whose blocking receive failed on any CP rank.
+
+        This is a CP collective. A blocking receive settles each request on its
+        own rank, with no cross-rank consensus like the one ``reap_gen_receives``
+        runs on the asynchronous path. If one CP rank fails a request and its
+        peer receives it, the peer decodes it alone and the helix all-to-all sees
+        different batches. TP ranks are not aligned here: without attention DP a
+        request can still fail on one TP rank and survive on another, as it can
+        without CP.
+
+        Every CP rank reaches the gather with the same ``admitted`` requests: the
+        pp=1 loops align them with ``align_gen_admission_across_cp``, and the PP
+        loop broadcasts CP rank 0's schedule to its peers. The exception is the PP
+        loop under attention DP with tp_size > 1, where each first-stage rank
+        schedules on its own (``PyExecutor._pp_schedule_and_propagate``), so the
+        gather is skipped there. KvCacheTransceiverV2 and KVCacheManagerV2 reject
+        that layout under helix. The C++ transceiver with KV cache manager V1
+        accepts it, so there a sync failure can still split the CP ranks.
+        """
+        if self._dist.cp_size == 1 or (
+            self._enable_attention_dp and self._dist.tp_size > 1 and self._dist.pp_size > 1
+        ):
+            return
+        local_failed_ids = [
+            req.py_request_id for req in admitted if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        ]
+        # small_payload: at most one iteration's gen-init request ids.
+        failed_ids = {
+            rid
+            for peer_ids in self._dist.cp_allgather(local_failed_ids, small_payload=True)
+            for rid in peer_ids
+        }
+        failed_on_a_peer_only = [
+            req
+            for req in admitted
+            if req.py_request_id in failed_ids and req.state != LlmRequestState.DISAGG_TRANS_ERROR
+        ]
+        if failed_on_a_peer_only:
+            logger.warning(
+                "Failing generation requests whose KV receive failed on a peer CP rank: "
+                f"{[req.py_request_id for req in failed_on_a_peer_only]}"
+            )
+        for req in failed_on_a_peer_only:
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
 
     def _take_receive_fences(
         self, requests: List[LlmRequest]
