@@ -3163,6 +3163,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return None
 
+    def get_disagg_layer_ids(self, layer_ids: Sequence[int]) -> list[int]:
+        """Return PP-independent transfer identifiers for native KV layers."""
+        return [self.pp_layers[layer] for layer in layer_ids]
+
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
 
@@ -6861,14 +6865,9 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             )
         if any(n < 0 or n % self.tokens_per_block for n in (self.first_n, self.last_n)):
             raise ValueError("First/Last counts must be nonnegative multiples of tokens_per_block")
-        if (
-            self.max_beam_width != 1
-            or self.max_draft_len
-            or self.is_disagg
-            or self.mapping.cp_size != 1
-        ):
+        if self.max_beam_width != 1 or self.max_draft_len or self.mapping.cp_size != 1:
             raise NotImplementedError(
-                "Mixed precision requires single-beam, non-speculative local execution"
+                "Mixed precision requires single-beam, non-speculative execution with CP=1"
             )
         if config.enable_swa_scratch_reuse:
             raise NotImplementedError("Mixed-precision staging requires ordinary SWA page tables")
@@ -6943,6 +6942,12 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             tiers.append(tier)
         ratio = self._split_mixed_precision_pool_ratio(config, layers)
         return replace(config, layers=layers, cache_tiers=tiers, initial_pool_ratio=ratio)
+
+    def get_disagg_layer_ids(self, layer_ids: Sequence[int]) -> list[int]:
+        # Transfer IDs distinguish the two stores; Attention keeps its model layer IDs.
+        ids = {local: 2 * model for local, model in enumerate(self.pp_layers)}
+        ids.update({high: ids[low] + 1 for low, high in self.high_layers.items()})
+        return [ids[layer] for layer in layer_ids]
 
     def _split_mixed_precision_pool_ratio(
         self, config: KVCacheManagerConfigPy, layers: Sequence[object]

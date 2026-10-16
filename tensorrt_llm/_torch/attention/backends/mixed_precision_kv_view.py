@@ -240,17 +240,14 @@ class MixedPrecisionKVView:
             if self._metadata is None:
                 self._metadata = replace(metadata, kv_cache_manager=self, cuda_graph_buffers=None)
             else:
-                for name in (
-                    "seq_lens",
-                    "seq_lens_kv",
-                    "num_contexts",
-                    "kv_cache_params",
-                    "request_ids",
-                    "prompt_lens",
-                    "position_ids",
-                    "padded_num_tokens",
-                ):
-                    setattr(self._metadata, name, getattr(metadata, name))
+                self._metadata.seq_lens = metadata.seq_lens
+                self._metadata.seq_lens_kv = metadata.seq_lens_kv
+                self._metadata.num_contexts = metadata.num_contexts
+                self._metadata.kv_cache_params = metadata.kv_cache_params
+                self._metadata.request_ids = metadata.request_ids
+                self._metadata.prompt_lens = metadata.prompt_lens
+                self._metadata.position_ids = metadata.position_ids
+                self._metadata.padded_num_tokens = metadata.padded_num_tokens
             self._metadata.prepare()
         else:
             self._metadata = copy.copy(metadata)

@@ -261,3 +261,37 @@ def test_short_sequence_uses_high_values_for_every_page(manager):
         assert all(page >= 0 for page in cache.get_base_page_indices(group))
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("manager", ["per_request"], indirect=True)
+def test_disagg_exports_both_pools_and_pairs_sink_tail(manager):
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.disaggregation.native.transfer import Sender
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+
+    rank = RankInfo.from_kv_cache_manager("mixed", manager, device_id=0)
+    table = rank.page_table
+    low_group = manager.impl.get_layer_group_id(0)
+    high_group = manager.impl.get_layer_group_id(manager.high_layers[0])
+    assert table.layer_groups[low_group].local_layers[0].global_layer_id == 0
+    assert table.layer_groups[high_group].local_layers[0].global_layer_id == 1
+    assert len(table.layer_groups[low_group].pool_views) == 2  # NVFP4 data and scales.
+    assert len(table.layer_groups[high_group].pool_views) == 1
+    registrar = PeerRegistrar(rank, KVRegionExtractorV1(table))
+    peer = RankInfo.from_bytes(rank.to_bytes())
+    peer.instance_name = "decode"
+    assert registrar.get_pool_mapping(peer) == {
+        (group, pool): (group, pool)
+        for group, layer in enumerate(table.layer_groups)
+        for pool in range(len(layer.pool_views))
+    }
+    # Native positional matching includes sink and tail, without moving stale middle pages.
+    source, destination = Sender._pair_ordinals(
+        np.array([4, -1, -1, -1, 7]), np.array([2, -1, -1, -1, 6])
+    )
+    assert source.tolist() == [4, 7]
+    assert destination.tolist() == [2, 6]
+    assert manager.pp_layers == [0] and manager.layer_offsets == {0: 0}

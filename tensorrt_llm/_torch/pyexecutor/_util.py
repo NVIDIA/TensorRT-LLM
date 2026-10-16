@@ -203,10 +203,9 @@ def get_kv_cache_manager_cls(
             raise ValueError(
                 "Mixed-precision KV requires use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None or is_hybrid_linear(config)
-                or is_disagg
                 or model_config.attn_backend not in ("TRTLLM", "FLASHINFER")):
             raise NotImplementedError(
-                "Mixed-precision KV currently supports local dense Attention/MLA with "
+                "Mixed-precision KV currently supports dense Attention/MLA with "
                 "TRTLLM or FlashInfer; sparse and recurrent models are not wired yet."
             )
         return MixedPrecisionKVCacheManager

@@ -90,8 +90,10 @@ def test_optimized_two_pool_prefill_and_decode(
             attention._fmha_manager,
         )
     scale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    decode_graph = None
 
     def forward(begin, end, context):
+        nonlocal decode_graph
         metadata = backend.Metadata(
             seq_lens=torch.tensor([end - begin] * batch, dtype=torch.int32),
             num_contexts=batch if context else 0,
@@ -111,7 +113,9 @@ def test_optimized_two_pool_prefill_and_decode(
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
         ]
         inputs = (
-            (torch.cat((q, k, v), dim=-1), None, None) if backend is TrtllmAttention else (q, k, v)
+            (torch.cat((q, k, v), dim=-1), None, None)
+            if backend is TrtllmAttention
+            else (q.clone(), k.clone(), v.clone())
         )
 
         def run():
@@ -134,6 +138,7 @@ def test_optimized_two_pool_prefill_and_decode(
                     tensor.copy_(tensor.flip(0))
             graph.replay()
             torch.testing.assert_close(output, reference.flip(0), atol=0.01, rtol=0.02)
+            decode_graph = (metadata, inputs, graph, output)
             output = output.flip(0)
         assert metadata.kv_cache_manager is manager and metadata.kv_layout == kv_layout
         return output
@@ -162,8 +167,12 @@ def test_optimized_two_pool_prefill_and_decode(
         if backend is TrtllmAttention:
             selection_cache = attention._unquantized_fmha_manager
             assert selection_cache is not None
-        implementation = "_forward_impl" if backend is TrtllmAttention else "forward_impl"
-        with patch.object(attention, implementation, side_effect=RuntimeError("test failure")):
+        target, implementation = (
+            (selection_cache, "select")
+            if backend is TrtllmAttention
+            else (attention, "forward_impl")
+        )
+        with patch.object(target, implementation, side_effect=RuntimeError("test failure")):
             with pytest.raises(RuntimeError, match="test failure"):
                 forward(0, length, True)
         assert attention.has_fp8_kv_cache == original_fp8_kv_cache
@@ -259,6 +268,19 @@ def test_optimized_two_pool_prefill_and_decode(
                 query[row, -1].view(1, query_heads, 1, width), *reference, enable_gqa=True
             ).reshape_as(output[row])
             torch.testing.assert_close(output[row], expected, atol=0.01, rtol=0.02)
+        if decode_graph is not None:
+            metadata, inputs, graph, captured_output = decode_graph
+            for request_id in request_ids:
+                cache = manager.kv_cache_map[request_id]
+                assert cache.resize(None, length + 1)
+                assert cache.resize(length + 2)
+                manager._restore_page_index_bufs(request_id, cache)
+            metadata.kv_cache_params.num_cached_tokens_per_seq = [length + 1] * batch
+            metadata.prepare()
+            graph.replay()
+            replayed = captured_output.clone()
+            eager = attention.forward(*inputs, metadata, kv_scale_quant_orig=scale)
+            torch.testing.assert_close(replayed, eager, atol=0.01, rtol=0.02)
     finally:
         manager.shutdown()
 
@@ -355,7 +377,10 @@ def test_mla_uses_independent_rope_and_native_attention(backend):
         v_head_dim=128,
         q_lora_rank=128,
         kv_lora_rank=512,
+        predicted_tokens_per_seq=1,
         max_position_embeddings=1024,
+        bias=False,
+        layer_idx=0,
         pos_embd_params=PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=RopeParams(dim=64, max_positions=1024, duplicate_data=True),
@@ -388,7 +413,9 @@ def test_mla_uses_independent_rope_and_native_attention(backend):
                 prompt_lens=[512],
                 kv_layout="HND",
                 enable_context_mla_with_cached_kv=True,
-                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+                runtime_features=AttentionRuntimeFeatures(
+                    chunked_prefill=True, cache_reuse=True, chunk_size=256
+                ),
             )
             metadata.prepare()
             output = hidden.new_empty((end - begin, 16 * 128))

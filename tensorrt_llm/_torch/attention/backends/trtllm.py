@@ -2172,354 +2172,352 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             history_dequant_scale=(forward_args.kv_scale_quant_orig
                                    if forward_args.kv_scale_quant_orig
                                    is not None else self.kv_scale_quant_orig))
-        if attention_kv is None:
-            return self._forward_impl(q, k, v, metadata, forward_args)
-        metadata = attention_kv.prepare_metadata(metadata)
-        with use_unquantized_kv(self):
-            result = self._forward_impl(
-                q, k, v, metadata,
-                replace(forward_args,
-                        kv_scale_orig_quant=None,
-                        kv_scale_quant_orig=None))
-            attention_kv.writeback()
-            return result
-
-    def _forward_impl(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: TrtllmAttentionMetadata,
-        forward_args: AttentionForwardArgs,
-    ):
-        assert isinstance(
-            metadata,
-            TrtllmAttentionMetadata,
-        )
-        token_major_view = (metadata.token_major_gen_view()
-                            if forward_args.attention_input_type
-                            == AttentionInputType.generation_only else None)
-        if metadata.enable_flash_mla and token_major_view is not None:
-            raise ValueError(
-                "FlashMLA does not support ragged token-major generation; "
-                "disable FlashMLA for this layout.")
-        # Cross-attention uses the THOP path; the trtllm-gen backend API does
-        # not carry encoder K/V tensors yet.
-
-        # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
-        # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
-        if (self.sparse_params is not None and getattr(
-                self.sparse_params, 'algorithm', None) == 'mqa_gqa'):
-            metadata.use_paged_context_fmha = True
-
-        if self.is_mla_enable:
-            # Context MLA uses separate qkv instead of paged_context_fmha
-            metadata.use_paged_context_fmha = False
-
-        if (forward_args.enable_dsv4_epilogue_fusion and
-            (forward_args.output is None or forward_args.output_sf is None)):
-            raise ValueError(
-                "DSv4 epilogue fusion requires caller-provided output and "
-                "output_sf buffers.")
-
-        if forward_args.output is None:
-            is_gen_only = (forward_args.attention_input_type ==
-                           AttentionInputType.generation_only)
-            outputs = self.create_output(
-                q,
-                is_quantize_output=forward_args.out_scale is not None,
-                metadata=metadata,
-                attention_mask=forward_args.attention_mask,
-                use_paged_context_fmha=metadata.use_paged_context_fmha,
-                is_mla_enable=self.is_mla_enable,
-                is_gen_only=is_gen_only,
+        if attention_kv is not None:
+            metadata = attention_kv.prepare_metadata(metadata)
+            forward_args = replace(forward_args,
+                                   kv_scale_orig_quant=None,
+                                   kv_scale_quant_orig=None)
+        with (use_unquantized_kv(self)
+              if attention_kv is not None else contextlib.nullcontext()):
+            assert isinstance(
+                metadata,
+                TrtllmAttentionMetadata,
             )
-            forward_args.output = outputs[0]
-            forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
-
-        has_q_only = False
-        if self.is_mla_enable:
-            forward_args.is_fused_qkv = False
-            forward_args.update_kv_cache = True
-            has_q_only = k is None and v is None
-        elif not metadata.is_cross and k is None and v is None:
-            q_hidden_size = self.num_heads * self.head_dim
-            qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
-            has_q_only = q.size(-1) == q_hidden_size
-            forward_args.is_fused_qkv = q.size(-1) == qkv_hidden_size
-            forward_args.update_kv_cache = not has_q_only
-        else:
-            forward_args.is_fused_qkv = not metadata.is_cross and k is None
-            forward_args.update_kv_cache = not metadata.is_cross or k is not None
-        has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
-        has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
-                          and v is not None)
-        uses_cached_cross_kv = (metadata.is_cross
-                                and not forward_args.update_kv_cache
-                                and k is None and v is None)
-        assert (has_fused_qkv or has_unfused_kv or has_q_only
-                or uses_cached_cross_kv)
-        # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
-        # C++ op interprets the buffer as the destination of a pre-quantized
-        # FP8 Q for the DSv4 fused norm+RoPE path. `quant_q_buffer` alone is
-        # still valid for the regular FP8-KV-cache path.
-        assert (forward_args.quant_scale_qkv is None
-                or forward_args.quant_q_buffer is not None), (
-                    "quant_scale_qkv requires quant_q_buffer to be set")
-        if forward_args.cu_q_seqlens is None:
-            forward_args.cu_q_seqlens = metadata.cu_q_seqlens
-        if forward_args.cu_kv_seqlens is None:
-            forward_args.cu_kv_seqlens = metadata.cu_kv_seqlens
-
-        # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
-        # new latent to the paged cache, and fills the trtllm-gen scheduler
-        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
-        # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
-        # so we skip only the RoPE and do the append + scheduler init here: the
-        # generation FMHA only reads the cache, and the fallback path needs the
-        # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
-        if (self.is_mla_enable and forward_args.skip_mla_rope_generation
-                and not getattr(self, "use_fp8_ds_mla", False)
-                and forward_args.attention_input_type
-                == AttentionInputType.generation_only):
-            num_ctx = metadata.num_contexts
-            n_gen = metadata.num_generations
-            # Use the GPU-resident length tensors (no host->device copy) so this
-            # stays CUDA-graph-capturable.
-            gen_q_lens = metadata.seq_lens_cuda[num_ctx:num_ctx + n_gen].to(
-                torch.int32)
-            gen_kv_lens = metadata.kv_lens_cuda_runtime[num_ctx:num_ctx +
-                                                        n_gen].to(torch.int32)
-            cu_q = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
-            cu_kv = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
-            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(
-                torch.int32) * self.num_heads
-            cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
-            forward_args.cu_q_seqlens = cu_q
-            forward_args.cu_kv_seqlens = cu_kv
-            if forward_args.fmha_scheduler_counter is None:
-                forward_args.fmha_scheduler_counter = torch.zeros(
-                    1, dtype=torch.uint32, device=q.device)
-            else:
-                forward_args.fmha_scheduler_counter.zero_()
-            assert forward_args.latent_cache is not None
-            from ...pyexecutor.kv_cache.mamba_cache_manager import \
-                BaseMambaCacheManager
-            # Hybrid (mamba/masked-layer) KV managers take the graph-safe
-            # append; the same predicate interface.py uses to detect hybrid
-            # managers for mamba metadata. Dense MLA models keep the
-            # host-side path unchanged.
-            from .mixed_precision_kv_view import MixedPrecisionKVView
-            if isinstance(metadata.kv_cache_manager,
-                          (BaseMambaCacheManager, MixedPrecisionKVView)):
-                from .utils import \
-                    append_mla_latent_cache_generation_cuda_graph_safe
-
-                # The write positions must come from device tensors: the host
-                # lists (request ids, seq lens, cached-token counts) are
-                # frozen into the graph at capture time and corrupt the cache
-                # on replay. The helper falls back to the host-side loop for
-                # eager forwards only; under CUDA graphs it scatters
-                # device-side for any uniform q_len (1 for plain decode,
-                # 1 + draft_len for padded spec-dec verification batches).
-                append_mla_latent_cache_generation_cuda_graph_safe(
-                    metadata,
-                    # NOTE: get_buffers / layer_offsets take the GLOBAL layer
-                    # index (they map through layer_offsets internally).
-                    # Passing the local offset double-maps and breaks hybrid
-                    # models whose KV manager covers a masked layer subset
-                    # (e.g. Kimi K3).
-                    self.layer_idx,
-                    forward_args.latent_cache,
-                )
-            else:
-                # TODO(TRTLLM-15193): this host-side path freezes write
-                # positions at CUDA graph capture time and may corrupt the
-                # cache on replay IF a non-hybrid MLA model reaches this path
-                # under graph capture. Investigate whether that is reachable;
-                # if so, the graph-safe branch above is a correctness fix to
-                # generalize, not an optimization.
-                from .utils import append_mla_latent_cache
-                append_mla_latent_cache(
-                    metadata.kv_cache_manager,
-                    self.get_local_layer_idx(metadata),
-                    metadata.request_ids,
-                    metadata.seq_lens.tolist(),
-                    metadata.kv_cache_params.num_cached_tokens_per_seq,
-                    forward_args.latent_cache,
-                    kv_layout=metadata.kv_layout,
-                    seq_start=num_ctx,
-                )
-
-        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, v, metadata, forward_args)
-
-        # Compute FlashMLA tile-scheduler metadata once per forward pass.
-        # The flag is invalidated whenever FlashMLA inputs change. The metadata
-        # must always match the compacted generation sub-batch, which is also
-        # the layout used by block_ids_per_seq.
-        if (metadata.enable_flash_mla and forward_args.attention_input_type
-                != AttentionInputType.context_only
-                and metadata.num_generations > 0
-                and not metadata._flash_mla_metadata_valid):
-            self._compute_flash_mla_metadata(metadata)
-            metadata._flash_mla_metadata_valid = True
-
-        # Blackwell first_sparse: refresh at layer 0 before kernel launch.
-        if self.get_local_layer_idx(metadata) == 0 and (
-                metadata.spec_bl_tree_first_sparse_mask_offset_kv is not None
-                and metadata._seq_lens_cuda is not None):
-            metadata.update_blackwell_first_sparse_mask_offset()
-
-        if metadata.is_cross:
-            if k is not None and v is not None:
-                k_flat = k.contiguous().view(k.shape[0], -1)
-                v_flat = v.contiguous().view(v.shape[0], -1)
-                forward_args.cross_kv = torch.cat([k_flat, v_flat],
-                                                  dim=1).contiguous()
-
-            q_hidden_size = self.num_heads * self.head_dim
-            kv_hidden_size = self.num_kv_heads * self.head_dim
-            qkv_hidden_size = q_hidden_size + 2 * kv_hidden_size
-            if q.shape[1] == q_hidden_size:
-                fused_q = q.new_zeros((q.shape[0], qkv_hidden_size))
-                fused_q[:, :q_hidden_size].copy_(q)
-                q = fused_q
-            else:
-                assert q.shape[1] == qkv_hidden_size
-            k = None
-            v = None
-            forward_args.is_fused_qkv = True
-
-        attention_input_type = forward_args.attention_input_type
-        if not self.is_mla_enable:
-            if forward_args.is_fused_qkv:
-                qkv_hidden_size = (self.num_heads +
-                                   2 * self.num_kv_heads) * self.head_dim
-                assert q.shape[1] == qkv_hidden_size
-            else:
-                q_hidden_size = self.num_heads * self.head_dim
-                assert q.shape[1] == q_hidden_size
-                if forward_args.update_kv_cache:
-                    kv_hidden_size = self.num_kv_heads * self.head_dim
-                    assert k.shape[1] == kv_hidden_size
-                    assert v.shape[1] == kv_hidden_size
-            num_tokens = q.shape[0]
-            if k is not None and not metadata.is_cross:
-                assert k.shape[0] == num_tokens
-                assert v.shape[0] == num_tokens
-        else:
-            assert not forward_args.is_fused_qkv
-            sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
-            is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
-            ) > 0
-            if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
-                assert k is None and v is None
-                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
-                                                    self.qk_rope_head_dim)
-            elif attention_input_type == AttentionInputType.context_only:
-                assert k is not None and v is not None
-                qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
-                                                    self.qk_rope_head_dim)
-            elif attention_input_type == AttentionInputType.generation_only:
-                assert k is None and v is None
-                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
-                                                    self.qk_rope_head_dim)
-            else:
+            token_major_view = (metadata.token_major_gen_view()
+                                if forward_args.attention_input_type
+                                == AttentionInputType.generation_only else None)
+            if metadata.enable_flash_mla and token_major_view is not None:
                 raise ValueError(
-                    "In MLA, TrtllmAttention can only support context_only or generation_only, not mixed."
+                    "FlashMLA does not support ragged token-major generation; "
+                    "disable FlashMLA for this layout.")
+            # Cross-attention uses the THOP path; the trtllm-gen backend API does
+            # not carry encoder K/V tensors yet.
+
+            # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
+            # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
+            if (self.sparse_params is not None and getattr(
+                    self.sparse_params, 'algorithm', None) == 'mqa_gqa'):
+                metadata.use_paged_context_fmha = True
+
+            if self.is_mla_enable:
+                # Context MLA uses separate qkv instead of paged_context_fmha
+                metadata.use_paged_context_fmha = False
+
+            if (forward_args.enable_dsv4_epilogue_fusion
+                    and (forward_args.output is None
+                         or forward_args.output_sf is None)):
+                raise ValueError(
+                    "DSv4 epilogue fusion requires caller-provided output and "
+                    "output_sf buffers.")
+
+            if forward_args.output is None:
+                is_gen_only = (forward_args.attention_input_type ==
+                               AttentionInputType.generation_only)
+                outputs = self.create_output(
+                    q,
+                    is_quantize_output=forward_args.out_scale is not None,
+                    metadata=metadata,
+                    attention_mask=forward_args.attention_mask,
+                    use_paged_context_fmha=metadata.use_paged_context_fmha,
+                    is_mla_enable=self.is_mla_enable,
+                    is_gen_only=is_gen_only,
                 )
-            assert q.shape[
-                1] == qkv_hidden_size, f"q.shape[1] must be equal to qkv_hidden_size, got {q.shape[1]=}, {qkv_hidden_size=}"
+                forward_args.output = outputs[0]
+                forward_args.output_sf = outputs[1] if len(
+                    outputs) == 2 else None
 
-        batch_size = metadata.kv_lens_cuda_runtime.shape[0]
-        assert metadata.kv_lens_runtime.shape[0] == batch_size
-        assert metadata.prompt_lens_cuda_runtime.shape[0] == batch_size
-        assert metadata.prompt_lens_cpu_runtime.shape[0] == batch_size
-        assert metadata.host_request_types_runtime.shape[0] == batch_size
+            has_q_only = False
+            if self.is_mla_enable:
+                forward_args.is_fused_qkv = False
+                forward_args.update_kv_cache = True
+                has_q_only = k is None and v is None
+            elif not metadata.is_cross and k is None and v is None:
+                q_hidden_size = self.num_heads * self.head_dim
+                qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
+                has_q_only = q.size(-1) == q_hidden_size
+                forward_args.is_fused_qkv = q.size(-1) == qkv_hidden_size
+                forward_args.update_kv_cache = not has_q_only
+            else:
+                forward_args.is_fused_qkv = not metadata.is_cross and k is None
+                forward_args.update_kv_cache = not metadata.is_cross or k is not None
+            has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
+            has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
+                              and v is not None)
+            uses_cached_cross_kv = (metadata.is_cross
+                                    and not forward_args.update_kv_cache
+                                    and k is None and v is None)
+            assert (has_fused_qkv or has_unfused_kv or has_q_only
+                    or uses_cached_cross_kv)
+            # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
+            # C++ op interprets the buffer as the destination of a pre-quantized
+            # FP8 Q for the DSv4 fused norm+RoPE path. `quant_q_buffer` alone is
+            # still valid for the regular FP8-KV-cache path.
+            assert (forward_args.quant_scale_qkv is None
+                    or forward_args.quant_q_buffer is not None), (
+                        "quant_scale_qkv requires quant_q_buffer to be set")
+            if forward_args.cu_q_seqlens is None:
+                forward_args.cu_q_seqlens = metadata.cu_q_seqlens
+            if forward_args.cu_kv_seqlens is None:
+                forward_args.cu_kv_seqlens = metadata.cu_kv_seqlens
 
-        self._ensure_rope_table_size(metadata.max_seq_len)
+            # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
+            # new latent to the paged cache, and fills the trtllm-gen scheduler
+            # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
+            # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
+            # so we skip only the RoPE and do the append + scheduler init here: the
+            # generation FMHA only reads the cache, and the fallback path needs the
+            # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
+            if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                    and not getattr(self, "use_fp8_ds_mla", False)
+                    and forward_args.attention_input_type
+                    == AttentionInputType.generation_only):
+                num_ctx = metadata.num_contexts
+                n_gen = metadata.num_generations
+                # Use the GPU-resident length tensors (no host->device copy) so this
+                # stays CUDA-graph-capturable.
+                gen_q_lens = metadata.seq_lens_cuda[num_ctx:num_ctx + n_gen].to(
+                    torch.int32)
+                gen_kv_lens = metadata.kv_lens_cuda_runtime[num_ctx:num_ctx +
+                                                            n_gen].to(
+                                                                torch.int32)
+                cu_q = torch.zeros(n_gen + 1,
+                                   dtype=torch.int32,
+                                   device=q.device)
+                cu_kv = torch.zeros(n_gen + 1,
+                                    dtype=torch.int32,
+                                    device=q.device)
+                cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(
+                    torch.int32) * self.num_heads
+                cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
+                forward_args.cu_q_seqlens = cu_q
+                forward_args.cu_kv_seqlens = cu_kv
+                if forward_args.fmha_scheduler_counter is None:
+                    forward_args.fmha_scheduler_counter = torch.zeros(
+                        1, dtype=torch.uint32, device=q.device)
+                else:
+                    forward_args.fmha_scheduler_counter.zero_()
+                assert forward_args.latent_cache is not None
+                from ...pyexecutor.kv_cache.mamba_cache_manager import \
+                    BaseMambaCacheManager
+                # Hybrid (mamba/masked-layer) KV managers take the graph-safe
+                # append; the same predicate interface.py uses to detect hybrid
+                # managers for mamba metadata. Dense MLA models keep the
+                # host-side path unchanged.
+                from .mixed_precision_kv_view import MixedPrecisionKVView
+                if isinstance(metadata.kv_cache_manager,
+                              (BaseMambaCacheManager, MixedPrecisionKVView)):
+                    from .utils import \
+                        append_mla_latent_cache_generation_cuda_graph_safe
 
-        # Prime `self.local_layer_idx` so FMHA implementations read a
-        # populated int rather than the `None` placeholder.
-        # The call is a fast cache hit after the first forward.
-        self.local_layer_idx = self.get_local_layer_idx(metadata)
-        if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
-            metadata.spec_decoding_bl_tree_mask.zero_()
+                    # The write positions must come from device tensors: the host
+                    # lists (request ids, seq lens, cached-token counts) are
+                    # frozen into the graph at capture time and corrupt the cache
+                    # on replay. The helper falls back to the host-side loop for
+                    # eager forwards only; under CUDA graphs it scatters
+                    # device-side for any uniform q_len (1 for plain decode,
+                    # 1 + draft_len for padded spec-dec verification batches).
+                    append_mla_latent_cache_generation_cuda_graph_safe(
+                        metadata,
+                        # NOTE: get_buffers / layer_offsets take the GLOBAL layer
+                        # index (they map through layer_offsets internally).
+                        # Passing the local offset double-maps and breaks hybrid
+                        # models whose KV manager covers a masked layer subset
+                        # (e.g. Kimi K3).
+                        self.layer_idx,
+                        forward_args.latent_cache,
+                    )
+                else:
+                    # TODO(TRTLLM-15193): this host-side path freezes write
+                    # positions at CUDA graph capture time and may corrupt the
+                    # cache on replay IF a non-hybrid MLA model reaches this path
+                    # under graph capture. Investigate whether that is reachable;
+                    # if so, the graph-safe branch above is a correctness fix to
+                    # generalize, not an optimization.
+                    from .utils import append_mla_latent_cache
+                    append_mla_latent_cache(
+                        metadata.kv_cache_manager,
+                        self.get_local_layer_idx(metadata),
+                        metadata.request_ids,
+                        metadata.seq_lens.tolist(),
+                        metadata.kv_cache_params.num_cached_tokens_per_seq,
+                        forward_args.latent_cache,
+                        kv_layout=metadata.kv_layout,
+                        seq_start=num_ctx,
+                    )
 
-        if self.print_skip_softmax_stat:
-            self.skip_softmax_stat.zero_()
+            forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
+                self, q, k, v, metadata, forward_args)
 
-        # Propagate the KV cache manager's SWA window to the FMHA kernel when
-        # the model does not specify one, so paged-context attention does not
-        # read stale page-table entries (BAD_PAGE_INDEX).
-        if forward_args.attention_window_size is None and metadata.kv_cache_manager is not None:
-            window = metadata.kv_cache_manager.max_attention_window_vec[
-                self.local_layer_idx]
-            if window is not None:
-                forward_args.attention_window_size = window
-        if forward_args.attention_window_size is None:
-            forward_args.attention_window_size = metadata.max_seq_len
+            # Compute FlashMLA tile-scheduler metadata once per forward pass.
+            # The flag is invalidated whenever FlashMLA inputs change. The metadata
+            # must always match the compacted generation sub-batch, which is also
+            # the layout used by block_ids_per_seq.
+            if (metadata.enable_flash_mla and forward_args.attention_input_type
+                    != AttentionInputType.context_only
+                    and metadata.num_generations > 0
+                    and not metadata._flash_mla_metadata_valid):
+                self._compute_flash_mla_metadata(metadata)
+                metadata._flash_mla_metadata_valid = True
 
-        # Promote `out_scale_sf` -> `out_scale` for the NVFP4-output path
-        # (kernel reads a single `out_scale` and interprets it as the SF
-        # quant scale when `output_sf` is allocated). `output_sf` is
-        # populated by `create_output` in `forward` above, so the
-        # decision is correct only here, not at the attention/attention.py
-        # call site where `output_sf` is always `None`.
-        if (not forward_args.enable_dsv4_epilogue_fusion
-                and forward_args.output_sf is not None
-                and forward_args.out_scale_sf is not None):
-            forward_args.out_scale = forward_args.out_scale_sf
+            # Blackwell first_sparse: refresh at layer 0 before kernel launch.
+            if self.get_local_layer_idx(metadata) == 0 and (
+                    metadata.spec_bl_tree_first_sparse_mask_offset_kv
+                    is not None and metadata._seq_lens_cuda is not None):
+                metadata.update_blackwell_first_sparse_mask_offset()
 
-        # Default `forward_args.kv_scale_*` to the layer-level mirrors when
-        # the caller didn't populate them. `attention/attention.py` only sets
-        # these for fp4 KV cache; fp8-KV models leave them `None`. Several
-        # XQA kernels (mha.cu, mha_sm90.cu) deref `kvCacheScale[0]` when
-        # `isKVCacheQuantized` is true and don't check for nullptr, so
-        # passing `None` crashes with illegal memory access.
-        if forward_args.kv_scale_orig_quant is None:
-            forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
-        if forward_args.kv_scale_quant_orig is None:
-            forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
+            if metadata.is_cross:
+                if k is not None and v is not None:
+                    k_flat = k.contiguous().view(k.shape[0], -1)
+                    v_flat = v.contiguous().view(v.shape[0], -1)
+                    forward_args.cross_kv = torch.cat([k_flat, v_flat],
+                                                      dim=1).contiguous()
 
-        # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
-        if metadata.max_context_q_len_override is not None:
-            assert metadata.is_cuda_graph
-            assert metadata.num_generations == 0
-            assert metadata.kv_cache_manager is None
-            assert metadata.num_contexts == metadata.num_seqs
+                q_hidden_size = self.num_heads * self.head_dim
+                kv_hidden_size = self.num_kv_heads * self.head_dim
+                qkv_hidden_size = q_hidden_size + 2 * kv_hidden_size
+                if q.shape[1] == q_hidden_size:
+                    fused_q = q.new_zeros((q.shape[0], qkv_hidden_size))
+                    fused_q[:, :q_hidden_size].copy_(q)
+                    q = fused_q
+                else:
+                    assert q.shape[1] == qkv_hidden_size
+                k = None
+                v = None
+                forward_args.is_fused_qkv = True
 
-        # On a ragged generation step the attention op is handed
-        # one row per query token so its `num_tokens % num_seqs == 0` check
-        # passes with seq_len == 1. Keep the presentation scoped around both
-        # library selection and dispatch: support checks read the
-        # same runtime metadata as the selected FMHA implementation.
-        with metadata.presented_token_major(token_major_view):
-            fmha = self._fmha_manager.select(self, q, k, v, metadata,
-                                             forward_args)
+            attention_input_type = forward_args.attention_input_type
+            if not self.is_mla_enable:
+                if forward_args.is_fused_qkv:
+                    qkv_hidden_size = (self.num_heads +
+                                       2 * self.num_kv_heads) * self.head_dim
+                    assert q.shape[1] == qkv_hidden_size
+                else:
+                    q_hidden_size = self.num_heads * self.head_dim
+                    assert q.shape[1] == q_hidden_size
+                    if forward_args.update_kv_cache:
+                        kv_hidden_size = self.num_kv_heads * self.head_dim
+                        assert k.shape[1] == kv_hidden_size
+                        assert v.shape[1] == kv_hidden_size
+                num_tokens = q.shape[0]
+                if k is not None and not metadata.is_cross:
+                    assert k.shape[0] == num_tokens
+                    assert v.shape[0] == num_tokens
+            else:
+                assert not forward_args.is_fused_qkv
+                sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
+                is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
+                ) > 0
+                if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
+                    assert k is None and v is None
+                    qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                        self.qk_rope_head_dim)
+                elif attention_input_type == AttentionInputType.context_only:
+                    assert k is not None and v is not None
+                    qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
+                                                        self.qk_rope_head_dim)
+                elif attention_input_type == AttentionInputType.generation_only:
+                    assert k is None and v is None
+                    qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                        self.qk_rope_head_dim)
+                else:
+                    raise ValueError(
+                        "In MLA, TrtllmAttention can only support context_only or generation_only, not mixed."
+                    )
+                assert q.shape[
+                    1] == qkv_hidden_size, f"q.shape[1] must be equal to qkv_hidden_size, got {q.shape[1]=}, {qkv_hidden_size=}"
 
-            if fmha is None:
-                raise RuntimeError(
-                    "No TRT-LLM attention FMHA library supports this request.")
-            if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
-                # Conservatively disable reclamation for metadata used by graphs
-                # or backends that can retain staged workspace state.
-                metadata.workspace_reclaimable = False
-            try:
-                fmha.forward(q, k, v, metadata, forward_args)
-            except RuntimeError as exc:
-                log_attention_failure_context(
-                    type(self).__name__, self.layer_idx, metadata,
-                    forward_args.attention_window_size, exc)
-                raise
+            batch_size = metadata.kv_lens_cuda_runtime.shape[0]
+            assert metadata.kv_lens_runtime.shape[0] == batch_size
+            assert metadata.prompt_lens_cuda_runtime.shape[0] == batch_size
+            assert metadata.prompt_lens_cpu_runtime.shape[0] == batch_size
+            assert metadata.host_request_types_runtime.shape[0] == batch_size
 
-        if self.print_skip_softmax_stat:
-            total_blocks, skipped_blocks = self.skip_softmax_stat
-            if total_blocks != 0:
-                print(
-                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
-                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
+            self._ensure_rope_table_size(metadata.max_seq_len)
+
+            # Prime `self.local_layer_idx` so FMHA implementations read a
+            # populated int rather than the `None` placeholder.
+            # The call is a fast cache hit after the first forward.
+            self.local_layer_idx = self.get_local_layer_idx(metadata)
+            if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
+                metadata.spec_decoding_bl_tree_mask.zero_()
+
+            if self.print_skip_softmax_stat:
+                self.skip_softmax_stat.zero_()
+
+            # Propagate the KV cache manager's SWA window to the FMHA kernel when
+            # the model does not specify one, so paged-context attention does not
+            # read stale page-table entries (BAD_PAGE_INDEX).
+            if forward_args.attention_window_size is None and metadata.kv_cache_manager is not None:
+                window = metadata.kv_cache_manager.max_attention_window_vec[
+                    self.local_layer_idx]
+                if window is not None:
+                    forward_args.attention_window_size = window
+            if forward_args.attention_window_size is None:
+                forward_args.attention_window_size = metadata.max_seq_len
+
+            # Promote `out_scale_sf` -> `out_scale` for the NVFP4-output path
+            # (kernel reads a single `out_scale` and interprets it as the SF
+            # quant scale when `output_sf` is allocated). `output_sf` is
+            # populated by `create_output` in `forward` above, so the
+            # decision is correct only here, not at the attention/attention.py
+            # call site where `output_sf` is always `None`.
+            if (not forward_args.enable_dsv4_epilogue_fusion
+                    and forward_args.output_sf is not None
+                    and forward_args.out_scale_sf is not None):
+                forward_args.out_scale = forward_args.out_scale_sf
+
+            # Default `forward_args.kv_scale_*` to the layer-level mirrors when
+            # the caller didn't populate them. `attention/attention.py` only sets
+            # these for fp4 KV cache; fp8-KV models leave them `None`. Several
+            # XQA kernels (mha.cu, mha_sm90.cu) deref `kvCacheScale[0]` when
+            # `isKVCacheQuantized` is true and don't check for nullptr, so
+            # passing `None` crashes with illegal memory access.
+            if forward_args.kv_scale_orig_quant is None:
+                forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
+            if forward_args.kv_scale_quant_orig is None:
+                forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
+
+            # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
+            if metadata.max_context_q_len_override is not None:
+                assert metadata.is_cuda_graph
+                assert metadata.num_generations == 0
+                assert metadata.kv_cache_manager is None
+                assert metadata.num_contexts == metadata.num_seqs
+
+            # On a ragged generation step the attention op is handed
+            # one row per query token so its `num_tokens % num_seqs == 0` check
+            # passes with seq_len == 1. Keep the presentation scoped around both
+            # library selection and dispatch: support checks read the
+            # same runtime metadata as the selected FMHA implementation.
+            with metadata.presented_token_major(token_major_view):
+                fmha = self._fmha_manager.select(self, q, k, v, metadata,
+                                                 forward_args)
+
+                if fmha is None:
+                    raise RuntimeError(
+                        "No TRT-LLM attention FMHA library supports this request."
+                    )
+                if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+                    # Conservatively disable reclamation for metadata used by graphs
+                    # or backends that can retain staged workspace state.
+                    metadata.workspace_reclaimable = False
+                try:
+                    fmha.forward(q, k, v, metadata, forward_args)
+                except RuntimeError as exc:
+                    log_attention_failure_context(
+                        type(self).__name__, self.layer_idx, metadata,
+                        forward_args.attention_window_size, exc)
+                    raise
+
+            if self.print_skip_softmax_stat:
+                total_blocks, skipped_blocks = self.skip_softmax_stat
+                if total_blocks != 0:
+                    print(
+                        f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
+                        f" = {skipped_blocks / total_blocks * 100: .2f}%")
+
+            if attention_kv is not None:
+                attention_kv.writeback()
 
         if forward_args.output_sf is None:
             return forward_args.output
