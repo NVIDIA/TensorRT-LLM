@@ -3,7 +3,7 @@
 
 import struct
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import numpy as np
 import torch
@@ -55,63 +55,91 @@ def serialize_item(obj: object) -> bytes:
     between distinct values that happen to share a raw byte payload (for
     example transposed image dimensions or reshaped arrays).
     """
+    parts: list[Any] = []
+    _update_serialized_item(parts.append, obj)
+    return b"".join(parts)
+
+
+def _update_serialized_item(update: Callable[[Any], None], obj: object) -> None:
+    """Stream ``serialize_item(obj)`` into ``hasher`` without a payload copy.
+
+    Large image and tensor payloads are passed through the buffer protocol.
+    The emitted byte sequence is identical to :func:`serialize_item`, so this
+    changes only hashing cost and temporary memory, not cache identity.
+    """
     if isinstance(obj, str):
-        return _u8(0x01) + _len_prefixed(obj.encode("utf-8"))
+        payload = obj.encode("utf-8")
+        update(_u8(0x01))
+        update(_u64(len(payload)))
+        update(payload)
+        return
+
     if isinstance(obj, bytes):
-        return _u8(0x02) + _len_prefixed(obj)
+        update(_u8(0x02))
+        update(_u64(len(obj)))
+        update(obj)
+        return
+
     # bool must be checked before int: bool is a subclass of int.
     if isinstance(obj, bool):
-        return _u8(0x05) + _u8(1 if obj else 0)
+        update(_u8(0x05))
+        update(_u8(1 if obj else 0))
+        return
+
     if isinstance(obj, int):
         nbytes = (obj.bit_length() + 8) // 8  # +1 sign bit, then ceil-divide.
-        return _u8(0x03) + _u8(nbytes) + obj.to_bytes(nbytes, "big", signed=True)
+        update(_u8(0x03))
+        update(_u8(nbytes))
+        update(obj.to_bytes(nbytes, "big", signed=True))
+        return
+
     if isinstance(obj, float):
-        return _u8(0x04) + struct.pack(">d", obj)
+        update(_u8(0x04))
+        update(struct.pack(">d", obj))
+        return
 
     if isinstance(obj, Image.Image):
         width, height = obj.size
-        payload = np.array(obj.convert("RGBA")).tobytes()
-        return (
-            _u8(0x10)
-            + _len_prefixed(obj.mode.encode("utf-8"))
-            + _u32(width)
-            + _u32(height)
-            + _len_prefixed(payload)
-        )
+        rgba = np.asarray(obj.convert("RGBA"))
+        update(_u8(0x10))
+        update(_len_prefixed(obj.mode.encode("utf-8")))
+        update(_u32(width))
+        update(_u32(height))
+        update(_u64(rgba.nbytes))
+        update(memoryview(rgba).cast("B"))
+        return
+
     if isinstance(obj, (torch.Tensor, np.ndarray)):
-        # The container (torch.Tensor vs np.ndarray) is not part of the content
-        # identity -- only dtype, shape, and raw bytes are. Normalize both to a
-        # contiguous NumPy array so identical content hashes identically.
         if isinstance(obj, torch.Tensor):
             obj = obj.detach().cpu().contiguous().numpy()
         array = np.ascontiguousarray(obj)
-        parts = [
-            _u8(0x11),
-            _len_prefixed(array.dtype.str.encode("utf-8")),
-            _u8(array.ndim),
-        ]
-        parts.extend(_u64(dim) for dim in array.shape)
-        parts.append(_len_prefixed(array.tobytes()))
-        return b"".join(parts)
+        update(_u8(0x11))
+        update(_len_prefixed(array.dtype.str.encode("utf-8")))
+        update(_u8(array.ndim))
+        for dim in array.shape:
+            update(_u64(dim))
+        update(_u64(array.nbytes))
+        update(memoryview(array).cast("B"))
+        return
+
     if isinstance(obj, (tuple, list)):
-        # Ordered sequence; the container (tuple vs list) is not part of the
-        # content identity.
-        parts = [_u8(0x20), _u64(len(obj))]
-        parts.extend(serialize_item(item) for item in obj)
-        return b"".join(parts)
+        update(_u8(0x20))
+        update(_u64(len(obj)))
+        for item in obj:
+            _update_serialized_item(update, item)
+        return
+
     if isinstance(obj, dict):
-        parts = [_u8(0x22), _u64(len(obj))]
+        update(_u8(0x22))
+        update(_u64(len(obj)))
         for key in sorted(obj):
-            parts.append(serialize_item(key))
-            parts.append(serialize_item(obj[key]))
-        return b"".join(parts)
+            _update_serialized_item(update, key)
+            _update_serialized_item(update, obj[key])
+        return
 
     if isinstance(obj, np.generic):
-        # numpy scalar (e.g. np.int64 / np.float32 / np.bool_): normalize to the
-        # equivalent Python scalar and recurse, so numpy-typed values hash
-        # identically to their Python counterparts. In numpy 2.x these are not
-        # subclasses of Python int/float/bool, so they bypass the checks above.
-        return serialize_item(obj.item())
+        _update_serialized_item(update, obj.item())
+        return
 
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
