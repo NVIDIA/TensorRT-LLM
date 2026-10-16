@@ -290,7 +290,8 @@ class TestCompletionsRender:
         # Completions add special tokens by default; the chat route does not.
         assert prepared["token_ids"] == tokenizer.encode("hello world", add_special_tokens=True)
         assert prepared["kind"] == "completion"
-        assert prepared["request"]["prompt"] == prepared["token_ids"]
+        # `request` is the submitted request; the ids are in `token_ids`.
+        assert prepared["request"]["prompt"] == "hello world"
 
     def test_special_tokens_and_truncation_follow_the_request(self, client, tokenizer) -> None:
         (without_bos,) = self._render(client, "hello world", add_special_tokens=False).json()
@@ -310,13 +311,17 @@ class TestCompletionsRender:
             tokenizer.encode("hello"),
             tokenizer.encode("world"),
         ]
+        # Each item carries its own prompt, not the whole batch.
+        assert [item["request"]["prompt"] for item in prepared] == ["hello", "world"]
 
     def test_token_prompts_pass_through(self, client) -> None:
         (single,) = self._render(client, [5, 6, 7]).json()
         batch = self._render(client, [[1, 2], [3]]).json()
 
         assert single["token_ids"] == [5, 6, 7]
+        assert single["request"]["prompt"] == [5, 6, 7]
         assert [item["token_ids"] for item in batch] == [[1, 2], [3]]
+        assert [item["request"]["prompt"] for item in batch] == [[1, 2], [3]]
 
 
 class TestEmbeddedMounting:

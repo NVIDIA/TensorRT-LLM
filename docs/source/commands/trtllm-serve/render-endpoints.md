@@ -51,7 +51,7 @@ Chat returns one rendered request. This is the response for a chat request with 
 ```
 
 Completions return a list with one rendered request per prompt. In each, `request` is the original body with `prompt`
-replaced by the ids:
+set to that item's own prompt:
 
 ```json
 {
@@ -63,7 +63,7 @@ replaced by the ids:
   "reasoning_ended": null,
   "reasoning_parser_kwargs": null,
   "cache_salt": null,
-  "request": {"model": "Qwen3-0.6B", "prompt": [785, 6722, 315, 9625, 374], "max_tokens": 8, "temperature": 0}
+  "request": {"model": "Qwen3-0.6B", "prompt": "The capital of France is", "max_tokens": 8, "temperature": 0}
 }
 ```
 
@@ -75,7 +75,7 @@ replaced by the ids:
 | `model`, `cache_salt` | Copied from the request. |
 | `reasoning_ended` | Whether reasoning had already ended before the first generated token, read off the prompt for the reasoning parser the renderer is started with. `null` when there is no such parser or the prompt does not say. |
 | `reasoning_parser_kwargs` | The `chat_template_kwargs` the prompt was rendered with. Set for chat when the renderer has a reasoning parser, otherwise `null`. |
-| `request` | The request body. For chat it is the original body. |
+| `request` | The original request body. For a completions request with several prompts, each item carries its own prompt. |
 
 ## Send the result to the inference endpoints
 
@@ -83,11 +83,11 @@ The original request is always valid to send to a worker. The ids only let the w
 
 ### Completions
 
-Each item's `request` is ready to send:
+Add the ids as the `prompt` of each item's `request`:
 
 ```bash
 curl -s $RENDERER/v1/completions/render -d @request.json \
-  | jq -c '.[].request' \
+  | jq -c '.[] | .request + {prompt: .token_ids}' \
   | while read -r body; do curl -s $WORKER/v1/completions -d "$body"; done
 ```
 
