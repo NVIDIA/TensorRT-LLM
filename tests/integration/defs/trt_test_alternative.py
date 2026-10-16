@@ -286,6 +286,20 @@ elif is_windows():
         p.kill()
 
 
+class CalledProcessErrorWithOutput(subprocess.CalledProcessError):
+    """``CalledProcessError`` whose message includes the captured output."""
+
+    def __str__(self):
+        message = super().__str__()
+        for name, stream in (("stdout", self.stdout), ("stderr", self.stderr)):
+            if stream is None:
+                continue
+            if isinstance(stream, bytes):
+                stream = stream.decode(errors="replace")
+            message += f"\n{name}:\n{stream}"
+        return message
+
+
 @contextlib.contextmanager
 def popen(*popenargs,
           start_new_session=True,
@@ -348,7 +362,7 @@ def check_call(*popenargs, **kwargs):
         cmd = kwargs.get("args")
         if cmd is None:
             cmd = popenargs[0]
-        raise subprocess.CalledProcessError(retcode, cmd)
+        raise CalledProcessErrorWithOutput(retcode, cmd)
     return 0
 
 
@@ -375,10 +389,10 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
         if start_new_session:
             cleanup_process_tree(process, True, True)
         if retcode:
-            raise subprocess.CalledProcessError(retcode,
-                                                process.args,
-                                                output=stdout,
-                                                stderr=stderr)
+            raise CalledProcessErrorWithOutput(retcode,
+                                               process.args,
+                                               output=stdout,
+                                               stderr=stderr)
     return stdout.decode()
 
 
