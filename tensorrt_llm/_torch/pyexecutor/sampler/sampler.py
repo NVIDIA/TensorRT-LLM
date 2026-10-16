@@ -53,6 +53,7 @@ from .beam_search import (
     finalize_beam,
     prepare_beam_search,
 )
+from .draft_verification import DraftTokenVerifier
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
 from .ops.custom import fused_sample_from_logits, fused_sample_from_logits_with_probs
@@ -84,7 +85,6 @@ from .sampling_resolution import SamplingMode, SlotSamplingParams
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 from .top_p_decay import TopPDecayHandler
-from .two_model_spec_dec import TwoModelSpecDecHandler
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -705,7 +705,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
 
-        self._two_model_spec_dec = TwoModelSpecDecHandler(self)
+        self._draft_verifier = DraftTokenVerifier(self)
 
         self._async_worker_init(args.enable_async_worker)
 
@@ -1501,7 +1501,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 processed = 1
                 num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
-                num_accepted = self._two_model_spec_dec.process_draft_tokens(
+                num_accepted = self._draft_verifier.process_draft_tokens(
                     req,
                     new_tokens_list=new_tokens_list,
                     finish_reasons=finish_reasons,

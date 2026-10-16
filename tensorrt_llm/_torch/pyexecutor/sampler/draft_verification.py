@@ -20,8 +20,8 @@ verifies via ``SpecSampler`` and never enters this path -- see the note in
 ``speculative/drafter.py`` on which drafters use ``TorchSampler``.
 
 Draft tokens are accepted while they match the tokens the target sampled at
-the same positions. ``TorchSampler`` owns one :class:`TwoModelSpecDecHandler`
-and delegates to :meth:`TwoModelSpecDecHandler.process_draft_tokens`.
+the same positions. ``TorchSampler`` owns one :class:`DraftTokenVerifier`
+and delegates to :meth:`DraftTokenVerifier.process_draft_tokens`.
 """
 
 from typing import TYPE_CHECKING
@@ -32,10 +32,10 @@ from .sampler_common import DEFAULT_BEAM_IDX, FinishReasonsList, add_token
 if TYPE_CHECKING:
     from .sampler import TorchSampler
 
-__all__ = ["TwoModelSpecDecHandler"]
+__all__ = ["DraftTokenVerifier"]
 
 
-class TwoModelSpecDecHandler:
+class DraftTokenVerifier:
     """Verifies draft tokens produced by a drafter.
 
     Holds a back-reference to the owning ``TorchSampler`` because verification
