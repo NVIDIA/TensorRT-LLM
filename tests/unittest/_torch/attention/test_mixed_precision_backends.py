@@ -327,11 +327,12 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
         num_heads=heads,
         num_kv_heads=1,
         head_dim=width,
-        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+        quant_config=QuantConfig(quant_algo="FP8_BLOCK_SCALES", kv_cache_quant_algo="NVFP4"),
         pos_embd_params=PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gptj,
             rope=RopeParams.from_config(
                 SimpleNamespace(
+                    model_type="glm_moe_dsa",
                     qk_rope_head_dim=64,
                     max_position_embeddings=1024,
                     hidden_size=7168,
@@ -376,10 +377,11 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
                 max_num_requests=1,
                 max_num_tokens=length,
                 num_contexts=int(context),
-                prompt_lens=[length],
+                prompt_lens=[end - begin if context else length],
                 kv_cache_manager=manager,
                 kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[begin]),
                 sparse_attention_config=sparse,
+                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
             )
             metadata.prepare()
             inputs = latent[begin:end].clone()
@@ -409,9 +411,10 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
                 unabsorbed.view(-1, heads, 192)[..., 128:] = query.view(-1, heads, width)[..., 512:]
                 attention.mla_rope_append_paged_kv_assign_q(unabsorbed, inputs, metadata)
                 query.view(-1, heads, width)[..., 512:] = unabsorbed.view(-1, heads, 192)[..., 128:]
-                args["q_rope_applied"] = True
+                args["q_pe"] = query.view(-1, heads, width)[..., 512:].contiguous()
             else:
                 args.update(
+                    latent_cache=inputs,
                     cu_q_seqlens=torch.empty(2, dtype=torch.int32, device="cuda"),
                     cu_kv_seqlens=torch.empty(2, dtype=torch.int32, device="cuda"),
                     fmha_scheduler_counter=torch.empty(1, dtype=torch.uint32, device="cuda"),
@@ -420,6 +423,7 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
                     quant_q_buffer=torch.empty_like(query, dtype=torch.uint8),
                 )
                 q_pe = query.view(-1, heads, width)[..., 512:].contiguous()
+                args["q_pe"] = q_pe
                 attention.mla_rope_generation(
                     query,
                     q_pe,
@@ -439,6 +443,9 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
                 lo, hi = ordinal * block, min((ordinal + 1) * block, end)
                 expected = encode_high_precision_kv(expected_high[lo:hi], pool.dtype)
                 actual = pool[page, : hi - lo, 0].float()
+                torch.testing.assert_close(
+                    actual[:, :512], expected.float()[:, :512], atol=0, rtol=0
+                )
                 torch.testing.assert_close(actual, expected.float(), atol=0.03125, rtol=0.01)
             selected = (
                 torch.arange(topk, device="cuda", dtype=torch.int32).expand(end - begin, -1).clone()
@@ -487,7 +494,7 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
                 output = attention.forward(query, None, None, metadata, **args)
             assert overlay.call_count == 1
             assert output.shape == (end - begin, heads * 512)
-            assert torch.isfinite(output).all()
+            assert torch.isfinite(output.float()).all(), (begin, end, context)
             q_reference = (
                 encode_high_precision_kv(query, torch.float8_e4m3fn)
                 if context
