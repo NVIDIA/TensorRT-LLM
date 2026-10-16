@@ -15,6 +15,19 @@ trtllm_repo_path:    /path/to/TensorRT-LLM
 # slurm-environment:
 #   slurm_partition: <partition>
 #   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+#   # Optional: a pool of whole nodes the run holds for its workers, asked for
+#   # as soon as the run starts. Workers run GPU commands in it, served by
+#   # their task's priority, instead of submitting their own jobs.
+#   gpu_pool:
+#     nodes: 4                  # holder jobs kept submitted
+#     account: <account>
+#     partition: <partition>    # default: slurm_partition
+#     qos: <qos>                # optional
+#     gpus_per_node: 4          # default 4
+#     hours: 24                 # time limit of one holder job; default 24
+#     reserve: 2                # free GPUs perf work may not take; default 2
+#     container_mounts: [/path/to/models]   # besides the workspace and checkout
+#     setup: /path/to/setup.sh  # optional: runs `setup.sh <worktree> <command...>`
 
 # What the run must prove. The planner plans the tasks that prove each item,
 # and the run ends when they are DONE.

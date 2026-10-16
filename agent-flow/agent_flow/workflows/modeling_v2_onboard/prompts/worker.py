@@ -13,6 +13,7 @@ from ._common import (
     CITATION_DISCIPLINE,
     DETACHED_JOBS,
     EVIDENCE_DISCIPLINE,
+    GPU_POOL,
     MODELING_V2_LAYOUT,
     MODELING_V2_SWITCH,
     SLURM_ENVIRONMENT,
@@ -83,15 +84,19 @@ valid result file is treated as `FAILED`.
 """
 
 
-def build_worker_system_prompt(tags: Sequence[str], *, slurm: bool) -> str:
+def build_worker_system_prompt(tags: Sequence[str], *, slurm: bool, gpu_pool: bool = False) -> str:
     """Compose the worker system prompt for a task with ``tags``.
 
     Args:
         tags: The task's tags, primary first. Each adds its block in order.
         slurm: Whether ``task.yaml`` carries a ``slurm-environment``.
+        gpu_pool: Whether the run holds a GPU pool, which GPU work then goes
+            through instead of the worker's own Slurm jobs.
     """
     blocks = [_WORKER_BASE, *(TAG_PROMPTS[tag] for tag in tags)]
-    if slurm:
+    if gpu_pool:
+        blocks.append(GPU_POOL)
+    elif slurm:
         blocks.append(SLURM_ENVIRONMENT)
     blocks += [
         DETACHED_JOBS,
@@ -123,6 +128,8 @@ class WorkerTask:
         jobs: The task's ``jobs.json``.
         previous_attempts: Result files of earlier attempts at this task.
         test_commands: The Slurm command cache, when the run uses Slurm.
+        gpu_run: The command prefix that runs a command in the run's GPU pool,
+            when it has one.
     """
 
     task_id: str
@@ -138,6 +145,7 @@ class WorkerTask:
     previous_attempts: tuple[Path, ...] = ()
     test_commands: Path | None = None
     side: bool = False
+    gpu_run: str | None = None
 
 
 def worker_turn_prompt(task: WorkerTask) -> str:
@@ -153,6 +161,11 @@ def worker_turn_prompt(task: WorkerTask) -> str:
     ]
     if task.test_commands is not None:
         lines.append(f"- Verified Slurm commands: `{task.test_commands}`")
+    if task.gpu_run is not None:
+        lines.append(
+            f"- Run GPU work with: `{task.gpu_run} --task {task.task_id} --gpus <N> "
+            f"--minutes <M> {task.worktree} <command...>`"
+        )
     if task.is_final:
         lines += [
             "",

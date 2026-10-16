@@ -97,6 +97,11 @@ class Layout:
         return self.workspace / ".state.json"
 
     @property
+    def gpu_pool_dir(self) -> Path:
+        """The run's GPU pool: its holder script, locks, queue and logs."""
+        return self.workspace / "gpu_pool"
+
+    @property
     def priorities_path(self) -> Path:
         """``{task id: priority class}`` of the running plan, for the GPU pool."""
         return self.workspace / "gpu_priorities.json"

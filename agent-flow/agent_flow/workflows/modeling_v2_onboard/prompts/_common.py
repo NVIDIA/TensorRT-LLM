@@ -17,6 +17,7 @@ __all__ = [
     "CITATION_DISCIPLINE",
     "DETACHED_JOBS",
     "EVIDENCE_DISCIPLINE",
+    "GPU_POOL",
     "MODELING_V2_LAYOUT",
     "MODELING_V2_SWITCH",
     "SLURM_ENVIRONMENT",
@@ -150,6 +151,34 @@ already recorded under the handle, check it yourself (`squeue -j <id>`, then
 `sacct -j <id> -o State,ExitCode`): still running → keep polling it; finished
 → collect its output; gone or failed → resubmit with the same `--handle`.
 Never resubmit a live job.
+"""
+
+GPU_POOL = """\
+## Running GPU work: the run's GPU pool
+
+The run holds a pool of GPU nodes for its workers. Run every command that
+needs a GPU through it with the command your turn prompt names; never submit
+your own `srun` or `sbatch`. It waits until GPUs are free for you — work on
+the way to the first accuracy result is served first — then runs the command
+as a step of a pool job: inside the run's container, in your worktree
+(mounted at its own path, as are the workspace and the checkout), with
+`CUDA_VISIBLE_DEVICES` set to your GPUs. It exits with the command's status
+and frees the GPUs when the command ends.
+
+- `--gpus` is how many GPUs the command uses, `--minutes` how long it may
+  run; ask for no more than it needs.
+- Run anything longer than a few minutes detached with `--kind local` (see
+  below), so it survives a restart of your session.
+- Never run TensorRT-LLM code on the login node: only a pool command is
+  evidence.
+
+A fresh worktree has no native build artifacts. When `implements_tips` or
+`test_commands.md` give a way to reuse an existing build, use it; the pool may
+already do it for every command. `test_commands.md` in the workspace is a
+cache of commands other tasks have **verified** to work: read it before
+drafting a command, add or update an entry after one works (a one-line
+purpose, then the exact command), and delete entries you find broken. Other
+tasks edit it concurrently, so edit it in place with small changes.
 """
 
 SLURM_ENVIRONMENT = """\

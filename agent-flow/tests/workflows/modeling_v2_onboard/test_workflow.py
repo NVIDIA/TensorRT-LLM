@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_flow.workflows.modeling_v2_onboard import gpu_pool
 from agent_flow.workflows.modeling_v2_onboard.files import Layout
 from agent_flow.workflows.modeling_v2_onboard.plan import PlanError
 from agent_flow.workflows.modeling_v2_onboard.workflow import (
@@ -591,6 +592,52 @@ def test_planning_cannot_finish(tmp_path, tmp_git_repo):
     assert _workflow(tmp_path, tmp_git_repo, factory).run() == RunOutcome.SUCCEEDED
     # FINISH in the first batch lets the final task start as soon as it can.
     assert workers.order[-1] == "land"
+
+
+def test_the_gpu_pool_is_requested_while_the_planner_plans(tmp_path, tmp_git_repo, monkeypatch):
+    calls: list[list[str]] = []
+
+    def slurm(args):
+        calls.append(args)
+        jobs = sum(c[0] == "sbatch" for c in calls)
+        out = "".join(f"{i}\n" for i in range(jobs)) if args[0] == "squeue" else "Submitted\n"
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(gpu_pool, "_run", slurm)
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            # The pool's first holder job is submitted before any plan exists.
+            await _until(lambda: any(c[0] == "sbatch" for c in calls))
+            _first_batch(prompt).write_text(_plan_text())
+        else:
+            _finish_when_ready(prompt)
+
+    factory = FakeFactory(planner=planner, worker=_Workers())
+    pool = {"nodes": 1, "account": "acct"}
+    workflow = _workflow(
+        tmp_path,
+        tmp_git_repo,
+        factory,
+        **{
+            "slurm-environment": {
+                "slurm_partition": "p",
+                "docker_image": "/i.sqsh",
+                "gpu_pool": pool,
+            }
+        },
+    )
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert calls[-1][0] == "scancel" and workflow.gpu_pool.job_name in calls[-1]
+    (a_agent,) = factory.workers("a")
+    assert "## Running GPU work: the run's GPU pool" in a_agent.system_prompt
+    assert f"gpu_run --pool {tmp_path / 'ws' / 'gpu_pool'} --task a --gpus" in a_agent.prompts[0]
+
+
+def test_a_bad_gpu_pool_is_refused(tmp_path, tmp_git_repo):
+    slurm = {"slurm_partition": "p", "docker_image": "/i.sqsh", "gpu_pool": {"nodes": 1}}
+    with pytest.raises(WorkflowError, match="gpu_pool.account"):
+        _workflow(tmp_path, tmp_git_repo, FakeFactory(), **{"slurm-environment": slurm})
 
 
 def test_an_invalid_plan_is_sent_back_until_it_validates(tmp_path, tmp_git_repo):

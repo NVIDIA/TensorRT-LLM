@@ -85,6 +85,32 @@ act on it before anything else. The message moves to `inbox/consumed/` once a
 turn that saw it has been applied, so a discarded turn or a crash hands it to
 the planner again.
 
+## GPU pool
+
+With `slurm-environment.gpu_pool` in `task.yaml` (see `task.example.yaml`),
+the run holds whole GPU nodes for its workers. The orchestrator writes a
+holder job (`gpu_pool/holder.sbatch`, which only sleeps) and keeps `nodes` of
+them submitted from the moment it starts, so they queue while the planner
+plans; it cancels them when the run ends. An interrupted run leaves them
+running for the resumed run (`scancel -n <job name>` releases them), and
+`--clean` cancels them.
+
+Workers run every GPU command through
+
+```bash
+python -m agent_flow.workflows.modeling_v2_onboard.gpu_run --pool <workspace>/gpu_pool \
+    --task <id> --gpus N --minutes M <worktree> <command...>
+```
+
+which waits for N free GPUs on one holder job with at least M more minutes
+(plus a margin), locks them, and runs the command as a step of that job in the
+container, in the worktree, with `CUDA_VISIBLE_DEVICES` set. Waiting commands
+are served by the task's class in `gpu_priorities.json` (`accuracy`, then
+`feature`, then `perf`; first come first served within one), and `perf` work
+leaves the last `reserve` free GPUs alone. A `setup` script, when given, runs
+the command as `setup <worktree> <command...>` to prepare the environment
+(for example linking a built checkout's native libraries into the worktree).
+
 ## Side tasks
 
 A `perf` node marked `side: true` is work the run does not merge: no task but
@@ -156,6 +182,7 @@ The planner's plan is checked before it runs (`plan.py`):
 | `nodes/<id>/` | a task's notes and `jobs.json` (detached jobs) |
 | `worktrees/<id>/` | a running task's git worktree |
 | `test_commands.md` | Slurm commands the workers verified (Slurm runs only) |
+| `gpu_pool/` | the GPU pool's `pool.json`, holder script, GPU locks, wait queue and holder logs |
 | `gpu_priorities.json` | each task's GPU priority class, rewritten whenever the plan changes |
 | `.state.json`, `.running_plan.md` | task states and the plan being run, for resume |
 

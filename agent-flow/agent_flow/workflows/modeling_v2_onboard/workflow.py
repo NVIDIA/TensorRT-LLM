@@ -26,6 +26,10 @@ A run that lands keeps every side task's branch as
 ``<landed branch>-unmerged/<id>`` and commits ``UNMERGED_OPTIMIZATIONS.md``
 listing them, so a human can merge any of them later.
 
+When ``task.yaml`` asks for a GPU pool, its holder jobs are submitted before
+the planner starts, kept submitted while the run goes on, and cancelled when it
+ends; workers run their GPU commands in it.
+
 A human steers a running run by leaving a message in its inbox
 (``modeling-v2-onboard --workspace <ws> --feedback ...``): it wakes the planner,
 which acts on it first. A message is consumed only by a turn that applied.
@@ -45,6 +49,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -68,6 +73,7 @@ from .files import (
     read_handoff,
     read_inbox,
 )
+from .gpu_pool import GpuPool, PoolConfigError, pool_config
 from .node_runner import Agent, AgentFactory, make_run_task, write_failure
 from .plan import PRIORITIES, PlanError, PlanSpec, parse_plan
 from .prompts import (
@@ -213,8 +219,23 @@ class ModelingV2OnboardWorkflow:
         self.isolation = GitWorktreeIsolation(
             repo_path=self.repo_path, worktrees_root=self.layout.worktrees_dir
         )
+        try:
+            config = pool_config(task_data)
+        except PoolConfigError as exc:
+            raise WorkflowError(f"task.yaml: {exc}") from exc
+        self.gpu_pool = None
+        if config is not None:
+            self.gpu_pool = GpuPool(
+                directory=self.layout.gpu_pool_dir,
+                config=config,
+                workspace=self.layout.workspace,
+                mounts=(self.layout.workspace, self.repo_path),
+            )
         self._run_task = make_run_task(
-            layout=self.layout, agent_factory=agent_factory, slurm=self.slurm
+            layout=self.layout,
+            agent_factory=agent_factory,
+            slurm=self.slurm,
+            gpu_run=self.gpu_pool.command(sys.executable) if self.gpu_pool else None,
         )
         self._log = get_logger().console
 
@@ -266,6 +287,9 @@ class ModelingV2OnboardWorkflow:
         """Delete this workflow's state, task worktrees and task branches."""
         layout = self.layout
         self._drop_task_branches()
+        if self.gpu_pool is not None:
+            self.gpu_pool.release()
+        shutil.rmtree(layout.gpu_pool_dir, ignore_errors=True)
         for path in (
             layout.state_path,
             layout.plan_path,
@@ -790,6 +814,9 @@ class ModelingV2OnboardWorkflow:
         await self._stop_workers()
         if self._deadline is not None:
             self._deadline.cancel()
+        if self.gpu_pool is not None:
+            self._pool_keeper.cancel()
+            await asyncio.to_thread(self.gpu_pool.release)
         for tid, state in self._state.tasks.items():
             if state != NodeState.DONE:
                 self._cancel_jobs(tid)
@@ -875,6 +902,13 @@ class ModelingV2OnboardWorkflow:
         # Side tasks stopped at the deadline, and the deadline's timer.
         self._overdue: set[str] = set()
         self._deadline: asyncio.Task[None] | None = None
+        # GPUs are asked for first: holder jobs queue while the planner plans.
+        self._pool_keeper: asyncio.Task[None] | None = None
+        if self.gpu_pool is not None:
+            self.gpu_pool.write()
+            self._pool_keeper = asyncio.create_task(
+                self.gpu_pool.keep(lambda note: print_message(note, self._log))
+            )
         self._planner: Agent = self.agent_factory(
             "planner",
             build_planner_system_prompt(max_parallel=self.max_parallel),
@@ -897,6 +931,14 @@ class ModelingV2OnboardWorkflow:
         finally:
             await self._stop_workers()
             await self._planner.__aexit__(None, None, None)
+            if self._pool_keeper is not None:
+                self._pool_keeper.cancel()
+                if self._state.phase != "done":
+                    print_message(
+                        f"The GPU pool's jobs ({self.gpu_pool.job_name}) are kept for the "
+                        f"resumed run; `scancel -n {self.gpu_pool.job_name}` releases them.",
+                        self._log,
+                    )
 
     def run(self) -> RunOutcome:
         """Run (or resume) the workflow to completion."""

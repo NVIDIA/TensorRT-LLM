@@ -71,6 +71,7 @@ def make_run_task(
     layout: Layout,
     agent_factory: AgentFactory,
     slurm: bool,
+    gpu_run: str | None = None,
 ) -> RunTask:
     """Build the callback that runs one task with a fresh worker.
 
@@ -78,6 +79,8 @@ def make_run_task(
         layout: The workspace layout.
         agent_factory: Builds each worker's agent.
         slurm: Whether ``task.yaml`` carries a ``slurm-environment``.
+        gpu_run: The command prefix that runs a command in the run's GPU pool,
+            when it has one.
     """
 
     async def run_task(
@@ -102,10 +105,11 @@ def make_run_task(
             jobs=layout.jobs_path(node.id),
             previous_attempts=tuple(layout.previous_attempts(node.id)),
             test_commands=layout.test_commands_path if slurm else None,
+            gpu_run=gpu_run,
         )
         agent = agent_factory(
             f"worker[{node.id}]",
-            build_worker_system_prompt(tags, slurm=slurm),
+            build_worker_system_prompt(tags, slurm=slurm, gpu_pool=gpu_run is not None),
             Path(cwd),
             "persistent",
         )
