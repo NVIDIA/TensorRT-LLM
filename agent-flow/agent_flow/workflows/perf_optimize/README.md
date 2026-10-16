@@ -423,18 +423,36 @@ exactly as in perf-analyze):
 | `optimize.approaches` | no | `[config, code]` | Which optimization approaches the run may plan/apply: `config` edits the live tuning YAML, `code` edits the TRT-LLM source. Restrict to `[code]` for a code-only campaign (no knob tuning) or `[config]` to leave the checkout untouched. Enforced in three layers: the analyzer only plans allowed items, the orchestrator never dispatches a disallowed pending item, and any attempt that edits through a disallowed approach (tuning file differs from the accepted snapshot / dirty worktree) is auto-rejected before the evaluator benchmarks it. |
 | `optimize.accept_fraction` | no | `0.5` | Fraction of an item's `expected_gain_pct` the measured gain must reach. |
 | `optimize.noise_floor_pct` | no | `1.0` | Minimum measured gain (%); also the actionability floor for pending items. |
-| `optimize.target_metric` | no | `output_throughput` | Result-JSON key gains are computed on (see below). |
+| `optimize.target_metric` | no | `output_throughput` | Exact benchmark output field used for gains. If the Benchmarker cannot find it, the flow stops before analysis. |
 | `optimize.target_improvement_pct` | no | — | Optional early-stop: the orchestrator concludes the loop once the roadmap ledger's cumulative improvement reaches this. |
 | `accuracy.command` | with `accuracy` | — | Accuracy eval command the final verification runs verbatim against the live server (e.g. `trtllm-eval ...`). Omit the whole block to skip accuracy checks. |
 | `accuracy.baseline_score` | no | — | Reference score to compare against. |
 | `accuracy.max_drop_pct` | no | `1.0` | Allowed relative score drop vs `baseline_score`. |
 
-**Target metric keys** (from the `benchmark_serving.py` result JSON):
+For the builtin driver, target metric keys from the result JSON include:
 `output_throughput` (tok/s, default), `total_token_throughput`,
 `request_throughput`, and latency keys `mean_ttft_ms` / `median_ttft_ms`
 / `p99_ttft_ms` (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). Gains
 are always normalized so positive = improvement (throughput up, latency
 down).
+
+To use another benchmark tool, replace the builtin operating-point fields
+with the following minimal contract:
+
+```yaml
+benchmark:
+  type: external
+  path: /path/to/tool
+  command: |
+    tool-command --dataset ...
+  notes: |
+    Explain dataset requirements and where optimize.target_metric appears.
+```
+
+The harness does not parse the external tool's artifacts. The measuring
+agents receive this contract, extract the exact target field, and report its
+numeric value and source through structured progress. A missing field stops
+the flow; users are responsible for choosing a field the tool actually emits.
 
 When `slurm-environment.cluster_ssh` is set, paths belong to these machines:
 

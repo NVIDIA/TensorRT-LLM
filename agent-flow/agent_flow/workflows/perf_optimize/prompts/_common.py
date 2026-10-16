@@ -23,10 +23,8 @@ appended only when the projector stage is enabled — the default, unless
 from typing import Sequence
 
 from agent_flow.workflows.perf_analyze.prompts._common import (
-    BENCHMARK_FLAGS_REFERENCE,
     BOTTLENECK_TAXONOMY,
     CASEBOOK_CONSULTATION,
-    DERIVED_METRICS_REFERENCE,
     EVIDENCE_DISCIPLINE,
     EXECUTION_SLURM_BOOTSTRAP,
     PROFILE_FINDINGS_CONTRACT,
@@ -43,11 +41,9 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 
 __all__ = [
-    "BENCHMARK_FLAGS_REFERENCE",
     "BOTTLENECK_TAXONOMY",
     "CASEBOOK_APPLY",
     "CASEBOOK_CONSULTATION",
-    "DERIVED_METRICS_REFERENCE",
     "DORMANT_CAPABILITY_SWEEP",
     "EVIDENCE_DISCIPLINE",
     "EXECUTION_SLURM_BOOTSTRAP",
@@ -89,7 +85,7 @@ runs on. Its exact shape:
 
 ```yaml
 version: 1
-target_metric: output_throughput      # key in the benchmark_serving result JSON
+target_metric: output_throughput      # exact field reported by the benchmark
 baseline:                             # analyzer writes this once in round 1; frozen afterward
   value: 1234.5                       # curve mode: the MEAN of curve[].value
   source: baseline/benchmark_results.md
@@ -469,26 +465,15 @@ MEASUREMENT_PROTOCOL = """\
 Comparable numbers are the loop's foundation — every measurement follows
 the same recipe:
 
-- Drive the **canonical `benchmark_serving.py` command** at the operating
-  point(s) configured in `task.yaml`'s `benchmark` block: ISL / OSL
-  fixed, `num_prompts` exactly as configured (a single integer used at
-  every point, or a list paired index-by-index with the concurrency
-  list — use the paired entry per point), and **one run per
-  `benchmark.concurrency` point, sequentially ascending, over one server
-  launch** when it is a list (curve mode). Never resize the operating
-  point or the point list mid-run — a measurement at a different point
-  (or a different set of points, or a different `num_prompts` at the
-  same point) is not comparable and is worthless to the loop.
-- Pass `--result-dir <the artifact directory named in your instructions>`
-  so the result JSON lands next to the stage's other artifacts — in curve
-  mode `--result-dir <that directory>/concurrency_<c>` for the run at
-  point `<c>` — and read the metrics from that JSON (not from eyeballing
-  stdout).
-- Metric keys in the result JSON: `output_throughput` (output tok/s — the
-  default target metric), `total_token_throughput`, `request_throughput`,
-  and latency keys `mean_ttft_ms` / `median_ttft_ms` / `p99_ttft_ms`
-  (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). The active target is
-  `optimize.target_metric` in `task.yaml`.
+- Drive the benchmark command and workload declared in `task.yaml`'s
+  `benchmark` block. Replay the same command and workload at baseline,
+  evaluation, integration, and final verification; changing either makes
+  the comparison invalid.
+- Keep or copy benchmark outputs into the artifact directory named in the
+  turn instructions when possible. Read metrics from the source identified
+  by the configured benchmark contract, and record that source explicitly.
+- The active target is the exact field named by `optimize.target_metric`.
+  Never substitute a similar metric or invent a missing value.
 - **Direction rule:** throughput metrics are better when higher; `*_ms`
   latency metrics are better when lower. Always report `gain_pct`
   normalized so **positive = improvement**:

@@ -75,6 +75,17 @@ benchmark:
   # request_rate: inf        # requests/sec; "inf" sends all at once
   # dataset_path: /path/to/ShareGPT.json   # for sharegpt / hf datasets
 
+# External alternative: replace the builtin benchmark block above with
+# only this contract. The agents run it verbatim and use notes to locate
+# optimize.target_metric in its stdout/log/files.
+# benchmark:
+#   type: external
+#   path: /path/to/tool
+#   command: |
+#     tool-command --dataset semianalysisai/example
+#   notes: |
+#     Explain dataset requirements and where the requested metric appears.
+
 # Optional: which profilers the Analyzer runs each round, and the
 # steady-state iteration window that gates them (TLLM_PROFILE_START_STOP
 # for nsys; ncu arms on the same window via --profile-from-start
