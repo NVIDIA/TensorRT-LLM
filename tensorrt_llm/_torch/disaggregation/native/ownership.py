@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Internal physical-access bookkeeping shared by transfer integrations.
+"""Physical-access bookkeeping for the native transfer protocol.
 
-This is not an allocator or a public cache-backend API. Callers supply already
-mapped participants and backend-defined access-end evidence, and retain manager
-loans until the deadline permits retirement. Logical Attempt outcomes remain
-separate. Native publication ordering, transport submission and local-copy
-synchronization are not implemented here.
+Native sessions supply participant mappings and protocol evidence, submit and
+poll backend operations, and synchronize local copies. These helpers retain
+operation roots and account for physical access; allocation and registration
+ownership remain with the native caller. Logical outcomes stay separate, and
+deadline arbitration comes from the shared lifecycle package.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from .retirement import RetirementDeadline
+from ..lifecycle.retirement import RetirementDeadline
 
 if TYPE_CHECKING:
     from ..base.agent import TransferStatus

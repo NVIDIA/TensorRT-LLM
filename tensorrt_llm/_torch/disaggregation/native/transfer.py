@@ -56,16 +56,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
-    PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
-)
-from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
-    ReceiveOperationOwner as _ReceiveOperationOwner,
-)
-from tensorrt_llm._torch.disaggregation.lifecycle.ownership import SendOperationOwner
-from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
-    TransferNotSubmittedError as _TransferNotSubmittedError,
-)
 from tensorrt_llm._torch.disaggregation.lifecycle.retirement import (
     QuiescenceFatalEvent,
     RetirementDeadline,
@@ -81,6 +71,16 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
+)
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
+)
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    ReceiveOperationOwner as _ReceiveOperationOwner,
+)
+from tensorrt_llm._torch.disaggregation.native.ownership import SendOperationOwner
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    TransferNotSubmittedError as _TransferNotSubmittedError,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
@@ -413,7 +413,7 @@ class SendTaskBase(_LogicalTask):
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner = SendOperationOwner()
-        # Preserve the native diagnostic view of the shared owner's exact roots.
+        # Preserve the task's diagnostic view of its owner's exact roots.
         self._physical_operations = self._physical_owner._physical_operations
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
@@ -445,7 +445,7 @@ class SendTaskBase(_LogicalTask):
         return self._event.is_set()
 
     def begin_physical_operation(self, peer_rank: int) -> bool:
-        """Admit a participant once in the shared physical owner."""
+        """Admit a participant once in the native physical owner."""
         return self._physical_owner.begin_physical_operation(peer_rank)
 
     def begin_backend_submission(self, peer_rank: int, request: TransferRequest) -> None:
@@ -3961,7 +3961,7 @@ class RxSession(RxSessionBase):
                 if self._closed:
                     return True
                 retirement = getattr(self, "_retirement", None)
-                if retirement is not None and retirement.controller.admission_closed:
+                if retirement is not None and retirement.controller.shutdown_requested:
                     # Publication also holds this session lock. Only unsealed
                     # owners can be cancelled here; a reserved send remains live
                     # even before its network callback has actually started.
