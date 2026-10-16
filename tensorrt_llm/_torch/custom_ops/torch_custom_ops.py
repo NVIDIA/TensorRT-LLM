@@ -37,7 +37,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig, autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
@@ -59,6 +60,10 @@ from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
+
+if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4RubinLinear
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -1310,6 +1315,42 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         """Check if this is the only backend in allowed_backends (explicitly forced)."""
         return self.allowed_backends == [backend_name]
 
+    def _get_cutedsl_runner(self,
+                            *,
+                            required: bool = False) -> Optional[TunableRunner]:
+        """Select a CuTe DSL runner compatible with the device and output allocation."""
+        sm_version = get_sm_version()
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            error = "CuteDSL backend is not available. Please check CuteDSL installation."
+        elif sm_version in (100, 103):
+            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
+                                               self.output_buffer_kind,
+                                               self.group)
+        elif sm_version == 107:
+            if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+                error = "CuteDSL NVFP4 SM107 backend requires Rubin CuTe DSL support."
+            elif self.output_dtype != torch.bfloat16:
+                error = "CuteDSL NVFP4 SM107 backend only supports bfloat16 output."
+            elif self.output_buffer_kind not in (int(BufferKind.DEFAULT),
+                                                 int(BufferKind.USERBUFFERS)):
+                error = (
+                    "CuteDSL NVFP4 SM107 backend only supports DEFAULT and "
+                    "USERBUFFERS output buffers.")
+            else:
+                return CuteDSLNVFP4RubinLinear(
+                    self.output_dtype,
+                    to_userbuffers=self.output_buffer_kind == int(
+                        BufferKind.USERBUFFERS))
+        else:
+            error = (
+                "CuteDSL NVFP4 backend requires SM 100 (B200), SM 103 (B300), "
+                f"or SM 107 (Rubin), but got SM {sm_version}.")
+
+        if required or self._is_only_backend("cutedsl"):
+            raise ValueError(error +
+                             " Please add other backends to allowed_backends.")
+        return None
+
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
                           **kwargs) -> List[Tuple[str, int]]:
@@ -1391,47 +1432,25 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
 
         # Add CuteDSL tactics if available
         if self._is_backend_allowed("cutedsl"):
-            if IS_CUTLASS_DSL_AVAILABLE:
-                # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
-                sm_version = get_sm_version()
-                if sm_version not in [100, 103]:
-                    if self._is_only_backend("cutedsl"):
-                        # Explicitly forced CuteDSL but SM version not supported
-                        raise ValueError(
-                            f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
-                            f"CuteDSL NVFP4 is not supported on this GPU architecture. "
-                            "Please add other backends to allowed_backends.")
-                else:
-                    # SM version OK, check if CuteDSL supports the current shape
-                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
-                        self.output_dtype)
-                    # get_valid_tactics ranks/prunes with nvMatmulHeuristics
-                    # internally when TRTLLM_CUTEDSL_NVMMH_ENABLE=1 (no-op
-                    # otherwise), so the returned list already reflects any
-                    # opt-in pruning before it enters the unified tactic list.
-                    cutedsl_tactics = cutedsl_runner.get_valid_tactics(
-                        inputs, profile)
-
-                    if cutedsl_tactics:
-                        # CuteDSL supports this shape
-                        tactics.extend([("cutedsl", tactic)
-                                        for tactic in cutedsl_tactics])
-                    elif self._is_only_backend("cutedsl"):
-                        # Explicitly forced CuteDSL but it doesn't support this shape
-                        m, n, k = inputs[0].shape[0], inputs[1].shape[
-                            0], inputs[0].shape[1] * 2
-                        raise ValueError(
-                            f"CuteDSL backend does not support the current shape:\n"
-                            f"  M={m}, N={n}, K={k}\n"
-                            f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
-                            f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
-                            f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
-                            f"Please add other backends to allowed_backends.")
-            elif self._is_only_backend("cutedsl"):
-                raise ValueError(
-                    "CuteDSL backend is not available. "
-                    "Please check CuteDSL installation or add other backends to allowed_backends."
-                )
+            cutedsl_runner = self._get_cutedsl_runner()
+            if cutedsl_runner is not None:
+                # The Blackwell runner applies opt-in nvMatmulHeuristics
+                # pruning before returning its tactics.
+                cutedsl_tactics = cutedsl_runner.get_valid_tactics(
+                    inputs, profile)
+                if cutedsl_tactics:
+                    tactics.extend([("cutedsl", tactic)
+                                    for tactic in cutedsl_tactics])
+                elif self._is_only_backend("cutedsl"):
+                    m, n, k = inputs[0].shape[0], inputs[1].shape[
+                        0], inputs[0].shape[1] * 2
+                    raise ValueError(
+                        f"CuteDSL backend does not support the current shape:\n"
+                        f"  M={m}, N={n}, K={k}\n"
+                        f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
+                        f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
+                        f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
+                        f"Please add other backends to allowed_backends.")
 
         return tactics
 
@@ -1479,11 +1498,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                            tactic=sub_tactic,
                                                            bias=bias)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
-                                               self.output_buffer_kind,
-                                               self.group)(inputs,
-                                                           tactic=sub_tactic,
-                                                           bias=bias)
+            cutedsl_runner = self._get_cutedsl_runner(required=True)
+            assert cutedsl_runner is not None
+            return cutedsl_runner(inputs, tactic=sub_tactic, bias=bias)
         elif backend == "marlin":
             return MarlinNVFP4Runner(self.output_buffer_kind,
                                      self.output_dtype)(inputs,
@@ -1510,7 +1527,7 @@ def nvfp4_gemm(
     This function automatically chooses the best backend from the allowed list:
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
-    - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
+    - CuteDSL: Blackwell/Rubin persistent kernels (when available and inputs are valid)
     - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
     - Marlin: Ada/Hopper W4A16 NVFP4 implementation (requires SM 89-99)
 

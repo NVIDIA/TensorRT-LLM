@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -179,7 +179,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         mAllReduceCommPtrs
             = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 3}),
                 tensorrt_llm::DataType::kINT64);
-        auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
+        auto commPtrs = mAllReduceCommPtrs->getBufferRange<void*>();
         // Start from 1 since 0 represents released state for barrier at the beginning of the all_reduce.
         // The last element is the barrier flag counter.
         mFlagPtrs = manager.copyFrom(std::vector<int64_t>{1, 1, 0}, ITensor::makeShape({3}), MemoryType::kGPU);

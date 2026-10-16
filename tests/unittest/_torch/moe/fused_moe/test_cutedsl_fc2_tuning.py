@@ -61,6 +61,7 @@ def _make_runner(
             [
                 ((128, 128), (1, 1), False),
                 ((128, 128), (1, 2), False),
+                ((128, 256), (1, 1), False),
             ],
         ),
         (
@@ -97,7 +98,7 @@ def test_fc2_n_tile_size_override(
     tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
 
     assert tactics == expected_tactics
-    expected_override = 128 if env_value is None else (None if env_value == "0" else int(env_value))
+    expected_override = None if env_value in (None, "0") else int(env_value)
     assert runner._get_default_tactic()[0][1] == (expected_override or 128)
     if expected_override is None:
         assert "fc2_n_tile_size_override" not in runner.unique_id()
