@@ -421,7 +421,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _send_disagg_request_gen_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> UCompletionResponse:
+    ) -> UCompletionResponseOrGenerator:
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -450,7 +450,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         )
         self._strip_gen_subagent_affinity(gen_req)
 
-        if request.stream and need_ctx:
+        if not need_ctx:
+            return await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+            )
+
+        if request.stream:
             # For streaming gen_first requests, the gen client returns a lazy
             # async generator whose HTTP POST only fires when iterated. The ctx
             # server blocks waiting for the gen server's rx session (gen_first
@@ -490,7 +495,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
             # Now send ctx request — gen server has received its request
             try:
-                await self._ctx_client.send_request(
+                ctx_response = await self._ctx_client.send_request(
                     ctx_req,
                     server=ctx_server,
                     hooks=hooks,
@@ -499,6 +504,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             except (Exception, asyncio.CancelledError):
                 await _close_gen_response()
                 raise
+
+            if self._context_was_cancelled(ctx_response):
+                await _close_gen_response()
+                return self._finish_context_cancellation(request, ctx_response)
 
             async def _yield_from_queue():
                 try:
@@ -518,29 +527,49 @@ class OpenAIDisaggregatedService(OpenAIService):
             await response.__anext__()
             return response
         else:
-            # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
-            # through generator consumption, so asyncio.gather works fine.
-            tasks = []
-            if need_ctx:
-                tasks.append(
-                    asyncio.create_task(
-                        self._ctx_client.send_request(
-                            ctx_req,
-                            server=ctx_server,
-                            hooks=hooks,
-                            req_id=disagg_request_id,
-                        )
-                    )
-                )
-            tasks.append(
-                asyncio.create_task(
-                    self._gen_client.send_request(
-                        gen_req,
-                        server=gen_server,
-                        hooks=hooks,
-                        req_id=disagg_request_id,
-                    )
+            ctx_task = asyncio.create_task(
+                self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
             )
-            responses = await asyncio.gather(*tasks)
-            return responses[-1]
+            gen_task = asyncio.create_task(
+                self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            )
+            tasks = (ctx_task, gen_task)
+            try:
+                completed, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if gen_task in completed and ctx_task not in completed:
+                    # Preserve prompt GEN failure reporting while CTX is still waiting.
+                    gen_task.result()
+                ctx_response = await ctx_task
+                if not self._context_was_cancelled(ctx_response):
+                    return await gen_task
+            finally:
+                # Closing the HTTP leg requests worker cancellation. It does not
+                # authorize reuse of KV memory still owned by a physical transfer.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return self._finish_context_cancellation(request, ctx_response)
+
+    @staticmethod
+    def _context_was_cancelled(response: Optional[UCompletionResponse]) -> bool:
+        """Recognize worker cancellation returned as a normal HTTP response."""
+        return response is not None and any(
+            choice.finish_reason == "cancelled" for choice in response.choices
+        )
+
+    @staticmethod
+    def _finish_context_cancellation(
+        request: UCompletionRequest,
+        response: UCompletionResponse,
+    ) -> UCompletionResponseOrGenerator:
+        """Return the CTX cancellation after closing its paired GEN request."""
+        for choice in response.choices:
+            del choice.disaggregated_params
+        # GEN's HTTP client owns completion hooks, including when it finished
+        # before CTX returned. Do not synthesize another completion here.
+        return done_generator() if request.stream else response
