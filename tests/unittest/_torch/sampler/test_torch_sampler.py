@@ -1899,8 +1899,6 @@ class TestBatchedSampling:
         logits_orig = logits.clone()
         try:
             yield {
-                # No 'd2t': Non-greedy sampling with 'd2t' is currently not
-                #           supported and greedy case is tested elsewhere
                 "logits": logits,
             }
         finally:

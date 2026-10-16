@@ -72,7 +72,6 @@ from .sampler_features import (
     SamplerEvent,
     _PackedStepIndexer,
     _UnpackedStepIndexer,
-    apply_d2t,
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
@@ -1029,7 +1028,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         logits_cuda = model_outputs["logits"]
-        d2t = model_outputs.get("d2t", None)
 
         # Staging runs after the batch is settled, so the staged width has to
         # equal the rows the forward produced. A mismatch means an unexpected
@@ -1047,13 +1045,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
         dest_indices = dest_indices[: self._in_graph_rows]
 
-        self._fast_sample_in_graph(logits_cuda, dest_indices, d2t)
+        self._fast_sample_in_graph(logits_cuda, dest_indices)
 
     def _fast_sample_in_graph(
         self,
         logits_cuda: torch.Tensor,
         dest_indices: torch.Tensor,
-        d2t: torch.Tensor | None,
     ) -> None:
         """Sample the fast tier from the staged per-row params.
 
@@ -1078,8 +1075,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seed=params.seed[:num_rows],
             offset=params.offset[:num_rows],
         )
-        if d2t is not None:
-            next_tokens = next_tokens + d2t[next_tokens]
         scatter_new_tokens(next_tokens, self.store.new_tokens, dest_indices, self.max_beam_width)
 
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
@@ -1826,7 +1821,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         logits_cuda: torch.Tensor,
         requests: list[LlmRequest],
-        model_outputs: dict[str, Any],
         *,
         logits_cuda_indexer: _PackedStepIndexer,
         req_num_generated_tokens: torch.Tensor,
@@ -1845,11 +1839,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         seq_slots_list = seq_slots.tolist()
         groups = self._group_requests(requests, seq_slots_list)
-        # NB: "d2t" maps sampled draft-vocab tokens into the target vocab; the
-        #     probs of a non-greedy sampler would still be over the draft vocab.
-        needs_d2t = "d2t" in model_outputs
-        if needs_d2t and any(group.mode is not SamplingMode.GREEDY for group in groups):
-            raise ValueError("d2t does not yet support non-greedy sampling")
 
         # Tensors for collecting sampling results (in batch ordering)
         batch_req_indices = torch.empty((len(requests),), dtype=torch.int32)
@@ -2062,14 +2051,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 batch_raw_logprob_indices_cuda = logits_cuda_indexer[
                     torch.tensor(reqs_indices_needing_raw_logprobs, dtype=torch.int64)
                 ].to(device=cuda_device, non_blocking=True)
-
-        # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
-        #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
-        #     is the target vocab, whereas the output logits correspond to the draft
-        #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
-        #     they currently need to be handled within TorchSampler.
-        if needs_d2t:
-            apply_d2t(batch_next_tokens_cuda_int, model_outputs)
 
         return _BatchedSamplingResult(
             req_indices=batch_req_indices,
@@ -2334,7 +2315,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             and self.max_beam_width == 1
             and scheduled_requests.num_context_requests == 0
             and len(generation_requests) <= raw_logits_cuda.shape[0]
-            and model_outputs.get("d2t") is None
             and all(
                 not request.is_dummy and get_draft_token_length(request) == 0
                 for request in generation_requests
@@ -2465,7 +2445,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda,
                 seq_slots_cuda,
                 self.max_beam_width,
-                None,
             )
             new_tokens_host = self._copy_to_host(next_tokens)
             return (
@@ -2586,16 +2565,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda.device, non_blocking=True
             )
 
-            # Get d2t tensor if present
-            d2t = model_outputs.get("d2t", None)
-
-            # Run compiled kernel for argmax, d2t application, and scatter
+            # Run compiled kernel for argmax and scatter
             fast_greedy_sample_kernel(
                 logits_cuda,
                 new_tokens_cuda,
                 batch_dest_indices_cuda,
                 self.max_beam_width,
-                d2t,
             )
 
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
@@ -2622,7 +2597,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             sampling_requests,
-            model_outputs,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=sampling_requests_metadata.req_offsets,
             seq_slots=seq_slots_host,
