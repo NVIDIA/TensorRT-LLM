@@ -43,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -54,6 +55,7 @@ from tensorrt_llm.llmapi.llm_args import (
     PARDDecodingConfig,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
@@ -811,6 +813,55 @@ def test_nvfp4_scale_indices_with_mixed_bf16_storage() -> None:
                 assert address + page_bytes <= scale_base + group.num_slots * scale_pool.slot_bytes
     finally:
         manager.shutdown()
+
+
+def test_mixed_nvfp4_bf16_pool_pointer_views() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    bf16 = torch.empty((2, 1, 32, 128), dtype=torch.bfloat16, device="cuda")
+    nvfp4 = torch.empty((2, 1, 32, 64), dtype=torch.uint8, device="cuda")
+    scales = torch.empty((2, 1, 32, 8), dtype=torch.float8_e4m3fn, device="cuda")
+    pointers = torch.tensor(
+        [
+            [[nvfp4.data_ptr(), scales.data_ptr()], [0, 0]],
+            # A nonzero scale pointer must be ignored for the BF16 layer.
+            [[bf16.data_ptr(), scales.data_ptr()], [0, 0]],
+        ],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    mapping = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32, device="cpu")
+    block_offsets = torch.zeros((2, 1, 2, 1), dtype=torch.int32, device="cuda")
+    for table, layer_id, quant_mode, expected_data, expected_scales in (
+        (pointers, 1, 0, bf16, None),
+        (pointers, 0, int(QuantMode.NVFP4_KV_CACHE), nvfp4, scales),
+        (pointers[:, :, 0].contiguous(), 1, 0, bf16, None),
+    ):
+        data, blocks, block_scales = thop.build_trtllm_gen_kv_cache_metadata(
+            host_kv_cache_pool_pointers=table,
+            host_kv_cache_pool_mapping=mapping,
+            kv_cache_block_offsets=block_offsets,
+            layer_idx=layer_id,
+            num_kv_heads=1,
+            tokens_per_block=32,
+            head_dim=128,
+            kv_factor=2,
+            total_num_blocks=2,
+            kv_cache_quant_mode=quant_mode,
+            batch_start=0,
+            batch_size=1,
+            dtype=torch.bfloat16,
+        )
+        assert data.data_ptr() == expected_data.data_ptr()
+        assert data.shape == expected_data.shape
+        assert data.dtype == expected_data.dtype
+        assert blocks.data_ptr() == block_offsets[layer_id].data_ptr()
+        if expected_scales is None:
+            assert block_scales is None
+        else:
+            assert block_scales is not None
+            assert block_scales.data_ptr() == expected_scales.data_ptr()
+            assert block_scales.shape == expected_scales.shape
 
 
 def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
