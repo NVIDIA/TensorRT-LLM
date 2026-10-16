@@ -100,6 +100,9 @@ def initialize_sparse_attn(self) -> None:
         dtype=self.dtype,
         eps=self.rms_norm_eps,
     )
+    # Unit FP8 Q scale for the fused Q paths. Allocated here, not on first use, so
+    # a first forward under CUDA graph capture never issues an H2D copy.
+    self.register_buffer("_quant_scale_qkv", torch.ones(1, dtype=torch.float32), persistent=False)
     self.o_a_proj = nn.Parameter(
         torch.empty(
             (
@@ -270,13 +273,11 @@ def _rubin_dsv4_o_b_proj_out(
 
 def _rubin_dsv4_o_lora_quantized_input(
     self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
-) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run o_a_proj on SM107 and emit FP8 O-LoRA plus packed scales for o_b_proj.
 
-    Returns None when the Rubin direct-output o_b_proj path is not in use.
+    Only valid when `_uses_rubin_dsv4_o_b_proj_out` holds; callers check it.
     """
-    if not _uses_rubin_dsv4_o_b_proj_out(self):
-        return None
     num_tokens = attn_fp8.shape[1]
     flat_n = self.n_local_groups * self.o_lora_rank
     fp8_output = torch.empty(
@@ -301,9 +302,8 @@ def _deepseek_v4_fp8_o_a_proj(
     self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
 ) -> torch.Tensor:
     """Run o_a_proj and o_b_proj on the FP8 inverse-RoPE output."""
-    quantized_input = _rubin_dsv4_o_lora_quantized_input(self, attn_fp8, attn_scale)
-    if quantized_input is not None:
-        return self.o_b_proj(quantized_input)
+    if _uses_rubin_dsv4_o_b_proj_out(self):
+        return self.o_b_proj(_rubin_dsv4_o_lora_quantized_input(self, attn_fp8, attn_scale))
     from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
 
     num_tokens = attn_fp8.shape[1]
@@ -324,18 +324,17 @@ def _deepseek_v4_fp8_o_a_proj(
 
 def _run_dsv4_o_lora_bmms(
     self,
-    o_lora_output: torch.Tensor,
+    output: torch.Tensor,
     num_context_tokens: int,
     num_tokens: int,
     context_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
     generation_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
-    """Run both O-LoRA projections and write hidden states into `o_lora_output`.
+    """Run both O-LoRA projections and write hidden states into `output`.
 
-    `o_lora_output` is the single mutable output of the MLA custom op. The final
-    projection stays inside the op and its result lands in the leading
-    `hidden_size` columns of the flattened buffer, so the op contract holds under
-    CUDA-graph replay and torch.compile.
+    `output` is the single mutable output of the MLA custom op, a contiguous
+    `[tokens, 1, hidden_size]` buffer. The final projection stays inside the op,
+    so the op contract holds under CUDA-graph replay and torch.compile.
     """
     active_inputs = [
         item for item in (context_o_lora_bmm_input, generation_o_lora_bmm_input) if item is not None
@@ -343,43 +342,24 @@ def _run_dsv4_o_lora_bmms(
     if not active_inputs:
         return
 
-    uses_direct_output = _uses_rubin_dsv4_o_b_proj_out(self)
-    projected_output = None
-    if uses_direct_output:
-        projected_output = o_lora_output.flatten(1)[:num_tokens]
-        if projected_output.shape[1] != self.hidden_size:
-            raise ValueError(
-                f"DSv4 projected output width must be {self.hidden_size}, got "
-                f"{projected_output.shape[1]}"
-            )
-
-    def write_projected_output_copy(
-        o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    ) -> None:
-        projected = self.o_b_proj(o_b_proj_input)
-        output_view = o_lora_output.flatten(1)
-        output_view[: projected.shape[0], : self.hidden_size].copy_(projected)
-
-    if len(active_inputs) == 1:
-        quantized_input = _rubin_dsv4_o_lora_quantized_input(self, *active_inputs[0])
-        if quantized_input is not None:
-            if uses_direct_output:
-                assert projected_output is not None
-                _rubin_dsv4_o_b_proj_out(self, quantized_input, projected_output)
-            else:
-                write_projected_output_copy(quantized_input)
-            return
-
-    # The direct-output GEMM overwrites the buffer it reads from, so it needs a
-    # separate O-LoRA scratch; the copy path can reuse the output buffer.
-    if uses_direct_output:
-        o_lora_bmm_output = torch.empty(
-            [num_tokens, self.n_local_groups, self.o_lora_rank],
-            device=o_lora_output.device,
-            dtype=self.dtype,
+    projected_output = output.flatten(1)[:num_tokens]
+    if projected_output.shape[1] != self.hidden_size:
+        raise ValueError(
+            f"DSv4 projected output width must be {self.hidden_size}, got "
+            f"{projected_output.shape[1]}"
         )
-    else:
-        o_lora_bmm_output = o_lora_output
+
+    uses_direct_output = _uses_rubin_dsv4_o_b_proj_out(self)
+    if uses_direct_output and len(active_inputs) == 1:
+        quantized_input = _rubin_dsv4_o_lora_quantized_input(self, *active_inputs[0])
+        _rubin_dsv4_o_b_proj_out(self, quantized_input, projected_output)
+        return
+
+    o_lora_bmm_output = torch.empty(
+        [num_tokens, self.n_local_groups, self.o_lora_rank],
+        device=output.device,
+        dtype=self.dtype,
+    )
 
     def run_o_lora_bmm(
         o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
@@ -407,10 +387,9 @@ def _run_dsv4_o_lora_bmms(
             o_lora_bmm_output[num_context_tokens:num_tokens],
         )
     if uses_direct_output:
-        assert projected_output is not None
         _rubin_dsv4_o_b_proj_out(self, o_lora_bmm_output.flatten(1), projected_output)
     else:
-        write_projected_output_copy(o_lora_bmm_output[:num_tokens].flatten(1))
+        projected_output.copy_(self.o_b_proj(o_lora_bmm_output.flatten(1)))
 
 
 def prepare_sparse_attn_outputs(
@@ -447,18 +426,11 @@ def prepare_sparse_attn_outputs(
         return not self.inverse_rotary_emb.is_neox
 
     if _should_use_dsv4_epilogue_fusion():
-        num_tokens = hidden_states.shape[0]
-        # 3D marks the fused epilogue (see forward_sparse_attn). The direct-output
-        # path needs exactly hidden_size columns; the copy path keeps the
-        # O-LoRA-sized buffer and uses its leading hidden_size columns.
-        output_shape = (
-            [num_tokens, 1, self.hidden_size]
-            if _uses_rubin_dsv4_o_b_proj_out(self)
-            else [num_tokens, self.n_local_groups, self.o_lora_rank]
-        )
+        # 3D marks the fused epilogue (see forward_sparse_attn); the op writes the
+        # projected hidden states, so the buffer is exactly hidden_size wide.
         return [
             torch.empty(
-                output_shape,
+                [hidden_states.shape[0], 1, self.hidden_size],
                 device=hidden_states.device,
                 dtype=self.dtype,
             )
@@ -476,12 +448,9 @@ def project_sparse_attn_output(
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
     # The fused epilogue already ran both O-LoRA projections inside the custom op
-    # and wrote the hidden states into the leading hidden_size columns.
+    # and wrote the hidden states into its contiguous [tokens, 1, hidden] buffer.
     if attn_output_tensor.ndim == 3:
-        output_view = attn_output_tensor.flatten(1)
-        if output_view.shape[1] == self.hidden_size:
-            return output_view
-        return output_view[:, : self.hidden_size]
+        return attn_output_tensor.flatten(1)
 
     assert position_ids is not None
     num_tokens = attn_output_tensor.shape[0]
@@ -652,6 +621,16 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
         return False
     if self.apply_rotary_emb or position_ids is None:
         return False
+    # The kernel output, the FP8 Q buffer view, and the generation q_pe
+    # placeholder assume the DSv4 layout: 128 local heads of 448 NoPE + 64 RoPE.
+    if self.num_heads_tp != 128 or self.qk_rope_head_dim != 64:
+        return False
+    if self.qk_head_dim != self.kv_lora_rank + self.qk_rope_head_dim:
+        return False
+    # Fused Q RoPE skips the kernel that fills cu_q_seqlens, so generation needs
+    # the metadata to precompute them; without the hook, take the unfused path.
+    if getattr(attn_metadata, "mla_prepare_scheduler_buffers", None) is None:
+        return False
     # q is the q_a_layernorm output; the wrapper asserts contiguity before launch.
     if q.dtype != torch.bfloat16 or q.dim() != 2:
         return False
@@ -733,8 +712,6 @@ def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
     """
     assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
     assert q.is_contiguous(), "fused q_b GEMM needs a contiguous q_lora"
-    if getattr(self, "_quant_scale_qkv", None) is None:
-        self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
     q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
     position_ids_i32 = position_ids.reshape(-1)
     if position_ids_i32.dtype != torch.int32:
@@ -874,8 +851,6 @@ def _deepseek_v4_q_b_layernorm_fused_fp8(
     # allocation per forward.
     assert q_proj.dim() == 2
     assert q_proj.shape[1] == self.num_heads_tp * self.qk_head_dim
-    if getattr(self, "_quant_scale_qkv", None) is None:
-        self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q_proj.device)
     # q_pe is 3D so thop.attention's sparse-MLA context branch passes its
     # q_pe->dim() == 3 check; the kernel op consumes the flat 2D view.
     num_tokens = q_proj.shape[0]
@@ -904,12 +879,8 @@ def _deepseek_v4_q_b_layernorm_fused_fp8(
             seq_len,
             cu_q_seqlens,
         )
-    # Both buffers must be live for the fused path; the downstream
-    # absorption-context op switches on `quant_scale_qkv is not None`
-    # to enable the C++ fusion (see trtllm.py `thop.attention` call).
-    assert self._quant_scale_qkv is not None, (
-        "fused FP8-Q quant requires _quant_scale_qkv to be set"
-    )
+    # The downstream absorption-context op switches on `quant_scale_qkv is not
+    # None` to enable the C++ fusion (see trtllm.py `thop.attention` call).
     return q_proj, quant_q_buffer, q_pe, self._quant_scale_qkv
 
 
