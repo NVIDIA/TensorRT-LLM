@@ -330,7 +330,14 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
         quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
         pos_embd_params=PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gptj,
-            rope=RopeParams(dim=64, max_positions=1024),
+            rope=RopeParams.from_config(
+                SimpleNamespace(
+                    qk_rope_head_dim=64,
+                    max_position_embeddings=1024,
+                    hidden_size=7168,
+                    num_attention_heads=128,
+                )
+            ),
             is_neox=False,
         ),
         mla_params=MLAParams(
@@ -439,6 +446,7 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
             selected.masked_fill_(selected > positions[:, None], -1)
             attention.indexer.forward_from_projected = Mock(return_value=selected)
             original_overlay = attention._overlay_high_precision_kv
+            reference_rows = []
 
             def checked_overlay(meta, indices, compact, scratch, **kwargs):
                 low = scratch.clone()
@@ -466,6 +474,12 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
                     atol=0,
                     rtol=0,
                 )
+                reference_rows.append(
+                    scratch.view(-1, width)
+                    .view(torch.uint8)[compact[-1, :end].long()]
+                    .view(scratch.dtype)
+                    .float()
+                )
 
             with patch.object(
                 attention, "_overlay_high_precision_kv", side_effect=checked_overlay
@@ -474,6 +488,21 @@ def test_dsa_mixed_precision_native_prefill_and_decode(high_dtype):
             assert overlay.call_count == 1
             assert output.shape == (end - begin, heads * 512)
             assert torch.isfinite(output).all()
+            q_reference = (
+                encode_high_precision_kv(query, torch.float8_e4m3fn)
+                if context
+                else args["quant_q_buffer"].view(torch.float8_e4m3fn)
+            )
+            q_reference = q_reference.float().view(-1, heads, width).transpose(0, 1)
+            keys = reference_rows[0]
+            scores = q_reference @ keys.T / (192**0.5)
+            scores.masked_fill_(
+                torch.arange(end, device="cuda")[None, :] > positions[:, None], float("-inf")
+            )
+            expected_output = (
+                (scores.softmax(-1) @ keys[:, :512]).transpose(0, 1).reshape_as(output)
+            )
+            torch.testing.assert_close(output.float(), expected_output, atol=0.06, rtol=0.12)
             if not context:
                 assert tables[0][0] >= 0 and tables[0][1:3] == [kv.BAD_PAGE_INDEX] * 2
     finally:

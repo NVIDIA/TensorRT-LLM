@@ -158,7 +158,15 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
-    def forward(self, q, k, v, metadata, forward_args=None, **kwargs):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: DSAtrtllmAttentionMetadata,
+        forward_args: Optional[AttentionForwardArgs] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if isinstance(metadata.kv_cache_manager, MixedPrecisionKVCacheManager):
             # Sparse MLA already gathers the selected rows into its native
             # Attention input; it does not need the dense K/V paged view.
@@ -167,7 +175,12 @@ class DSATrtllmAttention(TrtllmAttention):
             )
         return super().forward(q, k, v, metadata, forward_args, **kwargs)
 
-    def _high_precision_rows(self, metadata, positions, request_indices):
+    def _high_precision_rows(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        positions: torch.Tensor,
+        request_indices: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         manager = metadata.kv_cache_manager
         if not isinstance(manager, MixedPrecisionKVCacheManager):
             return None
@@ -189,7 +202,14 @@ class DSATrtllmAttention(TrtllmAttention):
         valid = (positions >= 0) & (blocks < width) & (pages >= 0)
         return pool, pages, positions.long() % manager.tokens_per_block, valid
 
-    def _store_high_precision_kv(self, latent_cache, metadata, *, is_generation, apply_rope=False):
+    def _store_high_precision_kv(
+        self,
+        latent_cache: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        *,
+        is_generation: bool,
+        apply_rope: bool = False,
+    ) -> None:
         if not isinstance(metadata.kv_cache_manager, MixedPrecisionKVCacheManager):
             return
         start = metadata.num_ctx_tokens if is_generation else 0
@@ -228,13 +248,27 @@ class DSATrtllmAttention(TrtllmAttention):
         values = encode_high_precision_kv(latent_cache[valid], pool.dtype).unsqueeze(1)
         pool.view(torch.uint8)[pages[valid], offsets[valid]] = values.view(torch.uint8)
 
-    def mla_rope_generation(self, fused_q, q_pe, latent_cache, metadata, *args, **kwargs):
+    def mla_rope_generation(
+        self,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
+        latent_cache: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        *args,
+        **kwargs,
+    ) -> None:
         super().mla_rope_generation(fused_q, q_pe, latent_cache, metadata, *args, **kwargs)
         self._store_high_precision_kv(latent_cache, metadata, is_generation=True, apply_rope=True)
 
     def _overlay_high_precision_kv(
-        self, metadata, topk_indices, compact_indices, scratch, *, is_generation
-    ):
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        topk_indices: torch.Tensor,
+        compact_indices: torch.Tensor,
+        scratch: torch.Tensor,
+        *,
+        is_generation: bool,
+    ) -> None:
         start = metadata.num_ctx_tokens if is_generation else 0
         end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
         rows = self._high_precision_rows(
