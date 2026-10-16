@@ -5,7 +5,7 @@
 `MultimodalEncoderItemMetadata` describes request items. `MultimodalParams`
 references processed payloads and the `MultimodalRuntimeData` view for the
 current forward. `MultimodalInput` carries the executor boundary representation.
-`MultimodalFieldLayout` describes item axes and packed ranges within payloads.
+`MultimodalItemPartition` describes item axes and packed ranges within payloads.
 Processor registration and encoder execution live outside this module.
 """
 
@@ -34,8 +34,8 @@ MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
 
 
-class MultimodalFieldLayout(NamedTuple):
-    """How items occupy one processed payload field.
+class MultimodalItemPartition(NamedTuple):
+    """How one processed input is partitioned into multimodal items.
 
     ``item_axis`` identifies the item axis of a batched tensor, or is ``None``
     for a value shared by every item. Lists and tuples have item axis zero.
@@ -70,6 +70,8 @@ class MultimodalFieldLayout(NamedTuple):
                     "Packed field size does not match its item lengths")
             if not indices:
                 return value.narrow(self.item_axis, 0, 0)
+            item_range = range(len(self.item_lengths))
+            indices = [item_range[i] for i in indices]
             if indices == list(range(indices[0], indices[0] + len(indices))):
                 start = offsets[indices[0]]
                 if self.item_axis == 0:
@@ -94,7 +96,7 @@ class MultimodalFieldLayout(NamedTuple):
 
 def select_multimodal_fields(
     modality_data: dict[str, Any],
-    field_layouts: dict[str, MultimodalFieldLayout],
+    item_partitions: dict[str, MultimodalItemPartition],
     item_indices: Sequence[int],
 ) -> dict[str, Any]:
     """Select declared fields; unlisted and shared fields pass through.
@@ -104,9 +106,9 @@ def select_multimodal_fields(
     item count never changes a shared field's meaning.
     """
     selected = dict(modality_data)
-    for name, layout in field_layouts.items():
+    for name, partition in item_partitions.items():
         if name in modality_data:
-            selected[name] = layout.select(modality_data[name], item_indices)
+            selected[name] = partition.select(modality_data[name], item_indices)
     return selected
 
 
