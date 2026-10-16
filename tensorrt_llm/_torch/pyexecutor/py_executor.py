@@ -404,6 +404,41 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+@dataclasses.dataclass
+class PyExecutorResources:
+    """Resources and capacities replaced between profiling and serving.
+
+    The executor owns their execution lifetime. Model engines and weights
+    remain owned by the executor across resource transitions.
+    """
+
+    resource_manager: ResourceManager
+    scheduler: RequestScheduler
+    kv_cache_transceiver: Optional[KvCacheTransceiver]
+    peft_cache_config: Optional[PeftCacheConfig]
+    virtual_memory_pools: Optional[dict]
+    kv_connector_manager: Optional[KvCacheConnectorManager]
+    dwdp_manager: Optional[DwdpManager]
+    max_seq_len: Optional[int]
+    max_num_sequences: int
+    waiting_queue_policy: WaitingQueuePolicy
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExecutorExecutionConfig:
+    disable_overlap_scheduler: bool
+    enable_early_first_token_response: bool
+    max_input_len: int
+    max_batch_size: int
+    max_beam_width: int
+    max_draft_len: int
+    max_total_draft_tokens: int
+    garbage_collection_gen0_threshold: Optional[int]
+    resource_governor_queue: object
+    hang_detection_timeout: Optional[int]
+    enable_kv_pool_rebalance: bool
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -470,16 +505,6 @@ class PyExecutor:
 
         self.peft_cache_config = peft_cache_config
 
-        self.iter_counter = 0
-        # profile config
-        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
-            PROFILE_START_STOP_ENV_VAR_NAME)
-        # Convert to mutable sets so start_profile()/stop_profile() can
-        # .add() runtime-configured iteration indices.
-        # _load_iteration_indexes returns frozensets.
-        self.profile_start_iters = set(_env_start_iters)
-        self.profile_stop_iters = set(_env_stop_iters)
-
         # Runtime-configurable profiling state. Populated by start_profile()
         # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
         # or API calls. When these are None/False the _profiler() context
@@ -519,9 +544,88 @@ class PyExecutor:
         # the manager operates on those fields via a weakref.
         self._profile_manager = PyExecutorProfileManager(self)
 
+        self.model_engine = model_engine
+        self.sampler = sampler
+        self.drafter = drafter
+        self.guided_decoder = guided_decoder
+        self.dist = dist
+        self._execution_config = _ExecutorExecutionConfig(
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            enable_early_first_token_response=enable_early_first_token_response,
+            max_input_len=max_input_len,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            resource_governor_queue=resource_governor_queue,
+            hang_detection_timeout=hang_detection_timeout,
+            enable_kv_pool_rebalance=enable_kv_pool_rebalance,
+        )
+        self._resources_released = False
+        self._closed = False
+        self._initialize_execution(
+            PyExecutorResources(
+                resource_manager=resource_manager,
+                scheduler=scheduler,
+                kv_cache_transceiver=kv_cache_transceiver,
+                peft_cache_config=peft_cache_config,
+                virtual_memory_pools=virtual_memory_pools,
+                kv_connector_manager=kv_connector_manager,
+                dwdp_manager=dwdp_manager,
+                max_seq_len=max_seq_len,
+                max_num_sequences=max_num_sequences,
+                waiting_queue_policy=waiting_queue_policy,
+            ))
+        if start_worker:
+            self.start_worker()
+
+    def _initialize_execution(self, resources: PyExecutorResources) -> None:
+        """Initialize a stopped execution phase and warm its bound resources."""
+        model_engine = self.model_engine
+        sampler = self.sampler
+        drafter = self.drafter
+        guided_decoder = self.guided_decoder
+        dist = self.dist
+        resource_manager = resources.resource_manager
+        scheduler = resources.scheduler
+        kv_cache_transceiver = resources.kv_cache_transceiver
+        peft_cache_config = resources.peft_cache_config
+        virtual_memory_pools = resources.virtual_memory_pools
+        kv_connector_manager = resources.kv_connector_manager
+        dwdp_manager = resources.dwdp_manager
+        max_seq_len = resources.max_seq_len
+        max_num_sequences = resources.max_num_sequences
+        waiting_queue_policy = resources.waiting_queue_policy
+        disable_overlap_scheduler = self._execution_config.disable_overlap_scheduler
+        enable_early_first_token_response = self._execution_config.enable_early_first_token_response
+        max_input_len = self._execution_config.max_input_len
+        max_batch_size = self._execution_config.max_batch_size
+        max_beam_width = self._execution_config.max_beam_width
+        max_draft_len = self._execution_config.max_draft_len
+        max_total_draft_tokens = self._execution_config.max_total_draft_tokens
+        garbage_collection_gen0_threshold = self._execution_config.garbage_collection_gen0_threshold
+        resource_governor_queue = self._execution_config.resource_governor_queue
+        hang_detection_timeout = self._execution_config.hang_detection_timeout
+        enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
+        self.peft_cache_config = peft_cache_config
+        self.iter_counter = 0
+        # profile config
+        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
+            PROFILE_START_STOP_ENV_VAR_NAME)
+        # Convert to mutable sets so start_profile()/stop_profile() can
+        # .add() runtime-configured iteration indices.
+        # _load_iteration_indexes returns frozensets.
+        self.profile_start_iters = set(_env_start_iters)
+        self.profile_stop_iters = set(_env_stop_iters)
+
+        self._metrics = {}
+        self._disagg_coordinator = None
+        self._ctx_mla_kv_len_cap = "unset"
         # related modules
         self.resource_manager = resource_manager
-        self.model_engine = model_engine
+        self.kv_connector_manager = kv_connector_manager
+        self.dwdp_manager = dwdp_manager
         self._enable_adp_dummy_fixes = getattr(model_engine,
                                                "_enable_adp_dummy_fixes", False)
         self._enable_scheduler_aware_adp_dummy = getattr(
@@ -538,8 +642,6 @@ class PyExecutor:
         # the hang-detector status provider are initialized.
         self.kv_cache_transceiver = kv_cache_transceiver
         self.enable_attention_dp = model_engine.enable_attention_dp
-        self.dist = dist
-        self.sampler = sampler
         # Opt-in in-graph sampling: let the engine sample inside its forward CUDA
         # graph. The sampler resolves each batch to a tier and stages the
         # buffers the in-graph step reads; the engine keys its graph cache on
@@ -553,10 +655,8 @@ class PyExecutor:
                 sampler.stage_in_graph_sampling)
             model_engine.register_sample_in_graph_callable(
                 self._sample_in_graph)
-        self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
-        self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
@@ -1153,16 +1253,29 @@ class PyExecutor:
         # and race on the shared communicator, consuming the wrong ACKs.
         self._sleep_wakeup_lock = threading.Lock()
 
-        self.kv_connector_manager = kv_connector_manager
-
         self._maybe_init_kv_connector_manager()
-
-        self.dwdp_manager = dwdp_manager
 
         self._validate_moe_a2a_checkpoint_support()
 
-        if start_worker:
-            self.start_worker()
+    def rebind_resources(self, resources: PyExecutorResources) -> None:
+        """Bind fresh resources after release_resources(), without starting workers.
+
+        Call collectively on the startup thread. The previous phase must have
+        exited cleanly; failed and finally closed executors cannot be reused.
+        Warmup captures graphs against the new resource addresses.
+        """
+        if self._closed or not self._resources_released:
+            raise RuntimeError(
+                "Executor resources must be released before rebinding")
+        if self._event_loop_error is not None or self._fatal_error is not None:
+            raise RuntimeError(
+                "Cannot rebind an executor after an execution failure")
+        self._resources_released = False
+        try:
+            self._initialize_execution(resources)
+        except BaseException:
+            self.shutdown()
+            raise
 
     @property
     def metrics(self) -> dict[str, float | dict[str, float]]:
@@ -1954,23 +2067,81 @@ class PyExecutor:
             self._mpi_progress_thread = None
             self._mpi_progress_thread_exit_hook = None
 
-    def shutdown(self):
+    def release_resources(self) -> None:
+        """Stop a profiling phase and detach resources before cache replacement.
+
+        Call collectively after consuming profiling responses. Graph destruction
+        precedes workspace release, and transfer registrations precede cache
+        release. Model engines, weights and the execution stream remain valid.
         """
-        Signals the server to shutdown.
-        """
+        if self._closed or self._resources_released:
+            raise RuntimeError("Executor resources are already released")
+        if not self._release_execution_resources():
+            raise RuntimeError(
+                "Cannot release resources after an executor hang")
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None:
+                engine.attn_metadata = None
+        self.resource_manager = None
+        self.scheduler = None
+        self.kv_cache_manager = None
+        self.draft_kv_cache_manager = None
+        self.kv_cache_transceiver = None
+        self.kv_connector_manager = None
+        self.async_transfer_manager = None
+        self.adp_router = None
+        self._kv_load_tracker = None
+        self.hang_detector = None
+        self._sleep_wakeup_comm = None
+        self._sleep_wakeup_listener_thread = None
+        self.request_broadcaster = None
+        self._disagg_coordinator = None
+        self._disagg_pp_termination_handler = None
+        self.previous_batch = None
+        self.micro_batches = []
+        self.pending_encoder_steps.clear()
+        self.active_requests.clear()
+        self.responses.clear()
+        self.result_wait_queues.clear()
+        self._pending_transfer_responses.clear()
+        self._pending_response_terminations.clear()
+        self.request_accumulated.clear()
+        self.control_requests.clear()
+        self.waiting_queue = None
+        self._pending_adp_dummy_request = None
+        if self.dist.pp_size > 1:
+            self.executed_batch_queue = None
+            self.executed_batch_response_queue = None
+        self._resources_released = True
+
+    def shutdown(self) -> None:
+        """Finally close the executor; closed executors cannot be rebound."""
+        if self._closed:
+            return
+        if not self._resources_released:
+            if not self._release_execution_resources():
+                return
+        self._closed = True
+        del self.model_engine
+        if self.draft_model_engine is not None:
+            del self.draft_model_engine
+
+    def _release_execution_resources(self) -> bool:
+        """Stop execution and release GPU resources; retain model ownership."""
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
             self._openengine_node_server = None
-        self.executor_request_queue.enqueue_shutdown_request()
-        self.shutdown_event.wait()
+        if self.worker_started:
+            self.executor_request_queue.enqueue_shutdown_request()
+            self.shutdown_event.wait()
         # Tear down any profile window an HTTP caller left open (i.e.
         # /start_profile without a matching /stop_profile).  Runs before the
         # hang-detector early return below so the leaked window is closed on
         # every shutdown path.  A no-op when the executor loop already
         # unwound its own profiling state.
         self._profile_manager.cleanup()
-        if self.hang_detector.detected():
+        if self.hang_detector is not None and self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
             # this worker will be asked to shutdown immediately.
@@ -1982,11 +2153,12 @@ class PyExecutor:
             # already in flight is not interrupted.
             self._pp_mpi_progress_stop.set()
             self._stop_mpi_progress_thread()
-            return
-        self.worker_thread.join()
+            return False
+        if self.worker_started:
+            self.worker_thread.join()
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.shutdown()
-        if self.dist.pp_size > 1:
+        if self.dist.pp_size > 1 and self.worker_started:
             # The worker thread has exited, so no PP traffic needs progress.
             self._pp_mpi_progress_stop.set()
             self.executed_batch_queue.put(None)
@@ -2006,6 +2178,11 @@ class PyExecutor:
             encoder_launch_executor.shutdown(wait=True)
             self.encoder_launch_executor = None
 
+        # Stop the sampler's async worker, if it was used
+        if (isinstance(self.sampler, AsyncWorkerMixin)
+                and self.sampler.async_worker_enabled()):
+            self.sampler.async_worker_stop()
+
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
@@ -2021,33 +2198,20 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        for manager in self.resource_manager.resource_managers.values():
-            if manager:
-                manager.shutdown()
-        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
-        # also invoked mid-init by configure_kv_cache_capacity() in
-        # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
-        # shutdown() and then immediately reads model_engine.model.model_config
-        # to compute kv_cache_max_memory. cleanup() would set
-        # model_engine.model = None, breaking that read with
-        # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
-        del self.model_engine
-        if self.draft_model_engine is not None:
-            del self.draft_model_engine
+        if self.kv_cache_transceiver is not None:
+            self.kv_cache_transceiver.shutdown()
+        if self.resource_manager is not None:
+            for manager in self.resource_manager.resource_managers.values():
+                if manager:
+                    manager.shutdown()
         if self.virtual_memory_pools is not None:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
                 del self.virtual_memory_pools[key]
-        # Stop the sampler's async worker, if it was used
-        if (isinstance(self.sampler, AsyncWorkerMixin)
-                and self.sampler.async_worker_enabled()):
-            self.sampler.async_worker_stop()
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        return True
 
     def can_enqueue_requests(self) -> bool:
         """
