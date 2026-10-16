@@ -689,6 +689,7 @@ class GenerationResultBase:
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
+                    multimodal_input_layout=None,
                 )
 
             finish_reasons = response_result.finish_reasons
