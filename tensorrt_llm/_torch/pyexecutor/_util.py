@@ -3286,7 +3286,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs.update(
             first_n=kv_cache_config.first_n,
             last_n=kv_cache_config.last_n,
-            high_low_pool_ratio=kv_cache_config.high_low_pool_ratio,
+            high_low_pool_ratio=None
+            if estimating_kv_cache else kv_cache_config.high_low_pool_ratio,
         )
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
