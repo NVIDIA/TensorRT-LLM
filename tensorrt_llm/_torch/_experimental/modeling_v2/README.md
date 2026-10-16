@@ -194,7 +194,10 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**Every entry is certified on sm_103, and both targets are gated there.**
+**The 19 upstream entries are certified on sm_103. Kimi K3's sm_100
+operation receipts remain in its adjacent records; its generic-operation
+regressions now exercise the relocated entries. Certification is per
+architecture, not implied by a wrapper's location.**
 
 The 19 entries -- 8 shared, 8 owned by deepseek, 3 by gpt-oss -- each drive
 their cells through `__call__` and `reference` in pre-merge CI, plus the two
@@ -209,9 +212,10 @@ widening a tolerance, and each is written up in its own entry:
   `mla_rope_append_paged_kv_assign_q`). Parameters were renamed and added. The
   wrappers now mirror their schemas argument for argument, so the next drift
   fails loudly rather than shifting a positional list silently.
-* **The MoE FC1 epilogue changed block-scale recipe**, bit-exactly:
-  `floor(log2(amax))-8` on sm_100, `ceil(log2(amax/448))` on sm_103. The
-  reference is architecture-keyed and each arch refutes the other's recipe.
+* **The MoE FC1 epilogue's block-scale recipe is a property of the cubin**,
+  bit-exactly: `ceil(log2(amax/448))` or `floor(log2(amax))-8`. sm_100 and
+  sm_103 both use the first. The reference is architecture-keyed, and the test
+  refutes the recipe not in force.
 * **torch 2.12 made fp32 matmul default to TF32**, so `cublas_mm`'s *reference*
   was the imprecise side; the op is bit-identical to a TF32-disabled product.
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted

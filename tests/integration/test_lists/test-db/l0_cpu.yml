@@ -44,6 +44,9 @@ l0_cpu:
   # contributes only the marked files under attention/, in these sub-trees or elsewhere.
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
+  # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_decode_view.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_launch.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
