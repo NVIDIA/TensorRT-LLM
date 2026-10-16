@@ -1077,20 +1077,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # On the non-speculative path the host kv_lens snapshot bounds
             # every block-table access, so the staged/H2D width can be capped
             # at the batch's maximum instead of max_seq_len's worth of
-            # columns. Speculative decoding must stage the full width:
-            # draft/tree sub-steps and the overlap scheduler advance
-            # kv_lens_cuda on device past the host snapshot, and their
-            # kernels dereference block columns a host-derived cap would
-            # leave unstaged (uninitialized in this buffer).
+            # columns. Under speculative decoding the overlap scheduler and
+            # the draft sub-steps advance kv_lens_cuda on device past the host
+            # snapshot, and their kernels dereference block columns a
+            # host-derived cap would leave unstaged (uninitialized in this
+            # buffer). With a linear draft each of the two advances is less
+            # than one verification window of 1 + max_total_draft_tokens
+            # tokens, so the cap keeps two windows of room. Tree drafts and
+            # helix stage the full width.
             spec_active = (self.draft_kv_cache_manager is not None
                            or self.is_spec_decoding_enabled
                            or bool(self.kv_cache_params.num_extra_kv_tokens) or
                            (self.runtime_features is not None and
                             self.runtime_features.has_speculative_draft_tokens))
             max_blocks = None
-            if not spec_active and self.kv_cache_manager.tokens_per_block:
-                max_blocks = ceil_div(max_kv_len,
-                                      self.kv_cache_manager.tokens_per_block)
+            tokens_per_block = self.kv_cache_manager.tokens_per_block
+            if tokens_per_block and not spec_active:
+                max_blocks = ceil_div(max_kv_len, tokens_per_block)
+            elif (tokens_per_block and self.max_total_draft_tokens is not None
+                  and not self.is_spec_dec_tree
+                  and not self.is_spec_dec_dynamic_tree
+                  and not self.enable_helix):
+                max_blocks = ceil_div(
+                    max_kv_len + 2 * (1 + self.max_total_draft_tokens),
+                    tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets,
                 self.request_ids,

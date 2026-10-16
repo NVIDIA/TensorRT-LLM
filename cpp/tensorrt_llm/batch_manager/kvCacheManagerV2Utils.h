@@ -108,7 +108,9 @@ CUresult copyHostToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks
 CUresult copyDeviceToHost(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 
+//! Copies the block offsets of the batch rows. A non-negative maxNumBlocks bounds the copied columns
+//! (rounded up to a multiple of four); a negative one copies whole rows.
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
-    ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
+    ITensor const& indexScales, ITensor const& kvOffset, SizeType32 maxNumBlocks, CUstream stream) noexcept;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

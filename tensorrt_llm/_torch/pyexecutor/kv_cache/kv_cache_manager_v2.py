@@ -6536,8 +6536,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Offloaded sparse history requires Batch metadata and sparse fetch; "
                 "dense attention offsets cannot address host slots"
             )
-        # max_blocks is accepted for signature parity with KVCacheManager; the
-        # device-side copy op here already scales with allocated blocks only.
         assert beam_width <= self.max_copy_beam_width
 
         # Cross KV is request-scoped: generation beams share the encoder K/V
@@ -6556,6 +6554,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        # As in KVCacheManager, max_blocks bounds the copied block columns of
+        # each row; the columns past it keep their previous contents. Helix
+        # rows are copied whole.
+        bound = (
+            {"max_num_blocks": max_blocks}
+            if max_blocks is not None and not self._has_cp_helix
+            else {}
+        )
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
@@ -6563,6 +6569,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales,
             self.kv_offset,
             self._stream.cuda_stream,
+            **bound,
         )
 
     @staticmethod

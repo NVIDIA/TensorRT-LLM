@@ -184,19 +184,20 @@ CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, 
     return launchBatchedCopy(false, tasks, numBytes, stream);
 }
 
-// dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]
-// dst_tensor[:, :num_seqs, 1] = dst_tensor[:, :num_seqs, 0] + 1
+// dst_tensor[:, :num_seqs, 0, :numBlocksToCopy] = src_tensor[:, copy_idx, 0, :numBlocksToCopy]
+// dst_tensor[:, :num_seqs, 1, :numBlocksToCopy] = dst_tensor[:, :num_seqs, 0, :numBlocksToCopy] + 1
+// Rows are numBlocksPerSeq long in both tensors; the columns past numBlocksToCopy are not written.
 __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
     SizeType32* __restrict__ dstPtr, SizeType32 const srcMaxNumSequences, SizeType32 const dstMaxNumSequences,
-    SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex, SizeType32 const* __restrict__ indexScales,
-    SizeType32 const* __restrict__ kvOffset)
+    SizeType32 numBlocksPerSeq, SizeType32 numBlocksToCopy, SizeType32 const* __restrict__ copyIndex,
+    SizeType32 const* __restrict__ indexScales, SizeType32 const* __restrict__ kvOffset)
 {
     constexpr uint32_t kvFactor = 2;
     constexpr auto elemPerAccess = sizeof(PackedInt) / sizeof(SizeType32);
 
     __shared__ PackedInt data[copyBlocknbBufs][copyBlockCtaSize];
 
-    auto const iterPerSeq = divUp(numBlocksPerSeq * sizeof(SizeType32), sizeof(PackedInt) * copyBlockCtaSize);
+    auto const iterPerSeq = divUp(numBlocksToCopy * sizeof(SizeType32), sizeof(PackedInt) * copyBlockCtaSize);
     auto const tid = threadIdx.x;
     auto const poolIdx = blockIdx.x;
     auto const seqIdx = blockIdx.y;
@@ -205,7 +206,7 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
     uint32_t const dstIdxKBeg = tid * elemPerAccess + (poolIdx * dstMaxNumSequences + seqIdx) * seqDimStride;
     uint32_t const dstIdxVBeg = dstIdxKBeg + numBlocksPerSeq;
 
-    uint32_t const srcIdxEnd = (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride + numBlocksPerSeq;
+    uint32_t const srcIdxEnd = (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride + numBlocksToCopy;
 
     for (uint32_t i = 0; i < iterPerSeq + copyBlocknbBufs; i++)
     {
@@ -250,7 +251,7 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
 
 // Host-side launcher
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
-    ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept
+    ITensor const& indexScales, ITensor const& kvOffset, SizeType32 maxNumBlocks, CUstream stream) noexcept
 {
     using namespace tensorrt_llm::runtime;
 
@@ -282,11 +283,22 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
         "Not implemented case: numBlocksPerSeq * sizeof(SizeType32) = %zu must be a multiple of %zu.",
         static_cast<size_t>(numBlocksPerSeq * sizeof(SizeType32)), static_cast<size_t>(sizeof(PackedInt)));
 
+    // A negative maxNumBlocks copies whole rows. Otherwise the copy covers the first maxNumBlocks
+    // columns, rounded up to whole PackedInt accesses, which stay inside the row.
+    SizeType32 numBlocksToCopy = numBlocksPerSeq;
+    if (maxNumBlocks >= 0)
+    {
+        constexpr SizeType32 blocksPerAccess = sizeof(PackedInt) / sizeof(SizeType32);
+        SizeType32 const roundedBlocks
+            = (std::max(maxNumBlocks, SizeType32{1}) + blocksPerAccess - 1) / blocksPerAccess * blocksPerAccess;
+        numBlocksToCopy = std::min(numBlocksPerSeq, roundedBlocks);
+    }
+
     dim3 gridDim(numPools, numSeqs, 1);
     dim3 blockDim(copyBlockCtaSize);
 
     copyBatchBlockOffsetsToDeviceKernel<<<gridDim, blockDim, 0, stream>>>(srcPtr, dstPtr, srcMaxNumSequences,
-        dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr, indexScalesPtr, kvOffsetPtr);
+        dstMaxNumSequences, numBlocksPerSeq, numBlocksToCopy, copyIndexPtr, indexScalesPtr, kvOffsetPtr);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

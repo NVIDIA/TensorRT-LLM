@@ -11,11 +11,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional, Tuple
 
 import torch
+from torch.utils.weak import WeakIdKeyDictionary
 
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.host_staging import copy_if_changed
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -282,6 +284,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._radix_rows_per_sequence = 1
         # Set only inside defer_cuda_graph_decode_outputs().
         self._defer_decode_outputs = False
+        # Per INDEX_KEY host table, an object replaced whenever the table's
+        # contents change; device uploads of the table carry it as a token.
+        self._index_key_host_versions = WeakIdKeyDictionary()
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -1499,9 +1504,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         page_indices = pool_indices * cache_manager.indexer_k_cache_page_scale
         num_blocks = page_indices.shape[1]
-        self.host_indexer_k_cache_block_offsets[: self.num_seqs, :num_blocks].copy_(page_indices)
-        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
+        host_offsets = self.host_indexer_k_cache_block_offsets
+        host_rows = host_offsets[: self.num_seqs, :num_blocks]
+        version = self._index_key_host_versions.get(host_offsets)
+        if version is None or not torch.equal(host_rows, page_indices):
+            host_rows.copy_(page_indices)
+            version = self._index_key_host_versions[host_offsets] = object()
+        # Rows the device already took from this version of the host table
+        # are not uploaded again.
+        copy_if_changed(
+            self.indexer_k_cache_block_offsets[: self.num_seqs],
+            host_offsets[: self.num_seqs],
+            token=version,
         )
         # The batch rows hold non-negative pool slots. Sanitize the
         # graph-padding rows after them, which may be stale after cache
@@ -2072,10 +2086,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         host_block_table.masked_fill_(
             pad_cols.unsqueeze(0) >= num_blocks_per_seq[: self.num_seqs].unsqueeze(1), -1
         )
-        # Copy to GPU
-        self.block_table[: self.num_seqs, :max_blocks_used].copy_(
-            host_block_table, non_blocking=True
-        )
+        # Copy to GPU unless the device rows already hold this table.
+        copy_if_changed(self.block_table[: self.num_seqs, :max_blocks_used], host_block_table)
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor, dense_topk_indices: bool = True):
         """Decide which requests skip the indexer.

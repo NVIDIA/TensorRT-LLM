@@ -138,7 +138,7 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
     module.def(
         "copy_batch_block_offsets_to_device",
         [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales, at::Tensor kvOffset,
-            uintptr_t stream)
+            uintptr_t stream, SizeType32 maxNumBlocks)
         {
             auto _input = from_torch(input);
             auto _output = from_torch(output);
@@ -151,10 +151,11 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
             TLLM_CHECK_WITH_INFO(_indexScales.has_value(), "Invalid index scales tensor.");
             TLLM_CHECK_WITH_INFO(_kvOffset.has_value(), "Invalid kv offset tensor.");
             copyBatchBlockOffsetsToDevice(*(_input.value()), *(_output.value()), *(_copyIndex.value()),
-                *(_indexScales.value()), *(_kvOffset.value()), reinterpret_cast<CUstream>(stream));
+                *(_indexScales.value()), *(_kvOffset.value()), maxNumBlocks, reinterpret_cast<CUstream>(stream));
         },
         nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"), nb::arg("kv_offset"),
-        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(), "Copy batch block indices to device");
+        nb::arg("stream"), nb::arg("max_num_blocks") = -1, nb::call_guard<nb::gil_scoped_release>(),
+        "Copy batch block indices to device; a non-negative max_num_blocks bounds the copied columns");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
