@@ -670,8 +670,8 @@ class DecodeTarget:
         eh_proj output x. The layer runs no indexer. Its rows attend to ``pool_rows``, draft
         step 0's selection (``join_selection``, on the first such step, joins the side stream
         that made it); with a context short enough that the built-in metadata skips the
-        indexer, to every position up to their own, the selection that metadata lists (rebuilt
-        for this step by ``update_for_spec_dec``). Returns the MTP layer's output rows.
+        indexer, to every position up to their own, the dense selection that metadata lists
+        (refreshed for this step by the loop). Returns the MTP layer's output rows.
         """
         draft = self._draft
         layer = draft.layer
@@ -742,9 +742,8 @@ class DecodeTarget:
         the next step's eh_proj output x and ``input_layernorm(x)``, and its positions:
         ``positions`` (at ``gather_ids`` on draft step 0) plus one. On draft step 0
         ``seq_lens`` becomes 1 and ``kv_lens`` drops the rejected drafts
-        (``rewind_accepted``); afterwards ``kv_lens`` grows by one. The DSA decode metadata
-        is left to ``update_for_spec_dec``. Returns ``((normed, x), positions)`` for the next
-        step.
+        (``rewind_accepted``); afterwards ``kv_lens`` grows by one. Returns
+        ``((normed, x), positions)`` for the next step.
         """
         draft = self._draft
         norm = draft.layer.input_layernorm
@@ -1501,10 +1500,9 @@ class MTPDraftWorker(MTPEagleWorker):
     built-in loop.
 
     The loop keeps the built-in loop's attention-metadata handling: the MTP index-share flags,
-    the switch to one row per request after draft step 0, the per-step
-    ``update_for_spec_dec`` that rebuilds the DSA decode metadata from the sequence and KV
-    lengths the draft-step kernels write, and the cleanup. The draft tokens and the
-    next-new-tokens rows come from those kernels.
+    the switch to one row per request after draft step 0, and the cleanup. The draft-step
+    kernels advance the sequence and KV lengths in place, and the draft tokens and the
+    next-new-tokens rows come from them.
     """
 
     def __init__(
@@ -1683,9 +1681,12 @@ class MTPDraftWorker(MTPEagleWorker):
     ) -> torch.Tensor:
         """The draft loop on the decode target's kernels: the draft tokens [batch, draft_len].
 
-        After each step's kernel, which writes the next step's sequence and KV lengths,
-        ``update_for_spec_dec`` rebuilds the metadata derived from them, as in the built-in
-        loop; the host side of draft step 0's switch to one row per request comes before it.
+        Each step's last kernel writes the next step's sequence and KV lengths in place. The
+        steps after the first run no indexer and read nothing else of the DSA decode metadata,
+        so the built-in loop's per-step rebuild of it (``update_for_spec_dec``) is left out;
+        with a context short enough that the metadata skips the indexer, only the next step's
+        dense selection is refreshed from the new lengths. The host side of draft step 0's
+        switch to one row per request comes before that.
         """
         draft_len = spec_metadata.runtime_draft_len
         # The accepted tokens' rows: draft step 0's input ids (prepare_1st_drafter_inputs).
@@ -1757,7 +1758,10 @@ class MTPDraftWorker(MTPEagleWorker):
                         kv_lens,
                         rewind_accepted,
                     )
-                attn_metadata.update_for_spec_dec()
+                if not last and attn_metadata.skip_indexer_for_gen_reqs:
+                    attn_metadata.prepare_dense_topk_indices(
+                        attn_metadata.kv_lens_cuda, device=True
+                    )
                 if i == 0:
                     attn_metadata.use_spec_decoding = False
         self._drafted_rows = (draft_tokens, next_new_tokens)
