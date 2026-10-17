@@ -54,6 +54,9 @@ MODELING_V2_ROUTERS = {
     # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
     # config loader's composite branch writes the same name back.
     "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
+    # Muse Spark Open publishes ``MuseSparkForConditionalGeneration``; the config
+    # loader's open-format branch writes this name in its place.
+    "MuseSparkOpenOmniForCausalLM": "models.musespark_open.routing",
 }
 
 
