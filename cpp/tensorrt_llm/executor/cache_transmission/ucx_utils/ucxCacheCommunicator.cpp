@@ -48,6 +48,8 @@ using tensorrt_llm::pg_utils::PgHelper;
 namespace tensorrt_llm::executor::kv_cache
 {
 
+constexpr int64_t kMaxUcxCmMessageBytes = 64 * 1024;
+
 class UcxCmMessage
 {
 public:
@@ -340,6 +342,7 @@ UcxConnectionManager::UcxConnectionManager()
 
         mZmqRepSocket = zmq::socket_t(mZmqContext, zmq::socket_type::rep);
         mZmqRepSocket.set(zmq::sockopt::sndhwm, 1000);
+        mZmqRepSocket.set(zmq::sockopt::maxmsgsize, kMaxUcxCmMessageBytes);
         std::string localIp = getLocalIp(mRank);
         if (localIp.find(':') != std::string::npos)
         {
@@ -438,7 +441,22 @@ UcxConnectionManager::UcxConnectionManager()
                     TLLM_CHECK_WITH_INFO(ret, "mZmqRepSocket.recv failed");
                     std::string recvMessage(static_cast<char*>(message.data()), message.size());
                     std::istringstream is(recvMessage);
-                    UcxCmMessage ucxCmessage = UcxCmMessage::deserialize(is);
+                    UcxCmMessage ucxCmessage(UcxCmMessage::MessageType::STOP, std::nullopt);
+                    try
+                    {
+                        ucxCmessage = UcxCmMessage::deserialize(is);
+                        TLLM_CHECK_WITH_INFO(ucxCmessage.mType == UcxCmMessage::MessageType::STOP
+                                || (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS
+                                    && ucxCmessage.mWorkerAddress.has_value()),
+                            "Invalid UCX connection message");
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_WARNING("Dropping malformed UCX connection message: %s", e.what());
+                        // REP sockets must reply before receiving the next message.
+                        mZmqRepSocket.send(zmq::message_t{}, zmq::send_flags::none);
+                        continue;
+                    }
 
                     if (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS)
                     {
@@ -488,6 +506,7 @@ UcxConnectionManager::~UcxConnectionManager()
     {
         zmq::socket_t socket(mZmqContext, zmq::socket_type::req);
         socket.set(zmq::sockopt::ipv6, 1);
+        socket.set(zmq::sockopt::maxmsgsize, kMaxUcxCmMessageBytes);
         socket.connect(mZmqRepEndpoint);
         UcxCmMessage stopMessage(UcxCmMessage::MessageType::STOP, std::nullopt);
         std::ostringstream oStream;
@@ -569,6 +588,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             // same time.
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
             reqSocket.set(zmq::sockopt::ipv6, 1);
+            reqSocket.set(zmq::sockopt::maxmsgsize, kMaxUcxCmMessageBytes);
             reqSocket.connect(build_zmq_endpoint(ip, port));
             UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
             std::ostringstream oStream;

@@ -75,6 +75,8 @@ auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectio
 namespace
 {
 
+constexpr size_t kMaxSerializedNotificationBytes = 64ULL * 1024 * 1024;
+
 bool isValidBufferKind(uint8_t kind)
 {
     switch (static_cast<batch_manager::BufferKind>(kind))
@@ -535,8 +537,21 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
             auto notifIt = notifs.begin();
             while (notifIt != notifs.end())
             {
-                std::stringstream ss(*notifIt);
-                NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
+                std::optional<NotificationInfo> notificationStorage;
+                try
+                {
+                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedNotificationBytes,
+                        "Serialized agent notification exceeds the maximum size");
+                    std::stringstream ss(*notifIt);
+                    notificationStorage.emplace(NotificationInfo::deserialize(ss));
+                }
+                catch (std::exception const& e)
+                {
+                    TLLM_LOG_WARNING("Dropping malformed agent notification: %s", e.what());
+                    notifIt = notifs.erase(notifIt);
+                    continue;
+                }
+                auto const& notificationInfo = *notificationStorage;
                 bool erase = false;
                 if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
                 {
@@ -845,8 +860,21 @@ bool AgentConnectionManager::waitForNotification(
             auto notifIt = notifs.begin();
             while (notifIt != notifs.end())
             {
-                std::stringstream ss(*notifIt);
-                NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
+                std::optional<NotificationInfo> notificationStorage;
+                try
+                {
+                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedNotificationBytes,
+                        "Serialized agent notification exceeds the maximum size");
+                    std::stringstream ss(*notifIt);
+                    notificationStorage.emplace(NotificationInfo::deserialize(ss));
+                }
+                catch (std::exception const& e)
+                {
+                    TLLM_LOG_WARNING("Dropping malformed agent notification: %s", e.what());
+                    notifIt = notifs.erase(notifIt);
+                    continue;
+                }
+                auto const& notificationInfo = *notificationStorage;
                 bool erase = false;
                 if constexpr (std::is_same_v<NotificationType, NotificationSyncInfo>)
                 {
