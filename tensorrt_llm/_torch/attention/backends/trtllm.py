@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
     from ...model_config import ModelConfig
+    from ...pyexecutor.runtime_hooks import StepInputStager
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .sparse.dsa.metadata import TokenMajorGenView
@@ -123,6 +124,8 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
+    # A step-input stager while it records this metadata's writes, else None.
+    step_input_stager: ClassVar[Optional["StepInputStager"]] = None
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
@@ -997,8 +1000,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        stager = self.step_input_stager
+        if stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            stager.copy(self.prompt_lens_cuda[:self.num_seqs],
+                        self.prompt_lens_cpu[:self.num_seqs])
+        else:
+            self.prompt_lens_cuda[:self.num_seqs].copy_(
+                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1051,9 +1060,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        if stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            stager.copy(self.kv_lens_cuda[:self.num_seqs],
+                        kv_lens[:self.num_seqs])
+        else:
+            self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
+                kv_lens[:self.num_seqs]),
+                                                    non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1420,23 +1434,42 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                      dtype=torch.int64,
                      out=self.host_ctx_cached_token_indptr[1:self.num_contexts +
                                                            1])
-        self.ctx_cached_token_indptr[:self.num_contexts + 1].copy_(
-            self.host_ctx_cached_token_indptr[:self.num_contexts + 1],
-            non_blocking=True)
+        stager = self.step_input_stager
+        if stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            stager.copy(
+                self.ctx_cached_token_indptr[:self.num_contexts + 1],
+                self.host_ctx_cached_token_indptr[:self.num_contexts + 1])
+        else:
+            self.ctx_cached_token_indptr[:self.num_contexts + 1].copy_(
+                self.host_ctx_cached_token_indptr[:self.num_contexts + 1],
+                non_blocking=True)
         torch.cumsum(
             self.seq_lens[:self.num_contexts],
             dim=0,
             dtype=torch.int64,
             out=self.host_ctx_uncached_token_indptr[1:self.num_contexts + 1])
-        self.ctx_uncached_token_indptr[:self.num_contexts + 1].copy_(
-            self.host_ctx_uncached_token_indptr[:self.num_contexts + 1],
-            non_blocking=True)
+        if stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            stager.copy(
+                self.ctx_uncached_token_indptr[:self.num_contexts + 1],
+                self.host_ctx_uncached_token_indptr[:self.num_contexts + 1])
+        else:
+            self.ctx_uncached_token_indptr[:self.num_contexts + 1].copy_(
+                self.host_ctx_uncached_token_indptr[:self.num_contexts + 1],
+                non_blocking=True)
         torch.cumsum(kv_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,
                      out=self.host_ctx_kv_indptr[1:self.num_contexts + 1])
-        self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
-            self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
+        if stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            stager.copy(self.ctx_kv_indptr[:self.num_contexts + 1],
+                        self.host_ctx_kv_indptr[:self.num_contexts + 1])
+        else:
+            self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
+                self.host_ctx_kv_indptr[:self.num_contexts + 1],
+                non_blocking=True)
 
     def compute_max_num_custom_mask_tiles_kv_upper_bound(
             self, max_seq_len_kv, min_first_sparse_mask_offset_kv,
@@ -1678,6 +1711,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # FMHA library classes this instance tries before the registry's libraries.
+    prepended_fmha_lib_classes: tuple = ()
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):

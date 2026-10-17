@@ -352,8 +352,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      dtype=torch.int,
                                      device='cpu',
                                      pin_memory=prefer_pinned())
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
-                                                 non_blocking=True)
+        if self.step_input_stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            self.step_input_stager.copy(self.batch_indices_cuda[:num_seqs],
+                                        batch_indices)
+        else:
+            self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
+                                                     non_blocking=True)
         # Snapshot the real (unpadded) scheduled token count before the decrement
         # below. maybe_capture_hidden_states runs during the target forward and
         # must bound the capture by this count; self.num_tokens is about to be
