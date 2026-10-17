@@ -310,6 +310,24 @@ void EventManager::addCacheLevelUpdated(
         lifeCycle.value());
 }
 
+void EventManager::addPriorityUpdated(
+    Digest const& blockKey, Priority oldPriority, Priority newPriority, LifeCycleId lifeCycle)
+{
+    if (mMaxKvEventEntries <= 0)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const state = mStoredBlocks.find(blockKey);
+    if (state == mStoredBlocks.end() || state->second.lifeCycleIds.count(lifeCycle.value()) == 0)
+    {
+        return;
+    }
+    addEventUnlocked(
+        KVCacheUpdatedData{state->second.blockHash, std::nullopt, KVCacheEventDiff{oldPriority, newPriority}},
+        lifeCycle.value());
+}
+
 void EventManager::addStoredEventUnlocked(KVCacheStoredData data, EventLayerGroupId layerGroupId)
 {
     bool const hasPendingRemovedEvents = !mLatestRemovedBlockHashes.empty();
@@ -542,7 +560,7 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         if (pageCoversBlock(page, block))
         {
             cacheLevel = page->cacheLevel;
-            priority = page->priority;
+            priority = page->priority();
             foundPage = true;
             break;
         }

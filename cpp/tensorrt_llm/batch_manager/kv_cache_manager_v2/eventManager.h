@@ -188,6 +188,8 @@ public:
     void addRemovedLifeCycle(Digest const& blockKey, LifeCycleId lifeCycle) override;
     void addCacheLevelUpdated(
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle) override;
+    void addPriorityUpdated(
+        Digest const& blockKey, Priority oldPriority, Priority newPriority, LifeCycleId lifeCycle) override;
 
 private:
     enum class HashAlgorithm
