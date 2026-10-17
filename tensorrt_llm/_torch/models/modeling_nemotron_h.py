@@ -52,7 +52,7 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
 
-class NemotronHPuzzleConfig(PretrainedConfig):
+class NemotronHPuzzleConfig(NemotronHConfig):
     model_type = "nemotron_h_puzzle"
 
 
