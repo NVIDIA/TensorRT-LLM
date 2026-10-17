@@ -14,7 +14,10 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
     """Publish named health statuses to Check and all active Watch clients."""
 
     def __init__(self) -> None:
-        self._statuses = {"": health_pb2.HealthCheckResponse.NOT_SERVING}
+        self._statuses = {
+            service: health_pb2.HealthCheckResponse.NOT_SERVING
+            for service in ("", "inference", "liveness")
+        }
         self._changed = asyncio.Condition()
         self._shutting_down = False
 

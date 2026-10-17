@@ -30,7 +30,7 @@ OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC 
 | `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Startup and readiness probes |
 | `liveness` | The gRPC server has started and is not shutting down. | Liveness probe |
 
-The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. Both services report `NOT_SERVING` during graceful shutdown. Each `Watch` ends after this final status. A stopped or failed server cannot answer the probe.
+The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by up to one poll interval. The launcher stops the serving process when its engine health check fails; an external supervisor must restart it. Both services report `NOT_SERVING` during graceful shutdown. Each `Watch` ends after this final status. A stopped or failed server cannot answer the probe.
 
 For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
 
@@ -179,7 +179,7 @@ Verify that a checkout is current without modifying it:
 python scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
 ```
 
-The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. Its protobuf and `grpcio>=1.67.1,<2` runtime constraints are base TensorRT-LLM requirements.
+The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. Its protobuf, `grpcio>=1.73.1,<2`, and `grpcio-health-checking>=1.73.1,<1.82` runtime constraints are base TensorRT-LLM requirements. The health-checking upper bound keeps this protobuf 6 installation on compatible releases. OpenEngine maintainers own Health API behavior and compatibility. Dependency updates require a check of gRPC and protobuf requirements, wheel installation, and the OpenEngine Check/Watch tests in CI. Route Health behavior failures to the OpenEngine maintainers and installation or dependency-resolution failures to the requirements maintainers.
 
 The private Python namespace does not change the protobuf descriptor names: generated modules still register `openengine/v1/*.proto` in the process-wide default descriptor pool. Importing another OpenEngine binding package in the same process is safe only when it registers identical schema bytes; a different schema revision can raise a duplicate-file `TypeError` during import.
 
