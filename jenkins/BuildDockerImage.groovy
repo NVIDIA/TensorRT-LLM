@@ -45,7 +45,8 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
-TRIGGER_TYPE = env.triggerType ?: "manual"
+TRIGGER_TYPE = params.triggerType ?: env.triggerType ?: "manual"
+BUILD_STAGE_WHEEL_PLAN = parseBuildStageWheelPlan(params.buildStageWheelPlan ?: env.buildStageWheelPlan)
 
 // >>> BOLT profile-bundle overlay -- ships INERT (dead code) >>>
 // Master gate. While false (the default, i.e. the scaffolding PR), buildImage
@@ -65,6 +66,11 @@ BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequire
 // tarball is BOLT-optimized in the image build, before the release stage pip
 // installs it. Kept independent so it can be rolled back on its own.
 BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
+if (TRIGGER_TYPE == "pre-merge" && BUILD_STAGE_WHEEL_PLAN?.sbsa != true) {
+    echo "[BOLT] Pre-merge staging has no confirmed SBSA wheel producer; " +
+         "wheel optimization is disabled and the release image will build from source. Profile overlay is unchanged."
+    BOLT_OPTIMIZE_WHEEL = false
+}
 // The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
 // because overlayBoltBundle runs well below the scope globalVars is passed into.
 // Empty means unpinned, i.e. take whatever `latest` is.
@@ -290,30 +296,30 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
+def parseBuildStageWheelPlan(rawPlan) {
+    if (!rawPlan?.trim()) {
+        return null // Legacy caller: availability is unknown, not explicitly false.
+    }
+    def plan = readJSON(text: rawPlan, returnPojo: true)
+    if (!(plan instanceof Map) ||
+        !(plan.x86_64 instanceof Boolean) || !(plan.sbsa instanceof Boolean)) {
+        error "buildStageWheelPlan must contain boolean x86_64 and sbsa entries for uploadPath"
+    }
+    return plan
+}
+
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
-    // Whether THIS image has to ship a BOLT-optimized wheel. Answered before the
-    // gates below, and deliberately not subject to them.
-    //
-    // Optimizing the installed wheel is only possible on this path: the wheel is
-    // BOLTed by get_wheel_from_package.py as it is unpacked from the build
-    // tarball, so an image that compiles its own wheel in-container has nothing
-    // to optimize. That makes the two gates below load-bearing for BOLT, and
-    // both are unreliable for reasons that have nothing to do with BOLT:
-    //
-    //   useWheelFromBuildStage -- a kill switch added for nvbug 5433581 in Aug
-    //       2025 and never reverted. It was also read without being declared, so
-    //       it was not merely false but incapable of being true.
-    //   triggerType -- read from env and not a declared parameter of this job,
-    //       so whether it survives the launch is a property of job registration
-    //       rather than of this repo. When it does not, TRIGGER_TYPE is "manual"
-    //       and this returns early no matter what the caller asked for.
-    //
-    // boltOptimizeWheel, by contrast, IS declared, so it reliably arrives. Key
-    // off it and let a BOLT request carry itself past both gates. The bypass is
-    // deliberately narrow -- one arch, one dockerfile stage, only when BOLT was
-    // asked for -- so the nvbug's blast radius stays at the SBSA release image
-    // instead of being reopened for every image this job builds.
     def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && dockerfileStage == "release"
+
+    // Availability is a prerequisite, independent of wheel reuse or BOLT policy.
+    if (BUILD_STAGE_WHEEL_PLAN != null && BUILD_STAGE_WHEEL_PLAN[arch] == false) {
+        if (boltWheelRequired) {
+            error "BOLT optimization requires a build-stage wheel for ${arch}, but buildStageWheelPlan " +
+                  "has no producer at ${UPLOAD_PATH} (triggerType=${TRIGGER_TYPE})."
+        }
+        echo "No build-stage wheel producer for ${arch} at ${UPLOAD_PATH}; building from source"
+        return ""
+    }
 
     if (!boltWheelRequired) {
         if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
@@ -524,6 +530,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
     def dependent = config.dependent
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def dockerfileStage = config.dockerfileStage
+    // Reject an impossible BOLT request before checkout or a dependent image build.
+    def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, arch)
 
     def imageType = TRIGGER_TYPE == "nightly-release" ?
         "${target}-nightly" : target
@@ -668,7 +676,6 @@ def buildImage(config, imageKeyToTag, versionOverride)
             }
         }
 
-        def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -946,6 +953,16 @@ pipeline {
             defaultValue: "main",
             description: "Branch to launch job."
         )
+        string(
+            name: "triggerType",
+            defaultValue: "",
+            description: "Caller trigger: pre-merge, post-merge, or nightly-release. Empty uses the legacy environment value, then manual."
+        )
+        string(
+            name: "buildStageWheelPlan",
+            defaultValue: "",
+            description: 'JSON booleans x86_64 and sbsa indicating build-stage wheel producers at uploadPath. Empty means a legacy caller with unknown availability; false prevents download waiting.'
+        )
         choice(
             name: "action",
             choices: ["build", "push"],
@@ -979,12 +996,12 @@ pipeline {
         booleanParam(
             name: "useWheelFromBuildStage",
             defaultValue: false,
-            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declared here so the flag is at least capable of being set; it stays false by default, and nothing turns it on. boltOptimizeWheel does NOT depend on it: a BOLT request carries itself past this gate for the SBSA release image only."
+            description: "Install the build-stage wheel for post-merge or nightly-release images. Defaults to false. SBSA release wheel BOLT may bypass this switch, but cannot bypass an explicit missing producer in buildStageWheelPlan."
         )
         booleanParam(
             name: "boltOptimizeWheel",
             defaultValue: false,
-            description: "BOLT-optimize the wheel the SBSA release image installs, applying the branch's latest promoted profile bundle during the image build, and fail if no bundle can be applied. Independent of boltOverlayEnabled, which only bakes the bundle in as a layer and leaves the installed binaries unoptimized. Uses the last promoted bundle rather than this run's, so the image build never waits on BoltProfileGen. Ignored on x86_64, which has no promoted bundle."
+            description: "BOLT-optimize the SBSA release wheel using promoted profiles; fail if optimization is unavailable. Pre-merge staging without a confirmed SBSA wheel producer disables wheel BOLT and builds from source. Other triggers fail if the producer is explicitly absent. Independent of the profile overlay; ignored on x86_64."
         )
         string(
             name: "boltProfileBranch",
