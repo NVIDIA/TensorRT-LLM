@@ -6,14 +6,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from agent_flow.workflows.modeling_v2_onboard import gpu_run
 from agent_flow.workflows.modeling_v2_onboard.gpu_pool import GpuPool, PoolConfigError, pool_config
-from agent_flow.workflows.modeling_v2_onboard.gpu_run import Waiter, allowed
+from agent_flow.workflows.modeling_v2_onboard.gpu_run import Waiter, place
 
 
 def _task(**pool) -> dict:
@@ -37,6 +39,8 @@ def test_pool_config_defaults_to_the_slurm_environment():
     assert (config.nodes, config.gpus_per_node, config.reserve) == (2, 4, 2)
     assert (config.partition, config.qos, config.hours) == ("batch", "interactive", 24.0)
     assert config.container_image == "/images/trtllm.sqsh"
+    assert config.max_nodes is None
+    assert pool_config(_task(max_nodes=6)).max_nodes == 6
 
 
 def test_pool_config_lists_every_problem():
@@ -45,19 +49,27 @@ def test_pool_config_lists_every_problem():
     message = str(exc.value)
     for problem in ("nodes", "account", "hours", "`gpu_pool.extra`"):
         assert problem in message
+    with pytest.raises(PoolConfigError) as exc:
+        pool_config(_task(max_nodes=1))
+    assert "`gpu_pool.max_nodes` must be an integer of at least 2" in str(exc.value)
 
 
 class _Slurm:
     """Answers squeue with ``jobs`` holder jobs and records every command."""
 
-    def __init__(self, jobs: int = 0, squeue_ok: bool = True, sbatch_ok: bool = True) -> None:
+    def __init__(
+        self, jobs: int = 0, squeue_ok: bool = True, sbatch_ok: bool = True, running: int = 0
+    ) -> None:
         self.jobs, self.squeue_ok, self.sbatch_ok = jobs, squeue_ok, sbatch_ok
+        self.running = running
         self.calls: list[list[str]] = []
 
     def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
         if args[0] == "squeue":
-            out = "".join(f"{100 + i}\n" for i in range(self.jobs))
+            out = "".join(
+                f"{100 + i} {'R' if i < self.running else 'PD'}\n" for i in range(self.jobs)
+            )
             return subprocess.CompletedProcess(args, 0 if self.squeue_ok else 1, out, "")
         if args[0] == "sbatch":
             if not self.sbatch_ok:
@@ -107,14 +119,15 @@ def test_the_holder_job_holds_one_whole_node(tmp_path):
     assert other.job_name != pool.job_name
 
 
-def test_the_keeper_submits_one_holder_job_at_a_time_up_to_nodes(tmp_path):
+def test_the_keeper_submits_holder_jobs_up_to_nodes_and_follows_a_grown_pool(tmp_path):
     slurm = _Slurm()
     pool = _pool(tmp_path, slurm)
     pool.write()
-    assert pool.top_up() == "Submitted batch job 100"
-    assert pool.top_up() == "Submitted batch job 101"
+    assert pool.top_up() == "Submitted batch job 100; Submitted batch job 101"
     assert pool.top_up() is None
-    assert [c[0] for c in slurm.calls].count("sbatch") == 2
+    pool.nodes = 3
+    assert pool.top_up() == "Submitted batch job 102"
+    assert [c[0] for c in slurm.calls].count("sbatch") == 3
     pool.release()
     assert slurm.calls[-1][0] == "scancel" and pool.job_name in slurm.calls[-1]
 
@@ -130,12 +143,44 @@ def test_waiters_are_served_by_class_then_by_arrival():
     early_accuracy = Waiter(pid=1, rank=0, since=2.0, gpus=2)
     me = Waiter(pid=2, rank=1, since=1.0, gpus=2)
     # An accuracy waiter that came later is still ahead of a feature command.
-    assert not allowed(me, [early_accuracy], 3, perf=False, reserve=0)
+    assert place(me, [early_accuracy], {"a": 3}, perf=False, reserve=0) is None
     # Enough GPUs for both: no one waits.
-    assert allowed(me, [early_accuracy], 4, perf=False, reserve=0)
+    assert place(me, [early_accuracy], {"a": 4}, perf=False, reserve=0) == "a"
     # Perf work leaves the last `reserve` GPUs alone.
-    assert not allowed(me, [], 3, perf=True, reserve=2)
-    assert allowed(me, [], 4, perf=True, reserve=2)
+    assert place(me, [], {"a": 3}, perf=True, reserve=2) is None
+    assert place(me, [], {"a": 4}, perf=True, reserve=2) == "a"
+
+
+def test_a_whole_node_waiter_keeps_the_node_it_waits_for():
+    node_job = Waiter(pid=1, rank=0, since=1.0, gpus=4)
+    one_gpu = Waiter(pid=2, rank=1, since=2.0, gpus=1)
+    # Five GPUs free, but no node has four: the 4-GPU command claims the
+    # emptiest node, and a 1-GPU command may only use the other one.
+    free = {"a": 3, "b": 2}
+    assert place(one_gpu, [node_job], free, perf=False, reserve=0) == "b"
+    assert place(one_gpu, [node_job], {"a": 3, "b": 0}, perf=False, reserve=0) is None
+    # Once a node is whole, the 4-GPU command takes it.
+    assert place(node_job, [one_gpu], {"a": 4, "b": 2}, perf=False, reserve=0) == "a"
+
+
+def test_a_command_goes_to_the_fullest_node_it_fits_and_only_where_time_is_left():
+    me = Waiter(pid=1, rank=1, since=1.0, gpus=1)
+    free = {"a": 4, "b": 1}
+    assert place(me, [], free, perf=False, reserve=0) == "b"
+    assert place(me, [], free, perf=False, reserve=0, usable={"a"}) == "a"
+
+
+def test_the_pool_status_lists_nodes_and_waiters(tmp_path):
+    pool = _pool(tmp_path, _Slurm(jobs=2, running=1))
+    pool.write()
+    ticket = {"pid": os.getpid(), "rank": 0, "since": time.time() - 600, "gpus": 4}
+    (pool.directory / "queue" / "1.json").write_text(
+        json.dumps({**ticket, "task": "mtp-tp4", "class": "accuracy"})
+    )
+    status = pool.status()
+    assert "2 node(s) of 4 GPUs wanted, 1 running, 1 queued in Slurm" in status
+    assert "free GPUs per running node: [4]" in status
+    assert "`mtp-tp4` (accuracy) for 4 GPU(s), 10 min" in status
 
 
 def test_gpu_run_runs_the_command_in_the_worktree_on_locked_gpus(tmp_path, monkeypatch):
@@ -150,7 +195,7 @@ def test_gpu_run_runs_the_command_in_the_worktree_on_locked_gpus(tmp_path, monke
             launched.append(args)
             # The command's GPUs stay locked while it runs.
             locks = pool.directory / "locks"
-            assert gpu_run._free(locks, "4242", 4) == 2
+            assert gpu_run.free_gpus(locks, "4242", 4) == 2
 
         def wait(self):
             return 7
@@ -168,4 +213,4 @@ def test_gpu_run_runs_the_command_in_the_worktree_on_locked_gpus(tmp_path, monke
     assert f"--container-workdir={worktree}" in srun
     assert "CUDA_VISIBLE_DEVICES=0,1" in srun
     assert srun[-4:] == ["_", str(worktree), "pytest", "-x"]
-    assert gpu_run._free(pool.directory / "locks", "4242", 4) == 4
+    assert gpu_run.free_gpus(pool.directory / "locks", "4242", 4) == 4

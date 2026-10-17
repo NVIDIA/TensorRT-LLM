@@ -64,6 +64,7 @@ class PlannerDecision:
             removes or rewrites them.
         planning: The plan is not complete yet: the planner gets its next
             turn as soon as this one is applied, while the workers run.
+        gpu_nodes: Grow the GPU pool to this many nodes; ``None`` keeps it.
     """
 
     decision: str
@@ -71,6 +72,7 @@ class PlannerDecision:
     retry: tuple[str, ...] = ()
     cancel: tuple[str, ...] = ()
     planning: bool = False
+    gpu_nodes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -221,19 +223,25 @@ def parse_planner_decision(text: str) -> PlannerDecision:
 
     Raises:
         HandoffError: When ``decision`` is not one of :data:`PLANNER_DECISIONS`
-            or ``retry``/``cancel`` is not a list of ids, or ``planning`` is
-            not a boolean.
+            or ``retry``/``cancel`` is not a list of ids, ``planning`` is
+            not a boolean or ``gpu_nodes`` not a positive integer.
     """
     data = _mapping(text)
     planning = data.get("planning", False)
     if not isinstance(planning, bool):
         raise HandoffError(f"`planning` must be true or false, got {planning!r}")
+    gpu_nodes = data.get("gpu_nodes")
+    if gpu_nodes is not None and (
+        isinstance(gpu_nodes, bool) or not isinstance(gpu_nodes, int) or gpu_nodes < 1
+    ):
+        raise HandoffError(f"`gpu_nodes` must be a positive integer, got {gpu_nodes!r}")
     return PlannerDecision(
         decision=_choice(data, "decision", PLANNER_DECISIONS),
         summary=str(data.get("summary", "")).strip(),
         retry=_ids(data, "retry"),
         cancel=_ids(data, "cancel"),
         planning=planning,
+        gpu_nodes=gpu_nodes,
     )
 
 

@@ -115,7 +115,10 @@ With `slurm-environment.gpu_pool` in `task.yaml` (see `task.example.yaml`),
 the run holds whole GPU nodes for its workers. The orchestrator writes a
 holder job (`gpu_pool/holder.sbatch`, which only sleeps) and keeps `nodes` of
 them submitted from the moment it starts, so they queue while the planner
-plans; it cancels them when the run ends. An interrupted run leaves them
+plans; it cancels them when the run ends. Each planner turn shows the pool
+(nodes, free GPUs per node, waiting commands), and the planner may grow it by
+writing `gpu_nodes` in its turn file, up to `max_nodes` (default: the number
+of workers); the pool never shrinks during a run. An interrupted run leaves them
 running for the resumed run (`scancel -n <job name>` releases them), and
 `--clean` cancels them.
 
@@ -130,8 +133,10 @@ which waits for N free GPUs on one holder job with at least M more minutes
 (plus a margin), locks them, and runs the command as a step of that job in the
 container, in the worktree, with `CUDA_VISIBLE_DEVICES` set. Waiting commands
 are served by the task's class in `gpu_priorities.json` (`accuracy`, then
-`feature`, then `perf`; first come first served within one), and `perf` work
-leaves the last `reserve` free GPUs alone. Preparing the environment inside
+`feature`, then `perf`; first come first served within one), node by node:
+a waiter ahead that fits nowhere claims the node with the most free GPUs, so
+one-GPU commands cannot keep a node from ever draining for a whole-node one.
+`perf` work leaves the last `reserve` free GPUs alone. Preparing the environment inside
 the container (linking a built checkout's native libraries, the venv, model
 paths) is work for the planner's first batch: a worker writes the wrapper the
 other tasks then run their commands through.

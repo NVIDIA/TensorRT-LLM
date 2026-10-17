@@ -19,7 +19,8 @@ trtllm_repo_path:    /path/to/TensorRT-LLM
 #   # as soon as the run starts. Workers run GPU commands in it, served by
 #   # their task's priority, instead of submitting their own jobs.
 #   gpu_pool:
-#     nodes: 4                  # holder jobs kept submitted
+#     nodes: 4                  # holder jobs kept submitted at first
+#     max_nodes: 8              # the most the planner may grow it to; default: the worker count
 #     account: <account>
 #     partition: <partition>    # default: slurm_partition
 #     qos: <qos>                # optional

@@ -6,9 +6,9 @@
 The pool is a set of holder jobs, each holding one whole node and doing
 nothing else. The orchestrator keeps ``nodes`` of them submitted from the
 moment the run starts — while the planner is still planning — and cancels
-them when the run ends. Workers run GPU commands as steps of a holder job
-through :mod:`.gpu_run`, which locks GPUs and serves waiting commands by their
-task's priority class.
+them when the run ends. The planner may grow the pool, up to ``max_nodes``.
+Workers run GPU commands as steps of a holder job through :mod:`.gpu_run`,
+which locks GPUs and serves waiting commands by their task's priority class.
 
 Everything a command needs to find the pool is in ``<workspace>/gpu_pool/
 pool.json``, written by the orchestrator.
@@ -22,9 +22,12 @@ import hashlib
 import json
 import shlex
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from . import gpu_run
 
 __all__ = [
     "GpuPool",
@@ -48,7 +51,9 @@ class PoolConfig:
     """How the pool's holder jobs are submitted and its commands run.
 
     Attributes:
-        nodes: How many holder jobs (whole nodes) to keep submitted.
+        nodes: How many holder jobs (whole nodes) to keep submitted at first.
+        max_nodes: The most the planner may grow the pool to; ``None`` leaves
+            the bound to the orchestrator.
         gpus_per_node: GPUs each holder job holds.
         account: Slurm account of the holder jobs.
         partition: Slurm partition of the holder jobs.
@@ -69,6 +74,7 @@ class PoolConfig:
     hours: float = 24
     reserve: int = 2
     container_mounts: tuple[str, ...] = ()
+    max_nodes: int | None = None
 
 
 def pool_config(task_data: dict) -> PoolConfig | None:
@@ -86,6 +92,7 @@ def pool_config(task_data: dict) -> PoolConfig | None:
     problems: list[str] = []
     known = {
         "nodes",
+        "max_nodes",
         "gpus_per_node",
         "account",
         "partition",
@@ -111,6 +118,9 @@ def pool_config(task_data: dict) -> PoolConfig | None:
         return value
 
     nodes = integer("nodes", None, 0)
+    max_nodes = None
+    if raw.get("max_nodes") is not None:
+        max_nodes = integer("max_nodes", None, max(nodes, 1))
     gpus_per_node = integer("gpus_per_node", 4, 1)
     reserve = integer("reserve", 2, 0)
     account = text("account", None)
@@ -145,6 +155,7 @@ def pool_config(task_data: dict) -> PoolConfig | None:
         hours=float(hours),
         reserve=reserve,
         container_mounts=tuple(mounts),
+        max_nodes=max_nodes,
     )
 
 
@@ -179,6 +190,8 @@ class GpuPool:
         self.workspace = Path(workspace)
         self.mounts = tuple(dict.fromkeys([*config.container_mounts, *map(str, mounts)]))
         self._run = run or _run
+        # Holder jobs to keep submitted; the planner may raise it.
+        self.nodes = config.nodes
         digest = hashlib.sha1(str(self.workspace.resolve()).encode()).hexdigest()[:8]
         self.job_name = f"mv2pool-{digest}"
 
@@ -219,29 +232,74 @@ class GpuPool:
         ]
         self.holder_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def _jobs(self) -> int | None:
-        """Holder jobs running or queued; ``None`` when Slurm cannot be asked."""
+    def _jobs(self) -> list[tuple[str, str]] | None:
+        """``(job id, state)`` of the holder jobs running or queued.
+
+        ``None`` when Slurm cannot be asked.
+        """
         out = self._run(
-            ["squeue", "-h", "-u", getpass.getuser(), "-n", self.job_name, "-t", "R,PD", "-o", "%i"]
+            [
+                "squeue",
+                "-h",
+                "-u",
+                getpass.getuser(),
+                "-n",
+                self.job_name,
+                "-t",
+                "R,PD",
+                "-o",
+                "%i %t",
+            ]
         )
         if out.returncode != 0:
             return None
-        return len([line for line in out.stdout.splitlines() if line.strip()])
+        return [
+            (fields[0], fields[1] if len(fields) > 1 else "")
+            for fields in (line.split() for line in out.stdout.splitlines())
+            if fields
+        ]
 
     def top_up(self) -> str | None:
-        """Submit one holder job if fewer than ``nodes`` are submitted.
+        """Submit holder jobs until ``nodes`` are submitted.
 
-        One per call, so a refused submission is not repeated in a burst.
-        Returns what happened, for the log, or ``None`` when nothing did.
+        Stops at the first refused submission, so it is not repeated in a
+        burst. Returns what happened, for the log, or ``None`` when nothing did.
         """
         jobs = self._jobs()
-        if jobs is None or jobs >= self.config.nodes:
+        if jobs is None:
             return None
-        out = self._run(["sbatch", str(self.holder_path)])
-        if out.returncode != 0:
-            lines = (out.stderr or out.stdout).strip().splitlines()
-            return f"holder job not submitted: {lines[-1] if lines else 'sbatch failed'}"
-        return out.stdout.strip()
+        notes = []
+        for _ in range(self.nodes - len(jobs)):
+            out = self._run(["sbatch", str(self.holder_path)])
+            if out.returncode != 0:
+                lines = (out.stderr or out.stdout).strip().splitlines()
+                notes.append(f"holder job not submitted: {lines[-1] if lines else 'sbatch failed'}")
+                break
+            notes.append(out.stdout.strip())
+        return "; ".join(notes) or None
+
+    def status(self) -> str:
+        """The pool as the planner sees it: nodes, free GPUs and who waits."""
+        jobs = self._jobs()
+        if jobs is None:
+            return f"GPU pool: {self.nodes} node(s) wanted; Slurm did not answer."
+        running = [job for job, state in jobs if state == "R"]
+        queued = len(jobs) - len(running)
+        gpus = self.config.gpus_per_node
+        free = [gpu_run.free_gpus(self.directory / "locks", job, gpus) for job in running]
+        lines = [
+            f"GPU pool: {self.nodes} node(s) of {gpus} GPUs wanted, {len(running)} running"
+            + (f", {queued} queued in Slurm" if queued else "")
+            + f"; free GPUs per running node: {free or 'none'}."
+        ]
+        now = time.time()
+        waiting = sorted(gpu_run.tickets(self.directory / "queue"), key=lambda t: t["since"])
+        lines += [
+            f"- waiting: `{t.get('task', '?')}` ({t.get('class', '?')}) for {t['gpus']} GPU(s), "
+            f"{(now - t['since']) / 60:.0f} min"
+            for t in waiting
+        ] or ["- no command is waiting for GPUs."]
+        return "\n".join(lines)
 
     async def keep(self, log: Callable[[str], None]) -> None:
         """Keep the holder jobs submitted until cancelled."""

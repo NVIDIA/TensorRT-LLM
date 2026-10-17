@@ -14,9 +14,11 @@ SIGTERM/SIGINT stop the step.
 
 Waiting commands are served by their task's priority class, read from the
 run's ``gpu_priorities.json`` on every poll: ``accuracy`` before ``feature``
-before ``perf``, first come first served within a class. A command may take
-GPUs ahead of a better-placed waiter only when enough are free for both, and
-``perf`` work never takes the last ``reserve`` free GPUs.
+before ``perf``, first come first served within a class. Each waiter ahead of
+a command is placed first, node by node: on the fullest node it fits, or, when
+none has room, it claims the node with the most free GPUs, to start there once
+that node drains. A command takes the GPUs left over only, and ``perf`` work
+never takes the last ``reserve`` free GPUs.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["Waiter", "allowed", "main"]
+__all__ = ["Waiter", "free_gpus", "main", "place", "tickets"]
 
 RANKS = {"accuracy": 0, "feature": 1, "perf": 2}
 DEFAULT_CLASS = "feature"
@@ -53,12 +55,41 @@ class Waiter:
     gpus: int
 
 
-def allowed(me: Waiter, waiters: list[Waiter], free: int, *, perf: bool, reserve: int) -> bool:
-    """Whether ``me`` may take its GPUs now, with ``free`` GPUs free in the pool."""
-    ahead = sum(w.gpus for w in waiters if (w.rank, w.since) < (me.rank, me.since))
-    if free - ahead < me.gpus:
-        return False
-    return not perf or free - me.gpus >= reserve
+def place(
+    me: Waiter,
+    waiters: list[Waiter],
+    free: dict[str, int],
+    *,
+    perf: bool,
+    reserve: int,
+    usable: set[str] | None = None,
+) -> str | None:
+    """The node ``me`` may take its GPUs on now, or ``None`` if it waits.
+
+    Args:
+        me: The command asking.
+        waiters: The other commands waiting.
+        free: Free GPUs on each node of the pool.
+        perf: ``me`` is ``perf`` work, which leaves ``reserve`` GPUs free.
+        reserve: Free GPUs ``perf`` work may not take.
+        usable: The nodes ``me`` may run on (enough time left); all if ``None``.
+    """
+    left = dict(free)
+    ahead = [w for w in waiters if (w.rank, w.since) < (me.rank, me.since)]
+    for waiter in sorted(ahead, key=lambda w: (w.rank, w.since)):
+        if not left:
+            break
+        fits = [node for node, n in left.items() if n >= waiter.gpus]
+        if fits:
+            node = min(fits, key=lambda k: left[k])
+            left[node] -= waiter.gpus
+        else:
+            # The node it will start on once that node drains: no one else takes its GPUs.
+            left[max(left, key=lambda k: left[k])] = 0
+    if perf and sum(left.values()) - me.gpus < reserve:
+        return None
+    fits = [node for node, n in left.items() if n >= me.gpus and (usable is None or node in usable)]
+    return min(fits, key=lambda k: left[k]) if fits else None
 
 
 def _task_class(priorities: Path, task: str) -> str:
@@ -80,19 +111,24 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _waiters(queue: Path) -> list[Waiter]:
+def tickets(queue: Path) -> list[dict]:
+    """The tickets of the commands waiting for GPUs; dead waiters' are removed."""
     live = []
     for path in queue.glob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            waiter = Waiter(data["pid"], data["rank"], data["since"], data["gpus"])
+            Waiter(data["pid"], data["rank"], data["since"], data["gpus"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if _alive(waiter.pid):
-            live.append(waiter)
+        if _alive(data["pid"]):
+            live.append(data)
         else:
             path.unlink(missing_ok=True)
     return live
+
+
+def _waiters(queue: Path) -> list[Waiter]:
+    return [Waiter(t["pid"], t["rank"], t["since"], t["gpus"]) for t in tickets(queue)]
 
 
 def _seconds(left: str) -> int:
@@ -139,7 +175,7 @@ def _lock(locks: Path, job: str, gpus_per_node: int, n: int) -> list[tuple[int, 
     return []
 
 
-def _free(locks: Path, job: str, gpus_per_node: int) -> int:
+def free_gpus(locks: Path, job: str, gpus_per_node: int) -> int:
     """How many GPUs of ``job`` no command holds."""
     count = 0
     for gpu in range(gpus_per_node):
@@ -172,16 +208,22 @@ def _acquire(pool: dict, directory: Path, task: str, n: int, minutes: int):
         fcntl.flock(guard, fcntl.LOCK_EX)
         try:
             jobs = _holder_jobs(pool["job_name"])
-            free = {job: _free(locks, job, pool["gpus_per_node"]) for job, _ in jobs}
+            free = {job: free_gpus(locks, job, pool["gpus_per_node"]) for job, _ in jobs}
             others = [w for w in _waiters(queue) if w.pid != me.pid]
             total = sum(free.values())
-            if allowed(me, others, total, perf=klass == "perf", reserve=pool["reserve"]):
-                for job, left in jobs:
-                    if left >= (minutes + MARGIN_MINUTES) * 60 and free[job] >= n:
-                        held = _lock(locks, job, pool["gpus_per_node"], n)
-                        if held:
-                            ticket.unlink(missing_ok=True)
-                            return job, held
+            usable = {job for job, left in jobs if left >= (minutes + MARGIN_MINUTES) * 60}
+            node = place(
+                me,
+                others,
+                free,
+                perf=klass == "perf",
+                reserve=pool["reserve"],
+                usable=usable,
+            )
+            held = _lock(locks, node, pool["gpus_per_node"], n) if node else []
+            if held:
+                ticket.unlink(missing_ok=True)
+                return node, held
         finally:
             fcntl.flock(guard, fcntl.LOCK_UN)
             os.close(guard)

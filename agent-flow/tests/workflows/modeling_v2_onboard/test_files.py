@@ -48,6 +48,10 @@ def test_planner_decision_is_validated():
     assert parse_planner_decision("decision: CONTINUE\nplanning: true\n").planning
     with pytest.raises(HandoffError, match="`planning` must be true or false"):
         parse_planner_decision("decision: CONTINUE\nplanning: later\n")
+    assert parse_planner_decision("decision: CONTINUE\n").gpu_nodes is None
+    assert parse_planner_decision("decision: CONTINUE\ngpu_nodes: 6\n").gpu_nodes == 6
+    with pytest.raises(HandoffError, match="`gpu_nodes` must be a positive integer"):
+        parse_planner_decision("decision: CONTINUE\ngpu_nodes: 0\n")
 
 
 def test_missing_handoff_file_is_an_error(tmp_path):

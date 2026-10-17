@@ -131,6 +131,8 @@ class _State:
     finish: bool = False
     # The planner is still writing the plan: it gets its next turn at once.
     planning: bool = False
+    # The GPU pool's size the planner asked for; None keeps task.yaml's.
+    gpu_nodes: int | None = None
     tasks: dict[str, NodeState] = field(default_factory=dict)
     # Tasks that finished since the planner's last turn: (id, status, summary).
     finished: list[tuple[str, str, str]] = field(default_factory=list)
@@ -159,6 +161,7 @@ class _State:
             turn=data["turn"],
             finish=data["finish"],
             planning=data.get("planning", False),
+            gpu_nodes=data.get("gpu_nodes"),
             tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
             finished=[tuple(item) for item in data.get("finished", [])],
             landing_base=data.get("landing_base", {}),
@@ -706,6 +709,7 @@ class ModelingV2OnboardWorkflow:
                 problems.append(f"`retry`: task {tid!r} is not FAILED ({state})")
         text = self._read_plan_md()
         plan = self._plan
+        problems += self._gpu_nodes_problems(decision.gpu_nodes)
         if text != self._plan.text:
             cancelled = set(decision.cancel)
             effective = {
@@ -721,6 +725,7 @@ class ModelingV2OnboardWorkflow:
             and decision.planning
             and not decision.retry
             and not decision.cancel
+            and decision.gpu_nodes is None
         ):
             problems.append(
                 "`planning: true` but this turn changes nothing: add the tasks you have "
@@ -740,6 +745,29 @@ class ModelingV2OnboardWorkflow:
         }
         reset = set(decision.cancel) | set(decision.retry) | rewritten_failed | removed
         return _Change(decision=decision, plan=plan, old_plan=old, reset=reset, removed=removed)
+
+    @property
+    def _max_gpu_nodes(self) -> int:
+        """The most nodes the planner may grow the GPU pool to."""
+        assert self.gpu_pool is not None
+        bound = self.gpu_pool.config.max_nodes or self.max_parallel
+        return max(bound, self.gpu_pool.config.nodes)
+
+    def _gpu_nodes_problems(self, gpu_nodes: int | None) -> list[str]:
+        if gpu_nodes is None:
+            return []
+        if self.gpu_pool is None:
+            return ["`gpu_nodes`: this run has no GPU pool (task.yaml sets no `gpu_pool`)"]
+        if gpu_nodes < self.gpu_pool.nodes:
+            return [
+                f"`gpu_nodes`: {gpu_nodes} is fewer than the pool's {self.gpu_pool.nodes} "
+                "nodes; the pool only grows"
+            ]
+        if gpu_nodes > self._max_gpu_nodes:
+            return [
+                f"`gpu_nodes`: {gpu_nodes} is more than the run's limit of {self._max_gpu_nodes}"
+            ]
+        return []
 
     def _apply(self, change: _Change) -> list[asyncio.Task[None]]:
         """Apply a validated turn to the run state; return the cancelled workers."""
@@ -761,6 +789,10 @@ class ModelingV2OnboardWorkflow:
             if node.id not in tasks:
                 self._set(node.id, NodeState.PENDING)
         self._state.planning = change.decision.planning
+        gpu_nodes = change.decision.gpu_nodes
+        if self.gpu_pool is not None and gpu_nodes is not None and gpu_nodes != self.gpu_pool.nodes:
+            print_message(f"gpu pool: {self.gpu_pool.nodes} → {gpu_nodes} nodes", self._log)
+            self.gpu_pool.nodes = self._state.gpu_nodes = gpu_nodes
         if change.decision.decision == "FINISH":
             self._state.finish = True
         if change.decision.decision == "ABORT":
@@ -813,6 +845,10 @@ class ModelingV2OnboardWorkflow:
         self._save()
         turn_file = self.layout.turn_path(state.turn)
         turn_file.unlink(missing_ok=True)
+        pool = None
+        if self.gpu_pool is not None:
+            pool = await asyncio.to_thread(self.gpu_pool.status)
+            pool += f"\nThe pool may grow to {self._max_gpu_nodes} nodes (`gpu_nodes`)."
         prompt = planner_turn_prompt(
             turn_file=turn_file,
             plan=self.layout.plan_path,
@@ -834,6 +870,7 @@ class ModelingV2OnboardWorkflow:
             resumed=resumed,
             rejected=self._rejected,
             feedback=[text for _, text in feedback],
+            gpu_pool=pool,
         )
         self._rejected = []
         print_rule(f"[bold magenta]Planner turn {state.turn}[/bold magenta]", self._log)
@@ -865,6 +902,10 @@ class ModelingV2OnboardWorkflow:
         print_message(f"planner: {decision.decision} — {decision.summary}", self._log)
         await self._reset(change, cancelled)
         self._dispatch()
+        if self.gpu_pool is not None and decision.gpu_nodes is not None:
+            note = await asyncio.to_thread(self.gpu_pool.top_up)
+            if note:
+                print_message(f"gpu pool: {note}", self._log)
 
     async def _watch_inbox(self) -> None:
         """Wake the planner when a human message arrives."""
@@ -1012,6 +1053,8 @@ class ModelingV2OnboardWorkflow:
         # GPUs are asked for first: holder jobs queue while the planner plans.
         self._pool_keeper: asyncio.Task[None] | None = None
         if self.gpu_pool is not None:
+            if self._state.gpu_nodes is not None:
+                self.gpu_pool.nodes = max(self.gpu_pool.nodes, self._state.gpu_nodes)
             self.gpu_pool.write()
             self._pool_keeper = asyncio.create_task(
                 self.gpu_pool.keep(lambda note: print_message(note, self._log))

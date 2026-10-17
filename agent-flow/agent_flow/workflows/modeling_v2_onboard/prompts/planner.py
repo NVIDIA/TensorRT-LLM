@@ -335,6 +335,30 @@ work of kind 1.
   `e2e_accuracy` task on the joined code runs after the last of them, before
   the final task.
 
+## Sizing the GPU pool
+
+When the run has a GPU pool, each turn shows it: the nodes it holds, the free
+GPUs on each, and every command waiting for GPUs, with its task, class, GPU
+count and wait so far. The pool starts at `task.yaml`'s `gpu_pool.nodes`; you
+size it from then on. The number of workers is fixed at {max_parallel}, so the
+GPUs the run can use at once are those its running and ready tasks need at
+once — count it, do not guess:
+
+- Per task, the most GPUs its commands hold at the same time: a tp1 test
+  takes one GPU; a tp4 or dep4 boot, gate or benchmark takes one whole node,
+  and only a whole node.
+- Add them up over the running tasks and the ready tasks that will take the
+  next free slots, in whole nodes: one node per command that needs a node, and
+  the one-GPU commands packed four to a node.
+- If that exceeds the pool and commands on the way to a `completion_criteria`
+  item are waiting, write `gpu_nodes` with that count. Say the arithmetic in
+  `summary`. Slurm may take a while to start the new nodes; the pool shows
+  them as queued until it does.
+
+The pool only grows, up to the limit each turn shows, and holds its nodes
+until the run ends. Do not grow it for `perf` or side work alone, or for one
+short wait.
+
 ## Side tasks: performance work the run does not merge
 
 Once the goal is met, every merge stretches the serial tail of the run:
@@ -418,10 +442,12 @@ summary: |
 retry: []            # FAILED tasks to run again unchanged
 cancel: []           # RUNNING tasks to stop
 planning: false      # true: the plan is not complete; wake me again at once
+gpu_nodes: null      # grow the GPU pool to this many nodes
 ```
 
 - `planning: true` — you are still writing the plan (see Plan in batches).
   Each such turn must add or change tasks. Not with `FINISH`.
+- `gpu_nodes` — see Sizing the GPU pool. Leave it out to keep the pool as is.
 - `CONTINUE` — keep going.
 - `FINISH` — let shared tasks start as soon as all of their dependencies are
   `DONE`. Decide it when the main line holds every task the run should
@@ -515,6 +541,7 @@ def planner_turn_prompt(
     delivered: bool = False,
     side_wait_minutes: float = 60,
     planning: bool = False,
+    gpu_pool: str | None = None,
 ) -> str:
     """One planner turn while the workers run.
 
@@ -539,6 +566,7 @@ def planner_turn_prompt(
         delivered: The final task is DONE.
         side_wait_minutes: How long side tasks may still run once it is.
         planning: The planner said its plan is not complete yet.
+        gpu_pool: The GPU pool's state, if the run has one.
     """
     lines: list[str] = []
     if feedback:
@@ -598,13 +626,14 @@ def planner_turn_prompt(
         "Tasks:",
         *(f"- `{tid}`: {state}" for tid, state in states),
         "",
+        *([gpu_pool, ""] if gpu_pool else []),
         f"- The plan (edit in place): `{plan}`",
         f"- The user's task: `{task_yaml}`",
         f"- Every result, including earlier attempts: `{results_dir}`",
         "",
         f"End the turn by writing `{turn_file}` (decision: one of "
-        f"{', '.join(PLANNER_DECISIONS)}; optional `retry` and `cancel` lists and "
-        f"`planning`).",
+        f"{', '.join(PLANNER_DECISIONS)}; optional `retry` and `cancel` lists, "
+        f"`planning` and `gpu_nodes`).",
     ]
     return "\n".join(lines) + "\n"
 

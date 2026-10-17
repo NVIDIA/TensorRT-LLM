@@ -636,6 +636,47 @@ def test_the_gpu_pool_is_requested_while_the_planner_plans(tmp_path, tmp_git_rep
     assert f"gpu_run --pool {tmp_path / 'ws' / 'gpu_pool'} --task a --gpus" in a_agent.prompts[0]
 
 
+def test_the_planner_grows_the_gpu_pool_up_to_its_limit(tmp_path, tmp_git_repo, monkeypatch):
+    calls: list[list[str]] = []
+
+    def slurm(args):
+        calls.append(args)
+        jobs = sum(c[0] == "sbatch" for c in calls)
+        out = "".join(f"{i} R\n" for i in range(jobs)) if args[0] == "squeue" else "Submitted\n"
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(gpu_pool, "_run", slurm)
+    turns: list[str] = []
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _first_batch(prompt).write_text(_plan_text())
+        elif "cannot be run as written" in prompt:
+            assert "`gpu_nodes`: 5 is more than the run's limit of 3" in prompt
+            _decide(turns[-1], gpu_nodes=2)
+        else:
+            turns.append(prompt)
+            if len(turns) == 1:
+                assert "GPU pool: 1 node(s) of 4 GPUs wanted, 1 running" in prompt
+                assert "The pool may grow to 3 nodes" in prompt
+                _decide(prompt, gpu_nodes=5)
+            else:
+                assert "GPU pool: 2 node(s) of 4 GPUs wanted, 2 running" in prompt
+                _finish_when_ready(prompt)
+
+    factory = FakeFactory(planner=planner, worker=_Workers())
+    slurm_env = {
+        "slurm_partition": "p",
+        "docker_image": "/i.sqsh",
+        "gpu_pool": {"nodes": 1, "max_nodes": 3, "account": "acct"},
+    }
+    workflow = _workflow(tmp_path, tmp_git_repo, factory, **{"slurm-environment": slurm_env})
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert [c[0] for c in calls].count("sbatch") == 2
+    state = json.loads(Layout(tmp_path / "ws").state_path.read_text())
+    assert state["gpu_nodes"] == 2
+
+
 def test_a_bad_gpu_pool_is_refused(tmp_path, tmp_git_repo):
     slurm = {"slurm_partition": "p", "docker_image": "/i.sqsh", "gpu_pool": {"nodes": 1}}
     with pytest.raises(WorkflowError, match="gpu_pool.account"):
