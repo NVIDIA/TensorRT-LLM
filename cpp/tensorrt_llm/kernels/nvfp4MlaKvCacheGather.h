@@ -40,6 +40,20 @@ void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_
     int32_t* globalIndices, __nv_fp8_e4m3* output, float const* globalDequantScale, void* workspace,
     size_t workspaceSize, int32_t numQueryRows, int32_t topK, int32_t numRequests, int32_t maxKvTokens,
     int32_t outputCapacity, int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream = 0);
+// Worklist storage belongs to the caller and must outlive all captured users.
+// Power-of-two tableSlots >= 2 * maxQueryRowsPerRequest * topK keeps table load at most one half.
+// Saturation falls back to a distinct owner, preserving values without deduplication.
+void invokeNvFp4MlaKvCacheGatherWorklist(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* globalIndices, int32_t const* queryReqIndices, __nv_fp8_e4m3* output, int32_t* compactIndices,
+    int64_t* ownerTable, int32_t* ownerPairs, int32_t* ownerCount, float const* globalDequantScale,
+    int32_t numRows, int32_t topK, int32_t numRequests, int32_t tableSlots, int64_t numPoolTokens,
+    cudaStream_t stream = 0);
+
+// Reuse requires the same request-local equality classes and valid mask as publication.
+void invokeNvFp4MlaKvCacheGatherWorklistReuse(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* globalIndices, __nv_fp8_e4m3* output, int32_t* compactIndices, int32_t const* ownerPairs,
+    int32_t const* ownerCount, float const* globalDequantScale, int32_t numRows, int32_t topK, int64_t numPoolTokens,
+    cudaStream_t stream = 0);
 
 size_t getNvFp4MlaContextKvCacheGatherWorkspaceSize(int32_t totalKvTokens, cudaStream_t stream = 0);
 

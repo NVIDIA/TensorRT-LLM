@@ -152,8 +152,26 @@ def validate_and_set_mamba_ssm_cache_dtype(
     config.quant_config.mamba_ssm_philox_rounds = mamba_ssm_philox_rounds
 
 
-def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> None:
+def _supports_residual_nvfp4_dsa_storage(
+        model_config: ModelConfig, use_kv_cache_manager_v2: bool) -> bool:
+    """DSA stores residual NVFP4 but gathers FP8 before static sparse attention."""
+    config = model_config.pretrained_config
+    sparse_config = model_config.sparse_attention_config
+    return (use_kv_cache_manager_v2 is True
+            and model_config.attn_backend == "TRTLLM"
+            and getattr(sparse_config, "algorithm", None) == "dsa"
+            and getattr(config, "kv_lora_rank", None) == 512
+            and getattr(config, "qk_rope_head_dim", None) == 64
+            and model_config.torch_dtype in (torch.float16, torch.bfloat16)
+            and not is_hybrid_linear(config)
+            and os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1")
+
+
+def validate_and_set_kv_cache_quant(
+        model_config: ModelConfig,
+        pyt_kv_cache_dtype: str,
+        *,
+        use_kv_cache_manager_v2: bool = False) -> None:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -167,6 +185,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                                 else mapped_pyt_quant)
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
+            and not _supports_residual_nvfp4_dsa_storage(
+                model_config, use_kv_cache_manager_v2)
             and torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
@@ -2002,8 +2022,11 @@ class ModelLoader:
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
-        validate_and_set_kv_cache_quant(config,
-                                        self.llm_args.kv_cache_config.dtype)
+        validate_and_set_kv_cache_quant(
+            config,
+            self.llm_args.kv_cache_config.dtype,
+            use_kv_cache_manager_v2=(
+                self.llm_args.kv_cache_config.use_kv_cache_manager_v2 is True))
         validate_fp4_mla_config(config, self.llm_args)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,

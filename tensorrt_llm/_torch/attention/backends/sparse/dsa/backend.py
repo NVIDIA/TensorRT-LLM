@@ -40,6 +40,7 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # passes keep the per-layer path. Auto-inert on models without shared indexer
 # layers (every group is a singleton -> per-layer fallback).
 _GROUP_REMAP = os.environ.get("TRTLLM_DISABLE_DSA_GROUP_REMAP", "0") != "1"
+_NVFP4_OWNER_WORKLIST = os.environ.get("TRTLLM_DSA_NVFP4_OWNER_WORKLIST", "off") != "off"
 
 _NVFP4_MAX_BLOCK_SCALE = 448.0
 _NVFP4_MAX_VALUE = 6.0
@@ -161,6 +162,9 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the DSA indexer and convert its local TopK to paged indices."""
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
+        worklist = metadata._nvfp4_owner_worklist if _NVFP4_OWNER_WORKLIST else None
+        if worklist is not None:
+            worklist.begin_call(self, metadata, is_generation)
         sparse_backend_args = forward_args.sparse_backend_args
         phase_start = metadata.num_ctx_tokens if is_generation else 0
         phase_end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
@@ -248,17 +252,24 @@ class DSATrtllmAttention(TrtllmAttention):
                 )
             scratch = scratch[:num_rows]
             compact_indices = compact_indices[:num_rows]
-            torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
-                metadata.host_kv_cache_pool_pointers,
-                metadata.host_kv_cache_pool_mapping,
-                topk_indices_global,
-                scratch,
-                compact_indices,
-                self._nvfp4_mla_kv_scale_quant_orig,
-                local_layer_idx,
-                metadata.kv_cache_manager.mla_kv_cache_residual_dim,
-                metadata._cached_num_pool_tokens,
+            owner_indices = (
+                worklist.try_gather(self, metadata, topk_indices_global, scratch)
+                if worklist is not None else None
             )
+            if owner_indices is None:
+                torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+                    metadata.host_kv_cache_pool_pointers,
+                    metadata.host_kv_cache_pool_mapping,
+                    topk_indices_global,
+                    scratch,
+                    compact_indices,
+                    self._nvfp4_mla_kv_scale_quant_orig,
+                    local_layer_idx,
+                    metadata.kv_cache_manager.mla_kv_cache_residual_dim,
+                    metadata._cached_num_pool_tokens,
+                )
+            else:
+                compact_indices = owner_indices
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
@@ -348,6 +359,8 @@ class DSATrtllmAttention(TrtllmAttention):
             ):
                 return None
 
+        if _NVFP4_OWNER_WORKLIST and metadata._nvfp4_owner_worklist is not None:
+            metadata._nvfp4_owner_worklist.record_remap(leader, slot, batched)
         return batched[slot]
 
     def sparse_kv_predict(
