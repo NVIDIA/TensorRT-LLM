@@ -16,6 +16,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
+from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
@@ -1004,6 +1005,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        self.py_kv_hints: Optional[KvHintsSnapshot] = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1673,6 +1675,7 @@ def executor_request_to_llm_request(
                                                   None)
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
+    llm_request.py_kv_hints = getattr(executor_request, "py_kv_hints", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

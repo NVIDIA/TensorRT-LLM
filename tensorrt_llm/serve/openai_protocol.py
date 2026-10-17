@@ -54,6 +54,8 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.kv_hints import KvHintsEnvelope
+from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
@@ -150,6 +152,25 @@ def _logit_bias_to_embedding_bias(
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("kv_hints", mode="before", check_fields=False)
+    @classmethod
+    def admit_hint_envelope(cls, value: Any) -> Optional[KvHintsEnvelope]:
+        """Apply optional-hint admission before nested schema validation.
+
+        Args:
+            value: The decoded hint field from a trusted ingress.
+
+        Returns:
+            Supported metadata or None for ignored hints.
+
+        Raises:
+            ValueError: Known-version metadata is malformed.
+        """
+        try:
+            return admit_kv_hints(value)
+        except TypeError as error:
+            raise ValueError(str(error)) from error
 
 
 class SpeculativeDecodingStats(OpenAIBaseModel):
@@ -637,6 +658,11 @@ def _record_sampling_params_request_fields(
 
 
 class CompletionRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
@@ -1069,6 +1095,11 @@ class ChatCompletionThinkingParam(OpenAIBaseModel):
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -1505,6 +1536,11 @@ def _materialize_validator_iterators(value, _depth=0):
 
 
 class ResponsesRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
     #
