@@ -2854,6 +2854,14 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
+            from .mtp_tail_trim import (can_pack_draft_argmax,
+                                        gather_draft_argmax_pairs,
+                                        mtp_tail_trim_enabled)
+            if mtp_tail_trim_enabled() and can_pack_draft_argmax(logits):
+                # Fuse the local reduction and pair packing; keep the TP
+                # collective and rank-major result layout unchanged.
+                gathered = gather_draft_argmax_pairs(logits, mapping)
+                return self._get_draft_tokens_from_gathered(gathered)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
