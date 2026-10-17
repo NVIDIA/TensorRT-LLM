@@ -136,6 +136,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
+    mCudaContext.enterForTeardown();
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
 }
 

@@ -45,7 +45,8 @@ void checkOutsideCapture(CudaStream stream)
 } // namespace
 
 Batch::Batch(std::shared_ptr<KvCacheManager> manager, int maxRows, int maxBlocks, int maxBeamWidth)
-    : mManager(std::move(manager))
+    : mCudaContext(manager ? manager->cudaContext() : nullptr)
+    , mManager(std::move(manager))
     , mMaxRows(maxRows)
     , mMaxBlocks(maxBlocks)
     , mMaxBeamWidth(maxBeamWidth)
@@ -79,6 +80,7 @@ Batch::Batch(std::shared_ptr<KvCacheManager> manager, int maxRows, int maxBlocks
 
 Batch::~Batch()
 {
+    mCudaContext.enterForTeardown();
     KVCM2_POISON_ON_EXCEPT(
         [this]()
         {

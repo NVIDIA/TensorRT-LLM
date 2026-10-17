@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/cudaContext.h"
 #include "kv_cache_manager_v2/utils/poison.h"
 #include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
@@ -386,6 +387,12 @@ public:
     // See AGENTS.md ("Concurrency model") for the rationale, the granularity trade-off and the
     // rules for adding new APIs, and utils/reentrantSharedMutex.h for the lock's semantics.
 
+    //! The CUDA context this manager's resources belong to: the one current when it was built.
+    [[nodiscard]] CUcontext cudaContext() const noexcept
+    {
+        return mCudaContext.context();
+    }
+
     //! Exclusive lock for mutating APIs. Held by KvCache too, via its owning manager.
     [[nodiscard]] ReentrantSharedMutex::Guard lockExclusive() const
     {
@@ -406,6 +413,9 @@ private:
     // First member, so the registration covers the whole lifetime: it is taken before any state
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
+
+    // Before every member whose destruction calls the CUDA driver; see CudaContextBinding.
+    CudaContextBinding mCudaContext;
 
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;

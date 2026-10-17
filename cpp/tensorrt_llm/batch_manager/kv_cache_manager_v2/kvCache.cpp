@@ -57,6 +57,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats)
     : id(mId)
+    , mCudaContext(manager.cudaContext())
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
@@ -114,6 +115,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
 KvCache::~KvCache()
 {
+    mCudaContext.enterForTeardown();
     KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
@@ -2548,7 +2550,8 @@ void KvCache::stopCommitting()
 // ---------------------------------------------------------------------------
 
 PlannedDropHandle::PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages)
-    : mManager(manager.shared_from_this())
+    : mCudaContext(manager.cudaContext())
+    , mManager(manager.shared_from_this())
 {
     // Exclusive: mutates pages reachable from the radix tree and copies non-atomic refcounts.
     auto const apiLock = mManager->lockExclusive();
@@ -2607,6 +2610,7 @@ void PlannedDropHandle::drop()
 
 PlannedDropHandle::~PlannedDropHandle()
 {
+    mCudaContext.enterForTeardown();
     if (mPageRefs.has_value())
     {
         // Mirror Python's __del__: apply the plan if not already dropped.
