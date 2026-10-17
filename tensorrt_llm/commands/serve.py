@@ -1596,7 +1596,8 @@ def serve(
                     raise click.ClickException(
                         f"Failed to import OpenEngine support: {error}. "
                         "Restore the required gRPC runtime with `python -m pip "
-                        "install \"grpcio>=1.67.1,<2\"`.") from error
+                        "install \"grpcio>=1.73.1,<2\" "
+                        "\"grpcio-health-checking>=1.73.1,<1.82\"`.") from error
 
                 grpc_multi_frontend = _init_multi_frontend_mode(llm_args,
                                                                 enabled=True)

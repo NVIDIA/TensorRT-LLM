@@ -168,8 +168,6 @@ class OpenEngineServer:
                     "KV events are configured but the loaded engine has no streaming publisher; "
                     "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
                 )
-        await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
-        await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
         await self._server.start()
         await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
         await self._refresh_inference_health()
