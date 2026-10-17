@@ -61,7 +61,15 @@ from ..modules.fused_ops.rmsnorm_residual_add import (
 )
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
-from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ..modules.linear import (
+    Linear,
+    TensorParallelMode,
+    UnquantizedLinearMethod,
+    WeightMode,
+    WeightsLoadingConfig,
+    _should_apply_low_m_gemm,
+)
+from ..modules.low_m_gemm import apply_low_m_gemm
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
@@ -138,6 +146,48 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
         return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(gate_x)
     gate, x = gate_x.chunk(2, dim=-1)
     return nn.functional.gelu(gate, approximate="tanh") * x
+
+
+class _Gemma4SharedKVLinearMethod(UnquantizedLinearMethod):
+    """Compute shared K/V once for unquantized decode and prefill projections."""
+
+    def __init__(self, original: UnquantizedLinearMethod, q_size: int, kv_size: int) -> None:
+        self.original = original
+        self.q_size = q_size
+        self.kv_size = kv_size
+
+    def cache_derived_state(self, module: Linear) -> None:
+        self.original.cache_derived_state(module)
+
+    def transform_weights(self, module: Linear) -> None:
+        self.original.transform_weights(module)
+
+    def apply(
+        self, module: Linear, input: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        # Preserve independent K/V biases and weight gradients, and explicitly
+        # selected GEMM backends. The low-M dispatcher checks its own inputs;
+        # otherwise F.linear handles the unquantized tensor dtype and layout.
+        if (
+            bias is not None
+            or module.use_custom_cublas_mm
+            or module.use_cute_dsl_bf16_gemm
+            or torch.is_grad_enabled()
+        ):
+            return self.original.apply(module, input, bias)
+        # The Gemma4 weight mapper duplicates k_proj into v_proj for these
+        # layers. Slice the current parameter so reloads need no weight cache.
+        # q_size/kv_size describe this rank's shard, including replicated KV
+        # heads when TP exceeds the number of KV heads. LoRA is added by the
+        # caller after this base projection; its K/V updates need not be tied.
+        weight = module.weight[: self.q_size + self.kv_size]
+        output = None
+        if _should_apply_low_m_gemm(input):
+            output = apply_low_m_gemm(module, input, weight, None)
+        if output is None:
+            output = F.linear(input, weight)
+        # Materialize separate K/V storage before independent LoRA additions.
+        return torch.cat((output, output[..., self.q_size :]), dim=-1)
 
 
 class _Gemma4GeluQuantMLP(GatedMLP):
@@ -419,20 +469,39 @@ class Gemma4Attention(QKNormRoPEAttention):
         # unfused path below stays as the reference / fallback.
         self._fused_qkv_prep: Optional[bool] = None
         self._fused_qkv_prep_out_fp8 = False
+        self._fused_qkv_prep_out_kv_fp8 = False
         self._fused_prep_blocked = False
+
+    def cache_derived_state(self) -> None:
+        if self.is_kv_shared or not self.use_k_eq_v:
+            return
+        projection = self.qkv_proj
+        if type(projection.quant_method) is UnquantizedLinearMethod:
+            projection.quant_method = _Gemma4SharedKVLinearMethod(
+                projection.quant_method, self.q_size, self.kv_size
+            )
+            logger.info_once(
+                "Gemma4 projection: shared K/V compute reuse enabled",
+                key="gemma4_shared_kv",
+            )
+
+    def post_load_weights(self) -> None:
+        # Deferred mixed-precision loading determines the final linear method.
+        self.cache_derived_state()
 
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
-            use_flashinfer_fp8 = getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+            flashinfer_backend = getattr(self.attn, "flashinfer_backend", None)
+            use_flashinfer = flashinfer_backend in ("trtllm-gen", "fa2")
             use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
-                # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
-                # TRTLLM instead consumes the kernel's packed BF16 output.
-                and (use_flashinfer_fp8 or use_trtllm_bf16)
+                # FA2 keeps Q in BF16 and quantizes only K/V. Native TRTLLM
+                # consumes packed BF16; trtllm-gen consumes separate FP8 Q/K/V.
+                and (use_flashinfer or use_trtllm_bf16)
                 and getattr(self.attn, "has_fp8_kv_cache", False)
                 and rot is not None
                 and getattr(rot, "is_neox", False)
@@ -443,15 +512,16 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and rot.rotary_cos_sin.shape[1] == 2
                 and rot.rotary_cos_sin.shape[2] * 2 == self.head_dim
                 and rot.rotary_cos_sin.is_contiguous()
-                # Triton's reduction and tile ranges require powers of two.
-                and self.head_dim > 0
+                # Eight-element norm vectors and power-of-two Triton reductions.
+                and self.head_dim >= 8
                 and self.head_dim & (self.head_dim - 1) == 0
                 and self.q_norm.weight.shape == (self.head_dim,)
                 and self.k_norm.weight.shape == (self.head_dim,)
                 and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
                 and self.q_norm.variance_epsilon == self.v_norm.variance_epsilon
             )
-            self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8
+            self._fused_qkv_prep_out_fp8 = flashinfer_backend == "trtllm-gen"
+            self._fused_qkv_prep_out_kv_fp8 = use_flashinfer
         return self._fused_qkv_prep
 
     def apply_rope(
@@ -504,6 +574,7 @@ class Gemma4Attention(QKNormRoPEAttention):
                     self.head_dim,
                     out_fp8=self._fused_qkv_prep_out_fp8,
                     packed_output=self._use_trtllm_fused_qkv_prep,
+                    out_kv_fp8=self._fused_qkv_prep_out_kv_fp8,
                 )
 
             q, k, v = self.split_qkv(q, k, v)
