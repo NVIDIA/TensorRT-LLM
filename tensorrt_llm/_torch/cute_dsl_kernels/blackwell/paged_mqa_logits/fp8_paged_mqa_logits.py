@@ -202,6 +202,7 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        weight_cache_limit: int | None = None,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -216,6 +217,9 @@ class FP8MQALogitsKernel:
         self.early_tmem_copy = early_tmem_copy
         self.smem_subpartition_opt = smem_subpartition_opt
         self.num_heads = num_heads
+        if weight_cache_limit is not None and (weight_cache_limit <= 0 or weight_cache_limit % 4):
+            raise ValueError("weight_cache_limit must be a positive multiple of four")
+        self.weight_cache_limit = num_heads if weight_cache_limit is None else weight_cache_limit
         self.head_dim = head_dim
         self.next_n = next_n
         self.N = next_n * num_heads
@@ -1282,7 +1286,7 @@ class FP8MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads, self.weight_cache_limit)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
@@ -1517,7 +1521,7 @@ class FP8MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads, self.weight_cache_limit)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
