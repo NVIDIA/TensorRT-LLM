@@ -778,7 +778,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         in-graph, so a request using one cannot be sampled there at all.
         """
         return (
-            request._py_embedding_bias_1d is not None
+            request.py_embedding_bias is not None
             or bool(getattr(request, "py_bad_words", None))
             or bool(getattr(request, "py_no_repeat_ngram_size", None))
             or has_occurrence_penalty(request)

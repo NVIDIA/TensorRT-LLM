@@ -22,6 +22,24 @@ model_path = llm_models_root() / default_model_name
 
 
 @pytest.mark.cpu_only
+def test_embedding_bias_sparse_to_dense():
+    vocab_size = 123
+    embedding_bias = ((1, -0.5), (42, -2.0))
+    dense_bias = BaseWorker._embedding_bias_sparse_to_dense(
+        embedding_bias,
+        vocab_size=vocab_size,
+    )
+    assert dense_bias.shape == (vocab_size, )
+    for idx, val in embedding_bias:
+        assert dense_bias[idx] == val
+    idx_nz = set(idx for idx, _ in embedding_bias)
+    for idx in range(vocab_size):
+        if idx in idx_nz:
+            continue
+        assert dense_bias[idx] == 0
+
+
+@pytest.mark.cpu_only
 def test_enqueue_request_wraps_lora_load_error():
 
     class LoraManager:
