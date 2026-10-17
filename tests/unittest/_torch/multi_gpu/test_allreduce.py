@@ -23,11 +23,14 @@ from mpi4py import MPI
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import (AutoTuner, OptimizationProfile,
+                                           autotune)
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
                                              MiniMaxAllReduceRMS, MoEAllReduce,
                                              MoEAllReduceParams)
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -318,6 +321,64 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
     )
     for r in results:
         assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 1,
+                    reason="Requires a GPU to read the SM version")
+@pytest.mark.parametrize("num_tokens", [8, 2048, 8192],
+                         ids=lambda x: f"tokens:{x}")
+@pytest.mark.parametrize("hidden_size", [512, 4096],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize(
+    "fusion_op",
+    [
+        pytest.param(AllReduceFusionOp.NONE, id="none"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                     id="residual_rms_norm"),
+        pytest.param(AllReduceFusionOp.RMS_NORM, id="rms_norm"),
+    ],
+)
+def test_allreduce_tactics_match_auto_for_fused_patterns(
+        num_tokens, hidden_size, fusion_op):
+    """The tuner must not offer NCCL against the fusion kernels on latency alone.
+
+    NCCL/NCCL_SYMMETRIC reduce across ranks in the native dtype and normalize in
+    a separate kernel, while ONESHOT/TWOSHOT reduce in fp32 inside the fusion
+    kernel, so for a fused pattern they are not interchangeable candidates.
+    Pin the candidate set to the tuned AUTO table's own choice per shape.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+
+    tp_size = 8
+    runner = AllReduceRunner(tp_size, list(range(tp_size)), torch.bfloat16,
+                             int(fusion_op), 1e-5, True)
+    # device="meta" so no allocation is needed; get_valid_tactics only reads the
+    # shape and element size. A GPU is still required for the SM-version query.
+    input = torch.empty((num_tokens, hidden_size),
+                        dtype=torch.bfloat16,
+                        device="meta")
+    if input.numel() * input.element_size(
+    ) > CustomAllReduceHelper.max_workspace_size_auto(
+            tp_size, support_deterministic=False):
+        pytest.skip("Message exceeds the fusion workspace, so only the NCCL "
+                    "variants are offered regardless of the fusion op.")
+
+    # Stated independently of the runner's own constant, so a wrong set there
+    # cannot make this assertion agree with itself.
+    nccl_tactics = {
+        AllReduceStrategy.NCCL.value,
+        AllReduceStrategy.NCCL_SYMMETRIC.value,
+    }
+    tactics = set(runner.get_valid_tactics([input], OptimizationProfile()))
+    assert AllReduceStrategy.ONESHOT.value in tactics
+    assert (AllReduceStrategy.TWOSHOT.value in tactics) == (num_tokens
+                                                            >= tp_size)
+
+    expect_nccl = (fusion_op == AllReduceFusionOp.NONE
+                   or torch.ops.trtllm.allreduce_auto_strategy(
+                       num_tokens, hidden_size, int(fusion_op),
+                       tp_size) in nccl_tactics)
+    assert bool(tactics & nccl_tactics) == expect_nccl
 
 
 @torch.inference_mode()
