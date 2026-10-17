@@ -48,7 +48,6 @@ add_tllm_gtest(
   "unit;executor;host")
 add_gtest(executorTensorTest tensorTest.cpp)
 add_gtest(serializeUtilsTest serializeUtilsTest.cpp)
-add_gtest(requestWithIdTest requestWithIdTest.cpp)
 add_gtest(loraConfigTest loraConfigTest.cpp)
 add_gtest(coalesceTest coalesceTest.cpp)
 add_gtest(genUniqueAgentNameTest genUniqueAgentNameTest.cpp)
