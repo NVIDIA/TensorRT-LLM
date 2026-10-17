@@ -109,5 +109,5 @@ def test_l0_artifact_download_retries_overwrite_archive() -> None:
         if "wget -nv" in line and "llmTarfile" in line
     ]
 
-    assert len(download_commands) == 4
+    assert len(download_commands) == 5
     assert all("wget -nv -O" in command for command in download_commands)
