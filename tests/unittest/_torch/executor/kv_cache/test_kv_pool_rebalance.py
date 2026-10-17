@@ -34,12 +34,15 @@ isolation -- it is spread across three points inside
 ``test_py_executor.py`` does for the PP scheduling path.
 """
 
+from types import MethodType
 from unittest.mock import MagicMock, call
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager, OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -474,6 +477,58 @@ class TestConsumePreviousBatch:
         exe._flush_pending_transfer_responses.assert_called_once()
         exe._process_previous_batch.assert_called_once()
         exe.perf_manager.compute_batch_gpu_times.assert_called_once()
+        assert exe.previous_batch is None
+
+    def test_flushes_pending_buffered_kv_events(self) -> None:
+        calls = []
+
+        def gather(local_events: list) -> list:
+            calls.append("kv_event_allgather")
+            return [local_events, []]
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.event_manager = KVCacheEventManager(
+            max_kv_event_entries=8, attention_dp_rank=0, attention_dp_gather=gather
+        )
+        manager.event_manager.add_created_event([1])
+        prev = MagicMock()
+        exe = _make_executor(previous_batch=prev, enable_attention_dp=True, tp_size=2)
+        exe.enable_kv_cache_events = True
+        exe._is_kv_manager_v2 = True
+        exe.kv_cache_manager = manager
+        exe.enable_early_first_token_response = False
+        exe.enable_iter_perf_stats = False
+        exe.resource_manager.resource_managers = {ResourceManagerType.KV_CACHE_MANAGER: manager}
+        exe._update_v2_generation_resources = MethodType(
+            PyExecutor._update_v2_generation_resources, exe
+        )
+        exe._process_previous_batch = lambda: PyExecutor._process_previous_batch(exe)
+        exe._add_kv_cache_events = lambda: PyExecutor._add_kv_cache_events(exe)
+
+        def update_generation_resources(*args) -> None:
+            exe._handle_responses.assert_not_called()
+            manager.event_manager.add_created_event([2])
+
+        def update_resources(*args, skip_kv_cache_manager: bool) -> None:
+            assert skip_kv_cache_manager is True
+            manager.update_resources.assert_called_once()
+            exe._handle_responses.assert_called_once()
+            calls.append("update_resources")
+
+        manager.update_resources = MagicMock(side_effect=update_generation_resources)
+        exe.resource_manager.update_resources.side_effect = update_resources
+        exe.perf_manager = MagicMock()
+        exe.perf_manager.compute_batch_gpu_times.side_effect = lambda requests: calls.append(
+            "compute_batch_gpu_times"
+        )
+
+        PyExecutor._consume_previous_batch_for_rebalance(exe)
+
+        assert calls == ["update_resources", "kv_event_allgather", "compute_batch_gpu_times"]
+        events = manager.get_latest_events(timeout_ms=0)
+        assert len(events) == 2
+        assert [event.data.num_blocks_per_cache_level for event in events] == [[1], [2]]
+        assert manager.get_latest_events(timeout_ms=0) == []
         assert exe.previous_batch is None
 
 
