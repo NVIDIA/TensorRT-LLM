@@ -3038,6 +3038,29 @@ def test_attention_uses_native_mxfp8_projections_only_on_sm100_and_sm103():
     torch.cuda.empty_cache()
 
 
+# The CSA2 module can only be built on a GPU, so this records the projection
+# the adapter requests instead of constructing it.
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((9, 0), "bf16"), ((10, 0), "mxfp8"), ((10, 3), "mxfp8"), ((12, 0), "bf16")],
+)
+def test_attention_projection_quantization_follows_device_capability(
+    monkeypatch, capability, expected
+):
+    requested = []
+
+    def record_csa2_init(self, *args, projection_quantization, **kwargs):
+        nn.Module.__init__(self)
+        requested.append(projection_quantization)
+        self.o_b_proj = SimpleNamespace()
+
+    model_config, _ = _tiny_v41_model_config()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(v41.CSA2Attention, "__init__", record_csa2_init)
+    DeepseekV41Attention(model_config, layer_idx=0)
+    assert requested == [expected]
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize("strategy", ["AUTO", "NCCL"])
 def test_attention_adapter_preserves_model_allreduce_strategy(strategy):
