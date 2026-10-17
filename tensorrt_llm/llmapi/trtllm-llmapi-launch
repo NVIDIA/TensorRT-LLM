@@ -189,6 +189,33 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
     log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
 }
 
+# Ask the MPI Comm server started by mgmn_leader_node to shut down. Importing
+# tensorrt_llm here would load torch, the custom ops and the LLM API and
+# initialize MPI just to send one message, so the message is sent with pyzmq
+# directly. Its framing must match tensorrt_llm.executor.ipc.ZeroMqQueue: the
+# pickled None followed by its HMAC-SHA256 under the session key.
+function stop_mgmn_leader_node {
+    python3 - <<'PY'
+import hashlib
+import hmac
+import os
+import pickle
+import sys
+
+import zmq
+
+address = os.environ["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"]
+hmac_key = bytes.fromhex(os.environ["TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"])
+message = pickle.dumps(None)
+try:
+    with zmq.Context() as context, context.socket(zmq.PAIR) as socket:
+        socket.connect(address)
+        socket.send(message + hmac.new(hmac_key, message, hashlib.sha256).digest())
+except zmq.ZMQError as error:
+    sys.stderr.write(f"Failed to send MPI Comm server shutdown: {error}\n")
+PY
+}
+
 
 tllm_mpi_size=$(mpi_world_size)
 export tllm_mpi_size
@@ -245,7 +272,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
         # Stop the MPI Comm server
-        run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
+        run_child_command stop_mgmn_leader_node
         mpi_exit_code=$?
         log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
 
