@@ -46,11 +46,17 @@ from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (
     convert_to_token_sharded_tp,
 )
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
+    Fp8BlockScaledActivation,
     TokenShardedSequenceSharder,
     TokenShardedTP,
+    fp8_block_scale_prequant_ok,
+    fp8_scale_cols,
+    fp8_scales_mn_major,
+    quantize_fp8_block,
     quantize_nvfp4,
     swizzled_sf_numel,
 )
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -120,6 +126,13 @@ def _requires_blackwell():
         pytest.skip("NVFP4 quantize/GEMM requires SM100+")
 
 
+def _requires_sm100f():
+    # The rule (fp8_block_scale_prequant_ok) and the pinned quantizer need the SM100 family;
+    # SM120 is Blackwell too but takes neither.
+    if not torch.cuda.is_available() or not is_sm_100f():
+        pytest.skip("The FP8 block-scale DeepGEMM path requires an SM100-family GPU")
+
+
 # =============================================================================
 # Reference helpers (identical on all ranks)
 # =============================================================================
@@ -127,6 +140,9 @@ def _requires_blackwell():
 # (B, S): unpadded, a rank straddling the sample boundary, interior padding (B >= 2),
 # tail padding (B = 1) with fully padded ranks at tp = 4, and a longer sequence.
 _SHAPES = [(1, 8), (1, 5), (2, 5), (2, 8), (3, 7), (2, 256)]
+# FP8 block scales also: unpadded m with m % 4 != 0 and m % 128 != 0 (418 -> 209 at tp 2,
+# 420 -> 105 at tp 4, 53 at tp 8).
+_FP8_SHAPES = _SHAPES + [(1, 418), (1, 420)]
 
 
 def _real_row_mask(plan, device):
@@ -222,6 +238,51 @@ def _logic_all_gather(rank, world_size, device):
         ok = torch.equal(x_loc, padded_rows(x, plan)[rows])
         ok = torch.equal(tp.all_gather(x_loc), x.reshape(b * s, -1)) and ok
         _check(ok, f"plain all_gather {(b, s)}", device)
+
+
+# =============================================================================
+# all_gather of an FP8 block-scale pair (bytes + packed scales, re-laid MN-major)
+# =============================================================================
+
+
+def _fp8_shards(b, s, k, plan, gen):
+    """A global FP8 payload + packed scales and this rank's shard of them, as the quantizer
+    returns them (fp8 ``[m, K]``, MN-major int32 ``[m, P]``); token-pad rows are poisoned."""
+    cols = fp8_scale_cols(k)
+    payload = torch.randint(0, 256, (b, s, k), dtype=torch.uint8, generator=gen)
+    scales = torch.randint(0, 2**31 - 1, (b, s, cols), generator=gen).to(torch.int32)
+    payload_pad, scales_pad = padded_rows(payload, plan), padded_rows(scales, plan)
+    real = padded_rows(torch.ones(b, s, 1, dtype=torch.bool), plan)[:, 0]
+    payload_pad[~real] = 0xAB
+    scales_pad[~real] = -7
+    rows = slice(plan.row_start, plan.row_start + plan.local_rows)
+    loc = Fp8BlockScaledActivation(
+        payload_pad[rows].view(torch.float8_e4m3fn), fp8_scales_mn_major(scales_pad[rows])
+    )
+    return payload.reshape(b * s, k), scales.reshape(b * s, cols), loc
+
+
+def _logic_all_gather_fp8(rank, world_size, device):
+    for row_align in (1, 4):
+        tp = TokenShardedTP(dist.group.WORLD, row_align=row_align)
+        for b, s in _FP8_SHAPES:
+            plan = tp.begin(b, s)
+            n, g = len(plan.entry_batch), plan.rows_per_entry
+            for k in (128, 640):  # P = 1 and 2 packed scale columns
+                gen = torch.Generator().manual_seed(b * 100 + s + k + row_align)
+                payload, scales, loc = _fp8_shards(b, s, k, plan, gen)
+                loc = Fp8BlockScaledActivation(loc.fp8.to(device), loc.scale.to(device))
+                given = Fp8BlockScaledActivation(loc.fp8.view(n, g, k), loc.scale)  # [n, g, K]
+                for got in (tp.all_gather(loc), tp.gather_input(None, given)):
+                    ok = (
+                        isinstance(got, Fp8BlockScaledActivation)
+                        and got.fp8.dtype == torch.float8_e4m3fn
+                        and torch.equal(got.fp8.view(torch.uint8).cpu(), payload)
+                        and got.scale.dtype == torch.int32
+                        and torch.equal(got.scale.cpu(), scales)
+                        and got.scale.stride() == (1, pad_up(b * s, 4))
+                    )
+                    _check(ok, f"FP8 all_gather {(b, s, k)} row_align={row_align}", device)
 
 
 # =============================================================================
@@ -495,6 +556,224 @@ def _logic_adapters_nvfp4(rank, world_size, device):
 
 
 # =============================================================================
+# Converted FP8 block-scale column Linear / MLP == the same modules on all rows (NCCL)
+# =============================================================================
+
+
+def _fp8_block_checkpoint(weight):
+    """128x128 block-scale FP8 layout for a bf16 [N, K] weight (N, K multiples of 128): the
+    ``weight`` / ``weight_scale`` pair ``FP8BlockScalesLinearMethod`` loads."""
+    n, k = weight.shape
+    blocks = weight.float().view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
+    scale = blocks.abs().amax(dim=(2, 3), keepdim=True).clamp(min=1e-12) / 448.0
+    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return {
+        "weight": q.permute(0, 2, 1, 3).reshape(n, k),
+        "weight_scale": scale.reshape(n // 128, k // 128),
+    }
+
+
+def _fp8_quant_tactics(x):
+    """``(pinned, cuda, triton)`` packed 1x128 quantizations of bf16 ``[M, K]`` ``x``: the
+    helper's, and the two tactics the Linear's ``fp8_swap_ab_gemm`` autotunes between."""
+    from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils import fp8_quantize
+
+    pinned = quantize_fp8_block(x)
+    cuda = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, False)
+    a, sf = fp8_quantize.triton_fp8_quantize_1x128(x, use_ue8m0=True)
+    triton = (a, deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf.transpose(0, 1)))
+    return pinned, cuda, triton
+
+
+def _same_quant(p, q):
+    return torch.equal(p[0], q[0]) and torch.equal(p[1], q[1])
+
+
+def _logic_fp8_quant_tactics(rank, world_size, device):
+    """The pinned quantize is the CUDA tactic, bitwise; whether the Triton tactic agrees is
+    reported (the stock path is bitwise with the gathered bytes only when it does)."""
+    for m, k in ((8, 128), (209, 256), (105, 640), (4096, 5120)):
+        x = (torch.randn(m, k, generator=torch.Generator().manual_seed(m + k)) * 3).to(
+            device, torch.bfloat16
+        )
+        pinned, cuda, triton = _fp8_quant_tactics(x)
+        ok = (
+            _same_quant(pinned, cuda)
+            and pinned.fp8.shape == (m, k)
+            and pinned.scale.shape == (m, fp8_scale_cols(k))
+            and pinned.scale.stride() == (1, pad_up(m, 4))
+        )
+        _check(ok, f"pinned FP8 quantize == CUDA tactic {(m, k)}", device)
+        agree = torch.tensor([int(_same_quant(triton, cuda))], device=device)
+        dist.all_reduce(agree, op=dist.ReduceOp.MIN)
+        if rank == 0:
+            print(
+                f"FP8_QUANT_TACTICS m={m} k={k} triton_equals_cuda={bool(agree.item())}",
+                flush=True,
+            )
+
+
+def _logic_adapters_fp8_block_scales(rank, world_size, device):
+    """Converted real FP8 block-scale modules (DeepGEMM path): a column projection and an MLP
+    fed this rank's bf16 rows quantize them to FP8 + packed scales before the all-gather, so
+    the GEMMs see exactly the bytes they would quantize themselves on all rows: the column
+    output is bitwise equal to the plain Linear's (untuned, and after autotuning unless the
+    tuner picked the Triton quantizer and it disagrees with the CUDA one, which is reported);
+    a BF16 consumer never receives the pair."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.mlp import MLP
+
+    k_in, n_out = 256, 128 * world_size
+    torch.manual_seed(5)
+    weight = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
+    bias = torch.randn(n_out, dtype=torch.bfloat16) * 0.1
+    w_up = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
+    w_down = torch.randn(k_in, n_out, dtype=torch.bfloat16) * 0.05
+    ckpt_col = {**_fp8_block_checkpoint(weight), "bias": bias}
+    ckpt_up, ckpt_down = _fp8_block_checkpoint(w_up), _fp8_block_checkpoint(w_down)
+    mapping = _mapping(rank, world_size)
+    fp8bs = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+
+    def build():
+        col = Linear(
+            k_in,
+            n_out,
+            bias=True,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+            quant_config=fp8bs,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            reduce_output=False,
+        ).to(device)
+        config = ModelConfig(
+            mapping=mapping, allreduce_strategy=AllReduceStrategy.NCCL, quant_config=fp8bs
+        )
+        mlp = MLP(
+            hidden_size=k_in,
+            intermediate_size=n_out,
+            bias=False,
+            activation=gelu_tanh,  # Wan's FFN activation
+            dtype=torch.bfloat16,
+            config=config,
+        ).to(device)
+        return col, mlp
+
+    def load(col, mlp):
+        col.load_weights([ckpt_col])
+        mlp.up_proj.load_weights([ckpt_up])
+        mlp.down_proj.load_weights([ckpt_down])
+        for lin in (col, mlp.up_proj, mlp.down_proj):
+            lin.post_load_weights()
+
+    col_ref, mlp_ref = build()
+    load(col_ref, mlp_ref)
+    _check(
+        fp8_block_scale_prequant_ok(col_ref) and fp8_block_scale_prequant_ok(mlp_ref.up_proj),
+        "the FP8 block-scale rule engages on this GPU",
+        device,
+    )
+    adapters = {}
+    for row_align in (1, 4):
+        col, mlp = build()
+        tp = TokenShardedTP(dist.group.WORLD, row_align=row_align)
+        convert_to_token_sharded_tp(_as_model(col=col, mlp=mlp), tp, exceptions={"col": "column"})
+        load(col, mlp)
+        adapters[row_align] = (tp, col)
+        moved = _spy_all_gather(tp)
+        for b, s in _FP8_SHAPES:
+            x = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
+                device, torch.bfloat16
+            )
+            x2d = x.reshape(b * s, k_in)
+            h_ref = col_ref(x2d).view(b, s, -1)  # today's path: the Linear quantizes all rows
+            u_ref = mlp_ref.up_proj(x2d)
+            f_ref = mlp_ref(x2d).view(b, s, -1)  # all-reduced
+            plan = tp.begin(b, s)
+            x_loc = tp.local_view(tp.shard(x))
+            h = col(x_loc)
+            a = moved[-1]
+            ok = (
+                isinstance(a, Fp8BlockScaledActivation)
+                and a.fp8.dtype == torch.float8_e4m3fn
+                and a.fp8.shape == (plan.local_rows, k_in)
+                and 2 * a.fp8.numel() * a.fp8.element_size()
+                == x_loc.numel() * x_loc.element_size()  # half the bf16 bytes
+                and a.scale.shape == (plan.local_rows, fp8_scale_cols(k_in))
+                and torch.equal(h, h_ref)
+            )
+            _check(ok, f"FP8 column adapter {(b, s)} row_align={row_align}", device)
+            # The MLP's up-projection on the gathered pair (what TokenShardedMLP feeds it).
+            u = mlp.up_proj(tp.gather_input(mlp.up_proj, x_loc))
+            _check(
+                isinstance(moved[-1], Fp8BlockScaledActivation) and torch.equal(u, u_ref),
+                f"FP8 up_proj {(b, s)} row_align={row_align}",
+                device,
+            )
+            f = mlp(x_loc).reshape(plan.local_rows, -1)
+            _check(
+                isinstance(moved[-1], Fp8BlockScaledActivation), f"FP8 MLP gather {(b, s)}", device
+            )
+            mask = _real_row_mask(plan, device)
+            mine = slice(plan.row_start, plan.row_start + plan.local_rows)
+            _check_close(
+                f[mask],
+                padded_rows(f_ref, plan)[mine][mask],
+                device,
+                2e-2,
+                2e-2,
+                f"FP8 MLP {(b, s)}",
+            )
+    # Today's path after VisualGen's warmup: the Linear autotunes its quantizer per row count
+    # and may switch to the Triton kernel at large M. The gathered FP8 (pinned to the CUDA
+    # kernel) then matches the tuned Linear bitwise exactly when the two kernels agree.
+    from tensorrt_llm._torch.autotuner import autotune
+
+    tp, col = adapters[1]  # the served plans: from_model_config leaves row_align at 1
+    b, s = 2, 4096
+    x = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
+        device, torch.bfloat16
+    )
+    x2d = x.reshape(b * s, k_in)
+    _, cuda, triton = _fp8_quant_tactics(x2d)
+    agree = torch.tensor([int(_same_quant(triton, cuda))], device=device)
+    dist.all_reduce(agree, op=dist.ReduceOp.MIN)
+    with autotune(skip_dynamic_tuning_buckets=True):  # as the VisualGen pipeline warms up
+        col_ref(x2d)
+    h_ref_tuned = col_ref(x2d).view(b, s, -1)
+    tp.begin(b, s)
+    h = col(tp.local_view(tp.shard(x)))
+    equal_tuned = torch.equal(h, h_ref_tuned)
+    if rank == 0:
+        print(
+            f"FP8_TUNED_REFERENCE m={b * s} k={k_in} equal_tuned={equal_tuned} "
+            f"triton_equals_cuda={bool(agree.item())}",
+            flush=True,
+        )
+    _check(
+        equal_tuned or not bool(agree.item()),
+        "the autotuned FP8 Linear differs from the gathered-FP8 path although the Triton and "
+        "CUDA quantizers agree on this input",
+        device,
+    )
+    bf16_col = Linear(
+        k_in,
+        n_out,
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        reduce_output=False,
+    ).to(device)
+    plan = tp.begin(2, 8)
+    pair = quantize_fp8_block(
+        torch.randn(plan.local_rows, k_in, device=device, dtype=torch.bfloat16)
+    )
+    with pytest.raises(ValueError, match="not an FP8 block-scale Linear on the DeepGEMM path"):
+        tp.gather_input(bf16_col, pair)
+
+
+# =============================================================================
 # torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain
 # =============================================================================
 
@@ -662,6 +941,119 @@ def _logic_cuda_graph(rank, world_size, device):
 
 
 # =============================================================================
+# The same, with an FP8 block-scale consumer (FP8 + scales all-gather)
+# =============================================================================
+
+
+def _fp8_chain_parts(rank, world_size, device, d=256, n_col=128):
+    """A converted FP8 block-scale column Linear (gathers FP8 + packed scales) and a converted
+    bf16 row Linear (reduce-scatters)."""
+    torch.manual_seed(4)
+    col_w = torch.randn(n_col * world_size, d, dtype=torch.bfloat16) * 0.05
+    col = Linear(
+        d,
+        n_col * world_size,
+        bias=True,
+        dtype=torch.bfloat16,
+        mapping=_mapping(rank, world_size),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        reduce_output=False,
+    ).to(device)
+    _, row = _boundary_chain_parts(rank, world_size, device, d, n_col)
+    tp = _helper()
+    convert_to_token_sharded_tp(_as_model(col=col, row=row), tp, exceptions={"col": "column"})
+    col.load_weights([{**_fp8_block_checkpoint(col_w), "bias": torch.zeros(n_col * world_size)}])
+    col.post_load_weights()
+    return tp, col, row
+
+
+def _make_fp8_chain(tp, col, row):
+    """AdaLN norm (row-local) -> converted FP8 block-scale column Linear on a given bf16 input
+    (FP8 + scales all-gather, then DeepGEMM) -> converted row Linear -> gated residual, plus
+    the quantize + gather of that input on its own."""
+
+    def chain(x_loc, table, h_given):
+        d = x_loc.shape[-1]
+        shift, scale, gate = tp.per_sample_table(table)[:, :, None].unbind(1)  # [n, 1, D] each
+        h = (F.layer_norm(x_loc.float(), (d,)) * (1 + scale) + shift).to(x_loc.dtype)
+        q = col(h_given)  # all tokens, this rank's features; exact input -> bitwise GEMM
+        x = (h.float() + row(q).float() * gate).to(x_loc.dtype)
+        g = tp.all_gather(quantize_fp8_block(h_given))
+        return x, q, g.fp8, g.scale
+
+    return chain
+
+
+def _fp8_chain_inputs(tp, b, s, d, device):
+    gen = torch.Generator().manual_seed(b * 11 + s)
+    x = torch.randn(b, s, d, generator=gen).to(device, torch.bfloat16)
+    table = torch.randn(b, 3, d, generator=gen).to(device) * 0.1
+    x_loc = tp.local_view(tp.shard(x))
+    h_given = (torch.randn(*x_loc.shape, generator=gen) * 2).to(device, torch.bfloat16)
+    return x_loc, table, h_given
+
+
+def _logic_compile_fullgraph_fp8(rank, world_size, device):
+    import torch._dynamo
+
+    d = 256
+    tp, col, row = _fp8_chain_parts(rank, world_size, device, d)
+    chain = _make_fp8_chain(tp, col, row)
+
+    def compare(got, ref, b, s, what):
+        # The residual carries the Inductor-fused LayerNorm: bf16 resolution.
+        _check_close(got[0], ref[0], device, 1e-2, 1e-2, f"{what} residual {(b, s)}")
+        # The GEMM on the gathered FP8 pair and the pair itself: bitwise. Values only: Inductor
+        # lays the gathered scale out with strides (1, M), which the GEMM runner re-strides.
+        ok = all(torch.equal(g, r) for g, r in zip(got[1:], ref[1:]))
+        _check(ok, f"{what} FP8 gather + GEMM {(b, s)}", device)
+
+    for b, s in [(2, 256), (2, 5), (1, 5), (1, 418)]:  # m % 4 == 0 and != 0, padded
+        tp.begin(b, s)
+        args = _fp8_chain_inputs(tp, b, s, d, device)
+        torch._dynamo.reset()
+        compiled = torch.compile(chain, fullgraph=True)  # raises on any graph break
+        compare(compiled(*args), chain(*args), b, s, "compiled")
+
+    torch._dynamo.reset()
+    compiled = torch.compile(chain, fullgraph=True)
+    for b, s in [(2, 256), (1, 5), (2, 256)]:
+        tp.begin(b, s)
+        args = _fp8_chain_inputs(tp, b, s, d, device)
+        compare(compiled(*args), chain(*args), b, s, "recompiled")
+
+
+def _logic_cuda_graph_fp8(rank, world_size, device):
+    d = 256
+    tp, col, row = _fp8_chain_parts(rank, world_size, device, d)
+    chain = _make_fp8_chain(tp, col, row)
+    for b, s in [(2, 256), (2, 5), (1, 5), (1, 418)]:
+        tp.begin(b, s)
+        args = _fp8_chain_inputs(tp, b, s, d, device)
+        static_args = [a.clone() for a in args]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):  # eager warmups (as CUDAGraphRunner.WARMUP_STEPS)
+                chain(*static_args)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = chain(*static_args)
+        new_args = [args[0] * 0.5 + 0.25, args[1] * 0.5, args[2] * 0.75 - 0.5]
+        for dst, src in zip(static_args, new_args):
+            dst.copy_(src)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = chain(*new_args)
+        ok = all(torch.equal(got_t, ref_t) for got_t, ref_t in zip(static_out, ref))
+        _check(ok, f"FP8 CUDA graph replay vs eager {(b, s)}", device)
+        del graph
+
+
+# =============================================================================
 # Sharder round trip and adapters vs the full computation (exact)
 # =============================================================================
 #
@@ -786,6 +1178,7 @@ _WORLD_SIZES = [2, 3, 4]
 _LOGIC_CHECKS = (
     _logic_reduce_scatter,
     _logic_all_gather,
+    _logic_all_gather_fp8,
     _logic_rank_disagreement,
     _logic_layout_round_trip,
     _logic_adapters,
@@ -794,6 +1187,9 @@ _LOGIC_CHECKS = (
 _KERNEL_CHECKS = (_logic_fp4_quantize_gather, _logic_real_adapters, _logic_adapters_nvfp4)
 # torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain.
 _GRAPH_CHECKS = (_logic_compile_fullgraph, _logic_cuda_graph)
+# The FP8 block-scale gather: real DeepGEMM Linear / MLP, the quantize tactics, and the graphs.
+_FP8_KERNEL_CHECKS = (_logic_fp8_quant_tactics, _logic_adapters_fp8_block_scales)
+_FP8_GRAPH_CHECKS = (_logic_compile_fullgraph_fp8, _logic_cuda_graph_fp8)
 
 
 def _run_checks(rank, world_size, device, checks):
@@ -823,6 +1219,13 @@ def test_logic_nccl():
 def test_kernels_nccl(world_size):
     _requires_blackwell()
     checks = _KERNEL_CHECKS + (_GRAPH_CHECKS if world_size == 2 else ())
+    _run(world_size, _checks(*checks), "nccl")
+
+
+@pytest.mark.parametrize("world_size", [2, 3, 4, 8])
+def test_fp8_block_scales_nccl(world_size):
+    _requires_sm100f()
+    checks = _FP8_KERNEL_CHECKS + (_FP8_GRAPH_CHECKS if world_size == 2 else ())
     _run(world_size, _checks(*checks), "nccl")
 
 
