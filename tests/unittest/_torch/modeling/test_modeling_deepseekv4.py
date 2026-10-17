@@ -593,8 +593,7 @@ def _deepseek_v4_mtp_spec_config(num_nextn_predict_layers):
     "dense_dtype,mtp_dtype,dense_algo,dense_group,mtp_algo,mtp_group",
     [
         # ModelOpt experts-only NVFP4 repack: dense re-quantized to NVFP4 (U8),
-        # MTP left at the base model's MXFP4 (I8). This is the layout that
-        # crashed fused_moe load_quant_scales before the split detection.
+        # MTP left at the base model's MXFP4 (I8).
         ("U8", "I8", QuantAlgo.NVFP4, 16, QuantAlgo.W4A8_MXFP4_MXFP8, 32),
         # Inverse direction, to pin that neither layout is hard-coded.
         ("I8", "U8", QuantAlgo.W4A8_MXFP4_MXFP8, 32, QuantAlgo.NVFP4, 16),
