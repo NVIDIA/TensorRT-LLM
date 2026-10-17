@@ -2305,8 +2305,11 @@ def getPLCRepoUrlKey()
 {
     def repoUrlKey = "tensorrt_llm_github_sync"
     withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-        if (env.gitlabSourceRepoHttpUrl == DEFAULT_LLM_REPO) {
+        if (LLM_REPO == DEFAULT_LLM_REPO) {
             repoUrlKey = "tensorrt_llm_internal"
+        } else if (LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM.git" ||
+                   LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM") {
+            repoUrlKey = "tensorrt_llm_github"
         }
     }
     return repoUrlKey
