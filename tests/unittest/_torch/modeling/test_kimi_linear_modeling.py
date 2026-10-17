@@ -85,3 +85,22 @@ def test_kimi_k3_routed_expert_exclusion_outranks_the_checkpoint_entry() -> None
     assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
 
     assert resolve(model_config, 4) is per_layer
+
+
+def test_kimi_k3_latent_projection_uses_low_m_gemm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """dsv3_fused_a_gemm_op has no K3 latent shape (it would run cuBLAS split-K),
+    so decode-sized latent projections go to the low-M dispatcher first."""
+    projection = nn.Linear(16, 8, bias=False)
+    hidden = torch.randn(4, 16)
+    sentinel = torch.zeros(4, 8)
+    seen = []
+
+    def fake_apply(module, x, weight, bias):
+        seen.append((module, x, weight, bias))
+        return sentinel
+
+    monkeypatch.setattr(modeling_kimi_linear, "_should_apply_low_m_gemm", lambda x: True)
+    monkeypatch.setattr(modeling_kimi_linear, "apply_low_m_gemm", fake_apply)
+    out = modeling_kimi_linear.KimiK3MoERuntime._routed_projection(hidden, projection)
+    assert out is sentinel
+    assert seen == [(projection, hidden, projection.weight, None)]

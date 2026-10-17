@@ -34,6 +34,7 @@ from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
 from ..linear import Linear
+from ..low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
@@ -140,6 +141,10 @@ maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
 
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
+
+    # The fused [f_a | (g_a) | b] gate GEMM reads a plain weight tensor, so the
+    # low-M dispatcher's Linear scan needs this opt-in to reach it.
+    _low_m_gemm_opt_in = True
 
     def __init__(
         self,
@@ -558,7 +563,13 @@ class KimiKDALinearAttention(nn.Module):
         ``finalize_decode_weights`` to have published ``_bfa_proj_weight``.
         """
         hd, H = self.head_dim, self.num_heads
-        bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+        bfa = None
+        if _should_apply_low_m_gemm(x):
+            # Decode M: cuBLAS runs this narrow GEMM (N = 144) as split-K +
+            # splitKreduce; the low-M direct kernel needs one launch.
+            bfa = apply_low_m_gemm(self, x, self._bfa_proj_weight, None)
+        if bfa is None:
+            bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
         if self.use_full_rank_gate:
             return bfa[..., hd : hd + H], self.f_b_proj(bfa[..., :hd]), None
         beta = bfa[..., 2 * hd : 2 * hd + H]
