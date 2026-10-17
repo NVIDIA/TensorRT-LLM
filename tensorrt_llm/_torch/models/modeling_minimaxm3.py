@@ -72,7 +72,6 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
-from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
@@ -86,9 +85,12 @@ _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
 def _moe_routed_output_is_global(experts: nn.Module) -> bool:
-    """Return whether the selected MoE backend performs fused communication."""
-    backend = getattr(experts, "backend", experts)
-    return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
+    """Return whether the MoE layer hands back an already-combined routed output.
+
+    ``VanillaMoE`` is not an ``MoE`` subclass; it owns its communication, so
+    its output is always a rank partial.
+    """
+    return getattr(experts, "returns_global_routed_output", False)
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -729,6 +731,10 @@ class MiniMaxM3MoE(nn.Module):
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
             activation=self.moe_activation,
+            # Lets a FUSED_COMM backend return its globally combined routed
+            # output; ``routed_output_is_global`` then keeps it out of the
+            # external all-reduce.
+            accepts_global_routed_output=True,
         )
         self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Shared expert: dense MLP fused into MoE output. Constructed
