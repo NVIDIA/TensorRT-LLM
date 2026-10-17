@@ -1,16 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Multimodal utilities for handling images and other media types in TensorRT-LLM."""
+"""Common multimodal data contracts and layout operations.
+
+`MultimodalEncoderItemMetadata` describes request items. `MultimodalParams`
+references processed payloads and the `MultimodalRuntimeData` view for the
+current forward. `MultimodalInput` carries the executor boundary representation.
+`MultimodalItemPartition` describes item axes and packed ranges within payloads.
+Processor registration and encoder execution live outside this module.
+"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from itertools import accumulate
+from typing import (Any, Dict, List, NamedTuple, Optional, Sequence, Tuple,
+                    Union, cast)
 
 import numpy as np
 import torch
 from blake3 import blake3
 
 from tensorrt_llm._utils import maybe_pin_memory
-from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
+from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
+                                                 BaseModalityData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.logger import logger
 
@@ -22,6 +32,167 @@ MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
 _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
+
+
+class MultimodalItemPartition(NamedTuple):
+    """How one processed input is partitioned into multimodal items.
+
+    ``item_axis`` identifies the item axis of a batched tensor, or is ``None``
+    for a value shared by every item. Lists and tuples have item axis zero.
+    ``item_lengths`` partitions a packed tensor along that axis, for example
+    patch counts for vision or frame counts for audio. Lengths are host-side
+    metadata, independent of the payload tensor's device.
+    """
+
+    item_axis: int | None = 0
+    item_lengths: tuple[int, ...] | None = None
+
+    def select(self, value: Any, item_indices: Sequence[int]) -> Any:
+        """Select items in the requested order, preserving tensor dtype/device.
+
+        Contiguous selections of a packed tensor return a view. Other tensor
+        selections copy only the selected items; shared values retain identity.
+        """
+        if self.item_axis is None or value is None:
+            return value
+        indices = list(item_indices)
+        if isinstance(value, torch.Tensor):
+            if self.item_lengths is None:
+                if self.item_axis == 0:
+                    return value[indices]
+                index: list[slice | list[int]] = [slice(None)] * value.ndim
+                index[self.item_axis] = indices
+                return value[tuple(index)]
+
+            offsets = list(accumulate(self.item_lengths, initial=0))
+            if offsets[-1] != value.shape[self.item_axis]:
+                raise ValueError(
+                    "Packed field size does not match its item lengths")
+            if not indices:
+                return value.narrow(self.item_axis, 0, 0)
+            item_range = range(len(self.item_lengths))
+            indices = [item_range[i] for i in indices]
+            if indices == list(range(indices[0], indices[0] + len(indices))):
+                start = offsets[indices[0]]
+                if self.item_axis == 0:
+                    return value[start:offsets[indices[-1] + 1]]
+                return value.narrow(self.item_axis, start,
+                                    offsets[indices[-1] + 1] - start)
+            if self.item_axis == 0:
+                pieces = [value[offsets[i]:offsets[i + 1]] for i in indices]
+            else:
+                pieces = [
+                    value.narrow(self.item_axis, offsets[i],
+                                 self.item_lengths[i]) for i in indices
+                ]
+            return torch.cat(pieces, dim=self.item_axis)
+
+        if (isinstance(value, (list, tuple)) and self.item_axis == 0
+                and self.item_lengths is None):
+            return type(value)(value[i] for i in indices)
+        raise TypeError(
+            "Item fields must be tensors or lists/tuples on item axis zero")
+
+
+def select_multimodal_fields(
+    modality_data: dict[str, Any],
+    item_partitions: dict[str, MultimodalItemPartition],
+    item_indices: Sequence[int],
+) -> dict[str, Any]:
+    """Select declared fields; unlisted and shared fields pass through.
+
+    Optional fields absent from the payload are ignored. A model declares
+    every per-item field explicitly, so matching a tensor dimension to the
+    item count never changes a shared field's meaning.
+    """
+    selected = dict(modality_data)
+    for name, partition in item_partitions.items():
+        if name in modality_data:
+            selected[name] = partition.select(modality_data[name], item_indices)
+    return selected
+
+
+class MultimodalEncoderItemMetadata(NamedTuple):
+    """Prompt-ordered metadata shared by item scheduling and encoder assembly."""
+
+    item_refs: List[Tuple[str, int]]
+    """``(modality, local index)`` per atomic item, in prompt order.
+
+    The local index identifies the item within that modality's processed
+    payload. Legacy processors can supply `MultimodalParams.mm_item_order`
+    instead.
+    """
+
+    encoder_token_lengths: List[int]
+    """Physical attention-token cost charged to ``encoder_max_num_tokens``.
+
+    For Qwen ViTs this counts patch tokens before the spatial merger.
+    """
+
+    output_embedding_lengths: List[int]
+    """Output embedding rows per item, matching ``multimodal_embedding_lengths``.
+
+    These lengths split encoder outputs; they can differ from encoder cost
+    and from prompt token counts when only part of a placeholder is embedded.
+    """
+
+    def validate(self) -> None:
+        """Enforce the cross-field contract on producer-supplied metadata."""
+        if not all(isinstance(values, list) for values in self):
+            raise TypeError(
+                "Multimodal encoder item metadata fields must be lists")
+        lengths = self.encoder_token_lengths + self.output_embedding_lengths
+        if not all(isinstance(length, int) for length in lengths):
+            raise TypeError(
+                "Multimodal encoder item lengths must contain only integers")
+        if not (len(self.item_refs) == len(self.encoder_token_lengths) == len(
+                self.output_embedding_lengths)):
+            raise ValueError(
+                "Multimodal encoder item references and lengths must align")
+        if any(length <= 0 for length in self.encoder_token_lengths):
+            raise ValueError(
+                "Multimodal encoder token lengths must be positive")
+        if any(length <= 0 for length in self.output_embedding_lengths):
+            raise ValueError(
+                "Multimodal encoder output embedding lengths must be positive")
+
+    def select(self,
+               item_indices: Sequence[int]) -> "MultimodalEncoderItemMetadata":
+        """Select prompt-order items and rebase refs to their sliced payloads.
+
+        Each modality's payload must be sliced in the same selected-item order.
+        The source metadata remains owned by the original request.
+        """
+        local_counts: dict[str, int] = {}
+        item_refs = []
+        for i in item_indices:
+            modality = self.item_refs[i][0]
+            local_index = local_counts.get(modality, 0)
+            item_refs.append((modality, local_index))
+            local_counts[modality] = local_index + 1
+        return MultimodalEncoderItemMetadata(
+            item_refs,
+            [self.encoder_token_lengths[i] for i in item_indices],
+            [self.output_embedding_lengths[i] for i in item_indices],
+        )
+
+
+def get_multimodal_encoder_item_metadata(
+    multimodal_data: Optional[Dict[str, Any]],
+) -> Optional[MultimodalEncoderItemMetadata]:
+    """Return typed atomic-item metadata from Python multimodal data."""
+    if multimodal_data is None:
+        return None
+    if not isinstance(multimodal_data, dict):
+        raise TypeError("multimodal_data must be a dict")
+    metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    if metadata is None:
+        return None
+    if not isinstance(metadata, MultimodalEncoderItemMetadata):
+        raise TypeError(f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a "
+                        "MultimodalEncoderItemMetadata")
+    metadata.validate()
+    return metadata
 
 
 def _validate_int_list(values: Any, field_name: str) -> None:
@@ -176,7 +347,7 @@ def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
     raw modality dictionaries are no longer needed and must not be moved to
     GPU by the subsequent LLM input-preparation path.
     """
-    for modality in ("image", "video", "audio"):
+    for modality in MEDIA_MODALITIES:
         mm_data.pop(modality, None)
 
 
@@ -467,10 +638,12 @@ _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
 
 @dataclass
 class MultimodalParams:
-    """Unified container for multimodal parameters.
+    """Processed multimodal inputs and views used by model execution.
 
-    This class encapsulates all multimodal-related data that flows through the system,
-    providing a clean interface for handling multimodal inputs across different models.
+    `item_metadata` reads the request's shared item record from processed data;
+    `get_item_layout` resolves its prompt order, including legacy formats.
+    Runtime data describes the current forward or chunk rather than encoder
+    readiness and cache ownership, which remain on the executor request.
 
     Attributes:
         multimodal_input: Multimodal input data with hashing information.
@@ -535,6 +708,44 @@ class MultimodalParams:
         """Ensure default values are properly set."""
         if self.multimodal_data is None:
             self.multimodal_data = {}
+
+    @property
+    def item_metadata(self) -> Optional[MultimodalEncoderItemMetadata]:
+        """Atomic-item metadata stored in this request's processed data."""
+        return get_multimodal_encoder_item_metadata(self.multimodal_data)
+
+    def get_item_layout(self) -> tuple[list[tuple[str, int]], list[int]]:
+        """Resolve prompt-order item refs and output lengths for all modalities.
+
+        Typed metadata takes precedence. Legacy processors supply
+        ``mm_item_order`` and ``multimodal_embedding_lengths``; a request with
+        just one modality can omit the order.
+        """
+        metadata = self.item_metadata
+        if metadata is not None:
+            return metadata.item_refs, metadata.output_embedding_lengths
+
+        lengths = self.multimodal_data.get("multimodal_embedding_lengths") or []
+        if self.mm_item_order:
+            item_refs = cast(
+                list[tuple[str, int]],
+                [(entry["modality"], entry["index"])
+                 for entry in self.mm_item_order],
+            )
+            return item_refs, lengths
+
+        present = [
+            m for m in MEDIA_MODALITIES
+            if self.multimodal_data.get(m) is not None
+        ]
+        if len(present) > 1:
+            raise ValueError(
+                "Request with multiple modalities present "
+                f"({present}) must carry item metadata or mm_item_order on MultimodalParams."
+            )
+        if present:
+            return [(present[0], i) for i in range(len(lengths))], lengths
+        return [], []
 
     def _is_shared_tensor_dict(self, obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
