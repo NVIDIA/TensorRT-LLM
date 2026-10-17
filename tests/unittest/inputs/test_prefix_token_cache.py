@@ -15,6 +15,8 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers, trainers
+from transformers import PreTrainedTokenizerFast
 
 from tensorrt_llm.inputs import prefix_token_cache
 from tensorrt_llm.inputs.prefix_token_cache import (
@@ -24,6 +26,7 @@ from tensorrt_llm.inputs.prefix_token_cache import (
 )
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.tokenizer import TransformersTokenizer
 
 
 def _tok_id(token: str) -> int:
@@ -275,6 +278,76 @@ def test_create_raises_on_invalid_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", "many")
     with pytest.raises(ValueError):
         create_prefix_token_cache(_MergeTokenizer())
+
+
+# --- Piecewise mode ----------------------------------------------------------
+
+_MARKERS = ("<|system|>", "<|user|>", "<|assistant|>", "<|end|>")
+
+
+def _bpe_tokenizer(
+    pre_tokenizer=None, markers: tuple[str, ...] = _MARKERS, **marker_options: bool
+) -> PreTrainedTokenizerFast:
+    """A small trained BPE with chat-template markers as added tokens."""
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizer or pre_tokenizers.ByteLevel(add_prefix_space=False)
+    trainer = trainers.BpeTrainer(
+        vocab_size=400, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+    )
+    tokenizer.train_from_iterator(_turns(20), trainer)
+    tokenizer.add_special_tokens([AddedToken(m, **marker_options) for m in markers])
+    return PreTrainedTokenizerFast(tokenizer_object=tokenizer)
+
+
+def _chat(messages: list[str]) -> str:
+    """A chat prompt; adding a message extends the previous prompt."""
+    turns = "re: ok<|end|>".join(f"<|user|>{m}<|end|><|assistant|>" for m in messages)
+    return f"<|system|>{_PREAMBLE}<|end|>{turns}"
+
+
+def test_piecewise_growth_and_edits_are_identical_to_full_tokenization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
+    tokenizer = _bpe_tokenizer()
+    cache = create_prefix_token_cache(TransformersTokenizer(tokenizer))
+    assert cache is not None and cache._pieces is not None
+    messages = [f"turn {i}: thé cd inner answer aber {i} thereabouts." for i in range(8)]
+    prompts = [_chat(messages[: i + 1]) for i in range(len(messages))]
+    # An edited history and a reordered conversation share pieces but not the prefix.
+    prompts += [_chat(["edited", *messages[1:]]), _chat(messages[::-1])]
+    for prompt in prompts:
+        expected = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        assert cache.encode(tokenizer, prompt) == expected
+    assert cache.hits == len(messages) - 1
+
+
+def test_piecewise_keeps_offsets_splice_for_prompts_not_ending_near_an_added_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
+    tokenizer = _bpe_tokenizer()
+    cache = create_prefix_token_cache(tokenizer)
+    # Plain-text turns after one leading marker, as in templates without added-token roles.
+    for prompt in _turns(8, preamble="<|system|>" + _PREAMBLE * 3):
+        expected = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        assert cache.encode(tokenizer, prompt) == expected
+    assert cache.hits > 0
+    assert not any(entry.piecewise for entry in cache._entries.values())
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(rstrip=True),
+        dict(pre_tokenizer=pre_tokenizers.Metaspace(prepend_scheme="first")),
+        dict(markers=(*_MARKERS, "a<|end|>b")),
+    ],
+    ids=["marker-strips-spaces", "metaspace-first", "marker-inside-marker"],
+)
+def test_piecewise_is_off_when_pieces_depend_on_their_neighbours(options: dict) -> None:
+    cache = create_prefix_token_cache(_bpe_tokenizer(**options))
+    assert cache is not None and cache._pieces is None
 
 
 # --- DefaultInputProcessor integration --------------------------------------
