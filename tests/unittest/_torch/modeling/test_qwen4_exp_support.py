@@ -445,7 +445,7 @@ def test_shared_expert_finalize_defers_only_when_no_collective_follows(
     # deferring stays sound above TP1.
     block.mapping.tp_size = 2
     block.enable_attention_dp = True
-    monkeypatch.setattr(modeling_qwen3_next, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(modeling_qwen3_next, "is_sm_120f", lambda: False)
     deferred_adp = block(
         hidden_states,
         metadata,

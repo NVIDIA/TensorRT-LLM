@@ -115,7 +115,7 @@ def lora_setup(root_dir, cpp_resources_dir, python_exe):
 @pytest.fixture(scope="session")
 def build_google_tests(request, build_type):
 
-    cuda_arch = f"{request.param}-real"
+    cuda_arch = f"{request.param}"
 
     _logger.info(f"Using CUDA arch: {cuda_arch}")
 
@@ -144,7 +144,7 @@ def build_kv_cache_compression_tests(request, build_type):
     The binary uses NO_TLLM_LINKAGE, so this skips the full-library
     build that build_google_tests pays for.
     """
-    cuda_arch = f"{request.param}-real"
+    cuda_arch = f"{request.param}"
 
     _logger.info(f"Using CUDA arch: {cuda_arch}")
 

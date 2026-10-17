@@ -121,7 +121,7 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
         break;
     }
 #else
-    TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
+    TLLM_THROW("Please recompile with support for hopper by passing 90 as an arch to build_wheel.py.");
 #endif
 }
 

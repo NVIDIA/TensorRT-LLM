@@ -1235,6 +1235,12 @@ def is_sm_100f(sm_version=None):
     return sm_version >= 100 and sm_version < 110
 
 
+def is_sm_120f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version >= 120 and sm_version < 130
+
+
 def get_gpu_device_list():
     "get device list"
     with tempfile.TemporaryDirectory() as temp_dirname:
@@ -1318,7 +1324,7 @@ skip_no_mxfp4_swizzle = pytest.mark.skipif(
     check_device_contain(["H20"]) and not check_device_contain(["H200"]),
     reason="nvbugs/5446119: MXFP4 swizzle not supported on H20")
 
-skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+skip_no_sm120 = pytest.mark.skipif(not is_sm_120f(),
                                    reason="This test is for SM120")
 
 skip_arm = pytest.mark.skipif(

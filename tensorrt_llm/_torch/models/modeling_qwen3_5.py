@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -455,11 +455,12 @@ def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     cfg = qcd.get("lm_head")
     pretrained = model_config.pretrained_config
     mapping = model_config.mapping
+    sm = get_sm_version()
     return (
         cfg is not None
         and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
         and _has_nvfp4_gemm_block_width(cfg)
-        and get_sm_version() in (100, 103, 120)
+        and (is_sm_100f(sm) or is_sm_120f(sm))
         and not getattr(pretrained, "tie_word_embeddings", False)
         and not mapping.enable_attention_dp
         and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0

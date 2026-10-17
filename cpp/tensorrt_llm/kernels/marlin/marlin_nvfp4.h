@@ -32,7 +32,7 @@ inline bool isMarlinNvfp4SmSupported(int sm)
 
 inline bool isMarlinNvfp4DenseSmSupported(int sm)
 {
-    return isMarlinNvfp4SmSupported(sm) || sm == 120 || sm == 121;
+    return isMarlinNvfp4SmSupported(sm) || (sm >= 120 && sm < 130);
 }
 
 void dequantFp4Activations(

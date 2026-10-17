@@ -36,7 +36,7 @@ From the top-level directory call:
 
 ```bash
 CPP_BUILD_DIR=cpp/build
-python3 scripts/build_wheel.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR}
+python3 scripts/build_wheel.py -a "80;86" --build_dir ${CPP_BUILD_DIR}
 pip install -r requirements-dev.txt
 pip install build/tensorrt_llm*.whl
 cd $CPP_BUILD_DIR && make -j$(nproc) google-tests

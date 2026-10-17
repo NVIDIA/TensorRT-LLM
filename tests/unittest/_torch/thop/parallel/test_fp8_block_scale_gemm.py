@@ -21,7 +21,7 @@ import pytest
 import torch
 from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0)
-from utils.util import getSMVersion, isSM100Family
+from utils.util import getSMVersion, isSM100Family, isSM120Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -91,7 +91,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
 
-    if getSMVersion() == 120:
+    if isSM120Family():
         act_a_fp8, act_a_sf = fp8_utils.per_token_quant_and_transform(a)
         act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
         act_b_sf = fp8_utils.transform_sf_into_required_layout(
@@ -163,7 +163,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90 and getSMVersion() != 89 and getSMVersion() != 120,
+    getSMVersion() not in (90, 89, 120),
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),
 )
@@ -189,7 +189,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
     b = torch.randn((num_groups, n, k), device='cuda', dtype=dtype) / k
 
-    if getSMVersion() == 120:
+    if isSM120Family():
         a_fp8, a_scales = fp8_utils.per_token_quant_and_transform(
             a, need_permute102=True)
         b_fp8, b_scales = per_block_cast_to_fp8_e8m0(b)
@@ -223,7 +223,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 120,
+    not isSM120Family(),
     reason="The test is for SM120 only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

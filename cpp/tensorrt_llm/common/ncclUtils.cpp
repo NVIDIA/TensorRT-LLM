@@ -96,11 +96,11 @@ namespace
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 constexpr int kNcclWindowMinRuntimeVersion = NCCL_VERSION(2, 28, 0);
 constexpr int kNcclGb10WindowFixedVersion = NCCL_VERSION(2, 30, 4);
-constexpr int kGb10RealSmVersion = 121;
+constexpr int kGb10SmVersion = 121;
 
-bool isGb10Platform(int realSmVersion, bool isIntegrated)
+bool isGb10Platform(int smVersion, bool isIntegrated)
 {
-    return realSmVersion == kGb10RealSmVersion && isIntegrated;
+    return smVersion == kGb10SmVersion && isIntegrated;
 }
 #endif
 
@@ -150,27 +150,27 @@ bool queryNcclWindowSupported()
         return false;
     }
 
-    int realSmVersion = -1;
+    int smVersion = -1;
     try
     {
-        realSmVersion = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true);
+        smVersion = tensorrt_llm::common::getSMVersion();
     }
     catch (std::exception const& e)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Failed to query real CUDA SM version while checking NCCL window support: %s; falling back "
+            "[NCCLUtil] Failed to query CUDA SM version while checking NCCL window support: %s; falling back "
             "to regular tensors.",
             e.what());
         return false;
     }
 
-    bool const supported = !isGb10Platform(realSmVersion, isIntegrated != 0);
+    bool const supported = !isGb10Platform(smVersion, isIntegrated != 0);
     if (!supported)
     {
         TLLM_LOG_WARNING(
             "[NCCLUtil] Disabling NCCL window buffers on integrated SM %d with NCCL runtime version %d.%d.%d; "
             "GB10 requires NCCL 2.30.4 or newer for symmetric window registration.",
-            realSmVersion, version / 10000, (version % 10000) / 100, version % 100);
+            smVersion, version / 10000, (version % 10000) / 100, version % 100);
     }
     return supported;
 #else
@@ -180,7 +180,7 @@ bool queryNcclWindowSupported()
 
 } // namespace
 
-bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion)
+bool isNcclWindowSupportedForPlatform(int smVersion, bool isIntegrated, int ncclRuntimeVersion)
 {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     if (ncclRuntimeVersion < kNcclWindowMinRuntimeVersion)
@@ -188,9 +188,9 @@ bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int 
         return false;
     }
 
-    return !(ncclRuntimeVersion < kNcclGb10WindowFixedVersion && isGb10Platform(realSmVersion, isIntegrated));
+    return !(ncclRuntimeVersion < kNcclGb10WindowFixedVersion && isGb10Platform(smVersion, isIntegrated));
 #else
-    (void) realSmVersion;
+    (void) smVersion;
     (void) isIntegrated;
     (void) ncclRuntimeVersion;
     return false;

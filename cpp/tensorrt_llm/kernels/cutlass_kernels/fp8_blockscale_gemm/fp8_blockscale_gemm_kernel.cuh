@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -817,7 +817,7 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
         gemm_dispatch_sm89(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
         return;
     }
-    if (arch == 120)
+    if (tensorrt_llm::common::isSM120Family(arch))
     {
         gemm_dispatch_sm120(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
         return;
@@ -980,7 +980,7 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
 
     int arch = tensorrt_llm::common::getSMVersion();
 
-    if (arch == 120)
+    if (tensorrt_llm::common::isSM120Family(arch))
     {
         if (internal_quantize_a)
         {
@@ -1176,7 +1176,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
             scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream);
         return;
     }
-    if (arch == 120)
+    if (tensorrt_llm::common::isSM120Family(arch))
     {
         strided_batch_gemm_dispatch_sm120(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
             scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream);

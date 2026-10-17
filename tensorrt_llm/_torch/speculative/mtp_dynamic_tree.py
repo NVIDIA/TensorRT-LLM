@@ -21,7 +21,7 @@ import torch
 import triton
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed.ops import allgather
@@ -173,9 +173,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._mask_repack_buf = torch.zeros(
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
-        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no repack.
+        # SM100 family: prepareCustomMask keeps padded 3D; no repack.
         sm = get_sm_version()
-        self._needs_mask_repack = sm < 100 or sm in (120, 121)
+        self._needs_mask_repack = not is_sm_100f(sm)
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
