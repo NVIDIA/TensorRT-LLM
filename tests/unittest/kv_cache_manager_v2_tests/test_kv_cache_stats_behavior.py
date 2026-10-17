@@ -52,6 +52,7 @@ class _StatsRequest:
     is_last_context_chunk: bool = True
     is_encoder_init_state: bool = False
     is_dummy_request: bool = False
+    is_context_only_request: bool = False
     is_attention_dp_dummy: bool = False
     is_cuda_graph_dummy: bool = False
     is_disagg_generation_init_state: bool = False
