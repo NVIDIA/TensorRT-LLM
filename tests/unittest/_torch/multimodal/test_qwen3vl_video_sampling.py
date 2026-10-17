@@ -9,6 +9,7 @@ CUDA, model weights, or the model module's GPU kernel imports.
 import ast
 import copy
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -228,3 +229,58 @@ def test_no_source_mapping_retains_legacy_sampling_duration(adapter, processor):
     result = _run(adapter, processor, [video])
     assert result["video_grid_thw"][0, 0] == 2
     assert list(result["video_metadata"][0].frames_indices) == [0, 13, 26, 39]
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, [0.5, 2.5, 4.5, 6.5]),
+        ({"num_frames": 4}, [1.0, 6.0]),
+        ({"do_sample_frames": False}, [0.5, 2.5, 4.5, 6.5]),
+    ],
+)
+def test_prompt_contains_source_timestamps(adapter, processor, monkeypatch, kwargs, expected):
+    prompts = []
+    tokenize = type(processor.tokenizer).__call__
+
+    def capture_prompt(tokenizer, text=None, **tokenizer_kwargs):
+        prompts.extend(text)
+        return tokenize(tokenizer, text=text, **tokenizer_kwargs)
+
+    monkeypatch.setattr(type(processor.tokenizer), "__call__", capture_prompt)
+    _run(adapter, processor, [_video(list(range(0, 192, 24)))], **kwargs)
+    timestamps = re.findall(r"<([0-9.]+) seconds>", prompts[0])
+    assert [float(timestamp) for timestamp in timestamps] == pytest.approx(expected)
+
+
+def test_explicit_fps_uses_duration_without_source_frame_count(adapter, processor):
+    video = _video(np.linspace(0, 239, 40).astype(int).tolist())
+    del video.metadata["total_num_frames"]
+    result = _run(adapter, processor, [video], fps=2)
+    assert result["video_grid_thw"][0, 0] == 10
+    selected = np.linspace(0, 39, 20).round().astype(int)
+    assert list(result["video_metadata"][0].frames_indices) == [
+        video.metadata["frames_indices"][i] for i in selected
+    ]
+    assert result["video_metadata"][0].fps == 24.0
+
+
+@pytest.mark.parametrize("kwargs", [{"num_frames": 40}, {"fps": 4}])
+def test_matching_target_preserves_all_source_frames(adapter, processor, kwargs):
+    video = _video(np.linspace(0, 239, 40).astype(int).tolist())
+    result = _run(adapter, processor, [video], **kwargs)
+    assert result["video_grid_thw"][0, 0] == 20
+    assert list(result["video_metadata"][0].frames_indices) == video.metadata["frames_indices"]
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"num_frames": 8}])
+def test_preprocessing_does_not_mutate_request_or_frames(adapter, processor, kwargs):
+    video = _video(np.linspace(0, 239, 40).astype(int).tolist())
+    request = {"return_metadata": True, "do_normalize": False, **kwargs}
+    original_kwargs = copy.deepcopy(request)
+    original_frames = torch.stack(video.frames).clone()
+    adapter.preprocess(
+        SimpleNamespace(processor=processor), "<|video_pad|>", {"video": [video]}, request
+    )
+    assert request == original_kwargs
+    assert torch.equal(torch.stack(video.frames), original_frames)
