@@ -10,7 +10,7 @@
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace
@@ -79,6 +80,13 @@ void fillPattern(char* data, size_t bytes, uint64_t seed)
     }
 }
 
+//! Returns true iff TRTLLM_KV_CACHE_FORCE_SM_COPY is set to "1".
+bool forceSMCopyEnvSet()
+{
+    char const* v = std::getenv("TRTLLM_KV_CACHE_FORCE_SM_COPY");
+    return v != nullptr && std::string(v) == "1";
+}
+
 // ---------------------------------------------------------------------------
 // Path selection tests
 // ---------------------------------------------------------------------------
@@ -96,21 +104,28 @@ void fillPattern(char* data, size_t bytes, uint64_t seed)
 
 TEST(KvCacheManagerV2BatchedPageCopierTest, DefaultPathPrefersCopyEngine)
 {
-    // On a clean CI run with TRTLLM_KV_CACHE_FORCE_SM_COPY unset, the default must be copy engine
-    // whenever chunked host registration is off. We cannot assert chunked state here because it
-    // depends on the running kernel, but we can assert the invariant: if chunked registration is
-    // NOT in force then the copy engine must be selected, regardless of link type.
+    // The decision tree (see selectKernelViable in batchedPageCopy.cu):
+    //   1. TRTLLM_KV_CACHE_FORCE_SM_COPY=1  → SM kernel (opt-in escape hatch)
+    //   2. Chunked host registration        → SM kernel (copy-engine descriptors cannot cross
+    //                                         registration boundaries)
+    //   3. Otherwise                        → copy engine
+    //
+    // We check both conditions explicitly here so the test passes whether or not CI sets
+    // TRTLLM_KV_CACHE_FORCE_SM_COPY=1 on a non-chunked host.
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
     bool const chunked = HostMem::shouldUseChunkedRegistration();
+    bool const forceSM = forceSMCopyEnvSet();
+    bool const expectsKernel = chunked || forceSM;
+
     BatchedPageCopier copier;
 
-    if (!chunked)
+    if (!expectsKernel)
     {
-        // Non-chunked + no env var → copy engine is the only valid default.
+        // Non-chunked + no force env → copy engine is the only valid default.
         EXPECT_FALSE(copier.kernelEnabled())
-            << "expected copy engine path when chunked registration is off; "
-               "coherentLink="
+            << "expected copy engine path when chunked registration is off and "
+               "TRTLLM_KV_CACHE_FORCE_SM_COPY is unset; coherentLink="
             << copier.topology().coherentLink
             << " (NVLink-C2C used to force the SM kernel unconditionally, which caused "
                "CUDA-graph replay idle gaps)";
@@ -118,8 +133,9 @@ TEST(KvCacheManagerV2BatchedPageCopierTest, DefaultPathPrefersCopyEngine)
     }
     else
     {
-        // Chunked registration forbids the copy engine regardless of env/link.
-        EXPECT_TRUE(copier.kernelEnabled()) << "expected SM kernel when host registration is chunked";
+        // Either chunked registration or force env forbids the copy engine.
+        EXPECT_TRUE(copier.kernelEnabled())
+            << "expected SM kernel (chunked=" << chunked << ", forceSM=" << forceSM << ")";
         EXPECT_EQ(copier.pageIndexLocation(), PageIndexLocation::kDevice);
     }
 }
@@ -160,20 +176,46 @@ void roundTripAndCheck(CopyDirection dir, uint64_t seed)
     BatchedPageCopier copier;
     auto const cfg = copier.config(dir);
 
-    // Allocate pools: source and destination in device memory, mirrored in pinned host for H2D.
-    CudaAllocation deviceSrc = allocateCudaChecked(kNumPages * kDstSrcStride);
-    CudaAllocation deviceDst = allocateCudaChecked(kNumPages * kDstSrcStride);
-    PinnedAllocation hostSrc = allocatePinnedChecked(kNumPages * kBytesPerPage);
-    PinnedAllocation hostDst = allocatePinnedChecked(kNumPages * kBytesPerPage);
+    // Allocate pools. Device pools are sized by stride; host pools must match the strided layout
+    // so every page at offset pageIndex * stride is reachable (page 63 lives at offset 63*8192
+    // which is well past kNumPages * kBytesPerPage).
+    size_t const poolBytes = kNumPages * kDstSrcStride;
+    CudaAllocation deviceSrc = allocateCudaChecked(poolBytes);
+    CudaAllocation deviceDst = allocateCudaChecked(poolBytes);
+    PinnedAllocation hostSrc = allocatePinnedChecked(poolBytes);
+    PinnedAllocation hostDst = allocatePinnedChecked(poolBytes);
 
-    // Fill source (device for D2H test, host for H2D test).
+    // Fill source. Generate the per-page pattern in a contiguous host buffer, then place each
+    // page at its correct stride offset in the source pool so the copier reads/writes the right
+    // bytes at srcStride = dstStride = kDstSrcStride. A contiguous cudaMemcpy does not apply
+    // the pool stride, so we must build a strided staging buffer for D2H or index stride offsets
+    // directly in hostSrc for H2D. Writing through a CPU pointer into cudaMalloc'd memory is also
+    // invalid; D2H staging always goes via cudaMemcpy.
+    std::vector<char> patternBuf(kNumPages * kBytesPerPage);
+    fillPattern(patternBuf.data(), patternBuf.size(), seed);
+
     if (dir == CopyDirection::kD2H)
     {
-        fillPattern(reinterpret_cast<char*>(deviceSrc.get()), kNumPages * kBytesPerPage, seed);
+        // Build a strided host staging buffer matching deviceSrc layout, then transfer it down.
+        std::vector<char> stridedSrc(poolBytes, 0);
+        for (size_t i = 0; i < kNumPages; ++i)
+        {
+            std::memcpy(stridedSrc.data() + i * kDstSrcStride,
+                patternBuf.data() + i * kBytesPerPage, kBytesPerPage);
+        }
+        ASSERT_EQ(cudaMemcpy(deviceSrc.get(), stridedSrc.data(), poolBytes, cudaMemcpyHostToDevice),
+            cudaSuccess);
     }
     else
     {
-        fillPattern(reinterpret_cast<char*>(hostSrc.get()), kNumPages * kBytesPerPage, seed);
+        // H2D: zero the pool, then place each page's pattern at its stride offset.
+        std::memset(hostSrc.get(), 0, poolBytes);
+        auto* hostSrcChars = reinterpret_cast<char*>(hostSrc.get());
+        for (size_t i = 0; i < kNumPages; ++i)
+        {
+            std::memcpy(hostSrcChars + i * kDstSrcStride,
+                patternBuf.data() + i * kBytesPerPage, kBytesPerPage);
+        }
     }
 
     // Build a simple identity page-index mapping (page i of pool src → page i of pool dst).
@@ -189,13 +231,12 @@ void roundTripAndCheck(CopyDirection dir, uint64_t seed)
     // The copy engine path builds descriptors on the CPU and therefore needs pairs in host memory;
     // the kernel path reads pairs from device memory. BatchedPageCopier::pageIndexLocation()
     // tells us which — but for our test we always keep pairs in host memory and adapt below.
-    CUdeviceptr pairsDev = 0;
+    void* pairsDevPtr = nullptr;
     if (copier.pageIndexLocation() == PageIndexLocation::kDevice)
     {
-        void* tmp = nullptr;
-        ASSERT_EQ(cudaMalloc(&tmp, pairs.size() * sizeof(PageIndexPair)), cudaSuccess);
-        pairsDev = reinterpret_cast<CUdeviceptr>(tmp);
-        ASSERT_EQ(cudaMemcpyAsync(pairsDev, pairs.data(), pairs.size() * sizeof(PageIndexPair),
+        ASSERT_EQ(cudaMalloc(&pairsDevPtr, pairs.size() * sizeof(PageIndexPair)), cudaSuccess);
+        // cudaMemcpyAsync needs a void* destination, not a CUdeviceptr integer.
+        ASSERT_EQ(cudaMemcpyAsync(pairsDevPtr, pairs.data(), pairs.size() * sizeof(PageIndexPair),
                       cudaMemcpyHostToDevice, stream),
             cudaSuccess);
     }
@@ -210,41 +251,51 @@ void roundTripAndCheck(CopyDirection dir, uint64_t seed)
     args.srcBase = reinterpret_cast<CUdeviceptr>(dir == CopyDirection::kD2H ? deviceSrc.get()
                                                                            : hostSrc.get());
     args.pairs = (copier.pageIndexLocation() == PageIndexLocation::kDevice)
-        ? reinterpret_cast<PageIndexPair const*>(pairsDev)
+        ? reinterpret_cast<PageIndexPair const*>(pairsDevPtr)
         : pairs.data();
 
     copier.launch(args, dir, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    // Verify: D2H means deviceSrc → hostDst, so hostDst must match deviceSrc.
-    // H2D means hostSrc → deviceDst, so deviceDst must match hostSrc.
+    // Verify: D2H means deviceSrc → hostDst, so hostDst must match the generated pattern.
+    // H2D means hostSrc (at strided offsets) → deviceDst, so deviceDst must match the pattern.
     if (dir == CopyDirection::kD2H)
     {
-        std::vector<char> expected(kNumPages * kBytesPerPage);
-        ASSERT_EQ(cudaMemcpy(expected.data(), deviceSrc.get(), expected.size(), cudaMemcpyDeviceToHost),
-            cudaSuccess);
         auto const* actual = reinterpret_cast<char const*>(hostDst.get());
-        for (size_t i = 0; i < expected.size(); ++i)
+        for (size_t i = 0; i < kNumPages; ++i)
         {
-            ASSERT_EQ(actual[i], expected[i]) << "byte mismatch at offset " << i;
+            char const* pageActual = actual + i * kDstSrcStride;
+            char const* pageExpected = patternBuf.data() + i * kBytesPerPage;
+            for (size_t b = 0; b < kBytesPerPage; ++b)
+            {
+                ASSERT_EQ(pageActual[b], pageExpected[b])
+                    << "byte mismatch at page " << i << " offset " << b;
+            }
         }
     }
     else
     {
-        std::vector<char> actual(kNumPages * kBytesPerPage);
-        ASSERT_EQ(cudaMemcpy(actual.data(), deviceDst.get(), actual.size(), cudaMemcpyDeviceToHost),
+        // Copier writes each page of deviceDst at offset i * dstStride. Read back the full
+        // strided pool and compare each page at its stride offset against the original pattern.
+        std::vector<char> actualPool(poolBytes);
+        ASSERT_EQ(cudaMemcpy(actualPool.data(), deviceDst.get(), poolBytes, cudaMemcpyDeviceToHost),
             cudaSuccess);
-        auto const* expected = reinterpret_cast<char const*>(hostSrc.get());
-        for (size_t i = 0; i < actual.size(); ++i)
+        for (size_t i = 0; i < kNumPages; ++i)
         {
-            ASSERT_EQ(actual[i], expected[i]) << "byte mismatch at offset " << i;
+            char const* pageActual = actualPool.data() + i * kDstSrcStride;
+            char const* pageExpected = patternBuf.data() + i * kBytesPerPage;
+            for (size_t b = 0; b < kBytesPerPage; ++b)
+            {
+                ASSERT_EQ(pageActual[b], pageExpected[b])
+                    << "byte mismatch at page " << i << " offset " << b;
+            }
         }
     }
 
     // Clean up device allocation for pairs if we made one.
-    if (pairsDev != 0)
+    if (pairsDevPtr != nullptr)
     {
-        cudaFree(reinterpret_cast<void*>(pairsDev));
+        cudaFree(pairsDevPtr);
     }
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
@@ -286,12 +337,25 @@ TEST(KvCacheManagerV2BatchedPageCopierTest, BothDirectionsProduceCorrectConfigs)
     EXPECT_EQ(onboard.threads, 128);
     EXPECT_EQ(onboard.ilp, 2);
 
-    // Offload uses 32 KiB in-flight, onboard uses 64 KiB (platform-independent knees).
-    EXPECT_EQ(offload.inFlightBytes, 32u * 1024u);
-    EXPECT_EQ(onboard.inFlightBytes, 64u * 1024u);
-
     // Path must match across both directions — we do not split offload/onboard between paths.
     EXPECT_EQ(offload.useKernel, onboard.useKernel);
+
+    if (offload.useKernel)
+    {
+        // Kernel path: offload uses 32 KiB in-flight, onboard uses 64 KiB (platform-independent knees).
+        EXPECT_EQ(offload.inFlightBytes, 32u * 1024u);
+        EXPECT_EQ(onboard.inFlightBytes, 64u * 1024u);
+        EXPECT_GT(offload.ctas, 0);
+        EXPECT_GT(onboard.ctas, 0);
+    }
+    else
+    {
+        // Copy-engine path: kernel sizing stays zeroed out.
+        EXPECT_EQ(offload.inFlightBytes, 0u);
+        EXPECT_EQ(onboard.inFlightBytes, 0u);
+        EXPECT_EQ(offload.ctas, 0);
+        EXPECT_EQ(onboard.ctas, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------

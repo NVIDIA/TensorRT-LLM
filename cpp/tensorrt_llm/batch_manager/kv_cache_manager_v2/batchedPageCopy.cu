@@ -818,9 +818,20 @@ void BatchedPageCopier::computeConfigs()
         config.threads = kThreads;
         config.ilp = kIlp;
         config.stages = stages;
+        config.useKernel = kernelViable;
+
+        if (!kernelViable)
+        {
+            // Copy-engine path: no SM work to launch, so keep grid/shared sizing at zero.
+            // Callers and tests observe config.ctas == 0 and config.inFlightBytes == 0 here.
+            config.ctas = 0;
+            config.inFlightBytes = 0;
+            config.sharedBytes = 0;
+            return config;
+        }
+
         config.inFlightBytes = static_cast<uint32_t>(kThreads) * kIlp * 16u * static_cast<uint32_t>(stages);
         config.sharedBytes = config.inFlightBytes;
-        config.useKernel = kernelViable;
 
         double cap = kLinkEfficiency * mTopology.linkBandwidthGBs;
         if (mTopology.coherentLink)
