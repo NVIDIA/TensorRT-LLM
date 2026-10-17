@@ -3,13 +3,15 @@
 """MiniMax-M3 integration tests for its MSA sparse attention backend.
 
 These validate MiniMax-M3 backend selection, indexer/cache integration, decode
-scratch-buffer sizing, and the paged HND contract passed to the packaged MSA
-kernel; the CUDA-gated fused cache-scatter test checks the single-launch
+scratch-buffer sizing, the paged HND contract passed to the packaged MSA
+kernel, and the opt-in native MSA prefill adapters' cache views and
+plan/run arguments; the CUDA-gated fused cache-scatter test checks the single-launch
 K/V/index-K write against the legacy per-cache path. Generic block-sparse
 MQA/GQA numerical coverage lives in the parent ``test_sparse_mqa_gqa.py``
 module.
 """
 
+import math
 import sys
 import weakref
 from types import ModuleType, SimpleNamespace
@@ -18,6 +20,7 @@ from unittest.mock import Mock, create_autospec
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha import msa_nvdev, msa_prefill
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
@@ -27,7 +30,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatte
     fused_write_layer_caches_nvfp4,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+    MSA_NATIVE_PREFILL_ENV,
     MSA_REQUIRED_TOPK,
+    msa_package_available,
     msa_paged_kv,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
@@ -42,6 +47,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -258,7 +264,7 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
     block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
     global_scale = torch.ones(1)
 
-    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103/SM107"):
         minimax_m3_sparse_attn_decode(
             q,
             kv,
@@ -273,6 +279,34 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
             v_block_scale=block_scale,
             k_global_scale=global_scale,
             v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_nvfp4_sparse_decode_admits_the_sm100_family(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """SM100-family devices, Rubin included, pass the device check and reach
+    input validation, which here rejects the missing scales."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="needs all four"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=torch.empty((1, 1, 128, 8), dtype=torch.uint8),
         )
     get_capability.assert_called_once_with(q.device)
 
@@ -487,6 +521,53 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nv
     index.fill_(3)
     torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
     torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("kv_dtype", "native_prefill", "expect_lengths"),
+    [
+        (DataType.FP8, False, False),
+        (DataType.FP8, True, True),
+        (DataType.NVFP4, False, True),
+        (DataType.NVFP4, True, True),
+    ],
+)
+def test_msa_buffers_reserve_cumulative_lengths_for_csr_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: DataType,
+    native_prefill: bool,
+    expect_lengths: bool,
+) -> None:
+    """The NVFP4 CSR kernel and the native prefill wrappers read graph-stable
+    cumulative lengths, so an FP8 cache reserves them only when native prefill
+    is enabled."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    if native_prefill:
+        monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+    else:
+        monkeypatch.delenv(MSA_NATIVE_PREFILL_ENV, raising=False)
+    metadata = _buffer_metadata(dtype=kv_dtype, sparse_layer_ids=[], layer_offsets={})
+    reserved = {}
+
+    def get_empty(buffers, shape, **kwargs):
+        reserved[kwargs["cache_name"]] = tuple(shape)
+        return torch.empty(shape, dtype=kwargs["dtype"])
+
+    monkeypatch.setattr(metadata, "get_empty", get_empty)
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+
+    names = ("msa_qo_lens_cuda", "msa_cu_q_lens", "msa_cu_kv_lens")
+    if expect_lengths:
+        assert reserved["msa_qo_lens_cuda"] == (MAX_NUM_SEQUENCES,)
+        assert reserved["msa_cu_q_lens"] == (MAX_NUM_SEQUENCES + 1,)
+        assert reserved["msa_cu_kv_lens"] == (MAX_NUM_SEQUENCES + 1,)
+        assert all(getattr(metadata, name) is not None for name in names)
+    else:
+        assert not set(names) & set(reserved)
+        assert all(getattr(metadata, name) is None for name in names)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1768,6 +1849,483 @@ def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
     torch.testing.assert_close(
         split[num_ctx_tokens:], reference[num_ctx_tokens:], rtol=6e-2, atol=6e-2
     )
+
+
+_NATIVE_FP8_MODULE = "inference.msa_v1.attention.prefill.q8kv8"
+_NATIVE_NVFP4_MODULE = "inference.msa_v1.attention.prefill.q8kv4"
+
+
+class _Q8KV8PrefillApi:
+    """Public Q8KV8 BatchPrefillWithPagedKVCacheWrapper surface at MSA c8e1013."""
+
+    def __init__(self, *, enable_fp16_softmax=None, enable_2x_fp8=None) -> None: ...
+
+    def plan(
+        self,
+        topk_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        page_table,
+        *,
+        num_q_heads=64,
+        num_kv_heads=None,
+        total_k,
+        total_rows,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=True,
+        sm_scale=None,
+    ) -> None: ...
+
+    def run(self, q, paged_kv_cache, *, out=None, lse=None, return_lse=False): ...
+
+
+class _Q8KV4PrefillApi:
+    """Q8KV4 wrapper surface at MSA c8e1013 with msa_q8kv4_prefill_sm107.patch."""
+
+    def __init__(self) -> None: ...
+
+    def plan(
+        self,
+        topk_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        page_table,
+        *,
+        total_k,
+        total_rows,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=True,
+        sm_scale=None,
+    ) -> None: ...
+
+    def run(
+        self,
+        q,
+        paged_kv_cache,
+        *,
+        kv_cache_sf,
+        kv_cache_global_sf=None,
+        v_scale_layout="linear",
+        allow_strided_cache=False,
+        out=None,
+        lse=None,
+        return_lse=False,
+    ): ...
+
+
+def _install_native_prefill(monkeypatch: pytest.MonkeyPatch, module_name: str, api: type) -> Mock:
+    """Stand in for one native MSA prefill module; returns its wrapper class."""
+    wrapper_cls = create_autospec(api, spec_set=True)
+    module = ModuleType(module_name)
+    module.BatchPrefillWithPagedKVCacheWrapper = wrapper_cls
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return wrapper_cls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("slot_shape", "plane_index", "multiplier"),
+    [
+        ((1, 2, 4, 8), (), 1),
+        ((2, 2, 4, 8), (0,), 2),
+        ((2, 2, 4, 8), (1,), 2),
+        ((3, 2, 2, 4, 8), (1, 1), 6),
+    ],
+    ids=["contiguous", "interleaved-k", "interleaved-v", "layer-interleaved-v"],
+)
+def test_virtual_pages_alias_each_physical_page(
+    slot_shape: tuple[int, ...], plane_index: tuple[int, ...], multiplier: int
+) -> None:
+    """Physical page p of a strided plane is virtual page p * multiplier of a
+    contiguous zero-copy view that ends where the plane ends."""
+    num_slots = 3
+    pool = torch.arange(num_slots * math.prod(slot_shape), dtype=torch.float32).view(
+        num_slots, *slot_shape
+    )
+    plane = pool[(slice(None), *plane_index)] if plane_index else pool.squeeze(1)
+    view, factor = msa_nvdev.virtual_contiguous_pages(plane)
+
+    assert factor == multiplier
+    assert view.is_contiguous()
+    assert view.shape == (factor * (num_slots - 1) + 1, *plane.shape[1:])
+    assert view.data_ptr() == plane.data_ptr()
+    for slot in range(num_slots):
+        assert torch.equal(view[slot * factor], plane[slot])
+    # The view's last element is the plane's last element.
+    assert view[-1].reshape(-1)[-1].data_ptr() == plane[-1].reshape(-1)[-1].data_ptr()
+
+
+@pytest.mark.cpu_only
+def test_page_mapping_scales_physical_ids_and_keeps_padding() -> None:
+    pool = torch.zeros(4, 2, 1, 4, 8)
+    page_table = torch.tensor([[2, 0, -1], [3, 1, 1]], dtype=torch.int32)
+
+    mapped, (k_view, v_view) = msa_nvdev.map_cache_pages(page_table, pool[:, 0], pool[:, 1])
+
+    assert torch.equal(mapped, torch.tensor([[4, 0, -1], [6, 2, 2]], dtype=torch.int32))
+    assert k_view.shape[0] == v_view.shape[0] == 7
+    assert v_view.data_ptr() == pool[:, 1].data_ptr()
+    # A table whose planes are already contiguous passes through untouched.
+    same, _ = msa_nvdev.map_cache_pages(page_table, pool[:, 0].contiguous())
+    assert same is page_table
+
+
+@pytest.mark.cpu_only
+def test_page_mapping_rejects_planes_it_cannot_address() -> None:
+    pool = torch.zeros(4, 2, 1, 4, 8)
+    page_table = torch.zeros(1, 1, dtype=torch.int32)
+    payload = 4 * 8
+    uneven = torch.zeros(4 * (payload + 1)).as_strided((4, 1, 4, 8), (payload + 1, payload, 8, 1))
+
+    with pytest.raises(ValueError, match="whole number of page payloads"):
+        msa_nvdev.map_cache_pages(page_table, uneven)
+    with pytest.raises(ValueError, match="virtual-page multiplier"):
+        msa_nvdev.map_cache_pages(page_table, pool[:, 0], pool[:, 0].contiguous())
+    with pytest.raises(ValueError, match="page capacity"):
+        msa_nvdev.map_cache_pages(page_table, pool[:, 0], pool[:3, 1])
+    with pytest.raises(ValueError, match="contiguous inner HND pages"):
+        msa_nvdev.map_cache_pages(page_table, pool[:, 0].transpose(2, 3))
+
+
+def _native_prefill_case(*, nvfp4: bool, num_kv_heads: int, data_dtype=torch.float8_e4m3fn):
+    """A five-token context row ahead of one decode row, over shuffled pages.
+
+    Only the context row reaches prefill. The NVFP4 data and scale pools get
+    different page pitches, as their coalesced pools have in production.
+    """
+    num_slots, head_dim, topk = 4, 128, MSA_REQUIRED_TOPK
+    num_heads = num_kv_heads * 16
+    manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
+    manager.is_nvfp4_layer.return_value = nvfp4
+    scales = None
+    if nvfp4:
+        data = torch.randint(-128, 128, (num_slots, 3, num_kv_heads, 128, head_dim // 2))
+        data = data.to(torch.int8)
+        scales = torch.randint(0, 120, (num_slots, 5, num_kv_heads, 128, head_dim // 16))
+        scales = scales.to(torch.uint8)
+        manager.get_buffers.return_value = data[:, :2]
+        manager.get_block_scale_buffers.return_value = scales[:, :2]
+    else:
+        data = torch.randn(num_slots, 2, num_kv_heads, 128, head_dim).to(data_dtype)
+        manager.get_buffers.return_value = data
+
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 0
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = manager
+    metadata.msa_block_table = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+    metadata.msa_cu_q_lens = torch.tensor([0, 5, 6], dtype=torch.int32)
+    metadata.msa_cu_kv_lens = torch.tensor([0, 5, 205], dtype=torch.int32)
+    metadata._msa_context_prefix_bounds = (5, 5, 5, 1)
+    metadata._msa_qo_lens_cpu = torch.tensor([5], dtype=torch.int32)
+    metadata._msa_kv_lens_cpu = torch.tensor([5], dtype=torch.int32)
+    metadata._msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
+    metadata.msa_kv_indices = torch.tensor([2], dtype=torch.int32)
+
+    table = torch.full((5, num_kv_heads, topk), -1, dtype=torch.int32)
+    table[:, :, 0] = 0
+    # Token-major view of a head-major backing, as the indexer publishes it.
+    topk_indices = table.permute(1, 0, 2).contiguous().permute(1, 0, 2)
+    q = torch.randn(5, num_heads * head_dim, dtype=torch.bfloat16)
+    return SimpleNamespace(
+        attention=attention,
+        metadata=metadata,
+        data=data,
+        scales=scales,
+        q=q,
+        output=torch.zeros_like(q),
+        topk_indices=topk_indices,
+    )
+
+
+def _run_context_prefill(case, *, kv_block_indexes, kv_scale_quant_orig=None) -> None:
+    msa_prefill.run_msa_prefill_gqa(
+        case.attention,
+        case.q,
+        case.metadata,
+        case.output,
+        kv_block_indexes=kv_block_indexes,
+        plan=None,
+        row_first=0,
+        num_rows=1,
+        kv_scale_quant_orig=kv_scale_quant_orig,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_native_fp8_prefill_plans_the_context_prefix_on_virtual_pages(
+    monkeypatch: pytest.MonkeyPatch, num_kv_heads: int
+) -> None:
+    monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+    wrapper_cls = _install_native_prefill(monkeypatch, _NATIVE_FP8_MODULE, _Q8KV8PrefillApi)
+    monkeypatch.setattr(
+        msa_prefill, "run_msa_sparse_gqa", Mock(side_effect=AssertionError("fmha_sm100 ran"))
+    )
+    case = _native_prefill_case(nvfp4=False, num_kv_heads=num_kv_heads)
+
+    _run_context_prefill(case, kv_block_indexes=case.topk_indices)
+
+    wrapper_cls.assert_called_once_with()
+    wrapper = wrapper_cls.return_value
+    (topk, cu_q, cu_k, pages), plan_kwargs = wrapper.plan.call_args
+    assert topk.is_contiguous()
+    assert torch.equal(topk, case.topk_indices.permute(1, 0, 2))
+    assert cu_q.data_ptr() == case.metadata.msa_cu_q_lens.data_ptr() and cu_q.shape == (2,)
+    assert cu_k.data_ptr() == case.metadata.msa_cu_kv_lens.data_ptr() and cu_k.shape == (2,)
+    # K and V interleave within a slot, so slot s is virtual page 2 * s.
+    assert torch.equal(pages, case.metadata.msa_block_table[:1] * 2)
+    assert plan_kwargs == dict(
+        num_q_heads=16 * num_kv_heads,
+        num_kv_heads=num_kv_heads,
+        total_k=5,
+        total_rows=1,
+        max_seqlen_q=5,
+        max_seqlen_k=5,
+        sm_scale=128**-0.5,
+    )
+    (q, (k_pages, v_pages)), run_kwargs = wrapper.run.call_args
+    assert q.dtype == torch.float8_e4m3fn
+    expected_q = case.q.view(5, 16 * num_kv_heads, 128).to(torch.float8_e4m3fn)
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    for plane, pages_view in enumerate((k_pages, v_pages)):
+        assert pages_view.is_contiguous()
+        for slot in range(case.data.shape[0]):
+            assert torch.equal(
+                pages_view[2 * slot].view(torch.uint8), case.data[slot, plane].view(torch.uint8)
+            )
+    assert run_kwargs.keys() == {"out"}
+    assert run_kwargs["out"].data_ptr() == case.output.data_ptr()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_native_nvfp4_prefill_passes_trtllm_scales_and_strided_planes(
+    monkeypatch: pytest.MonkeyPatch, num_kv_heads: int
+) -> None:
+    monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+    wrapper_cls = _install_native_prefill(monkeypatch, _NATIVE_NVFP4_MODULE, _Q8KV4PrefillApi)
+    monkeypatch.setattr(
+        msa_prefill, "run_msa_nvfp4_sparse_gqa", Mock(side_effect=AssertionError("CSR path ran"))
+    )
+    case = _native_prefill_case(nvfp4=True, num_kv_heads=num_kv_heads)
+    kv_scale_quant_orig = torch.tensor([1.0, 0.5, 0.25])
+
+    _run_context_prefill(
+        case, kv_block_indexes=case.topk_indices, kv_scale_quant_orig=kv_scale_quant_orig
+    )
+
+    wrapper_cls.assert_called_once_with()
+    wrapper = wrapper_cls.return_value
+    (topk, cu_q, cu_k, pages), plan_kwargs = wrapper.plan.call_args
+    assert torch.equal(topk, case.topk_indices.permute(1, 0, 2))
+    assert cu_q.shape == cu_k.shape == (2,)
+    # Each plane keeps its own pitch, so the physical page table goes as is.
+    assert pages.data_ptr() == case.metadata.msa_block_table.data_ptr()
+    assert pages.shape == (1, 2)
+    assert plan_kwargs == dict(
+        total_k=5, total_rows=1, max_seqlen_q=5, max_seqlen_k=5, sm_scale=128**-0.5
+    )
+    (q, (k_cache, v_cache)), run_kwargs = wrapper.run.call_args
+    assert q.dtype == torch.float8_e4m3fn
+    assert q.shape == (5, 16 * num_kv_heads, 128)
+    k_scale, v_scale = run_kwargs["kv_cache_sf"]
+    for plane, (data, scale) in enumerate(((k_cache, k_scale), (v_cache, v_scale))):
+        assert data.dtype == torch.uint8 and scale.dtype == torch.float8_e4m3fn
+        assert data.data_ptr() == case.data[:, plane].data_ptr()
+        assert data.stride() == case.data[:, plane].stride()
+        assert scale.data_ptr() == case.scales[:, plane].data_ptr()
+        assert scale.stride() == case.scales[:, plane].stride()
+    k_global, v_global = run_kwargs["kv_cache_global_sf"]
+    assert k_global.tolist() == [0.5] and v_global.tolist() == [0.25]
+    assert k_global.data_ptr() % 16 == 0 and v_global.data_ptr() % 16 == 0
+    assert run_kwargs["v_scale_layout"] == "swizzle4x4"
+    assert run_kwargs["allow_strided_cache"] is True
+    assert run_kwargs["out"].data_ptr() == case.output.data_ptr()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("nvfp4", "native", "sparse", "expected"),
+    [
+        (False, False, True, "run_msa_sparse_gqa"),
+        (False, True, False, "run_msa_sparse_gqa"),
+        (True, False, True, "run_msa_nvfp4_sparse_gqa"),
+    ],
+    ids=["fp8-default", "fp8-dense-layer", "nvfp4-default"],
+)
+def test_native_prefill_is_opt_in_and_serves_sparse_layers_only(
+    monkeypatch: pytest.MonkeyPatch, nvfp4: bool, native: bool, sparse: bool, expected: str
+) -> None:
+    if native:
+        monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+    else:
+        monkeypatch.delenv(MSA_NATIVE_PREFILL_ENV, raising=False)
+    native_wrappers = [
+        _install_native_prefill(monkeypatch, _NATIVE_FP8_MODULE, _Q8KV8PrefillApi),
+        _install_native_prefill(monkeypatch, _NATIVE_NVFP4_MODULE, _Q8KV4PrefillApi),
+    ]
+    packaged = {
+        name: create_autospec(getattr(msa_prefill, name), spec_set=True)
+        for name in ("run_msa_sparse_gqa", "run_msa_nvfp4_sparse_gqa")
+    }
+    for name, recorder in packaged.items():
+        monkeypatch.setattr(msa_prefill, name, recorder)
+    case = _native_prefill_case(nvfp4=nvfp4, num_kv_heads=1)
+
+    _run_context_prefill(
+        case,
+        kv_block_indexes=case.topk_indices if sparse else None,
+        kv_scale_quant_orig=torch.tensor([1.0, 0.5, 0.25]) if nvfp4 else None,
+    )
+
+    for name, recorder in packaged.items():
+        assert recorder.call_count == (1 if name == expected else 0)
+    for wrapper_cls in native_wrappers:
+        wrapper_cls.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_native_prefill_requires_the_staged_cumulative_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling native prefill after the metadata was built must fail loudly."""
+    monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+    wrapper_cls = _install_native_prefill(monkeypatch, _NATIVE_FP8_MODULE, _Q8KV8PrefillApi)
+    case = _native_prefill_case(nvfp4=False, num_kv_heads=1)
+    case.metadata.msa_cu_q_lens = None
+
+    with pytest.raises(RuntimeError, match=MSA_NATIVE_PREFILL_ENV):
+        _run_context_prefill(case, kv_block_indexes=case.topk_indices)
+    wrapper_cls.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_native_prefill_rejects_a_16_bit_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+    wrapper_cls = _install_native_prefill(monkeypatch, _NATIVE_FP8_MODULE, _Q8KV8PrefillApi)
+    case = _native_prefill_case(nvfp4=False, num_kv_heads=1, data_dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="FP8 and NVFP4 KV caches"):
+        _run_context_prefill(case, kv_block_indexes=case.topk_indices)
+    wrapper_cls.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+@pytest.mark.parametrize("nvfp4", [False, True], ids=["fp8", "nvfp4"])
+def test_native_prefill_matches_the_packaged_msa_path(
+    monkeypatch: pytest.MonkeyPatch, nvfp4: bool, num_kv_heads: int
+) -> None:
+    """Native and packaged MSA prefill agree on TRT-LLM's cache layout.
+
+    The context row of the mixed batch above (shuffled pages, a partial last
+    page, causal top-k) runs both ways over the context prefix alone. Both
+    planes of a slot share one pitch for FP8 (virtual pages); the NVFP4 data
+    and scale pools have different pitches. The native MSA checkout from
+    examples/minimax_m3/rubin/setup_msa.sh must be on PYTHONPATH.
+    """
+    if not is_sm_100f():
+        pytest.skip("MSA prefill requires the SM100 family")
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA submodule) required")
+    pytest.importorskip(_NATIVE_NVFP4_MODULE if nvfp4 else _NATIVE_FP8_MODULE)
+
+    page_size, head_dim = 128, 128
+    attention, fields, q, kv_block_indexes, num_ctx_tokens = _mixed_batch_sparse_gqa_case(
+        page_size=page_size,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        group=16,
+        topk=MSA_REQUIRED_TOPK,
+        seed=73,
+    )
+    bf16_pool = fields["kv_cache_manager"].get_buffers(0)
+    num_pages = int(bf16_pool.shape[0])
+    kv_scale_quant_orig = None
+    if nvfp4:
+        generator = torch.Generator(device="cuda").manual_seed(74)
+        data = torch.randint(
+            0,
+            256,
+            (num_pages, 3, num_kv_heads, page_size, head_dim // 2),
+            device="cuda",
+            generator=generator,
+            dtype=torch.uint8,
+        ).view(torch.int8)
+        scale_values = torch.tensor([0.5, 1.0, 2.0], device="cuda")[
+            torch.randint(
+                0,
+                3,
+                (num_pages, 5, num_kv_heads, page_size, head_dim // 16),
+                device="cuda",
+                generator=generator,
+            )
+        ]
+        scales = scale_values.to(torch.float8_e4m3fn).view(torch.uint8)
+        manager = SimpleNamespace(
+            tokens_per_block=page_size,
+            get_buffers=lambda layer_idx, kv_layout=None: data[:, :2],
+            is_nvfp4_layer=lambda layer_idx: True,
+            get_block_scale_buffers=lambda layer_idx, kv_layout=None: scales[:, :2],
+        )
+        kv_scale_quant_orig = torch.tensor([1.0, 0.5, 0.25], device="cuda")
+    else:
+        fp8_pool = bf16_pool.to(torch.float8_e4m3fn)
+        manager = SimpleNamespace(
+            tokens_per_block=page_size,
+            get_buffers=lambda layer_idx, kv_layout=None: fp8_pool,
+        )
+
+    qo_lens_cpu, kv_lens_cpu = fields["msa_qo_lens_cpu"], fields["msa_kv_lens_cpu"]
+    context_kv = int(kv_lens_cpu[0])
+    metadata = SimpleNamespace(
+        **(fields | {"kv_cache_manager": manager}),
+        msa_cu_q_lens=torch.cat([qo_lens_cpu.new_zeros(1), qo_lens_cpu.cumsum(0)]).int().cuda(),
+        msa_cu_kv_lens=torch.cat([kv_lens_cpu.new_zeros(1), kv_lens_cpu.cumsum(0)]).int().cuda(),
+        _msa_live_batch=int(qo_lens_cpu.shape[0]),
+        _msa_context_prefix_bounds=(
+            int(qo_lens_cpu[0]),
+            context_kv,
+            context_kv,
+            (context_kv + page_size - 1) // page_size,
+        ),
+    )
+
+    def run_context(native: bool) -> torch.Tensor:
+        if native:
+            monkeypatch.setenv(MSA_NATIVE_PREFILL_ENV, "1")
+        else:
+            monkeypatch.delenv(MSA_NATIVE_PREFILL_ENV, raising=False)
+        output = torch.zeros_like(q[:num_ctx_tokens])
+        msa_prefill.run_msa_prefill_gqa(
+            attention,
+            q[:num_ctx_tokens],
+            metadata,
+            output,
+            kv_block_indexes=kv_block_indexes[:num_ctx_tokens],
+            plan=None,
+            row_first=0,
+            num_rows=1,
+            kv_scale_quant_orig=kv_scale_quant_orig,
+        )
+        torch.cuda.synchronize()
+        return output.view(num_ctx_tokens, attention.num_heads, head_dim).float()
+
+    packaged = run_context(native=False)
+    native = run_context(native=True)
+
+    assert torch.isfinite(native).all()
+    # Two kernel implementations with FP8 probabilities: the tolerance of the
+    # Triton-vs-fmha_sm100 A/B above.
+    torch.testing.assert_close(native, packaged, rtol=6e-2, atol=6e-2)
 
 
 def test_msa_scratch_sizing_covers_spec_verify_tokens():

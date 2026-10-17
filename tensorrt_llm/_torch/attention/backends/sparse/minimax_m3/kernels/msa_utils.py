@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import os
 import types
 from typing import Optional, Tuple
 
@@ -21,6 +22,15 @@ from .paged_cache import write_kv_slots
 # with a clear message rather than a cryptic shape error inside the kernel.
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
+
+# Opt-in: run sparse-layer context attention on the native MiniMax MSA nv_dev
+# prefill wrappers (an external package, see msa_nvdev) instead of fmha_sm100.
+MSA_NATIVE_PREFILL_ENV = "TRTLLM_MSA_NVDEV_PREFILL"
+
+
+def msa_native_prefill_enabled() -> bool:
+    """Whether sparse-layer prefill is routed to the native MSA nv_dev wrappers."""
+    return os.environ.get(MSA_NATIVE_PREFILL_ENV) == "1"
 
 
 def check_decode_span_shape(kernel: str, total_q: int, batch: int, query_len: int) -> None:

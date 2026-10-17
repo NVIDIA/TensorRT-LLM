@@ -52,6 +52,7 @@ from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
+    msa_native_prefill_enabled,
     per_token_valid_blocks,
     require_msa_module,
 )
@@ -458,7 +459,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
+        # The NVFP4 CSR kernel and both native MSA prefill wrappers take
+        # cumulative lengths and the context-prefix bounds staged with them.
+        if (
+            getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4
+            or msa_native_prefill_enabled()
+        ):
             self.msa_qo_lens_cuda = self.get_empty(
                 buffers,
                 (max_num_sequences,),

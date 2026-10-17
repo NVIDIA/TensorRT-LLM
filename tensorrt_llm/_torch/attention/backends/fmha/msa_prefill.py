@@ -21,11 +21,14 @@ module-scope import here would close a cycle.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .interface import FmhaPhase
+from .msa_nvdev import run_fp8_prefill, run_nvfp4_prefill
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -273,6 +276,36 @@ def run_msa_nvfp4_sparse_gqa(
     out.copy_(result)
 
 
+def _native_prefill_rows(metadata: "TrtllmAttentionMetadata", num_rows: int) -> dict[str, Any]:
+    """Staged lengths, page table and bounds of the context prefix's rows.
+
+    The native MSA wrappers cover the context rows alone; the generation
+    suffix of a mixed step stays on the decode kernels.
+    """
+    from ..sparse.minimax_m3.kernels.msa_utils import MSA_NATIVE_PREFILL_ENV
+
+    if metadata.msa_cu_q_lens is None:
+        raise RuntimeError(
+            "Native MSA prefill needs the cumulative-length buffers; set "
+            f"{MSA_NATIVE_PREFILL_ENV}=1 before the attention metadata is created."
+        )
+    max_seqlen_q, max_seqlen_k, total_k, total_rows = metadata._msa_context_prefix_bounds
+    if total_rows <= 0:
+        raise RuntimeError(
+            f"Native MSA prefill covers a context prefix of {num_rows} row(s), "
+            "but prepare() staged no bounds for one."
+        )
+    return dict(
+        cu_seqlens_q=metadata.msa_cu_q_lens[: num_rows + 1],
+        cu_seqlens_k=metadata.msa_cu_kv_lens[: num_rows + 1],
+        page_table=metadata.msa_block_table[:num_rows],
+        total_k=total_k,
+        total_rows=total_rows,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+
+
 def run_msa_prefill_gqa(
     attn: "TrtllmAttention",
     q: torch.Tensor,
@@ -296,7 +329,7 @@ def run_msa_prefill_gqa(
     `num_rows` are its batch rows, which narrow the host length tensors an
     inline plan would read.
     """
-    from ..sparse.minimax_m3.kernels.msa_utils import msa_paged_kv
+    from ..sparse.minimax_m3.kernels.msa_utils import msa_native_prefill_enabled, msa_paged_kv
 
     head_dim = attn.head_dim
     num_tokens = int(q.shape[0])
@@ -306,6 +339,9 @@ def run_msa_prefill_gqa(
     out_view = output.view(num_tokens, attn.num_heads, head_dim)
     k_paged, v_paged = msa_paged_kv(metadata.kv_cache_manager, attn.layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
+    # Native prefill serves the sparse layers' context prefix; dense layers keep
+    # fmha_sm100.
+    use_native = kv_block_indexes is not None and msa_native_prefill_enabled()
 
     if getattr(metadata.kv_cache_manager, "is_nvfp4_layer", lambda _: False)(attn.layer_idx):
         if kv_block_indexes is None or kv_scale_quant_orig is None:
@@ -315,6 +351,26 @@ def run_msa_prefill_gqa(
         if row_first != 0:
             raise ValueError("NVFP4 sparse prefill must cover the context prefix")
         k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, kv_scale_quant_orig)
+        if use_native:
+            logger.info_once(
+                "MiniMax-M3 sparse prefill: native MSA Q8KV4 over the NVFP4 KV cache",
+                key="minimax_m3_native_msa_q8kv4_prefill",
+            )
+            block_scales = metadata.kv_cache_manager.get_block_scale_buffers(attn.layer_idx, "HND")
+            run_nvfp4_prefill(
+                q_view,
+                k_paged,
+                v_paged,
+                block_scales[:, 0],
+                block_scales[:, 1],
+                k_scale,
+                v_scale,
+                kv_block_indexes.permute(1, 0, 2).contiguous(),
+                sm_scale=sm_scale,
+                out=out_view,
+                **_native_prefill_rows(metadata, num_rows),
+            )
+            return
         run_msa_nvfp4_sparse_gqa(
             q_view,
             k_paged,
@@ -336,6 +392,28 @@ def run_msa_prefill_gqa(
     use_fp8 = k_paged.dtype == torch.float8_e4m3fn
     if use_fp8:
         q_view = q_view.to(torch.float8_e4m3fn)
+
+    if use_native:
+        if not use_fp8:
+            raise ValueError(
+                f"Native MSA prefill supports FP8 and NVFP4 KV caches, not {k_paged.dtype}"
+            )
+        if row_first != 0:
+            raise ValueError("Native MSA prefill must cover the context prefix")
+        logger.info_once(
+            "MiniMax-M3 sparse prefill: native MSA Q8KV8 over the FP8 KV cache",
+            key="minimax_m3_native_msa_q8kv8_prefill",
+        )
+        run_fp8_prefill(
+            q_view,
+            k_paged,
+            v_paged,
+            kv_block_indexes.permute(1, 0, 2).contiguous(),
+            sm_scale=sm_scale,
+            out=out_view,
+            **_native_prefill_rows(metadata, num_rows),
+        )
+        return
 
     def rows_of(lens: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Narrow a per-request host length tensor to this phase's rows.
