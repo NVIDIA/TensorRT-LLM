@@ -56,6 +56,7 @@ __all__ = [
     "KimiK25ForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
+    "Kolibri1ForCausalLM",
     "LagunaForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
