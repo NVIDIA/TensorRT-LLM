@@ -9,6 +9,8 @@ mis-address.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -17,6 +19,8 @@ __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
+from tensorrt_llm._torch.modules.fla.cache_manager import GDNIntermediateState
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
 G = M._PoolGeometry(
     tokens_per_block=32,
@@ -69,6 +73,36 @@ def test_valid_pools_pass() -> None:
         _ssm(),
         _t(SLOTS, dtype=torch.int32),
     )
+
+
+def test_bind_step_buffers_uses_manager_layer_views() -> None:
+    state = GDNIntermediateState()
+    state.intermediate_conv = _t(2, SLOTS, 2, G.conv_dim, G.conv_kernel - 1)
+    state.intermediate_ssm = _t(
+        2, SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32
+    )
+    state.intermediate_indices = _t(SLOTS, dtype=torch.int32)
+    manager = Qwen4ExpHybridCacheManager.__new__(Qwen4ExpHybridCacheManager)
+    manager.spec_config = SimpleNamespace(tokens_per_gen_step=2)
+    manager._speculative_state = state
+    manager.mamba_layer_offsets = {3: 1, 7: 0}
+    manager.all_conv_states = [_conv(), _conv()]
+    manager.all_ssm_states = [_ssm(), _ssm()]
+
+    bound = M.Qwen4ExpTp1ModelingV2._bind_step_buffers(
+        SimpleNamespace(gdn_layers=[3, 7]), manager, G, _conv(), _ssm()
+    )
+
+    assert bound["int_idx"] is state.intermediate_indices
+    for role, storage in (
+        ("int_conv", state.intermediate_conv),
+        ("int_ssm", state.intermediate_ssm),
+    ):
+        for layer, offset in manager.mamba_layer_offsets.items():
+            view = bound[role][layer]
+            assert view._base is storage
+            assert view.storage_offset() == offset * storage.stride(0)
+            assert view.shape == storage.shape[1:]
 
 
 @pytest.mark.parametrize(

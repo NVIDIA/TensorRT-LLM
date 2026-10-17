@@ -1126,14 +1126,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if is_target_verify
             else None
         )
-        use_replay = is_target_verify and getattr(
-            attn_metadata.kv_cache_manager, "use_replay_state_update", False
-        )
         replay_metadata = (
             attn_metadata.kv_cache_manager.get_replay_state_update_metadata()
-            if use_replay
+            if is_target_verify
             else None
         )
+        use_replay = replay_metadata is not None
 
         use_cached_replay_all_layer_commit = (
             num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE

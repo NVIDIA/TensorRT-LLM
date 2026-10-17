@@ -37,7 +37,12 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
+from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManager
+from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
+    Qwen4ExpHybridCacheManager,
+    Qwen4ExpPLECacheParams,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
@@ -224,7 +229,14 @@ def _create_managers(
         mapping = Mapping(
             world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_attention_dp
         )
-        manager_cls = MambaHybridCacheManagerV2 if use_v2 else MixedMambaHybridCacheManager
+        if not use_v2:
+            manager_cls = MixedMambaHybridCacheManager
+        elif with_ple:
+            manager_cls = Qwen4ExpHybridCacheManager
+        elif conv_state_layout == "q_k_v":
+            manager_cls = Qwen35HybridCacheManager
+        else:
+            manager_cls = NemotronHybridCacheManager
         manager_kwargs = (
             {
                 "is_disagg": True,
@@ -292,7 +304,7 @@ def _zero_mamba_states(manager):
     for layer_idx in _mamba_layer_ids(manager):
         manager.get_conv_states(layer_idx).zero_()
         manager.get_ssm_states(layer_idx).zero_()
-    if isinstance(manager, MambaHybridCacheManagerV2):
+    if isinstance(manager, Qwen4ExpHybridCacheManager):
         for state in manager._ple_conv_states.values():
             state.zero_()
         for state in manager._ple_ngram_contexts.values():
@@ -854,7 +866,7 @@ def run_mamba_transfer_test(
                 ),
             )
 
-    # Only the V2 manager owns PLE state.
+    # PLE buffers are owned by the Qwen4 manager.
     if with_ple:
         for gen_rank, manager in enumerate(gen_mgrs):
             for req_idx, request_id in enumerate(gen_rids):
