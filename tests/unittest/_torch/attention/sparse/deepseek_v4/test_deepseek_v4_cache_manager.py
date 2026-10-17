@@ -2570,6 +2570,47 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
+    @pytest.mark.parametrize("compress_ratios", [[1], [1, 4, 128]])
+    @pytest.mark.parametrize("long_token_num", [127, 128, 129, 513])
+    @pytest.mark.parametrize("num_draft_tokens", [0, 3])
+    def test_materialized_dummy_generation_requests_with_swa_scratch_reuse(
+        self, compress_ratios: list[int], long_token_num: int, num_draft_tokens: int
+    ) -> None:
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=compress_ratios,
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=True,
+        )
+
+        requests = []
+        token_nums = [1, long_token_num]
+        try:
+            requests = cache_manager.add_dummy_requests(
+                request_ids=[0, 1],
+                token_nums=token_nums,
+                is_gen=True,
+                materialize_history=True,
+                max_num_draft_tokens=num_draft_tokens,
+            )
+            assert requests is not None
+            assert len(requests) == len(token_nums)
+
+            for req, token_num in zip(requests, token_nums):
+                kv_cache = cache_manager.kv_cache_map[req.py_request_id]
+                assert kv_cache.enable_swa_scratch_reuse
+                assert kv_cache.history_length == 0
+                assert kv_cache.capacity == (
+                    token_num + cache_manager.num_extra_kv_tokens + num_draft_tokens
+                )
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize(
         "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]
