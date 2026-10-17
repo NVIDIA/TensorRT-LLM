@@ -20,7 +20,7 @@ To enable chunked context, please set the `enable_chunked_prefill` in `LLM` API 
     )
 ```
 
-Note that if chunked context is enabled, please set the `max_num_tokens` to be an integer multiple of the kv-cache block size `tokens_per_block`, which defaults to 64.
+Note that if chunked context is enabled, please set the `max_num_tokens` to be an integer multiple of the kv-cache block size `tokens_per_block`. The generic `KvCacheConfig.tokens_per_block` defaults to 32, but some model and attention-backend combinations select a different block size (for example, FlashMLA uses 64 and FP4 MLA attention uses 128), so align `max_num_tokens` with the `tokens_per_block` actually in effect for your configuration.
 
 ## Chunked attention
 
