@@ -312,11 +312,9 @@ class LTX2Attention(Attention):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        # All cross-attn K-norm paths (with or without RoPE) go through the
-        # split-fuse kernels. Fallback only kicks in for unsupported head_dim
-        # — the fused kernel template covers {64, 128}; mini-config tests use
-        # head_dim=32 and must take the eager branch.
-        if self.qk_norm and self.head_dim in (64, 128):
+        # Projected K uses the same fusion switch as Q. Unsupported head
+        # dimensions also fall back to eager normalization and RoPE.
+        if self.fuse_qk_norm_rope and self.qk_norm and self.head_dim in (64, 128):
             self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
         else:
             if self.qk_norm:
@@ -1522,6 +1520,9 @@ class LTXModel(BaseDiffusionModel):
     follows the Lightricks reference implementation.
     """
 
+    _transformer_block_class = BasicAVTransformerBlock
+    _cache_text_kv = True
+
     def __init__(
         self,
         *,
@@ -1915,7 +1916,7 @@ class LTXModel(BaseDiffusionModel):
             else None
         )
         blocks: list[nn.Module] = [
-            BasicAVTransformerBlock(
+            self._transformer_block_class(
                 idx=idx,
                 video=video_config,
                 audio=audio_config,
@@ -2179,13 +2180,15 @@ class LTXModel(BaseDiffusionModel):
             v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
                 video_context, video_context_mask, video_positions, dtype
             )
-            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
+            if self._cache_text_kv:
+                v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
 
         if audio_context is not None:
             a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
                 audio_context, audio_context_mask, audio_positions, dtype
             )
-            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+            if self._cache_text_kv:
+                a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
             # cos/sin are token-major: token axis is dim 1 for both SPLIT and
             # INTERLEAVED rope, matching `_make_pe_local`'s `cos[:, s:e]` shard.
             if self._audio_pad > 0:

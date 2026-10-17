@@ -978,6 +978,13 @@ class BasePipeline(nn.Module):
         return (None,) * n_results if n_results > 1 else None
 
     @staticmethod
+    def _combine_cfg_predictions(
+        unconditional: torch.Tensor, conditional: torch.Tensor, guidance_scale: float
+    ) -> torch.Tensor:
+        """Combine conditional and unconditional classifier-free predictions."""
+        return unconditional + guidance_scale * (conditional - unconditional)
+
+    @staticmethod
     def _rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
         """Rescale noise to fix overexposure (https://huggingface.co/papers/2305.08891)."""
         std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
@@ -1127,7 +1134,7 @@ class BasePipeline(nn.Module):
         dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
         noise_cond = gather_list[0]
         noise_uncond = gather_list[1]
-        noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        noise_pred = self._combine_cfg_predictions(noise_uncond, noise_cond, guidance_scale)
 
         # All-gather extra stream noises
         extra_noise_preds = {}
@@ -1137,8 +1144,8 @@ class BasePipeline(nn.Module):
             dist.all_gather(gather_list_extra, noise_local, group=cfg_pg)
             noise_cond_extra = gather_list_extra[0]
             noise_uncond_extra = gather_list_extra[1]
-            extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
-                noise_cond_extra - noise_uncond_extra
+            extra_noise_preds[name] = self._combine_cfg_predictions(
+                noise_uncond_extra, noise_cond_extra, guidance_scale
             )
 
             if guidance_rescale > 0.0:
@@ -1201,13 +1208,15 @@ class BasePipeline(nn.Module):
         c_start = time.time()
         if do_cfg:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_pred = self._combine_cfg_predictions(
+                noise_pred_uncond, noise_pred_text, guidance_scale
+            )
 
             # Apply CFG to extra streams
             for name, noise_extra in extra_noise_preds.items():
                 noise_uncond_extra, noise_text_extra = noise_extra.chunk(2)
-                extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
-                    noise_text_extra - noise_uncond_extra
+                extra_noise_preds[name] = self._combine_cfg_predictions(
+                    noise_uncond_extra, noise_text_extra, guidance_scale
                 )
 
                 if guidance_rescale > 0.0:
