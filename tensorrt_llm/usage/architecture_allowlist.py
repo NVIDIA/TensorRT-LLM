@@ -24,6 +24,8 @@ arbitrary user-supplied names.
 PUBLIC_MODEL_ARCHITECTURES = frozenset(
     {
         "AfmoeForCausalLM",
+        "Apertus1p5ForConditionalGeneration",
+        "ApertusForCausalLM",
         "BartForConditionalGeneration",
         "BertForSequenceClassification",
         "CLIPVisionModel",
