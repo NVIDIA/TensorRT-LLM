@@ -29,8 +29,17 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blo
 from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
     tokenize_chat_request_for_serving,
+    uses_harmony_tokenization,
 )
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+from tensorrt_llm.serve.render import (
+    PreparedContext,
+    RenderResources,
+    UnsupportedRenderError,
+    fingerprints_match,
+    legacy_render_enabled,
+    render_chat,
+)
 
 KV_CACHE_HASH_ALGO_DEFAULT = kv_cache_hash.KV_CACHE_HASH_ALGO_DEFAULT
 KV_CACHE_HASH_ALGO_V1 = kv_cache_hash.KV_CACHE_HASH_ALGO_V1
@@ -213,11 +222,13 @@ class BlockHashMixin:
                     self._custom_tokenizer, model_path, trust_remote_code=trust_remote_code
                 )
             else:
-                from tensorrt_llm.tokenizer import TransformersTokenizer
+                from tensorrt_llm.tokenizer import load_hf_tokenizer
 
-                tokenizer = TransformersTokenizer.from_pretrained(
-                    model_path, trust_remote_code=trust_remote_code
-                )
+                # The loader a worker and the standalone renderer use, so the tokenizer's
+                # init options (and so its fingerprint) are the same as theirs.
+                tokenizer = load_hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+                if tokenizer is None:
+                    raise ValueError(f"Could not load a tokenizer from {model_path!r}.")
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
@@ -255,35 +266,163 @@ class BlockHashMixin:
                 self._model_types[model_path] = None
         return self._model_types[model_path]
 
+    def _make_encode_rendered(self, request: ChatCompletionRequest):
+        """Router-side tokenization with the exact-match prompt cache."""
+
+        def encode_rendered(rendered: str, tokenizer: object) -> list[int]:
+            key = hash(
+                "".join(
+                    str(
+                        msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+                    )
+                    for msg in request.messages[:2]
+                )
+            )
+            return self._encode_with_prefix_cache(rendered, key, tokenizer)
+
+        return encode_rendered
+
+    def _tokenize_chat_legacy(
+        self, request: ChatCompletionRequest, set_prompt_token_ids: bool = True
+    ) -> list[int]:
+        """The pre-merge router renderer (``TRTLLM_RENDER_LEGACY=1``)."""
+
+        def tokenizer_factory() -> object:
+            return self._get_tokenizer(request.model)
+
+        return tokenize_chat_request_for_serving(
+            request,
+            tokenizer_factory=tokenizer_factory,
+            encode_rendered=self._make_encode_rendered(request),
+            use_harmony=self._use_harmony,
+            model_type_resolver=self._get_model_type,
+            set_prompt_token_ids=set_prompt_token_ids,
+        )
+
+    def _render_resources(self, model: str) -> RenderResources:
+        """Rendering resources of this router for ``model``, built once."""
+        cache = self.__dict__.setdefault("_render_resources_cache", {})
+        resources = cache.get(model)
+        if resources is None:
+            try:
+                model_type = self._get_model_type()
+            except Exception as error:
+                logger.warning(f"Router could not resolve the model type: {error}")
+                model_type = None
+            if model_type is None:
+                # Not an intentional generic-text configuration: a model that renders through
+                # an extension or Harmony would be rendered here without it, so its routing
+                # ids are an estimate and its fingerprint will not match the workers'.
+                logger.warning(
+                    "Router has no resolvable model type (no checkpoint path or an unreadable "
+                    "config); it renders as a generic text model. Models that need a serving "
+                    "extension or Harmony route on estimated ids and never forward them."
+                )
+            use_harmony = uses_harmony_tokenization(
+                use_harmony=self._use_harmony, model_type_resolver=self._get_model_type
+            )
+            resources = RenderResources.from_tokenizer(
+                # Harmony renders token ids itself. Loading a tokenizer here would fail for a
+                # client that sends the served name when no tokenizer directory is configured.
+                None if use_harmony else self._get_tokenizer(model),
+                model_type=model_type,
+                use_harmony=use_harmony,
+                custom_tokenizer=self._custom_tokenizer,
+            )
+            cache[model] = resources
+        return resources
+
+    def _may_write_back_token_ids(self, model: str) -> bool:
+        """Whether prompt ids rendered here may replace the worker's own rendering.
+
+        Only when every active worker reports the same rendering fingerprint as
+        the router. A worker that reports none (an older version) or whose
+        ``/server_info`` could not be fetched counts as a mismatch. Hashing the vocabulary is slow, so the
+        router's own fingerprint is computed once per model.
+        """
+        published = self.__dict__.get("_published_render_fingerprints")
+        servers = list(getattr(self, "_servers", None) or [])
+        if published is not None:
+            # A coordinator frontend: it never fetches /server_info, so it judges the
+            # servers it was told about by the fingerprints the coordinator published.
+            # A server the coordinator has not reported yet counts as a mismatch.
+            remote = [published.get(server) for server in servers]
+        else:
+            # Every active worker, not only those whose /server_info was fetched: a failed
+            # fetch leaves a worker active with no entry, and it must not be skipped.
+            info = getattr(self, "_server_info", None) or {}
+            remote = [(info.get(server) or {}).get("render_fingerprint") for server in servers]
+        self._write_back_blockers = []
+        if not remote:
+            return False
+        cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
+        local = cache.get(model)
+        if local is None:
+            local = cache[model] = self._render_resources(model).fingerprint()
+        # Kept for the warning: which workers keep the ids from being forwarded.
+        self._write_back_blockers = [
+            server
+            for server, fingerprint in zip(servers, remote)
+            if not fingerprints_match(local, fingerprint)
+        ]
+        return not self._write_back_blockers
+
+    def set_published_render_fingerprints(self, fingerprints: dict[str, Optional[dict]]) -> None:
+        """Worker fingerprints (summaries) a disagg coordinator published, by server."""
+        self._published_render_fingerprints = dict(fingerprints)
+
+    def _tokenize_chat(self, request: ChatCompletionRequest) -> list[int]:
+        """Render a chat request with the shared core and decide on write-back."""
+        if request.prompt_token_ids is not None:
+            return list(request.prompt_token_ids)
+        try:
+            rendered = render_chat(
+                request,
+                self._render_resources(request.model),
+                tokenize=True,
+                encode_rendered=self._make_encode_rendered(request),
+            )
+        except UnsupportedRenderError as error:
+            # Media, or a model the renderer does not support: route on an
+            # estimate and let the worker render the request itself.
+            logger.debug(f"Router could not render the request ({error}); routing on an estimate.")
+            return self._tokenize_chat_legacy(request, set_prompt_token_ids=False)
+        # A forwarded request is an ordinary chat request carrying prompt_token_ids, so the
+        # worker cannot see the rendered text and decides nothing from it: usage adjustments
+        # (kimi_k3) and reasoning modes read off the prompt are lost. Ids whose serving
+        # semantics cannot be preserved that way are not forwarded; the worker renders them.
+        context = PreparedContext.model_validate(rendered.context)
+        reason = None
+        if getattr(request.tool_choice, "function", None) is not None:
+            # A named function makes the worker append a forced tool-call prefix to the prompt
+            # it renders, and the worker rejects such a request together with prompt_token_ids.
+            reason = "a named tool_choice is rendered by the worker"
+        elif not context.is_trivial():
+            reason = "serving decisions derived from the rendered prompt cannot be forwarded"
+        if reason is None and self._may_write_back_token_ids(request.model):
+            request.prompt_token_ids = rendered.token_ids
+        else:
+            self._render_fallbacks = getattr(self, "_render_fallbacks", 0) + 1
+            if self._render_fallbacks == 1:
+                blockers = getattr(self, "_write_back_blockers", None)
+                if reason is None:
+                    reason = (
+                        "rendering fingerprint missing or different on " + ", ".join(blockers)
+                        if blockers
+                        else "no workers are known yet"
+                    )
+                logger.warning(
+                    f"Router rendered prompt ids are not forwarded to workers: {reason}. "
+                    "Workers render the prompt themselves; routing is based on the router's ids."
+                )
+        return rendered.token_ids
+
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
-
-            def tokenizer_factory() -> object:
-                return self._get_tokenizer(request.model)
-
-            def encode_rendered(rendered: str, tokenizer: object) -> list[int]:
-                key = hash(
-                    "".join(
-                        str(
-                            msg.get("content")
-                            if isinstance(msg, dict)
-                            else getattr(msg, "content", "")
-                        )
-                        for msg in request.messages[:2]
-                    )
-                )
-                return self._encode_with_prefix_cache(rendered, key, tokenizer)
-
-            result = tokenize_chat_request_for_serving(
-                request,
-                tokenizer_factory=tokenizer_factory,
-                encode_rendered=encode_rendered,
-                use_harmony=self._use_harmony,
-                model_type_resolver=self._get_model_type,
-                set_prompt_token_ids=True,
-            )
-            return [result]
+            if legacy_render_enabled():
+                return [self._tokenize_chat_legacy(request)]
+            return [self._tokenize_chat(request)]
 
         # Handle CompletionRequest (has prompt)
         prompts = request.prompt

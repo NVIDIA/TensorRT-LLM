@@ -22,8 +22,9 @@ The server also supports the following endpoints:
 - ``/version``
 - ``/start_profile`` (prototype)
 - ``/stop_profile`` (prototype)
+- ``/v1/chat/completions/render`` and ``/v1/completions/render`` (prototype, enabled with ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1``)
 
-The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below.
+The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see :doc:`render-endpoints`.
 
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
@@ -244,6 +245,27 @@ Visual Generation Serving
 For checkpoints that support both LLM and Visual Generation, such as Cosmos3, pass ``--enable_visual_gen`` to select the VisualGen runtime when ``--visual_gen_args`` is not specified. The ``--visual_gen_args`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/sync`` (with ``/v1/videos/generations`` kept as a deprecated alias), and video management APIs.
 
 For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
+
+Render Endpoints
+----------------
+
+The render endpoints accept the same request body as ``/v1/chat/completions`` and ``/v1/completions`` and return the
+prompt token ids that a ``trtllm-serve`` server would build from it, including its chat template, tool and reasoning
+handling, and tokenization. They do not run the model. The response is a *rendered request*: the ``token_ids`` plus
+the original request body.
+
+Typical uses:
+
+- **Routing.** A KV-cache-aware router or gateway, such as Dynamo's endpoint picker, calls a render endpoint to get
+  exactly the token ids the server will see. It hashes them to find the server with the longest cached prefix, then
+  forwards the original request to that server.
+- **Skipping rendering on the server.** A client can send the ids to a server's chat or completions endpoint, so the
+  server does not apply the chat template and tokenize again.
+
+The render endpoints are a prototype and are not registered with ``trtllm-serve`` by default. Set
+``TRTLLM_ENABLE_RENDER_ENDPOINTS=1`` to register them on a ``trtllm-serve`` server, or run the standalone, CPU-only
+``trtllm-render`` next to your servers. See :doc:`render-endpoints` for the response format and for how to send a
+rendered request to the chat and completions endpoints.
 
 Multi-node Serving with Slurm
 -----------------------------
