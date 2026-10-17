@@ -60,6 +60,7 @@ from .backends import (
     TrtllmAttentionMetadata,
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
+from .backends.mixed_precision_kv_view import get_mixed_precision_kv_view
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
@@ -967,6 +968,11 @@ class MLA(nn.Module):
             )
             return
 
+        mixed_precision_kv_view = get_mixed_precision_kv_view(attn_metadata, self.layer_idx)
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.materialize()
+            attn_metadata = mixed_precision_kv_view.metadata
+
         self._forward_impl(
             position_ids,
             hidden_states,
@@ -974,6 +980,8 @@ class MLA(nn.Module):
             attn_output[0],
             latent_cache_gen=latent_cache_gen,
         )
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.writeback()
 
     def _forward_impl(
         self,

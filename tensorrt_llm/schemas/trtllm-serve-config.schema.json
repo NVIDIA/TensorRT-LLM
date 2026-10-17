@@ -2798,10 +2798,25 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by V2's internal 2000-sample / 120s cooldown. When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
+        },
+        "enable_mix_precision": {
+          "anyOf": [
+            {
+              "const": "nvfp4",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Store ordinary full-history KV in NVFP4 with an additional First/Last cache at the existing KV dtype. Requires KV cache manager V2.",
+          "status": "prototype",
+          "title": "Enable Mix Precision"
         },
         "enable_partial_reuse": {
           "default": true,
@@ -2820,6 +2835,14 @@
           "default": 0,
           "description": "Maximum size of the event buffer. If set to 0, the event buffer will not be used.",
           "title": "Event Buffer Max Size",
+          "type": "integer"
+        },
+        "first_n": {
+          "default": 256,
+          "description": "First tokens retained at the KV dtype when mixed precision is enabled. Accepts any nonnegative count; retention follows native page granularity.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "First N",
           "type": "integer"
         },
         "fp8_context_mla_kv_len_cap": {
@@ -2850,6 +2873,21 @@
           "default": 0.9,
           "description": "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used.",
           "title": "Free Gpu Memory Fraction"
+        },
+        "high_low_pool_ratio": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "High-precision to NVFP4 KV byte-budget ratio. Splits the selected KV groups without changing other groups' shares. None uses native pool sizing.",
+          "status": "prototype",
+          "title": "High Low Pool Ratio"
         },
         "host_cache_size": {
           "anyOf": [
@@ -2896,6 +2934,19 @@
           "default": null,
           "description": "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, each rank publishes its own events directly (e.g. over ZeroMQ) instead of the buffered event_buffer_max_size gather/poll path.",
           "status": "prototype"
+        },
+        "kv_pool_rebalance_config": {
+          "$ref": "#/$defs/KvPoolRebalanceConfig",
+          "description": "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when ``enable_kv_pool_rebalance`` is True.",
+          "status": "prototype"
+        },
+        "last_n": {
+          "default": 256,
+          "description": "Recent tokens retained at the KV dtype when mixed precision is enabled. Accepts any nonnegative count; retention follows native page granularity.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Last N",
+          "type": "integer"
         },
         "mamba_ssm_cache_dtype": {
           "default": "auto",
@@ -3157,6 +3208,63 @@
         }
       },
       "title": "KvCacheConnectorConfig",
+      "type": "object"
+    },
+    "KvPoolRebalanceConfig": {
+      "additionalProperties": false,
+      "description": "Tuning for the KV cache manager v2 pool rebalance auto-tuner.\n\nOnly used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.",
+      "properties": {
+        "check_interval": {
+          "default": 10,
+          "description": "Number of PyExecutor iterations between checks of whether a pool rebalance should be attempted.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Check Interval",
+          "type": "integer"
+        },
+        "cooldown_secs": {
+          "default": 120.0,
+          "description": "Minimum time, in seconds, between successive rebalance adjustments.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Cooldown Secs",
+          "type": "number"
+        },
+        "min_sampled_kv_caches": {
+          "default": 2000,
+          "description": "Minimum number of sampled (closed) KvCaches observed before the auto-tuner will consider making an adjustment.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Min Sampled Kv Caches",
+          "type": "integer"
+        },
+        "moving_average_decay": {
+          "default": 0.9999,
+          "description": "Decay factor for the exponential moving averages (reused length, capacity, history length) used to compute target pool ratios. Higher values react more slowly to change.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Moving Average Decay",
+          "type": "number"
+        },
+        "ratio_tolerance": {
+          "default": 0.25,
+          "description": "How far a pool group's current ratio may drift from its target before a rebalance is triggered, as a fraction of the smaller of the two. The comparison is symmetric, so 0.25 means a rebalance is triggered once one of the two exceeds the other by more than 25%.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Ratio Tolerance",
+          "type": "number"
+        },
+        "target_ratio_update_interval": {
+          "default": 100,
+          "description": "Number of newly sampled KvCaches between recomputations of the target pool-group ratios.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Target Ratio Update Interval",
+          "type": "integer"
+        }
+      },
+      "title": "KvPoolRebalanceConfig",
       "type": "object"
     },
     "LayerwiseBenchmarksConfig": {

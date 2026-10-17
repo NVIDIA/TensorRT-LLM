@@ -45,6 +45,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
+from .mixed_precision_kv_view import MixedPrecisionKVView
 from .utils import check_page_table, log_attention_failure_context
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
@@ -328,6 +329,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _logical_kv_lens: torch.Tensor = field(init=False, repr=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+    mixed_precision_kv_views: dict[int, MixedPrecisionKVView] | None = field(
+        init=False, default=None, repr=False, compare=False)
 
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
@@ -1080,6 +1083,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.mixed_precision_kv_views = None
+        if callable(
+                getattr(self.kv_cache_manager, "get_mixed_precision_buffers",
+                        None)):
+            self.mixed_precision_kv_views = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
@@ -2003,6 +2011,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
+
+        if self.mixed_precision_kv_views is not None:
+            MixedPrecisionKVView.prepare_batch(self)
 
     def plan(self,
              num_heads: int,

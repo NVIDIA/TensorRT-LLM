@@ -32,8 +32,9 @@ import torch
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
-from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, field_validator, model_validator)
+from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveFloat,
+                      PositiveInt, PrivateAttr, StrictInt, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -4895,6 +4896,34 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                                              "float32", "fp8", "fp8_ds_mla",
                                              "nvfp4"))
 
+    enable_mix_precision: Optional[Literal["nvfp4"]] = Field(
+        default=None,
+        status="prototype",
+        description="Store ordinary full-history KV in NVFP4 with an additional "
+        "First/Last cache at the existing KV dtype. Requires KV cache manager V2."
+    )
+    first_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "First tokens retained at the KV dtype when mixed precision is enabled. "
+        "Accepts any nonnegative count; retention follows native page granularity."
+    )
+    last_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Recent tokens retained at the KV dtype when mixed precision is enabled. "
+        "Accepts any nonnegative count; retention follows native page granularity."
+    )
+    high_low_pool_ratio: Optional[PositiveFloat] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "High-precision to NVFP4 KV byte-budget ratio. Splits the selected KV "
+        "groups without changing other groups' shares. None uses native pool sizing."
+    )
+
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
         "auto", "float16", "bfloat16", "float32"] = Field(
@@ -6943,6 +6972,18 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
+        if self.kv_cache_config.enable_mix_precision is None:
+            return self
+        if (self.speculative_config is not None
+                or self.kv_cache_compression_config is not None
+                or self.max_beam_width != 1):
+            raise ValueError(
+                "Mixed-precision KV currently requires single-beam execution "
+                "without speculative decoding or cold-page compression.")
         return self
 
     @model_validator(mode="after")

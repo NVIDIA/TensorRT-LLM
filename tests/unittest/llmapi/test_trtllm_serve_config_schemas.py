@@ -83,6 +83,18 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"enable_mix_precision": "nvfp4", "first_n": 1, "last_n": 65}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"enable_mix_precision": "nvfp4", "first_n": 255, "last_n": 0}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"first_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"last_n": -1}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),

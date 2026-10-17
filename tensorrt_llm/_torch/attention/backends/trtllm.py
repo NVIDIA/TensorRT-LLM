@@ -50,6 +50,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .mixed_precision_kv_view import MixedPrecisionKVView
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -137,6 +138,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
+    mixed_precision_kv_views: dict[int, MixedPrecisionKVView] | None = field(
+        init=False, default=None, repr=False, compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -368,6 +371,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.mixed_precision_kv_views = None
+        if callable(
+                getattr(self.kv_cache_manager, "get_mixed_precision_buffers",
+                        None)):
+            self.mixed_precision_kv_views = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1135,6 +1143,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
+
+        if self.mixed_precision_kv_views is not None:
+            MixedPrecisionKVView.prepare_batch(self)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
