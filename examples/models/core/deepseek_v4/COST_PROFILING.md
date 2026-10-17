@@ -1,100 +1,49 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Offline DSpark graph-cost profiling
+# Generate DSpark whole-step costs
 
-This interface collects and exports measured graph replay costs. The direct
-whole-step producer/export and separate paired collector/fitter have completed
-one recorded physical-K3/G64, global-BS512 GPU integration in an earlier
-Python/native environment. See [the reproduction guide](CONFIDENCE_REPRODUCTION.md)
-for the distinct newer-source validation scope and remaining limits.
-The default graph-replay collector retains its narrower scope: it does not itself
-generate a serving SPS table, paired calibration observations, an admission
-receipt or an enabled throughput result. The explicit complete-loop mode and
-CPU schema-v2 adapter are described in [COST_EXPORT.md](COST_EXPORT.md).
+Use this recipe when you need a new cost table. Reusing a compatible supplied
+table does not require profiling again. Installation, artifact reuse and
+ordinary execution are covered by the [reproduction guide](CONFIDENCE_REPRODUCTION.md).
 
-The tools contain no private model, dataset, scratch path, historical receipt or
-source-head pin. Use your own authorized local checkpoint and tokenized inputs.
-Raw observations include prompt and output tokens; store them in an appropriately
-access-controlled output directory.
-The Linux collector creates only a new directory with mode0700 and new raw files
-with mode0600, using exclusive/non-overwriting creation. It does not change
-existing paths, ACLs, process umask or host settings. Existing/symlink targets are
-rejected. The exercised Linux collector used new private output paths; CPU
-permission controls or one Linux execution do not qualify Windows ACLs or every
-destination filesystem.
+The workflow is **profile → reduce → export**. Whole-step collection uses the
+executor's complete-step `hostStepTimeMS` timer rather than only graph replay.
+It uses the normal model, KV, sampler and
+shutdown paths. No forced acceptance is permitted.
 
-## Scope and terminology
+## 1. Configure the runtime and grid
 
-- `K` is the physical draft block produced by the model. Set it explicitly with
-  `--physical-k`; it must equal the runtime's `speculative_config.max_draft_len`.
-  Profiling never relabels a K5 execution as K3.
-- `G` is the rank-local graph request count.
-- `V` is the total verifier token budget in that rank-local graph. `V=0` denotes
-  the native full-block control, not an empty execution. Positive compact cells
-  require `K>1` and `G <= V < G*(K+1)`; K1 currently supports only native cells.
-- The measured scope is **the original graph replay entry, including static
-  input copies**. It includes work already inside that graph, including the
-  embedded drafter and optional confidence head. It is not a target-only timer,
-  a complete confidence-policy price, or an end-to-end generation timer.
+K is the physical draft block, G is the rank-local request count, and V is the
+total verifier-row budget of a captured compact layout. V0 is the sentinel for
+native full-width `G*(K+1)` verification, not zero work. Every G needs a native
+V0 control. Compact cells require K > 1 and `G <= V < G*(K+1)`; choose the compact
+cells you want to price rather than sweeping every possible V.
 
-The offline engine uses the original model loader, attention/backend selection,
-graph capture/replay, request scheduler, KV allocator/estimator, sampler, token
-updates and shutdown. It prescribes a declared verification cell; it does not
-enable or bypass production confidence admission. Ordinary requests outside a
-prescribed offline generation are rejected, and no serving RPC endpoint is exposed.
-The profiler duplicates its control communicator collectively before worker
-construction, retains it through shutdown/evidence closure, then frees it.
-Original request broadcasts and runtime communicator/thread-local bindings are
-unchanged. Multi-rank profiling requires existing MPI `THREAD_MULTIPLE` support;
-the collector checks it and does not modify MPI initialization or thread level.
+Prepare a complete runtime YAML for the intended model, precision and backend.
+It must have:
 
-Each cell runs a fixed cohort of real requests through prefill, generation and
-drain, then repeats that generation. It does not time a single synthetic request
-replayed in isolation. Only decode steps with exactly `G` requests on every rank
-and the declared captured graph key become samples. Initial prefill, first-draft,
-peer-not-ready and shorter drain batches retain the native path and are not timed
-as that cell. No forced acceptance is allowed. The default reducer excludes
-generation 0 and the first two eligible samples of every retained generation.
+- `tensor_parallel_size` equal to the MPI world size, PP=1 and CP=1;
+- the intended expert parallelism and attention DP, plus sufficient request,
+  token, sequence-length and KV capacity;
+- `enable_iter_perf_stats: true` for the complete-loop timer;
+- padded CUDA graphs with a resolved rank-local ladder exactly matching all G
+  values in the grid;
+- embedded DSpark at the chosen physical K, with confidence scheduling and the
+  fused scheduler OFF, no mixed evidence or draft-length schedule, and no
+  SPS, STS, fingerprint or admission fields.
 
-## Prepare a matching runtime and workload
+Do not use an enabled `dynamic.yaml` unchanged for profiling. The grid's
+`record_confidence_head: true` records the loaded head inside the graphs without
+enabling serving confidence policy.
 
-Use a complete Linux checkout containing this tooling. Build/install TensorRT-LLM
-using the repository's [build instructions](../../../../docs/source/installation/build-from-source.md),
-or reuse genuinely compatible existing native artifacts through the documented
-precompiled/editable-install route. A Python-only tooling change does not by
-itself require a native rebuild or new cost/calibration measurements.
-Do not combine these Python modules with incompatible native interfaces. Retain
-the original native provenance and record changed Python source separately.
-The collector records
-the actual loaded Python/native-library hashes, package version, GPU class,
-topology, graph configuration and observed attention-module classes. A module
-roster is not proof of every dispatched kernel or of GPU health.
-These raw identity observations are also not a complete weight/JIT/source/build
-qualification or a production serving live fingerprint.
+The current whole-step exporter supports attention-DP fanout or a single rank;
+multi-rank attention-DP-off export is refused. The offline driver supports
+aggregate greedy generation and rejects guided decoding, LoRA, custom logits
+processors, disaggregated KV transfer/connectors, in-graph sampling, encode-only
+and resource-governor control. Multi-rank operation needs MPI `THREAD_MULTIPLE`.
 
-Prepare a runtime YAML accepted by `TorchLlmArgs`, including:
-
-- `tensor_parallel_size` matching the MPI world size, `pipeline_parallel_size: 1`
-  and `context_parallel_size: 1`;
-- the intended expert parallelism and `enable_attention_dp` setting;
-- enough `max_batch_size`, `max_num_tokens`, `max_seq_len` and KV capacity for the
-  full cohort and requested output length;
-- padded decode CUDA graphs whose **resolved rank-local ladder** exactly matches
-  all `G` values in the profile grid;
-- an embedded DSpark configuration with the selected physical K, confidence
-  scheduling and the optional fused scheduler disabled, no draft-length schedule,
-  and no confidence SPS/fingerprint/admission/calibration fields.
-
-This initial driver is aggregate, fixed greedy generation. It rejects LoRA,
-guided decoding, custom logits processors, disaggregated KV transfer/connectors,
-encode-only execution and in-graph sampling. Prefill graph capture is not part of
-this interface; resource-governor control is also unsupported. Keep the intended
-numerical/quantization/backend configuration;
-do not change it merely to make profiling launch.
-
-For example, an attention-DP eight-rank profile of global BS512 uses G64. One
-possible **declared grid**, not a measured cost table, is:
+For example, use this `profile-grid.json` for K3/G64:
 
 ```json
 {
@@ -110,185 +59,114 @@ possible **declared grid**, not a measured cost table, is:
 }
 ```
 
-Use `cuda_graph_config.batch_sizes: [64]` and `enable_padding: true` for that
-single-G example; the original runtime's token/request limits must retain G64.
-If the resolved ladder has more G values, include their native V0 controls and
-desired compact cells. Missing or silently clamped coverage is an error.
+This declares shapes, not measured prices. Merge the following fragment into
+the complete working runtime YAML for this example; it is not a standalone
+configuration:
 
-The interface can prepare all previously used global batch sizes
-128/256/512/1024/1536/2048. With eight attention-DP ranks these map to
-G16/G32/G64/G128/G192/G256. With attention DP off, G is the full global batch,
-not BS/8. Smaller points are explicit G inputs too; no pilot batch is hardcoded.
-Each additional G requires its own captured graph and measured compatible cells.
-Preparation does not imply validation of every batch size. The recorded K3/G64,
-global-BS512 integration has completed; other listed points remain prepared
-interfaces unless separately identified as tested. Compatible artifact reuse
-does not require a new batch-size sweep.
-
-The JSONL input file must contain at least the largest global cohort size, with
-one object per line and a nonempty list of integer `prompt_token_ids`. Use the
-actual licensed tokenizer and workload. The driver assigns stable input IDs and
-uses the same prompt prefix for repeated cells; prompts and requested output
-length must fit `max_seq_len`.
-
-## Development collection command
-
-After the complete launch procedure, matching native build and GPU health are
-qualified, invoke the CLI under the site's normal MPI/container launcher. For
-an already configured, healthy eight-GPU Linux environment the interface is:
-
-```bash
-mpirun -np 8 --bind-to none python -m tensorrt_llm.tools.verify_costs profile \
-  --model /path/to/authorized/checkpoint \
-  --config /path/to/runtime.yaml \
-  --grid /path/to/profile-grid.json \
-  --physical-k 3 \
-  --inputs /path/to/tokenized-prompts.jsonl \
-  --output /path/to/new-private-output-directory \
-  --generations 3 --output-tokens 768 --timeout 12180
+```yaml
+tensor_parallel_size: 8
+pipeline_parallel_size: 1
+context_parallel_size: 1
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+enable_iter_perf_stats: true
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [64]
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 3
+  enable_confidence_scheduling: false
 ```
 
-These paths are explicit inputs, not supplied artifacts. `--timeout` is the total
-generation-phase request budget after construction/identity, not a guarantee that
-startup fits a scheduler lease. Reserve the full startup, model, export and
-shutdown budget in the outer launcher. Do not restart on quiet logs or an
-observation timeout. The output directory must be new and its parent must exist;
-no existing output is overwritten.
+Change K and the grid/graph ladder together for another workload. Each additional
+G needs its own native control and desired compact cells. Request/token limits
+must retain the requested ladder: a silently clamped graph is not its requested
+shape. `max_samples` must accommodate the run's raw replay records.
 
-The result contains one `rank-R-record-N.json` per cell/generation/rank. It records
-actual replay keys, lease-completed GPU events, request/sampler/KV lifecycle joins,
-fixed-length original responses and closure. Completed evidence is retained on
-failure with `run_complete: false`; a failure record does not qualify costs.
-Successful shutdown is required before raw records can be exported as complete.
+The JSONL workload must contain at least the largest global cohort, with a
+nonempty integer `prompt_token_ids` list per line. Use the model's tokenizer and
+ensure prompt plus output fits `max_seq_len`. Each cell repeats the same real
+prompt cohort through prefill, generation and drain. Only decode steps with
+exactly G requests on every rank and the declared graph key are samples;
+bootstrap and shorter drain steps retain native execution.
 
-## Export and inspect raw measured costs
+## 2. Profile complete steps on GPUs
 
-Reduction is stdlib-only and can run without importing native TensorRT-LLM:
+Run from the source checkout using its compatible installed runtime and the
+normal allocation/container/MPI procedure. Set these Bash variables to your
+paths and selected inputs; for the example, `K=3`, `RANKS=8` and `GRAPH_G=(64)`.
+`SOURCE_ROOT` is the checkout used for execution; `PROFILE_YAML` is the complete
+confidence-OFF configuration above. Output parents must exist and output paths
+must be new.
+
+```bash
+mpirun -n "$RANKS" python -m tensorrt_llm.tools.verify_costs profile \
+  --model "$MODEL_DIR" --config "$PROFILE_YAML" --grid "$GRID_JSON" \
+  --physical-k "$K" --cost-scope whole-step --source-root "$SOURCE_ROOT" \
+  --inputs "$INPUTS_JSONL" --output "$PROFILE_OUT" \
+  --generations 3 --output-tokens 768 --timeout "$GENERATION_BUDGET_SECONDS"
+```
+
+`--timeout` is the shared generation-phase budget after construction and identity
+checks, not the whole allocation budget. Reserve startup, generation, export and
+natural shutdown in the outer launcher. Keep the full chosen output workload;
+a short run may not meet the sample floors below.
+
+The output contains `rank-R-record-N.json` for each cell/generation/rank, with
+actual graph keys, per-step samples, request/sampler/KV joins, responses and
+source/runtime/model/topology identity. Only completed runs with successful
+shutdown can be exported as complete measurements.
+
+## 3. Reduce all-rank observations on CPU
+
+This reduction uses the standard library and does not import native TensorRT LLM:
 
 ```bash
 python tensorrt_llm/tools/verify_costs.py export \
-  --raw /path/to/new-private-output-directory/rank-*-record-*.json \
-  --output /path/to/new-measured-summary.json \
+  --raw "$PROFILE_OUT"/rank-*-record-*.json --output "$SUMMARY_JSON" \
   --exclude-generations 1 --warmup-samples 2 \
   --minimum-generation-samples 12 --minimum-samples 24
 ```
 
-The reducer joins exact replay ordinals and executor iterations across **all**
-ranks, takes each joined rank maximum, then reports the retained median. It does
-not average ranks or sum overlapping spans. It preserves raw-file hashes,
-per-rank samples and every exclusion. It rejects duplicate JSON keys, nonfinite
-or nonpositive durations, unequal scopes/identities, missing declared cells or
-generations, missing/duplicate ranks, reused/reset ordinals, changed observed
-layouts and incomplete generation/run/shutdown closure.
-Each declared cell must observe one consistent graph key over its generations.
-If the workload crosses different sequence-length/attention graph regimes, the
-collector refuses to pool them; prepare separate appropriately declared runs.
-Each retained generation needs at least 12 exact samples after exclusions, and
-each cell needs at least 24 pooled retained samples. A large count in one
-generation does not waive another generation's floor.
+The shell expands the raw-file glob. Generation 0 is excluded, as are the first
+two eligible samples of each retained generation. Every retained generation
+needs at least 12 exact samples, and every cell needs at least 24 pooled samples.
+More samples in one generation do not waive another generation's floor.
 
-Cost keys contain physical K, graph G/V, attention layout, captured-head mode and
-the observed graph key. Rows with equal counts but different layouts are not
-pooled. Inspect the source/runtime/model/topology identity before comparing or
-reusing a summary. Raw summary structure and timing scope remain different from
-the runtime's schema-v2 prediction table; renaming a file does not convert it.
+The reducer joins replay ordinals and executor iterations across all ranks,
+takes each joined rank maximum, then reports the retained median. It does not
+average ranks or sum overlapping spans. It rejects missing/duplicate ranks or
+cells, changed layouts, unequal identities, nonfinite/nonpositive times and
+incomplete closure. Each cell must retain one consistent observed graph key;
+different sequence-length/attention graph regimes need separate declared runs.
 
-## Fit existing paired confidence observations on CPU
-
-The standalone fitter accepts tensor-only `.pt` shards containing
-`logits: [N, K]`, binary cumulative `prefix_mask: [N, K]` and
-`meta.pairing: "draft_seq_ring"`. The labels must be observed against the same
-stamped draft sequence and request incarnation as the raw logits, with full
-physical-K verification. A shortened compact verification cannot provide labels
-for its unverified suffix. This producer contract is not inferred from tensor
-dimensions or from a metadata string alone.
-
-Fit the established 41-point, left-to-right cumulative-survival ECE objective:
+## 4. Export the runtime table on CPU
 
 ```bash
-python tensorrt_llm/tools/dspark_calibration.py \
-  --shards /path/to/private/paired-observations-*.pt \
-  --physical-k 3 --output /path/to/new-sts.json
+python tensorrt_llm/tools/dspark_cost_export.py \
+  --input "$SUMMARY_JSON" --physical-k "$K" \
+  --graph-batch-sizes "${GRAPH_G[@]}" --output "$COST_TABLE_JSON"
 ```
 
-The shell expands the shard glob. The default floor is 1,000 paired rows; use
-representative data rather than interpreting a small fixture as a calibrated
-head. Physical K is explicit, not fixed to the profiling pilot. The output
-retains both `sts_temperatures` and `temperatures`, the original shard hashes,
-sample count and before/after ECE. Degenerate prefix positions are reported,
-not promoted as informative fits. Inputs use PyTorch's tensor-only safe loader;
-duplicate shards, wrong pairing/width, nonfinite data and invalid prefix order
-are rejected. Existing output files are never overwritten.
+`GRAPH_G` is a Bash array of the resolved ladder, for example `(16 64)` for two
+sizes. The exporter maps directly measured whole-step medians to schema-v2
+`step_time_ms`, retaining their original source/fingerprint and summary hash.
+It does not invent missing prices or refresh a historical identity. Use the
+new table as `confidence_sps_table_path` in the normal runtime configuration.
 
-This command has CPU math/CLI coverage, including exact agreement with the
-established fitter. The public paired collector and fitter have also completed
-the recorded earlier GPU integration. They remain distinct from graph-cost
-collection, which does not emit paired shards. No private collector command or
-environment variable is a public prerequisite. Neither fitting nor cost
-measurement certifies GPU freshness, task accuracy or positive scheduling
-economics. Ordinary runtime reuse of a valid supplied STS vector remains
-available without fitting it again.
+See [Cost format, export and reuse](COST_EXPORT.md) for accepted formats and
+structural checks. Costs do not calibrate the head, establish task accuracy or
+grant economic admission.
 
-## Next stages and validation boundary
+## Advanced: graph-replay diagnostics
 
-A measured summary deliberately sets `production_sps_table_eligible`,
-`production_admission_qualified`, `policy_overhead_measured` and
-`task_accuracy_qualified` to false. Do not rename it to
-`confidence_sps_table_path` or create a positive receipt from graph timings alone.
+The same `profile` CLI defaults to `--cost-scope graph-replay`. That mode measures
+graph replay including static input copies. Use it for
+graph-level investigation, omitting the whole-step-only `--source-root` option.
+Its replay medians are not serving prices and are rejected by the schema-v2 cost
+exporter. GPU-forward timing and overlap `iterLatencyMS` are not substitutes for
+the complete-loop boundary, and overlapping host/GPU spans must not be summed.
 
-Confidence scheduling remains default-off. With explicit enablement, the
-default reuse path accepts structurally valid supplied costs and calibration,
-with clear warnings when freshness and performance economics are unchecked.
-It retains physical-K/graph/layout coverage, finite positive values and ordinary
-runtime/acceptance safety. Fresh costs/calibration and positive economic
-admission are not universal prerequisites to a fair measured comparison.
-
-The candidate [self-generation workflow](CONFIDENCE_REPRODUCTION.md) includes
-whole-step cost export, correctly paired calibration collection/fitting, and
-ordinary static/dynamic execution plus comparison. The graph-replay mode keeps
-its narrower recorded scope; it does not price online policy, layout preparation
-or end-to-end request execution.
-Measure those exposed costs separately when evaluating prediction quality or
-scheduling headroom. Do not double-count overlapping spans.
-
-Users choosing `validate_confidence_artifact_freshness: true` additionally need
-an actual destination fingerprint and the optional workload-economic checks,
-including measured enabled-path overhead. Native decisions pay that overhead
-too. A positive receipt must come from genuine measured/replay evidence, never
-from graph timings alone. Neither this collector nor the CPU fitter fabricates
-one. The public strict-validation producer remains an explicit pending piece.
-
-A clean-checkout colleague run must ultimately verify requested versus resolved
-enablement, genuine compact routing, completed outputs/task checks and a fair
-matched static-versus-enabled benchmark. CPU fake-event tests and smoke imports
-are not CUDA replay, full-model accuracy, production admission or performance proof.
-
-The reusable measurement/export module is
-`tensorrt_llm/tools/verify_costs.py`; DSpark shape/runtime adapters are under
-`_torch/speculative/dspark_cost_profile.py`,
-`_torch/speculative/dspark_cost_profiler.py` and the explicit profile-only engine
-and request owner under `_torch/pyexecutor`. Future workload adapters can reuse
-timing leases, exact-rank reduction and export while supplying their own execution
-shape and layout identity. This does not assume unpublished model-specific details.
-
-Focused developer controls are:
-
-```bash
-python -B tests/unittest/tools/test_dspark_cost_export.py
-python -B tests/unittest/tools/test_dspark_calibration.py
-python -B tests/unittest/tools/test_dspark_observations.py
-python -m pytest -q tests/unittest/executor/test_dspark_reproduction_factory.py
-```
-
-The artifact and observation suites use CPU data and finite lifecycle controls;
-they do not qualify CUDA events or real distributed execution. The factory suite
-needs a matching native import environment but does not construct a model. It
-covers the ordinary public argument boundary and the explicit observation/profile
-constructor seams, including resource-governor rejection for the profile owner.
-It also checks the imported parent replay keyword/default contract and preserves
-the same position-offset object in native and measured profile replay branches.
-It also covers native-collection and enabled-observation graph parents, including
-the same position-offset forwarding and routing bookkeeping.
-The file contains fourteen parameter cases; its complete matching-runtime pytest run
-is distinct from selected-source CPU boundary controls.
-These controls are not full-model GPU, real-MPI, accuracy or performance results.
+Supported/tested scope and optional developer controls are in the
+[validation reference](CONFIDENCE_VALIDATION.md).

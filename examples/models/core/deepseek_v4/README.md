@@ -477,13 +477,11 @@ configuration.
 
 DSpark can use a trained confidence head to choose a measured verifier-token budget while
 continuing to propose the full physical draft block. Confidence scheduling is experimental and
-off by default. Enabling it requires a compatible cost table; optional temperature calibration
-can refine the predictions, but is not required to run.
+off by default. Enabling it requires a compatible cost table.
 
 Start with [Confidence scheduling and reproduction](CONFIDENCE_REPRODUCTION.md) for ordinary
-runtime configuration, artifact reuse, self-generation and benchmarking. The
-[validation and developer reference](CONFIDENCE_VALIDATION.md) records exercised configurations,
-advanced restrictions, optional freshness checks and developer tests.
+runtime YAML and benchmarking, artifact reuse or self-generation, and optional temperature
+calibration and controlled comparisons.
 
 ## Notes and Troubleshooting
 

@@ -4,10 +4,11 @@
 # Confidence scheduling: validation and developer reference
 
 Start with the [usage guide](CONFIDENCE_REPRODUCTION.md) for artifact reuse,
-self-generation and ordinary inference/benchmarking. This reference separates
-validation history and advanced contracts from that user workflow.
+self-generation and ordinary inference/benchmarking. This reference records
+supported/tested scope and advanced contracts. Developer checks and strict
+validation are opt-in, not an ordinary pre-run checklist.
 
-## Recorded validation scope
+## Validation scope
 
 These are the distinct integration scopes recorded before this documentation
 reorganization. Original source/native/artifact provenance remains unchanged.
@@ -22,6 +23,10 @@ reorganization. Original source/native/artifact provenance remains unchanged.
 Other prepared batch sizes and configurable physical K are interface coverage,
 not additional measured results. Existing source tests and historical
 measurements must not be relabeled as current-head GPU validation.
+The interfaces support the global BS128/256/512/1024/1536/2048 grid and smaller
+points when actual graph/K/cost/capacity coverage permits. With eight attention-DP
+ranks these map to G16/G32/G64/G128/G192/G256; with attention DP off, G is the
+global cohort. This mapping is not a GPU-validation claim for every point.
 
 The controlled helper reports fixed-cohort enqueue-to-final-response TPS,
 including prefill and drain. Historical plateau measurements and ordinary
@@ -76,10 +81,11 @@ not a blanket DSpark runtime restriction. Replay-entry timing remains a separate
 diagnostic; it is not renamed to a complete-loop cost or summed with overlapping
 host/GPU spans.
 
-Optional temperature vectors must have finite positive values for each physical
-draft position. Omitting calibration uses raw sigmoid probabilities. Reuse
-retains original artifacts and records the actual destination runtime separately;
-it does not rewrite old fingerprints or guarantee positive performance.
+Temperature vectors, when supplied, must have finite positive values for each
+physical draft position. See the [optional calibration workflow](CONFIDENCE_REPRODUCTION.md#optional-temperature-calibration)
+for collection, fitting and use. Reuse retains original artifacts and records
+the actual destination runtime separately; it does not rewrite old fingerprints
+or guarantee positive performance.
 
 ### Requested configuration versus execution
 
@@ -224,17 +230,27 @@ source/runtime identity. The fitter retains shard hashes, sample count,
 temperatures and before/after ECE; degenerate positions are reported rather than
 promoted as informative fits. This is not task-accuracy qualification.
 
-The optional constructor test below uses the real argument validator and
-internal factory seam without constructing a model. Run it only in a compatible
-installed native runtime; imports may require a driver. It is a developer
-regression, not a colleague pre-run gate or GPU qualification:
+Artifact, calibration and observation controls can run with CPU inputs:
+
+```bash
+python -B tests/unittest/tools/test_dspark_cost_export.py
+python -B tests/unittest/tools/test_dspark_calibration.py
+python -B tests/unittest/tools/test_dspark_observations.py
+```
+
+The constructor test uses the real argument validator and internal factory seam
+without constructing a model. Run it in a compatible installed native runtime;
+imports may require a driver:
 
 ```bash
 python -m pytest -q tests/unittest/executor/test_dspark_reproduction_factory.py
 ```
 
 `executor_cls` is internal and remains rejected as a public LLM argument.
-Additional synthetic contract regressions are:
+The factory tests cover observation/profile construction, the imported replay
+keyword/default contract, position-offset forwarding and routing bookkeeping.
+These CPU/native-import controls are not real MPI, GPU execution, accuracy or
+performance results. Additional contract regressions are:
 
 - `tests/unittest/_torch/speculative/hw_agnostic/test_dspark_workload_admission.py`
 - `tests/unittest/_torch/speculative/hw_agnostic/test_dspark_admission_resolution.py`
