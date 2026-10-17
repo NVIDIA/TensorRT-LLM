@@ -109,6 +109,15 @@ DOMAIN_PRIMING = """\
 - For MoE work, read
   `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
   across routing, expert parallelism, quantization, and fused-kernel contracts.
+- For weight loading and post-load work, follow "Adding a Model Family" in
+  `docs/source/features/model-express.md`: structural wiring goes in
+  `setup_aliases()`, one-shot tensor transforms in `transform_weights()`
+  guarded by `_weights_transformed`, and derived Python state in
+  `cache_derived_state()`. Staged receivers of already-transformed weights
+  skip `load_weights()`, `transform_weights()`, and every
+  `post_load_weights()`, so keep real work out of direct
+  `post_load_weights()` overrides and non-tensor state out of
+  `load_weights()`.
 - Use `KVCacheManagerV2` for new-model bring-up. The TRTLLM and FlashInfer
   attention backends are both valid targets when the plan tests the selected
   backend with `KVCacheManagerV2`.
@@ -741,4 +750,103 @@ SOURCE_BOUNDARY = """\
   technical sources unless the user explicitly names them in the spec.
 - Evidence must cite HF/vLLM, TensorRT-LLM, current workspace artifacts, or the
   user spec — not external skill or agent documents.
+"""
+
+# Default-on ModelExpress (MX) qualification step. It lives inside every
+# role's ``SYSTEM_PROMPT_EXTENSION``; ``task.yaml`` can turn it off or make
+# it the whole task through the two overrides below, which
+# ``build_modeling_bringup_prompts`` appends last so they win.
+MODEL_EXPRESS_POLICY = """\
+## ModelExpress (MX) qualification step
+
+Unless `task.yaml` sets `model_express.enabled: false`, a bring-up that
+delivers a complete `*ForCausalLM` root ends, once full-model parity
+passes, with ModelExpress (MX) checkpoint-loading qualification (the last
+plan step or Stage). Like the required bring-up mechanisms, this is a
+project-level outcome: an MX step in `plan.md` and MX items in
+`acceptance-criteria.md` are neither leaked prescriptions nor scope creep,
+even when `task.yaml` never mentions MX. Read
+`docs/source/features/model-express.md` before planning, implementing, or
+judging this step.
+
+- **Eligibility** comes from the real checkpoint config plus the
+  implemented model's realized runtime config; the code is the source of
+  truth (`_MX_BF16_DENSE_RUNTIME_CONSTRAINTS` and the profile registry in
+  `tensorrt_llm/_torch/pyexecutor/model_loader.py`). Only a text-only dense
+  causal-LM root qualifies (no MoE, vision-language, reward or embedding,
+  hybrid or linear attention, or sparse attention) that runs with BF16
+  dtype, no weight or KV-cache quantization, untied embeddings, the default
+  RoPE type, TRTLLM attention, no sliding window, and TP 1 or 2 on one node.
+- **Outcome.** Record one line: `MX: qualified — <profile_id>`,
+  `MX: not eligible — <failing constraint and its evidence>`, or
+  `MX: disabled by task.yaml` (PlanDrafter in `plan.md`, Coder and
+  Reviewer in `status.md`, QA under `## Notes` in `final-report.md`).
+  Phrase the MX acceptance item so either evidence-backed verdict closes
+  it. PlanReviewer, Reviewer, and QA re-derive the verdict and REJECT a
+  missing outcome or an uncited `not eligible`. An ineligible model gets no
+  MX code; never widen the envelope (dtype, quantization, MoE, backend,
+  RoPE, tied embeddings, parallelism, multi-node) to make it fit.
+- **Implementation.** Mirror the Qwen3 and Mistral qualification commits
+  (`git log --oneline -- tensorrt_llm/_torch/weight_sharing/post_transform_profiles.py`):
+  audit the post-load hooks, add a new transform-layout ABI constant and an
+  exact `PostTransformProfile`, and extend the same unit tests, `_MX_CASES`
+  rows, `l0_model_express.yml`, and the doc's support table (a unit test
+  compares it with the registry). Add a `dataclasses.replace` constraint
+  variant only to pin a dimension the family realizes differently. Never
+  reuse or reinterpret an existing ABI ID. Point `_MX_CASES` rows at a
+  checkpoint CI has under `LLM_MODELS_ROOT`, or flag the gap for the human.
+- **Evidence.** (1) The new and existing MX unit tests pass; they build
+  tiny CPU-tensor models by design and prove registry and lifecycle wiring
+  only. (2) On the GPU host, the model built from the real checkpoint
+  config the way `ModelLoader.load` builds it resolves to the new
+  `profile_id` via `ModelLoader._qualify_post_transform_profile` (report
+  the realized `PostTransformRuntimeConfig`), and a TP1 load with
+  `checkpoint_format: MX`, no MX server, and `TLLM_LOG_LEVEL=INFO` falls
+  back to native loading with no `Skipping MX post-transform publish` line
+  and the same greedy tokens as a default load. Together, (1) and (2)
+  satisfy the CUDA/GPU evidence rule for this step. (3) The donor/receiver
+  test needs a ModelExpress server, Redis, NIXL, and 2×TP GPUs; run it only
+  when `MODEL_EXPRESS_URL` and enough GPUs are available, otherwise record
+  it as deferred to the ModelExpress CI stages named in the doc. That
+  deferral is not a REJECT trigger, and a skipped run is not pass evidence.
+"""
+
+MODEL_EXPRESS_DISABLED = """\
+## ModelExpress (MX) step disabled for this run
+
+This run intentionally disables the ModelExpress (MX) qualification step
+(`model_express.enabled: false` in `task.yaml`). Do not plan, implement,
+test, require, or review MX profiles, ABI IDs, or MX tests, even if an
+earlier section asks for it; only record the outcome line
+`MX: disabled by task.yaml`. The post-load hook rule in the bring-up frame
+still applies.
+"""
+
+MODEL_EXPRESS_EXISTING_MODEL = """\
+## Existing-model MX qualification (task override)
+
+`task.yaml` sets `model_express.existing_model: true`: the target model
+already runs in TensorRT-LLM, and the whole task is the ModelExpress (MX)
+qualification step above. This overrides earlier sections, including
+those that apply regardless of how `task.yaml` is phrased:
+
+- Do not re-implement, refactor, or re-tune the model. Change model code
+  only where the post-load hook audit or the MX profile requires it.
+- New-model requirements do not apply: the required-mechanism list
+  (`KVCacheManagerV2`, attention backend at checkpoint scale, CUDA-graph
+  matrix), the `source_activation_replay` / `source_logit_replay` /
+  `generation_parity` labels, the reference ladder, attention and
+  full-model stages, and accuracy gates that `task.yaml` does not
+  configure.
+- Plans, acceptance criteria, Reviewer verdicts, and QA APPROVE rest on the
+  MX evidence above plus the model's existing TensorRT-LLM tests (for
+  example under `tests/unittest/_torch/modeling/`) still passing on GPU.
+- If the checkpoint is not eligible, the deliverable is the evidence-backed
+  `MX: not eligible — <reason>` verdict with no code change, and QA may
+  APPROVE it.
+- If the plan uses Stages, it has a single Stage, `MX qualification`,
+  instead of the accuracy-convergence progression.
+- In `final-report.md`, rows that only apply to new models read
+  `Not measured — existing-model MX qualification`; use Part 2 for the
+  profile, ABI ID, and hook changes.
 """
