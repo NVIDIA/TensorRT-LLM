@@ -111,7 +111,20 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
             w = getattr(norm, "weight", None)
             if w is None:
                 continue
-            norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
+            fused = (w.float() + 1.0).to(w.dtype)
+            cached = getattr(norm, "_fused_norm_weight", None)
+            if (cached is not None and cached.shape == fused.shape
+                    and cached.dtype == fused.dtype
+                    and cached.device == fused.device):
+                # In-place update keeps the buffer address stable: captured
+                # CUDA graphs bake this tensor's pointer into the fused-AR
+                # kernel args, and post_load_weights re-runs on RL weight
+                # refit (rlhf_utils.update_weights) without re-capturing
+                # graphs -- rebinding would leave replays reading freed
+                # memory.
+                cached.copy_(fused)
+            else:
+                norm._fused_norm_weight = fused
 
 
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
@@ -1123,6 +1136,9 @@ class Qwen3NextModel(DecoderModel):
 @register_auto_model("Qwen3NextForCausalLM")
 class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                                                        Qwen3NextConfig]):
+    # load_weights below only pre-processes the dict and delegates to the
+    # generic loader, which tolerates a torch.compile wrapper in the tree.
+    load_weights_strips_compile_wrapper = True
 
     def __init__(
         self,
