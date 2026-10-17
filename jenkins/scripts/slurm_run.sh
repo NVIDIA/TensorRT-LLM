@@ -162,7 +162,36 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
+if [ "${useRunTests:-false}" = "true" ]; then
+    # Single-node stages: run_tests.py renders the shard and runs regular,
+    # isolated and rerun pytest sessions, then merges the results.
+    runTestsArgs=(
+        python3 "$llmSrcNode/jenkins/scripts/run_tests.py"
+        --render
+        --test-db-list "$testListPathNode"
+        --splits "${testSplits:-1}"
+        --group "${testGroup:-1}"
+        --pytest-base-cmd "$pytestCommand"
+        --stage-name "$stageName"
+        --output-dir "$jobWorkspace"
+        --working-dir "$llmSrcNode/tests/integration/defs"
+        --fail-signatures "${failSignaturesList:-}"
+    )
+    if [ -n "${testDurationsPath:-}" ]; then
+        runTestsArgs+=(--durations-path "$testDurationsPath")
+    fi
+    if [ "$perfMode" = "true" ]; then
+        runTestsArgs+=(--perf-mode)
+    fi
+    for target in ${pytestTargets:-}; do
+        runTestsArgs+=(--pytest-target "$target")
+    done
+    "${runTestsArgs[@]}"
+else
+    # Multi-node and perf-sanity launches: pytestCommand carries the test list,
+    # shard and trtllm-llmapi-launch, so every rank runs it as a single session.
+    eval $pytestCommand
+fi
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
