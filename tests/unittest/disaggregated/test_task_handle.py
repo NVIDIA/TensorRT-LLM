@@ -27,16 +27,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import (
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import (
     CacheExtent,
-    CacheKind,
     Cancelled,
     Chunk,
     Delivered,
     Failed,
-    TokenRange,
 )
-from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import (
@@ -70,7 +69,7 @@ TOKENS = 8
 
 def _sole_piece() -> Chunk:
     return Chunk(
-        block_ids_per_layer_groups=[[0]],
+        pool_slot_ids_per_layer_group=[[0]],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=TOKENS),
         is_last=True,
@@ -620,7 +619,7 @@ def test_a_fetch_the_cancel_beat_reports_the_peers_cancel_rather_than_a_failure(
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=19), request_id=19
     )
 
-    attempt = PeerFetch(worker, request).fetch(CacheExtent(name=19, local=_sole_piece()))
+    attempt = PeerFetch(worker, request).fetch(CacheExtent(request_id=19, local=_sole_piece()))
 
     assert session._kv_tasks == []
     outcome = attempt.poll()
