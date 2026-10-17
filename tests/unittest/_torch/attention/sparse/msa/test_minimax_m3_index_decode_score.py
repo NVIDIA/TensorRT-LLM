@@ -194,6 +194,37 @@ def test_index_decode_score_multi_round_split_k(dtype):
 
 
 @skip_not_sm100
+def test_index_decode_score_stable_under_concurrent_writes():
+    """Scores must not change while another stream keeps the memory system busy.
+
+    Concurrent stores widen the window in which TMA can refill a shared-memory
+    stage before its ldmatrix reads have finished.
+    """
+    seq_lens = [131326, 131289, 131252, 131215]
+    idx_q, k_cache, block_table, seq_lens_dev, _, score, expected = _make_inputs(
+        seq_lens, dtype=torch.float8_e4m3fn, num_heads=1, decode_query_len=1, seed=7
+    )
+    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+        idx_q, k_cache, block_table, seq_lens_dev, score, 1
+    )
+    _assert_scores_close(score, expected)
+    quiet = score.clone()
+
+    noise = torch.zeros(1 << 26, device="cuda")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    for _ in range(20):
+        with torch.cuda.stream(side):
+            for _ in range(40):
+                noise.mul_(1.0)
+        torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+            idx_q, k_cache, block_table, seq_lens_dev, score, 1
+        )
+        assert torch.equal(score, quiet)
+        side.synchronize()
+
+
+@skip_not_sm100
 def test_index_decode_score_transposed_view_matches_contiguous():
     """The transposed selector view must produce the same values as a direct write.
 
