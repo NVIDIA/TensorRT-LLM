@@ -176,6 +176,18 @@ TEST_P(HostMemPageModeTest, RegistersAndResizesWithPrefaultDisabled)
     EXPECT_EQ(memory.size(), HostMem::kAlignment);
     memory.resize(2 * HostMem::kAlignment);
     EXPECT_EQ(memory.size(), 2 * HostMem::kAlignment);
+    for (int cycle = 0; cycle < 2; ++cycle)
+    {
+        memory.resize(0);
+        EXPECT_EQ(memory.address(), 0);
+        EXPECT_EQ(memory.size(), 0);
+        memory.resize(HostMem::kAlignment);
+        EXPECT_NE(memory.address(), 0);
+        EXPECT_EQ(memory.size(), HostMem::kAlignment);
+        cudaPointerAttributes attributes{};
+        ASSERT_EQ(cudaPointerGetAttributes(&attributes, reinterpret_cast<void*>(memory.address())), cudaSuccess);
+        EXPECT_EQ(attributes.type, cudaMemoryTypeHost);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(ThpModes, HostMemPageModeTest, testing::Values("0", "1"));

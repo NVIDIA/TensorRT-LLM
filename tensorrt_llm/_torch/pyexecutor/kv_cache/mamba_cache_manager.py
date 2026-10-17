@@ -43,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.virtual_memory import preserve_contents
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
@@ -1420,9 +1421,10 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             dtype=self.conv_state_dtype,
             device="cuda",
         )
-        self.intermediate_state_indices = torch.arange(max_batch_size,
-                                                       dtype=torch.int32,
-                                                       device="cuda")
+        with preserve_contents():
+            self.intermediate_state_indices = torch.arange(max_batch_size,
+                                                           dtype=torch.int32,
+                                                           device="cuda")
 
     def _allocate_pool_replay_buffers(
         self,
@@ -1456,12 +1458,14 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         assert history_size is not None
         nheads, head_dim, d_state = self.ssm_state_shape
         common_shape = [self.local_num_mamba_layers, cache_size, 2]
-        self.prev_num_accepted_tokens = torch.zeros(cache_size,
-                                                    dtype=torch.int32,
-                                                    device=device)
-        self.cache_buf_idx = torch.zeros(cache_size,
-                                         dtype=torch.int32,
-                                         device=device)
+        # Replay counts and buffer selectors must stay bounded across discard sleep.
+        with preserve_contents():
+            self.prev_num_accepted_tokens = torch.zeros(cache_size,
+                                                        dtype=torch.int32,
+                                                        device=device)
+            self.cache_buf_idx = torch.zeros(cache_size,
+                                             dtype=torch.int32,
+                                             device=device)
         self.old_x = torch.zeros(
             common_shape + [history_size, nheads, head_dim],
             dtype=self.conv_state_dtype,
@@ -3479,9 +3483,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.intermediate_state_indices = None
         if self.local_num_mamba_layers == 0:
             return
-        self.intermediate_state_indices = torch.arange(max_batch_size,
-                                                       dtype=torch.int32,
-                                                       device="cuda")
+        with preserve_contents():
+            self.intermediate_state_indices = torch.arange(max_batch_size,
+                                                           dtype=torch.int32,
+                                                           device="cuda")
 
     def _allocate_pool_replay_buffers(
         self,
@@ -3526,9 +3531,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 device=device,
             ).transpose(-1, -2)
 
-        self.prev_num_accepted_tokens = torch.zeros(cache_size,
-                                                    dtype=torch.int32,
-                                                    device=device)
+        # Retained padding requests use these counts to form kernel token indices.
+        with preserve_contents():
+            self.prev_num_accepted_tokens = torch.zeros(cache_size,
+                                                        dtype=torch.int32,
+                                                        device=device)
         self.kda_conv_q = allocate_dim_contiguous_conv_cache()
         self.kda_conv_k = allocate_dim_contiguous_conv_cache()
         self.kda_conv_v = allocate_dim_contiguous_conv_cache()
@@ -4170,12 +4177,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "checkpoint addressing",
                     key="gdn_cached_replay_v2_indirect_state_layout",
                 )
-                self._gdn_cached_replay_state_descriptors = torch.tensor(
-                    [(state.data_ptr(), state.stride(0))
-                     for state in self.all_ssm_states],
-                    dtype=torch.int64,
-                    device=reference.device,
-                )
+                with preserve_contents():
+                    self._gdn_cached_replay_state_descriptors = torch.tensor(
+                        [(state.data_ptr(), state.stride(0))
+                         for state in self.all_ssm_states],
+                        dtype=torch.int64,
+                        device=reference.device,
+                    )
 
     @staticmethod
     def _stack_state_views(
@@ -4466,6 +4474,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                if state_tok is not None else None),
                 )
             self.prev_num_accepted_tokens[slot] = 0
+
+    def materialize_memory(self) -> None:
+        super().materialize_memory()
+        if self.local_num_mamba_layers == 0:
+            return
+        # Padding requests survive sleep without going through prepare_resources().
+        # Refresh their indices before metadata preparation uploads them for graph replay.
+        # This refresh can be retried after base materialization has completed.
+        request_ids = [
+            request_id for request_id, cache in self.kv_cache_map.items()
+            if cache.is_active and request_id in self._request_id_to_state_index
+        ]
+        new_slots = [
+            self.kv_cache_map[request_id].get_ssm_block_base_index(
+                self.ssm_layer_group_id) for request_id in request_ids
+        ]
+        old_slots = [
+            self._request_id_to_state_index[request_id]
+            for request_id in request_ids
+        ]
+        if old_slots == new_slots:
+            return
+        if self.use_kda_replay_update:
+            with torch.cuda.stream(self._stream):
+                self._relocate_kda_replay_slots(old_slots, new_slots)
+            self._stream.synchronize()
+        self._request_id_to_state_index.update(zip(request_ids, new_slots))
 
     def add_dummy_requests(
         self,

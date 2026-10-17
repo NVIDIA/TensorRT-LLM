@@ -15,7 +15,7 @@
 """Multi-rank (TP=2) sleep/wakeup tests for the MPI/IPC executor path.
 
 Verifies that sleep() and wakeup() correctly release and restore GPU memory on
-*all* ranks, not just rank-0.  Uses TinyLlama with tensor_parallel_size=2 so
+*all* ranks, not just rank-0.  Uses Qwen3-0.6B with tensor_parallel_size=2 so
 the PyExecutor starts two MPI worker processes; the control-listener thread on
 rank-1 is exercised by every sleep/wakeup call.
 
@@ -28,6 +28,7 @@ import os
 import psutil
 import pytest
 from utils.llm_data import llm_models_root
+from utils.sleep import V2SleepWorker
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
@@ -42,7 +43,20 @@ _PROMPTS = [
     "The future of AI is",
 ]
 
-_SAMPLING_PARAMS = SamplingParams(temperature=0)
+_SAMPLING_PARAMS = SamplingParams(temperature=0, max_tokens=16)
+
+
+@pytest.fixture(autouse=True)
+def _assert_v2_on_every_rank(monkeypatch):
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+
+    original_init = GenerationExecutorProxy.__init__
+
+    def init_with_v2_assertion(self, *args, **kwargs):
+        kwargs["worker_cls"] = V2SleepWorker
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(GenerationExecutorProxy, "__init__", init_with_v2_assertion)
 
 
 def _per_device_gpu_memory() -> dict:
@@ -96,21 +110,28 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
        proving that non-rank-0 VMM was correctly restored (a partial restore
        would corrupt forward-pass results or crash NCCL).
     """
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False, max_tokens=16384, use_kv_cache_manager_v2=True
+    )
 
     llm = LLM(
         model=_LLAMA_MODEL_PATH,
         tensor_parallel_size=2,
         sleep_config=SleepConfig(),
         kv_cache_config=kv_cache_config,
+        max_batch_size=4,
+        max_seq_len=512,
+        max_num_tokens=512,
     )
 
     sleep_tags = [
+        ExecutorMemoryType.KV_CACHE,
         ExecutorMemoryType.MODEL_ENGINE_MAIN,
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN,
     ]
 
     with llm:
+        assert llm._executor.worker_cls is V2SleepWorker
         outputs_before = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
         generated_before = [o.outputs[0].text for o in outputs_before]
 
@@ -142,7 +163,10 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
         llm.resume([ExecutorMemoryType.MODEL_WEIGHTS_MAIN])
         status = llm.get_memory_status()
         assert status.state == "parked"
-        assert status.parked_tags == [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        assert status.parked_tags == [
+            ExecutorMemoryType.KV_CACHE,
+            ExecutorMemoryType.MODEL_ENGINE_MAIN,
+        ]
 
         llm.resume()
         assert llm.get_memory_status().state == "running"
@@ -178,9 +202,7 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
     rank-1's control listener and that generation still works after wakeup.
     """
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        max_tokens=16384,
-        use_kv_cache_manager_v2=False,
+        enable_block_reuse=True, max_tokens=16384, use_kv_cache_manager_v2=True
     )
 
     llm = LLM(
@@ -188,35 +210,51 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
         tensor_parallel_size=2,
         sleep_config=SleepConfig(),
         kv_cache_config=kv_cache_config,
+        max_batch_size=4,
+        max_seq_len=512,
+        max_num_tokens=512,
     )
 
     sleep_tags = [ExecutorMemoryType.KV_CACHE]
+    prompts = [prompt * 20 for prompt in _PROMPTS]
+    sampling_params = SamplingParams(temperature=0, max_tokens=16, return_perf_metrics=True)
 
     with llm:
-        outputs_before = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
+        assert llm._executor.worker_cls is V2SleepWorker
+        outputs_before = llm.generate(prompts, sampling_params)
         generated_before = [o.outputs[0].text for o in outputs_before]
 
-        mem_active = _per_device_gpu_memory()
-        llm.release(sleep_tags)
-        mem_sleep = _per_device_gpu_memory()
-        if process_gpu_memory_info_available:
+        for cycle in range(2):
+            warm_outputs = llm.generate(prompts, sampling_params)
+            assert any(
+                output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks > 0
+                for output in warm_outputs
+            )
+            mem_active = _per_device_gpu_memory()
             active_devices = {dev for dev, size in mem_active.items() if size > 0}
-            assert len(active_devices) == 2
-            for dev in active_devices:
-                assert mem_sleep.get(dev, 0) < mem_active[dev], (
-                    f"GPU {dev} KV cache memory was not released by sleep()"
-                )
-
-        llm.resume(sleep_tags)
-        mem_wakeup = _per_device_gpu_memory()
-        if process_gpu_memory_info_available:
-            for dev in active_devices:
-                assert mem_wakeup.get(dev, 0) > mem_sleep.get(dev, 0), (
-                    f"GPU {dev} KV cache memory was not restored by wakeup()"
-                )
-
-        outputs_after = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
-        generated_after = [o.outputs[0].text for o in outputs_after]
+            if process_gpu_memory_info_available:
+                assert len(active_devices) == 2
+            llm.release(sleep_tags)
+            assert llm.get_memory_status().state == "parked"
+            mem_sleep = _per_device_gpu_memory()
+            llm.resume(sleep_tags)
+            assert llm.get_memory_status().state == "running"
+            mem_wakeup = _per_device_gpu_memory()
+            if process_gpu_memory_info_available:
+                for dev in active_devices:
+                    assert mem_sleep.get(dev, 0) < mem_active[dev], (
+                        f"GPU {dev} KV cache memory was not released by sleep()"
+                    )
+                    assert mem_wakeup.get(dev, 0) > mem_sleep.get(dev, 0), (
+                        f"GPU {dev} KV cache memory was not restored by wakeup()"
+                    )
+            outputs_after = llm.generate(prompts, sampling_params)
+            assert all(
+                output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks == 0
+                for output in outputs_after
+            )
+            generated_after = [o.outputs[0].text for o in outputs_after]
+            assert generated_after == generated_before
 
     for before, after in zip(generated_before, generated_after, strict=True):
         assert before == after, (

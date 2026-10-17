@@ -49,10 +49,17 @@ struct ScratchDesc;
 //   - nullptr             → no page (block not allocated for this lifecycle/beam)
 //   - SharedPageLock      → locked (ACTIVE inference)
 //   - shared_ptr<PageHolder> → held (suspended, waiting for activation)
+//   - UnmaterializedPage   → discarded storage, retaining its place in the request
 // ---------------------------------------------------------------------------
+struct UnmaterializedPage
+{
+    CacheLevel level;
+};
+
 using BlockPage = std::variant<std::monostate, // nullptr
     SharedPageLock,                            // locked
-    SharedPtr<PageHolder>                      // held
+    SharedPtr<PageHolder>,                     // held
+    UnmaterializedPage                         // storage released
     >;
 
 inline bool blockPageIsNull(BlockPage const& bp) noexcept
@@ -234,7 +241,8 @@ public:
     {
         ACTIVE,
         SUSPENDED,
-        CLOSED
+        CLOSED,
+        UNMATERIALIZED
     };
     enum class CommitState
     {
@@ -586,6 +594,7 @@ public:
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 
 private:
+    friend class KvCacheManager;
     friend class KvCacheIntrospection;
     friend class UniqPageLock;
     friend class Batch;
@@ -593,6 +602,12 @@ private:
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
     void onPageStorageChanged() noexcept;
+
+    //! Discard uncommitted storage while retaining the suspended cache's logical state and page layout.
+    void releaseMemory();
+
+    //! Allocate replacement pages for released caches atomically, leaving them suspended.
+    static void materializeMemory(std::vector<KvCache*> const& caches);
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
@@ -818,6 +833,8 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+    // Previously active caches resume after sleep without new-request utilization gating.
+    bool mResumeAfterSleep = false;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

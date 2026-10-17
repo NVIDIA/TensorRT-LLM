@@ -119,9 +119,7 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
 
 
 def kv_cache_manager_v2_incompatible_features(
-        max_beam_width: Optional[int],
-        *,
-        enable_sleep: bool = False) -> List[str]:
+        max_beam_width: Optional[int]) -> List[str]:
     """Runtime features a V2 manager cannot serve.
 
     ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
@@ -137,14 +135,11 @@ def kv_cache_manager_v2_incompatible_features(
     """
     # The C++ backend supports beam search. Model-specific restrictions are
     # validated by KvCacheCreator before constructing the manager.
-    # V2's native allocations are not tracked by release_with_tag.
-    return ["SleepConfig"] if enable_sleep else []
+    return []
 
 
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
-                                    max_beam_width: Optional[int],
-                                    *,
-                                    enable_sleep: bool = False) -> bool:
+                                    max_beam_width: Optional[int]) -> bool:
     """Whether the executor will actually hold a V2 manager.
 
     ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
@@ -153,8 +148,7 @@ def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
     a pool from the request would leave V2 geometry on a V1 executor.
     """
     return (kv_cache_config.use_kv_cache_manager_v2 is True
-            and not kv_cache_manager_v2_incompatible_features(
-                max_beam_width, enable_sleep=enable_sleep))
+            and not kv_cache_manager_v2_incompatible_features(max_beam_width))
 
 
 def _resolve_disagg_transceiver_route(
@@ -974,8 +968,7 @@ class KvCacheCreator:
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
             incompat = kv_cache_manager_v2_incompatible_features(
-                self._max_beam_width,
-                enable_sleep=self._llm_args.sleep_config is not None)
+                self._max_beam_width)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's

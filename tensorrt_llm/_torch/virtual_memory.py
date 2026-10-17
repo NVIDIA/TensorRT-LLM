@@ -1,7 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Protocol
 
 import torch
 
@@ -12,8 +15,8 @@ from tensorrt_llm.bindings.internal.runtime import (
     push_virtual_memory_allocator)
 
 __all__ = [
-    "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "RestoreMode", "TaggedMemoryResource", "maybe_scope", "scope",
+    "preserve_contents", "release_with_tag", "materialize_with_tag"
 ]
 
 
@@ -37,8 +40,10 @@ class _MultiPoolProxy:
     the proxy.
     """
 
-    def __init__(self):
+    def __init__(self, tag: str, mode: RestoreMode):
         self._pools: list[torch.cuda.MemPool] = []
+        self.tag = tag
+        self.mode = mode
 
     def _add(self, pool: torch.cuda.MemPool):
         self._pools.append(pool)
@@ -76,7 +81,7 @@ def _scope(
         push_virtual_memory_allocator(tag, mode, stream.cuda_stream)
         pushed_allocator = True
 
-        proxy = _MultiPoolProxy()
+        proxy = _MultiPoolProxy(tag, mode)
         pool = torch.cuda.MemPool(
             _get_torch_pluggable_virtual_memory_allocator())
         pool_ctx = torch.cuda.use_mem_pool(pool)
@@ -106,6 +111,25 @@ scope = contextmanager(_scope)
 
 
 @contextmanager
+def preserve_contents() -> Generator[None, None, None]:
+    """Preserve metadata allocated inside a scope that discards data on sleep.
+
+    The metadata keeps the parent's tag, so it is released with its owning
+    component, but restores its contents at the same addresses on wakeup.
+    """
+    if not _pool_stack or _pool_stack[-1][1].mode not in (RestoreMode.NONE,
+                                                          RestoreMode.MEMSET):
+        yield
+        return
+    parent = _pool_stack[-1][1]
+    with scope(parent.tag, RestoreMode.CPU) as proxy:
+        try:
+            yield
+        finally:
+            parent._pools.extend(proxy._pools)
+
+
+@contextmanager
 def maybe_scope(
     enable: bool,
     tag: str,
@@ -117,18 +141,32 @@ def maybe_scope(
         yield
 
 
-def release_with_tag(*tags: str) -> int:
+class TaggedMemoryResource(Protocol):
+    """An owner of memory that is not allocated by the runtime allocator."""
+
+    def release_memory(self, tags: tuple[str, ...]) -> None:
+        ...
+
+    def materialize_memory(self, tags: tuple[str, ...]) -> None:
+        ...
+
+
+def release_with_tag(*tags: str,
+                     resource: TaggedMemoryResource | None = None) -> int:
     """Release virtual memory allocated with given tags
 
     :param tags: The tag of the scope when the virtual memory is allocated
     :return: Number of memory blobs released
     """
+    if resource is not None:
+        resource.release_memory(tags)
     manager = get_virtual_memory_manager()
     released_blobs = sum(manager.release_with_tag(tag) for tag in tags)
     return released_blobs
 
 
-def materialize_with_tag(*tags: str) -> int:
+def materialize_with_tag(*tags: str,
+                         resource: TaggedMemoryResource | None = None) -> int:
     """Materialize virtual memory allocated with given tags
 
     :param tags: The tag of the scope when the virtual memory is allocated
@@ -136,4 +174,7 @@ def materialize_with_tag(*tags: str) -> int:
     """
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    if resource is not None:
+        torch.cuda.synchronize()
+        resource.materialize_memory(tags)
     return materialized_blobs

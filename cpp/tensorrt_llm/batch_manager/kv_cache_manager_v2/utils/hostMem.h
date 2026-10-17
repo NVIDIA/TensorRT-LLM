@@ -50,7 +50,7 @@ public:
     HostMem(HostMem const&) = delete;
     HostMem& operator=(HostMem const&) = delete;
 
-    // Resize in-place (mremap, preserves data). Unregisters and re-registers with CUDA.
+    // Resize preserving data when nonempty. Zero releases the mapping; growth from zero allocates a new one.
     void resize(size_t newSize);
 
     // Unregister from CUDA and unmap. Safe to call multiple times.
@@ -70,6 +70,7 @@ public:
     }
 
 private:
+    void allocate(size_t size);
     void registerToCuda();
     void unregisterFromCuda();
     void madvisePageMode();

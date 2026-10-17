@@ -24,7 +24,9 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestAdmissionState,
 )
+from tensorrt_llm.executor.ray.executor import RayExecutor
 from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
 
 class _Args:
@@ -65,7 +67,7 @@ def test_ray_worker_publishes_persistent_admission_transition(method, operation)
     with (
         patch("tensorrt_llm.executor.ray.gpu_worker.TorchLlmArgs", _Args),
         patch("tensorrt_llm.executor.ray.gpu_worker.logger", MagicMock(), create=True),
-        patch(f"tensorrt_llm.executor.ray.gpu_worker.{operation}"),
+        patch(f"tensorrt_llm.executor.ray.gpu_worker.{operation}") as memory_operation,
         patch("tensorrt_llm.executor.ray.gpu_worker.torch.cuda.synchronize"),
         patch("tensorrt_llm.executor.ray.gpu_worker.gc.collect"),
         patch("tensorrt_llm.executor.ray.gpu_worker.torch.cuda.empty_cache"),
@@ -74,6 +76,9 @@ def test_ray_worker_publishes_persistent_admission_transition(method, operation)
 
     getattr(worker.engine, f"begin_{method}_transition").assert_called_once()
     getattr(worker.engine, f"complete_{method}_transition").assert_called_once_with()
+    memory_operation.assert_called_once_with(
+        ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+    )
     if method == "sleep":
         worker.engine.validate_sleep_tags.assert_called_once()
         worker.engine.invalidate_v1_prefix_cache_for_sleep.assert_called_once()
@@ -209,3 +214,31 @@ def test_ray_sleep_aborts_transition_when_drain_fails() -> None:
     worker.engine.complete_sleep_transition.assert_not_called()
     worker.engine.fail_sleep_wakeup_transition.assert_not_called()
     release.assert_not_called()
+
+
+@pytest.mark.parametrize("reject", [False, True])
+def test_ray_collective_validates_all_ranks_before_sleep(reject):
+    executor = object.__new__(RayExecutor)
+    executor.doing_shutdown = True
+    executor.workers = [MagicMock(), MagicMock()]
+    events = []
+    for rank, worker in enumerate(executor.workers):
+        worker.validate_sleep.remote.side_effect = lambda *_, rank=rank: events.append(
+            (rank, "validate")
+        )
+        worker.sleep.remote.side_effect = lambda *_, rank=rank: events.append((rank, "sleep"))
+
+    def get(refs):
+        if reject and events == [(0, "validate"), (1, "validate")]:
+            raise ValueError("host quota is too small")
+        return [None] * len(refs)
+
+    with patch("tensorrt_llm.executor.ray.executor.ray.get", side_effect=get):
+        if reject:
+            with pytest.raises(ValueError, match="host quota is too small"):
+                executor.collective_rpc("sleep", args=(["kv_cache"],))
+        else:
+            executor.collective_rpc("sleep", args=(["kv_cache"],))
+    assert events == (
+        [(0, "validate"), (1, "validate")] + ([] if reject else [(0, "sleep"), (1, "sleep")])
+    )

@@ -908,7 +908,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
                              .value("ACTIVE", kv::KvCache::Status::ACTIVE)
                              .value("SUSPENDED", kv::KvCache::Status::SUSPENDED)
-                             .value("CLOSED", kv::KvCache::Status::CLOSED);
+                             .value("CLOSED", kv::KvCache::Status::CLOSED)
+                             .value("UNMATERIALIZED", kv::KvCache::Status::UNMATERIALIZED);
 
     // ---- KV cache events ----------------------------------------------------
     nb::class_<kv::UniqueToken>(m, "UniqueToken")
@@ -2604,6 +2605,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("config"), nb::arg("event_manager").none() = nb::none(),
             nb::arg("cold_page_codec").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
+        .def("release_gpu_memory", &kv::KvCacheManager::releaseGpuMemory, nb::arg("discard") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("materialize_gpu_memory", &kv::KvCacheManager::materializeGpuMemory, nb::arg("zero") = false,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"))
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())

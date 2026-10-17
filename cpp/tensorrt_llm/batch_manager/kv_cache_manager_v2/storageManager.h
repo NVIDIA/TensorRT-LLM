@@ -159,6 +159,9 @@ public:
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
+    //! Initialize a discarded cold slot with the codec's representation of a zero hot page.
+    void initializeColdSlot(LifeCycleId lc, CacheLevel level, Slot& slot);
+
     // ---- Eviction ----------------------------------------------------------
 
     // Schedule a page for eviction (if evictable).
@@ -320,6 +323,17 @@ public:
     // Pool-group slot count (number of pages).
     SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
+    //! Release GPU backing, or empty GPU and HOST pools when discarding. Retain GPU virtual addresses.
+    void releaseMemory(bool discard);
+
+    //! Restore saved HOST and GPU pool capacities, optionally zeroing GPU backing.
+    void materializeMemory(bool zero);
+
+    bool hasSavedPoolCapacities() const noexcept
+    {
+        return mSleepingPoolSlots.has_value();
+    }
+
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
     {
@@ -457,6 +471,7 @@ private:
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
+    std::optional<TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>> mSleepingPoolSlots;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
     static constexpr size_t kPageStagingDepth = 3;
