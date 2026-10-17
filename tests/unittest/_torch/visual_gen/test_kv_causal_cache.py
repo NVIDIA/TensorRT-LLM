@@ -517,7 +517,7 @@ def host_model_rows(cache, size):
 
 
 def test_device_layout_matches_the_host_model(cache):
-    """The layout kernel's rows, lengths and pieces agree with the host model across
+    """The layout kernel's rows, lengths and committed_private copies agree with the host model across
     commits, with and without eviction and with a fixed tail on a shared page."""
     chunk = cache.test_geometry["max_staged_tokens"]
     open_with_fixed(cache, 13)
@@ -528,14 +528,14 @@ def test_device_layout_matches_the_host_model(cache):
             assert cache.causal_block_lengths(size)[1].tolist() == lengths
             offsets = cache.block_offsets(size)[0]
             assert offsets[:, 0].tolist() == [[r * cache.kv_factor for r in row] for row in rows]
-            # The pieces: the host model names each resident token's home and the private
+            # committed_private: the host model names each resident token's home and the private
             # slot its copy goes to. After a rotation the device reads the fixed tail
             # from the moved page (the same launch refills the tail's new home from it),
             # so translate that page to the new home before comparing.
             rpp = cache._rows_per_page
             blk = cache._layout(size)
             device = {
-                (s, d) for s, d in zip(blk.piece_src.tolist(), blk.piece_dst.tolist()) if s >= 0
+                (s, d) for s, d in zip(blk.committed_private_src.tolist(), blk.committed_private_dst.tolist()) if s >= 0
             }
             moved = {
                 s // rpp: d // rpp
@@ -543,7 +543,7 @@ def test_device_layout_matches_the_host_model(cache):
                 if s >= 0
             }
             device = {(moved.get(s // rpp, s // rpp) * rpp + s % rpp, d) for s, d in device}
-            home, copy = cache._mirror_rows(0, cache.staging_offset)
+            home, copy = cache._committed_private_rows(0, cache.staging_offset)
             private = set(blk.host_private_pages.reshape(-1).tolist())
             host = {(h, c) for h, c in zip(home.tolist(), copy.tolist()) if c // rpp in private}
             assert device == host

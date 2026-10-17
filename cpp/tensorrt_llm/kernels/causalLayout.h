@@ -30,10 +30,12 @@ namespace kernels::causalLayout
 //! The per-causal-block tensors of one block size for a causal K/V cache, computed on the device
 //! from the cache's page table. The cache holds logical tokens ``[0, past)``: ``fixedTokens`` fixed
 //! ones, then history; a forward stages ``numBlocks * blockSize`` tokens at ``past``. Block ``i``
-//! starts at ``past + i * blockSize`` and sees the fixed tokens, the ``windowTokens`` before it, the
-//! earlier blocks and itself. Its row lists every page it sees in full, then its private pages:
-//! the visible slots of the pages it sees only partly (at most three: where the fixed tokens end,
-//! where the window starts, where the block starts), then its own tokens.
+//! starts at ``past + i * blockSize`` and attends to the fixed tokens, the ``windowTokens`` before it,
+//! the earlier blocks and itself. Its row lists every page it attends to in full, then its private
+//! pages: copies of the tokens it attends to on its partial pages (at most three: where the fixed
+//! tokens end, where the window starts, where the block starts), then its own tokens. The copies of
+//! committed tokens (committed_private) are made at commit; the copies of earlier blocks' tokens of
+//! the same forward (current_private) are written by every forward.
 //!
 //! A view page is a layer-0 page index as the table stores it; a slot id is
 //! ``viewPage * tokensPerPage + slot``; a pool row is ``viewPage * rowsPerPage + slot``.
@@ -61,20 +63,22 @@ struct CausalLayoutParams
     int32_t* rows;         //!< [numBlocks, rowLen] view pages, 0-padded
     int64_t rowLen;
     int32_t* blockOffsets; //!< [numBlocks, 2, rowLen]
-    int32_t* seqLenKv;     //!< [numBlocks] keys in the row: whole pages, partial slots, the block
+    int32_t* seqLenKv;     //!< [numBlocks] keys in the row: full pages, segment slots, the block
     int64_t* ownSlots;     //!< [numBlocks * blockSize] slot ids of each block's own tokens
-    //! Earlier blocks' staged tokens on a block's partial pages: ``2 * (tokensPerPage - 1)`` entries
-    //! per block, (staged token index, slot id), padded with the block's own first token.
-    int64_t* extraSrc;
-    int64_t* extraDst;
-    //! Fixed and history tokens copied into a block's private pages: ``3 * (tokensPerPage - 1)``
-    //! entries per block, (source pool row, destination pool row), -1 past the used ones.
-    int64_t* pieceSrc;
-    int64_t* pieceDst;
+    //! current_private: this forward's tokens of earlier blocks on a block's partial pages, which every
+    //! forward writes into the block's private pages. ``2 * (tokensPerPage - 1)`` entries per block,
+    //! (staged token index, slot id), padded with the block's own first token.
+    int64_t* currentPrivateSrc;
+    int64_t* currentPrivateDst;
+    //! committed_private: committed tokens on a block's partial pages, copied into the block's private
+    //! pages at commit. ``3 * (tokensPerPage - 1)`` entries per block, (source pool row, destination
+    //! pool row), -1 past the used ones.
+    int64_t* committedPrivateSrc;
+    int64_t* committedPrivateDst;
 
     //! Optional, computed once per commit by the launch that gets them: slot ids of the
     //! ``numStaged`` staged tokens at ``past``, and the fixed tail's refill, ``tokensPerPage``
-    //! piece entries (-1 past the tail, all -1 when nothing was dropped).
+    //! entries (-1 past the tail, all -1 when nothing was dropped).
     int64_t* stagedSlots;
     int64_t numStaged;
     int64_t* refillSrc;

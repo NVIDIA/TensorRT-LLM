@@ -48,6 +48,8 @@ static_assert(kMaxSegments <= kWarpSize, "one warp plans a block");
 // range covers only partly cannot: a page table cannot start or stop a key sequence mid-page. Those
 // positions form segments (one per partial page and range), which are copied, in ascending position
 // order, into the block's private pages, slot by slot; the block's own tokens follow them there.
+// Segment slots holding committed tokens are committed_private (copied at commit); those holding
+// earlier blocks' tokens of the same forward are current_private (written by every forward).
 //
 // Example, 32-token pages, 40 fixed tokens, a 100-token window, a block starting at 200: the ranges
 // are [0, 40) and [100, 200). Full pages: 0, then 4 and 5. Segments, in order: positions 32-39 on
@@ -69,10 +71,9 @@ struct BlockPlan
     int64_t numFullPages;
     // Private slots before the block's own tokens: the segments' total length.
     int64_t numPartialSlots;
-    // Of those, the leading ones that hold committed tokens (position < past). They are copied
-    // into the private pages at commit; the rest hold earlier blocks' tokens of this forward, which
-    // every forward writes into the private pages.
-    int64_t numCommittedSlots;
+    // Of those, the leading ones that hold committed tokens (position < past): committed_private.
+    // The rest are current_private.
+    int64_t numCommittedPrivate;
     int numRanges; // 0 for a block at position 0, else 1 or 2
     int numSegments;
 };
@@ -178,7 +179,7 @@ __device__ void planBlock(CausalLayoutParams const& p, int64_t i, BlockPlan& pla
     cub::WarpScan<int>(segmentIndexScan).ExclusiveSum(segmentLength > 0 ? 1 : 0, segmentIndex, numSegments);
 
     // publish result
-    int64_t const numCommittedSlots = cub::WarpReduce<int64_t>(committedSum).Sum(committedLength); // lane 0 only
+    int64_t const numCommittedPrivate = cub::WarpReduce<int64_t>(committedSum).Sum(committedLength); // lane 0 only
     if (segmentLength > 0)
     {
         plan.segmentBegin[segmentIndex] = segmentBegin;
@@ -197,7 +198,7 @@ __device__ void planBlock(CausalLayoutParams const& p, int64_t i, BlockPlan& pla
         }
         plan.numSegments = numSegments;
         plan.numPartialSlots = numPartialSlots;
-        plan.numCommittedSlots = numCommittedSlots;
+        plan.numCommittedPrivate = numCommittedPrivate;
     }
 }
 
@@ -310,7 +311,7 @@ __global__ void causalLayoutKernel(CausalLayoutParams p)
         p.seqLenKv[i] = static_cast<int32_t>(plan.numFullPages * tpb + plan.numPartialSlots + p.blockSize);
     }
 
-    // The block's own tokens follow the partial slots in its private pages.
+    // The block's own tokens follow the segment slots in its private pages.
     int64_t* own = p.ownSlots + i * p.blockSize;
     for (int64_t t = threadIdx.x; t < p.blockSize; t += blockDim.x)
     {
@@ -318,43 +319,43 @@ __global__ void causalLayoutKernel(CausalLayoutParams p)
         own[t] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * tpb + slotOf(p, k);
     }
 
-    // Partial slots: committed tokens are copied in at commit (pieces); this forward's tokens of
-    // earlier blocks are written in by every forward (extras).
-    int64_t const pieceCap = 3 * (tpb - 1);
-    int64_t const extraCap = 2 * (tpb - 1);
-    int64_t* pieceSrc = p.pieceSrc + i * pieceCap;
-    int64_t* pieceDst = p.pieceDst + i * pieceCap;
-    for (int64_t k = threadIdx.x; k < pieceCap; k += blockDim.x)
+    // Segment slots: committed tokens are copied in at commit (committed_private); this forward's
+    // tokens of earlier blocks are written in by every forward (current_private).
+    int64_t const committedPrivateCap = 3 * (tpb - 1);
+    int64_t const currentPrivateCap = 2 * (tpb - 1);
+    int64_t* committedPrivateSrc = p.committedPrivateSrc + i * committedPrivateCap;
+    int64_t* committedPrivateDst = p.committedPrivateDst + i * committedPrivateCap;
+    for (int64_t k = threadIdx.x; k < committedPrivateCap; k += blockDim.x)
     {
-        if (k < plan.numCommittedSlots)
+        if (k < plan.numCommittedPrivate)
         {
             int64_t const pos = positionAtPrivateSlot(plan, k);
-            pieceSrc[k] = static_cast<int64_t>(viewOf(p, pos)) * p.rowsPerPage + slotOf(p, pos);
-            pieceDst[k] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * p.rowsPerPage + slotOf(p, k);
+            committedPrivateSrc[k] = static_cast<int64_t>(viewOf(p, pos)) * p.rowsPerPage + slotOf(p, pos);
+            committedPrivateDst[k] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * p.rowsPerPage + slotOf(p, k);
         }
         else
         {
-            pieceSrc[k] = -1;
-            pieceDst[k] = -1;
+            committedPrivateSrc[k] = -1;
+            committedPrivateDst[k] = -1;
         }
     }
-    int64_t* extraSrc = p.extraSrc + i * extraCap;
-    int64_t* extraDst = p.extraDst + i * extraCap;
+    int64_t* currentPrivateSrc = p.currentPrivateSrc + i * currentPrivateCap;
+    int64_t* currentPrivateDst = p.currentPrivateDst + i * currentPrivateCap;
     int64_t const ownFirst
         = static_cast<int64_t>(privatePages[pageOf(p, plan.numPartialSlots)]) * tpb + slotOf(p, plan.numPartialSlots);
-    for (int64_t t = threadIdx.x; t < extraCap; t += blockDim.x)
+    for (int64_t t = threadIdx.x; t < currentPrivateCap; t += blockDim.x)
     {
-        int64_t const k = plan.numCommittedSlots + t;
+        int64_t const k = plan.numCommittedPrivate + t;
         if (k < plan.numPartialSlots)
         {
             int64_t const pos = positionAtPrivateSlot(plan, k);
-            extraSrc[t] = pos - p.past;
-            extraDst[t] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * tpb + slotOf(p, k);
+            currentPrivateSrc[t] = pos - p.past;
+            currentPrivateDst[t] = static_cast<int64_t>(privatePages[pageOf(p, k)]) * tpb + slotOf(p, k);
         }
         else
         {
-            extraSrc[t] = i * p.blockSize;
-            extraDst[t] = ownFirst;
+            currentPrivateSrc[t] = i * p.blockSize;
+            currentPrivateDst[t] = ownFirst;
         }
     }
 }

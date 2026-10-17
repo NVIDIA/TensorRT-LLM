@@ -46,12 +46,12 @@ def layout(block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
         block_offsets=torch.full((1, n, 2, row_len), -7, dtype=torch.int32, device=DEV),
         seq_len_kv=torch.zeros(n, dtype=torch.int32, device=DEV),
         own_slots=torch.zeros(n * block_size, dtype=torch.int64, device=DEV),
-        extra_src=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
-        extra_dst=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
-        piece_src=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
-        piece_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
+        current_private_src=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
+        current_private_dst=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
+        committed_private_src=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
+        committed_private_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
     )
-    extra = dict(
+    commit_block = dict(
         staged_slots=torch.zeros(block_size, dtype=torch.int64, device=DEV),
         refill_src=torch.zeros(TPB, dtype=torch.int64, device=DEV),
         refill_dst=torch.zeros(TPB, dtype=torch.int64, device=DEV),
@@ -60,7 +60,7 @@ def layout(block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
         i32(TABLE),
         i32([PRIVATE_PAGES]),
         *out.values(),
-        *(extra.values() if shared else (None, None, None)),
+        *(commit_block.values() if shared else (None, None, None)),
         block_size,
         TPB,
         past,
@@ -72,7 +72,7 @@ def layout(block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
         KV_OFFSET,
         RPP,
     )
-    out.update(extra)
+    out.update(commit_block)
     return {k: v.tolist() for k, v in out.items()}
 
 
@@ -85,12 +85,12 @@ def test_hand_layout():
     assert got["seq_len_kv"] == [0 * TPB + 5 + 4]
     # Own tokens take private slots 5..8: page 21 slots 1-3, then page 22 slot 0.
     assert got["own_slots"] == [21 * TPB + 1, 21 * TPB + 2, 21 * TPB + 3, 22 * TPB + 0]
-    # Pieces: positions 0, 1, 3 (page 10) and 4, 5 (page 11) into private slots 0..4.
-    assert got["piece_src"] == [10 * RPP + 0, 10 * RPP + 1, 10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1] + [-1] * 4
-    assert got["piece_dst"] == [20 * RPP + 0, 20 * RPP + 1, 20 * RPP + 2, 20 * RPP + 3, 21 * RPP + 0] + [-1] * 4
-    # No staged token on a partial page: every extra is the padding (own first token).
-    assert got["extra_src"] == [0] * 6
-    assert got["extra_dst"] == [21 * TPB + 1] * 6
+    # committed_private: positions 0, 1, 3 (page 10) and 4, 5 (page 11) into private slots 0..4.
+    assert got["committed_private_src"] == [10 * RPP + 0, 10 * RPP + 1, 10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1] + [-1] * 4
+    assert got["committed_private_dst"] == [20 * RPP + 0, 20 * RPP + 1, 20 * RPP + 2, 20 * RPP + 3, 21 * RPP + 0] + [-1] * 4
+    # No staged token on a partial page: every current_private entry is the padding (own first token).
+    assert got["current_private_src"] == [0] * 6
+    assert got["current_private_dst"] == [21 * TPB + 1] * 6
     # Staged tokens 6..9 sit on logical pages 1 and 2.
     assert got["staged_slots"] == [11 * TPB + 2, 11 * TPB + 3, 12 * TPB + 0, 12 * TPB + 1]
     assert got["refill_src"] == [-1] * TPB and got["refill_dst"] == [-1] * TPB
@@ -102,11 +102,11 @@ def test_rotation_reads_the_fixed_tail_from_the_moved_page():
     got = layout(drop_pages=1)
     assert got["refill_src"] == [15 * RPP + 0, 15 * RPP + 1, -1, -1]
     assert got["refill_dst"] == [10 * RPP + 0, 10 * RPP + 1, -1, -1]
-    assert got["piece_src"][:2] == [15 * RPP + 0, 15 * RPP + 1]  # the fixed tail, from the old page
-    assert got["piece_src"][2:5] == [10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1]  # history, as mapped now
+    assert got["committed_private_src"][:2] == [15 * RPP + 0, 15 * RPP + 1]  # the fixed tail, from the old page
+    assert got["committed_private_src"][2:5] == [10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1]  # history, as mapped now
 
 
-def test_staged_tokens_on_a_partial_page_become_extras():
+def test_staged_tokens_on_a_partial_page_become_current_private():
     # Two blocks of 2: block 1 starts at 8 and sees [0, 2) and [5, 8); positions 6, 7 are
     # block 0's staged tokens on block 1's start page (page 1 holds 4..7).
     n, block_size, row_len = 2, 2, len(TABLE)
@@ -116,10 +116,10 @@ def test_staged_tokens_on_a_partial_page_become_extras():
         block_offsets=torch.zeros(1, n, 2, row_len, dtype=torch.int32, device=DEV),
         seq_len_kv=torch.zeros(n, dtype=torch.int32, device=DEV),
         own_slots=torch.zeros(n * block_size, dtype=torch.int64, device=DEV),
-        extra_src=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
-        extra_dst=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
-        piece_src=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
-        piece_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
+        current_private_src=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
+        current_private_dst=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
+        committed_private_src=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
+        committed_private_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
     )
     torch.ops.trtllm.causal_layout_(
         i32(TABLE), private_pages, *out.values(), None, None, None, block_size, TPB, 6, 2, 3,
@@ -128,12 +128,12 @@ def test_staged_tokens_on_a_partial_page_become_extras():
     got = {k: v.tolist() for k, v in out.items()}
     # Block 1: partial positions 0, 1 (page 0), 5 (page 1, resident), 6, 7 (page 1, staged).
     assert got["seq_len_kv"][1] == 5 + block_size
-    assert got["piece_src"][9:12] == [10 * RPP + 0, 10 * RPP + 1, 11 * RPP + 1]
-    assert got["piece_src"][12:18] == [-1] * 6
-    extra_src, extra_dst = got["extra_src"][6:], got["extra_dst"][6:]
-    assert extra_src[:2] == [0, 1]  # staged tokens 6 - past, 7 - past
-    assert extra_dst[:2] == [30 * TPB + 3, 31 * TPB + 0]  # private slots 3 and 4
-    assert extra_src[2:] == [block_size * 1] * 4 and extra_dst[2:] == [31 * TPB + 1] * 4
+    assert got["committed_private_src"][9:12] == [10 * RPP + 0, 10 * RPP + 1, 11 * RPP + 1]
+    assert got["committed_private_src"][12:18] == [-1] * 6
+    current_private_src, current_private_dst = got["current_private_src"][6:], got["current_private_dst"][6:]
+    assert current_private_src[:2] == [0, 1]  # staged tokens 6 - past, 7 - past
+    assert current_private_dst[:2] == [30 * TPB + 3, 31 * TPB + 0]  # private slots 3 and 4
+    assert current_private_src[2:] == [block_size * 1] * 4 and current_private_dst[2:] == [31 * TPB + 1] * 4
 
 
 def test_bad_arguments():
