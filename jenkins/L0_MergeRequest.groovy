@@ -2301,6 +2301,17 @@ def getCommonParameters()
     ]
 }
 
+def getPLCRepoUrlKey()
+{
+    def repoUrlKey = "tensorrt_llm_github_sync"
+    withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+        if (env.gitlabSourceRepoHttpUrl == DEFAULT_LLM_REPO) {
+            repoUrlKey = "tensorrt_llm_internal"
+        }
+    }
+    return repoUrlKey
+}
+
 def findCachedPLCSourceScanResult(commit) {
     def plcJobUrl = "${trtllm_utils.resolveCurrentJenkinsBaseUrl(this)}/job/LLM/job/helpers/job/PLCScanningSetup"
     def exitCode = sh(
@@ -2430,13 +2441,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         jUtils.markStageSkippedForConditional(STAGE_NAME)
                         return
                     }
-                    def ref = env.gitlabBranch ?: "main"
-                    def repoUrlKey = "tensorrt_llm_github_sync"
-                    withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-                        if (env.gitlabSourceRepoHttpUrl == DEFAULT_LLM_REPO) {
-                            repoUrlKey = "tensorrt_llm_internal"
-                        }
-                    }
+                    def repoUrlKey = getPLCRepoUrlKey()
                     def logger = new Logger(pipeline)
                     try {
                         // find_plc_build.py only needs python3 + network access to Jenkins, but
@@ -2455,7 +2460,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             echo "Reused PLC scan pipeline: ${cached.url}"
                             handleResult = cached.result
                         } else {
-                            echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                            echo "Triggering OSS Compliance (PLC) scan for ref: ${env.gitlabCommit}"
                             def params = [
                                 string(name: 'ref', value: env.gitlabCommit),
                                 string(name: 'repoUrlKey', value: repoUrlKey),
@@ -3039,9 +3044,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
                 stage("[NGC-Container-Compliance-Check] Run") {
-                    echo "Triggering OSS Compliance (PLC) container scan for ref: "
+                    def repoUrlKey = getPLCRepoUrlKey()
+                    echo "Triggering OSS Compliance (PLC) container scan for ref: ${env.gitlabCommit}"
                     try {
                         def params = [
+                            string(name: 'ref', value: env.gitlabCommit),
+                            string(name: 'repoUrlKey', value: repoUrlKey),
                             string(name: 'postMergePipelineName', value: env.JOB_NAME),
                             string(name: 'postMergeBuildNumber', value: env.BUILD_NUMBER),
                             string(
