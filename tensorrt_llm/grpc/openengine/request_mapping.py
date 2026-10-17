@@ -3,24 +3,45 @@
 
 """Translate an OpenEngine GenerateRequest into TensorRT-LLM request inputs."""
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from .bindings import generation_pb2
-from .capabilities import supported_guides
-from .errors import UnsupportedFeatureError
+from .capabilities import MediaCapabilities, resolve_media_capabilities, supported_guides
+from .errors import MediaUnavailableError, UnsupportedFeatureError
 
 # Cap on the number of stop conditions. Each one costs a KMP automaton per
 # output index and a scan of every generated token, so an unbounded list lets a
 # single request tax the event loop for the whole stream.
 _MAX_STOP_CONDITIONS = 64
+# Bound per-request decode work and retained image data.
+_MAX_MEDIA_ITEMS = 64
+_MAX_CONCURRENT_MEDIA_LOADS = 8
+# Checked after each decode; concurrency bounds peak overshoot. Encoded inputs
+# have separate gRPC and remote-loader caps.
+_MAX_TOTAL_DECODED_MEDIA_BYTES = 512 * 1024 * 1024
 _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
 _DETOKENIZE_EXTRA_KEY = "detokenize"
+
+
+_MediaLoader = Callable[[generation_pb2.MediaItem, int], Awaitable[Any]]
+
+
+@dataclass(frozen=True)
+class _MediaHandler:
+    name: str
+    loader_factory: Callable[[Any], _MediaLoader]
+    decoded_bytes: Callable[[Any], int]
 
 
 def conversation_affinity_enabled(llm: Any) -> bool:
@@ -244,13 +265,191 @@ def _metadata_from_context(
     return headers or None, target_dp_rank, affinity_headers
 
 
-def _input_from_request(request: generation_pb2.GenerateRequest) -> str | dict[str, list[int]]:
+def _base_input_from_request(
+    request: generation_pb2.GenerateRequest,
+) -> str | dict[str, list[int]]:
     input_kind = request.WhichOneof("input")
     if input_kind == "prompt":
         return request.prompt
     if input_kind == "token_ids":
         return {"prompt_token_ids": request.token_ids.ids[:]}
     raise ValueError("exactly one of prompt or token_ids must be set")
+
+
+def _image_io_for_model(llm: Any) -> ImageMediaIO:
+    input_processor = getattr(llm, "input_processor", None)
+    defaults = None
+    if isinstance(input_processor, BaseMultimodalInputProcessor):
+        preferences = input_processor.get_preferred_media_io_kwargs() or {}
+        defaults = preferences.get("image")
+    return ImageMediaIO.create(defaults, None)
+
+
+async def _load_image_item(
+    item: generation_pb2.MediaItem, image_io: ImageMediaIO, index: int
+) -> Any:
+    source = item.WhichOneof("source")
+    if source is None:
+        raise ValueError(f"media[{index}] must set exactly one source")
+    if source == "url":
+        if urlparse(item.url).scheme.lower() not in ("http", "https"):
+            raise ValueError(f"media[{index}].url must use http or https")
+        value = item.url
+    elif source == "data_uri":
+        if urlparse(item.data_uri).scheme.lower() != "data":
+            raise ValueError(f"media[{index}].data_uri must use the data scheme")
+        value = item.data_uri
+    elif source == "raw_bytes":
+        if item.mime_type and not item.mime_type.lower().startswith("image/"):
+            raise ValueError(f"media[{index}].mime_type must be an image type for raw image bytes")
+        try:
+            return await image_io.async_load_bytes(bytes(item.raw_bytes))
+        except Exception as error:
+            raise ValueError(f"media[{index}].raw_bytes could not be decoded: {error}") from error
+    else:
+        raise ValueError(f"media[{index}] has an unknown source '{source}'")
+
+    try:
+        return await image_io.async_load(value)
+    except MediaFetchError as error:
+        raise MediaUnavailableError(
+            f"media[{index}].{source} is temporarily unavailable: {error}"
+        ) from error
+    except Exception as error:
+        raise ValueError(f"media[{index}].{source} could not be loaded: {error}") from error
+
+
+def _image_loader_factory(llm: Any) -> _MediaLoader:
+    image_io = _image_io_for_model(llm)
+
+    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
+        return await _load_image_item(item, image_io, index)
+
+    return load
+
+
+def _decoded_image_bytes(image: Any) -> int:
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    if isinstance(image, torch.Tensor):
+        return image.numel() * image.element_size()
+    if isinstance(image, np.ndarray):
+        return image.nbytes
+    if isinstance(image, Image.Image):
+        return image.width * image.height * len(image.getbands())
+    raise TypeError(f"unsupported decoded image type: {type(image).__name__}")
+
+
+_MEDIA_HANDLERS: dict[int, _MediaHandler] = {
+    generation_pb2.MODALITY_IMAGE: _MediaHandler(
+        "image", _image_loader_factory, _decoded_image_bytes
+    ),
+}
+
+
+def media_capabilities_for_model(llm: Any) -> MediaCapabilities:
+    return resolve_media_capabilities(llm, {handler.name for handler in _MEDIA_HANDLERS.values()})
+
+
+def _modality_name(modality: int) -> str:
+    try:
+        return generation_pb2.Modality.Name(modality).removeprefix("MODALITY_").lower()
+    except ValueError:
+        return f"unknown ({modality})"
+
+
+async def _input_from_request(
+    request: generation_pb2.GenerateRequest,
+    llm: Any,
+    media_capabilities: MediaCapabilities | None = None,
+) -> str | dict[str, Any]:
+    """Build LLM API inputs without blocking the event loop on media."""
+    inputs = _base_input_from_request(request)
+    if not request.media:
+        return inputs
+
+    if len(request.media) > _MAX_MEDIA_ITEMS:
+        raise ValueError(
+            f"at most {_MAX_MEDIA_ITEMS} media items are supported per request, "
+            f"got {len(request.media)}"
+        )
+
+    capabilities = media_capabilities or media_capabilities_for_model(llm)
+    modalities = capabilities.modalities
+    if not modalities:
+        raise UnsupportedFeatureError("media input is not supported by the loaded model")
+
+    resolved_handlers: list[_MediaHandler] = []
+    for index, item in enumerate(request.media):
+        if item.modality == generation_pb2.MODALITY_UNSPECIFIED:
+            raise ValueError(f"media[{index}].modality must be set")
+        handler = _MEDIA_HANDLERS.get(item.modality)
+        if handler is None or handler.name not in modalities:
+            modality = _modality_name(item.modality)
+            supported_text = ", ".join(sorted(modalities)) or "none"
+            raise UnsupportedFeatureError(
+                f"multimodal modality '{modality}' is not supported by the loaded model; "
+                f"supported modalities: {supported_text}"
+            )
+        resolved_handlers.append(handler)
+
+    loaders: dict[str, _MediaLoader] = {}
+    for handler in resolved_handlers:
+        if handler.name not in loaders:
+            loaders[handler.name] = handler.loader_factory(llm)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEDIA_LOADS)
+    decoded_bytes = 0
+
+    async def load_bounded(
+        item: generation_pb2.MediaItem, index: int, handler: _MediaHandler
+    ) -> Any:
+        nonlocal decoded_bytes
+        async with semaphore:
+            decoded = await loaders[handler.name](item, index)
+            decoded_bytes += handler.decoded_bytes(decoded)
+            if decoded_bytes > _MAX_TOTAL_DECODED_MEDIA_BYTES:
+                raise ValueError(
+                    "decoded media exceeds the per-request limit of "
+                    f"{_MAX_TOTAL_DECODED_MEDIA_BYTES} bytes"
+                )
+            return decoded
+
+    tasks = [
+        asyncio.create_task(load_bounded(item, index, handler))
+        for index, (item, handler) in enumerate(zip(request.media, resolved_handlers))
+    ]
+    try:
+        decoded_media = await asyncio.gather(*tasks)
+    except (Exception, asyncio.CancelledError):
+        # gather leaves siblings running after the first failure.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    grouped_media: dict[str, list[Any]] = {}
+    grouped_uuids: dict[str, list[str | None]] = {}
+    item_order: list[dict[str, Any]] = []
+    for item, handler, decoded in zip(request.media, resolved_handlers, decoded_media):
+        modality_items = grouped_media.setdefault(handler.name, [])
+        modality_index = len(modality_items)
+        modality_items.append(decoded)
+        grouped_uuids.setdefault(handler.name, []).append(item.uuid or None)
+        item_order.append(
+            {
+                "modality": handler.name,
+                "index": modality_index,
+                "placeholder": capabilities.placeholder(handler.name, modality_index + 1),
+            }
+        )
+
+    mapped: dict[str, Any] = {"prompt": inputs} if isinstance(inputs, str) else dict(inputs)
+    mapped["multi_modal_data"] = grouped_media
+    if any(item.uuid for item in request.media):
+        mapped["multi_modal_uuids"] = grouped_uuids
+    mapped["mm_item_order"] = item_order
+    return mapped
 
 
 __all__ = [
