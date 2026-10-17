@@ -20,6 +20,7 @@ cross-cutting sub-configs it composes. All fields carry
 subject to breaking changes.
 """
 
+import math
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -657,6 +658,114 @@ class CpuOffloadConfig(StrictBaseModel):
     )
 
 
+# Bounds for warmup reference sizes: a typo here would otherwise crash or OOM
+# startup while synthesizing dummy media, before request validation could run.
+_MAX_REFERENCE_DIM = 16384
+_MAX_REFERENCE_FRAMES = 4096
+_MAX_REFERENCE_AUDIO_SECONDS = 3600.0
+
+
+class ReferenceVideoSpec(StrictBaseModel):
+    """One video reference in a warmup variant."""
+
+    size: Tuple[int, int] = Field(
+        description="(height, width) of the video frames.",
+    )
+    num_frames: int = Field(
+        description="Number of frames the video carries.",
+    )
+    fps: Optional[float] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Frame rate the video carries; the model resamples onto its own clock, "
+            "which changes the compiled shape. If None, uses the model's own frame rate."
+        ),
+    )
+    audio_seconds: Optional[float] = Field(
+        default=None,
+        status="prototype",
+        description="Duration in seconds of the video's soundtrack, if it carries one.",
+    )
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "ReferenceVideoSpec":
+        height, width = self.size
+        if not (0 < height <= _MAX_REFERENCE_DIM and 0 < width <= _MAX_REFERENCE_DIM):
+            raise ValueError(
+                f"video size must be positive and at most {_MAX_REFERENCE_DIM} per "
+                f"side, got {self.size}."
+            )
+        if not 0 < self.num_frames <= _MAX_REFERENCE_FRAMES:
+            raise ValueError(
+                f"video num_frames must be in (0, {_MAX_REFERENCE_FRAMES}], got {self.num_frames}."
+            )
+        if self.fps is not None and not (math.isfinite(self.fps) and self.fps > 0):
+            raise ValueError(f"video fps must be finite and positive, got {self.fps}.")
+        if self.audio_seconds is not None and not (
+            0 < self.audio_seconds <= _MAX_REFERENCE_AUDIO_SECONDS
+        ):
+            raise ValueError(
+                f"video audio_seconds must be in (0, {_MAX_REFERENCE_AUDIO_SECONDS}], "
+                f"got {self.audio_seconds}."
+            )
+        return self
+
+
+class ReferenceWarmupVariant(StrictBaseModel):
+    """One reference-carrying warmup variant.
+
+    The references attached to a single synthetic warmup request.
+
+    Warmup synthesizes dummy references of these sizes and runs them through
+    the pipeline's real preprocessing, so the recorded warmup keys match
+    request keys exactly. Sizes are raw input sizes (pixels, frames, seconds),
+    not processed latent sizes. Per-reference counts must stay within the
+    model's accepted reference slots (``ref_slot_specs``).
+    """
+
+    images: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        status="prototype",
+        description="(height, width) of each image reference for this variant.",
+    )
+    videos: List[ReferenceVideoSpec] = Field(
+        default_factory=list,
+        status="prototype",
+        description="Video references for this variant.",
+    )
+    audio: List[float] = Field(
+        default_factory=list,
+        status="prototype",
+        description="Duration in seconds of each audio reference for this variant.",
+    )
+    order: Optional[List[str]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Cross-modality reference order as 'image:N', 'video:N', 'audio:N' "
+            "entries (zero-based per modality), for models where reference order "
+            "changes the compiled shape. If None, images then videos then audio."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "ReferenceWarmupVariant":
+        for height, width in self.images:
+            if not (0 < height <= _MAX_REFERENCE_DIM and 0 < width <= _MAX_REFERENCE_DIM):
+                raise ValueError(
+                    f"image sizes must be positive and at most {_MAX_REFERENCE_DIM} "
+                    f"per side, got ({height}, {width})."
+                )
+        for seconds in self.audio:
+            if not 0 < seconds <= _MAX_REFERENCE_AUDIO_SECONDS:
+                raise ValueError(
+                    f"audio durations must be in (0, {_MAX_REFERENCE_AUDIO_SECONDS}], "
+                    f"got {seconds}."
+                )
+        return self
+
+
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -691,6 +800,18 @@ class CompilationConfig(StrictBaseModel):
         False,
         status="prototype",
         description="Skip the post-load warmup pass (compile + capture).",
+    )
+    reference_variants_for_warmup: Optional[List[ReferenceWarmupVariant]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Reference-carrying variants to warm in addition to the plain pass at "
+            "each resolutions x num_frames shape; used only by warmup, never by "
+            "requests. Needed when a model's references change the compiled shape "
+            "(e.g. FLUX.2 image references, MiniMax-H3 ref2va image/video/audio "
+            "references). If None, uses model-specific defaults; if [], disables "
+            "reference warmup."
+        ),
     )
 
 
@@ -921,6 +1042,8 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "ReferenceVideoSpec",
+    "ReferenceWarmupVariant",
     "RuntimeLoRAConfig",
     "VisualGenArgs",
 ]
