@@ -12,22 +12,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
+import time
 from collections import deque
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
+from tensorrt_llm.executor.rpc import RPCCancelled
 from tensorrt_llm.serve.openai_server import OpenAIServer
+
+# The CPU-* CI stages run pytest with -m 'cpu_only'; without the marker every
+# test here is deselected.
+pytestmark = pytest.mark.cpu_only
 
 
 class _FakeGenerator:
     def __init__(
-        self, stat_batches: list[list[dict]], iter_stats_max_iterations: int | None = None
+        self,
+        stat_batches: list[list[dict]],
+        iter_stats_max_iterations: int | None = None,
+        enable_iter_perf_stats: bool = True,
+        stats_delay: float = 0.0,
+        stats_error: Exception | None = None,
     ):
-        self.args = SimpleNamespace(iter_stats_max_iterations=iter_stats_max_iterations)
+        self.args = SimpleNamespace(
+            iter_stats_max_iterations=iter_stats_max_iterations,
+            enable_iter_perf_stats=enable_iter_perf_stats,
+            return_perf_metrics=False,
+        )
+        self._executor = SimpleNamespace(resource_governor_queue=None)
         self._stat_batches = deque(stat_batches)
+        self._stats_delay = stats_delay
+        self._stats_error = stats_error
         self.stats_timeouts = []
+
+    def get_stats(self, timeout: float | None) -> list[dict]:
+        # Blocks like the executor's stats RPC, which waits for stats to arrive.
+        self.stats_timeouts.append(timeout)
+        time.sleep(self._stats_delay)
+        if self._stats_error is not None:
+            raise self._stats_error
+        return list(self._stat_batches.popleft()) if self._stat_batches else []
 
     def get_stats_async(self, timeout: float | None):
         self.stats_timeouts.append(timeout)
@@ -54,9 +83,18 @@ def _make_server(
     with_stats_buffer: bool = True,
     is_visual_gen: bool = False,
     iter_stats_max_iterations: int | None = None,
+    enable_iter_perf_stats: bool = True,
+    stats_delay: float = 0.0,
+    stats_error: Exception | None = None,
 ) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
-    server.generator = _FakeGenerator(stat_batches, iter_stats_max_iterations)
+    server.generator = _FakeGenerator(
+        stat_batches,
+        iter_stats_max_iterations,
+        enable_iter_perf_stats,
+        stats_delay,
+        stats_error,
+    )
     server.metrics_collector = _FakeMetricsCollector()
     server._is_visual_gen = is_visual_gen
     max_buffer_size = OpenAIServer._iteration_stats_buffer_maxlen(
@@ -107,6 +145,82 @@ async def test_metrics_endpoint_reads_queue_without_background_buffer():
     assert _response_content(response) == stats
     assert server.generator.stats_timeouts == [2]
     assert server.metrics_collector.logged_stats == []
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_does_not_block_the_event_loop():
+    """Responses keep streaming while /metrics waits for stats."""
+    stats = [{"iter": 7}]
+    server = _make_server([stats], with_stats_buffer=False, stats_delay=0.5)
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        response = await server.get_iteration_stats()
+    finally:
+        ticker_task.cancel()
+
+    assert _response_content(response) == stats
+    # About 50 ticks fit in the 0.5 s wait; none would if it held the loop.
+    assert ticks >= 10
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_reports_no_stats_when_executor_unreachable():
+    server = _make_server(
+        [],
+        with_stats_buffer=False,
+        stats_error=RPCCancelled("Server is shutting down, request cancelled"),
+    )
+
+    response = await server.get_iteration_stats()
+
+    assert response.status_code == 200
+    assert _response_content(response) == []
+    assert server.generator.stats_timeouts == [2]
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_does_not_poll_when_iteration_stats_disabled():
+    server = _make_server([], with_stats_buffer=False, enable_iter_perf_stats=False)
+
+    for _ in range(2):
+        response = await server.get_iteration_stats()
+        assert _response_content(response) == []
+
+    assert server.generator.stats_timeouts == []
+
+
+@pytest.mark.parametrize(
+    "enable_iter_perf_stats,with_stats_buffer",
+    [(False, False), (True, True)],
+)
+@pytest.mark.asyncio
+async def test_metrics_route_does_not_poll_iteration_stats_queue(
+    enable_iter_perf_stats: bool, with_stats_buffer: bool
+):
+    server = _make_server(
+        [],
+        with_stats_buffer=with_stats_buffer,
+        enable_iter_perf_stats=enable_iter_perf_stats,
+    )
+    server.app = FastAPI()
+    server.use_harmony = False
+    server.register_routes()
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert server.generator.stats_timeouts == []
 
 
 @pytest.mark.asyncio
