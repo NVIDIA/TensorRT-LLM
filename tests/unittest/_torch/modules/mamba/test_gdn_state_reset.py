@@ -34,7 +34,7 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 def _cpp_style_pool(
     num_layers, num_slots, heads, head_dim, d_state, conv_dim, d_conv, ssm_dtype, dev
 ):
-    """One byte pool per (layer, slot) holding ssm then conv, viewed like CppMambaHybridCacheManager."""
+    """One byte pool per (layer, slot) holding ssm then conv, viewed like the real Mamba layer cache."""
     ssm_bytes = heads * head_dim * d_state * ssm_dtype.itemsize
     conv_bytes = conv_dim * (d_conv - 1) * 2
     pool = torch.randint(
