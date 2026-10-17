@@ -211,7 +211,11 @@ class ADPRouter(ABC):
                 there exclusively (see RankState.num_pending_new_requests).
         """
         local_state = self._build_local_rank_state(
-            active_requests, new_requests, iter_stats_payload, num_pending_new_requests, forward_work
+            active_requests,
+            new_requests,
+            iter_stats_payload,
+            num_pending_new_requests,
+            forward_work,
         )
         # The serialized RankState is a fixed-size flat int list, so ship it
         # as a CPU int64 tensor: a tensor allgather is a single host

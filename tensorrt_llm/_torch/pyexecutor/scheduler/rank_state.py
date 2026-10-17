@@ -124,7 +124,9 @@ class RankState:
         # The telemetry fields are optional on the wire; forward-work counters
         # always follow the iteration payload. The full message length identifies
         # whether telemetry was included in this allgather.
-        stats_field_count = len(fields(RankIterStatsPayload)) if len(values) >= prefix_field_count + 12 else 9
+        stats_field_count = (
+            len(fields(RankIterStatsPayload)) if len(values) >= prefix_field_count + 12 else 9
+        )
         stats_end = prefix_field_count + stats_field_count
         return cls(
             rank=rank_values[0],

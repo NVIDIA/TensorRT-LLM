@@ -32,6 +32,7 @@ collectives):
   when the object-collective groups exist and fall back to the base path
   otherwise.
 """
+
 import copy
 import threading
 from types import SimpleNamespace
@@ -42,15 +43,16 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggTransferCoordinator, NoopDisaggCoordinator)
+    DisaggTransferCoordinator,
+    NoopDisaggCoordinator,
+)
 from tensorrt_llm._torch.distributed.communicator import TorchDist
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
-    DefaultADPRouter, RankState)
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 
 pytestmark = pytest.mark.cpu_only
 
@@ -83,25 +85,24 @@ class _FakeGroup:
         return gathered
 
     def dist(self, rank):
-        d = SimpleNamespace(rank=rank,
-                            tp_rank=rank,
-                            world_size=self.n,
-                            tp_size=self.n,
-                            pp_size=1,
-                            cp_size=1,
-                            has_cp_helix=False)
+        d = SimpleNamespace(
+            rank=rank,
+            tp_rank=rank,
+            world_size=self.n,
+            tp_size=self.n,
+            pp_size=1,
+            cp_size=1,
+            has_cp_helix=False,
+        )
         d.allgather_ints = lambda values: [
-            list(v)
-            for v in self._exchange(rank, "allgather_ints", list(values))
+            list(v) for v in self._exchange(rank, "allgather_ints", list(values))
         ]
-        d.tp_allgather = lambda obj, **kw: self._exchange(
-            rank, "tp_allgather", obj)
+        d.tp_allgather = lambda obj, **kw: self._exchange(rank, "tp_allgather", obj)
         d.tp_allgather_int64 = lambda values: np.asarray(
-            self._exchange(rank, "tp_allgather_int64", list(values)),
-            dtype=np.int64)
+            self._exchange(rank, "tp_allgather_int64", list(values)), dtype=np.int64
+        )
         d.allreduce = lambda v, op=None: max(self._exchange(rank, "allreduce", v))
-        d.tp_allreduce = lambda v, op=None: max(
-            self._exchange(rank, "tp_allreduce", v))
+        d.tp_allreduce = lambda v, op=None: max(self._exchange(rank, "tp_allreduce", v))
         return d
 
     def run(self, fns):
@@ -115,16 +116,13 @@ class _FakeGroup:
                 errors[i] = exc
                 self._barrier.abort()
 
-        threads = [
-            threading.Thread(target=worker, args=(i, )) for i in range(self.n)
-        ]
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(self.n)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=120)
         for exc in errors:
-            if exc is not None and not isinstance(exc,
-                                                  threading.BrokenBarrierError):
+            if exc is not None and not isinstance(exc, threading.BrokenBarrierError):
                 raise exc
         for exc in errors:
             if exc is not None:
@@ -137,8 +135,7 @@ def _knob_env(monkeypatch):
     monkeypatch.setenv("TLLM_ADP_PACKED_SYNC", "1")
     monkeypatch.delenv("TLLM_ADP_PACKED_SYNC_VERIFY", raising=False)
     # The in-flight cancel helper caches its env lookup; pin the gate's view.
-    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled",
-                        lambda: False)
+    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: False)
 
 
 def _req(request_id, *, error=False, prompt_len=4):
@@ -150,8 +147,9 @@ def _req(request_id, *, error=False, prompt_len=4):
         py_orig_prompt_len=prompt_len,
         py_disaggregated_params=None,
         is_context_only_request=False,
-        state=(LlmRequestState.DISAGG_TRANS_ERROR
-               if error else LlmRequestState.GENERATION_IN_PROGRESS),
+        state=(
+            LlmRequestState.DISAGG_TRANS_ERROR if error else LlmRequestState.GENERATION_IN_PROGRESS
+        ),
     )
 
 
@@ -180,16 +178,14 @@ class _Coordinator:
             if executor_module.get_unique_rid(req) in pending:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
         errors = [
-            req for req in self._ex.active_requests
+            req
+            for req in self._ex.active_requests
             if req.state == LlmRequestState.DISAGG_TRANS_ERROR
         ]
         canceled = getattr(self._ex, "canceled_req_ids", set())
         return {
             "error_ids": [req.py_request_id for req in errors],
-            "blocked_ids": [
-                req.py_request_id for req in errors
-                if req.py_request_id in canceled
-            ],
+            "blocked_ids": [req.py_request_id for req in errors if req.py_request_id in canceled],
         }
 
     def take_pending_timed_out(self):
@@ -200,13 +196,7 @@ class _Coordinator:
         self.failed_synced.append(list(requests))
 
 
-def _make_executor(group,
-                   rank,
-                   *,
-                   active_requests,
-                   coordinator=None,
-                   runner=None,
-                   verify=False):
+def _make_executor(group, rank, *, active_requests, coordinator=None, runner=None, verify=False):
     ex = object.__new__(PyExecutor)
     ex.dist = group.dist(rank)
     ex.enable_attention_dp = True
@@ -225,7 +215,8 @@ def _make_executor(group,
     ex.resource_manager = None
     ex.model_engine = SimpleNamespace(
         make_graph_batch=lambda batch, resource_manager: (batch, frozenset()),
-        cuda_graph_runner=runner)
+        cuda_graph_runner=runner,
+    )
     return ex
 
 
@@ -233,9 +224,9 @@ def _make_runner(group, rank, *, enabled=True):
     runner = object.__new__(CUDAGraphRunner)
     runner.enabled = enabled
     runner.padding_enabled = False  # _get_padded_batch returns 0 after the gather
-    runner.config = SimpleNamespace(enable_attention_dp=True,
-                                    mapping=SimpleNamespace(tp_size=group.n),
-                                    dist=group.dist(rank))
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True, mapping=SimpleNamespace(tp_size=group.n), dist=group.dist(rank)
+    )
     runner._adp_graph_batch_hint = None
     runner.is_encoder_decoder = False
     runner.enable_encoder_decoder_mixed_cuda_graph = False
@@ -243,12 +234,14 @@ def _make_runner(group, rank, *, enabled=True):
 
 
 def _batch(batch_size, *, can_run_cuda_graph=True):
-    return SimpleNamespace(batch_size=batch_size,
-                           can_run_cuda_graph=can_run_cuda_graph,
-                           num_context_requests=0,
-                           num_generation_requests=batch_size,
-                           generation_requests=[None] * batch_size,
-                           context_requests=[])
+    return SimpleNamespace(
+        batch_size=batch_size,
+        can_run_cuda_graph=can_run_cuda_graph,
+        num_context_requests=0,
+        num_generation_requests=batch_size,
+        generation_requests=[None] * batch_size,
+        context_requests=[],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +250,6 @@ def _batch(batch_size, *, can_run_cuda_graph=True):
 
 
 def _run_loop_head(group, executors):
-
     def step(ex):
         result = ex._adp_loop_head_exchange()
         ex._adp_apply_loop_head_actions(result)
@@ -294,9 +286,7 @@ def test_loop_head_error_vote_runs_legacy_handler_on_every_rank():
     group = _FakeGroup(2)
     executors = [
         _make_executor(group, 0, active_requests=[_req(1)]),
-        _make_executor(group,
-                       1,
-                       active_requests=[_req(3), _req(4, error=True)]),
+        _make_executor(group, 1, active_requests=[_req(3), _req(4, error=True)]),
     ]
     results = _run_loop_head(group, executors)
     for rank, ex in enumerate(executors):
@@ -313,12 +303,14 @@ def test_loop_head_pending_context_failure_joins_the_vote():
     group = _FakeGroup(2)
     failing = _req(9)
     executors = [
-        _make_executor(group,
-                       0,
-                       active_requests=[failing],
-                       coordinator=_Coordinator(pending_ctx_failures={
-                           executor_module.get_unique_rid(failing)
-                       })),
+        _make_executor(
+            group,
+            0,
+            active_requests=[failing],
+            coordinator=_Coordinator(
+                pending_ctx_failures={executor_module.get_unique_rid(failing)}
+            ),
+        ),
         _make_executor(group, 1, active_requests=[_req(3)]),
     ]
     results = _run_loop_head(group, executors)
@@ -364,14 +356,15 @@ def test_loop_head_verify_mode_issues_legacy_collectives_and_agrees():
     group = _FakeGroup(2)
     executors = [
         _make_executor(group, 0, active_requests=[_req(1)], verify=True),
-        _make_executor(group, 1, active_requests=[_req(2, error=True)],
-                       verify=True),
+        _make_executor(group, 1, active_requests=[_req(2, error=True)], verify=True),
     ]
     _run_loop_head(group, executors)
     for rank in range(2):
         assert group.ops[rank] == [
-            "allgather_ints", "tp_allgather", "tp_allgather_int64",
-            "tp_allgather"
+            "allgather_ints",
+            "tp_allgather",
+            "tp_allgather_int64",
+            "tp_allgather",
         ]
 
 
@@ -383,10 +376,7 @@ def test_loop_head_verify_mode_issues_legacy_collectives_and_agrees():
 def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
     group = _FakeGroup(2)
     runners = [_make_runner(group, r) for r in range(2)]
-    executors = [
-        _make_executor(group, r, active_requests=[], runner=runners[r])
-        for r in range(2)
-    ]
+    executors = [_make_executor(group, r, active_requests=[], runner=runners[r]) for r in range(2)]
     batches = [_batch(3), _batch(0, can_run_cuda_graph=False)]
 
     def step(rank):
@@ -395,7 +385,8 @@ def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
         can_queue = ex._can_queue(batches[rank])
         # The runner pops the hint instead of gathering.
         runners[rank]._gather_adp_graph_batch_info = Mock(
-            side_effect=AssertionError("must not gather with a hint"))
+            side_effect=AssertionError("must not gather with a hint")
+        )
         padding = runners[rank]._get_padded_batch(batches[rank], None, 0)
         return can_queue, padding
 
@@ -407,7 +398,8 @@ def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
         assert group.ops[rank] == ["allgather_ints"]
         assert group.payloads[rank][0] == [
             batches[rank].batch_size,
-            int(batches[rank].can_run_cuda_graph), batches[rank].batch_size
+            int(batches[rank].can_run_cuda_graph),
+            batches[rank].batch_size,
         ]
         assert executors[rank]._packed_can_queue is None
         assert runners[rank]._adp_graph_batch_hint is None
@@ -416,18 +408,13 @@ def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
 def test_padding_hint_rows_match_the_runner_gather_layout():
     group = _FakeGroup(2)
     runners = [_make_runner(group, r) for r in range(2)]
-    executors = [
-        _make_executor(group, r, active_requests=[], runner=runners[r])
-        for r in range(2)
-    ]
+    executors = [_make_executor(group, r, active_requests=[], runner=runners[r]) for r in range(2)]
     batches = [_batch(2), _batch(5)]
-    group.run([
-        lambda r=r: executors[r]._adp_post_schedule_exchange(batches[r])
-        for r in range(2)
-    ])
+    group.run([lambda r=r: executors[r]._adp_post_schedule_exchange(batches[r]) for r in range(2)])
     for rank in range(2):
         assert runners[rank]._adp_graph_batch_hint == [
-            (True, 2, SampleType.FULL.value), (True, 5, SampleType.FULL.value)
+            (True, 2, SampleType.FULL.value),
+            (True, 5, SampleType.FULL.value),
         ]
 
 
@@ -444,10 +431,8 @@ def test_can_queue_without_stash_gathers_as_before():
     ex = object.__new__(PyExecutor)
     ex.enable_attention_dp = True
     ex._packed_can_queue = None
-    ex.dist = SimpleNamespace(tp_allgather_int64=Mock(
-        return_value=np.array([[2], [0]])))
-    assert PyExecutor._can_queue(ex, SimpleNamespace(batch_size=2)) == (False,
-                                                                        True)
+    ex.dist = SimpleNamespace(tp_allgather_int64=Mock(return_value=np.array([[2], [0]])))
+    assert PyExecutor._can_queue(ex, SimpleNamespace(batch_size=2)) == (False, True)
     ex.dist.tp_allgather_int64.assert_called_once_with([2])
 
 
@@ -493,19 +478,16 @@ def test_packed_sync_check_raises_on_mismatch():
 
 def _gate_executor(monkeypatch, **overrides):
     ex = object.__new__(PyExecutor)
-    ex.dist = SimpleNamespace(rank=0,
-                              world_size=2,
-                              tp_size=2,
-                              pp_size=1,
-                              cp_size=1)
+    ex.dist = SimpleNamespace(rank=0, world_size=2, tp_size=2, pp_size=1, cp_size=1)
     ex.enable_attention_dp = True
     ex.kv_cache_transceiver = object()
     ex.kv_connector_manager = None
     ex.is_benchmark_disagg = False
     ex.drafter = None
     ex.enable_early_first_token_response = False
-    ex.model_engine = SimpleNamespace(is_spec_decode=False,
-                                      make_graph_batch=lambda b, rm: (b, frozenset()))
+    ex.model_engine = SimpleNamespace(
+        is_spec_decode=False, make_graph_batch=lambda b, rm: (b, frozenset())
+    )
     ex.adp_router = DefaultADPRouter(ex.dist)
     ex._kv_load_tracker = SimpleNamespace(enabled=False)
     for key, value in overrides.items():
@@ -519,28 +501,23 @@ def test_gate_is_config_derived(monkeypatch):
     assert _gate_executor(monkeypatch)._resolve_packed_sync_enabled() is False
     monkeypatch.setenv("TLLM_ADP_PACKED_SYNC", "1")
     for override in (
-            dict(enable_attention_dp=False),
-            dict(kv_cache_transceiver=None),
-            dict(kv_connector_manager=object()),
-            dict(is_benchmark_disagg=True),
-            dict(drafter=object()),
-            dict(enable_early_first_token_response=True),
-            dict(model_engine=SimpleNamespace(is_spec_decode=True,
-                                              make_graph_batch=lambda b, rm: b)),
-            # conditional attention DP (remote-tail replay) gathers its own votes
-            dict(_enable_remote_tail_adp=True),
-            # KV-load routing telemetry rides the plain rank-state gather only
-            dict(_kv_load_tracker=SimpleNamespace(enabled=True)),
-            dict(model_engine=SimpleNamespace(is_spec_decode=False)),
-            dict(dist=SimpleNamespace(
-                rank=0, world_size=4, tp_size=2, pp_size=2, cp_size=1)),
-            dict(dist=SimpleNamespace(
-                rank=0, world_size=1, tp_size=1, pp_size=1, cp_size=1)),
+        dict(enable_attention_dp=False),
+        dict(kv_cache_transceiver=None),
+        dict(kv_connector_manager=object()),
+        dict(is_benchmark_disagg=True),
+        dict(drafter=object()),
+        dict(enable_early_first_token_response=True),
+        dict(model_engine=SimpleNamespace(is_spec_decode=True, make_graph_batch=lambda b, rm: b)),
+        # conditional attention DP (remote-tail replay) gathers its own votes
+        dict(_enable_remote_tail_adp=True),
+        # KV-load routing telemetry rides the plain rank-state gather only
+        dict(_kv_load_tracker=SimpleNamespace(enabled=True)),
+        dict(model_engine=SimpleNamespace(is_spec_decode=False)),
+        dict(dist=SimpleNamespace(rank=0, world_size=4, tp_size=2, pp_size=2, cp_size=1)),
+        dict(dist=SimpleNamespace(rank=0, world_size=1, tp_size=1, pp_size=1, cp_size=1)),
     ):
-        assert _gate_executor(
-            monkeypatch, **override)._resolve_packed_sync_enabled() is False
-    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled",
-                        lambda: True)
+        assert _gate_executor(monkeypatch, **override)._resolve_packed_sync_enabled() is False
+    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
     assert _gate_executor(monkeypatch)._resolve_packed_sync_enabled() is False
 
 
@@ -559,7 +536,8 @@ def test_coordinator_timeout_accessors():
     coord.fail_timed_out_synced(["a"])
     assert coord._effects.fail_requests.call_count == 2
     coord._effects.fail_requests.assert_called_with(
-        "Request timed out (KV transfer)", ["a"], charge_budget=False)
+        "Request timed out (KV transfer)", ["a"], charge_budget=False
+    )
 
     noop = NoopDisaggCoordinator()
     assert noop.take_pending_timed_out() == []
@@ -571,8 +549,8 @@ def test_coordinator_local_error_vote_marks_pending_failures_and_counts_blocked(
     coord = object.__new__(DisaggTransferCoordinator)
     coord._pending_ctx_transfer_failures = {executor_module.get_unique_rid(failing)}
     coord._registry = SimpleNamespace(
-        active_requests=lambda: [ok, failing, blocked],
-        canceled_request_ids=lambda: {3})
+        active_requests=lambda: [ok, failing, blocked], canceled_request_ids=lambda: {3}
+    )
     coord._transfers = SimpleNamespace(requests_in_transfer=lambda: set())
     vote = coord.local_error_vote()
     # The pending context failure joined the vote and the buffer is drained;

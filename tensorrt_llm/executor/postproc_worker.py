@@ -290,8 +290,10 @@ class PostprocWorker:
                                               0),
                         ctx_computed_tokens=getattr(response_result,
                                                     "ctx_computed_tokens", 0),
-                        ctx_first_begin=getattr(response_result, "ctx_first_begin", -1),
-                        ctx_num_chunks=getattr(response_result, "ctx_num_chunks", 0),
+                        ctx_first_begin=getattr(response_result,
+                                                "ctx_first_begin", -1),
+                        ctx_num_chunks=getattr(response_result,
+                                               "ctx_num_chunks", 0),
                     ))
                 if is_final:
                     self._records.pop(client_id, None)
