@@ -16,7 +16,7 @@
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import math
 import numbers
@@ -150,8 +150,8 @@ class _DecodeRuntime:
     v_page_stride: int
     v_head_stride: int
     v_token_stride: int
-    bmm1_scale: float
-    bmm2_scale: float
+    bmm1_scale: float | torch.Tensor
+    bmm2_scale: float | torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -190,6 +190,7 @@ class _DecodePlanState:
     planned_seq_lens_device: Optional[torch.Tensor]
     policy: tuple[tuple[str, object], ...]
     storage_page_size: Optional[int] = None
+    use_device_scales: bool = False
 
 
 def _decode_policy_from_config(
@@ -726,7 +727,7 @@ def _validate_dtype_pair(
             and output_dtype
             in (
                 (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-                if allow_fp8_bf16_output
+                if allow_fp8_bf16_output or k_dtype == torch.float8_e4m3fn
                 else (torch.float16, torch.float8_e4m3fn)
             )
         )
@@ -734,11 +735,7 @@ def _validate_dtype_pair(
     if not supported:
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
-                if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
-            )
+            "FP8-E4M3->FP16/BF16/FP8-E4M3; "
             + "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
             + "and BF16 Q/K + FP8 V; got "
             + f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
@@ -1512,6 +1509,7 @@ def _make_decode_compile_spec(
 @functools.cache
 def _get_compiled_decode(
     compile_spec: _DecodeCompileSpec,
+    use_device_scales: bool = False,
 ):
     """Compile and cache one batch-dynamic TS decode topology."""
 
@@ -1591,8 +1589,8 @@ def _get_compiled_decode(
         v_page_stride: cutlass.Int64,
         v_head_stride: cutlass.Int64,
         v_token_stride: cutlass.Int64,
-        bmm1_scale: cutlass.Float32,
-        bmm2_scale: cutlass.Float32,
+        bmm1_scale: cutlass.Float32 | cute.Tensor,
+        bmm2_scale: cutlass.Float32 | cute.Tensor,
         direct_q1_inputs: tuple,
         stream: cuda_drv.CUstream,
         static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
@@ -1670,8 +1668,8 @@ def _get_compiled_decode(
             partial_stats.iterator,
             split_kv_counter.iterator,
             attention_sinks.iterator,
-            bmm1_scale,
-            bmm2_scale,
+            bmm1_scale.iterator if use_device_scales else bmm1_scale,
+            bmm2_scale.iterator if use_device_scales else bmm2_scale,
             Int32(0),
             Int32(static_max_active_clusters),
             stream,
@@ -1902,6 +1900,7 @@ def _get_compiled_decode(
                 4,
             ),
         )
+    scale_fake = fake_compact(Float32, (1,), 4) if use_device_scales else Float32(1.0)
 
     with torch.cuda.device(device_index):
         compiled_main = cute.compile(
@@ -1927,8 +1926,8 @@ def _get_compiled_decode(
             Int64(1),
             Int64(1),
             Int64(1),
-            Float32(1.0),
-            Float32(1.0),
+            scale_fake,
+            scale_fake,
             direct_q1_fake,
             stream_fake,
             cfg,
@@ -2240,8 +2239,9 @@ def _launch_decode(
             workspace.partial_o,
             workspace.partial_stats,
             workspace.attention_sinks,
-            runtime.bmm1_scale,
-            runtime.bmm2_scale,
+            # Producers already scale normalized partial O and log2-LSE.
+            1.0,
+            1.0,
             (),
         )
     return runtime.out
@@ -3744,6 +3744,7 @@ class BatchDecodePagedTSWrapper:
         split_kv: bool = True,
         validate: bool = True,
         initialize_workspace: bool = True,
+        use_device_scales: bool = False,
     ) -> None:
         """Compile one static-capacity plan and optionally own sequence lengths.
 
@@ -3758,6 +3759,11 @@ class BatchDecodePagedTSWrapper:
         :meth:`run` requires its ``seq_lens`` argument to be ``None``. When
         omitted, both K/V prefix and length handling compile dynamically and
         every run must supply a CUDA length tensor.
+
+        ``use_device_scales=True`` compiles a plan that reads float32 BMM
+        scales from CUDA tensors supplied to every run. Values must be finite
+        and positive; they are not read back to the host for validation. This
+        supports preprocessing-produced scales and CUDA graph replay.
 
         ``workspace_buffer`` is caller-owned scratch for this plan. It is
         allocated when omitted, retained by the frozen plan state, and never
@@ -3834,7 +3840,13 @@ class BatchDecodePagedTSWrapper:
             Initialize control sections during planning, default ``True``.
             Set to ``False`` only for caller-initialized scratch with unchanged
             layout. Newly allocated scratch is always initialized.
+        use_device_scales : bool
+            Read BMM scales from per-run CUDA tensors instead of host scalars.
+            Defaults to ``False``.
         """
+
+        if not isinstance(use_device_scales, bool):
+            raise TypeError("use_device_scales must be a bool")
 
         k_data_type, v_data_type = _resolve_kv_dtypes(
             q_data_type, k_data_type, v_data_type, kv_data_type
@@ -3967,7 +3979,11 @@ class BatchDecodePagedTSWrapper:
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
         )
-        compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
+        compiled_main, compiled_reducer = (
+            _get_compiled_decode(compile_spec, use_device_scales=True)
+            if use_device_scales
+            else _get_compiled_decode(compile_spec)
+        )
         policy = spec.policy + (
             ("kv_prefix_mode", kv_prefix_mode),
             ("kv_lengths_mode", kv_lengths_mode),
@@ -4038,6 +4054,7 @@ class BatchDecodePagedTSWrapper:
             planned_seq_lens_device=planned_seq_lens_device,
             policy=policy,
             storage_page_size=storage_page_size,
+            use_device_scales=use_device_scales,
         )
         # This is the only wrapper mutation. Any failure above leaves the
         # previous complete plan revision usable.
@@ -4055,6 +4072,8 @@ class BatchDecodePagedTSWrapper:
         qo_indptr: Optional[torch.Tensor] = None,
         bmm1_scale: Optional[float] = None,
         bmm2_scale: float = 1.0,
+        bmm1_scale_device: Optional[torch.Tensor] = None,
+        bmm2_scale_device: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
@@ -4103,6 +4122,10 @@ class BatchDecodePagedTSWrapper:
         bmm1_scale : float, optional
             QK scaling factor. Defaults to the inverse square root of
             ``head_dim``.
+        bmm1_scale_device, bmm2_scale_device : torch.Tensor, optional
+            Float32 CUDA tensors of shape ``(1,)`` required by a plan with
+            ``use_device_scales=True``. Override the host scales, and may change
+            in place on graph replay. BMM1 uses the regular, not log2, scale.
         bmm2_scale : float
             Value/output scaling factor. Defaults to ``1.0``.
         out : torch.Tensor, optional
@@ -4213,6 +4236,27 @@ class BatchDecodePagedTSWrapper:
                 bmm2_scale=bmm2_scale,
                 out=out,
             )
+
+        if state.use_device_scales:
+            for name, scale in (
+                ("bmm1_scale_device", bmm1_scale_device),
+                ("bmm2_scale_device", bmm2_scale_device),
+            ):
+                if (
+                    scale is None
+                    or scale.dtype != torch.float32
+                    or scale.device != state.device
+                    or scale.shape != (1,)
+                    or not scale.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be a float32 tensor of shape (1,) on {state.device}"
+                    )
+            runtime = replace(
+                runtime, bmm1_scale=bmm1_scale_device, bmm2_scale=bmm2_scale_device
+            )
+        elif bmm1_scale_device is not None or bmm2_scale_device is not None:
+            raise ValueError("device scales require plan(use_device_scales=True)")
 
         return _launch_decode(
             runtime,
