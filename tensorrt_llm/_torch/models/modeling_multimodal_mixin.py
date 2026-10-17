@@ -46,6 +46,7 @@ from tensorrt_llm.inputs.registry import (
 )
 from tensorrt_llm.logger import logger
 
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from .modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
@@ -1752,14 +1753,18 @@ def _dispatch_cross_iter_prefetch(
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
 
-            if partial_hits and encoder_cache is not None:
-                model._encode_with_partial_cache(partial_hits, encoder_cache)
-            if cache_misses:
-                encoder_output = model.encode_multimodal_inputs(cache_misses)
-                _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
-                if encoder_cache is not None:
-                    for param in cache_misses:
-                        model._write_encoder_cache_entries(param, encoder_cache)
+            # Prefetch runs between executor steps, outside `ModelCaller`, so the vision tower's
+            # TP all-reduces can return NCCL window tensors here. The stored embeddings are read
+            # next iteration, so keep a clone rather than a view of a released window.
+            with discard_nccl_window_tensor_outputs(params_to_transfer):
+                if partial_hits and encoder_cache is not None:
+                    model._encode_with_partial_cache(partial_hits, encoder_cache)
+                if cache_misses:
+                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
+                    _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
+                    if encoder_cache is not None:
+                        for param in cache_misses:
+                            model._write_encoder_cache_entries(param, encoder_cache)
 
             # Prefetch only needs to attach each request's embedding. Validate each request
             # independently instead of gathering the unused batch output with `torch.cat`.

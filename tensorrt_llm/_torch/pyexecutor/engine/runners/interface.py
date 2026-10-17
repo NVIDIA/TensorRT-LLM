@@ -80,7 +80,7 @@ class RunnerConfig:
 class ModelRunner(ABC):
     """Shared lifecycle for scheduled and packed model execution."""
 
-    def release_graphs(self) -> None:
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
         """Release captured graphs before their referenced resources are replaced.
 
         The caller must stop execution and synchronize outstanding work first.

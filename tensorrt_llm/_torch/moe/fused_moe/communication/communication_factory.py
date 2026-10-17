@@ -483,6 +483,15 @@ class CommunicationFactory:
                 "NcclEP requires positive num_slots, hidden_size, and max_num_tokens, got "
                 f"{num_slots=}, {hidden_size=}, {max_num_tokens=}."
             )
+        # LL combine consumes BF16 and requires 512-element alignment, including
+        # NVFP4 combine. FP8 dispatch uses a BF16 view of width hidden_size / 2,
+        # whose 256-element alignment also requires hidden_size divisible by 512.
+        # TODO: Remove this guard when the pinned NCCL-EP supports unaligned hidden sizes.
+        if hidden_size % 512 != 0:
+            return (
+                "NcclEP low-latency dispatch/combine requires hidden_size divisible by 512, "
+                f"got {hidden_size=}."
+            )
         if moe_max_num_tokens is not None and moe_max_num_tokens <= 0:
             return (
                 f"NcclEP requires moe_max_num_tokens > 0 when provided, got {moe_max_num_tokens}."
