@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Replay-window and replay-shape checks of the layer-wise benchmarks Calibrator.
+"""Replay-window, replay-shape and decoder-layer checks of the Calibrator.
 
-No GPU and no nsys: these read the replay database and nothing else. They live
-apart from test_layer_wise_benchmarks.py, which is the nsys integration suite --
-its module-scoped autouse fixture skips that whole module when nsys cannot trace
-CUDA, which is the right answer for a trace-and-parse test and the wrong one for
-these.
+No GPU and no nsys: these read the replay database or wrap stand-in layers, and
+nothing else. They live apart from test_layer_wise_benchmarks.py, which is the
+nsys integration suite -- its module-scoped autouse fixture skips that whole
+module when nsys cannot trace CUDA, which is the right answer for a
+trace-and-parse test and the wrong one for these.
 
 The calibrator is built by hand rather than through Calibrator.init(), which
 cannot be used here: _init_replay_mode() decodes every record and moves the slots
@@ -18,7 +18,12 @@ from typing import Iterable
 
 import pytest
 
-from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator, Mode
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import (
+    Calibrator,
+    Mode,
+    NoDecoderLayers,
+    _decoder_layers,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -229,3 +234,141 @@ def test_replay_token_count_rejects_an_empty_window() -> None:
 def test_replay_token_count_requires_replay_mode() -> None:
     with pytest.raises(ValueError, match="only valid in REPLAY mode"):
         Calibrator().get_replay_token_count()
+
+
+class _Layer:
+    """Stands in for a decoder layer: the one thing the calibrator wraps."""
+
+    def forward(self, *args, **kwargs):
+        return None
+
+
+class _Holder:
+    def __init__(self, **attrs) -> None:
+        self.__dict__.update(attrs)
+
+
+def _wrapped_chain(unwraps: int, layers) -> _Holder:
+    """`layers` behind `unwraps` levels of `.model`."""
+    obj = _Holder(layers=layers)
+    for _ in range(unwraps):
+        obj = _Holder(model=obj)
+    return obj
+
+
+@pytest.mark.parametrize("attr", ["layers", "block", "blocks", "h"])
+def test_decoder_layers_under_each_known_name(attr: str) -> None:
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(**{attr: layers}))) is layers
+
+
+def test_decoder_layers_descends_into_llm() -> None:
+    """Qwen3.5-VL keeps the causal LM under `llm`: `model.llm.model.layers`."""
+    layers = [_Layer(), _Layer()]
+    vl = _Holder(llm=_Holder(model=_Holder(layers=layers)))
+    assert _decoder_layers(vl) is layers
+
+
+def test_decoder_layers_descends_into_language_model() -> None:
+    """The HF-style `*ForConditionalGeneration` shape."""
+    layers = [_Layer()]
+    vl = _Holder(language_model=_Holder(model=_Holder(layers=layers)))
+    assert _decoder_layers(vl) is layers
+
+
+def test_decoder_layers_skips_an_empty_candidate_for_a_real_one() -> None:
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(layers=[], blocks=layers))) is layers
+
+
+def test_decoder_layers_skips_a_mapping_named_h() -> None:
+    """A dict passes len(), then raises KeyError on [0]; the search must go on."""
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(h={"attn": 1}, model=_Holder(layers=layers))) is layers
+
+
+def test_decoder_layers_raises_when_only_a_mapping_is_present() -> None:
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(_Holder(model=_Holder(h={"attn": 1})))
+
+
+def test_decoder_layers_rejects_items_without_forward() -> None:
+    """A sized, indexable attribute is not by itself a decoder stack."""
+    with pytest.raises(NoDecoderLayers, match="none of"):
+        _decoder_layers(_Holder(model=_Holder(blocks=[{"hidden": 4096}])))
+
+
+def test_decoder_layers_stops_on_a_self_referential_wrapper() -> None:
+    holder = _Holder()
+    holder.model = holder
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(holder)
+
+
+def test_decoder_layers_stops_on_a_two_object_cycle() -> None:
+    """A cycle longer than one object must stop, not walk the depth budget."""
+    outer = _Holder()
+    inner = _Holder(llm=outer)
+    outer.model = inner
+    with pytest.raises(NoDecoderLayers, match=r"searched along _Holder -> _Holder \("):
+        _decoder_layers(outer)
+
+
+def test_decoder_layers_falls_through_to_a_later_inner_attr_after_a_cycle() -> None:
+    """A back-reference under `model` must not hide the real stack under `llm`."""
+    layers = [_Layer()]
+    outer = _Holder()
+    inner = _Holder(model=outer, llm=_Holder(model=_Holder(layers=layers)))
+    outer.model = inner
+    assert _decoder_layers(outer) is layers
+
+
+@pytest.mark.parametrize("unwraps", [0, 1, 2, 3, 4])
+def test_decoder_layers_searches_the_whole_budget(unwraps: int) -> None:
+    layers = [_Layer()]
+    assert _decoder_layers(_wrapped_chain(unwraps, layers)) is layers
+
+
+def test_decoder_layers_stops_one_level_past_the_budget() -> None:
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(_wrapped_chain(5, [_Layer()]))
+
+
+def test_decoder_layers_names_the_type_and_chain_it_searched() -> None:
+    class Outer(_Holder):
+        pass
+
+    class Inner(_Holder):
+        pass
+
+    with pytest.raises(NoDecoderLayers) as excinfo:
+        _decoder_layers(Outer(llm=Inner(decoder=[_Layer()])))
+    message = str(excinfo.value)
+    assert message.startswith("Outer keeps its decoder layers under none of layers, block")
+    assert "Outer -> Inner" in message
+
+
+def test_no_decoder_layers_is_an_attribute_error() -> None:
+    with pytest.raises(AttributeError):
+        _decoder_layers(_Holder())
+
+
+def test_maybe_wrap_model_wraps_layers_behind_a_nested_wrapper() -> None:
+    """Every layer of `model.llm.model.layers` is wrapped and still delegates.
+
+    Goes through the public entry point; MARK mode reaches _wrap_layer_forward
+    without touching CUDA.
+    """
+    layers = [_Layer(), _Layer(), _Layer()]
+    model = _Holder(llm=_Holder(model=_Holder(layers=layers)))
+    originals = [layer.forward for layer in layers]
+
+    calibrator = Calibrator()
+    calibrator.mode = Mode.MARK
+    assert calibrator.maybe_wrap_model(model) is model
+
+    for idx, (layer, original) in enumerate(zip(layers, originals)):
+        assert layer.forward is not original, f"layer {idx} left unwrapped"
+        # Bound methods are rebuilt on each attribute access, so compare by `==`.
+        assert layer.forward.__wrapped__ == original
+        assert layer.forward() is None
