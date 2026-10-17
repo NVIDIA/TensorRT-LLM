@@ -23,6 +23,7 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    engine: Optional[Any] = None,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 

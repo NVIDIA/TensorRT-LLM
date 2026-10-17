@@ -366,7 +366,7 @@ def test_qsa_cache_manager_requires_sparse_config() -> None:
         QSAMambaHybridCacheManagerV2(layer_mask=[True])
 
 
-@pytest.mark.parametrize("dtype", (DataType.NVFP4, DataType.FLOAT))
+@pytest.mark.parametrize("dtype", (DataType.FLOAT,))
 def test_qsa_cache_manager_delegates_regular_kv_layout(
     monkeypatch: pytest.MonkeyPatch, dtype: DataType
 ) -> None:

@@ -10,8 +10,11 @@ slices, fp32 gating params and NVFP4 scalars are derived in `modeling.py` after 
 Transforms:
 
 * fused shared-expert gate|up: `[gate ; up]` (the half order `flashinfer_silu_and_mul` reads);
-* NVFP4 routed-expert stacks: `[up ; gate]`, interleave, 32-row block shuffle of weight
-  and scale bytes, then 128x4 scale swizzle (FC2: shuffle only);
+* NVFP4 routed-expert stacks, laid out for the trunk's routed backend
+  (`core.trunk_moe_backend`): `[up ; gate]`, then 128x4 scale swizzle. trtllm-gen also
+  interleaves FC1 row by row and 32-row block shuffles weight and scale bytes (FC2:
+  shuffle only); CuteDSL interleaves FC1 in 64-row up/gate groups and leaves FC2 in
+  checkpoint row order;
 * n-gram table: 128 row chunks concatenated into one `[rows, 160]` buffer (the hash
   emits global row indices).
 
@@ -23,9 +26,9 @@ same either way. Offloading frees ~47.7 GiB, which the KV cache manager turns in
 more slots; several entries certify at most 461 slots, so raising
 `kv_cache_fraction` with the offload on needs those cells re-checked.
 
-Not loaded: `mtp.*` when there is no `speculative_config`, and
-`mtp.layers.0.self_attn.indexer.*` always (the draft layer runs dense attention).
-MTP experts are plain row-major FP8 128x128: `[up ; gate]` concat, bf16
+Not loaded: `mtp.*` when there is no `speculative_config`. With one, the whole MTP module
+is loaded, including the draft layer's own QSA indexer (`_index_branch`). MTP experts are
+plain row-major FP8 128x128: `[up ; gate]` concat, bf16
 `weight_scale_inv` cast to fp32. `lm_head` is the shell's parameter.
 
 `load(model, weights)` fills every declared parameter once and asserts coverage
@@ -176,15 +179,6 @@ _VISUAL = "model.visual"
 _MTP = "mtp"
 _MTP_LAYER = "mtp.layers.0"
 
-# The three tensors of the draft layer that are never loaded, with their reason
-# in the module docstring: its own QSA index projection and the two per-head
-# norms that go with it. The draft layer runs dense attention.
-_MTP_NOT_LOADED = (
-    f"{_MTP_LAYER}.self_attn.indexer.index_qk_proj.weight",
-    f"{_MTP_LAYER}.self_attn.indexer.q_layernorm.weight",
-    f"{_MTP_LAYER}.self_attn.indexer.k_layernorm.weight",
-)
-
 # NVFP4 block size: one e4m3 scale per 16 contiguous elements along K.
 SF_VEC = 16
 
@@ -221,8 +215,25 @@ def _interleave_perm(rows: int, device) -> torch.Tensor:
     return p.to(device)
 
 
-def _fc1_perm(rows: int, device) -> torch.Tensor:
-    """Interleave then 32-row block shuffle, composed into one gather."""
+#: The group the CuteDSL FC1 epilogue pairs up and gate rows in: rows `[128k, 128k + 64)`
+#: of the fused operand are up rows and the next 64 their gate rows.
+_CUTEDSL_GATE_UP_GROUP = 64
+
+
+def _group_interleave_perm(rows: int, group: int, device) -> torch.Tensor:
+    """Gather index that interleaves the `[up | gate]` halves of a `2*I` row stack in
+    `group`-row blocks: up[0:g], gate[0:g], up[g:2g], gate[g:2g], ..."""
+    assert rows % (2 * group) == 0, (rows, group)
+    idx = torch.arange(rows, device=device).view(2, rows // (2 * group), group)
+    return idx.transpose(0, 1).reshape(-1)
+
+
+def _fc1_perm(rows: int, device, core) -> torch.Tensor:
+    """The FC1 row gather of the trunk's routed backend. trtllm-gen: interleave then
+    32-row block shuffle, composed into one gather. CuteDSL: the 64-row group
+    interleave alone."""
+    if core.trunk_moe_backend == "CUTEDSL":
+        return _group_interleave_perm(rows, _CUTEDSL_GATE_UP_GROUP, device)
     return _interleave_perm(rows, device)[_block32_perm(rows, device)]
 
 
@@ -243,28 +254,34 @@ def _expert_fc1_w(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
     """(up, gate) packed nibbles -> one expert's FC1 operand."""
     up, gate = t
     w = torch.cat([up, gate], dim=0)
-    return torch.index_select(w, 0, _fc1_perm(w.shape[0], w.device)).contiguous()
+    return torch.index_select(w, 0, _fc1_perm(w.shape[0], w.device, core)).contiguous()
 
 
 def _expert_fc1_s(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
-    """(up, gate) e4m3 scales -> one expert's FC1 scale operand."""
+    """(up, gate) e4m3 scales -> one expert's FC1 scale operand: the weight's own row
+    permutation, then the swizzle."""
     up, gate = t
     s = torch.cat([up.view(torch.uint8), gate.view(torch.uint8)], dim=0)
     rows, cols = s.shape
-    s = torch.index_select(s, 0, _fc1_perm(rows, s.device))
+    s = torch.index_select(s, 0, _fc1_perm(rows, s.device, core))
     return _swizzle(s).reshape(rows, cols)
 
 
 def _expert_fc2_w(t: torch.Tensor, core) -> torch.Tensor:
-    """`down_proj` packed nibbles -> one expert's FC2 operand (no interleave)."""
+    """`down_proj` packed nibbles -> one expert's FC2 operand (no interleave): the
+    32-row block shuffle on trtllm-gen, checkpoint row order on CuteDSL."""
+    if core.trunk_moe_backend == "CUTEDSL":
+        return t.contiguous()
     return torch.index_select(t, 0, _block32_perm(t.shape[0], t.device)).contiguous()
 
 
 def _expert_fc2_s(t: torch.Tensor, core) -> torch.Tensor:
-    """`down_proj` e4m3 scales -> one expert's FC2 scale operand."""
+    """`down_proj` e4m3 scales -> one expert's FC2 scale operand: the weight's own row
+    order, then the swizzle."""
     s = t.view(torch.uint8)
     rows, cols = s.shape
-    s = torch.index_select(s, 0, _block32_perm(rows, s.device))
+    if core.trunk_moe_backend != "CUTEDSL":
+        s = torch.index_select(s, 0, _block32_perm(rows, s.device))
     return _swizzle(s).reshape(rows, cols)
 
 
@@ -473,6 +490,31 @@ def _gated_attention(tag, src, layers):
     )
 
 
+def _index_branch(tag, src, layers):
+    """The QSA index branch's three weights: one replicated, unquantized projection
+    producing `[index_heads q | 1 k]`, and two per-head gemma norms."""
+    return (
+        W(
+            f"{tag}idx_w",
+            shape=lambda d: (d.index_width, d.hidden),
+            src=src("index_qk_proj.weight"),
+            layers=layers,
+        ),
+        W(
+            f"{tag}idx_qn",
+            shape=lambda d: (d.index_head_dim,),
+            src=src("q_layernorm.weight"),
+            layers=layers,
+        ),
+        W(
+            f"{tag}idx_kn",
+            shape=lambda d: (d.index_head_dim,),
+            src=src("k_layernorm.weight"),
+            layers=layers,
+        ),
+    )
+
+
 def _shared_expert(tag, prefix, layers):
     """The bf16 shared expert beside the routed ones, and its per-token gate."""
     return (
@@ -529,26 +571,7 @@ class Qwen4ExpTp1Weights:
         ),
         # --- the gated GQA layers and their QSA index branch ---
         *_gated_attention("", lambda s: f"{{p}}.self_attn.{s}", _attn_layers),
-        # One replicated, unquantized projection producing [index_heads q | 1 k], and
-        # two per-head gemma norms.
-        W(
-            "idx_w",
-            shape=lambda d: (d.index_width, d.hidden),
-            src="{p}.self_attn.indexer.index_qk_proj.weight",
-            layers=_attn_layers,
-        ),
-        W(
-            "idx_qn",
-            shape=lambda d: (d.index_head_dim,),
-            src="{p}.self_attn.indexer.q_layernorm.weight",
-            layers=_attn_layers,
-        ),
-        W(
-            "idx_kn",
-            shape=lambda d: (d.index_head_dim,),
-            src="{p}.self_attn.indexer.k_layernorm.weight",
-            layers=_attn_layers,
-        ),
+        *_index_branch("", lambda s: f"{{p}}.self_attn.indexer.{s}", _attn_layers),
         # --- the Gated-DeltaNet layers ---
         W(
             "in_qkv_w",
@@ -872,6 +895,9 @@ class Qwen4ExpTp1Weights:
             )
         ),
         *_gated_attention("mtp_", lambda s: _mtp_key(f"{_MTP_LAYER}.self_attn.{s}"), _mtp_only),
+        *_index_branch(
+            "mtp_", lambda s: _mtp_key(f"{_MTP_LAYER}.self_attn.indexer.{s}"), _mtp_only
+        ),
         W(
             "mtp_router",
             shape=lambda d: (d.num_experts, d.hidden),
@@ -973,13 +999,10 @@ class Qwen4ExpTp1Weights:
         )
 
     def expected_unconsumed(self, core, weights) -> set:
-        """With MTP off, the whole `mtp.` subtree; with it on, exactly the three draft
-        indexer tensors. Named explicitly rather than by prefix so that a fourth unloaded
-        `mtp.*` key fails the coverage assert instead of hiding."""
+        """With MTP off, the whole `mtp.` subtree; with it on, nothing, so that any
+        unloaded `mtp.*` key fails the coverage assert instead of hiding."""
         if core.mtp_enabled:
-            for key in _MTP_NOT_LOADED:
-                assert key in weights, f"checkpoint key missing: {key}"
-            return set(_MTP_NOT_LOADED)
+            return set()
         return {k for k in weights if k.startswith(f"{_MTP}.")}
 
     def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
@@ -1082,9 +1105,7 @@ class Qwen4ExpTp1Weights:
         torch.cuda.synchronize()
         leftover = set(weights.keys()) - consumed
         expected = self.expected_unconsumed(core, weights)
-        what = (
-            "the draft layer's three QSA indexer tensors" if core.mtp_enabled else "the MTP module"
-        )
+        what = "empty" if core.mtp_enabled else "the MTP module"
         assert leftover == expected, (
             f"checkpoint coverage: leftover keys are not exactly {what}; "
             f"unexpected {sorted(leftover - expected)[:8]}, "

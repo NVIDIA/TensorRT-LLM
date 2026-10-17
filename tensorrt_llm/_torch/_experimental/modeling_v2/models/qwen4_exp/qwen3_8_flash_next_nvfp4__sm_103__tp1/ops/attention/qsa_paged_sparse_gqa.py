@@ -36,6 +36,7 @@ _CHECKPOINT = dict(
 
 _SPLIT_K = ("splitk", "merge")
 _PREFILL = ("prefill",)
+_FP8 = dict(cache_dtype=torch.float8_e4m3fn)
 
 
 def _spec(**overrides) -> dict:
@@ -53,8 +54,9 @@ def _decode(segments, launches=_SPLIT_K, **overrides) -> dict:
     return _spec(**{**base, **overrides})
 
 
-def _mixed(requests, context_lens) -> dict:
-    return _spec(mixed=(requests, context_lens), slots=32, prefill_pair=True, launches=_PREFILL)
+def _mixed(requests, context_lens, **overrides) -> dict:
+    base = dict(mixed=(requests, context_lens), slots=32, prefill_pair=True, launches=_PREFILL)
+    return _spec(**{**base, **overrides})
 
 
 class QsaPagedSparseGqa(OpWrapper):
@@ -117,6 +119,18 @@ class QsaPagedSparseGqa(OpWrapper):
         Cell(
             why="decode MTP: all 32 slots x 2 rows, positions 100..8099",
             spec=_decode(tuple((100 + (499 * g) % 8000, 2) for g in range(32))),
+        ),
+        Cell(
+            why="decode MTP7: 1 request x 8 rows, 32-way split-K",
+            spec=_decode(((4000, 8),)),
+        ),
+        Cell(
+            why="decode MTP7: 8 requests x 8 rows, 8-way split-K",
+            spec=_decode(tuple((4000 + 37 * i, 8) for i in range(8))),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
         ),
         Cell(
             why="300 rows, no prefill pair: split-K, one split, no merge",
@@ -185,6 +199,24 @@ class QsaPagedSparseGqa(OpWrapper):
             why="fp8-e4m3 pool under a bf16 q, read unscaled",
             spec=_decode(((900, 1),) * 4, cache_dtype=torch.float8_e4m3fn),
         ),
+        # The target's three call shapes over an fp8 pool (kv_cache_dtype=fp8, unit scale).
+        Cell(
+            why="fp8 decode MTP: 4 requests x 2 rows, split-K + merge",
+            spec=_decode(tuple((4000 + 37 * i, 2) for i in range(4)), **_FP8),
+        ),
+        Cell(
+            why="fp8 context 128 rows from 2032: pair passed, still split-K",
+            spec=_decode(((2032, 128),), prefill_pair=True, **_FP8),
+        ),
+        Cell(
+            why="fp8 context 272 rows from 2032: causal-prefix prefill kernel",
+            spec=_decode(((2032, 272),), launches=_PREFILL, prefill_pair=True, **_FP8),
+        ),
+        Cell(why="fp8 mixed 257 rows: 1 chunk + 31 MTP decodes", spec=_mixed(32, (195,), **_FP8)),
+        Cell(
+            why="fp8 decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32)), **_FP8),
+        ),
         Cell(
             why="int64 request indices", spec=_decode(((1000, 2),) * 4, request_dtype=torch.int64)
         ),
@@ -217,7 +249,8 @@ class QsaPagedSparseGqa(OpWrapper):
       - The prefill pair is a property of the launch: passed because some
         rows are context, it puts the generation rows on the prefill kernel
         too, and the bound applies to them (asserted with a planted index).
-      - There is no KV scale argument: an fp8 pool is read at face value.
+      - There is no KV scale argument: an fp8 pool is read at face value (each code
+        widens exactly to bf16 under a bf16 q), so it must hold K/V written at unit scale.
       - `D` must be a power of two (192 is refused); `Hq % Hkv == 0`.
 
     The op validates its own inputs loudly (11 `ValueError`s pinned by the
@@ -228,6 +261,10 @@ class QsaPagedSparseGqa(OpWrapper):
     PDL: `TRTLLM_ENABLE_PDL` (default on) enables programmatic dependent
     launch for multi-split launches of 4 rows or fewer; both launch modes are
     inside the cells. Calls are bitwise deterministic.
+
+    The decode site carries up to 8 rows per request (max_draft_len 7): the
+    cells run 1, 8 and 32 requests of 8 rows, which is 16, 128 and 512
+    `rows * Hkv` programs, so the 32-way, 8-way and 4-way split-K launches.
 
     Not certified: capture in a CUDA graph (the split-K path allocates its
     partials inside the call); head geometries other than 24/2 x 256;

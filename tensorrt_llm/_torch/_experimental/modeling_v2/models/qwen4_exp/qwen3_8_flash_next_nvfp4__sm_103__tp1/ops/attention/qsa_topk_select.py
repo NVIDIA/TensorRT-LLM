@@ -101,6 +101,31 @@ class QsaTopkSelect(OpWrapper):
             ),
         ),
         Cell(
+            why="decode MTP7: one request's 8 rows (6000..6007), NaN tail",
+            spec=dict(
+                rows=8,
+                cols=_SCORE_COLUMNS,
+                index_topk=_BLOCK_TOPK,
+                windows=("positions", tuple(range(6000, 6008))),
+                logits="relu",
+                tail="nan",
+            ),
+        ),
+        Cell(
+            why="decode MTP7: 32 requests x 8 rows = 256 rows, some below the budget, NaN tail",
+            spec=dict(
+                rows=256,
+                cols=_SCORE_COLUMNS,
+                index_topk=_BLOCK_TOPK,
+                windows=(
+                    "positions",
+                    tuple(600 + 233 * g + j for g in range(32) for j in range(8)),
+                ),
+                logits="relu",
+                tail="nan",
+            ),
+        ),
+        Cell(
             why="context: 8191 rows at positions 0..8190 (warm-up capture)",
             spec=dict(
                 rows=8191,
@@ -222,9 +247,10 @@ class QsaTopkSelect(OpWrapper):
     nothing. `torch.ops.trtllm.indexer_topk_decode` is the request-grouped
     sibling; QSA does not use it.
 
-    CUDA graphs: captured at `[8, 2048]`, `k=512`, and replayed against new
-    logits and a new `row_ends` through the captured addresses. Bitwise
-    comparison of two replays is not a valid check (order is unspecified).
+    CUDA graphs: captured at `[8, 2048]` and `[256, 2048]` (32 requests at
+    max_draft_len 7), `k=512`, and replayed against new logits and a new
+    `row_ends` through the captured addresses. Bitwise comparison of two
+    replays is not a valid check (order is unspecified).
 
     Hard limits: not probed. `indices` is addressed as `row * index_topk +
     slot`; the largest certified extent is 12416 x 64.

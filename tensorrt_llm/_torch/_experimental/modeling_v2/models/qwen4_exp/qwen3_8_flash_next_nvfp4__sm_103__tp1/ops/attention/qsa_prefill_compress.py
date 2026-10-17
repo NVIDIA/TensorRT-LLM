@@ -38,6 +38,10 @@ _CKPT = dict(
 
 _DECODE = ((4095, 1), (4096, 1), (4097, 1), (4098, 1), (4099, 1), (8191, 1), (3, 1), (2047, 1))
 
+#: 32 requests of one MTP7 verify block each (8 rows, two completed groups), at starts that put
+#: some blocks across a page edge and some inside one.
+_MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
+
 
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
@@ -115,6 +119,14 @@ class QsaPrefillCompress(OpWrapper):
             spec=_spec(((4094, 2), (4095, 2), (1022, 2), (30, 2)), pages=512),
         ),
         Cell(
+            why="decode MTP7: 1 request x 8 rows, two anchors, None",
+            spec=_spec(((4090, 8),), pages=160),
+        ),
+        Cell(
+            why="decode MTP7: 32 requests x 8 rows, two anchors each, None",
+            spec=_spec(_MTP7_32, pages=1100, slots=40, rounding_flips=1),
+        ),
+        Cell(
             why="mixed: chunk from 0, chunk from 1000, 2 MTP decodes, None",
             spec=_spec(((0, 64), (1000, 36), (4094, 2), (255, 2)), pages=256),
         ),
@@ -141,6 +153,18 @@ class QsaPrefillCompress(OpWrapper):
         Cell(
             why="index cache with a head-dim stride of 2",
             spec=_old(((0, 64),), pages=2, layout="head_dim_strided"),
+        ),
+        # Under an NVFP4 KV pool the position page shares each physical page with the index
+        # pages, so both caches are strided views of one allocation: index page stride
+        # 12 x 4096 + 192 = 49344 on the trunk (4288 on the draft), position strides
+        # (24672, 3, 1) (2144, 3, 1).
+        Cell(
+            why="NVFP4 trunk planes: 12 index roles and the position page share each page",
+            spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=12),
+        ),
+        Cell(
+            why="NVFP4 draft planes: one index role and the position page share each page",
+            spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=1),
         ),
         Cell(
             why="every row twice: two rows per anchor in one launch",
@@ -180,7 +204,17 @@ class QsaPrefillCompress(OpWrapper):
     `cos_sin`'s dtype is the rotation's precision: bf16 is accepted and was
     measured 1.4% of elements off by up to 1.56e-2 -- not certified. Text
     rows reduce mRoPE to plain RoPE bit for bit. Plain `@triton.jit`, no
-    autotune; CUDA-graph capturable at a fixed row count.
+    autotune; CUDA-graph capturable at a fixed row count (captured at 128 rows
+    and at 256, 32 MTP7 verify blocks).
+
+    Under an NVFP4 KV pool both caches are strided views of one per-slot
+    allocation (each physical page holds the index roles, then the position
+    page); the cells check the other index roles and the position page
+    untouched.
+
+    The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
+    reference's: every cell is bitwise the reference but the 32-block MTP7 one, where
+    1 of 8192 anchor elements rounds one bf16 step away.
 
     Hard limits (read from the kernel, not probed): positions, requests and
     page ids are widened to int64 before any address arithmetic, so no int32
