@@ -30,12 +30,54 @@ def _write_config(tmp_path, architectures, with_pooling=True):
     return str(tmp_path)
 
 
+def _write_decision_config(tmp_path, **overrides):
+    config = {
+        "attention_mode": "noncausal_full_attention",
+        "pooling": "last",
+        "codes": [f"code_{index}" for index in range(255)],
+        "token_ids": list(range(255)),
+    }
+    config.update(overrides)
+    (tmp_path / "decision_config.json").write_text(json.dumps(config))
+
+
 def test_qwen3_causal_lm_is_remapped_to_text_embedding(tmp_path):
     from tensorrt_llm.commands.serve import _resolve_embedding_architecture_override
 
     model = _write_config(tmp_path, ["Qwen3ForCausalLM"], with_pooling=True)
     override = _resolve_embedding_architecture_override(model, trust_remote_code=False)
     assert override == {"architectures": ["Qwen3ForTextEmbedding"]}
+
+
+def test_pplx_decider_is_remapped_to_decision_model(tmp_path):
+    from tensorrt_llm.commands.serve import _resolve_embedding_architecture_override
+
+    model = _write_config(tmp_path, ["Qwen3_5Model"], with_pooling=False)
+    _write_decision_config(tmp_path)
+
+    override = _resolve_embedding_architecture_override(model, trust_remote_code=False)
+
+    assert override == {"architectures": ["PplxDeciderForDecision"]}
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    [
+        ("attention_mode", "causal"),
+        ("pooling", "mean"),
+        ("codes", ["too_few"]),
+        ("token_ids", [1]),
+    ],
+)
+def test_invalid_pplx_decider_contract_is_left_alone(tmp_path, override, value):
+    from tensorrt_llm.commands.serve import _resolve_embedding_architecture_override
+
+    model = _write_config(tmp_path, ["Qwen3_5Model"], with_pooling=False)
+    _write_decision_config(tmp_path, **{override: value})
+
+    result = _resolve_embedding_architecture_override(model, trust_remote_code=False)
+
+    assert result is None
 
 
 def test_unknown_architecture_is_left_alone(tmp_path):

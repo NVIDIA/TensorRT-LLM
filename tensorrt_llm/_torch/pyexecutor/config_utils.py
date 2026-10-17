@@ -986,6 +986,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
+    model_kwargs = kwargs.get("model_kwargs") or {}
+    requested_architectures = model_kwargs.get("architectures") or architectures
 
     if checkpoint_format in ("mistral", "mistral_large_3"):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
@@ -1022,6 +1024,20 @@ def load_pretrained_config(model_name_or_path: str,
         config_dict.pop("layer_types", None)
         model_config = _CONFIG_REGISTRY[model_type].from_dict(
             config_dict, **kwargs)
+    elif (requested_architectures
+          and requested_architectures[0] == "PplxDeciderForDecision"):
+        # pplx-decider packages a text-only decision model in a composite
+        # Qwen3.5 config. Flatten the nested text config before the generic
+        # Qwen3.5 VLM branches preserve the vision config.
+        from tensorrt_llm._torch.models.modeling_pplx_decider import \
+            PPLX_DECIDER_NUM_LABELS
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            Qwen35ConfigCompat
+        normalized_config = Qwen35ConfigCompat.normalize(
+            config_dict, require_text_config=True)
+        normalized_config["architectures"] = ["PplxDeciderForDecision"]
+        normalized_config["num_labels"] = PPLX_DECIDER_NUM_LABELS
+        model_config = transformers.Qwen3NextConfig.from_dict(normalized_config)
     elif (model_type == "qwen3_5_moe" and
           (("text_config" in config_dict and "vision_config" in config_dict) or
            (architectures
