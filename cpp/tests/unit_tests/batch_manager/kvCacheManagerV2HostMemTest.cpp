@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/exceptions.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
@@ -201,6 +202,127 @@ TEST(KvCacheManagerV2HostMemTest, PrefaultedAllocationSupportsGpuRoundTrip)
     auto const* bytes = reinterpret_cast<unsigned char const*>(memory.address());
     EXPECT_TRUE(std::all_of(bytes, bytes + kSize, [](unsigned char value) { return value == 0x5A; }));
     EXPECT_EQ(cudaFree(devicePtr), cudaSuccess);
+}
+
+bool isRegistered(MemAddress addr)
+{
+    unsigned int flags = 0;
+    bool const registered = cudaHostGetFlags(&flags, reinterpret_cast<void*>(addr)) == cudaSuccess;
+    cudaGetLastError();
+    return registered;
+}
+
+void fillPattern(MemAddress addr, size_t begin, size_t end)
+{
+    auto* bytes = reinterpret_cast<unsigned char*>(addr);
+    for (size_t i = begin; i < end; i += HostMem::kAlignment)
+    {
+        bytes[i] = static_cast<unsigned char>((i / HostMem::kAlignment) * 7 + 1);
+    }
+}
+
+bool checkPattern(MemAddress addr, size_t begin, size_t end)
+{
+    auto const* bytes = reinterpret_cast<unsigned char const*>(addr);
+    for (size_t i = begin; i < end; i += HostMem::kAlignment)
+    {
+        if (bytes[i] != static_cast<unsigned char>((i / HostMem::kAlignment) * 7 + 1))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(KvCacheManagerV2HostMemTest, ReservedResizeKeepsAddressDataAndRegistration)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "2");
+    ScopedEnv delta("TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN", std::nullopt);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kMiB = 1 << 20;
+    HostMem memory(4 * kMiB, /*alignHint=*/HostMem::kAlignment, /*maxSize=*/64 * kMiB);
+    MemAddress const addr = memory.address();
+    fillPattern(addr, 0, 4 * kMiB);
+
+    memory.resize(40 * kMiB);
+    EXPECT_EQ(memory.address(), addr);
+    EXPECT_TRUE(checkPattern(addr, 0, 4 * kMiB));
+    fillPattern(addr, 4 * kMiB, 40 * kMiB);
+    EXPECT_TRUE(isRegistered(addr + 39 * kMiB));
+
+    memory.resize(10 * kMiB);
+    EXPECT_EQ(memory.address(), addr);
+    EXPECT_TRUE(checkPattern(addr, 0, 10 * kMiB));
+    EXPECT_TRUE(isRegistered(addr + 10 * kMiB - HostMem::kAlignment));
+    EXPECT_FALSE(isRegistered(addr + 10 * kMiB));
+
+    memory.resize(64 * kMiB);
+    EXPECT_EQ(memory.address(), addr);
+    EXPECT_TRUE(checkPattern(addr, 0, 10 * kMiB));
+    EXPECT_TRUE(isRegistered(addr + 64 * kMiB - HostMem::kAlignment));
+
+    // Past the reservation: falls back to moving the pages, data survives.
+    fillPattern(addr, 0, 64 * kMiB);
+    memory.resize(96 * kMiB);
+    EXPECT_TRUE(checkPattern(memory.address(), 0, 64 * kMiB));
+    EXPECT_TRUE(isRegistered(memory.address() + 96 * kMiB - HostMem::kAlignment));
+}
+
+TEST(KvCacheManagerV2HostMemTest, ReservedExtentsNeverSplitASlot)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
+    ScopedEnv delta("TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN", std::nullopt);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kSlot = 3 * HostMem::kAlignment + 2048; // 14336, lcm with 4 KiB is 28672
+    auto const bytesFor = [](size_t slots)
+    { return (slots * kSlot + HostMem::kAlignment - 1) / HostMem::kAlignment * HostMem::kAlignment; };
+    HostMem memory(bytesFor(100), kSlot, bytesFor(4000));
+    for (size_t slots : {size_t{1003}, size_t{517}, size_t{2999}, size_t{9}, size_t{4000}})
+    {
+        memory.resize(bytesFor(slots));
+        for (size_t slot = 0; slot < slots; slot += 37)
+        {
+            MemAddress const slotAddr = memory.address() + slot * kSlot;
+            CUdeviceptr start = 0;
+            ASSERT_EQ(cuPointerGetAttribute(&start, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, slotAddr), CUDA_SUCCESS);
+            EXPECT_EQ((start - memory.address()) % kSlot, 0u) << "slots=" << slots << " slot=" << slot;
+            EXPECT_TRUE(isRegistered(slotAddr + kSlot - 1)) << "slots=" << slots << " slot=" << slot;
+        }
+    }
+}
+
+TEST(KvCacheManagerV2HostMemTest, OversizedAlignmentFallsBackToFullRegistration)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
+    ScopedEnv delta("TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN", std::nullopt);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    // lcm(4 KiB, 1 MiB + 1) is ~4 GiB, beyond the 1 GiB extent limit, so this pool cannot use slot-aligned extents.
+    constexpr size_t kMiB = 1 << 20;
+    HostMem memory(4 * kMiB, kMiB + 1, 64 * kMiB);
+    fillPattern(memory.address(), 0, 4 * kMiB);
+    memory.resize(32 * kMiB);
+    EXPECT_TRUE(checkPattern(memory.address(), 0, 4 * kMiB));
+    EXPECT_TRUE(isRegistered(memory.address() + 32 * kMiB - HostMem::kAlignment));
+    memory.resize(8 * kMiB);
+    EXPECT_TRUE(checkPattern(memory.address(), 0, 4 * kMiB));
+    EXPECT_FALSE(isRegistered(memory.address() + 8 * kMiB));
+}
+
+TEST(KvCacheManagerV2HostMemTest, DeltaPinCanBeDisabled)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
+    ScopedEnv delta("TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN", "0");
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kMiB = 1 << 20;
+    HostMem memory(2 * kMiB, HostMem::kAlignment, 64 * kMiB);
+    fillPattern(memory.address(), 0, 2 * kMiB);
+    memory.resize(8 * kMiB);
+    EXPECT_TRUE(checkPattern(memory.address(), 0, 2 * kMiB));
+    EXPECT_TRUE(isRegistered(memory.address() + 8 * kMiB - HostMem::kAlignment));
 }
 
 } // namespace

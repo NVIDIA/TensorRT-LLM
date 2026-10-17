@@ -17,8 +17,10 @@
 
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -29,6 +31,8 @@
 #include <exception>
 #include <fcntl.h>
 #include <mutex>
+#include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -183,9 +187,30 @@ bool HostMem::shouldUseChunkedRegistration()
     return chunked;
 }
 
-HostMem::HostMem(size_t size)
+namespace
+{
+bool hostDeltaPinEnabled()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN");
+    return value == nullptr || std::string_view(value) != "0";
+}
+} // namespace
+
+HostMem::HostMem(size_t size, size_t alignHint, size_t maxSize)
     : mUseThp(hostUseThp())
 {
+    size_t const regAlign = std::lcm(kAlignment, std::max<size_t>(alignHint, 1));
+    if (maxSize != 0 && regAlign <= kMaxExtentSize && hostDeltaPinEnabled())
+    {
+        mRegAlign = regAlign;
+        mMaxExtent = kMaxExtentSize / regAlign * regAlign;
+        if (initReserved(size, std::max(maxSize, size)))
+        {
+            return;
+        }
+        mRegAlign = kAlignment;
+        mMaxExtent = kMaxExtentSize;
+    }
     if (size == 0)
     {
         return;
@@ -220,6 +245,11 @@ HostMem::~HostMem()
 
 void HostMem::resize(size_t newSize)
 {
+    if (reserved())
+    {
+        resizeReserved(newSize);
+        return;
+    }
     unregisterFromCuda();
     try
     {
@@ -242,6 +272,15 @@ void HostMem::destroy()
     {
         return;
     }
+    if (reserved())
+    {
+        unregisterAllExtents();
+        hostMunmap(mAddr, mReserved);
+        mAddr = 0;
+        mSize = 0;
+        mReserved = 0;
+        return;
+    }
     unregisterFromCuda();
     hostMunmap(mAddr, mSize);
     mAddr = 0;
@@ -256,7 +295,17 @@ void HostMem::madvisePageMode()
 
 void HostMem::parallelPrefault(int numThreads)
 {
-    size_t const numChunks = (mSize + kPrefaultChunkSize - 1) / kPrefaultChunkSize;
+    parallelPrefaultRange(0, mSize, numThreads);
+}
+
+void HostMem::parallelPrefaultRange(size_t begin, size_t end, int numThreads)
+{
+    if (end <= begin || numThreads <= 0)
+    {
+        return;
+    }
+    size_t const rangeSize = end - begin;
+    size_t const numChunks = (rangeSize + kPrefaultChunkSize - 1) / kPrefaultChunkSize;
     int const workerCount = std::min<int>(numThreads, static_cast<int>(numChunks));
     std::atomic_size_t nextChunk{0};
     std::atomic_bool failed{false};
@@ -272,8 +321,8 @@ void HostMem::parallelPrefault(int numThreads)
             {
                 return;
             }
-            size_t const offset = chunkIndex * kPrefaultChunkSize;
-            size_t const chunkSize = std::min(kPrefaultChunkSize, mSize - offset);
+            size_t const offset = begin + chunkIndex * kPrefaultChunkSize;
+            size_t const chunkSize = std::min(kPrefaultChunkSize, end - offset);
             try
             {
                 hostPrefaultChunk(mAddr + offset, chunkSize);
@@ -333,6 +382,215 @@ void HostMem::unregisterFromCuda()
         --mNumRegisteredChunks;
     }
     TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Reserved-address-space mode: the buffer never moves, so CUDA registrations stay valid across resizes and only
+// the changed range is pinned or unpinned. The copy-engine path needs every per-page copy inside one registered
+// region; extents are cut only at multiples of mRegAlign (a multiple of the slot size), so no slot straddles two.
+// ---------------------------------------------------------------------------
+
+bool HostMem::initReserved(size_t size, size_t maxSize)
+{
+    size_t const reserve = roundUp(std::max(maxSize, kAlignment), kAlignment);
+    void* ptr = ::mmap(nullptr, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (ptr == MAP_FAILED || ptr == nullptr)
+    {
+        // Address space can be limited (RLIMIT_AS); the mremap mode needs only the committed size.
+        TLLM_LOG_WARNING(
+            "HostMem: cannot reserve %zu bytes of address space (%s); resizing will re-register the "
+            "whole buffer",
+            reserve, std::strerror(errno));
+        return false;
+    }
+    mAddr = reinterpret_cast<MemAddress>(ptr);
+    mReserved = reserve;
+    mSize = 0;
+    try
+    {
+        resizeReserved(size);
+    }
+    catch (...)
+    {
+        unregisterAllExtents();
+        hostMunmap(mAddr, mReserved);
+        mAddr = 0;
+        mSize = 0;
+        mReserved = 0;
+        throw;
+    }
+    return true;
+}
+
+void HostMem::commitRange(size_t begin, size_t end)
+{
+    if (end <= begin)
+    {
+        return;
+    }
+    void* addr = reinterpret_cast<void*>(mAddr + begin);
+    if (::mprotect(addr, end - begin, PROT_READ | PROT_WRITE) != 0)
+    {
+        throw HostOOMError(std::string("mprotect failed: ") + std::strerror(errno));
+    }
+    try
+    {
+        hostMadvisePageMode(mAddr + begin, end - begin, mUseThp);
+        parallelPrefaultRange(begin, end, hostPrefaultThreads());
+    }
+    catch (...)
+    {
+        releaseRange(begin, end);
+        throw;
+    }
+}
+
+void HostMem::releaseRange(size_t begin, size_t end) noexcept
+{
+    if (end <= begin)
+    {
+        return;
+    }
+    // Replacing the range with a fresh PROT_NONE mapping frees its pages and keeps the address space reserved.
+    void* ptr = ::mmap(reinterpret_cast<void*>(mAddr + begin), end - begin, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (ptr == MAP_FAILED)
+    {
+        std::fprintf(stderr, "HostMem: releasing [%zu, %zu) failed with errno %d\n", begin, end, errno);
+    }
+}
+
+void HostMem::registerRange(size_t begin, size_t end)
+{
+    TLLM_CHECK_DEBUG(begin % mRegAlign == 0);
+    size_t const alignedEnd = end / mRegAlign * mRegAlign;
+    size_t cur = begin;
+    while (cur < end)
+    {
+        size_t next = std::min(end, cur + mMaxExtent);
+        if (next == end && alignedEnd > cur && alignedEnd < end)
+        {
+            next = alignedEnd; // keep the unaligned tail as its own small extent
+        }
+        CUresult const res = cuMemHostRegister(reinterpret_cast<void*>(mAddr + cur), next - cur,
+            CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
+        cuCheck(res);
+        mExtents.emplace_back(cur, next);
+        cur = next;
+    }
+}
+
+void HostMem::unregisterAfter(size_t offset)
+{
+    // Drop every extent that reaches past offset. One that straddles it is re-registered up to offset; because its
+    // start is a multiple of mRegAlign that keeps the boundary invariant, and it costs at most one extent.
+    std::optional<size_t> reRegisterFrom;
+    while (!mExtents.empty() && mExtents.back().second > offset)
+    {
+        auto const [b, e] = mExtents.back();
+        cuCheck(cuMemHostUnregister(reinterpret_cast<void*>(mAddr + b)));
+        mExtents.pop_back();
+        if (b < offset)
+        {
+            reRegisterFrom = b;
+        }
+    }
+    if (reRegisterFrom.has_value())
+    {
+        registerRange(*reRegisterFrom, offset);
+    }
+}
+
+void HostMem::unregisterAllExtents() noexcept
+{
+    while (!mExtents.empty())
+    {
+        cuMemHostUnregister(reinterpret_cast<void*>(mAddr + mExtents.back().first));
+        mExtents.pop_back();
+    }
+}
+
+void HostMem::resizeReserved(size_t newSize)
+{
+    TLLM_CHECK_DEBUG(newSize % kAlignment == 0);
+    size_t const oldSize = mSize;
+    if (newSize == oldSize)
+    {
+        return;
+    }
+    if (newSize > mReserved)
+    {
+        // Out of reserved address space: move the committed pages into a larger reservation. mremap moves page
+        // tables, not data, but the new address invalidates every registration, so this costs a full re-pin.
+        size_t const reserve = roundUp(newSize, kAlignment);
+        void* fresh = ::mmap(nullptr, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (fresh == MAP_FAILED || fresh == nullptr)
+        {
+            throw HostOOMError(std::string("mmap reserve failed: ") + std::strerror(errno));
+        }
+        unregisterAllExtents();
+        if (oldSize > 0)
+        {
+            void* moved
+                = ::mremap(reinterpret_cast<void*>(mAddr), oldSize, oldSize, MREMAP_MAYMOVE | MREMAP_FIXED, fresh);
+            if (moved == MAP_FAILED)
+            {
+                int const err = errno;
+                hostMunmap(reinterpret_cast<MemAddress>(fresh), reserve);
+                registerRange(0, oldSize);
+                throw HostOOMError(std::string("mremap failed: ") + std::strerror(err));
+            }
+        }
+        if (mReserved > oldSize)
+        {
+            hostMunmap(mAddr + oldSize, mReserved - oldSize);
+        }
+        mAddr = reinterpret_cast<MemAddress>(fresh);
+        mReserved = reserve;
+        try
+        {
+            commitRange(oldSize, newSize);
+            registerRange(0, newSize);
+        }
+        catch (...)
+        {
+            // The data now lives at the new address; restore the old size there.
+            unregisterAllExtents();
+            releaseRange(oldSize, newSize);
+            registerRange(0, oldSize);
+            throw;
+        }
+        mSize = newSize;
+        return;
+    }
+    if (newSize > oldSize)
+    {
+        commitRange(oldSize, newSize);
+        // Re-register only the unaligned tail extent (shorter than mRegAlign) together with the new range.
+        size_t regStart = oldSize;
+        if (!mExtents.empty() && mExtents.back().second % mRegAlign != 0)
+        {
+            regStart = mExtents.back().first;
+            cuCheck(cuMemHostUnregister(reinterpret_cast<void*>(mAddr + regStart)));
+            mExtents.pop_back();
+        }
+        try
+        {
+            registerRange(regStart, newSize);
+        }
+        catch (...)
+        {
+            unregisterAfter(regStart);
+            registerRange(regStart, oldSize);
+            releaseRange(oldSize, newSize);
+            throw;
+        }
+        mSize = newSize;
+        return;
+    }
+    unregisterAfter(newSize);
+    releaseRange(newSize, oldSize);
+    mSize = newSize;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
