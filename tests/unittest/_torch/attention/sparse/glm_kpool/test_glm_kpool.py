@@ -421,6 +421,196 @@ def test_metadata_prepare_rejects_non_glm_cache_manager():
     manager.get_batch_slot_tables.assert_not_called()
 
 
+def _metadata_with_target_tables(target: torch.Tensor) -> Glm5NextMamba2Metadata:
+    """Construct GLM metadata with a prepared target table."""
+    prepared = object.__new__(Glm5NextMamba2Metadata)
+    prepared.glm_block_tables = target.clone()
+    prepared._glm_block_tables_cpu = target.clone()
+    prepared._glm_draft_block_tables = None
+    prepared._glm_draft_block_tables_cpu = None
+    return prepared
+
+
+def _draft_attention_metadata(prepared: Glm5NextMamba2Metadata, manager: object) -> SimpleNamespace:
+    """Provide the current request rows used by draft-table preparation."""
+    batch = prepared.glm_block_tables.shape[0]
+    return SimpleNamespace(
+        kv_cache_manager=manager,
+        mamba_metadata=prepared,
+        request_ids=list(range(11, 11 + batch)),
+        seq_lens=torch.ones(batch, dtype=torch.int32),
+    )
+
+
+def test_draft_forward_reads_the_draft_manager_slot_tables() -> None:
+    """Draft forwards refresh their own persistent buffer and preserve the target."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+        Glm5NextCacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    target = torch.tensor([[7, 8, 9, 0], [3, 4, 0, 0], [5, 0, 0, 0]])
+    prepared = _metadata_with_target_tables(target)
+    target_buffer = prepared.glm_block_tables
+    # The draft manager allocates on its own: other slot ids for the same requests.
+    draft_manager = Mock(spec=Glm5NextCacheManager)
+    draft_manager.get_batch_slot_tables.return_value = [[1, 2, 6], [0]]
+    attn_metadata = SimpleNamespace(
+        kv_cache_manager=draft_manager,
+        mamba_metadata=prepared,
+        request_ids=[11, 12],
+        seq_lens=torch.tensor([1, 1]),
+    )
+
+    saved = TrtllmAttentionMetadata.prepare_for_draft_forward(attn_metadata)
+
+    draft_manager.get_batch_slot_tables.assert_called_once_with([11, 12])
+    assert prepared.glm_block_tables is not target_buffer
+    assert prepared.glm_block_tables[:2].tolist() == [[1, 2, 6, 0], [0, 0, 0, 0]]
+    assert target_buffer.tolist() == target.tolist()
+
+    TrtllmAttentionMetadata.restore_after_draft_forward(attn_metadata, saved)
+
+    assert prepared.glm_block_tables is target_buffer
+
+    # A second draft forward reuses the draft buffer and drops the old rows.
+    draft_buffer = prepared._glm_draft_block_tables
+    draft_manager.get_batch_slot_tables.return_value = [[4], [2, 3]]
+    saved = TrtllmAttentionMetadata.prepare_for_draft_forward(attn_metadata)
+    assert prepared.glm_block_tables is draft_buffer
+    assert prepared.glm_block_tables[:2].tolist() == [[4, 0, 0, 0], [2, 3, 0, 0]]
+    TrtllmAttentionMetadata.restore_after_draft_forward(attn_metadata, saved)
+
+
+def test_draft_forward_keeps_the_tables_without_a_glm_draft_manager() -> None:
+    """Models without a separate GLM manager leave the target view unchanged."""
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    target = torch.tensor([[7, 8, 9, 0]])
+    prepared = _metadata_with_target_tables(target)
+    target_buffer = prepared.glm_block_tables
+    attn_metadata = SimpleNamespace(
+        kv_cache_manager=object(),
+        mamba_metadata=prepared,
+        request_ids=[11],
+        seq_lens=torch.tensor([1]),
+    )
+
+    saved = TrtllmAttentionMetadata.prepare_for_draft_forward(attn_metadata)
+
+    assert saved is None
+    assert prepared.glm_block_tables is target_buffer
+    TrtllmAttentionMetadata.restore_after_draft_forward(attn_metadata, saved)
+    assert prepared.glm_block_tables is target_buffer
+    # Metadata of models without recurrent state has no hook to call.
+    plain = SimpleNamespace(mamba_metadata=None)
+    assert TrtllmAttentionMetadata.prepare_for_draft_forward(plain) is None
+    TrtllmAttentionMetadata.restore_after_draft_forward(plain, None)
+
+
+@pytest.mark.parametrize("failure", ["lookup", "staging", "copy"])
+def test_draft_preparation_failure_preserves_target_tables(failure: str) -> None:
+    """Failed preparation leaves the target binding usable and supports a retry."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+        Glm5NextCacheManager,
+    )
+
+    target = torch.tensor([[7, 8, 0]])
+    prepared = _metadata_with_target_tables(target)
+    target_buffer = prepared.glm_block_tables
+    manager = Mock(spec=Glm5NextCacheManager)
+    manager.get_batch_slot_tables.return_value = [[1, 2]]
+    metadata = _draft_attention_metadata(prepared, manager)
+    saved = prepared.prepare_for_draft_forward(metadata)
+    prepared.restore_after_draft_forward(metadata, saved)
+    draft_buffer = prepared._glm_draft_block_tables
+    original_copy = torch.Tensor.copy_
+
+    def copy_with_failure(
+        tensor: torch.Tensor, source: torch.Tensor, non_blocking: bool = False
+    ) -> torch.Tensor:
+        """Fail the device-table copy while allowing host staging to complete."""
+        if tensor.data_ptr() == draft_buffer.data_ptr():
+            raise RuntimeError("draft table preparation failed")
+        return original_copy(tensor, source, non_blocking=non_blocking)
+
+    patches = {
+        "lookup": patch.object(
+            manager,
+            "get_batch_slot_tables",
+            side_effect=RuntimeError("draft table preparation failed"),
+        ),
+        "staging": patch(
+            "tensorrt_llm._torch.attention.backends.sparse.glm_kpool.metadata.torch.as_tensor",
+            side_effect=RuntimeError("draft table preparation failed"),
+        ),
+        "copy": patch.object(torch.Tensor, "copy_", copy_with_failure),
+    }
+    with patches[failure], pytest.raises(RuntimeError, match="draft table preparation failed"):
+        prepared.prepare_for_draft_forward(metadata)
+
+    assert prepared.glm_block_tables is target_buffer
+    torch.testing.assert_close(target_buffer, target)
+    saved = prepared.prepare_for_draft_forward(metadata)
+    assert prepared.glm_block_tables is draft_buffer
+    prepared.restore_after_draft_forward(metadata, saved)
+    assert prepared.glm_block_tables is target_buffer
+
+
+def test_draft_table_allocation_failure_can_retry() -> None:
+    """Publish the persistent draft buffers only after both allocations succeed."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+        Glm5NextCacheManager,
+    )
+
+    prepared = _metadata_with_target_tables(torch.tensor([[7, 8, 0]]))
+    target_buffer = prepared.glm_block_tables
+    manager = Mock(spec=Glm5NextCacheManager)
+    manager.get_batch_slot_tables.return_value = [[1, 2]]
+    metadata = _draft_attention_metadata(prepared, manager)
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.glm_kpool.metadata.torch.zeros",
+            side_effect=RuntimeError("draft staging allocation failed"),
+        ),
+        pytest.raises(RuntimeError, match="draft staging allocation failed"),
+    ):
+        prepared.prepare_for_draft_forward(metadata)
+
+    assert prepared.glm_block_tables is target_buffer
+    assert prepared._glm_draft_block_tables is None
+    assert prepared._glm_draft_block_tables_cpu is None
+    saved = prepared.prepare_for_draft_forward(metadata)
+    prepared.restore_after_draft_forward(metadata, saved)
+    assert prepared.glm_block_tables is target_buffer
+
+
+@pytest.mark.parametrize("oversized_row", [0, 1])
+def test_draft_preparation_rejects_oversized_slot_rows(oversized_row: int) -> None:
+    """Reject a too-wide row before publishing or overwriting the draft device table."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+        Glm5NextCacheManager,
+    )
+
+    prepared = _metadata_with_target_tables(torch.tensor([[7, 8], [3, 4]]))
+    target_buffer = prepared.glm_block_tables
+    manager = Mock(spec=Glm5NextCacheManager)
+    manager.get_batch_slot_tables.return_value = [[1], [2]]
+    metadata = _draft_attention_metadata(prepared, manager)
+    saved = prepared.prepare_for_draft_forward(metadata)
+    prepared.restore_after_draft_forward(metadata, saved)
+    previous_draft = prepared._glm_draft_block_tables.clone()
+    rows = [[5], [6]]
+    rows[oversized_row] = [1, 2, 3]
+    manager.get_batch_slot_tables.return_value = rows
+
+    with pytest.raises(RuntimeError, match="draft slot-table row.*3 pages.*width 2"):
+        prepared.prepare_for_draft_forward(metadata)
+
+    assert prepared.glm_block_tables is target_buffer
+    torch.testing.assert_close(prepared._glm_draft_block_tables, previous_draft)
+
+
 @pytest.mark.parametrize("heads", [16, 64])
 def test_backend_output_keeps_flat_contract_without_copy(heads):
     storage = torch.randn(3, 64, 512)
