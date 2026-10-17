@@ -290,7 +290,6 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // As before, syncTransfers() must be called after the last call to KVCacheManager::addSequenceBatch.
 // Failing to do so will lead to corrupted blocks eventually.
 //
-
 void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr const& block,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -420,6 +419,14 @@ void KVCacheTransferManager::syncTransfers()
     // Once we synchronize, clear our list of pending transfers.
     mPendingReads.clear();
     mPendingWrites.clear();
+}
+
+void KVCacheTransferManager::syncOnboardToBufferManager(tr::BufferManager const& bufferManager)
+{
+    tr::CudaEvent onboardEvent;
+    mOnboardManager.getStream().record(onboardEvent);
+    bufferManager.getStream().wait(onboardEvent);
+    onboardEvent.synchronize();
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
