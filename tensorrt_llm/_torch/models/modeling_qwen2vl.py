@@ -31,8 +31,10 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalEncoderItemMetadata,
+                                            MultimodalItemMetadata,
+                                            MultimodalItemPartition,
                                             MultimodalParams)
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -382,6 +384,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                multimodal_data, mm_item_order)
+        if metadata is not None:
+            for modality in ("image", "video"):
+                if isinstance(multimodal_data.get(modality), dict):
+                    metadata.input_partitions[
+                        modality] = _qwen_vision_input_partitions(
+                            multimodal_data, modality, metadata)
+        return metadata
 
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
@@ -2153,8 +2171,61 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states
 
 
+_QWEN_VISION_BATCHED_FIELD = MultimodalItemPartition()
+
+
+def _qwen_vision_item_partitions(
+    param: MultimodalParams,
+    modality: str,
+) -> dict[str, MultimodalItemPartition] | None:
+    if modality not in ("image", "video"):
+        return None
+    metadata = param.item_metadata
+    if metadata is not None and modality in metadata.input_partitions:
+        return metadata.input_partitions[modality]
+    grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+    grids = param.multimodal_data[modality][grid_key]
+    return _qwen_vision_input_partitions(
+        param.multimodal_data, modality,
+        metadata if grids.device.type != "cpu" else None)
+
+
+def _qwen_vision_input_partitions(
+    multimodal_data: dict[str, Any],
+    modality: str,
+    metadata: MultimodalItemMetadata | None,
+) -> dict[str, MultimodalItemPartition]:
+    """Declare patch packing once on the producer, with a legacy fallback."""
+    pixel_key, grid_key = (("pixel_values",
+                            "image_grid_thw") if modality == "image" else
+                           ("pixel_values_videos", "video_grid_thw"))
+    grids = multimodal_data[modality][grid_key]
+    if metadata is not None and metadata.encoder_token_lengths is not None:
+        costs = {
+            index: cost
+            for (item_modality, index), cost in zip(
+                metadata.item_refs, metadata.encoder_token_lengths, strict=True)
+            if item_modality == modality
+        }
+        patch_counts = tuple(costs[i] for i in range(grids.shape[0]))
+    else:
+        patch_counts = tuple(t * h * w for t, h, w in grids.tolist())
+    return {
+        pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
+        grid_key: _QWEN_VISION_BATCHED_FIELD,
+        "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+    }
+
+
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supports_mm_encoder_item_scheduling = True
+
+    def get_multimodal_item_partitions(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
 
     def __init__(
         self,
