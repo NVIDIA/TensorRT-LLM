@@ -1534,9 +1534,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
 
-        The draft pool mirrors the target pool (same requests, same block
-        boundaries, same ``tokens_per_block``), so a draft-side failure just
-        means this request does not fit. Roll the target growth back and report
+        The draft pool mirrors the target pool's requests and token counts (a
+        standalone drafter's pool may use its own ``tokens_per_block``), so a
+        draft-side failure just means this request does not fit. Roll the target growth back and report
         a plain allocation failure, letting the caller run the same evict /
         recompute-pause / self-suspend ladder it uses for target-pool pressure.
 
