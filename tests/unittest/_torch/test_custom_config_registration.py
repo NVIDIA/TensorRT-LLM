@@ -222,6 +222,33 @@ def test_nemotron_h_dense_pattern_survives_autoconfig(tmp_path):
     assert cfg.num_nextn_predict_layers == 0
 
 
+@pytest.mark.parametrize(
+    "declared, expected",
+    [(None, "bfloat16"), ("float32", "float32")],
+    ids=["undeclared", "declared_fp32"],
+)
+def test_nemotron_h_dense_ssm_cache_dtype(tmp_path, declared, expected):
+    # Dense Nemotron-H checkpoints (e.g. NVIDIA-Nemotron-Nano-12B-v2) do not
+    # declare mamba_ssm_cache_dtype, so kv_cache_config.mamba_ssm_cache_dtype
+    # "auto" must resolve to the checkpoint dtype. An fp32 default here doubles
+    # the recurrent-state cache and no longer fits max_batch_size=512 on H100.
+    # A checkpoint-declared value still wins.
+    import torch
+
+    from tensorrt_llm._torch.configs import NemotronHConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import resolve_auto_ssm_cache_dtype
+
+    config_dict = {**_nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN), "torch_dtype": "bfloat16"}
+    if declared is not None:
+        config_dict["mamba_ssm_cache_dtype"] = declared
+
+    cfg = AutoConfig.from_pretrained(_write_config(tmp_path, "nemotron_h", config_dict))
+
+    assert isinstance(cfg, NemotronHConfig)
+    assert cfg.mamba_ssm_cache_dtype == declared
+    assert resolve_auto_ssm_cache_dtype(cfg, torch.float16) == getattr(torch, expected)
+
+
 def test_nemotron_h_representable_pattern_uses_native_config(tmp_path):
     # Patterns the installed transformers can express must keep loading through
     # the native class, so this shim cannot regress checkpoints that work today.
