@@ -1338,7 +1338,7 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 "<parameter=param2>41.9</parameter>\n"
                 "<parameter=param3>42</parameter>\n"
                 "<parameter=param4>true</parameter>\n"
-                "<parameter=param5>{\"key\": \"value\"}</parameter>\n"
+                "<parameter=param5>{'key': 'value'}</parameter>\n"
                 "<parameter=param6>[1, 2, 3]</parameter>\n"
                 "<parameter=param7>null</parameter>\n"
                 "<parameter=param8>{'arg1': 3, 'arg2': [1, 2]}</parameter>\n"
@@ -1359,10 +1359,7 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             },
             "param6": [1, 2, 3],
             "param7": None,
-            "param8": {
-                "arg1": 3,
-                "arg2": [1, 2]
-            }
+            "param8": "{'arg1': 3, 'arg2': [1, 2]}"
         }
 
     def test_parse_anyof_parameter_type_conversion(self, parser):
@@ -1485,6 +1482,74 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         params = json.loads(result.calls[0].parameters)
         assert params["value"] is None
+
+    @pytest.mark.parametrize("streaming", [False, True],
+                             ids=["non_streaming", "streaming"])
+    def test_parse_preserves_string_and_null_types(self,
+                                                   parser: Qwen3CoderToolParser,
+                                                   streaming: bool) -> None:
+        """Preserve string values while converting permitted nulls."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_values",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "literal_none": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "literal_null": {
+                            "type": "string"
+                        },
+                        "nullable_null": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "nullable_integer": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+        chunks = [
+            "<tool_call>\n",
+            "<function=set_values>\n",
+            "<parameter=literal_none>None</parameter>\n",
+            "<parameter=literal_null>null</parameter>\n",
+            "<parameter=nullable_null>null</parameter>\n",
+            "<parameter=nullable_integer>None</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+        if streaming:
+            calls = []
+            for chunk in chunks:
+                calls.extend(
+                    parser.parse_streaming_increment(chunk, [tool_def]).calls)
+        else:
+            calls = parser.detect_and_parse("".join(chunks), [tool_def]).calls
+
+        assert [call.name for call in calls if call.name] == ["set_values"]
+        parameters = "".join(call.parameters for call in calls
+                             if call.parameters)
+        assert json.loads(parameters) == {
+            "literal_none": "None",
+            "literal_null": "null",
+            "nullable_null": None,
+            "nullable_integer": None,
+        }
 
     def test_qwen3_coder_format_compliance(
         self,
