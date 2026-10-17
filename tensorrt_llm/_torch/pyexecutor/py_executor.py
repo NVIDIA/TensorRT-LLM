@@ -1130,12 +1130,6 @@ class PyExecutor:
                 if self.draft_model_engine is not None:
                     self.draft_model_engine.warmup(self.resource_manager)
                 self._initialize_remote_tail_adp()
-                # Engine warmup never calls sample_async, so lazily-JIT'd sampling
-                # ops (torch.compile'd logprobs fusions, stop-word kernels) would
-                # otherwise compile inside the first real batch as an SPMD
-                # lock-step stall. Runs on all ranks; happens before
-                # async_worker_start, so no worker interaction.
-                self.sampler.warmup(self.model_engine)
 
             # Ensure the default stream waits for execution_stream to complete
             # before subsequent operations.
