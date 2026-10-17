@@ -1217,12 +1217,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         described by the kv lengths and the KV block table: this class itself
         (the sparse-attention subclasses keep per-step state in their own
         ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
-        domains / flash-MLA / MLA cached-kv prefill handling, no Mamba metadata
-        (hybrid models keep the regular ``prepare()``), and a KV cache manager
-        with a known block size.
+        domains / flash-MLA / MLA cached-kv prefill handling, and a KV cache
+        manager with a known block size.
         """
         return (type(self) is TrtllmAttentionMetadata
-                and not self.mamba_metadata and self.fp4_mla_state is None
+                and self.fp4_mla_state is None
                 and self.kv_cache_manager is not None and getattr(
                     self.kv_cache_manager, 'tokens_per_block', None) is not None
                 and not self.enable_helix and not self.has_cross_sub_metadata
@@ -1246,8 +1245,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         H2D copy). The KV block table is re-staged only when the caller saw a
         real request start a new block (``refresh_block_offsets``); otherwise
         the previously staged prefix still covers every block the kernels
-        read.
+        read. The Mamba metadata, if any, skips its state-index staging the
+        same way.
         """
+        if self.mamba_metadata:
+            self.mamba_metadata.prepare_steady_gen_step(self)
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
