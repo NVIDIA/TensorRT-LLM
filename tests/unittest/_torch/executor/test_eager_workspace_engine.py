@@ -7,7 +7,7 @@ import weakref
 from contextlib import ExitStack
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -173,12 +173,13 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine._config = SimpleNamespace(
             is_spec_decode=False, torch_compile_prefill_only=False
         )
+        self.engine._moe_workspace_reclaimer = None
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
         self.engine._torch_compile_backend = None
         self.engine.breakable_cuda_graph_runner = None
-        self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
+        self.metadata._num_tokens = 128
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
         self.engine.attn_metadata = self.metadata
         self.engine.model = SimpleNamespace(
@@ -226,6 +227,74 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.assertEqual(self.call(), 42)
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
+
+    def test_runner_warmup_preserves_moe_owner_on_success_and_failure(self) -> None:
+        self.engine.kv_cache_manager_key = object()
+        self.engine._metrics = {}
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = None
+        with (
+            patch(f"{_RUNNER_MODULE}.CutlassWorkspaceReclaimer") as factory,
+            patch(f"{_RUNNER_MODULE}.warmup_sampling_module") as sampling,
+            patch.object(self.engine, "_prewarm_engram_kernels"),
+            patch.object(self.engine, "_prewarm_csa2_sparse_indexer"),
+            patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "1"}),
+        ):
+            factory.side_effect = Mock
+            self.engine._initialize_moe_workspace_reclaimer()
+            owner = self.engine._moe_workspace_reclaimer
+            for fail in (False, False, True):
+                with self.subTest(fail=fail):
+                    self.engine._warmup_timer = MagicMock()
+                    sampling.side_effect = RuntimeError("warmup failed") if fail else None
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+                            self.engine.warmup(resource_manager)
+                    else:
+                        self.engine.warmup(resource_manager)
+                    self.assertIs(self.engine._moe_workspace_reclaimer, owner)
+                    self.engine._warmup_timer.__exit__.assert_called_once()
+            factory.assert_called_once()
+
+    def test_moe_scope_tracks_warmup_profiling_and_serving(self) -> None:
+        reclaimer = Mock()
+        reclaimer.forward.side_effect = lambda **kwargs: ExitStack()
+        self.engine._moe_workspace_reclaimer = reclaimer
+        # Dummy forwards include the KV-capacity profiling pass between warmups.
+        for is_dummy in (True, True, True, False):
+            with self.subTest(is_dummy=is_dummy):
+                self.assertEqual(self.call(is_dummy=is_dummy), 42)
+                reclaimer.forward.assert_called_once_with(warmup=is_dummy, num_tokens=128)
+                reclaimer.reset_mock()
+
+    def test_moe_reclamation_eligibility_and_escape_hatch(self) -> None:
+        with (
+            patch.object(self.engine, "_eager_workspace_reclaim_supported", True),
+            patch(f"{_RUNNER_MODULE}.CutlassWorkspaceReclaimer") as factory,
+        ):
+            for flag, expected in [("0", False), ("1", True)]:
+                with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": flag}):
+                    self.engine._initialize_moe_workspace_reclaimer()
+                    self.assertEqual(self.engine._moe_workspace_reclaimer is not None, expected)
+                    self.freeze()
+                    self.assertEqual(self.engine._eager_workspace_reclaimer is not None, expected)
+                    if not expected:
+                        for warmup in (True, False):
+                            self.assertEqual(self.call(is_dummy=warmup), 42)
+                        factory.assert_not_called()
+                        self.reclaimer_class.assert_not_called()
+            factory.assert_called_once()
+            for target, name, value in [
+                (self.engine._config, "is_spec_decode", True),
+                (self.engine.mapping, "cp_size", 2),
+                (self.engine, "_eager_workspace_reclaim_supported", False),
+                (self.engine, "_torch_compile_backend", object()),
+                (self.engine, "breakable_cuda_graph_runner", object()),
+            ]:
+                with patch.object(target, name, value):
+                    self.engine._initialize_moe_workspace_reclaimer()
+                    self.assertIsNone(self.engine._moe_workspace_reclaimer)
+            factory.assert_called_once()
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
         with patch.object(self.engine, "_eager_workspace_reclaim_supported", False):

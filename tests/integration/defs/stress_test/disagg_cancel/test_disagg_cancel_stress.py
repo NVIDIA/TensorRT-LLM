@@ -33,6 +33,8 @@ from typing import Any
 
 import pytest
 
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
+
 from .harness import DisaggCancellationStressHarness, StressConfig
 
 _CONFIG_DIR = Path(__file__).parent / "configs"
@@ -42,6 +44,18 @@ _CONFIG_DIR = Path(__file__).parent / "configs"
 _MARATHON_CONFIGS: list[str] = [
     "marathon_cpp_v1_deepseek.yaml",
 ]
+
+# ``trtllm-llmapi-launch`` exports these so an LLM created in the pytest process
+# binds to the launcher's single pre-spawned MPI leader. The marathon creates
+# no LLM in-process: every ``trtllm-serve`` it launches inherits this process's
+# environment and must start its own MPI session. That leader serves only one
+# client, so with these set all but one worker block waiting for executor
+# workers that never come up.
+_LAUNCHER_SPAWN_PROXY_ENV_NAMES = (
+    LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS,
+    LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR,
+    LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY,
+)
 
 
 def test_all_marathon_yamls_parse_and_validate() -> None:
@@ -60,13 +74,17 @@ def test_all_marathon_yamls_parse_and_validate() -> None:
 
 
 @pytest.mark.parametrize("config_filename", _MARATHON_CONFIGS)
-def test_disagg_cancellation_marathon(config_filename: str) -> None:
+def test_disagg_cancellation_marathon(
+    config_filename: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Drive the configured disagg stress mode and assert current pass criteria."""
     config_path = _CONFIG_DIR / config_filename
     assert config_path.exists(), (
         f"Marathon config not found: {config_path}. "
         "Did you regenerate the symlinks or rename the YAML?"
     )
+    for name in _LAUNCHER_SPAWN_PROXY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
 
     harness = DisaggCancellationStressHarness(config_path)
     try:
