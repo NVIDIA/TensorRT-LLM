@@ -975,7 +975,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     request = SimpleNamespace(
         py_request_id=7,
         lora_task_id=3,
-        cache_salt=11,
+        cache_salt="11",
         is_dummy=False,
         return_perf_metrics=False,
         prompt_len=8,

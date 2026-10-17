@@ -25,7 +25,11 @@ from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBloc
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
-from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    KVCacheEventManager,
+    ReuseScope,
+    sequence_to_blockchain_keys,
+)
 from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
     tokenize_chat_request_for_serving,
@@ -309,15 +313,18 @@ class BlockHashMixin:
         self,
         token_lists: list[list[int]],
         hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT,
-        cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
     ) -> list[list[BlockHash]]:
         if hash_algo == KV_CACHE_HASH_ALGO_V1:
             block_hasher = block_key_hasher
+            cache_salt_id = (
+                None if cache_salt is None else KVCacheEventManager._hash_cache_salt(cache_salt)
+            )
         elif hash_algo in (KV_CACHE_HASH_ALGO_V2, KV_CACHE_HASH_ALGO_V2_SHA256_64):
             # V2 keys chain from a reuse-scope root, which is exactly what
             # sequence_to_blockchain_keys yields; its first pair is the root itself, so
             # skip it. In KvCacheManager the last token is not part of any block key.
-            reuse_scope = ReuseScope(salt=cache_salt_id)
+            reuse_scope = ReuseScope(salt=cache_salt)
             to_hash = truncate_sha256_hash_to_int64
             if hash_algo == KV_CACHE_HASH_ALGO_V2:
 
@@ -366,24 +373,22 @@ class BlockHashMixin:
     def _tokenize_and_compute_block_hashes_with_salt(
         self,
         request: OpenAIRequest,
-        cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
     ) -> tuple[list[list[int]], list[list[int]]]:
         token_lists = self._tokenize(request)
-        block_hashes = self._compute_block_hashes(token_lists, cache_salt_id=cache_salt_id)
+        block_hashes = self._compute_block_hashes(token_lists, cache_salt=cache_salt)
         return token_lists, block_hashes
 
     def _tokenize_and_compute_block_hashes_by_algo(
         self,
         request: OpenAIRequest,
         hash_algos: Iterable[str],
-        cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
     ) -> tuple[list[list[int]], dict[str, list[list[BlockHash]]]]:
         """Synchronous tokenize + per-algorithm block hashes for thread offload."""
         token_lists = self._tokenize(request)
         return token_lists, {
-            hash_algo: self._compute_block_hashes(
-                token_lists, hash_algo, cache_salt_id=cache_salt_id
-            )
+            hash_algo: self._compute_block_hashes(token_lists, hash_algo, cache_salt=cache_salt)
             for hash_algo in set(hash_algos)
         }
 
@@ -396,6 +401,5 @@ class BlockHashMixin:
         return [[ord(c) for c in text] for text in texts]
 
     @staticmethod
-    def _get_request_cache_salt_id(request: OpenAIRequest) -> Optional[int]:
-        cache_salt = getattr(request, "cache_salt", None)
-        return None if cache_salt is None else get_cache_salt_id(cache_salt)
+    def _get_request_cache_salt(request: OpenAIRequest) -> Optional[str]:
+        return getattr(request, "cache_salt", None)

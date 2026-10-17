@@ -1019,7 +1019,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         Tokenization and per-algorithm block hashing are CPU-bound and run in a
         thread. The returned plain dict can be sent over HTTP unchanged.
         """
-        cache_salt_id = self._get_request_cache_salt_id(request)
+        cache_salt = self._get_request_cache_salt(request)
         # Hash for every algo any server might use (usually one).
         algos = ({self._routing_hash_algo}
                  if self._routing_hash_algo is not None else {
@@ -1032,7 +1032,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 "synchronize it with the coordinator before routing")
         token_lists, block_hashes_by_algo = \
             self._tokenize_and_compute_block_hashes_by_algo(
-                request, algos, cache_salt_id)
+                request, algos, cache_salt)
         return {
             "block_hashes_by_algo": block_hashes_by_algo,
             "conv_key": self._content_affinity_key(request),
