@@ -1231,10 +1231,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -1274,10 +1273,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1313,11 +1311,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
@@ -1345,11 +1342,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds1);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
@@ -1384,10 +1380,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds2);
 
     numTokens = llmRequest2->getNumTokens(beamIdx);
@@ -1418,10 +1413,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds3);
 
     numTokens = llmRequest3->getNumTokens(beamIdx);
@@ -1500,11 +1494,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         /*promptVocabSize=*/std::nullopt, multimodalHashes, multimodalPositions, multimodalLengths,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -1549,11 +1542,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         /*promptVocabSize=*/std::nullopt, multimodalHashes, multimodalPositions, multimodalLengths,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1593,11 +1585,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         /*promptVocabSize=*/std::nullopt, multimodalHashes2, multimodalPositions2, multimodalLengths2,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -1636,11 +1627,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         /*promptVocabSize=*/std::nullopt, multimodalHashes3, multimodalPositions3, multimodalLengths3,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     // reuse block 0, get new blocks 6 and 7
@@ -2018,10 +2008,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds);
 
@@ -2063,10 +2051,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId2, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2101,10 +2087,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
@@ -2132,10 +2117,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt, loraTaskId2, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds1);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
@@ -2169,10 +2153,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds2);
 
@@ -2204,10 +2186,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds3);
 
@@ -2238,10 +2218,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId2, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds3);
 
@@ -2321,10 +2299,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt,
@@ -2369,10 +2346,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
@@ -2413,10 +2389,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
@@ -2458,10 +2433,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
@@ -2496,10 +2470,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt,
@@ -8598,7 +8571,7 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchPreservesContextLogitsAfterReuse)
     EXPECT_EQ(req->getContextCurrentPosition(), reusableLen);
     EXPECT_EQ(req->getContextRemainingLength(), 1);
     EXPECT_EQ(req->getContextChunkSize(), 1);
-    EXPECT_TRUE(req->getReturnContextLogits());
+    EXPECT_TRUE(executorRequest.getOutputConfig().returnContextLogits);
     EXPECT_EQ(req->getState(), semanticState);
     EXPECT_EQ(req->getLlmRequestType(), semanticType);
 
