@@ -26,6 +26,10 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 import torch
 
 from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+from flashinfer.trace.templates.attention import (
+    attention_ts_decode_trace_dispatch,
+    prims_ts_decode_wrapper_trace_dispatch,
+)
 
 from . import _q_token_kv_block_sparse_policy as _sparse_policy
 from ._block_sparse.common import _num_sparse_pattern_heads
@@ -4043,7 +4047,7 @@ class BatchDecodePagedTSWrapper:
         # previous complete plan revision usable.
         self._plan_state = candidate
 
-    @flashinfer_experimental_api
+    @flashinfer_experimental_api(trace=prims_ts_decode_wrapper_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
@@ -4225,7 +4229,7 @@ class BatchDecodePagedTSWrapper:
         )
 
 
-@flashinfer_experimental_api
+@flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
 def batch_decode_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
