@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -108,6 +108,8 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
         smem_input_mask[lane_idx] = 33;
         smem_warp_sum_sqs[lane_idx] = 0.0f;
     }
+    // Order warp 0's initialization before other warps write their slots of the same arrays below.
+    __syncthreads();
     float warp_acc = 0.0f;
     PackedType const* __restrict__ weight_ptr = nullptr;
 
@@ -177,14 +179,6 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
     if (lane_idx == 0)
     {
         smem_warp_sum_sqs[warp_idx] = warp_sum;
-    }
-
-// Extra _syncwarp for sm < 900, needed to avoid race condition on smem_input_mask write.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900)
-    __syncwarp();
-#endif
-    if (lane_idx == 0)
-    {
         smem_input_mask[warp_idx] = input_idx;
     }
 
@@ -283,10 +277,13 @@ __global__ void GroupRMSNormKernelLargeBatch(
 
     alignas(128) __shared__ float smem_rsqrts[n][32];
 
-    if (warp_idx < n)
+    // With a single warp, warp 0 initializes every row because it also reduces every input below.
+    for (uint32_t row = warp_idx; row < n; row += blockDim.y)
     {
-        smem_rsqrts[warp_idx][lane_idx] = 0.0f;
+        smem_rsqrts[row][lane_idx] = 0.0f;
     }
+    // Order the initialization before other warps write their partial sums to the same rows below.
+    __syncthreads();
 
     const uint32_t round_offset = warp_size * kPackedSize;
 
@@ -442,6 +439,16 @@ __global__ void GroupRMSNormKernelLargeBatch(
         if (lane_idx == 0)
         {
             smem_rsqrts[0][0] = rsqrtf(block_sum / input_dim_0 + params.eps);
+        }
+
+        // Warp 1 does not exist when a single warp is launched, so warp 0 also reduces input 1.
+        if (blockDim.y == 1)
+        {
+            float block_sum_1 = tensorrt_llm::common::warpReduceSum(smem_rsqrts[1][lane_idx]);
+            if (lane_idx == 0)
+            {
+                smem_rsqrts[1][0] = rsqrtf(block_sum_1 / input_dim_1 + params.eps);
+            }
         }
     }
     else if (warp_idx == 1)

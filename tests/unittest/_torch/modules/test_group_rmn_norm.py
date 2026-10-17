@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,7 +129,7 @@ def test_group_rms_norm_base(batch_size, hidden_dims, eps, dtype,
 
 @torch.inference_mode()
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda x: f"batch:{x}")
-@pytest.mark.parametrize("hidden_dims", [[256, 512], [8448, 1024]],
+@pytest.mark.parametrize("hidden_dims", [[256, 256], [256, 512], [8448, 1024]],
                          ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
 @pytest.mark.parametrize("eps", [1e-6, 1e-5], ids=lambda x: f"eps:{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
@@ -160,3 +160,47 @@ def test_group_rms_norm_large_batch(batch_size, hidden_dims, eps, dtype,
                                                     weight_bias=0.0)
 
     _verify_outputs(group_outputs_large_batch, ref_outputs)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("op_name", [
+    "group_rms_norm_base", "group_rms_norm_large_batch",
+    "group_rms_norm_heuristic"
+])
+@pytest.mark.parametrize(
+    "batch_size,hidden_dims,dtype",
+    [
+        (64, [1536, 512], torch.bfloat16),
+        (2048, [256, 256], torch.bfloat16),
+        (2048, [256, 256], torch.float16),
+        (2048, [128, 128], torch.float32),
+    ],
+    ids=[
+        "bf16-64x1536-512", "bf16-2048x256-256", "fp16-2048x256-256",
+        "fp32-2048x128-128"
+    ],
+)
+def test_group_rms_norm_repeated_calls(op_name, batch_size, hidden_dims, dtype):
+    """Every call must be correct.
+
+    Shared-memory races only corrupt some launches, and [256, 256] (fp16/bf16)
+    or [128, 128] (fp32) runs the large batch kernel with a single warp.
+    """
+    eps = 1e-6
+    num_calls = 100
+    op = getattr(torch.ops.trtllm, op_name)
+    inputs = [(torch.randn(batch_size, dim, device="cuda") * (1 + i)).to(dtype)
+              for i, dim in enumerate(hidden_dims)]
+    weights = [(0.5 + torch.rand(dim, device="cuda")).to(dtype)
+               for dim in hidden_dims]
+    ref_outputs = []
+    for x, w in zip(inputs, weights):
+        xf = x.float()
+        ref_outputs.append(
+            (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps) *
+             w.float()).to(dtype))
+
+    for _ in range(num_calls):
+        outputs = [torch.empty_like(x) for x in inputs]
+        op(inputs, outputs, weights, eps=eps, weight_bias=0.0)
+        _verify_outputs(outputs, ref_outputs)
