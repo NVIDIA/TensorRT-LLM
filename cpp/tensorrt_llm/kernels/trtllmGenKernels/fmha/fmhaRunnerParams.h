@@ -380,6 +380,8 @@ struct TllmGenFmhaRunnerParams
     int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mForcePrepareSpecDecTreeMask = false;
     // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    // The SM107 FP8 (QkvE4m3, head dim 128) fp16-softmax kernels apply no softmax scale: callers fold
+    // it into the Q/K quantization scales and scaleSoftmaxLog2Ptr must point to 1.0.
     bool mFp16Softmax{false};
     // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
     bool mUsesSpcompress{false};
