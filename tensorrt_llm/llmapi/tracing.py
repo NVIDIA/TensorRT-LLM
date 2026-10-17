@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
 __all__ = [
     'SpanAttributes', 'SpanKind', 'contains_trace_headers',
@@ -33,7 +33,7 @@ try:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.trace import (SpanKind, Status, StatusCode, Tracer,
-                                     get_current_span, set_tracer_provider)
+                                     get_current_span)
     from opentelemetry.trace.propagation.tracecontext import \
         TraceContextTextMapPropagator
 
@@ -70,7 +70,10 @@ def init_tracer(instrumenting_module_name: str,
     trace_provider = TracerProvider()
     span_exporter = get_span_exporter(otlp_traces_endpoint)
     trace_provider.add_span_processor(BatchSpanProcessor(span_exporter))
-    set_tracer_provider(trace_provider)
+    # Keep the provider private to TRT-LLM instead of installing it as the
+    # OpenTelemetry global provider. A global provider would also export the
+    # spans of every other instrumented library in the process (e.g. FastAPI's
+    # native HTTP instrumentation) to this endpoint.
     tracer = trace_provider.get_tracer(instrumenting_module_name)
     set_global_otlp_tracer(tracer)
     return tracer
