@@ -360,7 +360,10 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             # capture needs a whole-sequence prefill.
             disable_overlap_scheduler=True,
             enable_chunked_prefill=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+            # CUDA graphs stay off here: MegaMoE CuteDSL under TEP deadlocks
+            # in graph-warmup multi-stream execution (https://nvbugs/6946611).
+            # Restore CudaGraphConfig(max_batch_size=8) once that is fixed.
+            cuda_graph_config=None,
             # Not the TRTLLM backend TestKimiK3 uses: trtllm-gen ships
             # SiTu cubins only for W4A8_MXFP4_MXFP8, so K3's NVFP4 routed
             # experts leave MEGAMOE_CUTEDSL and CUTLASS as the choices.
