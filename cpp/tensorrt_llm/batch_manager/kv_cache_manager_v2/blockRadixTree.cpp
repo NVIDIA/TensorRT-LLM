@@ -61,6 +61,10 @@ static void emitReuseScopeBytes(ReuseScope const& scope, Emit&& emit)
     {
         mask |= 1U << 1;
     }
+    if (scope.localityDomainId.has_value())
+    {
+        mask |= 1U << 2;
+    }
     emit(&mask, sizeof(mask));
     if (scope.loraId.has_value())
     {
@@ -70,6 +74,11 @@ static void emitReuseScopeBytes(ReuseScope const& scope, Emit&& emit)
     if (scope.salt.has_value())
     {
         std::uint64_t const value = *scope.salt;
+        emit(reinterpret_cast<uint8_t const*>(&value), sizeof(value));
+    }
+    if (scope.localityDomainId.has_value())
+    {
+        std::uint64_t const value = static_cast<std::uint64_t>(*scope.localityDomainId);
         emit(reinterpret_cast<uint8_t const*>(&value), sizeof(value));
     }
 }

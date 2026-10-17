@@ -367,8 +367,14 @@ static nb::object optionalIntToObject(std::optional<std::uint64_t> value)
     return nb::cast(*value);
 }
 
+// Two fields unless a locality domain is set, so non-localized scopes keep their tuple shape.
 static nb::tuple reuseScopeTuple(kv::ReuseScope const& self)
 {
+    if (self.localityDomainId.has_value())
+    {
+        return nb::make_tuple(
+            optionalIntToObject(self.loraId), optionalIntToObject(self.salt), nb::cast(*self.localityDomainId));
+    }
     return nb::make_tuple(optionalIntToObject(self.loraId), optionalIntToObject(self.salt));
 }
 
@@ -710,7 +716,16 @@ static kv::ReuseScope castReuseScope(nb::object reuseScope)
     }
     if (PyObject_HasAttrString(reuseScope.ptr(), "lora_id") && PyObject_HasAttrString(reuseScope.ptr(), "salt"))
     {
-        return {castOptionalIntAttr(reuseScope, "lora_id"), castOptionalIntAttr(reuseScope, "salt")};
+        std::optional<int> localityDomainId;
+        if (PyObject_HasAttrString(reuseScope.ptr(), "locality_domain_id"))
+        {
+            auto const value = castOptionalIntAttr(reuseScope, "locality_domain_id");
+            if (value.has_value())
+            {
+                localityDomainId = static_cast<int>(*value);
+            }
+        }
+        return {castOptionalIntAttr(reuseScope, "lora_id"), castOptionalIntAttr(reuseScope, "salt"), localityDomainId};
     }
     throw std::invalid_argument(
         "reuse_scope must be None, ReuseScope, an int lora_task_id, or an object with lora_id and salt");
@@ -1427,28 +1442,28 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- ReuseScope --------------------------------------------------------
     nb::class_<kv::ReuseScope>(m, "ReuseScope")
-        .def(nb::init<std::optional<kv::LoraTaskIdType>, std::optional<std::uint64_t>>(),
-            nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt)
+        .def(nb::init<std::optional<kv::LoraTaskIdType>, std::optional<std::uint64_t>, std::optional<int>>(),
+            nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt,
+            nb::arg("locality_domain_id").none() = std::nullopt)
         .def_ro("lora_id", &kv::ReuseScope::loraId)
         .def_ro("salt", &kv::ReuseScope::salt)
-        .def("__len__", [](kv::ReuseScope const&) { return 2; })
+        .def_ro("locality_domain_id", &kv::ReuseScope::localityDomainId)
+        .def("__len__", [](kv::ReuseScope const& self) { return reuseScopeTuple(self).size(); })
         .def(
             "__getitem__",
             [](kv::ReuseScope const& self, int index) -> nb::object
             {
+                auto const fields = reuseScopeTuple(self);
+                auto const size = static_cast<int>(fields.size());
                 if (index < 0)
                 {
-                    index += 2;
+                    index += size;
                 }
-                if (index == 0)
+                if (index < 0 || index >= size)
                 {
-                    return optionalIntToObject(self.loraId);
+                    throw nb::index_error("ReuseScope index out of range");
                 }
-                if (index == 1)
-                {
-                    return optionalIntToObject(self.salt);
-                }
-                throw nb::index_error("ReuseScope index out of range");
+                return fields[index];
             },
             nb::arg("index"))
         .def("__iter__",
@@ -1463,7 +1478,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     return nb::bool_(self == nb::cast<kv::ReuseScope>(other));
                 }
-                if (PyTuple_Check(other.ptr()) && PyTuple_GET_SIZE(other.ptr()) == 2)
+                if (PyTuple_Check(other.ptr()))
                 {
                     return nb::bool_(PyObject_RichCompareBool(reuseScopeTuple(self).ptr(), other.ptr(), Py_EQ) == 1);
                 }
@@ -1477,6 +1492,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 repr += self.loraId.has_value() ? std::to_string(*self.loraId) : "None";
                 repr += ", salt=";
                 repr += self.salt.has_value() ? std::to_string(*self.salt) : "None";
+                if (self.localityDomainId.has_value())
+                {
+                    repr += ", locality_domain_id=" + std::to_string(*self.localityDomainId);
+                }
                 repr += ")";
                 return repr;
             });
@@ -1555,6 +1574,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PoolDesc>(m, "PoolDesc")
         .def_prop_ro("pool_index", [](kv::PoolDesc const& self) { return self.poolIndex.value(); })
         .def_ro("base_address", &kv::PoolDesc::baseAddress)
+        .def_ro("mapped_ranges", &kv::PoolDesc::mappedRanges)
         .def_ro("slot_bytes", &kv::PoolDesc::slotBytes);
 
     nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")
@@ -1586,8 +1606,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__deepcopy__", [](cls const& self, nb::dict) { return cls(self); }, nb::arg("memo"))
 
     nb::class_<kv::GpuCacheTierConfig>(m, "GpuCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(
+            "__init__",
+            [](kv::GpuCacheTierConfig* self, size_t quota, bool enableLocalityDomains) {
+                new (self) kv::GpuCacheTierConfig{quota, enableLocalityDomains};
+            },
+            nb::arg("quota"), nb::arg("enable_locality_domains") = false)
         .def_rw("quota", &kv::GpuCacheTierConfig::quota)
+        .def_rw("enable_locality_domains", &kv::GpuCacheTierConfig::enableLocalityDomains)
         .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
         .def("assert_valid", &kv::GpuCacheTierConfig::assertValid) DEF_COPY(kv::GpuCacheTierConfig);
 
@@ -2090,6 +2116,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::rv_policy::reference_internal)
         .def_prop_ro("committed_tokens", &committedTokensList)
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
+        .def_prop_ro("locality_domain_id", &kv::KvCache::localityDomainId)
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
             nb::call_guard<nb::gil_scoped_release>())
@@ -2816,6 +2843,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none(),
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
+        .def_prop_ro("num_locality_domains", &kv::KvCacheManager::numLocalityDomains)
+        .def("get_per_locality_domain_free_slots", &kv::KvCacheManager::getPerLocalityDomainFreeSlots,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_mapped_buffer_views", &kv::KvCacheManager::getMappedBufferViews, nb::arg("layer_id"), nb::arg("role"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("event_manager",
             [](kv::KvCacheManager const& self)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })

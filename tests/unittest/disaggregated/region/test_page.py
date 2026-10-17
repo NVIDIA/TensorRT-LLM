@@ -238,3 +238,68 @@ def test_layer_byte_ranges_empty_view_raises():
 
     with pytest.raises(ValueError, match="no buffer entries"):
         get_layer_byte_ranges(_view([]))
+
+
+@pytest.mark.parametrize("ranges", [None, (), ((0, 512), (1024, 2048))])
+def test_physical_pool_mapped_ranges_roundtrip(ranges):
+    import json
+
+    pool = PhysicalPool(0x10000, 256, 8, mapped_ranges=ranges)
+    wire = json.loads(json.dumps(pool.to_dict()))
+    assert PhysicalPool.from_dict(wire).mapped_ranges == ranges
+    if ranges is None:
+        assert "mapped_ranges" not in wire
+
+
+def test_registration_excludes_holes_and_deduplicates_shared_pools():
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    pool = PhysicalPool(0x10000, 256, 8, mapped_ranges=((0, 512), (1024, 2048)))
+    table = KVCachePageTable(
+        tokens_per_block=64,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                kv_head_num_per_rank=8,
+                sliding_window_size=None,
+                local_layers=[LocalLayer(0, 5)],
+                pool_views=[PoolView(pool_idx=0, buffer_entries=_make_buffer_entries())],
+            )
+        ]
+        * 2,
+        pool_groups=[PhysicalPoolGroup(pools=[pool])],
+    )
+    assert get_unique_pool_memory_descs(table, device_id=3) == [
+        (0x10000, 512, 3, "kv_cache_memory_pool0"),
+        (0x10400, 1024, 3, "kv_cache_memory_pool1"),
+    ]
+
+
+def test_registration_preserves_interleaved_state_pool_deduplication():
+    from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    table = KVCachePageTable(
+        tokens_per_block=64,
+        layer_groups=[
+            MambaLayerGroup(
+                pool_group_idx=0,
+                local_layers=[LocalLayer(0, 0)],
+                pool_views=[
+                    PoolView(pool_idx=i, buffer_entries=_make_buffer_entries()) for i in (1, 0)
+                ],
+                slot_major_layout=True,
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(
+                pools=[
+                    PhysicalPool(0x10000, 128, 4, slot_stride_bytes=256),
+                    PhysicalPool(0x10080, 128, 4, slot_stride_bytes=256),
+                ]
+            )
+        ],
+    )
+    assert get_unique_pool_memory_descs(table, device_id=0) == [
+        (0x10000, 1024, 0, "kv_cache_memory_pool0")
+    ]

@@ -78,6 +78,12 @@ add_gtest(
 target_include_directories(
   kvCacheManagerV2SlotAllocatorTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2LocalityTest
+          "kvCacheManagerV2LocalityTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2LocalityTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 add_gtest(
   kvCacheManagerV2ReentrantSharedMutexTest
   "kvCacheManagerV2ReentrantSharedMutexTest.cpp;kvCacheManagerV2PoisonCheck.cpp"
