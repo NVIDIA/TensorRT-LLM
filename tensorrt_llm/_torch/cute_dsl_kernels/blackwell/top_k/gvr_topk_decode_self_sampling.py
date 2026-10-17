@@ -6149,6 +6149,7 @@ class GvrTopkRegKernel:
         dense_bracket: bool = False,
         warp_rank: bool = False,
         bracket_sample_lanes: int = 1,
+        dense_lower_bound: bool = False,
     ) -> None:
         self.det = bool(det)
         assert blk in (256, 512, 1024) and 1 <= vpt <= 10
@@ -6182,6 +6183,7 @@ class GvrTopkRegKernel:
         self.hint_free = bool(hint_free)
         # Dense brackets fold a prefix, or the complete row for DEG plans.
         self.dense_bracket = self.hint_free and (bool(dense_bracket) or self.det)
+        self.dense_lower_bound = self.hint_free and bool(dense_lower_bound) and not self.det
         self.warp_rank = bool(warp_rank) and not self.det
         assert bracket_sample_lanes in (1, 2, 4, 8, 16, 32)
         self.bracket_sample_lanes = bracket_sample_lanes
@@ -6619,13 +6621,21 @@ class GvrTopkRegKernel:
                 lmx = cutlass.Float32(_NEG_INF__reg)
                 for u in cutlass.range_constexpr(VPT):
                     pos4 = tid + cutlass.Int32(u * self.blk)
+                    if cutlass.const_expr(self.dense_lower_bound):
+                        if pos4 < n4:
+                            for component in cutlass.range_constexpr(4):
+                                lmn = fmin_f32(lmn, frags[u][component])
                     if (lane & cutlass.Int32(32 // self.bracket_sample_lanes - 1)) == cutlass.Int32(
                         0
                     ):
                         if pos4 < n4:
                             v = frags[u][0]
-                            lmn = fmin_f32(lmn, v)
+                            if cutlass.const_expr(not self.dense_lower_bound):
+                                lmn = fmin_f32(lmn, v)
                             lmx = fmax_f32(lmx, v)
+                if cutlass.const_expr(self.dense_lower_bound):
+                    if tid < ntail:
+                        lmn = fmin_f32(lmn, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
@@ -6659,9 +6669,15 @@ class GvrTopkRegKernel:
 
             # Reduce participating lanes before publishing warp bounds.
             if cutlass.const_expr(
-                not self.hint_free or self.dense_bracket or self.bracket_sample_lanes > 1
+                not self.hint_free
+                or self.dense_bracket
+                or self.bracket_sample_lanes > 1
+                or self.dense_lower_bound
             ):
                 lmin = warp_min_u32(lmin)
+            if cutlass.const_expr(
+                not self.hint_free or self.dense_bracket or self.bracket_sample_lanes > 1
+            ):
                 lmax = warp_max_u32(lmax)
             if lane == cutlass.Int32(0):
                 s_wmn[tid >> cutlass.Int32(5)] = lmin
@@ -8334,6 +8350,7 @@ def get_compiled__reg(
     dense_bracket: bool = False,
     warp_rank: bool = False,
     bracket_sample_lanes: int = 1,
+    dense_lower_bound: bool = False,
 ) -> Any:
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -8352,6 +8369,7 @@ def get_compiled__reg(
         dense_bracket = True
         warp_rank = False
         bracket_sample_lanes = 1
+        dense_lower_bound = False
     key = (
         tuple(tpl),
         bool(pdl),
@@ -8367,6 +8385,7 @@ def get_compiled__reg(
         bool(warp_rank),
         int(bracket_sample_lanes),
         static_npad,
+        bool(dense_lower_bound),
     )
     compiled = _COMPILE_CACHE__reg.get(key)
     if compiled is None:
@@ -8393,6 +8412,7 @@ def get_compiled__reg(
             dense_bracket=dense_bracket,
             warp_rank=warp_rank,
             bracket_sample_lanes=bracket_sample_lanes,
+            dense_lower_bound=dense_lower_bound,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         if static_npad is not None:
