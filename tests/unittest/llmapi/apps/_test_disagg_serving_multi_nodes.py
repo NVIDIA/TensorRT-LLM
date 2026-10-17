@@ -30,6 +30,10 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 CTX_SERVER_PORT = 8001
 GEN_SERVER_PORT = 8002
 DISAGG_SERVER_PORT = 8000
+# The disagg server starts once the local ctx server is ready, while the gen
+# server on the other node starts independently and may need longer, so the
+# default 180-second readiness window of the disagg server is too short.
+DISAGG_SERVER_START_TIMEOUT_S = 1200
 
 
 # Exclude the current node from the node list, then return other nodes by idx
@@ -168,11 +172,13 @@ def disagg_server(worker: RemoteOpenAIServer):
         # TODO: Hopefully the NODE_LIST is ordered by NODE_RANK, this test is only expected to run with 2 nodes now
         # We need to test with 4 nodes or more in the future, which should be easier with service discovery
         gen_url = f"{get_the_other_host(0)}:8002"
-        with RemoteDisaggOpenAIServer(ctx_servers=[ctx_url],
-                                      gen_servers=[gen_url],
-                                      port=DISAGG_SERVER_PORT,
-                                      llmapi_launch=False,
-                                      env=env()) as server:
+        with RemoteDisaggOpenAIServer(
+                ctx_servers=[ctx_url],
+                gen_servers=[gen_url],
+                port=DISAGG_SERVER_PORT,
+                llmapi_launch=False,
+                env=env(),
+                server_start_timeout=DISAGG_SERVER_START_TIMEOUT_S) as server:
             yield server
     else:
         print(f"skipping disagg_server for rank {RANK} node rank {NODE_RANK}")
