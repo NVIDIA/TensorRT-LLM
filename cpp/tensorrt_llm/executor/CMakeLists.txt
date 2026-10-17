@@ -23,20 +23,8 @@ set(SRCS
     cache_transmission/cacheSplitConcat.cu
     cache_transmission/mpi_utils/connection.cpp
     cache_transmission/rnnCacheSplitConcat.cu
-    cache_transmission/transferAgent.cpp
-    contextPhaseParams.cpp
     executorKVCacheEventManager.cpp
-    jsonSerialization.cpp
-    loraConfig.cpp
-    mropeConfig.cpp
-    multimodalInput.cpp
-    promptTuningConfig.cpp
-    request.cpp
-    requestUtils.cpp
-    requestWithId.cpp
-    response.cpp
-    serialization.cpp
-    tensor.cpp)
+    jsonSerialization.cpp)
 
 if(NOT WIN32)
   # additional warnings
@@ -87,7 +75,47 @@ target_link_libraries(
 set_target_properties(tllm_executor_serialization
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(
+  tllm_executor_values STATIC
+  contextPhaseParams.cpp
+  loraConfig.cpp
+  mropeConfig.cpp
+  multimodalInput.cpp
+  promptTuningConfig.cpp
+  request.cpp
+  response.cpp
+  serialization.cpp
+  tensor.cpp)
+add_library(tllm::executor_values ALIAS tllm_executor_values)
+target_link_libraries(tllm_executor_values PUBLIC tllm::executor_serialization
+                                                  tllm::runtime_buffers)
+
+add_library(tllm_executor_request_utils STATIC requestUtils.cpp
+                                               requestWithId.cpp)
+add_library(tllm::executor_request_utils ALIAS tllm_executor_request_utils)
+target_link_libraries(tllm_executor_request_utils PUBLIC tllm::executor_values
+                                                         tllm::kv_cache_legacy)
+
+add_library(tllm_executor_transfer_agent STATIC
+            cache_transmission/transferAgent.cpp)
+add_library(tllm::executor_transfer_agent ALIAS tllm_executor_transfer_agent)
+target_link_libraries(
+  tllm_executor_transfer_agent
+  PUBLIC tllm::common_logging CUDA::cuda_driver
+  PRIVATE ${CMAKE_DL_LIBS})
+
+foreach(component tllm_executor_values tllm_executor_transfer_agent
+                  tllm_executor_request_utils)
+  target_compile_features(${component} PUBLIC cxx_std_20)
+  set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
+                                                POSITION_INDEPENDENT_CODE ON)
+endforeach()
+
 add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
+target_link_libraries(
+  ${EXECUTOR_STATIC_TARGET}
+  PUBLIC tllm::executor_values tllm::executor_transfer_agent
+         tllm::executor_request_utils)
 set_target_properties(
   ${EXECUTOR_STATIC_TARGET}
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"

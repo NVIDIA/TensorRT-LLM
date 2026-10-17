@@ -19,29 +19,17 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    baseTransBuffer.cpp
-    blockKey.cpp
     cacheFormatter.cpp
-    cacheTransferLayer.cpp
-    mlaCacheFormatter.cpp
     cacheTransceiver.cpp
-    capacityScheduler.cpp
-    contextProgress.cpp
+    cacheTransferLayer.cpp
     contextTransferCoordinator.cpp
     dataTransceiver.cpp
-    kvCacheManager.cpp
-    kvCacheEventManager.cpp
-    kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
-    llmRequest.cpp
-    microBatchScheduler.cpp
+    mlaCacheFormatter.cpp
     peftCacheManager.cpp
     rnnCacheFormatter.cpp
-    rnnCacheTransBuffer.cpp
-    evictionPolicy.cpp
-    cacheTransBuffer.cpp
-    agentTree.cpp)
+    rnnCacheTransBuffer.cpp)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
@@ -76,13 +64,66 @@ endif()
 
 # Include kv_cache_manager_v2 C++ sources.
 include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
-list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
 
 # Include the KVCM cold-page compression codec bridge sources.
 include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_compression/CMakeLists.txt)
-list(APPEND SRCS ${KV_CACHE_COMPRESSION_SRCS})
+
+add_library(tllm_kv_cache_host_memory STATIC ${KV_CACHE_HOST_MEMORY_SRCS})
+add_library(tllm::kv_cache_host_memory ALIAS tllm_kv_cache_host_memory)
+target_include_directories(tllm_kv_cache_host_memory
+                           PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR})
+target_link_libraries(
+  tllm_kv_cache_host_memory PUBLIC tllm::common_logging CUDA::cuda_driver
+                                   Threads::Threads)
+
+add_library(tllm_kv_cache STATIC ${KV_CACHE_MANAGER_V2_SRCS}
+                                 ${KV_CACHE_COMPRESSION_SRCS})
+add_library(tllm::kv_cache ALIAS tllm_kv_cache)
+target_include_directories(
+  tllm_kv_cache PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR} ${SHA256_DIR})
+target_link_libraries(tllm_kv_cache PUBLIC tllm::kv_cache_host_memory
+                                           tllm::common_cuda CUDA::cuda_driver)
+
+add_library(
+  tllm_kv_cache_legacy STATIC
+  baseTransBuffer.cpp
+  blockKey.cpp
+  cacheTransBuffer.cpp
+  evictionPolicy.cpp
+  kvCacheManager.cpp
+  kvCacheEventManager.cpp
+  kvCacheTransferManager.cpp
+  llmRequest.cpp)
+add_library(tllm::kv_cache_legacy ALIAS tllm_kv_cache_legacy)
+target_link_libraries(
+  tllm_kv_cache_legacy
+  PUBLIC tllm::runtime_buffers tllm::runtime_distributed tllm::executor_values
+  PRIVATE tllm::common_environment tllm::executor_transfer_agent
+          tllm::kernel_kv_cache_copy)
+
+add_library(
+  tllm_batch_scheduler STATIC
+  agentTree.cpp capacityScheduler.cpp contextProgress.cpp
+  microBatchScheduler.cpp noOpPeftCacheManager.cpp)
+add_library(tllm::batch_scheduler ALIAS tllm_batch_scheduler)
+target_link_libraries(tllm_batch_scheduler PUBLIC tllm::kv_cache_legacy)
+target_include_directories(tllm_batch_scheduler
+                           PRIVATE ${maybe_nvtx_includedir})
+
+foreach(component tllm_kv_cache_host_memory tllm_kv_cache tllm_kv_cache_legacy
+                  tllm_batch_scheduler)
+  target_compile_features(${component} PUBLIC cxx_std_20)
+  set_target_properties(
+    ${component} PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON
+                            CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endforeach()
+target_compile_options(
+  tllm_kv_cache PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+add_cuda_architectures(tllm_kv_cache 89)
 
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
+                      PUBLIC tllm::kv_cache tllm::batch_scheduler)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
