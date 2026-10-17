@@ -76,6 +76,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_deltas_cache
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
 from tensorrt_llm.mapping import Mapping
@@ -971,14 +972,24 @@ def test_penalty_workspace_reserve_is_zero_without_extra_seats(
     )
 
 
-def test_penalty_store_is_read_from_the_torch_sampler_only():
-    store = SimpleNamespace(max_num_sequences=16, max_beam_width=1)
-    assert (
-        get_penalty_store(SimpleNamespace(_penalty_handler=SimpleNamespace(store=store))) is store
+def _penalty_store(max_num_sequences, max_beam_width=1):
+    return PenaltyStore.create(
+        max_num_sequences=max_num_sequences, max_beam_width=max_beam_width, device="cpu"
     )
+
+
+def _sampler_with(store):
+    return SimpleNamespace(_penalty_handler=SimpleNamespace(store=store))
+
+
+def test_penalty_store_is_read_from_the_torch_sampler_only():
+    store = _penalty_store(16)
+    assert get_penalty_store(_sampler_with(store)) is store
     # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
     assert get_penalty_store(SimpleNamespace()) is None
     assert get_penalty_store(None) is None
+    # A mocked sampler auto-creates the attributes; that is not a store to size from.
+    assert get_penalty_store(Mock()) is None
 
 
 @pytest.mark.parametrize("enable_overlap_headroom", [False, True])
@@ -998,12 +1009,11 @@ def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_he
             model_config=SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=vocab_size))
         )
     )
-    store = SimpleNamespace(max_num_sequences=seats, max_beam_width=1)
-    py_executor = SimpleNamespace(
-        sampler=SimpleNamespace(_penalty_handler=SimpleNamespace(store=store))
-    )
+    py_executor = SimpleNamespace(sampler=_sampler_with(_penalty_store(seats)))
     expected = max_batch_size * vocab_size * 5 if enable_overlap_headroom else 0
     assert creator._get_penalty_workspace_reserve(py_executor) == expected
     # No executor (skipped estimation) or a sampler without penalties reserves nothing.
     assert creator._get_penalty_workspace_reserve(None) == 0
     assert creator._get_penalty_workspace_reserve(SimpleNamespace(sampler=SimpleNamespace())) == 0
+    # Nor does a mocked executor, as the KV-estimation tests pass in.
+    assert creator._get_penalty_workspace_reserve(Mock()) == 0

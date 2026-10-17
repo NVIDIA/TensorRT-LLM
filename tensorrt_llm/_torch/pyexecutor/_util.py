@@ -78,6 +78,7 @@ from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
+from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
@@ -561,10 +562,11 @@ def get_overlap_headroom_penalty_workspace_bytes(
     return counts_bytes + presence_prefix_bytes
 
 
-def get_penalty_store(sampler):
+def get_penalty_store(sampler) -> Optional[PenaltyStore]:
     """Return the sampler's ``PenaltyStore``, or None if it does not own one."""
     penalty_handler = getattr(sampler, "_penalty_handler", None)
-    return getattr(penalty_handler, "store", None)
+    store = getattr(penalty_handler, "store", None)
+    return store if isinstance(store, PenaltyStore) else None
 
 
 def get_mla_context_workspace_kv_len_cap(
