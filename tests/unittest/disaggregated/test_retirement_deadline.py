@@ -21,23 +21,25 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("reason", ["cancelled", "failed", "shutdown", "peer lost"])
-def test_first_drain_trigger_cannot_be_extended(reason: str) -> None:
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+def test_first_drain_trigger_cannot_be_extended(reason: str, grace_s: float | None) -> None:
     """Repeated notifications do not reset the physical grace period."""
     clock, notify = Mock(return_value=10.0), Mock()
     watchdog = RetirementWatchdog(notify, clock=clock)
-    owner = watchdog.create_owner(4, "receive", 5.0)
+    owner = watchdog.create_owner(4, "receive", 5.0, grace_s=grace_s)
+    deadline = 10.0 + (5.0 if grace_s is None else grace_s)
     claim = object()
     assert owner.expose(claim)
     owner.request_drain(reason)
-    clock.return_value = 14.0
+    clock.return_value = deadline - 1.0
     owner.request_drain("another failure")
     watchdog.progress()
     assert watchdog.fatal is None
-    clock.return_value = 15.0
+    clock.return_value = deadline
     watchdog.progress()
     event = watchdog.fatal
     assert event is not None
-    assert (event.started_at, event.deadline, event.reason) == (10.0, 15.0, reason)
+    assert (event.started_at, event.deadline, event.reason) == (10.0, deadline, reason)
     assert not owner.settle(claim)
     assert not owner.can_retire()
     assert not owner.close()
@@ -45,16 +47,19 @@ def test_first_drain_trigger_cannot_be_extended(reason: str) -> None:
     notify.assert_called_once_with(event)
 
 
-@pytest.mark.parametrize("settle_at,retirable", [(14.999, True), (15.0, False), (15.001, False)])
-def test_settlement_and_deadline_share_one_boundary(settle_at: float, retirable: bool) -> None:
+@pytest.mark.parametrize("offset,retirable", [(-0.001, True), (0.0, False), (0.001, False)])
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+def test_settlement_and_deadline_share_one_boundary(
+    offset: float, retirable: bool, grace_s: float | None
+) -> None:
     """Evidence arriving exactly at expiry cannot authorize memory reuse."""
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
-    owner = watchdog.create_owner(4, "send", 5.0)
+    owner = watchdog.create_owner(4, "send", 5.0, grace_s=grace_s)
     claim = object()
     assert owner.expose(claim)
     owner.request_drain("failed")
-    clock.return_value = settle_at
+    clock.return_value = 10.0 + (5.0 if grace_s is None else grace_s) + offset
     assert owner.settle(claim) is retirable
     assert owner.close() is retirable
     clock.return_value = 100.0
@@ -62,21 +67,29 @@ def test_settlement_and_deadline_share_one_boundary(settle_at: float, retirable:
     assert (watchdog.fatal is None) is retirable
 
 
-def test_request_timeout_starts_grace_without_executor_polling() -> None:
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+@pytest.mark.parametrize("pieces_complete", [False, True])
+def test_request_timeout_starts_grace_without_executor_polling(
+    grace_s: float | None, pieces_complete: bool
+) -> None:
     """A stalled backend gets a request timeout followed by exactly one grace window."""
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
-    owner = watchdog.create_owner(4, "send", 5.0)
+    owner = watchdog.create_owner(4, "send", 5.0, grace_s=grace_s)
     claim = object()
     assert owner.expose(claim)
-    clock.return_value = 19.0
+    if pieces_complete:
+        owner.complete_pieces()
+    deadline = 15.0 + (5.0 if grace_s is None else grace_s)
+    clock.return_value = deadline - 1.0
     watchdog.progress()
     assert watchdog.fatal is None
     assert not owner.expose(object())
-    clock.return_value = 20.0
+    clock.return_value = deadline
     watchdog.progress()
     assert watchdog.fatal is not None
     assert watchdog.fatal.started_at == 15.0
+    assert watchdog.fatal.deadline == deadline
     assert watchdog.fatal.reason == "transfer timeout"
 
 
@@ -116,10 +129,39 @@ def test_unpublished_cancellation_is_retirable_without_fatal() -> None:
     watchdog.stop()
 
 
+def test_retention_query_observes_owner_lifecycle_without_progress() -> None:
+    """Observation neither retires an owner nor changes clocks or admission."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+
+    def assert_retention(expected: bool) -> None:
+        """Check the snapshot without progressing or stopping the watchdog."""
+        clock.reset_mock()
+        assert watchdog.has_retained_owners is expected
+        clock.assert_not_called()
+        notify.assert_not_called()
+        assert not watchdog._stopped.is_set()
+        assert not watchdog.admission_closed
+
+    assert_retention(False)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    assert_retention(True)
+    claim = object()
+    assert owner.expose(claim)
+    assert_retention(True)
+    assert owner._claims == {id(claim): claim}
+    assert owner.settle(claim)
+    assert_retention(True)
+    assert watchdog._owners == {owner}
+    assert owner.close()
+    assert_retention(False)
+    watchdog.stop()
+
+
 def test_fatal_closes_all_admission_and_keeps_sibling_roots() -> None:
     """One fatal owner closes the worker, not merely its own next operation."""
-    clock = Mock(return_value=10.0)
-    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
     sender = watchdog.create_owner(4, "send", 5.0)
     receiver = watchdog.create_owner(5, "receive", 5.0)
     source, destination = object(), object()
@@ -128,6 +170,13 @@ def test_fatal_closes_all_admission_and_keeps_sibling_roots() -> None:
     sender.request_drain("failed")
     clock.return_value = 15.0
     watchdog.progress()
+    clock.reset_mock()
+    assert watchdog.has_retained_owners
+    clock.assert_not_called()
+    notify.assert_called_once_with(watchdog.fatal)
+    assert not watchdog._stopped.is_set()
+    assert sender._claims == {id(source): source}
+    assert receiver._claims == {id(destination): destination}
     assert not receiver.settle(destination)
     assert not receiver.expose(object())
     with pytest.raises(RuntimeError, match="admission is closed"):
@@ -302,12 +351,18 @@ def test_repeated_done_is_idempotent_after_another_owner_becomes_fatal() -> None
     assert not task.resources_drained
 
 
-@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])
-def test_invalid_deadline_is_rejected_before_admission(timeout: float) -> None:
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), -float("inf"), float("nan")])
+@pytest.mark.parametrize("invalid_grace", [False, True])
+def test_invalid_deadline_is_rejected_before_admission(timeout: float, invalid_grace: bool) -> None:
     """Unbounded and non-positive settings cannot activate deadline enforcement."""
     watchdog = RetirementWatchdog(Mock())
     with pytest.raises(ValueError, match="finite positive"):
-        watchdog.create_owner(4, "send", timeout)
+        watchdog.create_owner(
+            4,
+            "send",
+            5.0 if invalid_grace else timeout,
+            grace_s=timeout if invalid_grace else 5.0,
+        )
     assert not watchdog._owners
 
 
