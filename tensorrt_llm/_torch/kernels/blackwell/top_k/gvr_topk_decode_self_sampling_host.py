@@ -954,6 +954,7 @@ def _varlen_launcher(
             and sm_version in (100, 103)
             else None,
             dense_bracket=k <= 512,
+            dense_lower_bound=k > 512 and n_kernel < 2 * k,
             bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8192 else 1,
             warp_rank=(
                 ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
