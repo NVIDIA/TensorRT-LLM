@@ -588,8 +588,10 @@ public:
                 TORCH_CHECK(v.has_value());
                 TORCH_CHECK(k->dim() == 2);
                 TORCH_CHECK(v->dim() == 2);
-                TORCH_CHECK(k->strides()[1] == 1);
-                TORCH_CHECK(v->strides()[1] == 1);
+                TORCH_CHECK(
+                    k->strides()[1] == 1, "Separate-K context FMHA requires contiguous K features within each token");
+                TORCH_CHECK(
+                    v->strides()[1] == 1, "Separate-V context FMHA requires contiguous V features within each token");
 
                 k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
@@ -955,6 +957,16 @@ public:
                 TORCH_CHECK(
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
+            }
+            if (op.mIsMLAEnabled && v_ptr != nullptr && v.has_value())
+            {
+                TORCH_CHECK(v->stride(0) > 0, "Separate-V context FMHA requires a positive V token stride");
+                enqueue_params.v_stride_in_bytes = v->stride(0) * v->element_size();
+                constexpr int64_t kTmaAlignmentBytes = 16;
+                TORCH_CHECK(enqueue_params.v_stride_in_bytes % kTmaAlignmentBytes == 0,
+                    "Separate-V context FMHA requires a 16-byte aligned V token stride");
+                TORCH_CHECK(reinterpret_cast<std::uintptr_t>(v_ptr) % kTmaAlignmentBytes == 0,
+                    "Separate-V context FMHA requires a 16-byte aligned V pointer");
             }
             if (is_cross && cross_kv.has_value())
             {
