@@ -1065,6 +1065,8 @@ class PyTorchModelEngine(ModelEngine):
         if record_msa:
             from ..attention.backends.sparse.minimax_m3 import jit_prefetch_msa
             jit_prefetch_msa.start_recording()
+            if self._uses_minimax_m3_msa():
+                self._start_msa_fmha_builds(resource_manager)
         try:
             self._runner.warmup(resource_manager)
         finally:
@@ -1083,6 +1085,31 @@ class PyTorchModelEngine(ModelEngine):
         sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
         return getattr(sparse_cfg, "algorithm", None) == "minimax_m3"
 
+    def _uses_minimax_m3_msa(self) -> bool:
+        sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
+        return self._uses_minimax_m3_sparse() and getattr(
+            sparse_cfg, "implementation", None) == "msa"
+
+    def _start_msa_fmha_builds(self, resource_manager: ResourceManager) -> None:
+        """Start building MiniMax-M3's MSA fmha_sm100 kernels in CPU-only
+        helpers, before the first warmup forward needs them (see
+        ``jit_prefetch.FmhaSm100Builds``). Every kernel follows from the
+        engine's geometry; once per process."""
+        from ..jit_prefetch import FmhaSm100Builds
+        if FmhaSm100Builds.get() is not None:
+            return
+        try:
+            from ..attention.backends.sparse.minimax_m3.jit_prefetch_fmha import \
+                MiniMaxM3FmhaProvider
+            provider = MiniMaxM3FmhaProvider(
+                self.model,
+                resource_manager.get_resource_manager(
+                    self.kv_cache_manager_key))
+            FmhaSm100Builds.start(provider)
+        except Exception as e:  # noqa: BLE001 - kernels then build in place
+            logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: "
+                           f"{type(e).__name__}: {e}")
+
     def _init_jit_prefetch(self) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
         ``tensorrt_llm/_torch/jit_prefetch.py``)."""
@@ -1091,6 +1118,8 @@ class PyTorchModelEngine(ModelEngine):
         self._jit_prefetcher = prefetcher
         if prefetcher is not None and get_sm_version() in (100, 103):
             prefetcher.observe_deep_gemm()
+            if self._uses_minimax_m3_msa():
+                prefetcher.install_fmha_sm100_counter()
         if prefetcher is None or not prefetch_enabled():
             return
         from .. import jit_prefetch_deep_gemm as jdg

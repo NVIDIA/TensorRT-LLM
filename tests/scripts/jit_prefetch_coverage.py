@@ -37,7 +37,8 @@ import time
 _EVENT_RE = re.compile(
     r"\[JIT stats\] rank (\d+) t=[0-9.]+ "
     r"(COMPILE on executor|AUTOTUNE on executor|CUTE_DSL compile on executor|"
-    r"DeepGEMM compile on executor|DEEP_GEMM compile in process)\s+(\S+)"
+    r"DeepGEMM compile on executor|DEEP_GEMM compile in process|"
+    r"FMHA_SM100 compile on executor)\s+(\S+)"
 )
 
 

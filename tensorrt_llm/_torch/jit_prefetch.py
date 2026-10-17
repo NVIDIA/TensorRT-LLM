@@ -33,7 +33,10 @@ ahead of that. Some providers take the batch-independent part of a launch
 (pool layouts, fixed scalars) from the launches warmup made; they are
 enumerated again after each warmup. DeepGEMM and CuTe DSL providers do the
 same through those libraries' compile-only entry points
-(``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``).
+(``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``). MiniMax-M3's
+MSA ``fmha_sm100`` kernels follow from the engine's geometry alone, so they
+are built from the start of warmup rather than at its end
+(:class:`FmhaSm100Builds`).
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -324,6 +327,154 @@ def cancel_flashinfer_build() -> None:
 
 
 # ---------------------------------------------------------------------------
+# MSA fmha_sm100 kernels built from the start of warmup
+# ---------------------------------------------------------------------------
+
+
+class FmhaSm100Builds:
+    """CPU-only helpers building MiniMax-M3's MSA ``fmha_sm100`` kernels.
+
+    ``fmha_sm100`` (the MSA backend's context-phase kernels) builds each
+    kernel with nvcc the first time a call needs it, 50-100 s each: a cold
+    MiniMax-M3 context server builds about a dozen, most of them in warmup
+    forwards and the rest in the first serving steps that reach a new
+    context-row class. Every one of them is known from the engine's geometry
+    (``minimax_m3/jit_prefetch_fmha.py``), so this pool starts building all of
+    them when warmup starts, in ``jit_prefetch_fmha_sm100_helper.py``
+    processes with no visible GPU, into the directories ``fmha_sm100`` loads
+    from, while the warmup forwards run on the GPU. A forward that needs a
+    kernel a helper is building waits on the per-kernel file lock that build
+    holds, and then loads it; one no helper has started (more kernels than
+    helpers) it builds itself, as without prefetch, and the helper then
+    finds it built. A failed helper build leaves the kernel to the forward.
+
+    Started once per process (the KV-cache estimation pass and the final
+    executor share the kernels); helpers exit when their queue is drained.
+    """
+
+    _instance: Optional["FmhaSm100Builds"] = None
+
+    def __init__(self, specs: List[str], pkg_dir: str, cache_base: str, n: int):
+        import subprocess
+        import sys
+
+        self.specs = list(specs)
+        self.t0 = time.perf_counter()
+        self.done: Dict[str, Tuple[bool, bool, float, str]] = {}
+        self._lock = threading.Lock()
+        self._queue: "queue.Queue[Tuple[int, str]]" = queue.Queue()
+        for tag, spec in enumerate(self.specs):
+            self._queue.put((tag, spec))
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
+        }
+        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
+        env.pop("PYTHONPATH", None)
+        helper = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_fmha_sm100_helper.py"
+        )
+        self.procs = []
+        for _ in range(n):
+            proc = subprocess.Popen(
+                [sys.executable, "-u", helper, str(os.getpid()), pkg_dir, cache_base],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                env=env,
+                cwd="/tmp",
+                text=True,
+                bufsize=1,
+            )
+            try:
+                os.setpriority(os.PRIO_PROCESS, proc.pid, 19)
+            except OSError:
+                pass
+            self.procs.append(proc)
+            threading.Thread(target=self._serve, args=(proc,), daemon=True).start()
+
+    def _serve(self, proc) -> None:
+        """Feed one helper a request at a time until the queue is empty. A
+        helper that exits early leaves its kernels to be built in place."""
+        if not proc.stdout.readline():
+            logger.warning(f"[JIT prefetch] fmha_sm100 helper {proc.pid} exited before it started")
+            return
+        while True:
+            try:
+                tag, spec = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            r = None
+            try:
+                proc.stdin.write(json.dumps({"tag": tag, "spec": spec}) + "\n")
+                proc.stdin.flush()
+                r = json.loads(proc.stdout.readline() or "null")
+            except (OSError, ValueError):
+                pass
+            if not isinstance(r, dict):
+                logger.warning(
+                    f"[JIT prefetch] fmha_sm100 helper {proc.pid} exited while building {spec}"
+                )
+                with self._lock:
+                    self.done[spec] = (False, False, 0.0, "helper exited")
+                break
+            with self._lock:
+                self.done[spec] = (bool(r["ok"]), bool(r["built"]), float(r["s"]), r["err"])
+            if not r["ok"]:
+                logger.warning(f"[JIT prefetch] fmha_sm100 helper failed on {spec}: {r['err']}")
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    @classmethod
+    def start(cls, provider) -> bool:
+        """Start building ``provider.specs`` (once per process). Returns False
+        if prefetch is off, there is nothing to build, or it already started."""
+        if not prefetch_enabled() or cls._instance is not None or not provider:
+            return False
+        try:
+            from .attention.backends.sparse.minimax_m3.jit_prefetch_fmha import fmha_jit_module
+
+            jit = fmha_jit_module()
+            pkg_dir = os.path.dirname(os.path.abspath(jit.__file__))
+            cache_base = str(jit.CACHE_BASE)
+        except Exception as e:  # noqa: BLE001 - the kernels then build in place
+            logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: {type(e).__name__}: {e}")
+            return False
+        n = max(
+            1,
+            min(
+                len(provider.specs),
+                int(os.environ.get("TLLM_JIT_PREFETCH_FMHA_WORKERS", str(_default_workers()))),
+            ),
+        )
+        cls._instance = cls(provider.specs, pkg_dir, cache_base, n)
+        # print(), as the [JIT stats] events: the experiment's record.
+        print(
+            f"[JIT prefetch] building {len(provider.specs)} MSA fmha_sm100 kernel(s) in {n} "
+            f"CPU-only helper(s) into {cache_base}",
+            flush=True,
+        )
+        return True
+
+    @classmethod
+    def get(cls) -> Optional["FmhaSm100Builds"]:
+        return cls._instance
+
+    def counts(self) -> Tuple[int, int, int, int]:
+        """(requested, finished, built by a helper, failed)."""
+        with self._lock:
+            done = list(self.done.values())
+        return (
+            len(self.specs),
+            len(done),
+            sum(1 for ok, built, _, _ in done if ok and built),
+            sum(1 for ok, _, _, _ in done if not ok),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Triton plumbing
 # ---------------------------------------------------------------------------
 
@@ -582,6 +733,12 @@ class _Stats:
     ta_compile_s: float = 0.0
     ta_wait_s: float = 0.0
     ta_s: float = 0.0
+    # MSA fmha_sm100 kernels (FmhaSm100Builds): built by the helpers, failed
+    # there, and built in process on the executor thread after warmup.
+    fmha_helper_built: int = 0
+    fmha_helper_fail: int = 0
+    fmha_executor_compiles: int = 0
+    fmha_executor_compile_s: float = 0.0
     events: List[str] = field(default_factory=list)
 
 
@@ -928,6 +1085,7 @@ class JitPrefetcher:
             self._executor_thread = threading.get_ident()
             self._event("executor thread bound; counting JIT from here")
             self._take_deep_gemm_compiles(report=False)
+            self.report_fmha_sm100_builds()
             return
         self._take_deep_gemm_compiles(report=True)
 
@@ -1401,6 +1559,67 @@ class JitPrefetcher:
             )
 
     # -- measurement hooks ------------------------------------------------
+    def install_fmha_sm100_counter(self) -> None:
+        """Count and time every MSA ``fmha_sm100`` kernel built in this
+        process on the executor thread (``FMHA_SM100 compile on executor``
+        events; ``fmha_executor_compiles`` / ``fmha_executor_compile_s`` in the
+        summary). Called by the MiniMax-M3 MSA setup; idempotent."""
+        try:
+            from .attention.backends.sparse.minimax_m3.jit_prefetch_fmha import fmha_jit_module
+
+            jit = fmha_jit_module()
+        except Exception:  # noqa: BLE001 - no fmha_sm100, nothing to count
+            return
+        cls = jit.FMHAVariantManager
+        if getattr(cls._compile_only, "_jitp_wrapped", False):
+            return
+        me = self
+
+        def counted(orig, what):
+            # what(args) -> (name, path of the library the call would build)
+            def wrapper(*args, **kwargs):
+                if threading.get_ident() != me._executor_thread:
+                    return orig(*args, **kwargs)
+                name, lib = what(args)
+                if lib.exists():
+                    return orig(*args, **kwargs)
+                t0 = time.perf_counter()
+                try:
+                    return orig(*args, **kwargs)
+                finally:
+                    dt = time.perf_counter() - t0
+                    me.stats.fmha_executor_compiles += 1
+                    me.stats.fmha_executor_compile_s += dt
+                    me._event(f"FMHA_SM100 compile on executor {name} {dt * 1e3:.0f} ms")
+
+            wrapper._jitp_wrapped = True
+            return wrapper
+
+        base = jit.CACHE_BASE
+        cls._compile_only = counted(
+            cls._compile_only, lambda a: (f"variant_{a[1]}", base / a[1] / f"{a[1]}.so")
+        )
+        for fn, sub, lib in (
+            ("_do_compile_plan", "plan", "fmha_sm100_plan.so"),
+            ("_do_compile_reduction", "reduction", "fmha_sm100_reduction.so"),
+            ("_do_compile_sparse_topk", "sparse_topk", "sparse_topk_select.so"),
+        ):
+            orig = getattr(jit, fn, None)
+            if orig is not None:
+                setattr(jit, fn, counted(orig, lambda a, s=sub, f=lib: (s, base / s / f)))
+
+    def report_fmha_sm100_builds(self) -> None:
+        builds = FmhaSm100Builds.get()
+        if builds is None:
+            return
+        requested, finished, built, failed = builds.counts()
+        self.stats.fmha_helper_built = built
+        self.stats.fmha_helper_fail = failed
+        self._event(
+            f"fmha_sm100 helpers: {finished}/{requested} kernel(s) done "
+            f"({built} built, {failed} failed) {time.perf_counter() - builds.t0:.0f} s after start"
+        )
+
     def _install_cute_dsl_counter(self) -> None:
         """Count and time every ``cute.compile`` on the executor thread.
 
@@ -1589,6 +1808,9 @@ class JitPrefetcher:
             f" ta_batches={s.ta_batches} ta_tunes={s.ta_tunes} ta_tune_s={s.ta_tune_s:.3f}"
             f" ta_compiles={s.ta_compiles} ta_compile_s={s.ta_compile_s:.3f}"
             f" ta_wait_s={s.ta_wait_s:.3f} ta_s={s.ta_s:.3f}"
+            f" fmha_helper_built={s.fmha_helper_built} fmha_helper_fail={s.fmha_helper_fail}"
+            f" fmha_executor_compiles={s.fmha_executor_compiles}"
+            f" fmha_executor_compile_s={s.fmha_executor_compile_s:.3f}"
         )
 
     def shutdown(self):
@@ -1601,6 +1823,7 @@ class JitPrefetcher:
         """
         if self._executor_thread is not None:
             self._take_deep_gemm_compiles(report=True)
+        self.report_fmha_sm100_builds()
         # print(), not only the logger: the summary is the experiment's
         # measurement and must reach the log at any log level.
         print(self.summary(), flush=True)
