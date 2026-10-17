@@ -160,8 +160,8 @@ struct DMA
         // buffer, so the seq coordinate is the global row = this request's
         // cumulative token offset (binfo.sum_s == cu_q_seqlens[bidb]) plus the
         // request-local position; without it every batch element re-reads
-        // request 0. KV reuses sum_s (PACKED_QKV: K/V share Q's token range) --
-        // sum_s_kv would deref the null cu_kv_seqlens on the self-attention path.
+        // request 0. PACKED_QKV makes K/V share Q's token range, so the KV
+        // offset is the same quantity and binfo.sum_s serves both.
         int const q_seq_offset = binfo.sum_s;
         int const kv_seq_offset = binfo.sum_s;
 
