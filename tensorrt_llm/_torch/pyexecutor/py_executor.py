@@ -8627,7 +8627,7 @@ class PyExecutor:
             # Failures parked for in-flight transfers no longer wait: the
             # executor exits instead of reusing their blocks, and they must
             # be failed with everything else.
-            self._transfer_held_failures.clear()
+            self._held_transfer_failures().clear()
 
             # Drain waiting_queue so that queued-but-not-yet-activated
             # requests don't get picked up on the next iteration.
@@ -8712,9 +8712,9 @@ class PyExecutor:
                     request for request in failed_requests
                     if id(request) not in held_ids
                 ]
+                parked = self._held_transfer_failures()
                 for request in held_requests:
-                    self._transfer_held_failures[id(request)] = (request,
-                                                                 error_msg)
+                    parked[id(request)] = (request, error_msg)
                 logger.warning(
                     f"Deferring failure of {len(held_requests)} request(s) "
                     "whose KV blocks a transfer still owns")
@@ -8736,11 +8736,9 @@ class PyExecutor:
                 error_msg=error_msg,
                 client_id=request.py_client_id)
         if requests is None:
-            if self._transfer_held_failures:
-                held_ids = {
-                    id(request)
-                    for request, _ in self._transfer_held_failures.values()
-                }
+            parked = self._held_transfer_failures()
+            if parked:
+                held_ids = {id(request) for request, _ in parked.values()}
                 self.active_requests = [
                     request for request in self.active_requests
                     if id(request) in held_ids
@@ -8818,7 +8816,8 @@ class PyExecutor:
             connector.release_unstarted_prefix_loads(request)
             if connector.defer_load_termination(request):
                 return
-        if self._is_kv_manager_v2 or self.kv_cache_transceiver is not None:
+        if (getattr(self, "_is_kv_manager_v2", False)
+                or getattr(self, "kv_cache_transceiver", None) is not None):
             transfers = getattr(self, "async_transfer_manager", None)
             if (transfers is not None and request.py_request_id
                     in transfers.requests_in_transfer()):
@@ -8901,7 +8900,7 @@ class PyExecutor:
         pipelined chunk before the final send -- has the fabric reading or
         writing unpinned blocks, so freeing must wait for the transfer.
         """
-        if self.kv_cache_transceiver is None:
+        if getattr(self, "kv_cache_transceiver", None) is None:
             return False
         try:
             if not self._is_request_in_transmission(request):
@@ -8915,6 +8914,18 @@ class PyExecutor:
         return not (transfers is not None and getattr(
             request, "py_request_id", None) in transfers.requests_in_transfer())
 
+    def _held_transfer_failures(self) -> Dict[int, Tuple[LlmRequest, str]]:
+        """Parked transfer-held failures, created on first touch.
+
+        Lazy so partially constructed executors (tests build shells with
+        object.__new__ that skip __init__) can run the error and loop
+        paths without pre-seeding the field.
+        """
+        held = getattr(self, "_transfer_held_failures", None)
+        if held is None:
+            held = self._transfer_held_failures = {}
+        return held
+
     def _sweep_transfer_held_failures(self) -> None:
         """Fail parked requests once no transfer owns their blocks.
 
@@ -8922,18 +8933,18 @@ class PyExecutor:
         transfer completed this iteration is failed before it can be admitted
         to a batch.
         """
-        if not self._transfer_held_failures:
+        parked = self._held_transfer_failures()
+        if not parked:
             return
-        for key, (request,
-                  error_msg) in list(self._transfer_held_failures.items()):
+        for key, (request, error_msg) in list(parked.items()):
             if request not in self.active_requests:
                 # Another path (transfer-error consensus, cancellation,
                 # shutdown) already finished this request.
-                del self._transfer_held_failures[key]
+                del parked[key]
                 continue
             if self._transfer_owns_request_blocks(request):
                 continue
-            del self._transfer_held_failures[key]
+            del parked[key]
             self._handle_errors(error_msg,
                                 requests=[request],
                                 charge_budget=False)
