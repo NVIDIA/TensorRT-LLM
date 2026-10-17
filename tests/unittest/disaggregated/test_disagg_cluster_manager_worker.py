@@ -10,6 +10,7 @@ from unittest.mock import ANY, AsyncMock, patch
 import pytest
 import pytest_asyncio
 from test_cluster_storage import http_server_storage
+from test_common.disagg_faults import Fault, FaultScenario
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
@@ -97,17 +98,20 @@ async def test_heartbeat_survives_stalled_refresh_within_ttl():
                                  storage)
 
     refreshed_at = []
-    stalls_left = 1
+    scenario = FaultScenario([
+        Fault("storage.expire",
+              worker.worker_key,
+              "delay",
+              gate="stalled-refresh")
+    ])
 
-    async def stalled_then_ok(*args, **kwargs):
-        nonlocal stalls_left
-        if stalls_left > 0:
-            stalls_left -= 1
-            # Far longer than the TTL, as a stuck client-side timeout would be.
-            await asyncio.sleep(config.inactive_timeout_sec * 5)
+    async def refresh():
         refreshed_at.append(key_time())
         worker._stop = True
         return True
+
+    async def stalled_then_ok(*args, **kwargs):
+        return await scenario.run("storage.expire", worker.worker_key, refresh)
 
     storage.expire.side_effect = stalled_then_ok
     worker._last_heartbeat = key_time()
@@ -125,6 +129,10 @@ async def test_heartbeat_survives_stalled_refresh_within_ttl():
         f"refresh landed at {refreshed_at[0]} after the registration expired "
         f"at {deadline}")
     storage.set.assert_not_awaited()
+    scenario.assert_consumed()
+    scenario.assert_idle()
+    events = [event.event for event in scenario.trace]
+    assert events == ["entered", "blocked", "cancelled", "entered", "completed"]
 
 
 @pytest.mark.asyncio

@@ -70,3 +70,23 @@ cancellation, injected failure/retry and cancellation of a pending drain. These
 test queue behavior and the helper's use at a real component boundary. They do
 not establish full DisaggClusterManager reconciliation, worker lifecycle,
 KV-transfer timeout handling, NIXL/UCX cancellation, or GPU correctness.
+
+The existing `test_heartbeat_survives_stalled_refresh_within_ttl` regression in
+`tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py` uses a
+scripted delay on the first storage refresh. The worker's real per-attempt
+timeout cancels that call, and the next attempt succeeds. The test retains its
+registration-deadline and retry assertions and checks the cancellation/retry
+trace and scenario cleanup. Its TTL checks still use the production clock;
+the gate only replaces the artificial long-running storage call.
+
+In a TensorRT-LLM development environment matching the checkout, run:
+
+```bash
+pytest -m cpu_only \
+  tests/unittest/disaggregated/test_fault_scenario.py \
+  tests/unittest/disaggregated/test_cluster_storage_faults.py \
+  tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py::test_heartbeat_survives_stalled_refresh_within_ttl
+```
+
+These tests use the normal production imports and require the corresponding
+Python/native dependencies even though they do not perform GPU inference.
