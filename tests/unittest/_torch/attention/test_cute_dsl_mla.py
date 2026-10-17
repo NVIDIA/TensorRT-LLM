@@ -123,7 +123,14 @@ class _TrtllmGenStub:
 
 
 def _select_mla_generation_fmha(
-    monkeypatch, *, sm: int, num_heads: int, seq_len_q: int, fp8_kv: bool, helix: bool
+    monkeypatch,
+    *,
+    sm: int,
+    num_heads: int,
+    seq_len_q: int,
+    fp8_kv: bool,
+    helix: bool,
+    batch_size: int = 4,
 ):
     """Run FmhaManager._select_mla over [CuteDslMlaFmha, TRTLLM-Gen stub] on CPU."""
     from tensorrt_llm._torch.attention.backends.fmha import cute_dsl_mla
@@ -145,7 +152,6 @@ def _select_mla_generation_fmha(
         CuteDslMlaFmha, "_kernel_can_implement", staticmethod(lambda *args, **kwargs: (True, ""))
     )
 
-    batch_size = 4
     num_tokens = batch_size * seq_len_q
     attn = SimpleNamespace(
         num_heads=num_heads,
@@ -186,29 +192,30 @@ def _select_mla_generation_fmha(
 
 
 @pytest.mark.parametrize(
-    "sm, num_heads, seq_len_q, fp8_kv, helix, expected",
+    "sm, num_heads, seq_len_q, fp8_kv, helix, expected, batch_size",
     [
         # Non-helix FP8 verify group at H=96 (DSpark under attention DP): the
         # TRTLLM-Gen MLA decode rejects 64 < H < 128, so it must not be chosen.
-        (103, 96, 8, True, False, "cute_dsl_mla"),
-        (100, 96, 8, True, False, "cute_dsl_mla"),
-        (103, 96, 2, True, False, "cute_dsl_mla"),
+        (103, 96, 8, True, False, "cute_dsl_mla", 4),
+        (100, 96, 8, True, False, "cute_dsl_mla", 4),
+        (103, 96, 2, True, False, "cute_dsl_mla", 4),
         # SM107 has no TRTLLM-Gen FMHA; the request keeps falling through.
-        (107, 96, 8, True, False, "trtllm_gen"),
+        (107, 96, 8, True, False, "trtllm_gen", 4),
         # Helix H=96 verify groups are unchanged.
-        (103, 96, 4, True, True, "cute_dsl_mla"),
-        (107, 96, 4, True, True, "cute_dsl_mla"),
-        # Single-token H=96 is unchanged (measured perf-table entry).
-        (103, 96, 1, True, False, "cute_dsl_mla"),
+        (103, 96, 4, True, True, "cute_dsl_mla", 4),
+        (107, 96, 4, True, True, "cute_dsl_mla", 4),
+        # Single-token H=96 retains the measured batch-size floor of eight.
+        (103, 96, 1, True, False, "cute_dsl_mla", 8),
+        (103, 96, 1, True, False, "trtllm_gen", 4),
         # Head counts TRTLLM-Gen serves keep the perf gate.
-        (103, 128, 8, True, False, "trtllm_gen"),
-        (103, 64, 8, True, False, "trtllm_gen"),
+        (103, 128, 8, True, False, "trtllm_gen", 4),
+        (103, 64, 8, True, False, "trtllm_gen", 4),
         # BF16 KV is unchanged (H=96 is already admitted for any seq_len_q).
-        (103, 96, 8, False, False, "cute_dsl_mla"),
+        (103, 96, 8, False, False, "cute_dsl_mla", 4),
     ],
 )
 def test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen(
-    monkeypatch, sm, num_heads, seq_len_q, fp8_kv, helix, expected
+    monkeypatch, sm, num_heads, seq_len_q, fp8_kv, helix, expected, batch_size
 ) -> None:
     assert (
         _select_mla_generation_fmha(
@@ -218,6 +225,7 @@ def test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen(
             seq_len_q=seq_len_q,
             fp8_kv=fp8_kv,
             helix=helix,
+            batch_size=batch_size,
         )
         == expected
     )

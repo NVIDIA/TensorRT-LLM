@@ -222,13 +222,16 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
 
     model, _, _ = _create_prefill_compiled_model()
     runner = _create_compile_restricted_runner(model, enabled=enabled)
+    runner._dspark_confidence_enabled = False
     runner.model.config = SimpleNamespace(vocab_size=128)
     runner.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     runner.guided_decoder = None
     runner._metrics = {}
     runner._warmup_timer = _WarmupTimer(rank=0)
     runner.cuda_graph_runner = SimpleNamespace(
-        allow_capture=contextlib.nullcontext, preallocate_padding_dummies=Mock()
+        allow_capture=contextlib.nullcontext,
+        preallocate_padding_dummies=Mock(),
+        reset_padding_dummies=Mock(),
     )
     runner._agree_warmup_flag = lambda value: value
     runner._agree_warmup_shapes = lambda shapes: shapes
@@ -288,6 +291,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         ("_run_cuda_graph_warmup", True),
         ("_general_warmup", not enabled),
     ]
+    assert runner.cuda_graph_runner.reset_padding_dummies.call_count == 2
     assert not model._bypass_active
 
 

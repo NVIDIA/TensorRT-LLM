@@ -136,8 +136,8 @@ def test_worker_lazy_init_window_buffers():
     assert worker._valid_len.shape == (9,)
     assert worker._position_initialized.shape == (9,)
     assert worker._scratch_slot == 8
-    # Dummy-id floor separates real request ids from CUDA-graph padding ids.
-    assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
+    # Both CUDA-graph padding families lie at or above the dummy-id floor.
+    assert worker._graph_dummy_id_floor == (1 << 64) - 2 * (worker.max_draft_len + 1)
     # The scratch row is never handed out through the free pool.
     assert list(worker._free_slots) == list(range(8))
     assert worker._batch_to_slot is not None
