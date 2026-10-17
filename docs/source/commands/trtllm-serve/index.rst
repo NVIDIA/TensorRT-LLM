@@ -7,3 +7,4 @@ trtllm-serve
 
    trtllm-serve
    run-benchmark-with-trtllm-serve
+   audio-transcriptions
