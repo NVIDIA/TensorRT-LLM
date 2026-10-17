@@ -263,7 +263,8 @@ void initBindings(nb::module_& m)
         nb::arg("quant_scale_qkv") = std::nullopt, nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt,
         nb::arg("enable_dsv4_epilogue_fusion") = false, nb::arg("force_prepare_spec_dec_tree_mask") = false,
         nb::arg("max_num_sequences") = std::nullopt, nb::arg("kv_norm_weight") = std::nullopt,
-        nb::arg("kv_norm_eps") = 1e-6, nb::arg("skip_correction_threshold") = 0.0,
+        nb::arg("kv_norm_eps") = 1e-6, nb::arg("variable_window_token_starts") = std::nullopt,
+        nb::arg("variable_window_token_ends") = std::nullopt, nb::arg("skip_correction_threshold") = 0.0,
         nb::arg("uses_spcompress") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 
