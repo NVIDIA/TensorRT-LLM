@@ -53,8 +53,8 @@ def get_long_seq_len(window: int) -> int:
     return window + 17
 
 
-def _phases_from_window(window: int) -> dict:
-    long_len = get_long_seq_len(window)
+def _phases(long_len: int, gen_len: int) -> dict:
+    """The ctx/gen/mix batch shapes, parameterized by context and generation len."""
     return {
         "ctx": dict(
             seq_lens=[long_len, 73, 41],
@@ -62,16 +62,20 @@ def _phases_from_window(window: int) -> dict:
             num_contexts=3,
         ),
         "gen": dict(
-            seq_lens=[1, 1, 1],
+            seq_lens=[gen_len] * 3,
             num_cached_tokens=[long_len, 73, 41],
             num_contexts=0,
         ),
         "mix": dict(
-            seq_lens=[long_len, 1, 1],
+            seq_lens=[long_len, gen_len, gen_len],
             num_cached_tokens=[0, long_len, 73],
             num_contexts=1,
         ),
     }
+
+
+def _phases_from_window(window: int) -> dict:
+    return _phases(get_long_seq_len(window), gen_len=1)
 
 
 # Standard self-attention batch phases. Non-sliding cases use a nominal window
@@ -80,7 +84,25 @@ def _phases_from_window(window: int) -> dict:
 _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
+# Model-agnostic sparse sweep dimensions. Each algorithm's cache manager fixes
+# its layout and manager version: DSA runs on the V1 head-major cache, and the
+# MiniMax-M3 manager is V2-only with NHD views for its Triton runtime.
+_SPARSE_COMPUTE_DTYPE = "bfloat16"
+_SPARSE_PAGE_SIZE = 64
+_SPARSE_CACHE = {
+    "dsa": dict(kv_layout="HND", use_kv_cache_manager_v2=False),
+    "minimax_m3": dict(kv_layout="NHD", use_kv_cache_manager_v2=True),
+}
+# Minimum SM per sparse algorithm. The DSA sweep includes TRTLLM's
+# Blackwell-only trtllm-gen sparse FMHA; MiniMax-M3's Triton runtime also runs
+# on Hopper.
+_SPARSE_MIN_SM_VERSION = {"dsa": 100}
+
+
 def _phases_for(cfg: ModelAttnConfig) -> dict:
+    if cfg.sparse_attention_config is not None:
+        # A long row past every selectable token keeps the selection sparse.
+        return _phases(cfg.sparse_selected_tokens + 32, gen_len=1)
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -120,7 +142,10 @@ def _common(cfg: ModelAttnConfig) -> dict:
             qk_nope_head_dim=cfg.qk_nope_head_dim,
             qk_rope_head_dim=cfg.qk_rope_head_dim,
             v_head_dim=cfg.v_head_dim,
+            hidden_size=cfg.hidden_size,
         )
+    if cfg.sparse_attention_config is not None:
+        common.update(sparse_attention_config=cfg.sparse_attention_config)
     return common
 
 
@@ -142,6 +167,31 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     """
     common = _common(cfg)
     phases = _phases_for(cfg)
+
+    # Sparse cases use one model-agnostic sweep per algorithm (bf16 cache, the
+    # algorithm's layout and manager, fixed page). Every backend runs its own
+    # selection over shared inputs, so a case covers selection and execution
+    # together; the phase lengths (selection budget + 32) keep every long row
+    # genuinely sparse.
+    if cfg.sparse_attention_config is not None:
+        cache = _SPARSE_CACHE[cfg.sparse_attention_config.algorithm]
+        manager = "v2" if cache["use_kv_cache_manager_v2"] else "v1"
+        tag = (
+            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{cache['kv_layout']}"
+            f"-p{_SPARSE_PAGE_SIZE}-{manager}"
+        )
+        for phase_name in ("ctx", "gen", "mix"):
+            yield (
+                f"{cfg.id}-{phase_name}-{tag}",
+                BackendCase(
+                    page_size=_SPARSE_PAGE_SIZE,
+                    dtype=_SPARSE_COMPUTE_DTYPE,
+                    **cache,
+                    **phases[phase_name],
+                    **common,
+                ),
+            )
+        return
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.
     if cfg.no_cache:
@@ -231,7 +281,14 @@ MODEL_CASES = _model_cases()
 
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
-    run_case(MODEL_CASES[name])
+    case = MODEL_CASES[name]
+    min_sm = _SPARSE_MIN_SM_VERSION.get(case.sparse_algorithm)
+    if min_sm is not None and getSMVersion() < min_sm:
+        pytest.skip(
+            f"{case.sparse_algorithm} sparse attention requires sm>={min_sm} "
+            f"(have sm{getSMVersion()})"
+        )
+    run_case(case)
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,9 @@ Layered as:
                                 orchestrator) and its
                                 :class:`AttentionBackend` subclass
                                 factory.
+  * :mod:`.vanilla_backend` -- the pure-PyTorch golden of the Triton
+                                reference, selected by the VANILLA
+                                attention backend.
   * :mod:`.msa_backend`     -- the MSA (fmha_sm100) backend, its flat
                                 metadata, and the backend factory.
   * :mod:`.msa_indexer`     -- the MSA proxy scoring + top-k block
@@ -53,9 +56,12 @@ from .triton_backend import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
+from .vanilla_backend import MiniMaxM3VanillaAttention, MiniMaxM3VanillaIndexer
 
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3MsaSparseAttention",
     "MiniMaxM3SparseRuntimeBackend",
+    "MiniMaxM3VanillaAttention",
+    "MiniMaxM3VanillaIndexer",
 ]

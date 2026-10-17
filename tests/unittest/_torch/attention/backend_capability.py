@@ -20,7 +20,7 @@ from utils.util import getSMVersion
 #   fp4_kv         - NVFP4 KV cache (Blackwell only)
 #   sliding_window - sliding-window attention via attention_window_size
 #   no_cache       - ragged/prefill forward with kv_cache_manager=None
-#   sparse         - sparse-attention forward plumbing (degenerate regime here)
+#   sparse         - sparse-attention forward plumbing
 #   mla            - multi-head latent attention
 #   cross_attn     - cross-attention (encoder-decoder)
 #   kv_layouts     - supported paged-cache block layouts ("NHD" / "HND")
@@ -60,12 +60,17 @@ BACKEND_CAPS = {
         fp4_kv=False,
         sliding_window=True,
         no_cache=True,
-        sparse=False,
+        sparse=True,
         mla=True,
         cross_attn=True,
         kv_layouts=("NHD",),  # reads the NHD get_buffers view
     ),
 }
+
+# Sparse algorithms whose backends store the paged cache in a fixed layout of
+# their own. MiniMax-M3 resolves TRTLLM to its Triton runtime, which reads the
+# NHD views of the MiniMax-M3 V2 cache manager.
+_SPARSE_KV_LAYOUTS = {"minimax_m3": ("NHD",)}
 
 _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96, 512)
 
@@ -86,7 +91,7 @@ def required_features(case) -> set:
         feats.add("sliding_window")
     if getattr(case, "cache", "paged") == "none":
         feats.add("no_cache")
-    if getattr(case, "sparse", "off") != "off":
+    if getattr(case, "sparse_attention_config", None) is not None:
         feats.add("sparse")
     if getattr(case, "is_mla", False):
         feats.add("mla")
@@ -119,7 +124,11 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     # head-major HND only). The Vanilla golden always runs in its native NHD and
     # is not gated here (run_case drives it directly, not via this check).
     kv_layout = getattr(case, "kv_layout", None)
-    if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
+    kv_layouts = caps.get("kv_layouts", ())
+    sparse_config = getattr(case, "sparse_attention_config", None)
+    if sparse_config is not None:
+        kv_layouts = _SPARSE_KV_LAYOUTS.get(sparse_config.algorithm, kv_layouts)
+    if kv_layout is not None and kv_layout not in kv_layouts:
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
     # FlashInfer's standard paged kernels reject these head dimensions. Keep
