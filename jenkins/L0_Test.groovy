@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
@@ -158,6 +159,19 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // capped at 2: SLURM dispatcher pods pass singleAttempt:true to the outer
 // K8s pod retry, so 1 pod × 2 SLURM attempts = 2 total.
 SLURM_INFRA_RETRY_MAX = 1
+
+// Only source-specific signatures are safe to match against arbitrary test
+// stdout/stderr in the SLURM job log. Keep the concrete terms and their retry
+// policy owned by FailureClassifier.
+SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
+    "slurm-ucx-worker-address",
+    "cuda-device-unavailable",
+    "cuda-buffer-mapping",
+    "nvidia-driver-unavailable",
+    "gpu-lost",
+    "gpu-ecc-uncorrectable",
+    "nvlink-fabric-failure",
+]
 
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
@@ -315,50 +329,53 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
     }
 }
 
-// Scrape the SLURM job output log for a device / driver / interconnect fault
-// signature and return the matched signature itself, or "" for no match.
-//
-// Device faults (CUDA/NVLink/ECC/driver) print into job-output.log but never
-// reach the stage exception chain -- the tracker squashes a failed job to
-// `exit 1` -- so classify() otherwise sees only a generic failure and cannot
-// steer the retry off the bad node. This is a GATE only: the returned signature
-// is folded into a fresh exception so FailureClassifier.PATTERN_CATALOG (the
-// authoritative list) makes the real retry/severity decision. A signature the
-// catalog does not recognize simply falls through to a normal rethrow.
-// App-induced CUDA errors (illegal memory access, unspecified launch failure,
-// OOM) are deliberately excluded -- the OpenSearch stage data shows those are
-// overwhelmingly code regressions, not node faults, and must not trigger a
-// node-avoiding retry.
-//
-// grep -o returns only the matched signature (not the whole line), so a long
-// log line cannot truncate the signature out of the result before it reaches
-// classify(). Each alternative must therefore be catalog-exact: it must match
-// (via `.` wildcards for shell-hostile chars) the full catalog substring, so
-// grep -o emits text that still contains the catalog pattern.
-def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath) {
-    def deviceFaultRegex = "cudaErrorMapBufferObjectFailed|mapping of buffer object failed|" +
-        "uncorrectable NVLink error|cudaErrorNvlinkUncorrectable|CUDA_ERROR_SYSTEM_NOT_READY|" +
-        "uncorrectable ECC error|CUDA_ERROR_ECC_UNCORRECTABLE|has fallen off the bus|GPU is lost|" +
-        "Unable to determine the device handle for GPU|RmInitAdapter failed|Failed to initialize NVML|" +
-        "could... communicate with the NVIDIA driver|CUDA_ERROR_DEVICE_UNAVAILABLE|" +
-        "no CUDA-capable device is detected|CUDA_ERROR_UNKNOWN: 999|CUDA unknown error|" +
-        "CUDA-capable device.s. is/are busy or unavailable"
+// Stream-scan the complete remote job log for the source-safe catalog subset,
+// returning at most one occurrence of each signature. Matching policy and
+// query precedence remain in the shared libraries.
+def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM).findAll {
+        SLURM_JOB_LOG_EVIDENCE_QUERY_IDS.contains(it.id)
+    }
+    def queryTerms = queries.collectMany { it.anyOf ?: (it.allOf ?: []) }.unique()
+    if (!queryTerms) return [source: "SLURM_JOB_LOG", collectionStatus: "NO_MATCH"]
+    def grepPatterns = queryTerms.collect {
+        "-e '" + it.replace("'", "'\"'\"'") + "'"
+    }.join(" ")
     try {
-        // Wrap the body in `bash -c` so it is shell-agnostic: cluster login shells
-        // are often csh/tcsh, which can't parse this bash test/pipe/redirection
-        // syntax. The login shell only has to run `bash -c '<single-quoted body>'`.
-        return Utils.exec(
+        def scanLog = "if [ -f '${remoteLogPath}' ]; then " +
+            "grep -aFio ${grepPatterns} -- '${remoteLogPath}' 2>/dev/null " +
+            '''| awk '{ key=tolower($0); if (!seen[key]++) print }'; fi'''
+        def candidateText = Utils.exec(
             pipeline,
-            script: Utils.sshUserCmd(remote,
-                "\"bash -c 'if [ -f \\\"${remoteLogPath}\\\" ]; then grep -aioE \\\"${deviceFaultRegex}\\\" \\\"${remoteLogPath}\\\" 2>/dev/null | tail -n 1 | cut -c1-500; fi'\""),
+            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(scanLog)),
             returnStdout: true,
-            numRetries: 1,
+            retryOnFail: false,
+            noNVDFEvent: true,
+            timeout: 300,
         )?.trim()
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception scrapeEx) {
-        pipeline.echo("Ignorable warning: could not scrape ${remoteLogPath} for device faults on ${remote.host}: ${scrapeEx.message}")
-        return ""
+        def match = FailureEvidenceCollector.matchQueries(candidateText, queries)
+        return [
+            source: "SLURM_JOB_LOG",
+            collectionStatus: match.matchedQueryId == null ? "NO_MATCH" : "MATCHED",
+            matchedQueryId: match.matchedQueryId,
+            matchedTerms: match.matchedTerms,
+            matchedMessage: match.matchedMessage,
+        ]
+    } catch (FlowInterruptedException interruptedError) {
+        // A bounded evidence scan is best-effort. Utils.exec marks its timeout
+        // as a non-actual interruption; user aborts must keep propagating.
+        if (interruptedError.isActualInterruption()) {
+            throw interruptedError
+        }
+        pipeline.echo("Ignorable warning: timed out collecting failure evidence from ${remoteLogPath} on " +
+            "${remote.host} after 5 minutes")
+        return [source: "SLURM_JOB_LOG", collectionStatus: "COLLECTION_ERROR"]
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (Exception collectionError) {
+        pipeline.echo("Ignorable warning: could not collect failure evidence from ${remoteLogPath} on " +
+            "${remote.host}: ${collectionError.message}")
+        return [source: "SLURM_JOB_LOG", collectionStatus: "COLLECTION_ERROR"]
     }
 }
 
@@ -2478,7 +2495,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
                     jobId=${slurmJobId}
-                    tail -f ${slurmJobLogPath} &
+                    tail -n +1 -F -- "${slurmJobLogPath}" &
                     tailPid=\$!
 
                     noLogTimeoutSecs=7200
@@ -2520,6 +2537,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             break
                         fi
                     done
+
+                    # A failed job can reach a terminal accounting state before
+                    # its final output is visible on the login node's shared FS.
+                    if [[ \$STATUS != "COMPLETED" ]]; then
+                        sleep 15
+                    fi
 
                     # Stop and reap the log follower. It may have already exited
                     # when the remote log stream closes; that is not a test failure.
@@ -2724,24 +2747,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "test failure.",
                             null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
                     }
-                    // A terminal FAILED state may be a node/device fault whose signature
-                    // (CUDA/NVLink/ECC/driver) printed only into the SLURM job output log,
-                    // never into this verdict. Scrape the log and, on a hit, surface the
-                    // matched line into a fresh exception so the authoritative catalog
-                    // (FailureClassifier.classify at the runLLMTestlistWithSbatch caller)
-                    // can match it and steer the retry off the bad node. A miss falls
-                    // through to the plain "Pytest failed" rethrow below.
-                    if (slurmState == "FAILED") {
-                        def deviceHit = scrapeSlurmLogForDeviceFault(pipeline, remote, slurmJobLogPath)
-                        if (deviceHit) {
-                            echo "[INFRA-RETRY] ${stageName}: device-fault signature in SLURM job ${slurmJobId} log; " +
-                                 "surfacing to classifier: ${deviceHit}"
-                            throw new Exception(
-                                "Device/interconnect fault on SLURM node during job ${slurmJobId} for ${stageName}: ${deviceHit}")
-                        }
+                    def jobFailure = new Exception(
+                        "SLURM job ${slurmJobId} for ${stageName} failed with state=" +
+                        "${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}")
+                    def evidence = collectSlurmJobLogEvidence(
+                        pipeline,
+                        remote,
+                        slurmJobLogPath,
+                    )
+                    def classified = FailureClassifier.classify(jobFailure, InfraFailure.SLURM, evidence)
+                    if (classified instanceof InfraFailure) {
+                        def classificationSource = evidence.collectionStatus == "MATCHED" ? "job log" : "job state"
+                        echo "[INFRA-RETRY] ${stageName}: SLURM ${classificationSource} matched " +
+                            "${classified.detectedPattern}: " +
+                            classified.message
+                        throw classified
                     }
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
-                    throw new Exception("Pytest failed in SLURM job ${slurmJobId} for ${stageName}")
+                    throw jobFailure
                 }
             }
             echo "Finished test stage execution."
