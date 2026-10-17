@@ -145,7 +145,9 @@ class DeepseekV41Attention(CSA2Attention):
             eps=config.rms_norm_eps,
             mapping=model_config.mapping,
             sparse_params=params,
-            projection_quantization="mxfp8",
+            projection_quantization=(
+                "mxfp8" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "bf16"
+            ),
             aux_stream=(aux_stream_dict or {}).get(AuxStreamType.MlaCompressor),
             allreduce_strategy=model_config.allreduce_strategy,
             kv_cache_dtype=model_config.extra_attrs.get("kv_cache_dtype", "auto"),
@@ -1690,6 +1692,13 @@ def _v41_load_coverage(
     }
     parameters = {name: param for name, param in model.named_parameters() if included(name)}
     targets = set(parameters) | {name for name, _ in model.named_buffers() if included(name)}
+    # BF16 projections fold the grouped output scale into o_a_proj at load, so
+    # o_a_proj_scale stays a None buffer, which named_buffers() skips.
+    targets |= {
+        f"{name}.o_a_proj_scale"
+        for name, module in modules.items()
+        if isinstance(module, CSA2Attention) and module.projection_quantization == "bf16"
+    }
 
     def enclosing(name: str) -> List[str]:
         parts = name.split(".")
