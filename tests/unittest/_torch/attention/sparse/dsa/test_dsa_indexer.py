@@ -1774,8 +1774,15 @@ def _create_mock_metadata(
     class MockMetadata(DSAtrtllmAttentionMetadata):
         """Mock DSA attention metadata for unit testing indexer operations."""
 
-        def __init__(self):
-            """Initialize mock metadata with buffers, block tables, and indexer state."""
+        def __init__(self, cache_manager):
+            """Initialize mock metadata with buffers, block tables, and indexer state.
+
+            `cache_manager` is a parameter rather than a capture of the enclosing
+            variable: a capture puts it in a closure cell reachable from the class
+            object, which is always part of a reference cycle, so only the cyclic
+            GC would free the manager -- on whatever thread runs the collection,
+            which need not have a CUDA context.
+            """
             self.num_sms = deep_gemm.get_num_sms()
             self.max_num_tokens = max_num_tokens
             self.request_ids = request_ids
@@ -2014,7 +2021,7 @@ def _create_mock_metadata(
             """
             return self._num_seqs
 
-    return MockMetadata()
+    return MockMetadata(cache_manager)
 
 
 @pytest.mark.parametrize("disabled_ratio", [0, 1])
