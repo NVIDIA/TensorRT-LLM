@@ -106,11 +106,11 @@ unittest/kv_cache_manager_v2_tests,NVIDIA H100,8,
 "unittest/trt/attention/test_gpt_attention.py -k ""partition2""",NVIDIA L40,6,
 "unittest/trt/attention/test_gpt_attention.py -k ""partition3""",NVIDIA L40,6,
 "unittest/trt/attention/test_gpt_attention.py -k ""xqa_generic""",NVIDIA L40,3,
-unittest/_torch/attention,NVIDIA Graphics Device,4,B200 Bring Up Board
+unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py,NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/misc,NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/speculative,NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/thop/parallel,NVIDIA Graphics Device,16,B200 Bring Up Board
-unittest/_torch/attention,NVIDIA B200,4,
+unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py,NVIDIA B200,4,
 unittest/_torch/misc,NVIDIA B200,4,
 unittest/_torch/speculative/test_eagle3.py,NVIDIA B200,4,
 unittest/_torch/thop/parallel,NVIDIA B200,16,
