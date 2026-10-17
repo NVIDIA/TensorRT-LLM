@@ -25,6 +25,7 @@ from .indexer import (
 )
 from .metadata import DSAtrtllmAttentionMetadata, build_req_idx_per_token
 from .params import DSABackendForwardArgs, DSAMetadataParams, DSAParams
+from .vanilla_backend import DSAVanillaAttention, DSAVanillaIndexer
 
 __all__ = [
     "HAS_FAST_HADAMARD",
@@ -35,6 +36,8 @@ __all__ = [
     "DSAParams",
     "DSATrtllmAttention",
     "DSAtrtllmAttentionMetadata",
+    "DSAVanillaAttention",
+    "DSAVanillaIndexer",
     "Indexer",
     "IndexerParams",
     "IndexerPrefillChunkMetadata",
