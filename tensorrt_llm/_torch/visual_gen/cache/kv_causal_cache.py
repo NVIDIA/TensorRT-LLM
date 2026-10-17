@@ -142,9 +142,9 @@ class _GeometryState:
     commit_copy_dst: torch.Tensor
     refill_src: torch.Tensor
     refill_dst: torch.Tensor
-    # [max_staged_tokens] int64 slot ids (view_page * tokens_per_page + slot) of the
-    # staged tokens' logical positions, the shared pages later blocks and later
-    # commits read.
+    # [max_staged_tokens] maps each staged token's logical position to its home slot id
+    # (view_page * tokens_per_page + slot) on the shared pages, where later blocks and
+    # later commits read it.
     staged_slots: torch.Tensor
 
 
