@@ -131,6 +131,56 @@ def test_bf16_correctness(M, B, has_ln_affine, has_modulation):
 
 
 # ---------------------------------------------------------------------------
+# Large-mean / tiny-spread rows: E[x^2] - mean^2 cancels catastrophically in FP32
+# here (E[x^2] ~ 248, true variance ~1.5e-6), so the variance must be computed
+# from centered values. Checked against an FP64 two-pass reference.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("eps", [1e-6, 1e-5])
+@pytest.mark.parametrize(
+    "has_ln_affine,has_modulation",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+)
+def test_bf16_large_mean_small_variance(has_ln_affine, has_modulation, eps):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+
+    row = torch.full((D,), 15.75, dtype=torch.float64)
+    row[:2] = 15.6875
+    x = torch.stack([row, -row]).to(device=device, dtype=torch.bfloat16)
+    M = x.shape[0]
+
+    ln_w = ln_b = scale_msa = shift_msa = None
+    if has_ln_affine:
+        ln_w = torch.ones(D, device=device) + torch.randn(D, device=device) * 0.1
+        ln_b = torch.randn(D, device=device) * 0.1
+    elif has_modulation:
+        scale_msa = torch.randn(1, D, device=device) * 0.2
+        shift_msa = torch.randn(1, D, device=device) * 0.2
+
+    out = torch.ops.trtllm.fused_adaptive_layernorm(x, ln_w, ln_b, scale_msa, shift_msa, M, eps)
+
+    x64 = x.double()
+    mean = x64.mean(dim=-1, keepdim=True)
+    var = ((x64 - mean) ** 2).mean(dim=-1, keepdim=True)
+    ref = (x64 - mean) / (var + eps).sqrt()
+    if has_ln_affine:
+        ref = ln_w.double() * ref + ln_b.double()
+    elif has_modulation:
+        ref = (1.0 + scale_msa.double()) * ref + shift_msa.double()
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), ref, rtol=1e-2, atol=2e-3)
+
+
+# ---------------------------------------------------------------------------
 # Batch modulation correctness: each batch element gets its own scale/shift.
 # With very different modulators the output rows must differ significantly.
 # ---------------------------------------------------------------------------
