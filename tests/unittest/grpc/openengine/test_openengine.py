@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 

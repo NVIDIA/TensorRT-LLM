@@ -143,8 +143,8 @@ def verify_openengine_distribution() -> None:
             raise RuntimeError(
                 f"Wheel extra {extra!r} does not declare {expected}")
 
-    for expected_grpc in (Requirement("grpcio>=1.67.1,<2"),
-                          Requirement("grpcio-health-checking>=1.73.1,<2")):
+    for expected_grpc in (Requirement("grpcio>=1.73.1,<2"),
+                          Requirement("grpcio-health-checking>=1.73.1,<1.82")):
         grpc_declared = any(
             canonicalize_name(requirement.name) == canonicalize_name(
                 expected_grpc.name) and requirement.specifier ==

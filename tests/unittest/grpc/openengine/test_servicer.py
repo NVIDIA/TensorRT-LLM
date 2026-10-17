@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
