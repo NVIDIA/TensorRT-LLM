@@ -1159,6 +1159,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager.kv_compression_manages_history = False
     # Fresh-page fill is off; the allocation path calls it unconditionally.
     manager._fresh_page_fill = None
+    # No sliding-window pools; the window-crossing check runs on every growth.
+    manager._windowed_layer_group_sizes = {}
 
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
@@ -2716,6 +2718,60 @@ def test_window_crossing_is_silent_without_a_crossing(
         "context",
     )
 
+    assert fake_logger.messages == []
+
+
+def test_window_crossing_builds_its_window_map_without_init(monkeypatch) -> None:
+    """Managers assembled with ``object.__new__`` (as many unit tests do) skip
+    ``__init__``. The window-crossing check runs on every capacity growth, so
+    its lazily built window map must exist on such a manager too: the first
+    growth builds it from the layer grouping instead of raising."""
+    fake_logger = _FakeLogger(level="info")
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = 4096
+    manager.tokens_per_block = 64
+    manager._get_event_window_sizes_by_layer_group = lambda: {0: 2048, 1: 4096}
+
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 100, 105, "generation"
+    )
+
+    assert manager._windowed_layer_group_sizes == {0: 2048}
+    assert fake_logger.messages == []
+
+
+@pytest.mark.parametrize(
+    "pre_capacity,new_capacity,expected_queries",
+    [
+        (100, 101, 0),  # ordinary decode growth below the window
+        (2049, 2050, 0),  # ordinary decode growth past the window
+        (2048, 2048, 0),  # no growth
+        (2047, 2049, 1),  # the one call that crosses the window
+    ],
+)
+def test_window_crossing_queries_log_level_only_on_a_crossing(
+    monkeypatch, pre_capacity: int, new_capacity: int, expected_queries: int
+) -> None:
+    """The log-level query walks the caller's frames, and this hook runs for
+    every generation request on every iteration. Calls that cross no window
+    must return before asking the logger anything."""
+    fake_logger = _FakeLogger(level="info")
+    is_debug_enabled = Mock(wraps=fake_logger.is_debug_enabled)
+    monkeypatch.setattr(fake_logger, "is_debug_enabled", is_debug_enabled)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1),
+        _FakeWindowedKVCache({0: [1]}),
+        pre_capacity,
+        new_capacity,
+        "generation",
+    )
+
+    assert is_debug_enabled.call_count == expected_queries
     assert fake_logger.messages == []
 
 

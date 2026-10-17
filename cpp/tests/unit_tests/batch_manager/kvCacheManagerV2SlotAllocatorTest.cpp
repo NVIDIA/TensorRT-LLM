@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
 
 #include <gtest/gtest.h>
 
@@ -112,6 +113,35 @@ TEST(KvCacheManagerV2SlotAllocatorTest, RejectsSlotIdsOutsideThePool)
     EXPECT_TRUE(allocator.isValidSlotId(SlotId{0}));
     EXPECT_TRUE(allocator.isValidSlotId(SlotId{7}));
     EXPECT_FALSE(allocator.isValidSlotId(SlotId{8}));
+}
+
+TEST(KvCacheManagerV2SlotAllocatorTest, GpuPoolGranularityGrowsWithQuotaUpTo256MiB)
+{
+    constexpr size_t kMiB = size_t{1} << 20;
+    constexpr size_t kGiB = size_t{1} << 30;
+    auto const granularity
+        = [](size_t quota) { return CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, quota); };
+
+    EXPECT_EQ(granularity(0), 2 * kMiB);
+    EXPECT_EQ(granularity(512 * kMiB), 2 * kMiB);
+    EXPECT_EQ(granularity(kGiB), 2 * kMiB);
+    EXPECT_EQ(granularity(2 * kGiB), 4 * kMiB);
+    EXPECT_EQ(granularity(3 * kGiB), 4 * kMiB);
+    EXPECT_EQ(granularity(16 * kGiB), 32 * kMiB);
+    EXPECT_EQ(granularity(64 * kGiB), 128 * kMiB);
+    EXPECT_EQ(granularity(128 * kGiB), 256 * kMiB);
+    // A full-GPU pool on a 180+ GiB part stays at the cap rather than growing further.
+    EXPECT_EQ(granularity(151 * kGiB), 256 * kMiB);
+    EXPECT_EQ(granularity(1024 * kGiB), 256 * kMiB);
+}
+
+TEST(KvCacheManagerV2SlotAllocatorTest, NonGpuTierGranularityIsIndependentOfQuota)
+{
+    for (size_t const quota : {size_t{1} << 20, size_t{1} << 30, size_t{1} << 40})
+    {
+        EXPECT_EQ(CacheLevelManager::cacheTierGranularity(CacheTier::HOST_MEM, quota), size_t{4096});
+        EXPECT_EQ(CacheLevelManager::cacheTierGranularity(CacheTier::DISK, quota), size_t{2} << 20);
+    }
 }
 
 } // namespace
