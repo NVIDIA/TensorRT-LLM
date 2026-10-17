@@ -26,7 +26,9 @@ FMHA, MLA 1CTA, and MLA 2CTA and are deliberately kept out of this module.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float32, Int32
+from cutlass import BFloat16, Float16, Float32, Int32, Int64
+
+from .mla_decode.helpers.constants import LN_2, LOG2_E
 
 
 @cute.jit
@@ -98,3 +100,124 @@ def unpack_normalized_vec8(
     if cutlass.const_expr(use_bf16_partial):
         return regs_vec.bitcast(BFloat16).to(Float32)
     return regs_vec.bitcast(Float16).to(Float32)
+
+
+@cute.jit
+def attention_sink_scale(log2_lse, sink):
+    """Denominator-only sink mass; keep the KV LSE independent of the sink."""
+    scale = Float32(0)
+    if log2_lse != Float32(-Float32.inf) and sink != Float32(Float32.inf):
+        delta = sink * Float32(LOG2_E) - log2_lse
+        z = cute.math.exp2(-cute.math.abs(delta), fastmath=True)
+        inverse = cute.math.rcp(Float32(1) + z, approx=True)
+        scale = z * inverse if delta > Float32(0) else inverse
+    return scale
+
+
+class MergeMlaSourceStates:
+    def __init__(self, independent_sources: bool, output_quant=None):
+        self.independent_sources = independent_sources
+        self.output_quant = output_quant
+
+    @cute.jit
+    def __call__(
+        self,
+        part_s,
+        part_c,
+        lse_s,
+        lse_c,
+        count_s,
+        count_c,
+        sinks,
+        out,
+        lse,
+        stream,
+        output_quant_args=None,
+    ):
+        self.finish(
+            part_s,
+            part_c,
+            lse_s,
+            lse_c,
+            count_s,
+            count_c,
+            sinks,
+            out,
+            lse,
+            output_quant_args,
+        ).launch(
+            grid=((out.shape[0] * out.shape[1] + 3) // 4, 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def finish(
+        self,
+        part_s,
+        part_c,
+        lse_s,
+        lse_c,
+        count_s,
+        count_c,
+        sinks,
+        out,
+        lse,
+        output_quant_args=None,
+    ):
+        block, _, _ = cute.arch.block_idx()
+        tid = cute.arch.thread_idx()[0]
+        lane = tid % 32
+        # One warp handles one output head. Group four heads per CTA to
+        # amortize launch overhead and avoid repeating normalization 128 times.
+        row = Int64(block) * 4 + Int64(tid // 32)
+        q = row // out.shape[1]
+        h = row % out.shape[1]
+        if row < out.shape[0] * out.shape[1]:
+            have_s = Int32(count_s[q]) > 0
+            have_c = (Int32(count_c[q]) > 0) if self.independent_sources else False
+            l0 = Float32(lse_s[q, h]) if have_s else Float32(-Float32.inf)
+            l1 = Float32(lse_c[q, h]) if have_c else Float32(-Float32.inf)
+            ws = Float32(0)
+            wc = Float32(0)
+            public_lse = Float32(-Float32.inf)
+            if have_s or have_c:
+                kv_lse, ws, wc = merge_log2_lse(l0, l1)
+                public_lse = kv_lse * Float32(LN_2)
+                sink_scale = attention_sink_scale(kv_lse, Float32(sinks[h]))
+                ws *= sink_scale
+                wc *= sink_scale
+            width = cutlass.const_expr(4 if self.output_quant is not None else 2)
+            for chunk in cutlass.range_constexpr(512 // (32 * width)):
+                column = lane * width + chunk * (32 * width)
+                values = cutlass.Array(Float32, width, space=cutlass.AddressSpace.rmem)
+                for j in cutlass.range_constexpr(width):
+                    values[j] = Float32(0)
+                if have_s:
+                    offset = q * part_s.stride[0] + h * part_s.stride[1] + column
+                    pair = cutlass.Pointer(
+                        part_s.iterator + offset, dtype=part_s.element_type
+                    ).load(count=width, alignment=width * 2)
+                    for j in cutlass.range_constexpr(width):
+                        values[j] = Float32(pair[j]) * ws
+                if have_c:
+                    offset = q * part_c.stride[0] + h * part_c.stride[1] + column
+                    pair = cutlass.Pointer(
+                        part_c.iterator + offset, dtype=part_c.element_type
+                    ).load(count=width, alignment=width * 2)
+                    for j in cutlass.range_constexpr(width):
+                        values[j] += Float32(pair[j]) * wc
+                if cutlass.const_expr(self.output_quant is not None):
+                    self.output_quant.store(output_quant_args, values, row, column)
+                else:
+                    packed = cutlass.Array(
+                        out.element_type, 2, space=cutlass.AddressSpace.rmem
+                    )
+                    for j in cutlass.range_constexpr(2):
+                        packed[j] = values[j].to(out.element_type)
+                    offset = q * out.stride[0] + h * out.stride[1] + column
+                    cutlass.Pointer(
+                        out.iterator + offset, dtype=out.element_type
+                    ).store(packed.load(0, 2), alignment=4)
+            if lane == 0:
+                lse[q, h] = public_lse
