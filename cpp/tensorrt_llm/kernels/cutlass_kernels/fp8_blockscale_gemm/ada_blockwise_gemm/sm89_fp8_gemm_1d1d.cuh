@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -117,7 +117,8 @@ struct AdaBlockwiseGemmKernel
     {
         // convert type
         auto epi = cute::make_fragment_like<ElementOutput>(accum);
-        cute::for_each(cute::make_int_sequence<cute::size(epi)>{}, [&](auto i) { epi(i) = ElementOutput(accum(i)); });
+        cute::for_each(cute::make_int_sequence<decltype(cute::size(epi))::value>{},
+            [&](auto i) { epi(i) = ElementOutput(accum(i)); });
 
         auto sO = cute::make_tensor(cute::make_smem_ptr(shared_storage.smem_o.data()), typename KT::SmemLayoutO{});
         // copy rf -> smem
@@ -378,7 +379,7 @@ struct AdaBlockwiseGemmKernel
                         smem_pipe_write = smem_pipe_read;
                         ++smem_pipe_read;
                         smem_pipe_read = smem_pipe_read == KT::Stages ? 0 : smem_pipe_read;
-                        cute::for_each(cute::make_int_sequence<cute::size(scale)>{},
+                        cute::for_each(cute::make_int_sequence<decltype(cute::size(scale))::value>{},
                             [&](auto i) { scale(i) = tXrSFA(i) * tXrSFB(0); });
                     }
                     cute::clear(temp);
@@ -416,7 +417,7 @@ struct AdaBlockwiseGemmKernel
                         {
                             ++smem_pipe_read;
                             smem_pipe_read = smem_pipe_read == KT::Stages ? 0 : smem_pipe_read;
-                            cute::for_each(cute::make_int_sequence<cute::size(scale)>{},
+                            cute::for_each(cute::make_int_sequence<decltype(cute::size(scale))::value>{},
                                 [&](auto i) { scale(i) = tXrSFA(i) * tXrSFB(0); });
                         }
                         cute::clear(temp);
@@ -437,7 +438,7 @@ struct AdaBlockwiseGemmKernel
                 cute::clear(temp);
                 if constexpr (n_block == 0)
                 {
-                    cute::for_each(cute::make_int_sequence<cute::size(scale)>{},
+                    cute::for_each(cute::make_int_sequence<decltype(cute::size(scale))::value>{},
                         [&](auto i) { scale(i) = tXrSFA(i) * tXrSFB(0); });
                 }
                 cute::gemm(mma, tCrA, tCrB(cute::_, cute::_, cute::_, n_block), temp);
