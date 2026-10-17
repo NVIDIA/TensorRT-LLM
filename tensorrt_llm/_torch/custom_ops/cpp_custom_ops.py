@@ -16,6 +16,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
+    @torch.library.register_fake("trtllm::pre_moe_allreduce_rmsnorm_fp4_linear")
+    def pre_moe_allreduce_rmsnorm_fp4_linear(
+        input: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor,
+        scale: torch.Tensor, workspace: torch.Tensor, rank: int, eps: float
+    ) -> List[torch.Tensor]:
+        return [
+            torch.empty_like(input),
+            torch.empty_like(residual),
+            input.new_empty((input.shape[0], input.shape[1] // 2), dtype=torch.uint8),
+            input.new_empty((input.shape[0], input.shape[1] // 16), dtype=torch.uint8),
+        ]
+
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,
