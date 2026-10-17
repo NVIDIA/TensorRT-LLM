@@ -36,6 +36,7 @@ def allocation_backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         pool=object(),
         release=MagicMock(return_value=2),
         restore=MagicMock(return_value=2),
+        discard=MagicMock(return_value=2),
         synchronize=MagicMock(),
         empty_cache=MagicMock(),
     )
@@ -43,6 +44,9 @@ def allocation_backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(sleep_module.virtual_memory, "scope", backend.scope)
     monkeypatch.setattr(sleep_module.virtual_memory, "release_with_tag", backend.release)
     monkeypatch.setattr(sleep_module.virtual_memory, "materialize_with_tag", backend.restore)
+    monkeypatch.setattr(
+        sleep_module.virtual_memory, "release_host_backups_with_tag", backend.discard
+    )
     monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
     monkeypatch.setattr(torch.cuda, "synchronize", backend.synchronize)
     monkeypatch.setattr(torch.cuda, "empty_cache", backend.empty_cache)
@@ -50,8 +54,13 @@ def allocation_backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("mode", ["CPU", "PINNED"])
-def test_sleep_cycle_and_idempotence(allocation_backend: SimpleNamespace, mode: str) -> None:
-    manager = PipelineSleepManager(mode, torch.device("cuda:0"))
+@pytest.mark.parametrize("release_host_backup", [False, True])
+def test_sleep_cycle_and_idempotence(
+    allocation_backend: SimpleNamespace, mode: str, release_host_backup: bool
+) -> None:
+    manager = PipelineSleepManager(
+        mode, torch.device("cuda:0"), release_host_backup=release_host_backup
+    )
     with manager.loading():
         pass
     manager.ensure_awake()
@@ -73,6 +82,95 @@ def test_sleep_cycle_and_idempotence(allocation_backend: SimpleNamespace, mode: 
         assert not manager.is_sleeping
         assert allocation_backend.restore.call_count == cycle + 1
         allocation_backend.restore.assert_called_with(tag)
+        if release_host_backup:
+            assert allocation_backend.discard.call_count == cycle + 1
+            allocation_backend.discard.assert_called_with(tag)
+        else:
+            allocation_backend.discard.assert_not_called()
+
+
+def test_wake_waits_for_cleanup_before_allowing_generation(
+    allocation_backend: SimpleNamespace,
+) -> None:
+    started, finish = Event(), Event()
+
+    def discard(_tag: str) -> int:
+        started.set()
+        assert finish.wait(10), "Test did not release cleanup"
+        return 2
+
+    allocation_backend.discard.side_effect = discard
+    manager = PipelineSleepManager("PINNED", torch.device("cuda:0"), release_host_backup=True)
+    with manager.loading():
+        pass
+    other = PipelineSleepManager("PINNED", torch.device("cuda:0"))
+    with other.loading():
+        pass
+    manager.sleep()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        waking = executor.submit(manager.wake_up)
+        try:
+            assert started.wait(5), "Wake did not reach cleanup"
+            assert not waking.done(), "Wake returned before cleanup finished"
+            with pytest.raises(RuntimeError, match="waking"):
+                with manager.generation():
+                    pytest.fail("Generation was admitted during cleanup")
+            with other.generation():
+                other.ensure_awake()
+        finally:
+            finish.set()
+        waking.result(timeout=5)
+    with manager.generation():
+        manager.ensure_awake()
+
+
+def test_backup_cleanup_starts_after_restore_synchronization(
+    allocation_backend: SimpleNamespace,
+) -> None:
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_host_backup=True)
+    with manager.loading():
+        pass
+    manager.sleep()
+    events = []
+    allocation_backend.restore.side_effect = lambda _tag: events.append("restore") or 2
+    allocation_backend.synchronize.side_effect = lambda *_args: events.append("synchronize")
+    allocation_backend.discard.side_effect = lambda _tag: events.append("cleanup") or 2
+    manager.wake_up()
+    assert events == ["restore", "synchronize", "cleanup"]
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_backup_cleanup_failure_disables_further_generation(
+    allocation_backend: SimpleNamespace,
+    error_type: type[BaseException],
+) -> None:
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_host_backup=True)
+    with manager.loading():
+        pass
+    manager.sleep()
+    allocation_backend.discard.side_effect = error_type("cleanup failed")
+    with pytest.raises(error_type, match="cleanup failed"):
+        manager.wake_up()
+    with pytest.raises(RuntimeError, match="failed"):
+        manager.ensure_awake()
+    with pytest.raises(RuntimeError, match="failed"):
+        manager.sleep()
+    with pytest.raises(RuntimeError, match="failed"):
+        manager.wake_up()
+
+
+@pytest.mark.parametrize("failure_stage", ["restore", "synchronize"])
+def test_failed_wake_does_not_discard_backup(
+    allocation_backend: SimpleNamespace, failure_stage: str
+) -> None:
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_host_backup=True)
+    with manager.loading():
+        pass
+    manager.sleep()
+    getattr(allocation_backend, failure_stage).side_effect = RuntimeError("restore failed")
+    with pytest.raises(RuntimeError, match="restore failed"):
+        manager.wake_up()
+    allocation_backend.discard.assert_not_called()
 
 
 def test_pipeline_tags_are_isolated(allocation_backend: SimpleNamespace) -> None:
@@ -286,18 +384,25 @@ def test_overlapping_generation_rejected_and_managers_independent(
 
 
 @pytest.mark.parametrize(
-    "first_operation, second_operation",
+    "first_operation, second_operation, blocked_stage",
     [
-        ("sleep", "sleep"),
-        ("sleep", "wake_up"),
-        ("wake_up", "wake_up"),
-        ("wake_up", "sleep"),
+        ("sleep", "sleep", "release"),
+        ("sleep", "wake_up", "release"),
+        ("wake_up", "wake_up", "restore"),
+        ("wake_up", "sleep", "restore"),
+        ("wake_up", "wake_up", "discard"),
+        ("wake_up", "sleep", "discard"),
     ],
 )
 def test_transitions_are_serialized(
-    allocation_backend: SimpleNamespace, first_operation: str, second_operation: str
+    allocation_backend: SimpleNamespace,
+    first_operation: str,
+    second_operation: str,
+    blocked_stage: str,
 ) -> None:
-    manager = PipelineSleepManager("CPU", torch.device("cuda:0"))
+    manager = PipelineSleepManager(
+        "CPU", torch.device("cuda:0"), release_host_backup=blocked_stage == "discard"
+    )
     with manager.loading():
         pass
     if first_operation == "wake_up":
@@ -305,9 +410,7 @@ def test_transitions_are_serialized(
     allocation_backend.release.reset_mock()
     allocation_backend.restore.reset_mock()
     entered, finish, second_entered = Event(), Event(), Event()
-    backend = (
-        allocation_backend.release if first_operation == "sleep" else allocation_backend.restore
-    )
+    backend = getattr(allocation_backend, blocked_stage)
 
     def transition(_tag: str) -> int:
         entered.set()
@@ -346,6 +449,8 @@ def test_transitions_are_serialized(
         first.result(timeout=10)
         second.result(timeout=10)
     assert manager.is_sleeping == (second_operation == "sleep")
+    if blocked_stage == "discard":
+        allocation_backend.discard.assert_called_once_with(manager._tag)
     assert allocation_backend.release.call_count + allocation_backend.restore.call_count == (
         1 if first_operation == second_operation else 2
     )
@@ -372,6 +477,15 @@ def test_loader_default_path_does_not_capture(allocation_backend: SimpleNamespac
     loader._load = MagicMock(return_value=pipeline)
     assert loader.load("checkpoint", skip_warmup=True) is pipeline
     loader._load.assert_called_once_with("checkpoint", True, None)
+    allocation_backend.scope.assert_not_called()
+
+
+def test_loader_rejects_backup_release_without_sleep(allocation_backend: SimpleNamespace) -> None:
+    loader = PipelineLoader.__new__(PipelineLoader)
+    loader._load = MagicMock()
+    with pytest.raises(ValueError, match="requires sleep_restore_mode"):
+        loader.load("checkpoint", sleep_release_host_backup=True)
+    loader._load.assert_not_called()
     allocation_backend.scope.assert_not_called()
 
 
@@ -414,8 +528,12 @@ def h3_loader(monkeypatch: pytest.MonkeyPatch) -> tuple:
 
 
 @pytest.mark.parametrize("skip_warmup", [False, True])
+@pytest.mark.parametrize("release_host_backup", [None, False, True])
 def test_loader_warmup_is_outside_persistent_pool(
-    allocation_backend: SimpleNamespace, h3_loader: tuple, skip_warmup: bool
+    allocation_backend: SimpleNamespace,
+    h3_loader: tuple,
+    skip_warmup: bool,
+    release_host_backup: bool | None,
 ) -> None:
     loader, pipeline = h3_loader
     events = []
@@ -447,13 +565,23 @@ def test_loader_warmup_is_outside_persistent_pool(
         events.append("warmup")
 
     pipeline.warmup.side_effect = warmup
+    options = (
+        {} if release_host_backup is None else {"sleep_release_host_backup": release_host_backup}
+    )
     assert (
-        loader.load("checkpoint", skip_warmup=skip_warmup, sleep_restore_mode="PINNED") is pipeline
+        loader.load("checkpoint", skip_warmup=skip_warmup, sleep_restore_mode="PINNED", **options)
+        is pipeline
     )
     assert events == ["enter", "materialize", "weights", "components", "post_load", "exit"] + (
         [] if skip_warmup else ["warmup"]
     )
     pipeline._sleep_manager.ensure_awake()
+    pipeline.sleep()
+    pipeline.wake_up()
+    if release_host_backup:
+        allocation_backend.discard.assert_called_once_with(pipeline._sleep_manager._tag)
+    else:
+        allocation_backend.discard.assert_not_called()
 
 
 @pytest.mark.parametrize("failure_stage", [None, "construction", "components"])
@@ -592,9 +720,10 @@ def test_loader_uses_model_hook_without_h3_dependency(
 
     class OtherSleepPipeline(BasePipeline):
         @contextmanager
-        def _sleep_loading_context(self, restore_mode, *, device):
+        def _sleep_loading_context(self, restore_mode, *, device, release_host_backup=False):
             assert restore_mode == "CPU"
             assert device == loader.device
+            assert release_host_backup is False
             events.append("enter")
             try:
                 yield
