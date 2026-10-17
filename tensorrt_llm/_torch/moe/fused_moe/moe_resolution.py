@@ -387,6 +387,7 @@ def build_moe_deployment(
         locality_domain_requested=bool(
             locality_domain_policy is not None and locality_domain_policy.enabled
         ),
+        use_cuda_graph=bool(getattr(model_config, "use_cuda_graph", False)),
     )
 
 

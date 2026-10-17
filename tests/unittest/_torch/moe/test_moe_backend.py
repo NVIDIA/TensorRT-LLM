@@ -2097,7 +2097,11 @@ def _make_megamoe_cutedsl_minimax_problem(
 
 
 def _make_megamoe_cutedsl_test_deployment(
-    *, ep_size: int = 1, parallel_size: int = 1, use_dp: bool = False
+    *,
+    ep_size: int = 1,
+    parallel_size: int = 1,
+    use_dp: bool = False,
+    use_cuda_graph: bool = False,
 ) -> MoEDeployment:
     return MoEDeployment(
         ep_size=ep_size,
@@ -2109,6 +2113,7 @@ def _make_megamoe_cutedsl_test_deployment(
             sm=100,
             available_deps=(MoEDep.MEGAMOE_CUTEDSL_RUNTIME, MoEDep.MEGAMOE_CUTEDSL_OP),
         ),
+        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -2180,6 +2185,37 @@ def test_megamoe_cutedsl_accepts_tep_for_every_model(
     verdict = MegaMoECuteDsl.can_implement(
         _make_megamoe_cutedsl_tep_problem(activation, constants),
         _make_megamoe_cutedsl_test_deployment(ep_size=parallel_size, parallel_size=parallel_size),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
+def test_megamoe_cutedsl_rejects_tep_with_cuda_graphs(
+    activation: ActivationType, constants: set[str]
+) -> None:
+    """TEP is eager-only: graph warmup deadlocks (https://nvbugs/6946611)."""
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(activation, constants),
+        _make_megamoe_cutedsl_test_deployment(ep_size=8, parallel_size=8, use_cuda_graph=True),
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+    assert "6946611" in verdict.detail
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "parallel_size, use_dp", [(1, False), (8, True)], ids=["single_rank", "adp"]
+)
+def test_megamoe_cutedsl_accepts_cuda_graphs_outside_tep(parallel_size: int, use_dp: bool) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
+        _make_megamoe_cutedsl_test_deployment(
+            ep_size=parallel_size, parallel_size=parallel_size, use_dp=use_dp, use_cuda_graph=True
+        ),
     )
 
     assert verdict.eligible, verdict.detail

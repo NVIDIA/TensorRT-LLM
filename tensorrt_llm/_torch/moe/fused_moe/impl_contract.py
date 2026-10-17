@@ -286,6 +286,10 @@ class MoEDeployment:
     # ``model_config.locality_domain_policy.enabled``. Whether the machine can
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
+    # ``model_config.use_cuda_graph``: whether the engine may capture and
+    # replay forwards from CUDA graphs. Impls whose device-side sync cannot
+    # survive graph-warmup capture for a topology reject that combination.
+    use_cuda_graph: bool = False
 
     @property
     def smart_router(self) -> bool:
