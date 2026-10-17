@@ -1984,6 +1984,12 @@ class PyExecutor:
             self._stop_mpi_progress_thread()
             return
         self.worker_thread.join()
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is not None and not coordinator.shared_shutdown_complete(
+        ):
+            raise RuntimeError(
+                "Shared KV cleanup is incomplete; retain resource managers until "
+                "Lifecycle containment or confirmed cleanup")
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1:
@@ -2202,7 +2208,18 @@ class PyExecutor:
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+            len(self.waiting_queue) == 0 and not self._has_pending_transfers()
+
+    def _has_pending_transfers(self) -> bool:
+        """Return whether connector or shared work needs another owner-loop round.
+
+        Returns:
+            Whether retained transfers prevent an indefinite idle wait or teardown.
+        """
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        return (self._has_pending_connector_transfers()
+                or (coordinator is not None
+                    and coordinator.has_pending_shared_transfers()))
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -3001,6 +3018,13 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is not None:
+            try:
+                coordinator.begin_shared_shutdown()
+            except Exception as error:
+                # Waiters are already awake; retained resources still block manager teardown.
+                logger.error(f"Shared KV shutdown initiation failed: {error}")
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -5168,7 +5192,7 @@ class PyExecutor:
 
         if pending.control_requires_drain and (
                 len(self.active_requests) != 0 or len(self.waiting_queue) != 0
-                or self._has_pending_connector_transfers()):
+                or self._has_pending_transfers()):
             # drain=True: keep the sentinel parked until the engine drains.
             return
 
@@ -6475,8 +6499,7 @@ class PyExecutor:
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
-                and not self._has_pending_connector_transfers())
+                and not self.is_shutdown and not self._has_pending_transfers())
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -6788,6 +6811,7 @@ class PyExecutor:
                     req_item.finished_prefix_load_ids)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
+                self.disagg.begin_shared_shutdown()
                 break
             elif req_item.is_canceled_request:
                 self.canceled_req_ids.append(req_item.id)

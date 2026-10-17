@@ -28,9 +28,10 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -45,11 +46,11 @@ from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 
-def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> Chunk:
+def _sole_piece(pool_slot_ids_per_layer_group=None, *, tokens=0, is_last=True) -> Chunk:
     """A transfer's only piece; nothing in this file exercises chunking."""
-    groups = list(block_ids_per_layer_groups or [])
+    groups = list(pool_slot_ids_per_layer_group or [])
     return Chunk(
-        block_ids_per_layer_groups=groups,
+        pool_slot_ids_per_layer_group=groups,
         kind_per_layer_group=[CacheKind.PAGED] * len(groups),
         token_range=TokenRange(start=0, end=tokens),
         is_last=is_last,
@@ -2469,7 +2470,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
         has_failed=Mock(return_value=False),
     )
     sender._get_or_create_send_session = Mock(return_value=send_session)
-    sender._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=kv_slice))
+    sender._create_cache_extent = Mock(return_value=CacheExtent(request_id=rid, local=kv_slice))
     sender._finalize_send = Mock()
 
     sender.respond_and_send_async(send_req)
@@ -2499,7 +2500,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
         receive=receive_after_rooting, fail_admission=Mock(), _kv_tasks=recv_tasks
     )
     receiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=recv_session))
-    receiver._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=kv_slice))
+    receiver._create_cache_extent = Mock(return_value=CacheExtent(request_id=rid, local=kv_slice))
     receiver._chunk_num_bytes = Mock(return_value=0)
 
     receiver.request_and_receive_async(recv_req)

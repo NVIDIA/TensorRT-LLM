@@ -378,7 +378,7 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
     result = []
     seen = set()
     roles = set()
-    for group, blocks in enumerate(chunk.block_ids_per_layer_groups):
+    for group, blocks in enumerate(chunk.pool_slot_ids_per_layer_group):
         for pool in range(len(extractor.page_table.layer_groups[group].pool_views)):
             memory = extractor.extract(blocks, group, pool).memory
             view = extractor.page_table.layer_groups[group].pool_views[pool]
@@ -696,7 +696,7 @@ def _exercise_live_session(
     cache = manager.kv_cache_map[request.py_request_id]
     block_ids = tuple(
         tuple(blocks.tolist())
-        for blocks in transceiver._create_chunk(request).block_ids_per_layer_groups
+        for blocks in transceiver._create_chunk(request).pool_slot_ids_per_layer_group
     )
     poll = (
         transceiver.check_context_transfer_status
@@ -712,7 +712,7 @@ def _exercise_live_session(
         assert manager.kv_cache_map[request.py_request_id] is cache
         assert block_ids == tuple(
             tuple(blocks.tolist())
-            for blocks in transceiver._create_chunk(request).block_ids_per_layer_groups
+            for blocks in transceiver._create_chunk(request).pool_slot_ids_per_layer_group
         )
         assert slot in worker._aux_buffer._occupied_slots
         assert worker._aux_buffer.free_slot.call_count == 0
