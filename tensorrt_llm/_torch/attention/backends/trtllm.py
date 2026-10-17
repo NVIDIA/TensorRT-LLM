@@ -1491,7 +1491,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
                 max_kv_len, 0, tile_size_kv_per_cta)
             max_num_tiles_q = math.ceil(
-                (seqLenQ * self.num_heads_per_kv) / tile_size_q_per_cta)
+                (seqLenQ * self.max_num_heads_per_kv) / tile_size_q_per_cta)
             mask_size = int(self.max_num_requests * max_num_tiles_q *
                             max_num_custom_mask_tiles_kv * num_instances_q *
                             num_instances_kv * tile_size_q * tile_size_kv / 32)
