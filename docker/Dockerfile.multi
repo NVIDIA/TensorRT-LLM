@@ -21,6 +21,8 @@ ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
 
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
+
 # Add NVIDIA EULA and AI Terms labels
 LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/"
 LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/"
@@ -172,6 +174,8 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
+
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
 
 WORKDIR /app/tensorrt_llm
 ARG GITHUB_MIRROR=""
