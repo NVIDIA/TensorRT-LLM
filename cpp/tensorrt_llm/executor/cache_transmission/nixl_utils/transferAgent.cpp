@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <array>
 #include <chrono>
 #include <cuda.h>
 #include <dirent.h>
@@ -35,6 +36,7 @@
 #include <netinet/in.h>
 #include <nixl_types.h>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <sys/file.h>
@@ -207,7 +209,7 @@ void NixlTransferAgent::maybeInitBounce(
         std::string const localIp = common::getLocalIp(common::getEnvNixlInterface(), mpi::MpiComm::world().getRank());
         std::string const bindAddr
             = (localIp.find(':') != std::string::npos) ? "tcp://[" + localIp + "]:*" : "tcp://" + localIp + ":*";
-        std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+        std::size_t const maxDescs = bounce::maxDescsPerChunk(cfg);
         // ROUTER frame cap: the largest legitimate DATA carries up to maxDescs scatter runs (+ header);
         // 2x headroom, never below 64 MiB. A cap below a real DATA would silently disconnect the peer.
         std::size_t const maxMsgBytes
@@ -250,7 +252,7 @@ void NixlTransferAgent::maybeInitBounce(
             cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes, cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs,
             cfg.quarantineMs, static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
             static_cast<int>(cfg.useZeroCopyArguments), controlDesc.c_str());
-        if (cfg.maxAverageDescriptorSizeBytes == 0)
+        if (cfg.outboundRoutingDisabled())
         {
             // Make "enabled but nothing routed" visible once; the per-rejection log stays DEBUG-only.
             TLLM_LOG_WARNING(
@@ -303,26 +305,47 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     {
         return BounceRejectReason::kSourceDevice;
     }
+    if (cfg.outboundRoutingDisabled())
+    {
+        return BounceRejectReason::kAverageDescriptorSize;
+    }
     // Screen every precondition BounceTransferPlan::build enforces with TLLM_CHECK: an admitted
     // request must never throw out of submitTransferRequests — it either runs on bounce or is
     // routed to the standard per-descriptor NIXL path.
-    std::uint64_t totalBytes = 0;
     // BounceTransport may clamp the configured cap further to the buddy allocator's usable capacity.
     auto const maxChunkSizeBytes = mBounce->transport->maxChunkSizeBytes();
-    for (std::size_t i = 0; i < srcs.size(); ++i)
+    // Bytes of descs [begin, end), or nullopt at the first desc that BounceTransferPlan::build would reject.
+    auto const shapeCheckedBytes = [&](std::size_t begin, std::size_t end) -> std::optional<std::uint64_t>
     {
-        auto const len = srcs[i].getLen();
-        if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
-            || dsts[i].getDeviceId() != destinationDeviceId)
+        std::uint64_t bytes = 0;
+        for (std::size_t i = begin; i < end; ++i)
+        {
+            auto const len = srcs[i].getLen();
+            if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
+                || dsts[i].getDeviceId() != destinationDeviceId)
+            {
+                return std::nullopt;
+            }
+            bytes += len;
+        }
+        return bytes;
+    };
+    std::size_t const descCount = srcs.size();
+    std::size_t const segments = bounce::bulkSegmentCount(descCount);
+    std::array<std::optional<std::uint64_t>, bounce::kMaxBulkSegments> segmentBytes{};
+    bounce::forEachSegment(mBounce->transport->poolForBulkPass(descCount), descCount, segments,
+        [&](std::size_t segment, std::size_t begin, std::size_t end)
+        { segmentBytes[segment] = shapeCheckedBytes(begin, end); });
+    std::uint64_t totalBytes = 0;
+    for (std::size_t segment = 0; segment < segments; ++segment)
+    {
+        if (!segmentBytes[segment].has_value())
         {
             return BounceRejectReason::kDescriptorShape;
         }
-        totalBytes += len;
+        totalBytes += *segmentBytes[segment];
     }
-    // max_average_descriptor_size = 0 disables outbound routing (gate off): reject unconditionally (an all-zero-length
-    // request would otherwise pass "avg > 0").
-    std::uint64_t const avg = totalBytes / srcs.size();
-    if (cfg.maxAverageDescriptorSizeBytes == 0 || avg > cfg.maxAverageDescriptorSizeBytes)
+    if (totalBytes / descCount > cfg.maxAverageDescriptorSizeBytes)
     {
         return BounceRejectReason::kAverageDescriptorSize;
     }
@@ -347,7 +370,7 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     // loadRemoteAgent (no peer handshake) never deserve a WARNING here — DEBUG only. Likewise every
     // rejection while the operator has disabled the gate (max_average_descriptor_size = 0, the kill
     // switch), whichever reason happened to fire first.
-    bool const killSwitch = mBounce->cfg.maxAverageDescriptorSizeBytes == 0;
+    bool const killSwitch = mBounce->cfg.outboundRoutingDisabled();
     bool const quiet = killSwitch || *reason == bounce::BounceRejectReason::kNotWrite
         || *reason == bounce::BounceRejectReason::kNotVram || *reason == bounce::BounceRejectReason::kSyncMessage
         || *reason == bounce::BounceRejectReason::kNoPeerHandshake;
@@ -395,7 +418,36 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     }
     return false;
 }
+
+namespace
+{
+std::optional<std::string> findParam(nixl_b_params_t const& params, std::string const& key)
+{
+    auto const it = params.find(key);
+    return it != params.end() ? std::optional<std::string>(it->second) : std::nullopt;
+}
+
+// See bounce::bounceWantsSplitBatchSizeOne.
+void maybeSetBounceSplitBatchSize(BaseAgentConfig const& config, std::string const& backend, nixl_b_params_t& params)
+{
+    bool const userSetSplitBatchSize = config.backendParams.count("split_batch_size") > 0;
+    if (!bounce::bounceWantsSplitBatchSizeOne(/*bounceRequested=*/config.agentBufferSizeMb > 0, backend,
+            config.useProgThread, userSetSplitBatchSize, findParam(params, "num_threads")))
+    {
+        return;
+    }
+    params["split_batch_size"] = "1";
+    TLLM_LOG_INFO(
+        "NixlTransferAgent::NixlTransferAgent bounce requested -> backendParams split_batch_size: 1 (set "
+        "split_batch_size, e.g. via TRTLLM_NIXL_SPLIT_BATCH_SIZE, to override)");
+}
+} // namespace
 #else  // !TLLM_BOUNCE_V2 — bounce not built; the member stays null; the stubs warn or throw as documented.
+namespace
+{
+void maybeSetBounceSplitBatchSize(BaseAgentConfig const&, std::string const&, nixl_b_params_t&) {}
+} // namespace
+
 namespace bounce
 {
 struct NixlBounceState
@@ -885,6 +937,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         init1[key] = value;
         TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: %s: %s", key.c_str(), value.c_str());
     }
+
+    maybeSetBounceSplitBatchSize(config, nixlBackend, init1);
 
     status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)
