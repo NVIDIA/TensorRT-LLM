@@ -29,8 +29,10 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     _checkpoint_startup_metadata,
     _construct_checkpoint_loader,
     _open_checkpoint_weight_session,
+    _resolve_checkpoint_io_policy,
     _timed_checkpoint_weight_session,
 )
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -168,6 +170,35 @@ def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
     status = loader.weight_loader.last_checkpoint_io_status
     assert status.requested == requested
     assert status.selected == "rank_striped_read_ahead"
+
+
+@pytest.mark.parametrize("requested", list(CheckpointIOPolicy))
+@pytest.mark.parametrize("as_string", [False, True])
+def test_resolve_checkpoint_io_policy_returns_enum(
+    requested: CheckpointIOPolicy, as_string: bool
+) -> None:
+    selected, reason = _resolve_checkpoint_io_policy(
+        None, "HF", LoadFormat.AUTO, requested.value if as_string else requested, False
+    )
+    expected = (
+        CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
+        if requested is CheckpointIOPolicy.AUTO
+        else requested
+    )
+    assert selected is expected
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    "policy", [CheckpointIOPolicy.NATIVE, CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD]
+)
+def test_hf_reader_normalizes_policy_strings(policy: CheckpointIOPolicy) -> None:
+    loader = HfWeightLoader(
+        checkpoint_io_policy=policy.value, requested_checkpoint_io_policy="auto"
+    )
+    assert loader.checkpoint_io_policy is policy
+    assert loader.last_checkpoint_io_status.requested is CheckpointIOPolicy.AUTO
+    assert loader.last_checkpoint_io_status.selected is policy
 
 
 @pytest.mark.parametrize(
