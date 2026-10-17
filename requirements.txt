@@ -91,7 +91,7 @@ openai-harmony==0.0.4
 # 4.8.0.dev0 is the first release exposing Rubin/SM107.
 nvidia-cutlass-dsl[cu13]==4.8.0.dev0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
-quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; only published release compatible with CUTLASS DSL >= 4.7
+quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA, FlashAttention 4 and the opt-in GatedMLP SwiGLU GEMM epilogue; only published release compatible with CUTLASS DSL >= 4.7
 jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr
