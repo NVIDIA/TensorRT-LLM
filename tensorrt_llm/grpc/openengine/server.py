@@ -18,6 +18,7 @@ from typing import Any
 import click
 import grpc
 import uvloop
+from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
@@ -29,6 +30,7 @@ from tensorrt_llm.serve._frontend_processes import (
     _terminate_attached_frontends,
 )
 
+from ._health import OpenEngineHealthServicer
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
@@ -41,6 +43,7 @@ __all__ = ["OpenEngineServer", "launch_server"]
 # responses are not rejected at the transport layer. Bounded (not unlimited) so
 # it still guards against pathological payloads.
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+_HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 _SERVER_OPTIONS = [
     ("grpc.max_receive_message_length", _MAX_MESSAGE_BYTES),
     ("grpc.max_send_message_length", _MAX_MESSAGE_BYTES),
@@ -109,9 +112,16 @@ class OpenEngineServer:
         self.host = host
         self.port = port
         self._llm = llm
+        self._frontend = frontend
+        self._stopping = False
+        self._health_task: asyncio.Task | None = None
+        self._health_refresh_lock = asyncio.Lock()
+        self._inference_serving = False
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
+        self._health = OpenEngineHealthServicer()
+        health_pb2_grpc.add_HealthServicer_to_server(self._health, self._server)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
             llm,
@@ -123,17 +133,15 @@ class OpenEngineServer:
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
         # Abort and GetLoad see the same requests Generate is serving.
-        openengine_pb2_grpc.add_ControlServicer_to_server(
-            OpenEngineControlServicer(
-                llm,
-                model,
-                inference,
-                kv_transfer_backend=kv_transfer_backend,
-                frontend=frontend,
-                instance_id=instance_id,
-            ),
-            self._server,
+        self._control = OpenEngineControlServicer(
+            llm,
+            model,
+            inference,
+            kv_transfer_backend=kv_transfer_backend,
+            frontend=frontend,
+            instance_id=instance_id,
         )
+        openengine_pb2_grpc.add_ControlServicer_to_server(self._control, self._server)
         bind_address = _format_bind_address(host, port)
         # Plaintext h2c with no authentication: any client that can reach this
         # port can run inference and call Control.Abort. It is meant to be
@@ -161,8 +169,42 @@ class OpenEngineServer:
                     "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
                 )
         await self._server.start()
+        await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
+        await self._refresh_inference_health()
+        self._health_task = asyncio.create_task(self._monitor_inference_health())
         address = _format_bind_address(self.host, self.port)
         logger.info(f"OpenEngine server started on {address}")
+
+    async def _refresh_inference_health(self) -> None:
+        async with self._health_refresh_lock:
+            ready = False
+            if not self._stopping:
+                try:
+                    ready = await asyncio.to_thread(self._control._engine_is_healthy)
+                    if ready and self._frontend is not None:
+                        status = await self._frontend.request("status")
+                        ready = bool(status["ready"] and not status["stopping"])
+                except (RuntimeError, ValueError, OSError, CoordinationError) as error:
+                    logger.warning(f"OpenEngine inference health check failed: {error}")
+            if self._stopping or ready == self._inference_serving:
+                return
+            self._inference_serving = ready
+            await self._health.set(
+                "inference",
+                health_pb2.HealthCheckResponse.SERVING
+                if ready
+                else health_pb2.HealthCheckResponse.NOT_SERVING,
+            )
+
+    async def _monitor_inference_health(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(_HEALTH_CHECK_INTERVAL_SECONDS)
+            try:
+                await self._refresh_inference_health()
+            except Exception as error:
+                logger.error(f"OpenEngine inference health monitor failed: {error}")
+                self._inference_serving = False
+                await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
 
     async def stop(self, grace: float = 5.0) -> None:
         """Stop accepting OpenEngine requests.
@@ -170,6 +212,11 @@ class OpenEngineServer:
         Args:
             grace: Maximum time in seconds to allow active RPCs to finish.
         """
+        self._stopping = True
+        await self._health.enter_graceful_shutdown()
+        if self._health_task is not None:
+            self._health_task.cancel()
+            await asyncio.gather(self._health_task, return_exceptions=True)
         await self._server.stop(grace=grace)
         logger.info("OpenEngine server stopped")
 
@@ -377,6 +424,7 @@ def launch_server(
             _signal_frontend_ready(mode)
             if coordinator is not None:
                 coordinator.ready = True
+                await server._refresh_inference_health()
             await stop_event.wait()
         finally:
             startup_cancelled.set()

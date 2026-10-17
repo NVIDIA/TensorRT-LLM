@@ -16,13 +16,16 @@
 
 import asyncio
 import gc
+import socket
 from types import SimpleNamespace
 
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
+
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     kv_pb2,
     openengine_pb2_grpc,
@@ -103,6 +106,220 @@ def test_openengine_server_serves_the_control_contract() -> None:
     asyncio.run(exercise_server())
 
 
+def test_health_and_control_are_reachable_on_pod_address() -> None:
+    """The shared listener accepts Pod-IP probes and control calls on one port."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect(("192.0.2.1", 9))
+            pod_ip = route.getsockname()[0]
+    except OSError:
+        pytest.skip("No non-loopback IPv4 route is available")
+    if pod_ip.startswith("127."):
+        pytest.skip("No non-loopback IPv4 address is available")
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=lambda: True,
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("0.0.0.0", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"{pod_ip}:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                response = await health.Check(
+                    health_pb2.HealthCheckRequest(service="inference"), timeout=5
+                )
+                assert response.status == health_pb2.HealthCheckResponse.SERVING
+                control = openengine_pb2_grpc.ControlStub(channel)
+                sources = await control.GetKvEventSources(
+                    kv_pb2.GetKvEventSourcesRequest(), timeout=5
+                )
+                assert list(sources.sources) == []
+        finally:
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readiness changes reach both RPCs without changing server liveness."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    engine = {"healthy": False}
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=lambda: engine["healthy"],
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+
+                async def check(service: str) -> int:
+                    response = await health.Check(
+                        health_pb2.HealthCheckRequest(service=service), timeout=5
+                    )
+                    return response.status
+
+                assert await check("liveness") == health_pb2.HealthCheckResponse.SERVING
+                assert await check("inference") == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert await check("") == health_pb2.HealthCheckResponse.NOT_SERVING
+                with pytest.raises(grpc.aio.AioRpcError) as unknown:
+                    await check("unknown")
+                assert unknown.value.code() == grpc.StatusCode.NOT_FOUND
+                unknown_stream = health.Watch(health_pb2.HealthCheckRequest(service="unknown"))
+                try:
+                    assert (
+                        await asyncio.wait_for(unknown_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
+                finally:
+                    unknown_stream.cancel()
+
+                stream = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
+                remaining_stream = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
+                try:
+                    initial = await asyncio.wait_for(stream.read(), 5)
+                    assert initial.status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    remaining_initial = await asyncio.wait_for(remaining_stream.read(), 5)
+                    assert remaining_initial.status == initial.status
+
+                    engine["healthy"] = True
+                    serving = await asyncio.wait_for(stream.read(), 5)
+                    assert serving.status == health_pb2.HealthCheckResponse.SERVING
+                    assert (
+                        await asyncio.wait_for(remaining_stream.read(), 5)
+                    ).status == serving.status
+                    assert await check("inference") == serving.status
+                    assert await check("") == serving.status
+
+                    stream.cancel()
+                    assert await asyncio.wait_for(stream.code(), 5) == grpc.StatusCode.CANCELLED
+                    engine["healthy"] = False
+                    unavailable = await asyncio.wait_for(remaining_stream.read(), 5)
+                    assert unavailable.status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert await check("inference") == unavailable.status
+                    assert await check("") == unavailable.status
+                    assert await check("liveness") == health_pb2.HealthCheckResponse.SERVING
+                finally:
+                    stream.cancel()
+                    remaining_stream.cancel()
+        finally:
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+def test_standard_grpc_health_watch_reports_shutdown() -> None:
+    """Active Watch clients receive non-serving status before shutdown closes them."""
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=lambda: True,
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        stop_task = None
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                liveness = health.Watch(health_pb2.HealthCheckRequest(service="liveness"))
+                inference = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
+                for stream in (liveness, inference):
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+
+                stop_task = asyncio.create_task(server.stop(grace=10))
+                for stream in (liveness, inference):
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert await asyncio.wait_for(stream.read(), 5) is grpc.aio.EOF
+                await asyncio.wait_for(stop_task, 5)
+        finally:
+            if stop_task is None:
+                await server.stop(grace=0)
+            elif not stop_task.done():
+                await server.stop(grace=0)
+                await stop_task
+
+    asyncio.run(exercise_server())
+
+
+def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed poll clears readiness and a later successful poll restores it."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    engine = {"raise": False}
+
+    def check_health() -> bool:
+        if engine["raise"]:
+            raise TypeError("health predicate failed")
+        return True
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=check_health,
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                inference = health_pb2.HealthCheckRequest(service="inference")
+                liveness = health_pb2.HealthCheckRequest(service="liveness")
+                assert (
+                    await health.Check(inference, timeout=5)
+                ).status == health_pb2.HealthCheckResponse.SERVING
+
+                stream = health.Watch(inference)
+                try:
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    engine["raise"] = True
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(health_pb2.HealthCheckRequest(), timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(liveness, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    engine["raise"] = False
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                finally:
+                    stream.cancel()
+        finally:
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
 @pytest.mark.parametrize("publisher_enabled", [False, True])
 def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> None:
     """Configured events must not advertise a source absent from the loaded engine."""
@@ -116,7 +333,8 @@ def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> Non
             ),
         ),
         _executor=SimpleNamespace(
-            get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {}
+            get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {},
+            is_shutdown=lambda: False,
         ),
     )
 
