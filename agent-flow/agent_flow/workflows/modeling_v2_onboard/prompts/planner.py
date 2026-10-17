@@ -114,7 +114,7 @@ nodes:
   - id: join-all
     type: merge
     kind: merge
-    depends_on: [gsm8k, feat-fp8-kv, perf-fuse-add-norm, perf-moe-gemm]
+    depends_on: [feat-fp8-kv, perf-fuse-add-norm, perf-moe-gemm]
   - id: gsm8k-final
     type: e2e_accuracy
     depends_on: [join-all]
@@ -122,7 +122,7 @@ nodes:
     type: merge
     kind: merge
     isolation: shared
-    depends_on: [gsm8k-final]
+    depends_on: [gsm8k, gsm8k-final]
 ```
 """
 
@@ -310,6 +310,14 @@ work of kind 1.
   topology, a quantization, a runtime capability), their module checks, and
   performance work. They depend on the task that produced the code they build
   on, not on the gate; a later `merge` task joins them with the gate's fixes.
+- **Verification never blocks the next step, joins included.** A `merge`
+  task depends only on the tasks whose code it joins. Tasks that check or
+  measure code (module checks, accuracy gates, benchmarks, profiles) run
+  beside the next step on the same code, not before it. When one fails, or
+  its result calls for a code change, add a task that fixes it and a new
+  `merge` that joins the fix into the latest main line, and re-run the check
+  there. Only the final task waits for checks: the ones that prove
+  `completion_criteria` on the fully joined code.
 - **Fill the remaining slots with `perf` tasks.** When correctness and
   feature work cannot use every slot, add performance tasks, largest share of
   runtime first (the big GEMMs, attention, MoE): try another existing
@@ -333,7 +341,9 @@ work of kind 1.
 - **Everything but side work reaches the final task.** Feature and
   performance branches join the main line through `merge` tasks, and an
   `e2e_accuracy` task on the joined code runs after the last of them, before
-  the final task.
+  the final task. A task that only checks or measures reaches the final task
+  directly, or through the task that reports its results, never through a
+  `merge` that would wait for it.
 
 ## Sizing the GPU pool
 
@@ -350,14 +360,13 @@ once — count it, do not guess:
 - Add them up over the running tasks and the ready tasks that will take the
   next free slots, in whole nodes: one node per command that needs a node, and
   the one-GPU commands packed four to a node.
-- If that exceeds the pool and commands on the way to a `completion_criteria`
-  item are waiting, write `gpu_nodes` with that count. Say the arithmetic in
+- If that exceeds the pool and commands are waiting, write `gpu_nodes` with
+  that count, in any phase of the run. Say the arithmetic in
   `summary`. Slurm may take a while to start the new nodes; the pool shows
   them as queued until it does.
 
 The pool only grows, up to the limit each turn shows, and holds its nodes
-until the run ends. Do not grow it for `perf` or side work alone, or for one
-short wait.
+until the run ends. Do not grow it for one short wait.
 
 ## Side tasks: performance work the run does not merge
 
@@ -473,6 +482,7 @@ gpu_nodes: null      # grow the GPU pool to this many nodes
 | "Read everything first, then write the whole plan" | Workers sit idle meanwhile. Write the first batch now and keep planning while it runs. |
 | "One more look at the HF code or the engine before the first batch" | That reading belongs to the second batch. The first is written from `task.yaml`, `config.json` and the README alone. |
 | "The plan is one chain: ops, target, accuracy, land" | Workers sit idle. Run independent work side by side and fill the rest with `perf` tasks. |
+| "Join once the gate / benchmark passes, to be safe" | A join waits only for the code it merges. If the check fails, fix it and join again. |
 | "Start the features once the accuracy gate passes" | The gate's fixes join later through a `merge`. Start the feature work now, from the same code. |
 | "One big task: implement the model" | A worker owns one outcome. Split by entry, by module, by gate. |
 | "The anchor is probably around X" | Anchors come from a written source or a measured oracle. |

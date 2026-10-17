@@ -10,6 +10,8 @@ Bring up a new model, or a new target of an existing model, in ModelingV2
   revises the plan while the others keep going. Its aim is to keep
   `--max-parallel` workers busy: independent work side by side, feature work
   alongside the accuracy gate, and `perf` tasks in the slots left over.
+  Checks never block the next step: a join waits only for the code it merges,
+  and a failed check gets a fix task and a new join.
 - **worker** — runs one task in its own git worktree and ends by writing
   `task_results/task_result_<id>.md`. Workers run in parallel.
 
@@ -179,8 +181,8 @@ A node's optional `priority` (`accuracy` > `feature` > `perf`) is its claim on
 worker slots and shared GPUs: a free slot goes to the ready task of the most
 urgent class (plan order breaks ties), and the orchestrator publishes the
 classes in `gpu_priorities.json` for a GPU pool to serve. A running task is
-never stopped to make room. Left out, the first `e2e_accuracy` gate built on a `target`
-task (one with no such gate upstream) and everything upstream of it are
+never stopped to make room. Left out, the first `e2e_accuracy` gates built on a `target`
+task (those checking the earliest code) and everything upstream of them are
 `accuracy`, other `perf`-tagged tasks are `perf`, and the rest are `feature`. Changing it never re-runs a task.
 
 ## Plan rules

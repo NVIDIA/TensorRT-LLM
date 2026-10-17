@@ -214,6 +214,33 @@ def test_priorities_default_by_role_and_can_be_set():
     assert defaults["perf-moe-gemm"] == "perf"
 
 
+def test_a_gate_on_later_code_is_not_a_first_gate_without_the_first_upstream():
+    # The tp4 gate checks code built on top of what `gate` checks, but joins do
+    # not wait for checks, so `gate` is not upstream of it.
+    nodes = """\
+  - id: target
+    type: target
+  - id: gate
+    type: e2e_accuracy
+    depends_on: [target]
+  - id: target-tp4
+    type: target
+    depends_on: [target]
+  - id: gate-tp4
+    type: e2e_accuracy
+    depends_on: [target-tp4]
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [gate, gate-tp4]
+"""
+    ids = ["target", "gate", "target-tp4", "gate-tp4", "land"]
+    priorities = parse_plan(_plan(nodes, ids)).priorities
+    assert priorities["target"] == priorities["gate"] == "accuracy"
+    assert priorities["target-tp4"] == priorities["gate-tp4"] == "feature"
+
+
 def test_an_unknown_priority_is_rejected():
     text = _plan(
         _VALID_NODES.replace("type: new_op", "type: new_op\n    priority: urgent"),

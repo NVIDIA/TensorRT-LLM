@@ -177,12 +177,15 @@ def default_priorities(
 ) -> dict[str, str]:
     """The priority class of each task when the plan does not set one.
 
-    The first accuracy gates are the ``e2e_accuracy`` tasks that build on a
-    ``target`` task with no such gate upstream (without a ``target`` task,
-    the ``e2e_accuracy`` tasks with none upstream). They and everything
-    upstream of them are ``accuracy``, ``perf``-tagged tasks among them
-    included: they are on the way to the first result. The other ``perf``
-    tasks are ``perf``, and the rest are ``feature``.
+    The gates are the ``e2e_accuracy`` tasks that build on a ``target`` task
+    (without a ``target`` task, every ``e2e_accuracy`` task). The first gates
+    are those that check the earliest code: no other gate is upstream of one,
+    and no other gate's upstream tasks are a strict part of its own. Later
+    gates need not depend on the first ones, since joins do not wait for
+    checks. The first gates and everything upstream of them are ``accuracy``,
+    ``perf``-tagged tasks among them included: they are on the way to the
+    first result. The other ``perf`` tasks are ``perf``, and the rest are
+    ``feature``.
     """
     ancestors = {node.id: _ancestors(graph, node.id) for node in graph.nodes}
     targets = {tid for tid, t in tags.items() if "target" in t}
@@ -191,7 +194,12 @@ def default_priorities(
         for tid, t in tags.items()
         if "e2e_accuracy" in t and (not targets or ancestors[tid] & targets)
     }
-    first = {tid for tid in gates if not ancestors[tid] & gates}
+    first = {
+        tid
+        for tid in gates
+        if not ancestors[tid] & gates
+        and not any(ancestors[other] < ancestors[tid] for other in gates)
+    }
     accuracy = first.union(*(ancestors[tid] for tid in first))
     return {
         node.id: "accuracy"
