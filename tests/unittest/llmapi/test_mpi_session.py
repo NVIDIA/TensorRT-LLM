@@ -12,8 +12,10 @@ from subprocess import PIPE, Popen
 from typing import Literal
 
 import pytest
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
@@ -183,6 +185,31 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
     except Exception as e:
         return f"Error in client: {str(e)}"
+
+
+@pytest.mark.cpu_only
+def test_lightweight_stop_helper_queue_compatibility() -> None:
+    """The standalone sender must deliver a stop through the production queue."""
+    server = ZeroMqQueue(is_server=True, socket_type=zmq.PAIR)
+    server.socket.setsockopt(zmq.LINGER, 0)
+    try:
+        endpoint, key = server.address
+        env = os.environ.copy()
+        env["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"] = endpoint
+        env["TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"] = key.hex()
+        helper = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+                  "_llmapi_mpi_stop.py")
+        result = subprocess.run([sys.executable, str(helper)],
+                                env=env,
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                                check=False)
+        assert result.returncode == 0, result.stderr
+        assert server.poll(5), "The helper did not deliver a shutdown message"
+        assert server.get(timeout=5) is None
+    finally:
+        server.close()
 
 
 @pytest.mark.cpu_only
