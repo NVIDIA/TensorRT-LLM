@@ -22,7 +22,7 @@ max_num_tokens: 256
 max_seq_len: 9236
 kv_cache_config:
   enable_block_reuse: false      # mandatory for K3 (KDA state)
-  tokens_per_block: 64           # mandatory for K3 MLA kernels
+  tokens_per_block: 64           # historical: older TRTLLM-Gen MLA kernels required 64
   # Proven by the aggregated DEP16 SA evals on GB300; bounds decode
   # concurrency x seq-len. Tune upward once the deployment is stable.
   free_gpu_memory_fraction: 0.25
