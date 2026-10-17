@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -ex
 
 # Authenticate the github.com clone below; no-op when no token is available.
@@ -6,6 +8,21 @@ source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
+# Default prefix for AWS EFA bundled with NGC PyTorch images.
+LIBFABRIC_INSTALL_PATH="/opt/amazon/efa"
+if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
+      ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
+    LIBFABRIC_INSTALL_PATH=""
+fi
+# NGC PyTorch's default Open MPI comes from HPC-X and is exposed at /usr/local/mpi.
+# Reuse the hwloc bundled with that MPI installation for the EFA plugin.
+HWLOC_INSTALL_PATH="/usr/local/mpi"
+if [[ -n "${LIBFABRIC_INSTALL_PATH}" &&
+      -f "${HWLOC_INSTALL_PATH}/include/hwloc.h" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/libhwloc.so" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/pkgconfig/hwloc.pc" ]]; then
+    export PKG_CONFIG_PATH="${HWLOC_INSTALL_PATH}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+fi
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="v1.4.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
@@ -36,8 +53,10 @@ fi
 CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
+# An empty libfabric_path uses optional system detection; no match skips the plugin.
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
+    -Dlibfabric_path="${LIBFABRIC_INSTALL_PATH}" \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
