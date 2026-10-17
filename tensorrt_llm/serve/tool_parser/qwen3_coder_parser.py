@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://raw.githubusercontent.com/sgl-project/sglang/d8fcbaa38da95201914a1277971044ee66837b26/python/sglang/srt/function_call/qwen3_coder_detector.py
 
 import ast
@@ -5,6 +7,9 @@ import html
 import json
 import re
 from typing import Any, Dict, List, Tuple
+
+import xgrammar
+from xgrammar import structural_tag
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -57,6 +62,72 @@ class Qwen3CoderToolParser(BaseToolParser):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
+    def build_required_structural_tag(
+        self, tools: list[Tool], *, thinking: bool
+    ) -> structural_tag.StructuralTag:
+        """Require at least one declared call after any prefilled reasoning."""
+        names = [tool.function.name for tool in tools]
+        if not names or len(set(names)) != len(names):
+            raise ValueError("Required tool calls need nonempty tools with unique names.")
+        if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in names):
+            raise ValueError("Tool names must contain only letters, digits, '_', '-', or '.'.")
+        tool_dicts = [tool.model_dump(exclude_none=True) for tool in tools]
+        for tool in tool_dicts:
+            tool["function"].setdefault("parameters", {"type": "object", "properties": {}})
+            if not tool["function"]["parameters"]:
+                tool["function"]["parameters"] = {"type": "object", "properties": {}}
+        template = xgrammar.get_builtin_structural_tag(
+            model="qwen_coder", tools=tool_dicts, reasoning=False
+        )
+        tags = template.format.tags
+        for tag, tool in zip(tags, tool_dicts):
+            schema = tool["function"]["parameters"]
+            if (
+                schema.get("type") == "object"
+                and schema.get("properties") == {}
+                and schema.keys()
+                <= {
+                    "type",
+                    "properties",
+                    "additionalProperties",
+                    "required",
+                    "minProperties",
+                    "maxProperties",
+                    "title",
+                    "description",
+                    "$schema",
+                }
+            ):
+                # Empty argument lists have no XML parameter blocks.
+                xgrammar.Grammar.from_json_schema(json.dumps(schema))
+                if schema.get("required") or schema.get("minProperties", 0) > 0:
+                    raise ValueError("A parameterless tool cannot require properties.")
+                tag.content = structural_tag.ConstStringFormat(value="")
+                tag.end = "</function>\n</tool_call>"
+        calls = template.format
+        calls.at_least_one = True
+        # Every opener must enter a declared call, including calls after free text.
+        calls.triggers = [self.tool_call_start_token]
+        if thinking:
+            # The opening <think> is already in the prompt.
+            template.format = structural_tag.SequenceFormat(
+                elements=[
+                    structural_tag.TagFormat(
+                        begin="",
+                        content=structural_tag.AnyTextFormat(excludes=[self.tool_call_start_token]),
+                        end="</think>",
+                    ),
+                    calls,
+                ]
+            )
+        else:
+            template.format = calls
+        try:
+            xgrammar.Grammar.from_structural_tag(template)
+        except RuntimeError as exc:
+            raise ValueError(f"Unsupported required-tool schema: {exc}") from exc
+        return template
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
@@ -73,8 +144,13 @@ class Qwen3CoderToolParser(BaseToolParser):
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
             if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+                partial = self._ends_with_partial_token(self._buf, self.tool_call_start_token)
+                if partial:
+                    normal += self._buf[:-partial]
+                    self._buf = self._buf[-partial:]
+                else:
+                    normal += self._buf
+                    self._buf = ""
                 break
 
             # Look for tool call start
@@ -146,30 +222,23 @@ class Qwen3CoderToolParser(BaseToolParser):
             if self._function_name_sent:
                 # Process parameters and get any calls to emit
                 param_config = self._get_arguments_config(self._current_function_name, tools)
-                parameter_calls = self._parse_and_stream_parameters(self._buf, param_config)
+                # A single increment can contain several calls. Parse only this call's body.
+                end_pos = self._buf.find(self.tool_call_end_token)
+                body = self._buf if end_pos == -1 else self._buf[:end_pos]
+                parameter_calls = self._parse_and_stream_parameters(body, param_config)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
                 if self.tool_call_end_token in self._buf:
                     end_pos = self._buf.find(self.tool_call_end_token)
 
-                    # Add closing brace to complete the JSON object
+                    # Parameter deltas leave the outer object open until the call closes.
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                    if current_streamed:
-                        # Count opening and closing braces to check if JSON is complete
-                        open_braces = current_streamed.count("{")
-                        close_braces = current_streamed.count("}")
-                        if open_braces > close_braces:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters="}",
-                                )
-                            )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
-                            )
+                    closing = "}" if current_streamed else "{}"
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=closing)
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = current_streamed + closing
 
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
@@ -181,6 +250,11 @@ class Qwen3CoderToolParser(BaseToolParser):
                     break
 
         return StreamingParseResult(normal_text=normal, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        normal = self._buf if not self._in_tool_call else ""
+        self._buf = ""
+        return StreamingParseResult(normal_text=normal)
 
     def _parse_and_stream_parameters(
         self, text_to_parse: str, param_config: dict

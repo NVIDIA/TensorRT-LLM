@@ -131,6 +131,8 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
+from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
+    Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -1976,13 +1978,33 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, self.allow_request_chat_template)
             model_type = resolve_top_level_model_type(self.model_config)
             is_kimi_k3 = model_type == "kimi_k3"
+            nemotron_required = (model_type == "nemotron_h_omni"
+                                 and request.tool_choice == "required")
             apply_model_chat_extensions(request, model_type)
-            if request.tool_choice == "required" and not is_kimi_k3:
-                # Schema-accepting "required" everywhere but enforcing it only
-                # for kimi_k3 would silently degrade to "auto" elsewhere;
-                # reject loudly for models that cannot honor it.
+            if request.tool_choice == "required" and not (is_kimi_k3
+                                                          or nemotron_required):
                 raise ValueError(
                     "tool_choice='required' is not supported for this model.")
+            if nemotron_required:
+                if (self.tool_parser != "qwen3_coder"
+                        or self.generator.args.reasoning_parser
+                        not in ("nemotron-v3", "nano-v3")
+                        or self.generator.args.guided_decoding_backend
+                        != "xgrammar"):
+                    raise ValueError(
+                        "Nemotron Super 3.5 VL tool_choice='required' requires "
+                        "qwen3_coder, the nemotron-v3 reasoning parser, and xgrammar."
+                    )
+                if not request.tools:
+                    raise ValueError(
+                        "tool_choice='required' requires request-level tools.")
+                if (request.prompt_token_ids is not None
+                        or request.prompt_token_ids_b64
+                        or not request.add_generation_prompt
+                        or request.disaggregated_params is not None):
+                    raise ValueError(
+                        "Nemotron tool_choice='required' requires chat messages "
+                        "with add_generation_prompt=True on a native server.")
             conversation: List[ConversationMessage] = []
             # exclude_none for kimi_k3: pydantic-injected null defaults
             # (strict, description, parameters) would otherwise leak into the
@@ -2003,6 +2025,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if nemotron_required and sampling_params.guided_decoding is not None:
+                raise ValueError(
+                    "tool_choice='required' cannot be combined with response_format "
+                    "or other guided-decoding settings.")
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2121,7 +2147,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # via structural tags (only if response_format doesn't already
                 # set guided decoding). Dynamic tools must be in the grammar
                 # too, or their calls would be masked out.
-                if sampling_params.guided_decoding is None:
+                if sampling_params.guided_decoding is None and not nemotron_required:
                     if (forced_tool_name is not None
                             and _parser_extracts_forced_tool_calls(
                                 self.tool_parser)):
@@ -2260,6 +2286,31 @@ class OpenAIServer(_VideoRoutesMixin):
                     # resolve_prefilled_thinking() inspects what the chat
                     # template rendered, and the prefix is not part of it.
                     rendered_prompt = prompt
+                if nemotron_required:
+                    suffix = rendered_prompt.rstrip() if rendered_prompt else ""
+                    if suffix.endswith("<|im_start|>assistant\n<think>"):
+                        thinking = True
+                    elif suffix.endswith(
+                            "<|im_start|>assistant\n<think></think>"):
+                        thinking = False
+                    else:
+                        raise ValueError(
+                            "Cannot resolve Nemotron required-tool reasoning state "
+                            "from the rendered generation prompt.")
+                    build_required = functools.partial(
+                        Qwen3CoderToolParser().build_required_structural_tag,
+                        request.tools,
+                        thinking=thinking)
+                    required_format = await asyncio.get_running_loop(
+                    ).run_in_executor(self._input_proc_executor, build_required)
+                    sampling_params.guided_decoding = GuidedDecodingParams(
+                        structural_tag=required_format.model_dump_json(
+                            by_alias=True))
+                    postproc_args.chat_template_kwargs = {
+                        **(request.chat_template_kwargs or {}),
+                        "enable_thinking":
+                        thinking,
+                    }
                 if forced_tool_begin_prefix is not None:
                     # Force the model to start generation inside the tool call.
                     # See ``_build_forced_tool_call_decoding`` for details.

@@ -318,6 +318,7 @@ class TestOpenAIChatIntegration:
         monkeypatch.setattr(openai_server, "async_apply_chat_template", fake_apply_chat_template)
 
         def generate_async(*, inputs, **kwargs):
+            rendered["generation"] = kwargs
             return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
 
         server = object.__new__(OpenAIServer)
@@ -332,6 +333,7 @@ class TestOpenAIChatIntegration:
         server.tool_parser = None
         server.tool_call_id_type = "random"
         server.multimodal_server_config = None
+        server._input_proc_executor = None
         server.generator = SimpleNamespace(
             args=SimpleNamespace(
                 gather_generation_logits=False,
@@ -359,6 +361,7 @@ class TestOpenAIChatIntegration:
         )
 
         app = FastAPI()
+        app.state.server = server
         app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
         return TestClient(app), events, rendered
 
@@ -381,3 +384,119 @@ class TestOpenAIChatIntegration:
         # The renderer saw the request the extension mutated, with the
         # client's own kwargs preserved.
         assert rendered["chat_template_kwargs"] == {"client_flag": 1, **self.MARKER}
+
+    @pytest.fixture
+    def required_chat_client(self, chat_client, monkeypatch):
+        from tensorrt_llm.serve import openai_server
+
+        client, events, rendered = chat_client
+        server = client.app.state.server
+        type(server.model_config).model_type = "nemotron_h_omni"
+        server.tool_parser = "qwen3_coder"
+        server.generator.args.reasoning_parser = "nemotron-v3"
+        server.generator.args.guided_decoding_backend = "xgrammar"
+
+        async def render_prompt(**kwargs):
+            thinking = rendered.get("thinking", True)
+            return "<|im_start|>assistant\n<think>" + ("\n" if thinking else "</think>")
+
+        monkeypatch.setattr(openai_server, "async_apply_chat_template", render_prompt)
+        return client, server, rendered
+
+    @staticmethod
+    def required_body():
+        return {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "tools": [{"type": "function", "function": {"name": "ping"}}],
+            "tool_choice": "required",
+            "max_tokens": 64,
+        }
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("workers", [0, 4])
+    def test_required_attaches_mandatory_grammar(self, required_chat_client, thinking, workers):
+        import xgrammar
+
+        client, server, rendered = required_chat_client
+        rendered["thinking"] = thinking
+        server.generator.args.num_postprocess_workers = workers
+        body = self.required_body()
+        body["chat_template_kwargs"] = {"enable_thinking": not thinking}
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200, response.text
+        params = rendered["generation"]["sampling_params"].guided_decoding
+        assert params is not None
+        compiler = xgrammar.GrammarCompiler(
+            xgrammar.TokenizerInfo(
+                [bytes([i]) for i in range(256)] + [b"<EOS>"], stop_token_ids=[256]
+            )
+        )
+        compiled = compiler.compile_structural_tag(params.structural_tag)
+        matcher = xgrammar.GrammarMatcher(compiled)
+        if thinking:
+            assert matcher.accept_string("Considering.</think>")
+        assert not matcher.accept_token(256)
+        assert matcher.accept_string("<tool_call>\n<function=ping>\n</function>\n</tool_call>")
+        assert matcher.accept_token(256)
+        postproc = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc.chat_template_kwargs["enable_thinking"] is thinking
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"tools": []},
+            {"prompt_token_ids": [1, 2]},
+            {"prompt_token_ids_b64": "AQAAAA=="},
+            {"add_generation_prompt": False},
+            {"response_format": {"type": "json_object"}},
+        ],
+    )
+    def test_required_rejects_conflicting_requests(self, required_chat_client, change):
+        client, server, rendered = required_chat_client
+        response = client.post("/v1/chat/completions", json={**self.required_body(), **change})
+        # The bare app uses FastAPI's 422 for request-schema errors.
+        expected_status = 422 if change.get("tools") == [] else 400
+        assert response.status_code == expected_status, response.text
+        assert "generation" not in rendered
+
+    @pytest.mark.parametrize(
+        "model_type,parser,backend",
+        [
+            ("nemotron_h", "qwen3_coder", "xgrammar"),
+            ("nemotron_h_omni", "qwen3", "xgrammar"),
+            ("nemotron_h_omni", "qwen3_coder", None),
+            ("nemotron_h_omni", "qwen3_coder", "llguidance"),
+        ],
+    )
+    def test_required_rejects_unsupported_configuration(
+        self, required_chat_client, model_type, parser, backend
+    ):
+        client, server, rendered = required_chat_client
+        type(server.model_config).model_type = model_type
+        server.tool_parser = parser
+        server.generator.args.guided_decoding_backend = backend
+        response = client.post("/v1/chat/completions", json=self.required_body())
+        assert response.status_code == 400, response.text
+        assert "generation" not in rendered
+
+    def test_required_rejects_unresolved_prompt(self, required_chat_client, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from tensorrt_llm.serve import openai_server
+
+        client, server, rendered = required_chat_client
+        monkeypatch.setattr(
+            openai_server, "async_apply_chat_template", AsyncMock(return_value="assistant:")
+        )
+        response = client.post("/v1/chat/completions", json=self.required_body())
+        assert response.status_code == 400, response.text
+        assert "generation" not in rendered
+
+    def test_auto_does_not_attach_required_grammar(self, required_chat_client):
+        client, server, rendered = required_chat_client
+        response = client.post(
+            "/v1/chat/completions", json={**self.required_body(), "tool_choice": "auto"}
+        )
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is None
