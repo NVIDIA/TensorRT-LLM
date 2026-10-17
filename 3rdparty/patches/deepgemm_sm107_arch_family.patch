@@ -1,0 +1,13 @@
+--- a/csrc/runtime/jit.hpp
++++ b/csrc/runtime/jit.hpp
+@@ -37,6 +37,10 @@ inline void init_jit(const std::string& library_root_path) {
+         // Preserve the existing 12.x family target when DeepJIT derives a different minor target.
+         if (runtime->device.get_arch_major() == 12 and runtime->device.get_arch_minor() != 0)
+             runtime->default_compiler_options.arch = "120f";
++        // Build SM107 as `sm_100f`, as before DeepJIT: the bundled CUTLASS has no SM107
++        // entries, so `sm_107f` leaves the SM90 TMA paths disabled and they trap at runtime.
++        if (runtime->device.get_arch_major() == 10 and runtime->device.get_arch_minor() == 7)
++            runtime->default_compiler_options.arch = "100f";
+         return runtime;
+     });
+ }

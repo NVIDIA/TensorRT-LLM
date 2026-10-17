@@ -84,3 +84,80 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
         [3, 4, 5],
         [6, 7, 8],
     ]
+
+
+def test_generation_step_keeps_the_dummy_slot_context_empty():
+    """Padding and ADP dummy rows must not accumulate drafter context.
+
+    They all map to the shared dummy slot, which no request ever frees. If the
+    generation step advanced its length like a real slot's, the dummies' drafter
+    context would grow every step until it reached ``_max_ctx``.
+    """
+    max_draft_len = 3
+    num_slots = 3  # two request slots plus the dummy slot
+    hidden, num_layers, num_kv_heads, head_dim = 8, 1, 1, 4
+    max_ctx = 64
+    config = DFlashDecodingConfig(
+        max_draft_len=max_draft_len, attention_backend="TRTLLM", mask_token_id=0
+    )
+    worker = DFlashWorker(config, Mapping())
+    worker._dummy_slot = num_slots - 1
+    worker._max_ctx = max_ctx
+    worker._compute_block_size = max_draft_len + 1
+    worker._ctx_len = torch.tensor([5, 0, 0], dtype=torch.long, device="cuda")
+    # Gen request 0 owns slot 0; gen request 1 is padding on the dummy slot.
+    worker._batch_to_slot = torch.tensor([0, worker._dummy_slot], dtype=torch.long, device="cuda")
+    buf_shape = (num_slots, num_layers, max_ctx + max_draft_len + 1, num_kv_heads, head_dim)
+    worker._ctx_k_buf = torch.zeros(buf_shape, device="cuda")
+    worker._ctx_v_buf = torch.zeros(buf_shape, device="cuda")
+
+    num_gens = 2
+    tokens_per_req = max_draft_len + 1
+    num_target_tokens = num_gens * tokens_per_req
+
+    def precompute_context_kv(projected, positions):
+        rows = projected.shape[0]
+        k = torch.ones(rows, num_layers, num_kv_heads, head_dim, device="cuda")
+        return k, k.clone()
+
+    embed_tokens = torch.nn.Embedding(16, hidden).cuda()
+    draft_model = SimpleNamespace(
+        fc=object(),
+        hidden_norm=object(),
+        project_target_hidden=lambda hs: hs,
+        precompute_context_kv=precompute_context_kv,
+        draft_model_full=SimpleNamespace(model=SimpleNamespace(embed_tokens=embed_tokens)),
+    )
+    captured = torch.randn(num_target_tokens, hidden, device="cuda")
+    spec_metadata = SimpleNamespace(
+        hidden_size=hidden,
+        runtime_draft_len=max_draft_len,
+        get_hidden_states=lambda num_tokens: captured[:num_tokens],
+    )
+    attn_metadata = SimpleNamespace(
+        num_contexts=0,
+        num_seqs=num_gens,
+        num_ctx_tokens=0,
+        _seq_lens_cuda=torch.zeros(num_gens, dtype=torch.int32, device="cuda"),
+        _seq_lens=torch.zeros(num_gens, dtype=torch.int32),
+    )
+    accepted_tokens = torch.arange(num_gens * tokens_per_req, dtype=torch.long, device="cuda").view(
+        num_gens, tokens_per_req
+    )
+    num_accepted_tokens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+
+    for step in range(2):
+        inputs = worker.prepare_1st_drafter_inputs(
+            input_ids=torch.zeros(num_target_tokens, dtype=torch.long, device="cuda"),
+            position_ids=torch.zeros(num_target_tokens, dtype=torch.long, device="cuda"),
+            hidden_states=torch.zeros(num_target_tokens, hidden, device="cuda"),
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model,
+            total_target_tokens=num_target_tokens,
+        )
+        real_len = 5 + 2 * (step + 1)
+        assert worker._ctx_len.tolist() == [real_len, 0, 0]
+        assert inputs["num_ctx_per_req"].tolist() == [real_len, 0]
