@@ -765,3 +765,66 @@ def test_full_dim_norm_packed_v_unchanged():
         interleave=False,
     )
     torch.testing.assert_close(qkv[:, 2 * hidden :], v_original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_per_head_rank_slice_matches_full(tp_size):
+    """A tensor-parallel rank holds a contiguous slice of the heads in its packed QKV.
+    With per-head norm weights the op on that slice, told the rank-local head counts,
+    equals the same columns of the op on the whole projection (Cosmos3 GQA layout:
+    q heads, then k heads, then v heads)."""
+    device = "cuda"
+    torch.random.manual_seed(7)
+    num_heads, num_kv_heads, head_dim, num_tokens = 32, 8, 128, 96
+    qkv = torch.randn(
+        num_tokens, (num_heads + 2 * num_kv_heads) * head_dim, dtype=torch.bfloat16, device=device
+    )
+    q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
+    full = qkv.clone()
+    _call_fused_kernel(
+        full,
+        num_heads,
+        num_kv_heads,
+        num_kv_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        None,
+        None,
+        cos_emb,
+        sin_emb,
+        -1,
+        interleave=False,
+    )
+    hq, hkv = num_heads // tp_size, num_kv_heads // tp_size
+    q0, k0 = 0, num_heads * head_dim
+    v0 = k0 + num_kv_heads * head_dim
+    for rank in range(tp_size):
+        cols = torch.cat(
+            [
+                torch.arange(q0 + rank * hq * head_dim, q0 + (rank + 1) * hq * head_dim),
+                torch.arange(k0 + rank * hkv * head_dim, k0 + (rank + 1) * hkv * head_dim),
+                torch.arange(v0 + rank * hkv * head_dim, v0 + (rank + 1) * hkv * head_dim),
+            ]
+        ).to(device)
+        local = qkv[:, cols].contiguous()
+        _call_fused_kernel(
+            local,
+            hq,
+            hkv,
+            hkv,
+            head_dim,
+            1e-6,
+            q_weight,
+            k_weight,
+            None,
+            None,
+            cos_emb,
+            sin_emb,
+            -1,
+            interleave=False,
+        )
+        torch.testing.assert_close(local, full[:, cols], rtol=0, atol=0)
