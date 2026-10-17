@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from unittest.mock import Mock
 
 import pytest
 
@@ -398,6 +399,39 @@ async def test_disconnect_after_done_is_ignored():
         None,
         disconnect,
     )
+
+
+@pytest.mark.asyncio
+async def test_record_is_submitted_when_stream_is_cancelled_before_final_body():
+    # A client that stops reading at [DONE] disconnects. Starlette then cancels the
+    # StreamingResponse, absorbs the cancellation and returns without the final body.
+    writer = Mock(spec=PerfMetricsJsonlWriter)
+    record = _record()
+
+    async def app(scope, receive, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        scope["state"]["perf_metrics_records"].append(record)
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b"data: [DONE]\n\n",
+                "more_body": True,
+            }
+        )
+
+    async def discard(message):
+        pass
+
+    middleware = PerfMetricsMiddleware(app, expose_headers=False, writer=writer)
+    await middleware({"type": "http", "headers": [], "state": {}}, None, discard)
+
+    writer.submit.assert_called_once_with(record)
 
 
 @pytest.mark.asyncio
