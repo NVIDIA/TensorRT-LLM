@@ -2711,8 +2711,8 @@ class PyExecutor:
     def _stage_begin(self) -> None:
         enabled = getattr(self, "_stage_timing", None)
         if enabled is None:
-            enabled = self._stage_timing = (
-                os.environ.get("TLLM_EXECUTOR_STAGE_TIMING", "0") == "1")
+            enabled = self._stage_timing = (os.environ.get(
+                "TLLM_EXECUTOR_STAGE_TIMING", "0") == "1")
             self._stage_acc = {}
             self._stage_n = 0
             self._stage_busy = 0
@@ -2725,16 +2725,18 @@ class PyExecutor:
         if not getattr(self, "_stage_timing", False):
             return
         now = time.perf_counter()
-        self._stage_acc[name] = self._stage_acc.get(name, 0.0) + (now - self._stage_t)
+        self._stage_acc[name] = self._stage_acc.get(name,
+                                                    0.0) + (now - self._stage_t)
         self._stage_t = now
 
     def _stage_end(self, busy: bool) -> None:
         if not getattr(self, "_stage_timing", False):
             return
         now = time.perf_counter()
-        self._stage_acc["wall"] = self._stage_acc.get("wall", 0.0) + (now - self._stage_pass_t0)
-        self._stage_acc["thread_cpu"] = self._stage_acc.get("thread_cpu", 0.0) + (
-            time.thread_time() - self._stage_cpu0)
+        self._stage_acc["wall"] = self._stage_acc.get(
+            "wall", 0.0) + (now - self._stage_pass_t0)
+        self._stage_acc["thread_cpu"] = self._stage_acc.get(
+            "thread_cpu", 0.0) + (time.thread_time() - self._stage_cpu0)
         self._stage_n += 1
         self._stage_busy += int(bool(busy))
         if self._stage_n % 500 == 0:
@@ -2742,9 +2744,11 @@ class PyExecutor:
             world = getattr(self.dist, "world_size", 1)
             if rank in (0, world - 1):
                 n = self._stage_n
-                parts = " ".join(f"{k}={v * 1e3 / 500:.2f}" for k, v in self._stage_acc.items())
-                logger.info(f"EXECUTOR_STAGES rank={rank} iter={self.iter_counter} passes=500 "
-                            f"busy={self._stage_busy} ms/pass: {parts}")
+                parts = " ".join(f"{k}={v * 1e3 / 500:.2f}"
+                                 for k, v in self._stage_acc.items())
+                logger.info(
+                    f"EXECUTOR_STAGES rank={rank} iter={self.iter_counter} passes=500 "
+                    f"busy={self._stage_busy} ms/pass: {parts}")
             self._stage_acc = {}
             self._stage_busy = 0
 
@@ -5733,8 +5737,8 @@ class PyExecutor:
         return flush_transfer_errors
 
     @nvtx_range("_adp_post_schedule_exchange")
-    def _adp_post_schedule_exchange(
-            self, scheduled_batch: ScheduledRequests) -> None:
+    def _adp_post_schedule_exchange(self,
+                                    scheduled_batch: ScheduledRequests) -> None:
         """Packed post-schedule exchange (TLLM_ADP_PACKED_SYNC, "Group B").
 
         One int64 tensor all-gather of ``[batch_size, can_run_cuda_graph,
@@ -5752,8 +5756,8 @@ class PyExecutor:
         cuda_graph_runner = getattr(self.model_engine, "cuda_graph_runner",
                                     None)
         can_run_cuda_graph = bool(
-            cuda_graph_runner._can_run_cuda_graph_batch(graph_batch)
-        ) if cuda_graph_runner is not None else False
+            cuda_graph_runner._can_run_cuda_graph_batch(
+                graph_batch)) if cuda_graph_runner is not None else False
         vectors = self.dist.allgather_ints(
             [batch_size,
              int(can_run_cuda_graph), graph_batch.batch_size])
@@ -5762,8 +5766,9 @@ class PyExecutor:
                       for vector in vectors]
 
         if self._packed_sync_verify:
-            legacy_batch_sizes = self.dist.tp_allgather_int64(
-                [batch_size])[:, 0].tolist()
+            legacy_batch_sizes = self.dist.tp_allgather_int64([batch_size
+                                                               ])[:,
+                                                                  0].tolist()
             self._packed_sync_check("batch_sizes", legacy_batch_sizes,
                                     batch_sizes)
             if cuda_graph_runner is not None:

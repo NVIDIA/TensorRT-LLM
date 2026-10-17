@@ -20,7 +20,8 @@ from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (Any, Callable, ContextManager, Iterable, List, Optional, Set, Tuple, Type, get_type_hints)
+from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
+                    Set, Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -824,9 +825,9 @@ def configure_cpu_affinity(device_id: int) -> None:
             logger.info(
                 f"Worker process {pid} CPU affinity set to "
                 f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
-                f"({bound}/{attempted} threads"
-                + (f"; {len(dropped)} service CPUs excluded: {dropped[0]}-{dropped[-1]}"
-                   if dropped else "") + ").")
+                f"({bound}/{attempted} threads" +
+                (f"; {len(dropped)} service CPUs excluded: {dropped[0]}-{dropped[-1]}"
+                 if dropped else "") + ").")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],

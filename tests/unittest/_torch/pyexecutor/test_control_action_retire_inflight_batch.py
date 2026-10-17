@@ -45,8 +45,16 @@ class _Rank:
 
     _retire_inflight_batch_for_control = PyExecutor._retire_inflight_batch_for_control
 
-    def __init__(self, *, previous_batch, pp_size=1, overlap=True,
-                 early_first_token=False, drafter=None, use_spec_decode=False):
+    def __init__(
+        self,
+        *,
+        previous_batch,
+        pp_size=1,
+        overlap=True,
+        early_first_token=False,
+        drafter=None,
+        use_spec_decode=False,
+    ):
         self.dist = MagicMock(pp_size=pp_size, world_size=8)
         self.disable_overlap_scheduler = not overlap
         self.previous_batch = previous_batch
@@ -91,15 +99,18 @@ class _Rank:
 
 
 class TestRetireInflightBatch:
-
     def test_rank_with_batch_follows_the_loop_tail_order(self):
         rank = _Rank(previous_batch=_batch())
 
         rank._retire_inflight_batch_for_control()
 
         assert rank.calls == [
-            "update_requests", "send_kv_async", "flush", "commit_stats",
-            "wait_input_copy", "process_previous_batch"
+            "update_requests",
+            "send_kv_async",
+            "flush",
+            "commit_stats",
+            "wait_input_copy",
+            "process_previous_batch",
         ]
         assert rank.previous_batch is None
         rank.perf_manager.compute_batch_gpu_times.assert_called_once_with(["r1", "r2"])
@@ -126,8 +137,11 @@ class TestRetireInflightBatch:
         assert without.calls == ["enqueue_empty", "flush", "enqueue_empty"]
         assert without.gathers == with_batch.gathers == 3
 
-    @pytest.mark.parametrize("kwargs", [dict(pp_size=2), dict(overlap=False)],
-                             ids=["pipeline_parallel", "non_overlap_loop"])
+    @pytest.mark.parametrize(
+        "kwargs",
+        [dict(pp_size=2), dict(overlap=False)],
+        ids=["pipeline_parallel", "non_overlap_loop"],
+    )
     def test_out_of_scope_loops_are_untouched(self, kwargs):
         """PP keeps its microbatches (BatchStatePP is consumed by
         _handle_executed_batch); the non-overlap loop has no in-flight batch."""
@@ -153,7 +167,6 @@ class TestRetireInflightBatch:
 
 
 class _RecordingEvent(threading.Event):
-
     def __init__(self, log, name):
         super().__init__()
         self._log = log
@@ -206,7 +219,6 @@ def cuda_sync(monkeypatch):
 
 
 class TestHandleControlRequest:
-
     def test_in_flight_action_retires_the_batch_before_releasing_the_barrier(self, cuda_sync):
         ex = _ControlExecutor(drain=False, active=["busy"])
 

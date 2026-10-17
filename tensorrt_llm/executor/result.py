@@ -592,7 +592,8 @@ class GenerationResultBase:
             self.avg_decoded_tokens_per_iter = (
                 response.avg_decoded_tokens_per_iter)
             self.cached_tokens = response.cached_tokens
-            self.ctx_computed_tokens = getattr(response, 'ctx_computed_tokens', 0)
+            self.ctx_computed_tokens = getattr(response, 'ctx_computed_tokens',
+                                               0)
             self.ctx_first_begin = getattr(response, 'ctx_first_begin', -1)
             self.ctx_num_chunks = getattr(response, 'ctx_num_chunks', 0)
             if isinstance(response.res, CompletionOutput):
@@ -660,8 +661,10 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
-            self.ctx_computed_tokens = getattr(response_result, 'ctx_computed_tokens', 0)
-            self.ctx_first_begin = getattr(response_result, 'ctx_first_begin', -1)
+            self.ctx_computed_tokens = getattr(response_result,
+                                               'ctx_computed_tokens', 0)
+            self.ctx_first_begin = getattr(response_result, 'ctx_first_begin',
+                                           -1)
             self.ctx_num_chunks = getattr(response_result, 'ctx_num_chunks', 0)
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)

@@ -16,7 +16,10 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, ResourceManager, ResourceManagerType)
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -36,11 +39,12 @@ N_REAL = 5  # pads to the 8-request graph size -> 3 dummies
 
 
 def _make_engine():
-    llm_args = TorchLlmArgs(model="dummy",
-                            max_batch_size=MAX_BATCH,
-                            max_num_tokens=258,
-                            cuda_graph_config=CudaGraphConfig(
-                                enable_padding=True, batch_sizes=[1, 2, 4, 8, 16]))
+    llm_args = TorchLlmArgs(
+        model="dummy",
+        max_batch_size=MAX_BATCH,
+        max_num_tokens=258,
+        cuda_graph_config=CudaGraphConfig(enable_padding=True, batch_sizes=[1, 2, 4, 8, 16]),
+    )
     engine = DummyModelEngine(llm_args, torch.half)
     kv = KVCacheManager(
         KvCacheConfig(max_tokens=258),
@@ -90,8 +94,9 @@ def _run_patched(fast: bool, monkeypatch, num_gen_steps, drop_after):
     counts = {"fast": 0, "block_copies": 0}
     if not fast:
         # The steady-gen fast path lives on the engine's decoder runner.
-        monkeypatch.setattr(type(engine._runner), "_can_use_steady_gen_fast_prepare",
-                            lambda self, *a, **k: False)
+        monkeypatch.setattr(
+            type(engine._runner), "_can_use_steady_gen_fast_prepare", lambda self, *a, **k: False
+        )
     orig_apply = engine._runner._apply_steady_gen_fast_prepare
 
     def spy_apply(*a, **k):
@@ -109,7 +114,9 @@ def _run_patched(fast: bool, monkeypatch, num_gen_steps, drop_after):
 
     reqs = [_create_request(PROMPT, i) for i in range(N_REAL)]
     for i, r in enumerate(reqs):
-        r.py_seq_slot = i  # the executor's slot manager does this; needed for the previous-tensor branch
+        r.py_seq_slot = (
+            i  # the executor's slot manager does this; needed for the previous-tensor branch
+        )
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = list(reqs)
     kv.prepare_resources(batch)
@@ -177,8 +184,12 @@ def test_fast_prepare_advances_the_host_runtime_kv_lens(monkeypatch):
     md = engine._runner.attn_metadata
     n = md.num_seqs
     torch.testing.assert_close(md.kv_lens_runtime[:n], md.kv_lens_cuda[:n].cpu(), atol=0, rtol=0)
-    torch.testing.assert_close(md.kv_lens_runtime[:n],
-                               md.kv_lens[:n] - md.kv_cache_params.num_extra_kv_tokens, atol=0, rtol=0)
+    torch.testing.assert_close(
+        md.kv_lens_runtime[:n],
+        md.kv_lens[:n] - md.kv_cache_params.num_extra_kv_tokens,
+        atol=0,
+        rtol=0,
+    )
     # every real request committed one token per gen step
     assert md.kv_lens_runtime[:N_REAL].tolist() == [PROMPT + 6] * N_REAL
     assert [s["kv_lens_runtime"][0].item() for s in out] == [PROMPT + k for k in range(1, 7)]
