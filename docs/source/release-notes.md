@@ -8,9 +8,13 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
 
+- Disaggregated serving supports the Responses API: `trtllm-serve disaggregated` serves `/v1/responses` with context-first and generation-first scheduling, and `/v1/models`. `previous_response_id` is rejected and `store` is ignored there, since no response history is kept. See [Disaggregated Serving](features/disagg-serving.md#responses-api).
+
 ### Infrastructure Changes
 
 ### API Changes
+
+- `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.
 
 ### Fixed Issues
 

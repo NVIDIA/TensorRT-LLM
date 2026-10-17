@@ -27,14 +27,16 @@ from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ResponsesRequest)
 # Shared tokenization / block-hashing utilities (single source of truth).
 # Re-exported here for backward compat.
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
     BlockHashMixin, OpenAIRequest, block_key_hasher, get_cache_salt_id,
-    get_request_num_tokens, hash_v1_block_key, truncate_sha256_hash_to_int64)
+    get_request_num_tokens, hash_v1_block_key, responses_request_text,
+    truncate_sha256_hash_to_int64)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_SELECT_MAX_ATTEMPTS = 2
@@ -1430,6 +1432,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     @staticmethod
     def _extract_text(request: OpenAIRequest) -> str:
         """Return a canonical text representation of the request content."""
+        if isinstance(request, ResponsesRequest):
+            return responses_request_text(request)
         if isinstance(request, ChatCompletionRequest):
             parts = []
             for msg in request.messages:
@@ -1454,6 +1458,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         Returns ``None`` when the request does not already carry them.
         """
+        if isinstance(request, ResponsesRequest):
+            token_ids = request.relayed_prompt_token_ids()
+            return None if token_ids is None else [token_ids]
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
