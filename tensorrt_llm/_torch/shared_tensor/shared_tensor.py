@@ -15,6 +15,8 @@ from torch.multiprocessing.reductions import (rebuild_cuda_tensor,
 
 logger = logging.getLogger(__name__)
 
+_sharing_strategy_lock = threading.Lock()
+
 
 class _LocalTensorStore:
     """Process-local stash for same-process tensor handoff.
@@ -452,14 +454,16 @@ class SharedTensorContainer:
             tensor_dict = SharedTensorContainer.cuda_handle_to_dict(
                 self.tensor_handle)
         elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
-            sharing_strategy = get_sharing_strategy()
-            # Here we use file_system sharing strategy to make it serializable between two non-python independent processes
-            set_sharing_strategy("file_system")
             storage = self.tensor_handle[1]
             meta_data = self.tensor_handle[2]
-            storage_handle = reduce_storage(storage)
-            # restore the original sharing strategy
-            set_sharing_strategy(sharing_strategy)
+            # Here we use file_system sharing strategy to make it serializable between two non-python independent processes
+            with _sharing_strategy_lock:
+                sharing_strategy = get_sharing_strategy()
+                set_sharing_strategy("file_system")
+                try:
+                    storage_handle = reduce_storage(storage)
+                finally:
+                    set_sharing_strategy(sharing_strategy)
             # exclude the first element which is the type of the storage
             storage_metadata = storage_handle[-1][1:]
             tensor_dict = SharedTensorContainer.cpu_handle_to_dict(
