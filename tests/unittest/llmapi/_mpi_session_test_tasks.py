@@ -22,3 +22,21 @@ def receive_logits_processor(addresses: list[tuple[str, bytes]]) -> None:
         queue.put((rank, logits.argmax(dim=-1).item()))
     finally:
         queue.close()
+
+
+def session_rank() -> int:
+    from tensorrt_llm._utils import mpi_rank
+
+    return mpi_rank()
+
+
+def occupy_rank(seconds: float) -> None:
+    import time
+
+    time.sleep(seconds)
+
+
+def allreduce_ranks() -> int:
+    from tensorrt_llm._utils import mpi_comm
+
+    return mpi_comm().allreduce(session_rank())
