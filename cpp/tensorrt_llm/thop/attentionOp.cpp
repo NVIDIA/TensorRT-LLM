@@ -1523,9 +1523,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         maxCrossKvLength = host_past_key_value_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
     }
-    int64_t const workspace_size
-        = runner->getWorkspaceSize(*op, num_contexts, num_ctx_tokens, max_context_q_len, maxCrossKvLength,
-            num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
+    // A generation-only call skips the context run below, so it needs no
+    // context workspace. num_contexts and host_total_kv_lens[0] still describe
+    // the context requests of the step and would size buffers that grow with
+    // their summed KV length, such as the fp8 context-MLA K/V staging.
+    int64_t const workspace_size = runner->getWorkspaceSize(*op, is_gen_only ? 0 : num_contexts,
+        is_gen_only ? 0 : num_ctx_tokens, max_context_q_len, maxCrossKvLength, num_generations,
+        max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, is_gen_only ? 0 : ctx_total_kv_len);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;
