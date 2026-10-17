@@ -22,9 +22,14 @@ trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAN
 bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_install\.sh/bash_utils.sh/')"
 source "$bashUtilsPath"
 
+# The read helper (jenkins/scripts/fetch_build_artifact.sh) sits beside this script, under the same
+# per-job prefix. LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID reach it
+# from the job script.
+fetchHelperPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_install\.sh/fetch_build_artifact.sh/')"
+
 slurm_install_setup() {
     : "${tarName:?tarName is required}"
-    : "${llmTarfile:?llmTarfile is required}"
+    : "${llmTarArtifactPath:?llmTarArtifactPath is required}"
     : "${resourcePathNode:?resourcePathNode is required}"
     : "${stageName:?stageName is required}"
     : "${pytestCommand:?pytestCommand is required}"
@@ -53,12 +58,11 @@ slurm_install_setup() {
         # Job/node-specific tmp path to avoid collisions on concurrent jobs
         archive_tmp="${archive_path}.tmp.${SLURM_JOB_ID:-local}.${SLURM_NODEID:-0}"
         rm -f "$archive_path" "$archive_tmp"
-        # Download the artifact idempotently with retry. A bare "retry_command wget <url>" will
-        # save artifact as $tarName.1 when the first attempt fails in the middle of downloading.
-        # Here we download to the tmp path and only promote it on success
-        if ! retry_command --timeout 1800 bash -c 'wget -nv "$1" -O "$2" && mv -f "$2" "$3"' _ "$llmTarfile" "$archive_tmp" "$archive_path"; then
+        # Download the artifact idempotently with retry: each attempt writes to the tmp path, and
+        # only a successful one promotes it.
+        if ! retry_command --timeout 1800 bash -c 'bash "$1" "$2" "$3" && mv -f "$3" "$4"' _ "$fetchHelperPath" "$llmTarArtifactPath" "$archive_tmp" "$archive_path"; then
             rm -f "$archive_tmp"
-            echo "Artifact download failed after retries: $llmTarfile"
+            echo "Artifact download failed after retries: $llmTarArtifactPath"
             return 1
         fi
         if [ ! -f "$archive_path" ]; then
