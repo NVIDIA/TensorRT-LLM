@@ -39,7 +39,7 @@ only when all ranks line up on the same iteration.
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -201,6 +201,10 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     # child Mock for attribute access (always truthy when called), which would
     # classify every request as dummy and zero out all per-request aggregates.
     fake._is_stats_dummy_request = PyExecutor._is_stats_dummy_request
+    fake._completed_deferred_recompute_pauses = 0
+    fake._take_deferred_recompute_pauses = types.MethodType(
+        PyExecutor._take_deferred_recompute_pauses, fake
+    )
     return fake
 
 
@@ -566,6 +570,59 @@ def test_full_mixed_iteration():
     assert ifb.num_queued_ctx_tokens == 256 + 512 + 1024
     assert ifb.num_paused_requests == 2
     assert ifb.num_paused_kv_tokens == 400 + 900
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+def test_deferred_preemption_counts_once_in_next_batch(dummy):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor.enable_attention_dp = True
+    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager.try_complete_preemption.side_effect = [True, False]
+    executor._free_request_resources = Mock()
+    executor._pause_recompute_request = Mock()
+    request = types.SimpleNamespace(is_dummy=dummy)
+
+    assert executor._resume_preempted_request(request)
+    assert not executor._resume_preempted_request(request)
+    executor._free_request_resources.assert_called_once_with(request)
+    executor._pause_recompute_request.assert_called_once_with(request)
+
+    batch = types.SimpleNamespace(
+        context_requests=[],
+        generation_requests=[],
+        paused_requests=[types.SimpleNamespace(is_dummy=False)],
+        recompute_paused_requests=[types.SimpleNamespace(is_dummy=False)],
+    )
+    assert executor._collect_scheduled_batch_stats(batch).num_paused_requests == 2 + (not dummy)
+    assert executor._collect_scheduled_batch_stats(batch).num_paused_requests == 2
+    assert executor._take_deferred_recompute_pauses() == 0
+
+
+@pytest.mark.parametrize("has_batch_snapshot", [False, True])
+def test_deferred_pauses_are_consumed_only_without_a_batch_snapshot(has_batch_snapshot):
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
+    fake = _build_fake_self([], None)
+    fake._completed_deferred_recompute_pauses = 2
+    snapshot = ScheduledBatchStats(num_paused_requests=5) if has_batch_snapshot else None
+
+    with patch(f"{__name__}._build_fake_self", return_value=fake):
+        first = _invoke_update_iter_stats(
+            _StubScheduledBatch(paused_reqs=[_StubRequest(num_tokens=300)]),
+            [],
+            num_ctx_tokens=0,
+            scheduled_batch_stats=snapshot,
+        )
+        second = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
+        third = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
+
+    assert first.inflight_batching_stats.num_paused_requests == (5 if has_batch_snapshot else 3)
+    assert second.inflight_batching_stats.num_paused_requests == (2 if has_batch_snapshot else 0)
+    assert third.inflight_batching_stats.num_paused_requests == 0
+    assert fake._completed_deferred_recompute_pauses == 0
 
 
 def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
