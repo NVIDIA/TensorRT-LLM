@@ -66,7 +66,7 @@ def _snapshot(engine, n):
     width = -(-int(md.kv_lens[:n].max()) // TOKENS_PER_BLOCK)
     return {
         "pos": engine.model.recorded_position_ids.clone().cpu(),
-        "input_ids": engine._runner.input_ids_cuda[:N_REAL].clone().cpu(),
+        "input_ids": engine._runner._inputs._buffers.input_ids_cuda[:N_REAL].clone().cpu(),
         "kv_lens": md.kv_lens[:n].clone(),
         "kv_lens_cuda": md.kv_lens_cuda[:n].clone().cpu(),
         # the host tensor thop.attention reads for max_past_kv_length (mMaxSeqLenKv)
@@ -93,17 +93,19 @@ def _run_patched(fast: bool, monkeypatch, num_gen_steps, drop_after):
     rm = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv})
     counts = {"fast": 0, "block_copies": 0}
     if not fast:
-        # The steady-gen fast path lives on the engine's decoder runner.
+        # The steady-gen fast path lives on the decoder runner's input preparer.
         monkeypatch.setattr(
-            type(engine._runner), "_can_use_steady_gen_fast_prepare", lambda self, *a, **k: False
+            type(engine._runner._inputs),
+            "_can_use_steady_gen_fast_prepare",
+            lambda self, *a, **k: False,
         )
-    orig_apply = engine._runner._apply_steady_gen_fast_prepare
+    orig_apply = engine._runner._inputs._apply_steady_gen_fast_prepare
 
     def spy_apply(*a, **k):
         counts["fast"] += 1
         return orig_apply(*a, **k)
 
-    monkeypatch.setattr(engine._runner, "_apply_steady_gen_fast_prepare", spy_apply)
+    monkeypatch.setattr(engine._runner._inputs, "_apply_steady_gen_fast_prepare", spy_apply)
     orig_copy = kv.copy_batch_block_offsets
 
     def spy_copy(*a, **k):
@@ -147,7 +149,7 @@ def test_fast_prepare_fires_with_padding_and_matches_full_pass(monkeypatch):
     ref, ref_counts, _ = _run(False, monkeypatch)
     out, counts, engine = _run(True, monkeypatch)
     assert ref_counts["fast"] == 0
-    assert engine._runner._steady_gen_cache is not None, "recording condition never held"
+    assert engine._runner._inputs._steady_gen_cache is not None, "recording condition never held"
     # the context step already assigns py_batch_idx, so gen step 1 is a full pass that
     # records the layout and steps 2..6 take the fast path
     assert counts["fast"] == 5
@@ -158,7 +160,7 @@ def test_fast_prepare_fires_with_padding_and_matches_full_pass(monkeypatch):
                 torch.testing.assert_close(a[key], b[key], atol=0, rtol=0, msg=f"step {step} {key}")
             else:
                 assert a[key] == b[key], (step, key)
-    cache = engine._runner._steady_gen_cache
+    cache = engine._runner._inputs._steady_gen_cache
     assert cache is not None and cache["num_requests"] == 8 and cache["num_real"] == N_REAL
     assert cache["attn_metadata"] is engine._runner.attn_metadata
     assert cache["tokens_per_block"] == TOKENS_PER_BLOCK
@@ -202,8 +204,8 @@ def test_batch_change_records_new_layout(monkeypatch):
     # steps 2,3,4 fast (5 real + 3 dummies); step 5 full pass (4 real, no padding needed),
     # re-records; steps 6,7 fast again
     assert counts["fast"] == 5
-    assert engine._runner._steady_gen_cache["num_requests"] == 4
-    assert engine._runner._steady_gen_cache["num_real"] == 4
+    assert engine._runner._inputs._steady_gen_cache["num_requests"] == 4
+    assert engine._runner._inputs._steady_gen_cache["num_real"] == 4
     for step, (a, b) in enumerate(zip(out, ref), start=1):
         for key in a:
             if isinstance(a[key], torch.Tensor):
