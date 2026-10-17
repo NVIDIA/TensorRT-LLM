@@ -43,15 +43,15 @@ void checkIndex(torch::Tensor const& t, char const* op, char const* name, c10::S
 //! ``table``: ``[>= num_pages]`` int32 view pages. ``private_pages``: ``[num_blocks, num_private_pages]`` int32
 //! private view pages. Written: ``rows [num_blocks, row_len]`` and ``block_offsets [1, num_blocks, 2,
 //! row_len]`` int32, ``seq_len_kv [num_blocks]`` int32, ``own_slots [num_blocks * block_size]``,
-//! ``extra_src``/``extra_dst [num_blocks * 2 * (tokens_per_page - 1)]`` and
-//! ``piece_src``/``piece_dst [num_blocks * 3 * (tokens_per_page - 1)]`` int64 (-1 past the used
-//! pieces). Given ``staged_slots`` (int64, the staged token count long) and ``refill_src``/
+//! ``current_private_src``/``current_private_dst [num_blocks * 2 * (tokens_per_page - 1)]`` and
+//! ``committed_private_src``/``committed_private_dst [num_blocks * 3 * (tokens_per_page - 1)]`` int64 (-1 past the used
+//! entries). Given ``staged_slots`` (int64, the staged token count long) and ``refill_src``/
 //! ``refill_dst`` (int64, ``tokens_per_page`` long), also writes those. ``drop_pages`` is the page
 //! count the rotation preceding this call moved to the ring's tail, 0 if none. No allocation,
 //! safe inside CUDA graph capture.
 void causal_layout_(torch::Tensor table, torch::Tensor private_pages, torch::Tensor rows, torch::Tensor block_offsets,
-    torch::Tensor seq_len_kv, torch::Tensor own_slots, torch::Tensor extra_src, torch::Tensor extra_dst,
-    torch::Tensor piece_src, torch::Tensor piece_dst, std::optional<torch::Tensor> staged_slots,
+    torch::Tensor seq_len_kv, torch::Tensor own_slots, torch::Tensor current_private_src, torch::Tensor current_private_dst,
+    torch::Tensor committed_private_src, torch::Tensor committed_private_dst, std::optional<torch::Tensor> staged_slots,
     std::optional<torch::Tensor> refill_src, std::optional<torch::Tensor> refill_dst, int64_t block_size,
     int64_t tokens_per_page, int64_t past, int64_t fixed_tokens, int64_t window_tokens, int64_t num_pages,
     int64_t drop_pages, int64_t kv_factor, int64_t kv_offset, int64_t rows_per_page)
@@ -83,12 +83,12 @@ void causal_layout_(torch::Tensor table, torch::Tensor private_pages, torch::Ten
     checkIndex(block_offsets, op, "block_offsets", torch::kInt32, {1, n, 2, row_len}, device);
     checkIndex(seq_len_kv, op, "seq_len_kv", torch::kInt32, {n}, device);
     checkIndex(own_slots, op, "own_slots", torch::kInt64, {n * block_size}, device);
-    int64_t const extra = n * 2 * (tokens_per_page - 1);
-    int64_t const pieces = n * 3 * (tokens_per_page - 1);
-    checkIndex(extra_src, op, "extra_src", torch::kInt64, {extra}, device);
-    checkIndex(extra_dst, op, "extra_dst", torch::kInt64, {extra}, device);
-    checkIndex(piece_src, op, "piece_src", torch::kInt64, {pieces}, device);
-    checkIndex(piece_dst, op, "piece_dst", torch::kInt64, {pieces}, device);
+    int64_t const numCurrentPrivate = n * 2 * (tokens_per_page - 1);
+    int64_t const numCommittedPrivate = n * 3 * (tokens_per_page - 1);
+    checkIndex(current_private_src, op, "current_private_src", torch::kInt64, {numCurrentPrivate}, device);
+    checkIndex(current_private_dst, op, "current_private_dst", torch::kInt64, {numCurrentPrivate}, device);
+    checkIndex(committed_private_src, op, "committed_private_src", torch::kInt64, {numCommittedPrivate}, device);
+    checkIndex(committed_private_dst, op, "committed_private_dst", torch::kInt64, {numCommittedPrivate}, device);
     TORCH_CHECK(refill_src.has_value() == refill_dst.has_value(), op, ": refill_src and refill_dst go together");
     if (staged_slots)
     {
@@ -125,10 +125,10 @@ void causal_layout_(torch::Tensor table, torch::Tensor private_pages, torch::Ten
     p.blockOffsets = block_offsets.data_ptr<int32_t>();
     p.seqLenKv = seq_len_kv.data_ptr<int32_t>();
     p.ownSlots = own_slots.data_ptr<int64_t>();
-    p.extraSrc = extra_src.data_ptr<int64_t>();
-    p.extraDst = extra_dst.data_ptr<int64_t>();
-    p.pieceSrc = piece_src.data_ptr<int64_t>();
-    p.pieceDst = piece_dst.data_ptr<int64_t>();
+    p.currentPrivateSrc = current_private_src.data_ptr<int64_t>();
+    p.currentPrivateDst = current_private_dst.data_ptr<int64_t>();
+    p.committedPrivateSrc = committed_private_src.data_ptr<int64_t>();
+    p.committedPrivateDst = committed_private_dst.data_ptr<int64_t>();
     p.stagedSlots = staged_slots ? staged_slots->data_ptr<int64_t>() : nullptr;
     p.numStaged = staged_slots ? staged_slots->size(0) : 0;
     p.refillSrc = refill_src ? refill_src->data_ptr<int64_t>() : nullptr;
@@ -183,8 +183,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "causal_layout_(Tensor table, Tensor private_pages, Tensor(a!) rows, Tensor(b!) block_offsets, "
-        "Tensor(c!) seq_len_kv, Tensor(d!) own_slots, Tensor(e!) extra_src, Tensor(f!) extra_dst, "
-        "Tensor(g!) piece_src, Tensor(h!) piece_dst, Tensor(i!)? staged_slots, Tensor(j!)? refill_src, "
+        "Tensor(c!) seq_len_kv, Tensor(d!) own_slots, Tensor(e!) current_private_src, Tensor(f!) current_private_dst, "
+        "Tensor(g!) committed_private_src, Tensor(h!) committed_private_dst, Tensor(i!)? staged_slots, Tensor(j!)? refill_src, "
         "Tensor(k!)? refill_dst, int block_size, int tokens_per_page, int past, int fixed_tokens, "
         "int window_tokens, int num_pages, int drop_pages, int kv_factor, int kv_offset, int rows_per_page) -> ()");
     m.def(
