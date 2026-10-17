@@ -15,6 +15,8 @@ Eligibility is automatic:
 - RPC executors            -> keep a private, never-cached pool; their seam
                               drains the cache first (their engine build
                               cannot share GPUs with cached idle pools)
+- child processes          -> a test starting one drains the cache first,
+                              for the same reason (nvidia-smi is exempt)
 - tests passing their own ``_mpi_session`` (the explicit fixtures) -> never
   reach the patched seam
 - ``@pytest.mark.private_mpi_session`` -> explicit opt-out: the cache is
