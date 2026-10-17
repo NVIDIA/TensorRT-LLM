@@ -146,22 +146,21 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype(is_encoder_decode
 
 
 @pytest.mark.parametrize(
-    "kv_cache_dtype,checkpoint_quant,expected_quant,expected_source",
+    "kv_cache_dtype,checkpoint_quant,expected_quant",
     [
-        ("fp8", None, "FP8", "kv_cache_config.dtype='fp8'"),
-        ("fp8_ds_mla", None, "FP8", "kv_cache_config.dtype='fp8_ds_mla'"),
-        ("nvfp4", None, "NVFP4", "kv_cache_config.dtype='nvfp4'"),
-        ("fp8", QuantAlgo.NVFP4, "FP8", "kv_cache_config.dtype='fp8'"),
-        ("auto", QuantAlgo.FP8, "FP8", "the checkpoint"),
-        ("auto", QuantAlgo.NVFP4, "NVFP4", "the checkpoint"),
+        ("fp8", None, QuantAlgo.FP8),
+        ("fp8_ds_mla", None, QuantAlgo.FP8),
+        ("nvfp4", None, QuantAlgo.NVFP4),
+        ("fp8", QuantAlgo.NVFP4, QuantAlgo.FP8),
+        ("auto", QuantAlgo.FP8, QuantAlgo.FP8),
+        ("auto", QuantAlgo.NVFP4, QuantAlgo.NVFP4),
     ],
 )
 @pytest.mark.parametrize("sm107", [False, True])
-def test_validate_and_set_kv_cache_quant_rejects_quantized_cross_cache(
+def test_validate_and_set_kv_cache_quant_preserves_encoder_decoder_self_cache(
     kv_cache_dtype: str,
     checkpoint_quant: QuantAlgo | None,
-    expected_quant: str,
-    expected_source: str,
+    expected_quant: QuantAlgo,
     sm107: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,15 +171,11 @@ def test_validate_and_set_kv_cache_quant_rejects_quantized_cross_cache(
         quant_config=QuantConfig(kv_cache_quant_algo=checkpoint_quant),
     )
 
-    with pytest.raises(ValueError, match="KV cache quantization.*encoder-decoder") as exc_info:
-        validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+    validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
-    message = str(exc_info.value)
-    assert f"{expected_quant} KV cache quantization from {expected_source}" in message
-    assert "Use a checkpoint without KV cache quantization" in message
-    assert "kv_cache_config.dtype='auto'" in message
-    assert "'auto' preserves checkpoint quantization; it does not disable it." in message
-    assert model_config.quant_config.kv_cache_quant_algo == checkpoint_quant
+    if sm107 and expected_quant == QuantAlgo.NVFP4:
+        expected_quant = QuantAlgo.FP8
+    assert model_config.quant_config.kv_cache_quant_algo == expected_quant
 
 
 @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])

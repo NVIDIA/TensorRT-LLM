@@ -1933,6 +1933,15 @@ class KvCacheCreator:
         logger.info(
             "External drafter KV pool keeps the drafter dtype; dropping "
             "the fp8 KV quant algo inherited from the target.")
+        return self._get_unquantized_kv_model_config(effective_draft_config)
+
+    @staticmethod
+    def _get_unquantized_kv_model_config(
+            model_config: ModelConfig) -> ModelConfig:
+        """Describe a model-dtype KV pool without changing the model config."""
+        quant_config = model_config.quant_config
+        if quant_config is None or quant_config.kv_cache_quant_algo is None:
+            return model_config
         neutral_quant = copy.copy(quant_config)
         neutral_quant.kv_cache_quant_algo = None
         # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
@@ -1945,9 +1954,9 @@ class KvCacheCreator:
         # No _frozen dance: ModelConfig.__setattr__ exempts quant_config by
         # name, and restoring _frozen to True would freeze a copy whose source
         # may not have been frozen.
-        effective_draft_config = copy.copy(effective_draft_config)
-        effective_draft_config.quant_config = neutral_quant
-        return effective_draft_config
+        model_config = copy.copy(model_config)
+        model_config.quant_config = neutral_quant
+        return model_config
 
     def _get_num_draft_layers(self) -> int:
         """Return the actual number of draft KV cache layers.
@@ -2332,7 +2341,8 @@ class KvCacheCreator:
         """Estimate bytes/token for the encoder-decoder cross-attention pool."""
         from types import SimpleNamespace
 
-        model_config = self._model_engine.model.model_config
+        model_config = self._get_unquantized_kv_model_config(
+            self._model_engine.model.model_config)
         config = model_config.pretrained_config
         (num_layers, num_kv_heads, head_dim,
          _) = self._get_cross_kv_cache_layout()
@@ -2448,12 +2458,17 @@ class KvCacheCreator:
         ``KVCacheManagerV2`` for V2) so that both pools share the same
         runtime ABI and scheduler integration. V1 is the default and the
         production target for encoder-decoder models.
+
+        CrossAttention writes model-dtype K/V, regardless of the self-attention
+        KV quantization. Use the same unquantized config as the cost estimate.
         """
         (num_layers, num_kv_heads, head_dim,
          max_seq_len) = self._get_cross_kv_cache_layout(fallback_max_seq_len)
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         return _create_kv_cache_manager(
             model_engine=self._model_engine,
+            model_config=self._get_unquantized_kv_model_config(
+                self._model_engine.model.model_config),
             kv_cache_manager_cls=self._kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=cross_kv_cache_config,

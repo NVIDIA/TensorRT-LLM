@@ -29,7 +29,7 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -37,6 +37,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -364,6 +366,72 @@ class TestResourceManagerType:
 
 class TestCrossKvCacheConstruction:
     """Exercise the Steps 4 and 5 construction path beyond helper math."""
+
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    @pytest.mark.parametrize("kv_quant", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+    @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("estimating_kv_cache", [False, True])
+    def test_cross_cache_uses_model_dtype(
+        self, use_kv_cache_manager_v2, kv_quant, model_dtype, estimating_kv_cache
+    ):
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        )
+        model_config = _make_model_config(is_encoder_decoder=True, torch_dtype=model_dtype)
+        original_quant = QuantConfig(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=kv_quant)
+        model_config.quant_config = original_quant
+        model_config.quant_config_dict = {"attention": original_quant}
+        original_mode = original_quant.quant_mode
+        original_layer_mode = original_quant.layer_quant_mode
+        original_state = original_quant.model_dump()
+        creator = _make_creator(config, model_config=model_config)
+        creator._model_engine.dtype = model_dtype
+        creator._skip_est = False
+        manager_cls = creator._kv_cache_manager_cls
+
+        # Run the shared allocator, replacing only the GPU-owning constructor.
+        with patch.object(manager_cls, "__init__", return_value=None) as init:
+            creator._create_cross_kv_cache_manager(config, estimating_kv_cache)
+        kwargs = init.call_args.kwargs
+        expected_dtype = (
+            tensorrt_llm.bindings.DataType.HALF
+            if model_dtype == torch.float16
+            else tensorrt_llm.bindings.DataType.BF16
+        )
+        assert kwargs["dtype"] == expected_dtype
+        assert kwargs["is_estimating_kv_cache"] == estimating_kv_cache
+        assert (
+            CacheCost.from_raw(creator._get_cross_kv_size_per_token()).slope == 6 * 2 * 8 * 64 * 2
+        )
+        assert model_config.quant_config is original_quant
+        assert model_config.quant_config_dict["attention"] is original_quant
+        assert original_quant.model_dump() == original_state
+        assert original_quant.quant_mode is original_mode
+        assert original_quant.layer_quant_mode is original_layer_mode
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_unquantized_pool_config_preserves_weights_and_frozen_state(self, frozen):
+        model_config = _make_model_config(is_encoder_decoder=True)
+        model_config.quant_config = QuantConfig(
+            quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8
+        )
+        assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
+        assert model_config.quant_config.layer_quant_mode.has_fp8_kv_cache()
+        model_config._frozen = frozen
+
+        pool_config = KvCacheCreator._get_unquantized_kv_model_config(model_config)
+
+        assert pool_config is not model_config
+        assert pool_config._frozen == frozen
+        assert pool_config.pretrained_config is model_config.pretrained_config
+        assert pool_config.quant_config.quant_algo == QuantAlgo.FP8
+        assert pool_config.quant_config.kv_cache_quant_algo is None
+        assert not pool_config.quant_config.quant_mode.has_kv_cache_quant()
+        assert not pool_config.quant_config.layer_quant_mode.has_kv_cache_quant()
+        assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
+        assert model_config.quant_config.layer_quant_mode.has_fp8_kv_cache()
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
     def test_create_cross_kv_cache_manager_uses_encoder_geometry(self, use_kv_cache_manager_v2):
