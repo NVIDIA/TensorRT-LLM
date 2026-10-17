@@ -26,6 +26,7 @@ on the repo's currently-pinned ``transformers==5.5.4`` CI as well as on
   with ``None.itemsize``).
 * The self-contained ``MiniCPMV4_6VisionConfig`` window helpers.
 * The runtime ``transformers>=5.7.0`` guard used by the input processor.
+* The vision encoder's call into the shared Qwen-VL attention-metadata helper.
 
 A single ``transformers>=5.7.0``-gated test asserts the native config is present
 once the pin is bumped (at which point the local shim can be removed).
@@ -33,6 +34,7 @@ once the pin is bumped (at which point the local shim can be removed).
 
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -252,6 +254,26 @@ class TestTransformersGuard:
 
         monkeypatch.setattr(transformers, "__version__", version)
         mod._ensure_transformers_supports_minicpmv4_6()
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder attention metadata
+# ---------------------------------------------------------------------------
+def test_vision_attn_metadata_passes_max_seq_len(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_minicpmv4_6 as mod
+
+    calls = []
+
+    def capture_prepare_attn_metadata(seq_lens, attn_metadata, *, max_seq_len):
+        calls.append((seq_lens, max_seq_len))
+        return attn_metadata
+
+    monkeypatch.setattr(mod, "_prepare_qwen_vl_vision_attn_metadata", capture_prepare_attn_metadata)
+    vision_model = SimpleNamespace(metadata_cls=lambda **kwargs: SimpleNamespace(**kwargs))
+
+    mod.MiniCPMV4_6VisionModel._make_attn_metadata(vision_model, [64, 16])
+
+    assert calls == [([64, 16], 64)]
 
 
 # ---------------------------------------------------------------------------

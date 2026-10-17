@@ -549,7 +549,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
             max_num_tokens=sum(seq_lens) + 1,
             kv_cache_manager=None,
         )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=max(seq_lens)
+        )
 
     @staticmethod
     def _grid_seq_lens(target_sizes: torch.Tensor) -> List[int]:
