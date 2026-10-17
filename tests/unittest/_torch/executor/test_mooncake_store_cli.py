@@ -34,7 +34,11 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors import mooncake_store
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import CONFIG_PATH_ENV
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import provision_pool
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
+    PoolManifest,
+    _published_manifest,
+    provision_pool,
+)
 from tensorrt_llm.commands import _telemetry
 from tensorrt_llm.commands import mooncake as mooncake_commands
 from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
@@ -252,3 +256,37 @@ def test_an_inherited_config_is_left_in_charge(monkeypatch, tmp_path):
     with provision_pool(pool) as rendered:
         assert rendered is None
     assert os.environ[CONFIG_PATH_ENV] == str(inherited)
+
+
+def test_partial_manifest_publication_is_retracted(tmp_path):
+    published = tmp_path / "pool.json"
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    sentinel = occupied / "keep"
+    sentinel.write_text("unrelated")
+    manifest = PoolManifest(master_server_address="127.0.0.1:50051")
+
+    with pytest.raises(OSError):
+        with _published_manifest(manifest, [str(published), str(occupied)]):
+            pytest.fail("publishing over a directory should not have yielded")
+
+    assert not published.exists()
+    assert not (tmp_path / "occupied.partial").exists()
+    assert sentinel.read_text() == "unrelated"
+
+
+def test_failed_manifest_publication_preserves_unvisited_paths(tmp_path):
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    untouched = tmp_path / "another-pool.json"
+    contents = '{"master_server_address": "another-master:50051"}\n'
+    untouched.write_text(contents)
+    manifest = PoolManifest(master_server_address="127.0.0.1:50051")
+
+    with pytest.raises(OSError):
+        with _published_manifest(manifest, [str(occupied), str(untouched)]):
+            pytest.fail("publishing over a directory should not have yielded")
+
+    assert untouched.read_text() == contents
+    assert occupied.is_dir()
+    assert not (tmp_path / "occupied.partial").exists()
