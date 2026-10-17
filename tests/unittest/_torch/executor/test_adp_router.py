@@ -218,9 +218,9 @@ class TestRankState:
         assert state.num_active_requests == 5
         assert state.num_active_tokens == 100
 
-    def test_serialize(self):
+    def test_serialize(self) -> None:
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, *RankIterStatsPayload().serialize(), 0, 0]
+        assert state.serialize() == [0, 5, 100, 0, *RankIterStatsPayload().serialize(), 0, 0, 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -510,7 +510,10 @@ class TestDefaultADPRouter:
             RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
         )
 
-    def test_gather_all_rank_states_piggybacks_iter_stats(self):
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    def test_gather_all_rank_states_piggybacks_iter_stats(
+        self, include_kv_cache_load: bool
+    ) -> None:
         dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
         pending = RankIterStatsPayload(
             has_iter_stats=1,
@@ -522,25 +525,42 @@ class TestDefaultADPRouter:
             num_gen_kv_tokens=1024,
             num_paused_requests=1,
             num_paused_kv_tokens=256,
+            kv_used_blocks=4 if include_kv_cache_load else -1,
+            kv_total_blocks=10 if include_kv_cache_load else -1,
+            kv_load_timestamp_ns=123 if include_kv_cache_load else 0,
         )
         expected_local = RankState(
             rank=0,
             num_active_requests=1,
             num_active_tokens=10,
             iter_stats=pending,
+            num_context_requests=2,
+            num_generation_requests=3,
+            num_connector_transfers=5,
+            connector_poll_failed=True,
         )
         rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather.return_value = [expected_local.serialize(), rank1.serialize()]
+        dist.tp_allgather.return_value = [
+            expected_local.serialize(include_kv_cache_load),
+            rank1.serialize(include_kv_cache_load),
+        ]
 
         router = DefaultADPRouter(dist=dist)
         req = Mock(py_orig_prompt_len=10)
-        states = router.gather_all_rank_states([req], iter_stats_payload=pending)
+        states = router.gather_all_rank_states(
+            [req],
+            iter_stats_payload=pending,
+            forward_work=(2, 3),
+            num_connector_transfers=5,
+            connector_poll_failed=True,
+            include_kv_cache_load=include_kv_cache_load,
+        )
 
         assert states[0] == expected_local
         assert states[1] == rank1
-        dist.tp_allgather.assert_called_once_with(expected_local.serialize())
+        dist.tp_allgather.assert_called_once_with(expected_local.serialize(include_kv_cache_load))
 
-    def test_kv_load_payload_only_changes_wire_shape_when_enabled(self):
+    def test_kv_load_payload_only_changes_wire_shape_when_enabled(self) -> None:
         payload = RankIterStatsPayload(
             kv_used_blocks=4,
             kv_total_blocks=10,
@@ -551,17 +571,32 @@ class TestDefaultADPRouter:
             iter_stats=payload,
             num_context_requests=2,
             num_generation_requests=3,
+            num_connector_transfers=5,
+            connector_poll_failed=True,
         )
 
         disabled = state.serialize()
-        assert len(disabled) == 15
-        assert RankState.deserialize(disabled).num_context_requests == 2
+        assert len(disabled) == 17
+        restored = RankState.deserialize(disabled)
+        assert restored.num_context_requests == 2
+        assert restored.num_generation_requests == 3
+        assert restored.num_connector_transfers == 5
+        assert restored.connector_poll_failed
+        assert restored.iter_stats.kv_used_blocks == -1
         enabled = state.serialize(include_kv_cache_load=True)
-        assert len(enabled) == 18
+        assert len(enabled) == 20
         restored = RankState.deserialize(enabled)
         assert restored.iter_stats.kv_used_blocks == 4
         assert restored.num_context_requests == 2
         assert restored.num_generation_requests == 3
+        assert restored.num_connector_transfers == 5
+        assert restored.connector_poll_failed
+        for wire in (disabled, enabled):
+            legacy = RankState.deserialize(wire[:-2])
+            assert legacy.num_context_requests == 2
+            assert legacy.num_generation_requests == 3
+            assert legacy.num_connector_transfers == 0
+            assert not legacy.connector_poll_failed
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(

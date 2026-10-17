@@ -25,6 +25,7 @@ This file tests:
 import builtins
 import functools
 import random
+from collections.abc import Callable
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -368,10 +369,11 @@ def test_kv_lens_row_reorder_threshold():
 
 
 @skip_pre_hopper
-def test_gvr_prior_writeback_uses_aux_stream():
+def test_gvr_prior_writeback_uses_aux_stream(request: pytest.FixtureRequest) -> None:
     batch_size = 2
     index_topk = 4
     cache_manager, sparse_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=128,
         tokens_per_block=64,
@@ -379,62 +381,59 @@ def test_gvr_prior_writeback_uses_aux_stream():
         num_layers=1,
         index_topk=index_topk,
     )
-    try:
-        request_ids = list(range(batch_size))
-        kv_lens = torch.full((batch_size,), index_topk, dtype=torch.int32)
-        cache_manager.add_dummy_requests(
-            request_ids,
-            kv_lens.tolist(),
-            is_gen=False,
-            prepare_resource=True,
-        )
-        metadata = _create_mock_metadata(
-            request_ids,
-            batch_size,
-            num_contexts=0,
-            num_generations=batch_size,
-            seq_lens=torch.ones(batch_size, dtype=torch.int32),
-            kv_lens=kv_lens,
-            num_cached_tokens=[index_topk - 1] * batch_size,
-            cache_manager=cache_manager,
-            num_ctx_tokens=0,
-            num_tokens=batch_size,
-            index_topk=index_topk,
-            enable_indexer_skip=True,
-        )
-        indexer = create_indexer(sparse_config)
-        # temporal GVR consumes the prior; force it independent of hardware
-        indexer.top_k.decode_implementation = TopKImplementation.CUTE_DSL_GVR
-        indexer.top_k.gvr_self_sampling = False
-        indexer.aux_stream = torch.cuda.Stream()
-        metadata.gvr_prior_indices = torch.zeros(
-            (cache_manager.num_local_layers, batch_size, index_topk),
-            device="cuda",
-            dtype=torch.int32,
-        )
-        hidden_states = torch.empty((batch_size, 1), device="cuda")
-        unused = torch.empty((batch_size, 1), device="cuda")
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), index_topk, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids,
+        kv_lens.tolist(),
+        is_gen=False,
+        prepare_resource=True,
+    )
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.ones(batch_size, dtype=torch.int32),
+        kv_lens=kv_lens,
+        num_cached_tokens=[index_topk - 1] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size,
+        index_topk=index_topk,
+        enable_indexer_skip=True,
+    )
+    indexer = create_indexer(sparse_config)
+    # temporal GVR consumes the prior; force it independent of hardware
+    indexer.top_k.decode_implementation = TopKImplementation.CUTE_DSL_GVR
+    indexer.top_k.gvr_self_sampling = False
+    indexer.aux_stream = torch.cuda.Stream()
+    metadata.gvr_prior_indices = torch.zeros(
+        (cache_manager.num_local_layers, batch_size, index_topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    hidden_states = torch.empty((batch_size, 1), device="cuda")
+    unused = torch.empty((batch_size, 1), device="cuda")
 
-        with with_multi_stream(True):
-            topk_indices = indexer.sparse_attn_indexer(
-                metadata,
-                hidden_states,
-                unused,
-                unused,
-                unused,
-                unused,
-            )
-            assert indexer._prev_topk_copy_pending
-            indexer.maybe_join_prev_topk_copy()
-
-        local_layer = cache_manager.layer_offsets[indexer.layer_idx]
-        torch.testing.assert_close(
-            metadata.gvr_prior_indices[local_layer, :batch_size],
-            topk_indices,
+    with with_multi_stream(True):
+        topk_indices = indexer.sparse_attn_indexer(
+            metadata,
+            hidden_states,
+            unused,
+            unused,
+            unused,
+            unused,
         )
-        assert not indexer._prev_topk_copy_pending
-    finally:
-        cache_manager.shutdown()
+        assert indexer._prev_topk_copy_pending
+        indexer.maybe_join_prev_topk_copy()
+
+    local_layer = cache_manager.layer_offsets[indexer.layer_idx]
+    torch.testing.assert_close(
+        metadata.gvr_prior_indices[local_layer, :batch_size],
+        topk_indices,
+    )
+    assert not indexer._prev_topk_copy_pending
 
 
 def test_shared_topk_lifecycle(monkeypatch):
@@ -802,6 +801,7 @@ def _load_cast_back_from_fp4():
 
 
 def create_dsa_cache_manager(
+    request: pytest.FixtureRequest,
     batch_size: int,
     head_dim: int,
     tokens_per_block: int,
@@ -810,9 +810,9 @@ def create_dsa_cache_manager(
     indexer_k_dtype: str = "fp8",
     index_topk: int = 2048,
     use_kv_cache_manager_v2: bool = True,
-    pretrained_config=None,
-):
-    """Helper to create a DSA cache manager for testing."""
+    pretrained_config: SimpleNamespace | None = None,
+) -> tuple[DSACacheManager | DSACacheManagerV2, DeepSeekSparseAttentionConfig]:
+    """Create a cache manager and close its requests on the test thread."""
 
     sparse_attn_config = DeepSeekSparseAttentionConfig(
         index_head_dim=head_dim,
@@ -849,6 +849,10 @@ def create_dsa_cache_manager(
         pretrained_config=pretrained_config,
     )
 
+    # Metadata can retain the manager through reference cycles. Keep it alive
+    # until fixture teardown so background garbage collection cannot close live
+    # requests on a thread without a CUDA context.
+    request.addfinalizer(cache_manager.shutdown)
     return cache_manager, sparse_attn_config
 
 
@@ -1277,7 +1281,9 @@ def test_group_remap_orchestration_cuda_graph():
             assert torch.equal(outs[i], baseline), f"layer {i} diverged on replay (seed={seed})"
 
 
-def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
+def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask(
+    request: pytest.FixtureRequest,
+) -> None:
     """V2 registers INDEX_KEY storage only for layers that own an indexer."""
     num_layers = 3
     head_dim = 128
@@ -1300,6 +1306,7 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
     )
 
     cache_manager, _ = create_dsa_cache_manager(
+        request,
         batch_size=2,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
@@ -1309,35 +1316,32 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         pretrained_config=pretrained_config,
     )
 
-    try:
-        assert cache_manager.indexer_k_cache_local_layer_mask == [True, False, True]
-        assert cache_manager.indexer_k_cache_page_scale == 2
-        assert cache_manager.get_indexer_k_cache_buffers(0).shape == (
-            cache_manager.blocks_in_primary_pool * cache_manager.indexer_k_cache_page_scale,
-            tokens_per_block,
-            1,
-            head_dim + 4,
-        )
+    assert cache_manager.indexer_k_cache_local_layer_mask == [True, False, True]
+    assert cache_manager.indexer_k_cache_page_scale == 2
+    assert cache_manager.get_indexer_k_cache_buffers(0).shape == (
+        cache_manager.blocks_in_primary_pool * cache_manager.indexer_k_cache_page_scale,
+        tokens_per_block,
+        1,
+        head_dim + 4,
+    )
 
-        indexer_bytes_per_token = head_dim + 4
-        has_indexer_buffers = []
-        for local_layer_idx in range(num_layers):
-            layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
-            has_indexer_buffers.append(
-                any(buffer.role == Role.INDEX_KEY for buffer in layer_config.buffers)
-            )
-        assert has_indexer_buffers == [True, False, True]
-
-        key_bytes = sum(
-            cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
-            for local_layer_idx in range(num_layers)
+    indexer_bytes_per_token = head_dim + 4
+    has_indexer_buffers = []
+    for local_layer_idx in range(num_layers):
+        layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
+        has_indexer_buffers.append(
+            any(buffer.role == Role.INDEX_KEY for buffer in layer_config.buffers)
         )
-        expected_cache_bytes = key_bytes + 2 * indexer_bytes_per_token
-        assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
-        with pytest.raises(AssertionError, match="shared-indexer layer"):
-            cache_manager.get_indexer_k_cache_buffers(1)
-    finally:
-        cache_manager.shutdown()
+    assert has_indexer_buffers == [True, False, True]
+
+    key_bytes = sum(
+        cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
+        for local_layer_idx in range(num_layers)
+    )
+    expected_cache_bytes = key_bytes + 2 * indexer_bytes_per_token
+    assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
+    with pytest.raises(AssertionError, match="shared-indexer layer"):
+        cache_manager.get_indexer_k_cache_buffers(1)
 
 
 def test_dsa_cache_manager_v2_remaps_indexer_after_empty_layers() -> None:
@@ -2065,7 +2069,9 @@ def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
+def test_recompute_slot_mappings_matches_prepare_with_cached_tokens(
+    request: pytest.FixtureRequest,
+) -> None:
     """Recompute slot mappings without re-running full Indexer.prepare()."""
     head_dim = 128
     block_size = 64
@@ -2077,6 +2083,7 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
     num_tokens = seq_lens.sum().item()
 
     cache_manager, _ = create_dsa_cache_manager(
+        request,
         batch_size=len(request_ids),
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2116,7 +2123,7 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_indexer_k_cache_scatter_custom_op():
+def test_indexer_k_cache_scatter_custom_op(request: pytest.FixtureRequest) -> None:
     """
     Direct comparison: CUDA kernel vs Python reference for k_cache scatter.
 
@@ -2138,6 +2145,7 @@ def test_indexer_k_cache_scatter_custom_op():
 
     # Create cache manager with multiple layers
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2307,7 +2315,7 @@ def test_indexer_k_cache_scatter_custom_op():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_fp8_k_cache_roundtrip():
+def test_fp8_k_cache_roundtrip(request: pytest.FixtureRequest) -> None:
     """Verify FP8 quantization scales survive write/read cycle for multiple requests."""
     torch.manual_seed(42)
 
@@ -2318,6 +2326,7 @@ def test_fp8_k_cache_roundtrip():
     num_tokens_per_req = [150, 100]  # Request 0: 3 blocks, Request 1: 2 blocks
 
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2410,7 +2419,9 @@ def test_fp8_k_cache_roundtrip():
     ],
 )
 @pytest.mark.parametrize("compress_ratio", [1, 4])
-def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compress_ratio):
+def test_indexer_decode_with_paged_kv_cache(
+    request: pytest.FixtureRequest, batch_size: int, next_n: int, backend: str, compress_ratio: int
+) -> None:
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
 
@@ -2464,6 +2475,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
 
     # Setup: Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2696,7 +2708,9 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         ),
     ],
 )
-def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
+def test_indexer_decode_with_paged_kv_cache_fp4(
+    request: pytest.FixtureRequest, batch_size: int, next_n: int, backend: str
+) -> None:
     """FP4 indexer paged decode test (DeepGEMM + CuTe DSL backends).
 
     Mirrors test_indexer_decode_with_paged_kv_cache but exercises the FP4
@@ -2758,6 +2772,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     # Setup: FP4 cache manager + indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -3597,7 +3612,13 @@ def test_plan_mla_chunked_prefill_chunks_covers_tp_shares(tp_size):
         (1000, [400, 600, 2200, 500], "two_level"),  # Mixed: request 2 needs Q-blocks
     ],
 )
-def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compress_ratio):
+def test_indexer_chunked_prefill(
+    request: pytest.FixtureRequest,
+    chunk_size: int,
+    seq_lens_list: list[int],
+    chunking_type: str,
+    compress_ratio: int,
+) -> None:
     """
     Tests for indexer chunked prefill:
     1. Request-level chunking: Multiple small requests packed together
@@ -3662,6 +3683,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
 
     # Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -3862,7 +3884,13 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
 @pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
-def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_len_range):
+def test_indexer_decode_custom_vs_fallback(
+    request: pytest.FixtureRequest,
+    batch_size: int,
+    next_n: int,
+    index_topk: int,
+    seq_len_range: tuple[int, int],
+) -> None:
     """
     Test that the production and Torch Top-K modules produce identical results
     in the decode phase of sparse_attn_indexer.
@@ -3922,6 +3950,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     # Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4096,7 +4125,9 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 @skip_pre_hopper
 @pytest.mark.parametrize("step0_mode", ["gen", "context"])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
+def test_indexer_decode_mtp_topk_reuse(
+    request: pytest.FixtureRequest, step0_mode: str, batch_size: int
+) -> None:
     """Verify mtp_index_share: draft step 0 stashes each request's last-token
     Top-K and draft steps > 0 reuse it verbatim (bit-exact), across > 1 draft
     step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
@@ -4113,6 +4144,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
     md = 1
 
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4255,7 +4287,9 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("chunk_size", [1024, 2048])
-def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chunk_size):
+def test_indexer_prefill_chunked_custom_vs_fallback(
+    request: pytest.FixtureRequest, batch_size: int, index_topk: int, chunk_size: int
+) -> None:
     """
     Test chunked prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks != None.
@@ -4283,6 +4317,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     # Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4373,7 +4408,9 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("seq_len_range", [(1, 512)])
-def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, seq_len_range):
+def test_indexer_prefill_single_pass_custom_vs_fallback(
+    request: pytest.FixtureRequest, batch_size: int, index_topk: int, seq_len_range: tuple[int, int]
+) -> None:
     """
     Test single-pass prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks == None (else branch).
@@ -4393,6 +4430,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     # Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4536,7 +4574,9 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
 @skip_pre_hopper
 @pytest.mark.parametrize("enable_indexer_skip", [True, False])
-def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
+def test_indexer_topk_multi_request_with_different_cache(
+    request: pytest.FixtureRequest, enable_indexer_skip: bool
+) -> None:
     """
     Test that custom topk kernel handles multi-request batches with different cached amounts.
     """
@@ -4565,6 +4605,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Create cache manager
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4715,7 +4756,14 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
 
 
-def _mla_prefill_reuse_case(monkeypatch):
+def _mla_prefill_reuse_case(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> tuple[
+    Callable[[int, Mapping | None], tuple[DSAtrtllmAttentionMetadata, torch.Tensor]],
+    list[int],
+    list[int],
+    int,
+]:
     """Build a reuse-hit MLA chunked-prefill batch; return a runner over it.
 
     Four context requests bring few new tokens each on top of long cached
@@ -4735,6 +4783,7 @@ def _mla_prefill_reuse_case(monkeypatch):
     total_tokens = sum(seq_lens)
 
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4784,7 +4833,9 @@ def _mla_prefill_reuse_case(monkeypatch):
     q_fp8 = q.to(torch.float8_e4m3fn)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
-    def run(elem_budget, mapping=None):
+    def run(
+        elem_budget: int, mapping: Mapping | None
+    ) -> tuple[DSAtrtllmAttentionMetadata, torch.Tensor]:
         monkeypatch.setattr(dsa_indexer, "_INDEXER_PACKED_LOGITS_ELEM_BUDGET", elem_budget)
         metadata = _create_mock_metadata(
             request_ids,
@@ -4813,7 +4864,9 @@ def _mla_prefill_reuse_case(monkeypatch):
 
 
 @skip_pre_hopper
-def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
+def test_indexer_mla_prefill_groups_requests_by_logits_budget(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Grouping reuse-hit requests into separate chunks must not change top-k.
 
     Under MLA chunked prefill, packing every context request into one indexer
@@ -4823,9 +4876,9 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
     splits such batches; each query row still scores only its own request's
     window, so the selected indices must match the packed run.
     """
-    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(monkeypatch)
-    packed_metadata, topk_packed = run(1 << 62)
-    split_metadata, topk_split = run(0)
+    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(request, monkeypatch)
+    packed_metadata, topk_packed = run(1 << 62, None)
+    split_metadata, topk_split = run(0, None)
     packed_chunks = packed_metadata.indexer_prefill_chunks
     split_chunks = split_metadata.indexer_prefill_chunks
 
@@ -4845,7 +4898,9 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
 
 @skip_pre_hopper
 @pytest.mark.parametrize("tp_size", [2, 4])
-def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
+def test_indexer_mla_prefill_tp_split_matches_unsplit(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tp_size: int
+) -> None:
     """Splitting a grouped MLA prefill batch across TP ranks must not change top-k.
 
     Each emulated rank plans chunks for its share of the context queries only,
@@ -4853,13 +4908,13 @@ def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
     rows once. Concatenating the gathered shares must reproduce the top-k of
     the unsplit run.
     """
-    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(monkeypatch)
+    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(request, monkeypatch)
     # Pairs of requests fit the budget. With TP2 the second rank's share holds
     # a cut request followed by two whole ones grouped into one chunk; with TP4
     # every share is too short to hold two whole requests.
     elem_budget = 600 * 8000
     request_bounds = [sum(seq_lens[:i]) for i in range(1, len(seq_lens))]
-    _, topk_unsplit = run(elem_budget)
+    _, topk_unsplit = run(elem_budget, None)
 
     monkeypatch.setattr(dsa_indexer, "_prefill_q_split_threshold", lambda metadata: 1)
     gathered = []
@@ -5022,7 +5077,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_blackwell
-def test_cutedsl_mqa_logits_output_buffer_persistent():
+def test_cutedsl_mqa_logits_output_buffer_persistent(request: pytest.FixtureRequest) -> None:
     """Regression: the CuteDSL paged-MQA-logits output must have a STABLE address
     across calls, not be a per-forward ``torch.empty``.
 
@@ -5044,6 +5099,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
     kv_len = 4096
 
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -5107,7 +5163,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_topk_indices_buffer_cuda_graph():
+def test_topk_indices_buffer_cuda_graph(request: pytest.FixtureRequest) -> None:
     from tensorrt_llm._torch.memory_buffer_utils import Buffers
 
     batch_size, next_n = 4, 3
@@ -5118,6 +5174,7 @@ def test_topk_indices_buffer_cuda_graph():
     num_tokens = batch_size * next_n
 
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        request,
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,

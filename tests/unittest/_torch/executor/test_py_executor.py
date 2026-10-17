@@ -616,6 +616,7 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=Mock(),
         _prefetched_request_ids={41},
+        enable_attention_dp=False,
         disagg=Mock(),
     )
     request = types.SimpleNamespace(py_request_id=41)
@@ -1166,13 +1167,14 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_waiting_queue_size() == 1
 
 
-def _make_executor_with_kv_cache_manager(kv_cache_manager):
+def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
     executor.resource_manager = Mock()
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     executor.enable_attention_dp = False
+    executor._kv_connector_deadlines = {}
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
@@ -3175,8 +3177,12 @@ def _unfittable_rank(**kwargs):
     return stub, ScheduledRequests()
 
 
-def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
+@pytest.mark.parametrize("has_local_request", [False, True])
+def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_request: bool) -> None:
     stub, scheduled_batch = _unfittable_rank()
+    if not has_local_request:
+        # Local cancellation can empty this owner while peers still need forward.
+        stub.active_requests = []
 
     _run_pad_empty(stub, scheduled_batch)
 
@@ -3185,8 +3191,8 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     dummy = scheduled_batch.generation_requests[0]
     assert dummy.is_attention_dp_dummy is True
     assert dummy in stub.active_requests
-    # A generation dummy, not the context dummy the pre-schedule path would
-    # pick: this rank is empty precisely because it is short of KV cache.
+    # Post-schedule padding uses a generation dummy for both a starved owner
+    # and an owner left empty by cancellation.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
@@ -3212,14 +3218,16 @@ def test_pad_empty_batch_no_op_when_attention_dp_disabled():
     assert scheduled_batch.batch_size == 0
 
 
-def test_pad_empty_batch_no_op_when_rank_has_no_active_requests():
-    # The pre-schedule path already covers this case.
+def test_pad_empty_batch_no_op_when_no_rank_has_active_requests() -> None:
     stub, scheduled_batch = _unfittable_rank()
     stub.active_requests = []
+    stub.expected_num_active_requests = 0
 
     _run_pad_empty(stub, scheduled_batch)
 
     assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
+    assert scheduled_batch.batch_size == 0
 
 
 def test_pad_empty_batch_respects_max_num_active_requests():
@@ -3436,8 +3444,9 @@ class TestPendingTransferResponseFlush:
         executor._terminate_request.assert_called_once_with(request)
 
     @staticmethod
-    def _make_executor_loop_stub():
+    def _make_executor_loop_stub() -> PyExecutor:
         executor = object.__new__(PyExecutor)
+        executor.enable_attention_dp = False
         executor.device_id = 0
         profiler = MagicMock()
         profiler.__enter__.return_value = Mock()

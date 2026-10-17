@@ -23,6 +23,7 @@ class _StubRequest:
 
 def _make_executor(handler: Mock | None) -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
     executor.model_engine = None
     executor.draft_model_engine = None
     executor._disagg_pp_termination_handler = handler
