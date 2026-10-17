@@ -355,6 +355,50 @@ def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) ->
     assert gen.py_kv_transfer_timed_out
 
 
+def test_context_timeout_does_not_count_the_wait_for_the_peer_to_ask(clock) -> None:
+    """Nothing is written until the generation peer asks, and under load its
+    request can queue past the timeout; that wait must not expire the send
+    (nvbugs/6621362). Once the peer has asked, the transfer gets the full
+    budget."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    clock["t"] += 2.0
+
+    h.coordinator.check_transfer_timeouts()
+
+    assert not req.py_kv_transfer_timed_out
+    assert req.py_kv_transfer_start_time == clock["t"]
+
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: False
+    clock["t"] += 0.5
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.0
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_send_whose_peer_never_asks_still_times_out(clock) -> None:
+    """The deadline is the only thing that ends a send whose peer never asks,
+    so the peer wait is bounded."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    ceiling_s = coordinator_module._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER * 1.0
+
+    clock["t"] += ceiling_s
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.5
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
 def test_timeout_check_is_inert_without_a_configured_timeout(clock) -> None:
     h = _Harness(kv_transfer_timeout_ms=None)
     req = _Request(1)
@@ -474,6 +518,79 @@ def test_refused_cancellation_is_retried_on_the_next_poll(inflight_cancel, clock
 
     assert attempts == [1, 1]
     assert req.py_kv_transfer_timed_out
+
+
+def test_idle_poll_fails_a_timed_out_receive_without_a_forward_pass(clock) -> None:
+    """Without in-flight cancellation a timed-out receive must not wait for the
+    response pass: a generation worker whose every slot holds a stalled
+    receive schedules nothing and never runs it (nvbugs/6621362)."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    stalled = _receiving(h, 1, started_at=clock["t"])
+    fresh = _receiving(h, 2, started_at=clock["t"] + 1.5)
+    clock["t"] += 2.0
+    h.coordinator.check_transfer_timeouts()
+
+    h.coordinator.poll_gen_transfers()
+
+    assert "cancel_request:1" in h.transceiver.call_log
+    assert "cancel_request:2" not in h.transceiver.call_log
+    assert h.effects.failed == [("Request 1 timed out", [stalled], False)]
+    assert fresh.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+
+def test_idle_poll_settles_a_refused_timeout_cancel_through_the_reap(clock) -> None:
+    """A cancel refused because a task is mid-write is retried each poll and the
+    request is failed once its session reports the cancellation."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _receiving(h, 1, started_at=clock["t"])
+    clock["t"] += 2.0
+    h.coordinator.check_transfer_timeouts()
+    attempts = []
+    h.transceiver.cancel_request = lambda request: attempts.append(request.py_request_id) or False
+
+    h.coordinator.poll_gen_transfers()
+    assert attempts == [1]
+    assert h.effects.failed == []
+
+    h.transceiver.cancel_recv_remotely(req)
+    h.coordinator.poll_gen_transfers()
+
+    assert attempts == [1, 1]
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == [
+        ("Error in kv cache transfer for generation requests", [req], False)
+    ]
+
+
+def test_idle_poll_leaves_a_user_cancelled_timed_out_receive_to_the_cancel_path(clock) -> None:
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    _receiving(h, 1, started_at=clock["t"])
+    h.registry.canceled = [1]
+    clock["t"] += 2.0
+    h.coordinator.check_transfer_timeouts()
+
+    h.coordinator.poll_gen_transfers()
+
+    assert "cancel_request:1" not in h.transceiver.call_log
+    assert h.effects.failed == []
+
+
+def test_idle_poll_under_adp_fails_a_timed_out_receive_once(clock) -> None:
+    """Under multi-rank ADP the released request stays active until the synced
+    drain; later polls must not queue it again."""
+    h = _Harness(kv_transfer_timeout_ms=1000, enable_attention_dp=True, world_size=2)
+    req = _receiving(h, 1, started_at=clock["t"])
+    clock["t"] += 2.0
+    h.coordinator.check_transfer_timeouts()
+    h.dist.tp_allgather_int64.return_value = Mock(any=lambda: True)
+
+    h.coordinator.poll_gen_transfers()
+    h.coordinator.poll_gen_transfers()
+    assert h.effects.failed == []
+
+    h.coordinator.handle_timeouts_synced()
+
+    assert h.effects.failed == [("Request timed out (KV transfer)", [req], False)]
 
 
 def test_peer_rank_timeout_decision_is_mirrored_locally(inflight_cancel, clock) -> None:

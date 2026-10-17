@@ -833,6 +833,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         return rid in self._send_sessions or rid in self._recv_sessions
 
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        # A send cannot write anything until every peer rank's REQUEST_DATA
+        # has arrived.
+        return not self._transfer_worker.has_all_peer_req_infos_for_send(get_unique_rid(req))
+
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""
         return req.py_kv_send_session_retired and get_unique_rid(req) not in self._send_sessions

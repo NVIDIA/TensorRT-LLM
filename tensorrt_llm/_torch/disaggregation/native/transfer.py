@@ -690,6 +690,10 @@ class Sender(SenderBase):
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    # How long a cleared TxSession's id is remembered. A generation peer can ask for its KV
+    # long after the context side gave up on it (its request may wait in the generation queue
+    # for minutes), so this outlives the stale-request-info TTL.
+    _RETIRED_SESSION_TTL_S = 600.0
 
     def __init__(
         self,
@@ -715,6 +719,11 @@ class Sender(SenderBase):
         # Who asked is not recoverable from the id alone, and the two differ: a peer's cancel is a
         # transfer error, our own side's is an ordinary end.
         self._pre_cancelled_rids: dict[int, bool] = {}
+        # unique_rid -> clear time, for sessions already cleared (completed, failed, cancelled or
+        # timed out). A REQUEST_DATA for one of them must be answered FAILED: parking it as an
+        # early generation-first request would leave the peer's receive unresolved for good.
+        # Protected by _sessions_lock.
+        self._retired_rids: dict[int, float] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -782,6 +791,13 @@ class Sender(SenderBase):
         entries that are never consumed; this sweep prevents unbounded growth.
         """
         now = time.monotonic()
+        with self._sessions_lock:
+            for rid in [
+                rid
+                for rid, ts in self._retired_rids.items()
+                if now - ts > self._RETIRED_SESSION_TTL_S
+            ]:
+                del self._retired_rids[rid]
         with self._peer_requests_lock:
             stale_rids = [
                 rid
@@ -804,6 +820,7 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
+            self._retired_rids.pop(unique_rid, None)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids.pop(unique_rid)
@@ -1645,8 +1662,27 @@ class Sender(SenderBase):
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
-                self._save_peer_req_info(info)
-                return
+                # A retried generation request carries a fresh unique_rid, so the
+                # context-side id names the retired session as well.
+                retired = (
+                    info.unique_rid in self._retired_rids
+                    or info.sender_req_id in self._retired_rids
+                )
+                if not retired:
+                    self._save_peer_req_info(info)
+                    return
+        if session is None:
+            # The session was already cleared, typically because the context side
+            # timed out waiting for this request while the peer's request sat in its
+            # generation queue. Nothing will ever be sent; say so instead of leaving
+            # the peer's receive (and its KV pages) waiting forever.
+            logger.warning(
+                f"_respond_with_kv: TxSession {info.sender_req_id} already retired; "
+                f"failing REQUEST_DATA for peer rid={info.unique_rid} "
+                f"rank={info.instance_rank}"
+            )
+            self._send_failed_result_to_receiver(info)
+            return
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -1821,6 +1857,7 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if unique_rid in self._sessions:
                 del self._sessions[unique_rid]
+                self._retired_rids[unique_rid] = time.monotonic()
         self._remove_req_info(unique_rid)
 
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
