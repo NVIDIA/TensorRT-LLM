@@ -68,7 +68,7 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     worker = DFlashWorker(config, Mapping())
     draft_model = _FakeDraftModel()
     worker.set_draft_model(draft_model)
-    spec_metadata = SimpleNamespace(max_num_requests=2)
+    spec_metadata = SimpleNamespace(max_num_requests=2, num_seq_slots=2)
     attn_metadata = SimpleNamespace(max_seq_len=64)
 
     worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)

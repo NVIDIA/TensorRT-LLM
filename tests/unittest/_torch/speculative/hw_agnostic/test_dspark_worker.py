@@ -32,6 +32,8 @@ from tensorrt_llm._torch.speculative.dspark import (
     DSv4DSparkWorker,
 )
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DSpark metadata/worker allocate CUDA buffers"
@@ -97,6 +99,16 @@ def test_metadata_prepare_batch_indices():
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
 
 
+def test_metadata_preserves_default_seq_slot_pool_in_graph_copy():
+    metadata = _make_metadata(max_num_requests=5)
+
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert metadata.num_seq_slots == 5
+    assert graph_metadata.max_num_requests == 2
+    assert graph_metadata.num_seq_slots == 5
+
+
 def _make_worker(enable_confidence_scheduling=False):
     cfg = types.SimpleNamespace(
         max_draft_len=5,
@@ -148,6 +160,46 @@ def test_worker_lazy_init_window_buffers():
     buf_id = id(worker._kv_windows)
     worker._lazy_init(dm, meta)
     assert id(worker._kv_windows) == buf_id
+
+
+def test_worker_graph_bucket_uses_full_seq_slot_pool():
+    """A small graph bucket must not shrink the persistent rolling-window pool."""
+    num_seq_slots = 5
+    spec_config = types.SimpleNamespace(
+        max_draft_len=5,
+        tokens_per_gen_step=6,
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        target_layer_ids=[0],
+        # The embedded form is the one served by DSv4DSparkWorker and its
+        # DSparkSpecMetadata; the standalone form routes to DFlash metadata.
+        draft_is_embedded_in_target=True,
+        advanced_sampling_mode=AdvancedSamplingMode.FULL,
+    )
+    metadata = get_spec_metadata(
+        spec_config,
+        types.SimpleNamespace(hidden_size=HIDDEN, torch_dtype=torch.bfloat16, vocab_size=32),
+        max_num_requests=num_seq_slots,
+        max_num_tokens=8,
+        num_seq_slots=num_seq_slots,
+    ).create_cuda_graph_metadata(max_batch_size=2)
+    worker = _make_worker()
+    worker._lazy_init(
+        _fake_draft_model(num_stages=1, window_size=8, head_dim=4),
+        metadata,
+    )
+
+    assert metadata.max_num_requests == 2 < metadata.num_seq_slots
+    num_slots = num_seq_slots + 1
+    assert worker._kv_windows.shape[0] == num_slots
+    assert worker._ctx_len.shape[0] == num_slots
+    assert worker._batch_to_slot.shape == (num_seq_slots,)
+    assert worker._scratch_slot == num_seq_slots
+    assert list(worker._free_slots) == list(range(num_seq_slots))
+
+    live_slots = {worker._assign_slot(100 + i, reset=False) for i in range(num_seq_slots)}
+    assert live_slots == set(range(num_seq_slots))
+    assert worker._scratch_slot not in live_slots
+    assert list(worker._free_slots) == []
 
 
 def test_worker_rejects_mismatched_block_size():
@@ -220,6 +272,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     draft_model = DraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=1,
+        num_seq_slots=1,
         request_ids=[100],
         get_hidden_states=lambda _num_tokens: torch.zeros(
             3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -278,7 +331,7 @@ def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_w
         written.append(positions.tolist())
 
     draft.write_context_windows = write
-    meta = types.SimpleNamespace(max_num_requests=2, request_ids=[100, 101])
+    meta = types.SimpleNamespace(max_num_requests=2, num_seq_slots=2, request_ids=[100, 101])
     worker._lazy_init(draft, meta)
     expected = []
     total_kept = 0
@@ -590,6 +643,7 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     draft_model = _RecordingDraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=2,
+        num_seq_slots=2,
         qo_indptr=None,
         verify_lens=None,
     )
@@ -1120,6 +1174,7 @@ def test_ragged_draft_gathers_each_requests_hidden_state():
     draft_model = _RecordingDraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=2,
+        num_seq_slots=2,
         qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device="cuda"),
         verify_lens=torch.tensor([4, 2], dtype=torch.int32, device="cuda"),
     )
