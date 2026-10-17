@@ -23,6 +23,8 @@ Tests for:
 """
 
 import inspect
+import random
+from collections import OrderedDict
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -45,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
 )
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import AttentionDpConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -1752,6 +1755,331 @@ class TestConversationAwareADPRouter:
         assert expected <= cap
         assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
 
+
+class TestConversationAwareTokenAwarePlacement:
+    """TLLM_ADP_TOKEN_AWARE_PLACEMENT=1: the ``rank is None`` branch of
+    ConversationAwareADPRouter places by pinned prompt tokens (last-seen prompt
+    length per live conversation), ties round-robin; load expires by write volume."""
+
+    ENV = ConversationAwareADPRouter.TOKEN_AWARE_ENV
+    WINDOW_ENV = ConversationAwareADPRouter.TOKEN_AWARE_WINDOW_ENV
+
+    @staticmethod
+    def _router(tp_size=4, window=0, max_sessions=1 << 16, placement="round_robin"):
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size),
+            max_sessions=max_sessions,
+            new_conv_placement=placement,
+            token_aware_placement=True,
+            token_window_tokens=window,
+        )
+
+    @staticmethod
+    def _states(tp_size, active=None):
+        active = active or [0] * tp_size
+        return [
+            RankState(rank=r, num_active_requests=active[r], num_active_tokens=0)
+            for r in range(tp_size)
+        ]
+
+    @classmethod
+    def _turns(cls, router, specs, tp_size=4, active=None, cap=256):
+        """specs: (req_id, conversation_id or None, isl). Returns {req_id: rank}."""
+        items = [_make_conv_request_item(rid, conv, num_tokens=isl) for rid, conv, isl in specs]
+        assign, _ = router.route_requests(
+            cls._states(tp_size, active), items, max_num_active_requests=cap
+        )
+        return {item.id: r for r, lst in assign.items() for item in lst}
+
+    @staticmethod
+    def _cfg(placement="round_robin", affinity=True, max_sessions=1 << 16):
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = affinity
+        cfg.enable_kv_cache_aware_routing = False
+        cfg.kv_cache_routing_max_sessions = max_sessions
+        cfg.kv_cache_routing_fair_share_multiplier = 2.0
+        cfg.kv_cache_routing_new_conv_placement = placement
+        return cfg
+
+    @staticmethod
+    def _kvm(primary=32578, secondary=44362, tokens_per_block=64):
+        kvm = MagicMock(spec=[])
+        kvm.blocks_in_primary_pool = primary
+        kvm.blocks_in_secondary_pool = secondary
+        kvm.tokens_per_block = tokens_per_block
+        return kvm
+
+    @staticmethod
+    def _check_invariants(router, tp_size):
+        assert sum(router._pinned_tokens[:tp_size]) == sum(router._last_isl.values())
+        assert all(v >= 0 for v in router._pinned_tokens)
+        for r in range(tp_size):
+            expected = {c for c in router._last_isl if router._conv_to_rank[c] == r}
+            assert set(router._live[r]) == expected
+        assert set(router._last_isl) <= set(router._conv_to_rank)
+
+    # --- gating -----------------------------------------------------------------------------------------
+
+    def test_default_off_is_bit_identical(self, monkeypatch):
+        monkeypatch.delenv(self.ENV, raising=False)
+        created = ADPRouter.create(
+            dist=_mock_dist(tp_size=4), kv_cache_manager=None, attention_dp_config=self._cfg()
+        )
+        plain = ConversationAwareADPRouter(dist=_mock_dist(tp_size=4))
+        assert created._token_aware is False and plain._token_aware is False
+        assert not hasattr(created, "_pinned_tokens")
+        assert created.pinned_tokens_per_rank() == []
+
+        messages = []
+        for name in ("debug", "info", "warning"):
+            monkeypatch.setattr(
+                logger, name, lambda *a, **k: messages.append(" ".join(str(x) for x in a))
+            )
+        batches = [
+            [(1, "A", 1000), (2, "B", 10), (3, "C", 10), (4, "D", 10)],
+            [(5, "E", 10), (6, "A", 1200), (7, None, 50)],
+            [(8, "F", 300), (9, "B", 40)],
+        ]
+        positions = [
+            [self._turns(router, batch, active=[i, 0, 1, 0]) for i, batch in enumerate(batches)]
+            for router in (created, plain)
+        ]
+        assert positions[0] == positions[1]
+        assert created._conv_to_rank == plain._conv_to_rank
+        assert created._round_robin_cursor == plain._round_robin_cursor
+        # The off path must not leak any token-aware log line (h00 runs at DEBUG).
+        assert messages, "the pre-existing conversation debug line is expected"
+        assert not any("token_aware" in m or "token-aware" in m for m in messages)
+
+    def test_env_var_enables_via_factory(self, monkeypatch):
+        monkeypatch.delenv(self.WINDOW_ENV, raising=False)
+        monkeypatch.setenv(self.ENV, "1")
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=4),
+            kv_cache_manager=self._kvm(100, 50, 64),
+            attention_dp_config=self._cfg(),
+        )
+        assert isinstance(router, ConversationAwareADPRouter)
+        assert router._token_aware is True
+        assert router._window_tokens == 150 * 64
+
+        monkeypatch.setenv(self.ENV, "0")
+        assert ADPRouter.create(dist=_mock_dist(), attention_dp_config=self._cfg())._token_aware is False
+        monkeypatch.delenv(self.ENV)
+        assert ADPRouter.create(dist=_mock_dist(), attention_dp_config=self._cfg())._token_aware is False
+
+        # Set, but the conversation router is not selected -> default router and one warning.
+        monkeypatch.setenv(self.ENV, "1")
+        warn = MagicMock()
+        monkeypatch.setattr(logger, "warning_once", warn)
+        router = ADPRouter.create(
+            dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=self._cfg(affinity=False)
+        )
+        assert isinstance(router, DefaultADPRouter)
+        warn.assert_called_once()
+        assert warn.call_args.kwargs["key"] == "adp_token_aware_ignored"
+
+    def test_env_overrides_least_queued(self):
+        router = self._router(placement="least_queued")
+        self._turns(router, [(1, "A", 100), (2, "B", 100), (3, "C", 100)])
+        assert router.pinned_tokens_per_rank() == [100, 100, 100, 0]
+        # least_queued would pick rank 1 (least active); token-aware picks the un-pinned rank 3.
+        pos = self._turns(router, [(4, "D", 10)], active=[5, 1, 5, 5])
+        assert pos[4] == 3
+
+    # --- placement ------------------------------------------------------------------------------------
+
+    def test_new_conversation_goes_to_least_pinned_rank(self):
+        router = self._router()
+        pos = self._turns(router, [(1, "A", 1000), (2, "B", 10), (3, "C", 10), (4, "D", 10)])
+        assert pos == {1: 0, 2: 1, 3: 2, 4: 3}
+        pos = self._turns(router, [(5, "E", 20)])
+        assert pos[5] == 1  # ranks 1..3 tie at 10; the cursor (0 after four placements) scans 0,1,...
+        assert router.pinned_tokens_per_rank() == [1000, 30, 10, 10]
+        assert router._conv_to_rank["E"] == 1
+
+    def test_ties_round_robin_not_lowest_index(self):
+        router = self._router()
+        pos = self._turns(router, [(i, f"c{i}", 10) for i in range(8)])
+        assert [pos[i] for i in range(4)] == [0, 1, 2, 3]
+        assert [sum(1 for r in pos.values() if r == k) for k in range(4)] == [2, 2, 2, 2]
+
+    def test_sticky_return_replaces_last_seen_isl(self):
+        router = self._router()
+        self._turns(router, [(1, "A", 100)])
+        assert router.pinned_tokens_per_rank() == [100, 0, 0, 0]
+        self._turns(router, [(2, "A", 700)], active=[9, 0, 0, 0])
+        assert router.pinned_tokens_per_rank() == [700, 0, 0, 0]
+        assert router._written_tokens[0] == 700
+        self._turns(router, [(3, "A", 650)])
+        assert router.pinned_tokens_per_rank() == [650, 0, 0, 0]
+        assert router._written_tokens[0] == 700  # shrink writes nothing new
+        assert router._conv_to_rank["A"] == 0
+
+    def test_within_batch_burst_spreads_by_tokens(self):
+        router = self._router()
+        pos = self._turns(
+            router, [(1, "A", 500), (2, "B", 500), (3, "C", 100), (4, "D", 100), (5, "E", 100)]
+        )
+        assert [pos[i] for i in range(1, 6)] == [0, 1, 2, 3, 2]
+        assert router.pinned_tokens_per_rank() == [500, 500, 200, 100]
+
+    def test_sub_agent_children_are_independent_conversations(self):
+        router = self._router()
+        self._turns(router, [(1, "P", 500_000)])
+        children = ["P::sa:subagent_001", "P::sa:subagent_002", "P::fa:003"]
+        pos = self._turns(router, [(10 + i, c, 1000) for i, c in enumerate(children)])
+        assert all(r != 0 for r in pos.values())
+        assert len(set(pos.values())) == 3
+        for c in children:
+            assert router._conv_to_rank[c] == pos[10 + children.index(c)]
+        assert router.pinned_tokens_per_rank()[0] == 500_000
+        assert router._last_isl["P"] == 500_000
+
+    # --- expiry and eviction --------------------------------------------------------------------------
+
+    def test_expiry_by_write_volume(self):
+        router = self._router(tp_size=1, window=1000)
+        self._turns(router, [(1, "A", 600)], tp_size=1)
+        assert router._live[0]["A"] == 600
+        self._turns(router, [(2, None, 700)], tp_size=1)  # written 1300; 1300-600 <= 1000 -> stays
+        self._turns(router, [(3, None, 400)], tp_size=1)  # written 1700
+        assert "A" in router._last_isl
+        self._turns(router, [], tp_size=1)  # next call: 1700-600 > 1000 -> A's load expires
+        assert "A" not in router._last_isl
+        assert "A" not in router._live[0]
+        assert router.pinned_tokens_per_rank() == [0]
+        assert router._conv_to_rank["A"] == 0  # stickiness survives
+        self._turns(router, [(4, "A", 650)], tp_size=1)
+        assert router.pinned_tokens_per_rank() == [650]
+        assert router._live[0]["A"] == router._written_tokens[0]
+
+    def test_expiry_disabled_when_window_zero(self):
+        router = self._router(tp_size=1, window=0)
+        self._turns(router, [(1, "A", 600)], tp_size=1)
+        for i in range(10):
+            self._turns(router, [(10 + i, None, 5000)], tp_size=1)
+        self._turns(router, [], tp_size=1)
+        assert router.pinned_tokens_per_rank() == [600]
+        assert "A" in router._live[0]
+
+    def test_lru_eviction_subtracts_pinned(self):
+        router = self._router(tp_size=1, max_sessions=2)
+        self._turns(router, [(1, "A", 100), (2, "B", 200), (3, "C", 300)], tp_size=1)
+        assert list(router._conv_to_rank) == ["B", "C"]
+        assert "A" not in router._last_isl and "A" not in router._live[0]
+        assert router.pinned_tokens_per_rank() == [500]
+        self._turns(router, [(4, "D", 400), (5, "E", 50)], tp_size=1)
+        assert list(router._conv_to_rank) == ["D", "E"]
+        assert router.pinned_tokens_per_rank() == [450]
+        self._check_invariants(router, 1)
+
+    def test_no_conversation_id_counts_writes_not_pinned(self):
+        router = self._router()
+        pos = self._turns(router, [(1, None, 50), (2, None, 70)])
+        assert pos == {1: 0, 2: 1}  # ties -> round robin
+        assert router.pinned_tokens_per_rank() == [0, 0, 0, 0]
+        assert router._written_tokens[:4] == [50, 70, 0, 0]
+        assert router._last_isl == {} and router._conv_to_rank == OrderedDict()
+
+    def test_sticky_overflow_accounting(self):
+        router = self._router(tp_size=2)
+        self._turns(router, [(1, "A", 100)], tp_size=2, cap=1)
+        assert router._conv_to_rank["A"] == 0
+        # Home rank 0 is at the hard cap: A overflows to the least pinned rank without rebinding.
+        pos = self._turns(router, [(2, "A", 300)], tp_size=2, active=[1, 0], cap=1)
+        assert pos[2] == 1
+        assert router._conv_to_rank["A"] == 0
+        assert router.pinned_tokens_per_rank() == [100, 0]
+        assert router._last_isl["A"] == 100
+        assert router._written_tokens[:2] == [100, 300]
+
+    # --- determinism, capacity, window ----------------------------------------------------------------
+
+    def test_deterministic_across_ranks_with_expiry(self):
+        routers = [self._router(window=3000) for _ in range(2)]
+        rng = random.Random(7)
+        req_id = 0
+        for batch in range(40):
+            specs = []
+            for _ in range(rng.randint(0, 6)):
+                req_id += 1
+                conv = rng.choice([f"c{rng.randint(0, 15)}", None])
+                specs.append((req_id, conv, rng.randint(1, 900)))
+            active = [rng.randint(0, 3) for _ in range(4)]
+            results = [
+                self._turns(r, list(specs), active=list(active), cap=8) for r in routers
+            ]
+            assert results[0] == results[1]
+            a, b = routers
+            assert a._pinned_tokens == b._pinned_tokens
+            assert a._written_tokens == b._written_tokens
+            assert a._last_isl == b._last_isl
+            assert a._conv_to_rank == b._conv_to_rank
+            assert [list(x.items()) for x in a._live] == [list(x.items()) for x in b._live]
+            assert a._round_robin_cursor == b._round_robin_cursor
+
+    def test_returned_expected_covers_every_rank_token_aware(self):
+        router = self._router(tp_size=8)
+        states = self._states(8, active=[3, 0, 5, 1, 2, 0, 4, 1])
+        items = [_make_conv_request_item(i, "A", num_tokens=100) for i in range(40)]
+        assign, expected = router.route_requests(states, items, max_num_active_requests=256)
+        final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
+        assert all(expected >= f for f in final), (expected, final)
+        assert sum(len(v) for v in assign.values()) == 40
+
+    def test_window_derived_from_kv_manager_and_override(self, monkeypatch):
+        monkeypatch.delenv(self.WINDOW_ENV, raising=False)
+        warn = MagicMock()
+        monkeypatch.setattr(logger, "warning", warn)
+        make = lambda kvm, override=None: ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=4),
+            token_aware_placement=True,
+            kv_cache_manager=kvm,
+            token_window_tokens=override,
+        )
+        assert make(self._kvm())._window_tokens == (32578 + 44362) * 64 == 4_924_160
+        warn.assert_not_called()
+        # KVCacheManagerV2 shape: no secondary pool attribute, but a summed all-tier capacity.
+        v2 = MagicMock(spec=[])
+        v2.blocks_in_primary_pool = 100
+        v2.tokens_per_block = 64
+        v2.kv_capacity_tokens_all_tiers = 6_343_744
+        assert make(v2)._window_tokens == 6_343_744
+        warn.assert_not_called()
+        # Neither shape (primary only) -> 0 + one warning.
+        partial = MagicMock(spec=[])
+        partial.blocks_in_primary_pool = 100
+        partial.tokens_per_block = 64
+        assert make(partial)._window_tokens == 0
+        assert warn.call_count == 1
+        assert make(None)._window_tokens == 0
+        assert warn.call_count == 2
+        # Env override wins over the manager; constructor override wins over env.
+        monkeypatch.setenv(self.WINDOW_ENV, "123")
+        assert make(self._kvm())._window_tokens == 123
+        assert make(self._kvm(), override=77)._window_tokens == 77
+        monkeypatch.setenv(self.WINDOW_ENV, "-5")
+        assert make(self._kvm())._window_tokens == 0
+        monkeypatch.setenv(self.WINDOW_ENV, "abc")
+        assert make(self._kvm())._window_tokens == 4_924_160  # non-integer env ignored with a warning
+        assert warn.call_count == 3
+
+    def test_invariants_random_sequence(self):
+        tp_size = 6
+        router = self._router(tp_size=tp_size, window=5000, max_sessions=64)
+        rng = random.Random(2026)
+        req_id = 0
+        for _ in range(250):
+            specs = []
+            for _ in range(rng.randint(0, 8)):
+                req_id += 1
+                conv = rng.choice([f"c{rng.randint(0, 120)}", None, None])
+                specs.append((req_id, conv, rng.randint(1, 4000)))
+            active = [rng.randint(0, 4) for _ in range(tp_size)]
+            self._turns(router, specs, tp_size=tp_size, active=active, cap=6)
+            self._check_invariants(router, tp_size)
+        assert req_id > 800
 
 class TestNumInputTokens:
     """The cheap token-count accessor used by the routers (avoids copying the
