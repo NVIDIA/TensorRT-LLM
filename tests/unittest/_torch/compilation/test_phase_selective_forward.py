@@ -172,6 +172,7 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
     for method in (
         "_allocate_decoder_buffers",
         "_init_decoder_state",
+        "_initialize_moe_workspace_reclaimer",
         "_initialize_cuda_graph_runner",
         "_initialize_breakable_cuda_graph_runner",
     ):
