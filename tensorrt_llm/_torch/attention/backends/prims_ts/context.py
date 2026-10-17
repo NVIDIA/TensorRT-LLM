@@ -37,7 +37,6 @@ register trace templates.
 
 from dataclasses import dataclass
 import functools
-import importlib.metadata
 import itertools
 import math
 import numbers
@@ -494,22 +493,6 @@ def _validate_device(device: torch.device) -> int:
     return device_index
 
 
-@functools.cache
-def _dsl_supports_ldtm_stat() -> bool:
-    """LDTM.STAT uses a native wrapper in DSL 4.8 or inline PTX in 4.7."""
-    try:
-        dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
-    except importlib.metadata.PackageNotFoundError:
-        return False
-    from packaging import version as pkg_version
-
-    try:
-        # Use .release so 4.7.0.dev* includes the inline-PTX path.
-        return pkg_version.Version(dsl_version).release >= (4, 7, 0)
-    except pkg_version.InvalidVersion:
-        return False
-
-
 def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
     """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
 
@@ -537,21 +520,10 @@ def _default_two_cta_umma(device_index: int) -> bool:
 
 
 def _default_uses_ldtm_stat(device_index: int) -> bool:
-    """Enable LDTM.STAT on SM103/SM107 with native or compatibility lowering."""
-    if not _dsl_supports_ldtm_stat():
-        return False
-    # tcgen05.ld.red.max (LDTM.STAT) is available on B300 (SM103) and Rubin
-    # (SM107), not B200 (SM100).
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability == (10, 3):
-        return True
-    if capability == (10, 7):
-        # DSL 4.7's Rubin escape hatch targets sm_100f, which cannot emit
-        # LDTM.STAT. Keep Rubin on the native wrapper/target support path.
-        from cutlass.experimental import primitives as prims
+    """Enable LDTM.STAT where the shared tcgen05 gate allows it."""
+    from .kernels.tcgen05_compat import ldtm_stat_supported
 
-        return hasattr(prims, "tcgen05_ld_red")
-    return False
+    return ldtm_stat_supported(torch.cuda.get_device_capability(device_index))
 
 
 def _resolve_cuda_device(

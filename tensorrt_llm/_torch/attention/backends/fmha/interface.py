@@ -43,6 +43,9 @@ class Fmha(ABC):
     supports_skip_correction: ClassVar[bool] = False
     supports_block_sparse_inputs: ClassVar[bool] = False
     supports_per_tensor_fp8: ClassVar[bool] = False
+    # Reads the SageAttention inputs the attention core quantized from
+    # ``AttentionForwardArgs.sage_quantized``.
+    supports_sage_quantized_inputs: ClassVar[bool] = False
     supports_workspace_reclamation: bool = False
     supports_fp4_mla: ClassVar[bool] = False
 

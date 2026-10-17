@@ -104,32 +104,24 @@ class TestAttentionConfigQuantValidation:
                     ),
                 )
 
-    @pytest.mark.parametrize(
-        ("backend", "quant_config"),
-        [
-            (
-                "TRTLLM",
-                QuantAttentionConfig(
-                    qk_dtype="fp8",
-                    q_block_size=1,
-                    k_block_size=1,
-                    v_block_size=1,
-                ),
-            ),
-            (
-                "CUTEDSL",
-                QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
-            ),
-        ],
-    )
-    def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
+    def test_vsa_and_quantization_compose_only_on_trtllm(self):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            sage = QuantAttentionConfig(
+                qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1
+            )
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=sage,
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            )
+            assert attention.quant_attention_config is sage
+
             with pytest.raises(
                 ValidationError, match="VSA and quant_attention_config are mutually exclusive"
             ):
                 AttentionConfig(
-                    backend=backend,
-                    quant_attention_config=quant_config,
+                    backend="CUTEDSL",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
                     sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
                 )
 
@@ -160,8 +152,10 @@ class TestAttentionConfigQuantValidation:
             (100, "int8", 1, 16, 1),
             (100, "fp8", 1, 1, 1),
             (100, "fp8", 1, 4, 1),
+            (100, "fp8", 1, 16, 1),
             (103, "fp8", 1, 1, 1),
             (103, "fp8", 1, 4, 1),
+            (103, "fp8", 1, 16, 1),
             (100, "bf16", 0, 0, 0),
             (100, "fp8", 0, 0, 0),
             (103, "bf16", 0, 0, 0),
@@ -184,14 +178,15 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
     @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
-    def test_smooth_k_rejected_without_sage_recipe(self, backend):
+    def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
-            with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):
+            with pytest.raises(ValidationError, match="are SageAttention options"):
                 AttentionConfig(
                     backend=backend,
                     quant_attention_config=QuantAttentionConfig(
-                        qk_dtype="bf16", v_dtype="fp8", smooth_k=True
+                        qk_dtype="bf16", v_dtype="fp8", **{smoothing: True}
                     ),
                 )
 

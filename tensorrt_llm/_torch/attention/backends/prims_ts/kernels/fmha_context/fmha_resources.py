@@ -87,15 +87,14 @@ from cutlass.pipeline import PipelineAsync, PipelineState
 from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
 from ..placeholder_helpers import _placeholder_smem_array, _placeholder_tmem_ptr
+from ..tcgen05_compat import tcgen05_ld_32x32b_max
 from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
     freeze_smem_descriptor,
-    load_tmem_32x32b_max,
     variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
-from cutlass._mlir.dialects import arith as arith_dialect
 
 SmemDescOffsets: TypeAlias = tuple[int, int]
 TmemAddr: TypeAlias = int | Int32
@@ -3235,38 +3234,11 @@ class TmemSPResource(MemoryResource):
         s_data: SoftmaxChunks = [None] * num_chunks
         chunk_maxima: tuple[Any, ...] = ()
         for chunk_idx in cutlass.range_constexpr(num_chunks):
-            if cutlass.const_expr(hasattr(prims, "tcgen05_ld_red")):
-                loaded_words, red_word = prims.tcgen05_ld_red(
-                    prims.Tcgen05LdStShape.SHAPE_32X32B,
-                    prims.make_tmem_ptr(
-                        tmem_s_addr + chunk_idx * tmem_x, self.cfg.qk_acc_dtype
-                    ),
-                    prims.ReductionKind.MAX,
-                    num=tmem_x,
-                )
-                s_data[chunk_idx] = cutlass.Vector.from_elements(
-                    tuple(
-                        loaded_words[i].bitcast(self.cfg.qk_acc_dtype)
-                        for i in range(tmem_x)
-                    ),
-                    dtype=self.cfg.qk_acc_dtype,
-                )
-                chunk_max = self.cfg.qk_acc_dtype(
-                    arith_dialect.bitcast(
-                        self.cfg.qk_acc_dtype.mlir_type, red_word.ir_value()
-                    )
-                )
-            else:
-                # PTX ISA 8.8 supports LDTM.STAT on SM103 before the DSL 4.8
-                # convenience wrapper is available. The geometry is fixed at
-                # 32 rows x 32 FP32 values for each context load fragment.
-                assert tmem_x == 32
-                loaded = load_tmem_32x32b_max(tmem_s_addr + chunk_idx * tmem_x)
-                s_data[chunk_idx] = cutlass.Vector.from_elements(
-                    loaded[:32], dtype=self.cfg.qk_acc_dtype
-                )
-                chunk_max = loaded[32]
-            chunk_maxima += (chunk_max,)
+            loaded = tcgen05_ld_32x32b_max(tmem_s_addr + chunk_idx * tmem_x, tmem_x)
+            s_data[chunk_idx] = cutlass.Vector.from_elements(
+                loaded[:tmem_x], dtype=self.cfg.qk_acc_dtype
+            )
+            chunk_maxima += (loaded[tmem_x],)
         cute.arch.fence_view_async_tmem_load()
         # Reduction results are asynchronous, just like the loaded scores.
         tile_max = cutlass.Vector.from_elements(
