@@ -90,6 +90,7 @@ def _make_executor(
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
+    exe.enable_kv_cache_events = False
     exe.kv_cache_transceiver = kv_cache_transceiver
     exe.kv_connector_manager = kv_connector_manager
     exe.is_warmup = is_warmup
