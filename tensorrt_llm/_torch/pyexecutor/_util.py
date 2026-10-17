@@ -4063,6 +4063,7 @@ def create_py_executor_instance(
     max_num_tokens: Optional[int] = None,
     peft_cache_config: Optional[PeftCacheConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
+    scheduler_policy_explicit: Optional[bool] = None,
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
@@ -4307,8 +4308,15 @@ def create_py_executor_instance(
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        # Model defaults may reconstruct SchedulerConfig with every field set.
+        # The creator records user intent before that reconstruction.
+        if scheduler_policy_explicit is None:
+            scheduler_policy_explicit = (
+                scheduler_config is not None and "capacity_scheduler_policy"
+                in scheduler_config.model_fields_set)
         scheduler_policy = (scheduler_config.capacity_scheduler_policy
-                            if scheduler_config is not None else
+                            if scheduler_config is not None
+                            and scheduler_policy_explicit else
                             CapacitySchedulerPolicy.MAX_UTILIZATION)
         enable_prefix_aware_scheduling = (
             scheduler_config.enable_prefix_aware_scheduling
