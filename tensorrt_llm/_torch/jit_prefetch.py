@@ -36,7 +36,10 @@ same through those libraries' compile-only entry points
 (``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``). MiniMax-M3's
 MSA ``fmha_sm100`` kernels follow from the engine's geometry alone, so they
 are built from the start of warmup rather than at its end
-(:class:`FmhaSm100Builds`).
+(:class:`FmhaSm100Builds`). So do FlashInfer JIT modules: the sampling module
+is built from the start of warmup, a module a model's layers build in their
+first forward (GLM-5.3-Flash's TRTLLM-GEN decode launcher) from the moment
+the model is constructed, while its weights load (``start_model_builds``).
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -145,35 +148,47 @@ def stats_enabled() -> bool:
 # FlashInfer JIT modules built ahead of warmup
 # ---------------------------------------------------------------------------
 
-# One CPU-only build per process: the module names it builds and the process.
-_fi_build: Optional[Tuple[Tuple[str, ...], Any]] = None
+# The CPU-only builds started in this process, oldest first: the module names
+# each one builds and its process. Warmup joins them (or stops them).
+_fi_builds: List[Tuple[Tuple[str, ...], Any]] = []
+# Every module a build has been started for, so none is started twice.
+_fi_started: set = set()
 
 
-def _flashinfer_spec(name: str):
-    """FlashInfer's ``JitSpec`` for JIT module ``name`` (``flashinfer.jit.<name>``
-    defines ``gen_<name>_module``)."""
-    import importlib
+def _flashinfer_is_compiled(name: str) -> bool:
+    """Whether FlashInfer's JIT module ``name`` is on disk, its AOT library or
+    a JIT build, as ``JitSpecNvcc.is_compiled`` checks it. Reads the paths
+    without generating the spec: ``fmha_gen``'s generator downloads its
+    kernel header."""
+    from flashinfer.jit import env as jit_env
 
-    return getattr(importlib.import_module(f"flashinfer.jit.{name}"), f"gen_{name}_module")()
+    return any(
+        (root / name / f"{name}.so").exists()
+        for root in (jit_env.FLASHINFER_AOT_DIR, jit_env.FLASHINFER_JIT_DIR)
+    )
 
 
 def start_flashinfer_build(modules: Tuple[str, ...] = ("sampling",)) -> bool:
     """Start building FlashInfer JIT ``modules`` in a CPU-only helper process.
 
-    Warmup builds FlashInfer's sampling module (``warmup_sampling_module``)
-    before its first forward: an nvcc compile of about a minute with a cold
-    cache, during which the GPU idles. Started at the beginning of warmup, the
-    helper builds it while the warmup forwards run on the GPU;
-    ``wait_flashinfer_build`` then joins it before the first phase that can
-    launch the sampling kernels (CUDA graph capture), and the in-process
-    ``build_and_load`` only loads the result. The helper has no visible GPU:
-    ``FLASHINFER_CUDA_ARCH_LIST`` gives it this process's FlashInfer targets,
-    which also name the cache directory, so the build lands where this
-    process looks. Returns False if prefetch is off, FlashInfer is missing,
-    or the module is already built.
+    FlashInfer builds a JIT module with nvcc at its first use, about a minute
+    with a cold cache, during which the GPU idles. Warmup builds the sampling
+    module (``warmup_sampling_module``) before its first forward; a model's
+    layers may build others in warmup's first forwards (see
+    ``start_model_builds``). Started ahead of that use, the helper builds the
+    modules, one after another in the given order, while the process does
+    other work: the sampling module from the beginning of warmup, a layer's
+    module while the weights load. ``wait_flashinfer_build`` joins the helpers
+    before the first warmup phase that can launch the sampling kernels (CUDA
+    graph capture); a use before that waits on FlashInfer's own file lock,
+    which the helper holds while it builds the module. Either way the
+    in-process ``build_and_load`` only loads the result. The helper has no
+    visible GPU: ``FLASHINFER_CUDA_ARCH_LIST`` gives it this process's
+    FlashInfer targets, which also name the cache directory, so the build
+    lands where this process looks. Returns False if prefetch is off,
+    FlashInfer is missing, or every module is built already or being built.
     """
-    global _fi_build
-    if not prefetch_enabled() or _fi_build is not None or os.environ.get("FLASHINFER_DISABLE_JIT"):
+    if not prefetch_enabled() or os.environ.get("FLASHINFER_DISABLE_JIT"):
         return False
     try:
         import torch
@@ -184,8 +199,13 @@ def start_flashinfer_build(modules: Tuple[str, ...] = ("sampling",)) -> bool:
             return False
         from flashinfer.compilation_context import CompilationContext
 
-        # Nothing to build: an AOT artifact, or a JIT build already on disk.
-        pending = [name for name in modules if not _flashinfer_spec(name).is_compiled]
+        # Nothing to build: an AOT artifact or a JIT build already on disk, or
+        # a helper started on it before.
+        pending = [
+            name
+            for name in modules
+            if name not in _fi_started and not _flashinfer_is_compiled(name)
+        ]
         if not pending:
             return False
         # The targets as FlashInfer resolved them here, suffix included
@@ -231,99 +251,128 @@ def start_flashinfer_build(modules: Tuple[str, ...] = ("sampling",)) -> bool:
         os.setpriority(os.PRIO_PROCESS, proc.pid, 19)
     except OSError:
         pass
-    _fi_build = (tuple(pending), proc)
+    _fi_builds.append((tuple(pending), proc))
+    _fi_started.update(pending)
     logger.info(f"[JIT prefetch] building FlashInfer {', '.join(pending)} in a CPU-only helper")
     return True
 
 
 def wait_flashinfer_build(timeout_s: Optional[float] = None) -> Optional[float]:
-    """Join the helper ``start_flashinfer_build`` started; return the seconds
-    waited, or None if none was started. Called where warmup needs the module:
-    a failed or timed-out build only means the module is built in place."""
+    """Join the helpers ``start_flashinfer_build`` started; return the seconds
+    waited, or None if none was started. Called where warmup needs the
+    modules: a failed or timed-out build only means the module is built in
+    place. ``timeout_s`` bounds the whole join."""
     import subprocess
 
-    global _fi_build
-    if _fi_build is None:
+    if not _fi_builds:
         return None
-    modules, proc = _fi_build
     if timeout_s is None:
         timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
     t0 = time.perf_counter()
-    try:
-        out, _ = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        cancel_flashinfer_build()
-        logger.warning(
-            f"[JIT prefetch] FlashInfer {', '.join(modules)} build still running after"
-            f" {timeout_s:.0f} s: stopped, built in place instead"
-        )
-        return time.perf_counter() - t0
-    _fi_build = None
-    waited = time.perf_counter() - t0
-    reported = set()
-    for line in (out or "").splitlines():
+    while _fi_builds:
+        modules, proc = _fi_builds[0]
         try:
-            r = json.loads(line)
-            name, ok, secs = r["module"], r["ok"], float(r["s"])
-        except (ValueError, TypeError, KeyError):
-            continue
-        if name not in modules:
-            continue
-        reported.add(name)
-        if not ok:
-            logger.warning(f"[JIT prefetch] FlashInfer {name} build failed: {r.get('err')}")
-        elif not _flashinfer_spec(name).is_compiled:
+            out, _ = proc.communicate(timeout=max(0.0, timeout_s - (time.perf_counter() - t0)))
+        except subprocess.TimeoutExpired:
+            unjoined = [name for names, _ in _fi_builds for name in names]
+            cancel_flashinfer_build()
             logger.warning(
-                f"[JIT prefetch] FlashInfer {name}: the helper's build is not where this"
-                " process loads it from; built in place instead"
+                f"[JIT prefetch] FlashInfer {', '.join(unjoined)} build(s) still running after"
+                f" {timeout_s:.0f} s: stopped, built in place instead"
             )
-        else:
-            logger.info(
-                f"[JIT prefetch] FlashInfer {name} built by the helper in {secs:.1f} s"
-                f" (waited {waited:.1f} s)"
+            return time.perf_counter() - t0
+        _fi_builds.pop(0)
+        reported = set()
+        for line in (out or "").splitlines():
+            try:
+                r = json.loads(line)
+                name, ok, secs = r["module"], r["ok"], float(r["s"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if name not in modules:
+                continue
+            reported.add(name)
+            if not ok:
+                logger.warning(f"[JIT prefetch] FlashInfer {name} build failed: {r.get('err')}")
+            elif not _flashinfer_is_compiled(name):
+                logger.warning(
+                    f"[JIT prefetch] FlashInfer {name}: the helper's build is not where this"
+                    " process loads it from; built in place instead"
+                )
+            else:
+                logger.info(
+                    f"[JIT prefetch] FlashInfer {name} built by the helper in {secs:.1f} s"
+                    f" (waited {time.perf_counter() - t0:.1f} s)"
+                )
+        missing = [m for m in modules if m not in reported]
+        if missing:
+            logger.warning(
+                f"[JIT prefetch] FlashInfer helper exited with code {proc.returncode} before"
+                f" building {', '.join(missing)}"
             )
-    missing = [m for m in modules if m not in reported]
-    if missing:
-        logger.warning(
-            f"[JIT prefetch] FlashInfer helper exited with code {proc.returncode} before"
-            f" building {', '.join(missing)}"
-        )
-    return waited
+    return time.perf_counter() - t0
 
 
 def cancel_flashinfer_build() -> None:
-    """Stop the helper ``start_flashinfer_build`` started, unless it has been
-    joined, and return once it has exited. The module is then built in place."""
+    """Stop the helpers ``start_flashinfer_build`` started that have not been
+    joined, and return once they have exited. Their modules are then built in
+    place."""
     import signal
     import subprocess
 
-    global _fi_build
-    if _fi_build is None:
-        return
-    _, proc = _fi_build
-    _fi_build = None
-    # SIGTERM to the helper's process group, sent again each second until the
-    # helper exits, so a ninja started after the first one gets it as well.
-    # ninja stops the compilers it runs (each in a process group of its own)
-    # and removes their partial outputs; the helper waits for it. A compiler
-    # left running would write into the directory the in-place build uses.
-    sig, deadline = signal.SIGTERM, time.monotonic() + 60.0
-    while proc.poll() is None:
-        if time.monotonic() > deadline:
-            if sig == signal.SIGKILL:
-                logger.warning("[JIT prefetch] FlashInfer helper did not exit; left running")
-                break
-            logger.warning("[JIT prefetch] FlashInfer helper did not stop on SIGTERM; killing it")
-            sig, deadline = signal.SIGKILL, time.monotonic() + 10.0
-        try:
-            os.killpg(proc.pid, sig)
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            pass
-    proc.stdout.close()
+    while _fi_builds:
+        _, proc = _fi_builds.pop(0)
+        # SIGTERM to the helper's process group, sent again each second until
+        # the helper exits, so a ninja started after the first one gets it as
+        # well. ninja stops the compilers it runs (each in a process group of
+        # its own) and removes their partial outputs; the helper waits for it.
+        # A compiler left running would write into the directory the in-place
+        # build uses.
+        sig, deadline = signal.SIGTERM, time.monotonic() + 60.0
+        while proc.poll() is None:
+            if time.monotonic() > deadline:
+                if sig == signal.SIGKILL:
+                    logger.warning("[JIT prefetch] FlashInfer helper did not exit; left running")
+                    break
+                logger.warning(
+                    "[JIT prefetch] FlashInfer helper did not stop on SIGTERM; killing it"
+                )
+                sig, deadline = signal.SIGKILL, time.monotonic() + 10.0
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+        proc.stdout.close()
+
+
+def flashinfer_builds_pending() -> bool:
+    """Whether a helper ``start_flashinfer_build`` started is still to be
+    joined (``wait_flashinfer_build``) or stopped (``cancel_flashinfer_build``)."""
+    return bool(_fi_builds)
+
+
+def start_model_builds(model) -> bool:
+    """Start building, in a CPU-only helper, the FlashInfer JIT modules
+    ``model``'s layers build in warmup's first forwards; called once the model
+    is constructed, so the build runs while the weights load. Each provider
+    module that knows of such modules lists them from the model's geometry.
+    Returns False if prefetch is off or there is nothing to build."""
+    if not prefetch_enabled():
+        return False
+    try:
+        from .attention.backends.sparse.glm_kpool.jit_prefetch import (
+            flashinfer_modules as glm_kpool_modules,
+        )
+
+        modules = tuple(glm_kpool_modules(model))
+    except Exception as e:  # noqa: BLE001 - the modules then build in place
+        logger.warning(f"[JIT prefetch] FlashInfer builds not planned: {type(e).__name__}: {e}")
+        return False
+    return bool(modules) and start_flashinfer_build(modules)
 
 
 # ---------------------------------------------------------------------------

@@ -974,6 +974,12 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
+            # With JIT prefetch on (TLLM_JIT_PREFETCH=1), FlashInfer JIT
+            # modules the model's layers build in warmup are built in a
+            # CPU-only helper while the weights load.
+            from ..jit_prefetch import start_model_builds
+            start_model_builds(model)
+
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
                 for module in model.modules())

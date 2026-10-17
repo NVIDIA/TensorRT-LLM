@@ -17,7 +17,10 @@
 ``start_flashinfer_build`` builds the module in a helper with no visible GPU,
 into a fresh FlashInfer workspace; ``wait_flashinfer_build`` joins it. The GPU
 process then loads the module from that workspace without rebuilding it, and
-it samples. Without prefetch, or with the module already built, nothing is
+it samples. The same holds for the TRTLLM-GEN attention launcher (``fmha_gen``)
+GLM-5.3-Flash's native decode builds, started before the sampling module as
+the model loader starts it: GLM's decode call then loads it without a
+rebuild. Without prefetch, or with the module already built, nothing is
 started. A build still running at the join's timeout is stopped together with
 its compilers, and the module is then built in place; so is one whose
 starting process exits. Each case runs in a subprocess: FlashInfer fixes its
@@ -115,7 +118,7 @@ _TIMEOUT_CASE = _SESSION + textwrap.dedent(
     from flashinfer.jit.sampling import gen_sampling_module
 
     started = jp.start_flashinfer_build()
-    sid = jp._fi_build[1].pid
+    sid = jp._fi_builds[0][1].pid
     # Join once the helper's nvcc is running, with a timeout far shorter
     # than the compile.
     compilers = wait_compiling(sid)
@@ -145,7 +148,7 @@ _ORPHAN_CASE = _SESSION + textwrap.dedent(
     from tensorrt_llm._torch import jit_prefetch as jp
 
     assert jp.start_flashinfer_build()
-    sid = jp._fi_build[1].pid
+    sid = jp._fi_builds[0][1].pid
     assert wait_compiling(sid)
     print(json.dumps({"sid": sid}), flush=True)
     """
@@ -158,6 +161,55 @@ _ORPHAN_WATCH = _SESSION + textwrap.dedent(
 
     left = wait_gone(int(sys.argv[1]))
     print(json.dumps({"left": left, "built": gen_sampling_module().is_compiled}))
+    """
+)
+
+
+# FlashInfer's TRTLLM-GEN attention launcher (fmha_gen), started before the
+# sampling module as the model loader starts it, and joined with it: the GPU
+# process then loads it without rebuilding it, and GLM-5.3-Flash's native
+# decode (FlashInfer's TRTLLM-GEN sparse MLA decode) runs on it.
+_FMHA_GEN_CASE = textwrap.dedent(
+    """
+    import json, os, time
+    import torch
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from flashinfer.jit import env as jit_env
+
+    so = jit_env.FLASHINFER_JIT_DIR / "fmha_gen" / "fmha_gen.so"
+    started_model = jp.start_flashinfer_build(("fmha_gen",))
+    started_sampling = jp.start_flashinfer_build()
+    pending = jp.flashinfer_builds_pending()
+    waited = jp.wait_flashinfer_build()
+    mtime = os.stat(so).st_mtime_ns if so.exists() else None
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
+
+    # One decode token of a 16-head, 512-wide latent layer over 64 selected
+    # rows, laid out as GlmKpoolNativeDecode passes them.
+    dev = torch.device("cuda")
+    q = torch.randn(1, 1, 16, 512, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(4, 1, 32, 512, dtype=torch.bfloat16, device=dev)
+    rows = torch.arange(64, dtype=torch.int32, device=dev).view(1, 1, 64)
+    lens = torch.full((1,), 64, dtype=torch.int32, device=dev)
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    counter = torch.zeros(get_trtllm_gen_multi_ctas_kv_counter_bytes(8, 16, sms),
+                          dtype=torch.uint8, device=dev)
+    workspace = torch.zeros(256 << 20, dtype=torch.uint8, device=dev)
+    t = time.time()
+    out = trtllm_batch_decode_with_kv_cache_mla(
+        query=q, kv_cache=kv, workspace_buffer=workspace, qk_nope_head_dim=256,
+        kv_lora_rank=512, qk_rope_head_dim=0, block_tables=rows, seq_lens=lens,
+        max_seq_len=64, sparse_mla_top_k=64, bmm1_scale=1.0, backend="trtllm-gen",
+        sparse_mla_top_k_lens=lens, multi_ctas_kv_counter_buffer=counter)
+    torch.cuda.synchronize()
+    first_call_s = time.time() - t
+    print(json.dumps({"started": [started_model, started_sampling], "pending": pending,
+                      "waited": waited, "built_before_load": mtime is not None,
+                      "rebuilt": mtime is not None and os.stat(so).st_mtime_ns != mtime,
+                      "first_call_s": first_call_s, "finite": bool(torch.isfinite(out).all()),
+                      "again": [jp.start_flashinfer_build(("fmha_gen",)),
+                                jp.flashinfer_builds_pending()]}))
     """
 )
 
@@ -196,6 +248,22 @@ def test_helper_build_is_what_warmup_loads(tmp_path):
     assert r["built_before_load"] and not r["rebuilt"], r
     assert r["load_s"] < 10, r
     assert r["sampled"] == [4]
+
+
+def test_layer_module_built_by_helper_is_what_the_layer_loads(tmp_path):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("FlashInfer's TRTLLM-GEN MLA decode needs SM100 / SM103")
+    r = _run_json(tmp_path, prefetch=True, case=_FMHA_GEN_CASE)
+    # Two helpers (the model's module, then the sampling module), both joined.
+    assert r["started"] == [True, True] and r["pending"] is True, r
+    assert r["waited"] is not None
+    # The helper built the launcher; the decode call loaded it without a
+    # rebuild (a build takes about a minute) and ran on it.
+    assert r["built_before_load"] and not r["rebuilt"], r
+    assert r["first_call_s"] < 30, r
+    assert r["finite"], r
+    # Built and joined: nothing is started again, nothing left to join.
+    assert r["again"] == [False, False], r
 
 
 def test_nothing_started_without_prefetch(tmp_path):

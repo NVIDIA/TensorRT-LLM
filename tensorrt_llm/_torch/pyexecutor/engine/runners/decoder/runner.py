@@ -682,7 +682,8 @@ class DecoderRunner(ScheduledModelRunner):
         # With JIT prefetch on, a CPU-only helper builds the sampling module
         # while the eager warmup forwards below run on the GPU; it is joined
         # (and the module loaded) before CUDA graph capture, the first phase
-        # that can launch the sampling kernels.
+        # that can launch the sampling kernels, together with any helper the
+        # model loader started on a module of the model's layers.
         sampling_in_helper = kv_cache_manager is not None and start_flashinfer_build()
         try:
             with self._warmup_timer.phase(
@@ -700,14 +701,15 @@ class DecoderRunner(ScheduledModelRunner):
                 return
             self._warmup_scheduled_forwards(resource_manager, kv_cache_manager, sampling_in_helper)
         finally:
-            if sampling_in_helper:
+            if kv_cache_manager is not None:
                 # No-op once joined. Warmup raised before the join: stop the
-                # helper rather than wait for it; the module is built in
-                # place on first use.
+                # helpers rather than wait for them; their modules are built
+                # in place on first use.
                 cancel_flashinfer_build()
 
     def _join_sampling_module_build(self) -> None:
-        """Wait for the helper building FlashInfer's sampling module, then load it."""
+        """Wait for the helpers building FlashInfer modules (the sampling
+        module, a module of the model's layers), then load the sampling module."""
         from tensorrt_llm._torch.jit_prefetch import wait_flashinfer_build
 
         with self._warmup_timer.phase(
@@ -720,6 +722,8 @@ class DecoderRunner(ScheduledModelRunner):
         self, resource_manager: ResourceManager, kv_cache_manager, sampling_in_helper: bool
     ) -> None:
         """The warmup phases that run forwards, after the pre-JIT prewarms."""
+        from tensorrt_llm._torch.jit_prefetch import flashinfer_builds_pending
+
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
@@ -730,7 +734,7 @@ class DecoderRunner(ScheduledModelRunner):
                 logger.info(
                     f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
                 )
-                if sampling_in_helper:
+                if sampling_in_helper or flashinfer_builds_pending():
                     self._join_sampling_module_build()
                 return
 
@@ -801,7 +805,7 @@ class DecoderRunner(ScheduledModelRunner):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        if sampling_in_helper:
+        if sampling_in_helper or flashinfer_builds_pending():
             self._join_sampling_module_build()
         # Warm up every graph shape before capturing any graph. Attention
         # kernels can switch implementations at smaller batch sizes and require

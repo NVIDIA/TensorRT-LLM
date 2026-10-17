@@ -16,8 +16,8 @@
 
     jit_prefetch_flashinfer_helper.py <parent_pid> <module> [<module> ...]
 
-Builds each named FlashInfer JIT module (``sampling``) into FlashInfer's own
-JIT cache and prints one JSON line per module to stdout,
+Builds each named FlashInfer JIT module (see ``MODULES``), in order, into
+FlashInfer's own JIT cache and prints one JSON line per module to stdout,
 ``{"module": str, "ok": bool, "s": float, "err": str}``, then exits. Anything
 else printed goes to stderr.
 
@@ -45,6 +45,15 @@ import time
 
 _stop = False
 
+# FlashInfer JIT modules a helper builds, by JitSpec name (the directory of
+# FlashInfer's JIT cache it is built in): (module, generator of its JitSpec).
+# ``fmha_gen`` is FlashInfer's TRTLLM-GEN attention launcher; its generator
+# also downloads the kernel header the build includes.
+MODULES = {
+    "sampling": ("flashinfer.jit.sampling", "gen_sampling_module"),
+    "fmha_gen": ("flashinfer.jit.attention", "gen_trtllm_gen_fmha_module"),
+}
+
 
 def _on_sigterm(signum, frame) -> None:
     global _stop
@@ -62,11 +71,11 @@ def _stop_with_parent(parent: int) -> None:
 
 
 def _gen_spec(name: str):
-    """FlashInfer's ``JitSpec`` for module ``name`` (``flashinfer.jit.<name>``
-    defines ``gen_<name>_module``)."""
+    """FlashInfer's ``JitSpec`` for module ``name`` (see ``MODULES``)."""
     import importlib
 
-    return getattr(importlib.import_module(f"flashinfer.jit.{name}"), f"gen_{name}_module")()
+    module, generator = MODULES[name]
+    return getattr(importlib.import_module(module), generator)()
 
 
 def main() -> int:

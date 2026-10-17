@@ -30,6 +30,10 @@ launchers on ``meta`` tensors built from the template; a scheduled batch adds
 nothing the enumeration has not queued. Pointers that are fresh allocations
 or fixed views (pools, block tables, the query and its head weights) keep the
 alignment they were recorded with.
+
+``flashinfer_modules`` names the FlashInfer JIT module the backend's native
+decode path builds (``fmha_gen``) when the model's geometry selects that path,
+so the prefetcher can build it in a CPU-only helper while the weights load.
 """
 
 from types import SimpleNamespace
@@ -39,6 +43,39 @@ import torch
 
 from .....jit_prefetch import KernelCall, shadow_launches
 from . import kernels
+
+
+def flashinfer_modules(model) -> List[str]:
+    """FlashInfer JIT modules ``model``'s glm_kpool layers build at their first
+    native decode: ``["fmha_gen"]`` if any layer runs small generation batches
+    on FlashInfer's TRTLLM-GEN MLA decode kernel, else none.
+
+    That path takes a BF16 latent cache and a TP-local query geometry the
+    kernel supports (``GlmKpoolSparseAttention.native_decode_geometry``). Its
+    launcher module is an nvcc build of about a minute that each rank pays in
+    warmup's first forward with a generation request, before which only the
+    model's geometry is needed: the layers' head counts and the KV cache
+    dtype, which follows from the model's quantization (FP8 / NVFP4 KV) or
+    else its dtype, as the cache manager derives it.
+    """
+    from .backend import GlmKpoolSparseAttention
+
+    model_config = getattr(model, "model_config", None)
+    if model_config is None:
+        return []
+    quant_mode = model_config.quant_config.quant_mode
+    if quant_mode.has_fp8_kv_cache() or quant_mode.has_fp4_kv_cache():
+        return []
+    if model_config.torch_dtype != torch.bfloat16:
+        return []
+    for mod in model.modules():
+        backend = getattr(mod, "attn_backend", None)
+        if isinstance(backend, GlmKpoolSparseAttention) and backend.native_decode_geometry(
+            backend.num_heads, backend.head_dim
+        ):
+            return ["fmha_gen"]
+    return []
+
 
 # Row counts covering each of Triton's integer classes (1, %16, other). The
 # row count of kpool_update / kpool_expand only sizes the grid.
