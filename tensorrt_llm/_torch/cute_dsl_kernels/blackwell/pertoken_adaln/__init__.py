@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Fused per-token AdaLN modulate (CuTe DSL) for the WAN per-token
-# (temb.ndim == 4) path. The ops take raw bf16 temb chunk views plus the
-# [D] fp32 scale_shift_table rows and fuse the fp32 table+chunk add inline,
-# avoiding materialized fp32 [B, S, D] modulator tensors.
+# Fused per-token AdaLN modulate (CuTe DSL) for Blackwell (SM100). Takes raw
+# bf16 modulation chunk views plus [D] fp32 table rows and fuses the fp32
+# table+chunk add inline, avoiding materialized fp32 [B, S, D] modulator
+# tensors. Used by WAN (temb.ndim == 4) and FLUX.3 (no table split; callers
+# omit the table rows).
 #
 # Custom ops registered under the ``trtllm::`` torch.library namespace.
 

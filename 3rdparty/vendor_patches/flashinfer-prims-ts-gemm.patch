@@ -1,0 +1,45 @@
+diff --git a/api.py b/api.py
+index 7c7fdcaa137bb54634afce4e523053bee066c9f1..b40ae27a10019a007ce6c697ef5d9ef489bd3896 100644
+--- a/api.py
++++ b/api.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -225,7 +226,7 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
+         module = _KERNEL_MODULES.get(config)
+         if module is not None:
+             return module
+-        tag = f"flashinfer.prims_ts.gemm._kernel_{abs(hash(config)):x}"
++        tag = f"{__package__}._kernel_{abs(hash(config)):x}"
+         spec = importlib.util.spec_from_file_location(
+             tag, Path(__file__).with_name("kernel.py")
+         )
+@@ -440,7 +441,7 @@ def _compile(
+         if debug_checks:
+             kernel_name += "_dbg"
+         compiled = build_and_load_cute_dsl_kernel(
+-            "prims_ts_dense_gemm",
++            "trtllm_prims_ts_dense_gemm",
+             kernel_name,
+             compile_kernel,
+             extra_key_files=(
+diff --git a/runner.py b/runner.py
+index d61b7f52ca742a42a76c388b57c722d83b680316..4eabd75e921f4d07b1523800a7f8ccb77dceec24 100644
+--- a/runner.py
++++ b/runner.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/tactics.py b/tactics.py
+index ef314c97b22f189148b4bb42b817de4f537b9321..8367423956a60a27443632d9c2e63aa8eb7a801c 100644
+--- a/tactics.py
++++ b/tactics.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");

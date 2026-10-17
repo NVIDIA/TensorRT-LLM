@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/fp8PerTokenQuant/fp8_per_token_quant.cuh"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <c10/cuda/CUDAGuard.h>
+#include <cmath>
 #include <torch/extension.h>
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
@@ -420,6 +422,61 @@ std::tuple<Tensor, Tensor> vectorized_per_token_fp8_quant(Tensor input)
     return {output, scales};
 }
 
+std::tuple<Tensor, Tensor> warp_per_token_fp8_quant(Tensor input, bool enablePdl, double minScale)
+{
+    CHECK_CONTIGUOUS(input);
+    CHECK_TH_CUDA(input);
+    TORCH_CHECK(
+        std::isfinite(minScale) && static_cast<float>(minScale) > 0.0f && std::isfinite(static_cast<float>(minScale)),
+        "min_scale must be finite and positive in FP32");
+    TORCH_CHECK(input.numel() != 0, "input should not be empty tensor");
+    TORCH_CHECK(input.dim() >= 2, "input dim should be >= 2");
+
+    auto const scalarType = input.scalar_type();
+    TORCH_CHECK(scalarType == torch::kFloat32 || scalarType == torch::kFloat16 || scalarType == torch::kBFloat16,
+        "warp_per_token_fp8_quant: input must be FP16, BF16, or FP32");
+
+    int64_t const hiddenSize = input.size(-1);
+    int64_t const numTokens = input.numel() / hiddenSize;
+    TORCH_CHECK(hiddenSize <= INT_MAX, "hidden_size exceeds INT_MAX");
+    TORCH_CHECK(numTokens <= INT_MAX, "num_tokens exceeds INT_MAX");
+
+    at::cuda::CUDAGuard deviceGuard{static_cast<signed char>(input.get_device())};
+    Tensor output
+        = torch::empty(input.sizes(), torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA).requires_grad(false));
+    std::vector<int64_t> scaleShape;
+    for (int i = 0; i < input.dim() - 1; ++i)
+    {
+        scaleShape.push_back(input.size(i));
+    }
+    scaleShape.push_back(1);
+    Tensor scales = torch::empty(scaleShape, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    auto* outputPtr = get_ptr<void>(output);
+    auto* scalePtr = get_ptr<float>(scales);
+    auto const* props = at::cuda::getCurrentDeviceProperties();
+    bool const usePdl = enablePdl && props->major >= 9 && getEnvEnablePDL();
+    auto launch = [&](auto const* inputPtr)
+    {
+        tensorrt_llm::kernels::invokeWarpPerTokenFP8Quant(outputPtr, scalePtr, inputPtr, static_cast<int>(hiddenSize),
+            numTokens, props->multiProcessorCount, usePdl, static_cast<float>(minScale), stream);
+    };
+    if (scalarType == torch::kBFloat16)
+    {
+        launch(get_ptr<__nv_bfloat16 const>(input));
+    }
+    else if (scalarType == torch::kFloat16)
+    {
+        launch(get_ptr<half const>(input));
+    }
+    else
+    {
+        launch(get_ptr<float const>(input));
+    }
+    return {output, scales};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -437,6 +494,9 @@ TORCH_LIBRARY_FRAGMENT(tensorrt_llm, m)
     m.def("dequantize_e4m3_activation(Tensor activation, Tensor scales) -> Tensor");
     m.def("dequantize_e4m3_per_tensor(Tensor input, Tensor scales) -> Tensor");
     m.def("vectorized_per_token_fp8_quant(Tensor input) -> (Tensor, Tensor)");
+    m.def(
+        "warp_per_token_fp8_quant(Tensor input, bool enable_pdl=True, float min_scale=0.000004359654017857143) -> "
+        "(Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
@@ -451,6 +511,7 @@ TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
     m.impl("dequantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_dequantize_activation);
     m.impl("dequantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_dequantize_per_tensor);
     m.impl("vectorized_per_token_fp8_quant", &tensorrt_llm::torch_ext::vectorized_per_token_fp8_quant);
+    m.impl("warp_per_token_fp8_quant", &tensorrt_llm::torch_ext::warp_per_token_fp8_quant);
 }
 
 static auto dequantize_mxe4m3_host = torch::RegisterOperators(

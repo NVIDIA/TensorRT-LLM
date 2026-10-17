@@ -426,8 +426,8 @@ def fused_pertoken_adaln(
     x: torch.Tensor,
     shift_chunk: torch.Tensor,
     scale_chunk: torch.Tensor,
-    table_shift: torch.Tensor,
-    table_scale: torch.Tensor,
+    table_shift: Optional[torch.Tensor],
+    table_scale: Optional[torch.Tensor],
     eps: float = 1e-6,
     vec: int = DEFAULT_VEC,
 ) -> torch.Tensor:
@@ -440,7 +440,8 @@ def fused_pertoken_adaln(
                                   views of a [B, S, 6, D] temb — strides
                                   (S*6*D, 6*D, 1)); stride(-1)==1, outer
                                   strides divisible by D
-      - table_shift, table_scale: [D] fp32 contiguous rows of scale_shift_table
+      - table_shift, table_scale: optional [D] fp32 contiguous table rows;
+                                  None omits that table addition (e.g. FLUX.3).
       - D: multiple of 256, <= 8192 (unpredicated LDG.128 vectorized loads)
     """
     if x.ndim != 3:
@@ -457,7 +458,20 @@ def fused_pertoken_adaln(
     y = torch.empty_like(x)
     # Scalar placeholders for absent operands (CuTe DSL TVM-FFI backend does
     # not accept None); they generate no code (const_expr isinstance checks).
-    torch_tensors = [y, 0, 0, x, 1, 1, 1, 0, shift_chunk, scale_chunk, table_shift, table_scale]
+    torch_tensors = [
+        y,
+        0,
+        0,
+        x,
+        1,
+        1,
+        1,
+        0,
+        shift_chunk,
+        scale_chunk,
+        0 if table_shift is None else table_shift,
+        0 if table_scale is None else table_scale,
+    ]
     _launch(torch_tensors, D, vec, eps, x.device)
     return y
 
@@ -467,8 +481,8 @@ def _fused_pertoken_adaln_fake(
     x: torch.Tensor,
     shift_chunk: torch.Tensor,
     scale_chunk: torch.Tensor,
-    table_shift: torch.Tensor,
-    table_scale: torch.Tensor,
+    table_shift: Optional[torch.Tensor],
+    table_scale: Optional[torch.Tensor],
     eps: float = 1e-6,
     vec: int = DEFAULT_VEC,
 ) -> torch.Tensor:

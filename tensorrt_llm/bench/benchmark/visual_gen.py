@@ -95,15 +95,15 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 )
 @click.option(
     "--fps",
-    type=int,
-    default=16,
-    help="Frames per second.",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Frames per second. Omit to use the pipeline default.",
 )
 @click.option(
     "--num_frames",
     type=int,
     default=None,
-    help="Total frames to generate. Overrides --seconds (computed as num_frames / fps).",
+    help="Total frames to generate. With --fps, overrides --seconds as num_frames / fps.",
 )
 @click.option(
     "--num_inference_steps",
@@ -128,6 +128,12 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
     type=str,
     default=None,
     help="Negative prompt (concepts to avoid).",
+)
+@click.option(
+    "--image_reference",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a reference image for image-to-image conditioning.",
 )
 @click.option(
     "--max_concurrency",
@@ -180,12 +186,13 @@ def visual_gen_command(
     num_prompts: int,
     size: str,
     seconds: float,
-    fps: int,
+    fps: Optional[int],
     num_frames: Optional[int],
     num_inference_steps: Optional[int],
     guidance_scale: Optional[float],
     seed: int,
     negative_prompt: Optional[str],
+    image_reference: Optional[str],
     max_concurrency: int,
     warmup: int,
     save_result: bool,
@@ -197,7 +204,7 @@ def visual_gen_command(
     """Benchmark VisualGen (image/video generation) models offline."""
     import yaml
 
-    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen import MediaRef, VisualGen, VisualGenParams
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     if prompt is None and prompt_file is None:
@@ -225,11 +232,13 @@ def visual_gen_command(
 
     # Parse generation parameters
     width, height = _parse_size(size)
-    if num_frames is not None:
+    if num_frames is not None and fps is not None:
         seconds = num_frames / fps
         logger.info(f"Computed seconds={seconds:.3f} from num_frames={num_frames} / fps={fps}")
 
-    gen_params_kwargs: dict = {"seed": seed, "frame_rate": float(fps)}
+    gen_params_kwargs: dict = {"seed": seed}
+    if fps is not None:
+        gen_params_kwargs["frame_rate"] = float(fps)
     if height is not None:
         gen_params_kwargs["height"] = height
     if width is not None:
@@ -242,14 +251,18 @@ def visual_gen_command(
         gen_params_kwargs["guidance_scale"] = guidance_scale
     if negative_prompt is not None:
         gen_params_kwargs["negative_prompt"] = negative_prompt
+    if image_reference is not None:
+        gen_params_kwargs["image_reference"] = MediaRef(content=image_reference, format="path")
 
     gen_params = VisualGenParams(**gen_params_kwargs)
 
-    gen_params_for_report = {
-        "size": size,
-        "seconds": seconds,
-        "fps": fps,
-    }
+    gen_params_for_report = {"size": size}
+    if num_frames is not None:
+        gen_params_for_report["num_frames"] = num_frames
+        if fps is not None:
+            gen_params_for_report["seconds"] = seconds
+    if fps is not None:
+        gen_params_for_report["fps"] = fps
     if num_inference_steps is not None:
         gen_params_for_report["num_inference_steps"] = num_inference_steps
     if guidance_scale is not None:
@@ -257,6 +270,8 @@ def visual_gen_command(
     if negative_prompt is not None:
         gen_params_for_report["negative_prompt"] = negative_prompt
     gen_params_for_report["seed"] = seed
+    if image_reference is not None:
+        gen_params_for_report["image_reference"] = image_reference
 
     # Load prompts
     input_requests = load_visual_gen_prompts(prompt, prompt_file, num_prompts)

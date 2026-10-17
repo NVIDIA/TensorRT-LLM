@@ -28,6 +28,11 @@ python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
+# Base FLUX.3: BF16 (omit --variant), FP8 (--variant fp8r), NVFP4 (--variant nvfp4).
+python models/flux3.py --model black-forest-labs/flux-3-image-klein-base --variant nvfp4 --visual_gen_args configs/flux3-images-1gpu.yaml
+python models/flux3.py --model black-forest-labs/flux-3-image-klein-base --variant nvfp4 --visual_gen_args configs/flux3-images-1gpu.yaml --image /path/to/image.png --prompt "Change the yarn color to blue"
+# Distilled FLUX.3: BF16 (omit --variant), FP8 (--variant fp8r), NVFP4 (--variant nvfp4).
+python models/flux3.py --model black-forest-labs/flux-3-image-klein --visual_gen_args configs/flux3-images-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
 python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-1gpu.yaml --image /path/to/image.png
