@@ -44,19 +44,23 @@ def _export(client: ModuleType, with_decode_intervals: bool) -> dict:
     return export
 
 
+def _extra_inputs(cmd: list) -> list:
+    """Every value passed to ``--extra-inputs`` in an aiperf command line."""
+    return [cmd[i + 1] for i, arg in enumerate(cmd[:-1]) if arg == "--extra-inputs"]
+
+
 def test_max_output_tokens_overrides_every_turn(client: ModuleType, monkeypatch):
     monkeypatch.delenv("AGENTX_EXTRA_ARGS", raising=False)
     args = client.parse_args(_BASE_ARGS + ["--max-output-tokens", "1"])
     cmd = client.build_aiperf_cmd(args, "http://h:1", "/tmp/a")
-    i = cmd.index("--extra-inputs")
     # aiperf merges --extra-inputs over each turn's own max_completion_tokens.
-    assert cmd[i + 1] == "max_completion_tokens:1"
+    assert "max_completion_tokens:1" in _extra_inputs(cmd)
 
 
 def test_trace_output_lengths_kept_by_default(client: ModuleType, monkeypatch):
     monkeypatch.delenv("AGENTX_EXTRA_ARGS", raising=False)
     cmd = client.build_aiperf_cmd(client.parse_args(_BASE_ARGS), "http://h:1", "/tmp/a")
-    assert "--extra-inputs" not in cmd
+    assert not any(v.startswith("max_completion_tokens:") for v in _extra_inputs(cmd))
 
 
 def test_max_output_tokens_must_be_positive(client: ModuleType):
