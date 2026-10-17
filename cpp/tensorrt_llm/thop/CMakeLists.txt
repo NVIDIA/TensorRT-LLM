@@ -161,6 +161,13 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
+add_th_common_family(th_common_glm_moe_dsa)
+
+# GLM-MoE-DSA torch ops live in glmMoeDsa/ (kernels in
+# cpp/tensorrt_llm/kernels/glmMoeDsa/); that directory adds them to
+# th_common_glm_moe_dsa with target_sources().
+add_subdirectory(glmMoeDsa)
+
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>
@@ -169,7 +176,8 @@ add_library(
   $<TARGET_OBJECTS:th_common_distributed>
   $<TARGET_OBJECTS:th_common_sequence>
   $<TARGET_OBJECTS:th_common_visual_gen>
-  $<TARGET_OBJECTS:th_common_decoding>)
+  $<TARGET_OBJECTS:th_common_decoding>
+  $<TARGET_OBJECTS:th_common_glm_moe_dsa>)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
