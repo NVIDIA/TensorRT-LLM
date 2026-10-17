@@ -487,16 +487,34 @@ def test_typed_message_keeps_plain_string_parts():
 
 def test_typed_message_keeps_plain_string_parts_beside_media():
     image = {"type": "input_image", "image_url": _IMAGE_URL}
-    msg = _response_output_item_to_chat_completion_message(_user_item("Describe it.", image))
-    assert msg["content"] == [
+    item = _user_item("Describe it.", image)
+    expected = [
         {"type": "text", "text": "Describe it."},
         {"type": "image_url", "image_url": {"url": _IMAGE_URL}},
     ]
+    assert _response_output_item_to_chat_completion_message(item)["content"] == expected
+    assert _messages({"input": [item]}) == [{"role": "user", "content": expected}]
 
 
-def test_typed_message_rejects_a_part_without_text():
+@pytest.mark.parametrize(
+    "part", [42, {"type": "input_video", "video_id": "v-1"}], ids=["non-dict", "unknown-dict"]
+)
+def test_typed_message_rejects_a_part_without_text(part):
     with pytest.raises(ValueError, match="Unsupported message content part"):
-        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, 42))
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, part))
+
+
+def test_replayed_refusal_is_skipped():
+    """A refusal in a replayed assistant turn has no text for the model, and must not fail the request."""
+    item = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "I can't help with that."}],
+    }
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": "assistant",
+        "content": "",
+    }
 
 
 def test_input_image_accepts_the_chat_url_object():

@@ -784,7 +784,9 @@ def _input_content_to_chat_content(
     written. Content that carries media becomes an ordered list of chat parts,
     so the chat parser loads every image and places it where the client put
     it. Content this server cannot serve is rejected rather than dropped,
-    since a model that never sees it still answers as if it had.
+    since a model that never sees it still answers as if it had. The one
+    exception is a refusal, which a replayed assistant turn may carry and
+    which has no text to give the model.
     """
     chat_parts: list[dict[str, Any]] = []
     for part in content:
@@ -800,6 +802,8 @@ def _input_content_to_chat_content(
             chat_parts.append(part)
         elif part.get("text"):
             chat_parts.append({"type": "text", "text": part["text"]})
+        elif "text" not in part and part.get("type") != "refusal":
+            raise ValueError(f"Unsupported message content part: {part!r}")
     if all(part["type"] == "text" for part in chat_parts):
         return "".join(part["text"] for part in chat_parts)
     return chat_parts
