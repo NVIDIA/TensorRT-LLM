@@ -217,7 +217,7 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
             sender_req_id=71,
             instance_name="generation",
             instance_rank=target_info.instance_rank,
-            block_ids_per_layer_groups=target_slice.block_ids_per_layer_groups,
+            block_ids_per_layer_groups=target_slice.pool_slot_ids_per_layer_group,
             unique_rid=991,
         )
         write = sender._build_kv_write_meta(task, receiver)

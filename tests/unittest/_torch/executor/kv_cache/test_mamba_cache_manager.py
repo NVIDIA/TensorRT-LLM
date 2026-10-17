@@ -151,6 +151,7 @@ def _hybrid_model_config():
     )
     return SimpleNamespace(
         pretrained_config=config,
+        mapping=None,
         sparse_attention_config=None,
         get_num_mamba_layers=lambda: 1,
     )
@@ -1094,8 +1095,8 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
     chunk = transceiver._create_chunk(request)
 
-    # No mamba layer group → no STATE entries in block_ids
-    assert all(ids.size == 0 for ids in chunk.block_ids_per_layer_groups)
+    # No mamba layer group means no STATE entries in the pool slot tables.
+    assert all(ids.size == 0 for ids in chunk.pool_slot_ids_per_layer_group)
 
 
 def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
@@ -1134,8 +1135,8 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 
     chunk = transceiver._create_chunk(request)
 
-    # Slot index 7 should be in the STATE group's block_ids
-    assert chunk.block_ids_per_layer_groups[0][0] == 7
+    # Slot index 7 should be in the STATE group's pool slot table.
+    assert chunk.pool_slot_ids_per_layer_group[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 

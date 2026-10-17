@@ -14,14 +14,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import (
-    CacheExtent,
-    CacheKind,
-    Chunk,
-    Delivered,
-    Publishes,
-    TokenRange,
-)
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.native.extent import Attempt, CacheExtent, Chunk, Delivered
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
 from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
 
@@ -46,9 +40,9 @@ def _request(rid: int = 42):
 
 def _extent(rid: int = 42, end: int = TOKENS, is_last: bool = True) -> CacheExtent:
     return CacheExtent(
-        name=rid,
+        request_id=rid,
         local=Chunk(
-            block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+            pool_slot_ids_per_layer_group=[np.array([0, 1], dtype=np.int64)],
             kind_per_layer_group=[CacheKind.PAGED],
             token_range=TokenRange(start=0, end=end),
             is_last=is_last,
@@ -65,8 +59,9 @@ def _sending(rid: int = 42) -> TxSession:
     )
 
 
-def test_the_adapter_satisfies_the_contract():
-    assert isinstance(PeerPublish(_sending(), _request()), Publishes)
+def test_the_adapter_answers_with_an_attempt():
+    handle = PeerPublish(_sending(), _request()).publish(_extent())
+    assert isinstance(handle, Attempt)
 
 
 def test_each_piece_gets_its_own_handle():
@@ -109,7 +104,7 @@ def test_an_extent_for_another_request_is_refused():
     """
     session = _sending()
     extent = _extent()
-    extent.name = 99
+    extent.request_id = 99
 
     with pytest.raises(ValueError, match="bound to 42"):
         PeerPublish(session, _request(42)).publish(extent)

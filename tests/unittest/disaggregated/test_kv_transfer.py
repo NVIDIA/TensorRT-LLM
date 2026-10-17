@@ -55,8 +55,9 @@ except ImportError as e:
 else:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -208,12 +209,12 @@ def test_token_range_invalid_start_gt_end():
 @pytest.mark.cpu_only
 def test_chunk_construction():
     c = Chunk(
-        block_ids_per_layer_groups=[[1, 2, 3]],
+        pool_slot_ids_per_layer_group=[[1, 2, 3]],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=3),
         is_last=True,
     )
-    assert c.block_ids_per_layer_groups == [[1, 2, 3]]
+    assert c.pool_slot_ids_per_layer_group == [[1, 2, 3]]
     assert c.kind_per_layer_group == [CacheKind.PAGED]
     assert c.token_range == TokenRange(start=0, end=3)
     assert c.is_last is True
@@ -221,7 +222,7 @@ def test_chunk_construction():
     # Everything a reader cannot recompute has to be stated.
     with pytest.raises(TypeError):
         Chunk(
-            block_ids_per_layer_groups=[],
+            pool_slot_ids_per_layer_group=[],
             kind_per_layer_group=[],
             token_range=TokenRange(start=0, end=0),
         )
@@ -266,7 +267,7 @@ def _send_prefill_chunks(
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
     whole = Chunk(
-        block_ids_per_layer_groups=all_block_ids,
+        pool_slot_ids_per_layer_group=all_block_ids,
         kind_per_layer_group=[CacheKind.PAGED] * len(all_block_ids),
         token_range=TokenRange(start=0, end=total_blocks * tokens_per_block),
         is_last=True,
@@ -348,7 +349,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     # A full-attention group keeps the whole prompt resident from block 0, so
     # _describe_local describes every block regardless of prefill progress.
     transceiver._describe_local.return_value = Chunk(
-        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.arange(prompt_blocks, dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=prompt_blocks * tokens_per_block),
         is_last=True,
@@ -376,7 +377,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
 
         expected = np.full(prompt_blocks, -1, dtype=np.int64)
         expected[chunk_start:chunk_end] = np.arange(chunk_start, chunk_end)
-        assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
+        assert np.array_equal(kv_slice.pool_slot_ids_per_layer_group[0], expected)
         assert kv_slice.token_range == TokenRange(
             start=chunk_start * tokens_per_block, end=chunk_end * tokens_per_block
         )
@@ -469,7 +470,7 @@ def test_send_prefill_chunks_integrity_check(prepopulated_blocks):
     for lg_idx, original in enumerate(all_block_ids):
         reassembled = []
         for s in slices:
-            reassembled.extend(_valid(s.block_ids_per_layer_groups[lg_idx]).tolist())
+            reassembled.extend(_valid(s.pool_slot_ids_per_layer_group[lg_idx]).tolist())
         assert reassembled == original
 
 
@@ -487,8 +488,8 @@ def test_send_prefill_chunks_unaligned_boundary_splits_on_a_block():
         TokenRange(start=0, end=4 * tokens_per_block),
         TokenRange(start=4 * tokens_per_block, end=8 * tokens_per_block),
     ]
-    assert np.array_equal(_valid(slices[0].block_ids_per_layer_groups[0]), np.arange(4))
-    assert np.array_equal(_valid(slices[1].block_ids_per_layer_groups[0]), np.arange(4, 8))
+    assert np.array_equal(_valid(slices[0].pool_slot_ids_per_layer_group[0]), np.arange(4))
+    assert np.array_equal(_valid(slices[1].pool_slot_ids_per_layer_group[0]), np.arange(4, 8))
 
 
 def test_send_prefill_chunks_multiple_layer_groups():
@@ -497,13 +498,13 @@ def test_send_prefill_chunks_multiple_layer_groups():
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
     # Positional tables: the chunk keeps its own ordinals and blanks the rest.
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], [0, 1, 2, 3, -1, -1, -1, -1])
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], [-1, -1, -1, -1, 4, 5, 6, 7])
+    assert np.array_equal(slices[0].pool_slot_ids_per_layer_group[0], [0, 1, 2, 3, -1, -1, -1, -1])
+    assert np.array_equal(slices[1].pool_slot_ids_per_layer_group[0], [-1, -1, -1, -1, 4, 5, 6, 7])
     assert np.array_equal(
-        slices[0].block_ids_per_layer_groups[1], [100, 101, 102, 103, -1, -1, -1, -1]
+        slices[0].pool_slot_ids_per_layer_group[1], [100, 101, 102, 103, -1, -1, -1, -1]
     )
     assert np.array_equal(
-        slices[1].block_ids_per_layer_groups[1], [-1, -1, -1, -1, 104, 105, 106, 107]
+        slices[1].pool_slot_ids_per_layer_group[1], [-1, -1, -1, -1, 104, 105, 106, 107]
     )
     # Default tokens_per_block is 1, so the token range doubles as block coords.
     assert slices[0].token_range == TokenRange(start=0, end=4)
@@ -911,7 +912,7 @@ def get_block_data(
         return block_datas
 
 
-def get_block_ids_per_layer_groups(
+def get_pool_slot_ids_per_layer_group(
     kv_cache_manager,
     transfer_worker,
     request_id: int,
@@ -1070,7 +1071,7 @@ def add_and_verify_request(
 
     # Get block_ids per layer_group with window_size filtering
     ctx_block_ids_per_groups = [
-        get_block_ids_per_layer_groups(
+        get_pool_slot_ids_per_layer_group(
             ctx_kv_cache_manager,
             ctx_transfer_worker,
             ctx_request.py_request_id,
@@ -1084,7 +1085,7 @@ def add_and_verify_request(
     ]
 
     gen_block_ids_per_groups = [
-        get_block_ids_per_layer_groups(
+        get_pool_slot_ids_per_layer_group(
             gen_kv_cache_manager,
             gen_transfer_worker,
             gen_request.py_request_id,
@@ -1108,7 +1109,7 @@ def add_and_verify_request(
 
         send_kv_slices = [
             Chunk(
-                block_ids_per_layer_groups=ctx_block_ids_per_group,
+                pool_slot_ids_per_layer_group=ctx_block_ids_per_group,
                 kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids_per_group),
                 token_range=TokenRange(start=0, end=ctx_request.prompt_len),
                 is_last=True,
@@ -1127,7 +1128,7 @@ def add_and_verify_request(
         ]
         recv_kv_slices = [
             Chunk(
-                block_ids_per_layer_groups=gen_block_ids_per_group,
+                pool_slot_ids_per_layer_group=gen_block_ids_per_group,
                 kind_per_layer_group=[CacheKind.PAGED] * len(gen_block_ids_per_group),
                 token_range=TokenRange(start=0, end=gen_request.prompt_len),
                 is_last=True,
@@ -1144,7 +1145,7 @@ def add_and_verify_request(
         ]
         recv_kv_slices = [
             Chunk(
-                block_ids_per_layer_groups=gen_block_ids_per_group,
+                pool_slot_ids_per_layer_group=gen_block_ids_per_group,
                 kind_per_layer_group=[CacheKind.PAGED] * len(gen_block_ids_per_group),
                 token_range=TokenRange(start=0, end=gen_request.prompt_len),
                 is_last=True,
@@ -1168,7 +1169,7 @@ def add_and_verify_request(
 
         send_kv_slices = [
             Chunk(
-                block_ids_per_layer_groups=ctx_block_ids_per_group,
+                pool_slot_ids_per_layer_group=ctx_block_ids_per_group,
                 kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids_per_group),
                 token_range=TokenRange(start=0, end=ctx_request.prompt_len),
                 is_last=True,
@@ -1555,10 +1556,10 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         )
 
     # Get block IDs
-    ctx_block_ids = get_block_ids_per_layer_groups(
+    ctx_block_ids = get_pool_slot_ids_per_layer_group(
         ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block, request_len
     )
-    gen_block_ids = get_block_ids_per_layer_groups(
+    gen_block_ids = get_pool_slot_ids_per_layer_group(
         gen_mgr, gen_tw, 1, use_v2, tokens_per_block, request_len
     )
 
@@ -1576,7 +1577,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         # Gen's table masks the reused prefix; the sender pairs the remaining ordinals.
         rx = gen_tw.create_rx_session(gen_request)
         recv_slice = Chunk(
-            block_ids_per_layer_groups=gen_suffix_block_ids,
+            pool_slot_ids_per_layer_group=gen_suffix_block_ids,
             kind_per_layer_group=[CacheKind.PAGED] * len(gen_suffix_block_ids),
             token_range=TokenRange(start=0, end=gen_request.prompt_len),
             is_last=True,
@@ -1586,7 +1587,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         if chunk_size_blocks is None:
             tx.send(
                 Chunk(
-                    block_ids_per_layer_groups=ctx_block_ids,
+                    pool_slot_ids_per_layer_group=ctx_block_ids,
                     kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids),
                     token_range=TokenRange(start=0, end=ctx_request.prompt_len),
                     is_last=True,
@@ -1730,7 +1731,7 @@ def test_session_cancel_after_send():
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = Chunk(
-            block_ids_per_layer_groups=block_ids_per_groups,
+            pool_slot_ids_per_layer_group=block_ids_per_groups,
             kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
             token_range=TokenRange(start=0, end=ctx_request.prompt_len),
             is_last=True,
@@ -1814,13 +1815,13 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
             )
 
     ctx_block_ids = [
-        get_block_ids_per_layer_groups(
+        get_pool_slot_ids_per_layer_group(
             mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block, request_len
         )
         for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
     ]
     gen_block_ids = [
-        get_block_ids_per_layer_groups(
+        get_pool_slot_ids_per_layer_group(
             mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block, request_len
         )
         for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
@@ -1988,7 +1989,7 @@ def test_session_has_transferring_tasks_false():
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = Chunk(
-            block_ids_per_layer_groups=block_ids_per_groups,
+            pool_slot_ids_per_layer_group=block_ids_per_groups,
             kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
             token_range=TokenRange(start=0, end=ctx_request.prompt_len),
             is_last=True,
@@ -2073,7 +2074,9 @@ def test_incompatible_peer_fails_only_affected_requests(
     # empty per-layer-group block lists suffice (no KV sequence needed).
     page_table = gen_tw._rank_info.page_table
     empty_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        pool_slot_ids_per_layer_group=[
+            np.array([], dtype=np.int64) for _ in page_table.layer_groups
+        ],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=0),
         is_last=True,
@@ -2163,7 +2166,7 @@ def add_and_verify_pipelined_request(
     ]
     for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids, strict=True):
         full_slice = Chunk(
-            block_ids_per_layer_groups=block_ids_per_groups,
+            pool_slot_ids_per_layer_group=block_ids_per_groups,
             kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
             token_range=TokenRange(start=0, end=ctx_info["gen_request"].prompt_len),
             is_last=True,
