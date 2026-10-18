@@ -30,7 +30,7 @@ By NVIDIA TensorRT LLM Team
 
 The KV cache is the largest and most contended resource in an LLM inference server. It decides how many requests fit on a GPU, how much of a conversation can be reused across turns, and how long a million-token context takes to prefill. Everything else — scheduling, batching, attention kernels, disaggregated serving — negotiates with it.
 
-TensorRT LLM's original KV cache manager, which we will call V1 throughout this post, has served that role since the project began and remains the default for most models today. But over the past two years the shape of the models it manages changed faster than the shape of the manager could follow. Sliding-window attention arrived, then *variable* sliding-window attention (VSWA) where the window alternates layer by layer. State-space and Mamba layers arrived, whose "cache" is not a growing list of tokens at all but a fixed-size recurrent state. Sparse attention arrived, attaching auxiliary per-layer buffers with their own shapes and dtypes. Each was accommodated, and each accommodation left a mark.
+TensorRT LLM's original KV cache manager, which we will call V1 throughout this post, served that role from the start and still runs behind a good deal of production traffic. But over the past two years the shape of the models it manages changed faster than the shape of the manager could follow. Sliding-window attention arrived, then *variable* sliding-window attention (VSWA) where the window alternates layer by layer. State-space and Mamba layers arrived, whose "cache" is not a growing list of tokens at all but a fixed-size recurrent state. Sparse attention arrived, attaching auxiliary per-layer buffers with their own shapes and dtypes. Each was accommodated, and each accommodation left a mark.
 
 KVCacheManagerV2 (KVCM2) is a ground-up redesign built around a single question: *which buffers, across which layers, live and die together?* Answering that question explicitly — instead of assuming the answer is "all of them" — is what lets one manager serve full attention, sliding-window attention, and recurrent state with a single prefix-reuse tree, a narrow public API, and first-class GPU/host/disk storage.
 
@@ -63,7 +63,7 @@ Packing many layers into one block is the right instinct — managing each layer
 
 </div>
 
-Gemma4 hybrid attention and sparse-attention models are routed to V2 unconditionally for this reason: their per-layer buffer layouts cannot be represented in V1's unified pool at all.
+This is why the architectures that arrived most recently need V2. Hybrid Mamba, linear attention and sparse attention each want per-layer buffers and retention rules that a unified pool cannot express. Where V1 can run them at all it does so through a separate compatibility manager with prefix reuse switched off model-wide, and for per-layer buffer layouts it cannot represent them even that far.
 
 ### Sliding Windows as Parallel Managers
 
@@ -308,20 +308,18 @@ That is the extension pattern in general. A new architecture arrives as a subcla
 
 ## Current State
 
-KVCM2 is the default KV cache manager for a growing set of models, each for a reason that traces directly back to one of V1's structural limits. Users can select explicitly through `kv_cache_config.use_kv_cache_manager_v2`, which defaults to `auto`.
+KVCM2 is now the default KV cache manager. `kv_cache_config.use_kv_cache_manager_v2` defaults to `True`, and V1 is reached only by asking for it or by tripping one of the few feature combinations V2 does not yet serve.
 
 <div align="center">
 
-| Model | Why V2 by default |
+| Architecture | Why it needs V2 |
 | :--- | :--- |
-| Hybrid Mamba (Nemotron-H, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
-| DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
-| GPT-OSS | Sliding window on every other layer (VSWA); pools sized independently |
-| Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers |
+| Hybrid recurrent and linear attention (Nemotron-H, Qwen3-Next, Kimi K3) | Attention KV and recurrent state must be sized, reused and evicted together; on V1 they are separate managers and prefix reuse is off model-wide |
+| Sparse attention (DeepSeek-V4) | Auxiliary per-layer buffers whose layouts V1's unified pool cannot represent |
+| VSWA (GPT-OSS, Gemma3, Gemma4) | Sliding-window and full-attention pools must be sized independently |
 
 </div>
 
-Gemma4 hybrid attention and sparse-attention models route to V2 unconditionally, because their per-layer buffer layouts cannot be represented in V1's unified pool at all.
 
 <div align="center">
 
@@ -346,14 +344,14 @@ Gemma4 hybrid attention and sparse-attention models route to V2 unconditionally,
 
 </div>
 
-V1 remains the default everywhere else, and it is not a legacy path. It is a mature, heavily tested implementation, and one runtime feature still keeps a model on it: beam search. `max_beam_width > 1` is the sole entry on V2's incompatible-feature list; everything else that once forced a fallback, including the KV connector, is now served on V2. The routing logic reflects the distinction honestly — for models where V2 is structurally required, requesting beam search raises rather than silently downgrading; for a plain model it warns and falls back to V1.
+V1 is not a legacy path. It is a mature, heavily tested implementation that remains the fallback, and one runtime feature still sends a model to it: beam search. `max_beam_width > 1` is the sole entry on V2's incompatible-feature list; everything else that once forced a fallback, including the KV connector, is now served on V2. The routing logic reflects the distinction honestly — for models where V2 is structurally required, requesting beam search raises rather than silently downgrading; for a plain model it warns and falls back to V1.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog31_e2e_throughput.png" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6: End-to-end serving impact on models where V2 is the default.</em></sub></p>
+<p align="center"><sub><em>Figure 6: End-to-end serving impact on models that exercise V2's structural advantages.</em></sub></p>
 
 <!-- FIGURE BRIEF (not rendered) — Fig 6, NUMBERS STILL NEEDED. Throughput/latency comparison, two
 panels. (a) GPT-OSS (VSWA): V1 vs V2, isolating the benefit of independently sized sliding-window and
@@ -369,8 +367,7 @@ KVCM2 spent its first year as pure Python. That was deliberate: V1 being C++ was
 - **KV cache compression**: The cold-page codec interface is complete and a custom codec already works against it. Because encode and decode are stream-ordered GPU work, compression costs a little GPU time on the migration path rather than host time, and buys substantially more effective host- and disk-tier capacity. It is the next thing to reach users.
 - **Smarter rebalancing**: The ratio-driven quota adjustment currently samples the live batch. Feeding it workload-level signals such as conversation structure and expected reuse should let it converge faster and overshoot less.
 - **Beam search**: Multi-beam support is designed for throughout — the data structures are beam-indexed — but the commit path is not yet complete.
-- **Retiring V1**: With the key models already on V2, the remaining families are being migrated one at a time, each behind accuracy and performance validation. Once that finishes, V1 goes away and the adapter stops needing to speak two dialects.
-- **Broader default rollout**: Each model family moved to V2 by default is preceded by accuracy and performance validation, and the list will keep growing.
+- **Retiring V1**: With V2 the default, V1 survives as the fallback for the feature combinations V2 does not yet serve. Once beam search lands, that last reason goes away and so does V1.
 
 ## Acknowledgment
 
