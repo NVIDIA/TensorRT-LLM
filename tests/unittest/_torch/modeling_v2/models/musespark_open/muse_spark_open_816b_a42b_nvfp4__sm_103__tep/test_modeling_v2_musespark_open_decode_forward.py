@@ -184,6 +184,9 @@ except ImportError:  # pragma: no cover - the test needs MPI ranks
     MPI = None
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
+    attention as target_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
     dispatch,
     modeling,
 )
@@ -894,7 +897,7 @@ def env():
     weights, open_format = _checkpoint_weights(checkpoint)
     # Module-level entry points, counted for every arm (the call sites look them up by name).
     patched = [
-        (modeling, "paged_decode_attention", "paged_decode_attention"),
+        (target_attention, "paged_decode_attention", "paged_decode_attention"),
         (projection_gathers._unpool, "unpool_gather_boundary", "unpool_gather_boundary"),
         (projection_gathers._pool, "pool_gather_rmsnorm_fp4quant", "pool_gather_fp4quant"),
         (dense_gemms, "dense_gemm", "dense_gemm"),

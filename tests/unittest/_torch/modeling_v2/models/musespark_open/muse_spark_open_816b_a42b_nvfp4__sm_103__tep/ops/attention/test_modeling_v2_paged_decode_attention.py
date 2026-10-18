@@ -34,9 +34,6 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
     attention as target_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
-    modeling as target_modeling,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.attention.paged_decode_attention import (  # noqa: E501
     HEAD_DIM,
     window_splits,
@@ -643,7 +640,7 @@ def test_the_adopted_sliding_layer_runs_the_op_on_a_decode_step(plan, rows, ctx,
         with validating(op):
             return op(*args)
 
-    monkeypatch.setattr(target_modeling, "paged_decode_attention", counted)
+    monkeypatch.setattr(target_attention, "paged_decode_attention", counted)
     qkv = _qkv(rows, seed=ctx)
     with _sequence(rows, ctx, seed=ctx) as md:
         pool, table = _cache_view(md, SLIDING_LAYER)
@@ -677,7 +674,7 @@ def test_the_adopted_sliding_layer_runs_the_op_on_a_decode_step(plan, rows, ctx,
 def test_a_step_the_op_does_not_fit_runs_the_builtin(monkeypatch):
     """Nine rows: the built-in attention, the same bits as with no plan."""
     attention = _attention_module(SLIDING_LAYER)
-    monkeypatch.setattr(target_modeling, "paged_decode_attention", None)
+    monkeypatch.setattr(target_attention, "paged_decode_attention", None)
     rows, ctx = 9, 5000
     qkv = _qkv(rows, seed=1)
     with _sequence(rows, ctx, seed=1) as md:

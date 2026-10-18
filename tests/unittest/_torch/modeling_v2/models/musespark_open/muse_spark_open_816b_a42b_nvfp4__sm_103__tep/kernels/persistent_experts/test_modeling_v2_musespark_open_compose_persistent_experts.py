@@ -51,6 +51,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 def _load_decode_forward_harness():
     path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
         "test_modeling_v2_musespark_open_decode_forward.py",
     )
     spec = importlib.util.spec_from_file_location("_decode_forward_harness", path)

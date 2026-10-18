@@ -216,6 +216,9 @@ except ImportError:  # pragma: no cover - the test needs MPI ranks
     MPI = None
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
+    attention as target_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
     dispatch,
     modeling,
 )
@@ -1635,7 +1638,8 @@ _FINALIZE_KERNEL = re.compile(r"[Ff]inalize")
 #: exited. It is not listed here: its key-less CTAs may exit before their wait (an exit
 #: that depends on the ``rows`` parameter, which the SASS walker cannot bound), so its own
 #: SASS does not pass the wait-before-exit audit. ``prep_fold``'s ``full_attention_prep_fold`` kernel
-#: (``FullAttnSplitKvFoldKernel``, a class of its own, so its symbol is not the op's build's) is
+#: (``FullAttnSplitKvFoldKernel``, a class of its own, so its symbol is not the op's build's;
+#: the DSL cuts that symbol inside the class name, ``FullAttnSplitKvFo``: ``_short_name``) is
 #: entered from the QKV projection, which triggers early: every one of its threads waits
 #: before it exits, and it is listed.
 WAIT_BEFORE_EXIT = re.compile(
@@ -1645,7 +1649,8 @@ WAIT_BEFORE_EXIT = re.compile(
     r"|nvjet_sm103_tst_64x8_64x16_4x1_v_bz_splitK_TNT"
     r"|_ZN8cublasLt19splitKreduce_kernelILi32ELi16Eif13__nv_bfloat16fS1_Lb0EfS1"
     r"|PostAttnConsumerKernel|_preattn_prep_append_kernel|_attention_norm_gate_pdl_kernel"
-    r"|_combine_norm_gate_pdl_kernel|FullAttnSplitKvFoldKernel|PoolDirectRouteKernel)$"
+    r"|_combine_norm_gate_pdl_kernel|FullAttnSplitKvFoldKernel|FullAttnSplitKvFo"
+    r"|PoolDirectRouteKernel)$"
 )
 #: Kernels (short names) whose SASS never executes ``griddepcontrol.launch_dependents``
 #: (``PREEXIT``): a kernel entered through a programmatic edge from one of them launches
@@ -1720,9 +1725,18 @@ def _prepare_stream_aliased(model) -> bool:
 
 
 def _short_name(raw: str) -> str:
-    """A kernel's class name (``...Kernel``) when its symbol carries one, else its symbol's head."""
+    """A kernel's class name (``...Kernel``) when its symbol carries one, else its symbol's head.
+
+    The CuTe DSL cuts a long symbol (module path, then class) at a fixed length: when the cut
+    falls inside the class name, that name's head ends the symbol, before the ``_<n>`` suffix.
+    """
     camel = re.findall(r"[A-Z][A-Za-z0-9]*Kernel", raw)
-    return camel[-1] if camel else raw[:72]
+    if camel:
+        return camel[-1]
+    cut = re.search(r"([A-Z][A-Za-z0-9]*)_\d+$", raw)
+    if raw.startswith("kernel_cutlass_kernel_") and cut:
+        return cut.group(1)
+    return raw[:72]
 
 
 def _graph_nodes_and_edges(graph):
@@ -2934,7 +2948,7 @@ def env():
     tokens = torch.randint(0, embed.get_shape()[0], (TOKEN_POOL,), generator=generator).tolist()
     e.table = torch.cat([embed[t : t + 1] for t in tokens]).to("cuda", torch.bfloat16)
     patched = [
-        (modeling, "paged_decode_attention", "paged_decode_attention"),
+        (target_attention, "paged_decode_attention", "paged_decode_attention"),
         (projection_gathers._unpool, "unpool_gather_boundary", "unpool_gather_boundary"),
         (projection_gathers._pool, "pool_gather_rmsnorm_fp4quant", "pool_gather_fp4quant"),
         (dense_gemms, "dense_gemm", "dense_gemm"),
