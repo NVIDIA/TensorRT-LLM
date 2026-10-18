@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import bisect
 import contextlib
 import os
@@ -159,6 +161,10 @@ class CUDAGraphRunner:
     multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
+    # ``(input_ids ptr, position_ids ptr, tokens)`` of the inputs a step-input
+    # stager already wrote into the static inputs for the next replay, or None
+    # (the replay copies them).
+    staged_static_inputs = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -781,7 +787,14 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        staged = self.staged_static_inputs
+        if staged is not None:
+            self.staged_static_inputs = None
+        committed = staged is not None and staged == (
+            input_ids.data_ptr(), current_inputs["position_ids"].data_ptr(),
+            seqlen)
+        if not committed:
+            static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -828,7 +841,8 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            if not committed:
+                static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
