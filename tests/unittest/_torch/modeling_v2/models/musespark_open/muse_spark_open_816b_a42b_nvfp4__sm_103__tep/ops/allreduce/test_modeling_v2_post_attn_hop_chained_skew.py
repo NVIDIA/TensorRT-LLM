@@ -37,8 +37,10 @@ except Exception:  # noqa: BLE001 - no MPI launch means no group
     COMM, WORLD, RANK = None, 1, 0
 
 pytestmark = pytest.mark.skipif(
-    WORLD != 8 or not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="needs 8 MPI ranks on two four-GPU GB300 nodes",
+    WORLD != 8
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="needs 8 MPI ranks on two four-GPU sm_103 or sm_107 nodes",
 )
 
 LAYERS = 16

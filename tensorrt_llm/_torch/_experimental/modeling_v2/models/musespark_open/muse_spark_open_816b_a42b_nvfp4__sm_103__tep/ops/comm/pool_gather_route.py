@@ -683,13 +683,14 @@ if _AVAILABLE:
             trigger: int = 0,
             stamps: int = 0,
         ):
+            major, minor = torch.cuda.get_device_capability()
             super().__init__(
                 dtype=cutlass.BFloat16,
                 H=HIDDEN,
                 block_size=BLOCK,
                 output_swizzled=False,
                 is_fp16=False,
-                sm_version=103,
+                sm_version=10 * major + minor,
                 scale_format="e4m3",
             )
             if not (

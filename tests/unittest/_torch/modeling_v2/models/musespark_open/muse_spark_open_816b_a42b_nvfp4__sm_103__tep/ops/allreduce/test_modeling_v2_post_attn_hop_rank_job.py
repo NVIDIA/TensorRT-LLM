@@ -60,13 +60,14 @@ def _sm103_devices() -> list:
     return [
         dev
         for index, dev in enumerate(ids)
-        if index < torch.cuda.device_count() and torch.cuda.get_device_capability(index) == (10, 3)
+        if index < torch.cuda.device_count()
+        and torch.cuda.get_device_capability(index) in ((10, 3), (10, 7))
     ]
 
 
 pytestmark = pytest.mark.skipif(
     len(_sm103_devices()) < WORLD_SIZE,
-    reason=f"the post_attn_hop collective is certified on {WORLD_SIZE} GB300 GPUs",
+    reason=f"the post_attn_hop collective needs {WORLD_SIZE} sm_103 or sm_107 GPUs",
 )
 
 

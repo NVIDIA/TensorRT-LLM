@@ -15,9 +15,10 @@ read off the flat config.
 
 The target claims every tensor-parallel size of its layout. Which fast paths a
 deployment runs is the target's own decision at construction
-(``dispatch.compose``): the composition of its tensor-parallel size when the
-GPU topology and the speculative decoding mode are the ones the compositions
-are written for, and the built-in forward through the target otherwise. So
+(``dispatch.compose``): the composition of its GPU architecture and
+tensor-parallel size when the GPU topology and the speculative decoding mode
+are the ones the compositions are written for, and the built-in forward
+through the target otherwise. So
 ``route`` reads neither the speculative-decoding config nor the GPUs per node
 (launcher state: the visible devices, or the tensor-parallel size under Ray),
 and a deployment the target serves without fast paths still lands here.
@@ -35,8 +36,10 @@ from typing import Any, Optional, Tuple
 
 from ..._router_index import NoTarget
 
-# The one GPU architecture the target is written for.
-_SM = (10, 3)
+# The GPU architectures the target is routed on: sm103 and sm107. Each has its own
+# compositions (``modeling.TARGET_PATHS``); the sm107 ones need the built-in fused
+# kernels opted in (``dispatch.SM107_FUSED_KERNELS``).
+_SMS = ((10, 3), (10, 7))
 
 # The checkpoint's config shape, read off the flat config; see the gpt_oss routing
 # module for what shape-sniffing does and does not pin. The attention fields fix
@@ -93,16 +96,16 @@ def route(
     # and the shape does not match.
     shape = tuple(getattr(pretrained_config, name, None) for name in _SHAPE_FIELDS)
 
-    # Muse-Spark-Open-816B-A42B on sm103, tensor-parallel attention and
+    # Muse-Spark-Open-816B-A42B on sm103 or sm107, tensor-parallel attention and
     # expert-parallel MoE over the same ranks.
-    served = compute_capability == _SM and shape == _SHAPE and _tep(mapping)
+    served = tuple(compute_capability) in _SMS and shape == _SHAPE and _tep(mapping)
     if not served:
         raise NoTarget(
             f"compute capability {compute_capability}, "
             f"config shape {shape}, parallel ws={mapping.world_size} tp={mapping.tp_size} "
             f"pp={mapping.pp_size} cp={mapping.cp_size} moe_ep={mapping.moe_ep_size} "
             f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp}; the one "
-            "musespark_open target is Muse-Spark-Open-816B-A42B on sm103, attention "
+            "musespark_open target is Muse-Spark-Open-816B-A42B on sm103 or sm107, attention "
             "tensor-parallel and the experts expert-parallel over the same ranks at any size "
             "(moe_tp 1, pp 1, cp 1, no attention DP)"
         )

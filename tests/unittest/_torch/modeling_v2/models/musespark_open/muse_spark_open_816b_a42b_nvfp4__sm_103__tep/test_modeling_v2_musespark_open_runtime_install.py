@@ -161,15 +161,15 @@ def build(monkeypatch):
     return _build
 
 
-@pytest.mark.parametrize("tp", sorted(modeling.TARGET_PATHS))
-def test_every_composition_serves_both_executor_paths(tp):
-    served = modeling.TARGET_PATHS[tp].served
+@pytest.mark.parametrize("key", sorted(modeling.TARGET_PATHS))
+def test_every_composition_serves_both_executor_paths(key):
+    served = modeling.TARGET_PATHS[key].served
     assert {"deferred_input_prep", "sampler_store"} <= served
 
 
-@pytest.mark.parametrize("tp", sorted(modeling.TARGET_PATHS))
-def test_the_shell_builds_its_hooks_after_compose_and_before_adopt(build, tp):
-    shell = build(dispatch.Plan(modeling.TARGET_PATHS[tp].served))
+@pytest.mark.parametrize("key", sorted(modeling.TARGET_PATHS))
+def test_the_shell_builds_its_hooks_after_compose_and_before_adopt(build, key):
+    shell = build(dispatch.Plan(modeling.TARGET_PATHS[key].served))
     assert build.events == ["built-in model", ("hooks", 1), "adopt"]
     assert shell.runtime_hooks is build.hooks
     assert runtime_hooks_of(shell) is build.hooks

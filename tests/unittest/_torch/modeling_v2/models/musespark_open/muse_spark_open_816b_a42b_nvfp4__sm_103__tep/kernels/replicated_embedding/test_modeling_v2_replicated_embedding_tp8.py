@@ -70,8 +70,8 @@ def test_replicated_embedding_tp8_equals_the_sharded_embedding():
         pytest.skip("Requires MUSESPARK_REFERENCE_CKPT")
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Requires GB300")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Requires sm_103 or sm_107")
     mapping = Mapping(world_size=8, tp_size=8, rank=rank, gpus_per_node=4)
     with torch.device("cuda"):
         embedding = Embedding(

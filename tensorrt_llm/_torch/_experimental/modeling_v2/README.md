@@ -121,7 +121,7 @@ The targets, as `models/<family>/<target>`:
   low-latency decode with attention tensor-parallel and the experts expert-parallel over the same
   ranks, at four ranks on one node (TEP4) and eight ranks on two nodes (TEP8). Each fast path's
   host code is a package under the target's `kernels/<path>/` and its op entries are under `ops/`.
-  `TARGET_PATHS` in `modeling.py` names the paths each tensor-parallel size runs, `dispatch.py`
+  `TARGET_PATHS` in `modeling.py` names the paths each (SM, tensor-parallel size) runs, `dispatch.py`
   selects them at construction and `layers.py` composes them into the built-in decoder layers.
 * `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`
 

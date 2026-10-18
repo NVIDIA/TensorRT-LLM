@@ -40,7 +40,7 @@ instruction: then it waits for the attention hop in full (the fork's edge), and 
 programmatic join into this kernel resolves only when the twin has completed. Checked on
 the twin's PTX and SASS for every row count and both warp counts it is launched with.
 
-Needs one GB300 (sm_103) GPU, the CuTe DSL and ``cuobjdump``; skips otherwise.
+Needs one sm_103 or sm_107 GPU, the CuTe DSL and ``cuobjdump``; skips otherwise.
 """
 
 import glob
@@ -71,10 +71,10 @@ from _sass_wait_audit import audit, parse  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 3)
+    or torch.cuda.get_device_capability() not in ((10, 3), (10, 7))
     or not direct.available()
     or shutil.which("cuobjdump") is None,
-    reason="needs a GB300 (sm_103) GPU, the CuTe DSL and cuobjdump",
+    reason="needs an sm_103 or sm_107 GPU, the CuTe DSL and cuobjdump",
 )
 
 #: The CTA: 4 quantizing warps, then 4 routing warps.

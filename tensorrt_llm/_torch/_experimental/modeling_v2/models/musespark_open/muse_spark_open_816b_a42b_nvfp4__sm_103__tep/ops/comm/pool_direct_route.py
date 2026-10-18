@@ -891,8 +891,8 @@ class PoolDirectWorkspace:
             refusal = (
                 "CuTe DSL, flashinfer's RMSNormFP4QuantKernel or the direct poll is unavailable"
             )
-        elif torch.cuda.get_device_capability(self.device) != (10, 3):
-            refusal = "the direct routed pool kernel is validated on SM103 only"
+        elif torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+            refusal = "the direct routed pool kernel runs on SM103 or SM107 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):

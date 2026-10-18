@@ -32,8 +32,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="SM103 only",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="SM103 or SM107 only",
 )
 
 #: The checkpoint's metap multiplier and output soft cap.
@@ -511,7 +511,7 @@ def test_every_lm_head_producer_publishes_each_word_once(tmp_path):
         _WAITER_CPP,
         cuda_sources=_WAITER_CUDA,
         functions=["poll", "wait_started", "set_done"],
-        extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a"],
+        extra_cuda_cflags=["-O3", hs._gencode()],
         build_directory=str(tmp_path),
     )
     rows, hidden = 8, 8192

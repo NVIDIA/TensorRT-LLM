@@ -29,7 +29,7 @@ def test_every_fast_path_carries_ids_and_no_id_is_shared_but_the_staging_pair():
 
 
 def test_the_tp8_composition_carries_the_served_ids():
-    ids = plans.ids_of(dispatch.Plan(modeling.TARGET_PATHS[8].served))
+    ids = plans.ids_of(dispatch.Plan(modeling.TARGET_PATHS[103, 8].served))
     # 47 served ids, and the two the served ones imply (the dense GEMMs, the split sampler).
     assert len(ids) == 49 and {"dense_gemms", "split_sampler"} <= ids
 

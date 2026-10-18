@@ -41,7 +41,7 @@ A change that moves any access across a wait, or that adds a pre-wait load,
 fails here and needs its own argument (and this test's update). A new kernel
 that reads ``logits_local`` behind the router-fork join belongs in this file too.
 
-Needs one GB300 (sm_103) GPU, the CuTe DSL and ``cuobjdump``; skips otherwise.
+Needs one sm_103 or sm_107 GPU, the CuTe DSL and ``cuobjdump``; skips otherwise.
 """
 
 import glob
@@ -65,10 +65,10 @@ import _sass_walk as sass_walk  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 3)
+    or torch.cuda.get_device_capability() not in ((10, 3), (10, 7))
     or not route.available()
     or shutil.which("cuobjdump") is None,
-    reason="needs a GB300 (sm_103) GPU, the CuTe DSL and cuobjdump",
+    reason="needs an sm_103 or sm_107 GPU, the CuTe DSL and cuobjdump",
 )
 
 #: The CTA: 4 quantizing warps, then 4 routing warps (``QUANT_WARPS``, ``ROUTE_THREADS``).

@@ -286,8 +286,8 @@ class FullAttnSplitKv(OpWrapper):
     stride and 16-byte aligned rows; a contiguous FP8 E4M3 pool ``[blocks, 2, 32, 64]``; an
     int32 ``[2, pages]`` block table with a unit last stride and at most 256 pages per split;
     int32 ``seq_lens``; an fp32 scale; ``1 <= num_splits <= 512``; partial buffers of the
-    shapes above; every tensor 16-byte aligned on one sm_103 device. The first call per device
-    and build compiles the kernel, which must not happen inside a CUDA-graph capture.
+    shapes above; every tensor 16-byte aligned on one sm_103 or sm_107 device. The first call
+    per device and build compiles the kernel, which must not happen inside a CUDA-graph capture.
 
     Not certified: more than one sequence per call, other head counts or widths, other page
     sizes, sliding windows.
@@ -403,10 +403,11 @@ class FullAttnSplitKv(OpWrapper):
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
-            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
+            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
         ):
             raise ValueError(
-                "full_attention_split_kv takes, on one sm_103 device and 16-byte aligned: BF16 qkv "
+                "full_attention_split_kv takes, on one sm_103 or sm_107 device and 16-byte aligned: "
+                "BF16 qkv "
                 f"[1..{MAX_ROWS}, {QKV_WIDTH}] (unit last stride, rows a multiple of 8 elements "
                 f"apart), a contiguous FP8 E4M3 pool [blocks, {KV_HEADS}, {PAGE}, {HEAD_DIM}], an "
                 f"int32 [2, pages] block table (unit last stride, at most {MAX_CTA_PAGES} pages "

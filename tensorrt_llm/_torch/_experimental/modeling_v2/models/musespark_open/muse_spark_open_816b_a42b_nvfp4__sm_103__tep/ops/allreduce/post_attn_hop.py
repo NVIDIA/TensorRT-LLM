@@ -833,8 +833,8 @@ class PostAttnHopWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) != (10, 3):
-                raise RuntimeError("the fused hop is validated on SM103 only")
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the fused hop runs on SM103 or SM107 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, WORKSPACE_BYTES, mapping, use_fabric
@@ -1589,8 +1589,8 @@ class PostAttnDirectWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) != (10, 3):
-                raise RuntimeError("the direct hop is validated on SM103 only")
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the direct hop runs on SM103 or SM107 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, WORKSPACE_BYTES, mapping, use_fabric

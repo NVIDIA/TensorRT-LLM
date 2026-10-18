@@ -849,8 +849,8 @@ class FinalizeTransportWorkspace:
                 raise RuntimeError(f"expected an open FinalizeIpcWorkspace, got {type(legacy)!r}")
             if not legacy._use_mnnvl or legacy._ranks != RANKS:
                 raise RuntimeError("the wrapped workspace is not the TP8 fabric one")
-            if torch.cuda.get_device_capability(self.device) != (10, 3):
-                raise RuntimeError("the finalize transport is validated on SM103 only")
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the finalize transport runs on SM103 or SM107 only")
             self._handle = _make_mnnvl_mcast_buffer(self._comm, WORKSPACE_BYTES, mapping, True)
             words = WORKSPACE_BYTES // 4
             self._uc = [

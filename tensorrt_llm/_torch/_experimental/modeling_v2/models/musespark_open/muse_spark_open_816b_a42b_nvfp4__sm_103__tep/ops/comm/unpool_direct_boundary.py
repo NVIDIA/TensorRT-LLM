@@ -591,8 +591,8 @@ class UnpoolDirectWorkspace:
         refusal: Optional[str] = None
         if not _AVAILABLE:
             refusal = "CuTe DSL or the built-in cluster boundary is unavailable"
-        elif torch.cuda.get_device_capability(self.device) != (10, 3):
-            refusal = "the direct unpool boundary is validated on SM103 only"
+        elif torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+            refusal = "the direct unpool boundary runs on SM103 or SM107 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):

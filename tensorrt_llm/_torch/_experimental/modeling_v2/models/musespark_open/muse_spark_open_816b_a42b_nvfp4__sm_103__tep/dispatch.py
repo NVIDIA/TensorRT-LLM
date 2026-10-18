@@ -4,12 +4,13 @@
 
 ``FAST_PATHS`` names every fast path of the target and the fast paths each one
 builds on (``depends_on``). A composition (``TargetPaths``) is the set of fast
-paths served at one tensor-parallel size, closed under ``depends_on``, with the
-GPU topology it was validated on; it applies when the drafter is DFlash drafting
-a linear chain of ``DRAFT_LEN`` tokens on an NVFP4 checkpoint. Those facts are
-structural: a deployment that misses one has no composition, and runs the
-built-in forward under ``modeling_v2="auto"`` (``NO_PATHS``) or raises under
-``require``. Nothing reads the environment to pick or trim a composition.
+paths served on one GPU architecture at one tensor-parallel size (its
+``CompositionKey``), closed under ``depends_on``, with the GPU topology it was
+validated on; it applies when the drafter is DFlash drafting a linear chain of
+``DRAFT_LEN`` tokens on an NVFP4 checkpoint. Those facts are structural: a
+deployment that misses one has no composition, and runs the built-in forward
+under ``modeling_v2="auto"`` (``NO_PATHS``) or raises under ``require``. Nothing
+reads the environment to pick or trim a composition.
 
 ``compose`` then checks the public preconditions the planned fast paths are
 written against (``PRECONDITIONS``, and the composition's own), once, agreed
@@ -272,7 +273,7 @@ def closure(names: Iterable[str]) -> FrozenSet[str]:
     return frozenset(seen)
 
 
-#: GPUs per GB300 tray.
+#: GPUs per node: one compute tray of an NVL72 rack, whose GPUs all share one NVLink domain.
 GPUS_PER_TRAY = 4
 
 
@@ -293,7 +294,11 @@ def describe_topology(mapping: Any) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class Topology:
-    """Where the ranks of a tensor-parallel group sit: ``nodes`` GB300 trays of four GPUs."""
+    """Where the ranks of a tensor-parallel group sit: ``nodes`` nodes of four GPUs.
+
+    The nodes are compute trays of one NVLink domain: the MNNVL allocations the
+    fast paths need (``PRECONDITIONS``) hold only there.
+    """
 
     description: str
     nodes: int
@@ -306,15 +311,28 @@ class Topology:
         )
 
 
-#: The TP group on one GB300 tray.
-ONE_TRAY_OF_4 = Topology("one GB300 tray of 4", 1)
-#: The TP group over two GB300 trays.
-TWO_TRAYS_OF_4 = Topology("two GB300 trays of 4", 2)
+#: The TP group on one node of four GPUs.
+ONE_TRAY_OF_4 = Topology("one node of 4 in one NVLink domain", 1)
+#: The TP group over two nodes of four GPUs in one NVLink domain.
+TWO_TRAYS_OF_4 = Topology("two nodes of 4 in one NVLink domain", 2)
+
+
+#: What a composition is keyed by: the GPU architecture as an SM number
+#: (``sm_of``: 103 for sm_103) and the tensor-parallel size.
+CompositionKey = Tuple[int, int]
+
+
+def sm_of(compute_capability: Optional[Tuple[int, int]]) -> Optional[int]:
+    """The SM number of ``compute_capability`` (``(10, 3)`` -> 103), or None without one."""
+    if compute_capability is None:
+        return None
+    major, minor = compute_capability
+    return 10 * int(major) + int(minor)
 
 
 @dataclasses.dataclass(frozen=True)
 class TargetPaths:
-    """A composition: the fast paths served at one tensor-parallel size, closed under
+    """A composition: the fast paths served at one ``CompositionKey``, closed under
     ``depends_on``, the topology they were validated on, and the preconditions of
     the composition beyond its paths' own (``PRECONDITIONS``).
 
@@ -436,28 +454,34 @@ def nvfp4_checkpoint(model_config: Any) -> bool:
     return getattr(quant_config, "quant_algo", None) == QuantAlgo.NVFP4
 
 
-def served_compositions(compositions: Mapping[int, TargetPaths]) -> str:
+def served_compositions(compositions: Mapping[CompositionKey, TargetPaths]) -> str:
     """The compositions this target serves, in words."""
-    sizes = (
+    keys = (
         ", ".join(
-            f"tp {tp} on {compositions[tp].topology.description}" for tp in sorted(compositions)
+            f"sm{sm} tp {tp} on {compositions[sm, tp].topology.description}"
+            for sm, tp in sorted(compositions)
         )
         or "none"
     )
     return (
-        f"{sizes}, each with DFlash drafting a linear chain of {DRAFT_LEN} tokens "
+        f"{keys}, each with DFlash drafting a linear chain of {DRAFT_LEN} tokens "
         "(max_draft_len = max_total_draft_tokens = "
         f"{DRAFT_LEN}, no draft_len_schedule, VANILLA attention_backend) and an NVFP4 checkpoint"
     )
 
 
 def composition(
-    model_config: Any, compositions: Mapping[int, TargetPaths]
+    model_config: Any,
+    compositions: Mapping[CompositionKey, TargetPaths],
+    compute_capability: Optional[Tuple[int, int]],
 ) -> Optional[TargetPaths]:
-    """The composition this deployment is served with, or None. Pure: reads the config only.
+    """The composition this deployment is served with, or None. Pure: reads its arguments only.
 
-    Every fact read here is structural: the tensor-parallel size, where its ranks
-    sit (``Topology``), the speculative-decoding mode and the checkpoint layout.
+    Every fact read here is structural: the GPU architecture
+    (``compute_capability``, read once from the device by the caller, as
+    ``route`` gets it), the tensor-parallel size, where its ranks sit
+    (``Topology``), the speculative-decoding mode and the checkpoint layout. An
+    architecture without an entry has no composition.
     """
     mapping = getattr(model_config, "mapping", None)
     if (
@@ -466,36 +490,47 @@ def composition(
         or not nvfp4_checkpoint(model_config)
     ):
         return None
-    served = compositions.get(int(mapping.tp_size))
+    served = compositions.get((sm_of(compute_capability), int(mapping.tp_size)))
     if served is None or not served.topology.holds(mapping):
         return None
     return served
 
 
-def unserved_reason(model_config: Any, compositions: Mapping[int, TargetPaths]) -> str:
+def unserved_reason(
+    model_config: Any,
+    compositions: Mapping[CompositionKey, TargetPaths],
+    compute_capability: Optional[Tuple[int, int]],
+) -> str:
     """Why ``composition`` found none for this deployment, naming every fact it read."""
     mapping = getattr(model_config, "mapping", None)
     tp = getattr(mapping, "tp_size", None)
     spec = describe_speculation(getattr(model_config, "spec_config", None))
+    arch = "no CUDA device" if compute_capability is None else f"sm{sm_of(compute_capability)}"
     return (
-        f"tp {tp}, {describe_topology(mapping)}, speculative decoding {spec}, checkpoint "
+        f"{arch}, tp {tp}, {describe_topology(mapping)}, speculative decoding {spec}, checkpoint "
         f"quantization {describe_quantization(model_config)}; the fast paths are served at "
         + served_compositions(compositions)
     )
 
 
 def require_served(
-    model_config: Any, mode: ModelingV2Mode, compositions: Mapping[int, TargetPaths]
+    model_config: Any,
+    mode: ModelingV2Mode,
+    compositions: Mapping[CompositionKey, TargetPaths],
+    compute_capability: Optional[Tuple[int, int]],
 ) -> None:
     """Raise under ``require`` when the deployment has no composition; before any construction.
 
     Raises:
         ValueError: under ``modeling_v2="require"`` when ``composition`` is None.
     """
-    if mode is ModelingV2Mode.REQUIRE and composition(model_config, compositions) is None:
+    if (
+        mode is ModelingV2Mode.REQUIRE
+        and composition(model_config, compositions, compute_capability) is None
+    ):
         raise ValueError(
             f"modeling_v2='require': {TAG} serves no fast path for this deployment: "
-            + unserved_reason(model_config, compositions)
+            + unserved_reason(model_config, compositions, compute_capability)
         )
 
 
@@ -752,6 +787,14 @@ NO_PREFILL_SEQUENCE_PARALLEL = Precondition(
     _no_prefill_sequence_parallel,
 )
 
+#: On sm107, the built-in model's SM103-measured fused kernels (its cluster residual
+#: boundary, fused finalize all-reduce and sharded projections), which the sm107
+#: compositions build on and whose arithmetic their bitwise paths reproduce.
+SM107_FUSED_KERNELS = Precondition(
+    "the built-in fused kernels on sm107 (MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)",
+    _builtin_switch("_sm107_fused_kernels_enabled", True),
+)
+
 
 def preconditions(paths: FrozenSet[str], served: TargetPaths) -> Tuple[Precondition, ...]:
     """The preconditions of a model built with ``paths`` from composition ``served``."""
@@ -797,7 +840,8 @@ def compose(
     text_model: Any,
     model_config: Any,
     mode: ModelingV2Mode,
-    compositions: Mapping[int, TargetPaths],
+    compositions: Mapping[CompositionKey, TargetPaths],
+    compute_capability: Optional[Tuple[int, int]],
     spec_worker: Any = None,
 ) -> Plan:
     """The plan this model is built with: its composition, or ``NO_PATHS``.
@@ -815,13 +859,13 @@ def compose(
             composition; under any mode when a precondition is missing on some
             rank, or the ranks disagree on the drafter arena (on every rank alike).
     """
-    served = composition(model_config, compositions)
+    served = composition(model_config, compositions, compute_capability)
     mapping = getattr(model_config, "mapping", None)
     if served is None:
-        require_served(model_config, mode, compositions)
+        require_served(model_config, mode, compositions, compute_capability)
+        reason = unserved_reason(model_config, compositions, compute_capability)
         logger.info(
-            f"{TAG} no fast path for this deployment ({unserved_reason(model_config, compositions)}); "
-            "running the built-in forward"
+            f"{TAG} no fast path for this deployment ({reason}); running the built-in forward"
         )
         return NO_PATHS
     windowed = windowed_context_arena(spec_worker)
@@ -836,7 +880,9 @@ def compose(
     ]
     if split:
         missing.append(f"the same drafter context arena on every rank ({split[0]})")
-    composed = f"{TAG} tep{mapping.tp_size} on {served.topology.description}"
+    composed = (
+        f"{TAG} sm{sm_of(compute_capability)} tep{mapping.tp_size} on {served.topology.description}"
+    )
     if missing:
         raise ValueError(f"{composed}: the fast paths need " + "; ".join(missing))
     plan = Plan(paths)

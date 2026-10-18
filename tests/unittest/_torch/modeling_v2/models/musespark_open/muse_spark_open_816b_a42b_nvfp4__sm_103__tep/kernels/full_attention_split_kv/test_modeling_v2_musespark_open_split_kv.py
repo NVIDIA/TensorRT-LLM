@@ -128,7 +128,7 @@ def test_install_refuses_without_prep_append_or_off_sm103_and_changes_nothing(
     model = _model()
     before = [type(layer.self_attn) for layer in model.layers]
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 0))
-    with pytest.raises(ValueError, match="sm_103 only"):
+    with pytest.raises(ValueError, match="sm_103 and sm_107 only"):
         split_kv_attention.install(model)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 3))
     model.layers[3].self_attn.attn.q_scaling = 2.0

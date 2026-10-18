@@ -547,6 +547,38 @@ def _fused_residual_enabled() -> bool:
     )
 
 
+def _sm107_fused_kernels_enabled() -> bool:
+    """Whether the fused kernels this file measured on SM103 (GB300) also run on SM107 (VR).
+
+    Off unless MUSESPARK_OPEN_SM107_FUSED_KERNELS names a truthy value. The
+    kernels behind ``fused_kernels_supported`` run on SM107 but are not certified
+    there, and two of them are on by default on SM103 (the cluster residual
+    boundary and the TP4 fused finalize all-reduce): enabling them on SM107
+    changes this model's default arithmetic on that GPU, so it is an opt-in.
+    """
+    return os.environ.get("MUSESPARK_OPEN_SM107_FUSED_KERNELS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def fused_kernels_supported(capability: Tuple[int, int]) -> bool:
+    """Whether the SM103-measured fused kernels of this model run on ``capability``.
+
+    SM103: yes. SM107: only with ``_sm107_fused_kernels_enabled``. Any other GPU:
+    no. Read once where each kernel is set up (model construction, its workspace
+    or availability check), never per step.
+    """
+    capability = tuple(capability)
+    if capability == (10, 3):
+        return True
+    if capability == (10, 7):
+        return _sm107_fused_kernels_enabled()
+    return False
+
+
 def _preqkv_norm_fp32_residual_enabled() -> bool:
     """Whether the pre-QKV prenorm reads the FP32 residual (cast after norm).
 
@@ -1723,7 +1755,7 @@ class MuseSparkOpenMoE(nn.Module):
         self._bf16x3_router_enabled = (
             os.getenv("MUSESPARK_OPEN_BF16X3_ROUTER", "0") == "1"
             and torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (10, 3)
+            and fused_kernels_supported(torch.cuda.get_device_capability())
         )
         # EP reduces normalized local experts; pure TP must instead reduce
         # each expert's FC2 partials before its nonlinear normalization.
@@ -2544,7 +2576,7 @@ class MuseSparkOpenModel(DecoderModel):
             and not mapping.enable_attention_dp
             and torch.cuda.is_available()
             and config.torch_dtype == torch.bfloat16
-            and torch.cuda.get_device_capability() == (10, 3)
+            and fused_kernels_supported(torch.cuda.get_device_capability())
             and all(
                 layer.feed_forward.expert_hidden_size == 4096 and layer.feed_forward.top_k == 8
                 for layer in self.layers
@@ -2565,7 +2597,7 @@ class MuseSparkOpenModel(DecoderModel):
                 and mapping.cp_size == mapping.pp_size == 1
                 and not mapping.enable_attention_dp
                 and config.torch_dtype == torch.bfloat16
-                and torch.cuda.get_device_capability() == (10, 3)
+                and fused_kernels_supported(torch.cuda.get_device_capability())
                 and all(
                     layer.feed_forward.expert_hidden_size == 4096
                     and getattr(layer.feed_forward.experts, "comm", None) is None
@@ -2573,7 +2605,8 @@ class MuseSparkOpenModel(DecoderModel):
                 )
             ):
                 raise ValueError(
-                    "Sharded projections require GB300 BF16 TP8/EP8, four GPUs per node, "
+                    "Sharded projections require SM103 (or SM107 with "
+                    "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1) BF16 TP8/EP8, four GPUs per node, "
                     "CP1/PP1, expert width 4096, and no attention DP or external MoE communication"
                 )
             from .musespark_open_projection_gather import ProjectionGatherWorkspace

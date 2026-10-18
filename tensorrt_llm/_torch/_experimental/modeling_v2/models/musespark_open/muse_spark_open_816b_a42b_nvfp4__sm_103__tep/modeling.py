@@ -35,9 +35,10 @@ processor and the weight loader (``weights.py``). Entries only this target calls
 go under ``ops/<category>/`` beside this file.
 
 The fast paths a model is built with are fixed by its composition
-(``TARGET_PATHS``, keyed by the tensor-parallel size, each with the GPU topology
-it was validated on, for DFlash drafting seven tokens on an NVFP4 checkpoint;
-``dispatch.compose``), decided once when the shell is constructed: all of them,
+(``TARGET_PATHS``, keyed by the GPU architecture and the tensor-parallel size,
+each with the GPU topology it was validated on, for DFlash drafting seven
+tokens on an NVFP4 checkpoint; ``dispatch.compose``), decided once when the
+shell is constructed: all of them,
 or none (``dispatch.NO_PATHS``) when the deployment has no composition, and the
 target then runs only the built-in modules as described above. A missing public
 precondition of a planned fast path is an error, whatever the mode. Over a
@@ -239,7 +240,7 @@ context-K/V fork's head fork point right after that GEMM).
 from __future__ import annotations
 
 import contextlib
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -539,36 +540,63 @@ class DecodeTarget:
         return hidden_states
 
 
-#: The compositions, per tensor-parallel size: the fast paths served and the GPU
-#: topology they were validated on, with DFlash drafting a linear chain of
-#: ``dispatch.DRAFT_LEN`` tokens on an NVFP4 checkpoint; every other deployment
-#: runs the built-in modules only.
+#: TEP8: every fast path.
+_TEP8_PATHS = _dispatch.FAST_PATH_NAMES
+#: TEP4: the fast paths written for any rank count whose output is bitwise the
+#: built-in model's.
+_TEP4_PATHS = frozenset(
+    {
+        "preattn_prep",
+        "full_attention_prep_append",
+        "post_attention_hop",
+        "deferred_input_prep",
+        "sampler_store",
+        "replicated_embedding",
+        "fused_accept",
+        "verify_fold",
+        "draft_head",
+        "path_walk_tail",
+        "drafter_block_conv",
+        "context_kv_fork",
+        "split_sampler",
+    }
+)
+
+#: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
+#: the fast paths served and the GPU topology they were validated on, with DFlash
+#: drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
+#: checkpoint; every other deployment runs the built-in modules only.
 TARGET_PATHS = {
-    8: _dispatch.TargetPaths(served=_dispatch.FAST_PATH_NAMES, topology=_dispatch.TWO_TRAYS_OF_4),
-    # The fast paths written for any rank count whose output is bitwise the
-    # built-in model's.
-    4: _dispatch.TargetPaths(
-        served=frozenset(
-            {
-                "preattn_prep",
-                "full_attention_prep_append",
-                "post_attention_hop",
-                "deferred_input_prep",
-                "sampler_store",
-                "replicated_embedding",
-                "fused_accept",
-                "verify_fold",
-                "draft_head",
-                "path_walk_tail",
-                "drafter_block_conv",
-                "context_kv_fork",
-                "split_sampler",
-            }
-        ),
+    (103, 8): _dispatch.TargetPaths(served=_TEP8_PATHS, topology=_dispatch.TWO_TRAYS_OF_4),
+    # sm107 leaves out attention_output_into_hop: its producer check
+    # (post_attn_hop.VALIDATED_PRODUCERS) names only the sm103 o_proj kernel.
+    (107, 8): _dispatch.TargetPaths(
+        served=_TEP8_PATHS - {"attention_output_into_hop"},
+        topology=_dispatch.TWO_TRAYS_OF_4,
+        preconditions=(_dispatch.SM107_FUSED_KERNELS,),
+    ),
+    (103, 4): _dispatch.TargetPaths(
+        served=_TEP4_PATHS,
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL,),
     ),
+    (107, 4): _dispatch.TargetPaths(
+        served=_TEP4_PATHS,
+        topology=_dispatch.ONE_TRAY_OF_4,
+        preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL, _dispatch.SM107_FUSED_KERNELS),
+    ),
 }
+
+
+def device_compute_capability() -> Optional[Tuple[int, int]]:
+    """This rank's compute capability, the fact ``route`` routes on; None without a CUDA device.
+
+    Read once, when the shell is constructed; the composition is keyed by it
+    (``TARGET_PATHS``), and a deployment without a device has none.
+    """
+    if not torch.cuda.is_available():
+        return None
+    return tuple(torch.cuda.get_device_capability())
 
 
 class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForConditionalGeneration):
@@ -601,13 +629,15 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
                 with a precondition of the plan missing (``dispatch.compose``).
         """
         mode = resolved_mode(type(self))
-        _dispatch.require_served(model_config, mode, TARGET_PATHS)
+        capability = device_compute_capability()
+        _dispatch.require_served(model_config, mode, TARGET_PATHS, capability)
         super().__init__(model_config, *args, **kwargs)
         plan = _dispatch.compose(
             self.llm.model,
             model_config,
             mode,
             TARGET_PATHS,
+            capability,
             spec_worker=getattr(self.llm, "spec_worker", None),
         )
         self._plan = plan

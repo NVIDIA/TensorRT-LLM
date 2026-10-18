@@ -681,12 +681,12 @@ _COUNTS: dict = {}
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU GB300 nodes)")
+        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("needs GB300 (sm_103)")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("needs sm_103 or sm_107")
     checkpoint = os.environ.get("MUSESPARK_REFERENCE_CKPT", "")
     if not os.path.isfile(os.path.join(checkpoint, "model.safetensors.index.json")):
         pytest.skip(

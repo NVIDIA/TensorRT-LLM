@@ -68,8 +68,8 @@ from _validating import (  # noqa: E402,F401 — path above; fixture by name
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="preattn_prep_append is built for sm_103",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="preattn_prep_append is built for sm_103 and sm_107",
 )
 
 DEV = "cuda"

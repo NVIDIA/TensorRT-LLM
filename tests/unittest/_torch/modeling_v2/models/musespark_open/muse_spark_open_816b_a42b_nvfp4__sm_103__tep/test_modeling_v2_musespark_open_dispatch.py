@@ -4,8 +4,9 @@
 
 Host-only. ``FAST_PATHS`` is closed and acyclic; each composition is closed and
 carries its topology; a ``Plan`` is always closed under ``depends_on``. A
-deployment without a composition (tensor-parallel size, topology, speculative
-decoding, checkpoint layout) gets ``NO_PATHS`` under ``auto`` and an error under
+deployment without a composition (GPU architecture, tensor-parallel size,
+topology, speculative decoding, checkpoint layout) gets ``NO_PATHS`` under
+``auto`` and an error under
 ``require``; a deployment with one gets all of it or, when a precondition is
 missing, an error under both modes, never a part: every combination of missing
 preconditions, and every combination of the public switches they read (with
@@ -49,10 +50,19 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 pytestmark = pytest.mark.cpu_only
 
 
+_SM103, _SM107 = (10, 3), (10, 7)
+
+
 @pytest.fixture(autouse=True)
 def _no_runtime_hooks(monkeypatch):
     """The executor hooks pin host staging blocks; these shells are built without them."""
     monkeypatch.setattr(_runtime, "make_runtime_hooks", lambda model: None)
+
+
+@pytest.fixture(autouse=True)
+def _on_sm103(monkeypatch):
+    """The shells here are built as on an sm103 device, whatever device runs the test."""
+    monkeypatch.setattr(modeling, "device_compute_capability", lambda: _SM103)
 
 
 _AUTO, _REQUIRE = ModelingV2Mode.AUTO, ModelingV2Mode.REQUIRE
@@ -113,15 +123,92 @@ def test_the_dependencies_are_acyclic():
     assert done == dispatch.FAST_PATH_NAMES
 
 
-def test_tensor_parallel_size_8_serves_every_fast_path_and_only_4_and_8_any():
-    assert set(modeling.TARGET_PATHS) == {4, 8}
-    served = modeling.TARGET_PATHS[8].served
+def test_sm103_tensor_parallel_size_8_serves_every_fast_path_and_only_4_and_8_any():
+    assert set(modeling.TARGET_PATHS) == {(103, 8), (107, 8), (103, 4), (107, 4)}
+    served = modeling.TARGET_PATHS[103, 8].served
     assert served == dispatch.FAST_PATH_NAMES
     assert len(served) == 39
     assert dispatch.closure(served) == served
-    assert modeling.TARGET_PATHS[8].topology is dispatch.TWO_TRAYS_OF_4
-    for tp in (1, 2, 16):
-        assert dispatch.composition(_config(tp, _dflash(7)), modeling.TARGET_PATHS) is None
+    assert modeling.TARGET_PATHS[103, 8].topology is dispatch.TWO_TRAYS_OF_4
+    for capability in (_SM103, _SM107):
+        for tp in (1, 2, 16):
+            config = _config(tp, _dflash(7))
+            assert dispatch.composition(config, modeling.TARGET_PATHS, capability) is None
+
+
+def test_sm107_tensor_parallel_size_8_serves_every_fast_path_but_the_o_proj_into_the_hop():
+    sm107 = modeling.TARGET_PATHS[107, 8]
+    assert sm107.served == dispatch.FAST_PATH_NAMES - {"attention_output_into_hop"}
+    assert dispatch.closure(sm107.served) == sm107.served
+    assert sm107.topology is dispatch.TWO_TRAYS_OF_4
+    assert dispatch.composition(_SERVED, modeling.TARGET_PATHS, _SM107) is sm107
+    assert (
+        dispatch.composition(_SERVED, modeling.TARGET_PATHS, _SM103)
+        is modeling.TARGET_PATHS[103, 8]
+    )
+
+
+def test_both_architectures_serve_the_same_tep4_set():
+    sm103, sm107 = modeling.TARGET_PATHS[103, 4], modeling.TARGET_PATHS[107, 4]
+    assert sm103.served == sm107.served == _TEP4
+    assert sm103.topology is sm107.topology is dispatch.ONE_TRAY_OF_4
+    assert dispatch.composition(_config(4, _dflash(7)), modeling.TARGET_PATHS, _SM107) is sm107
+
+
+def test_the_sm107_compositions_need_the_builtin_fused_kernels_opted_in():
+    for tp in (4, 8):
+        assert dispatch.SM107_FUSED_KERNELS in modeling.TARGET_PATHS[107, tp].preconditions
+        assert dispatch.SM107_FUSED_KERNELS not in modeling.TARGET_PATHS[103, tp].preconditions
+
+
+@pytest.mark.parametrize("value, holds", [(None, False), ("0", False), ("1", True), ("on", True)])
+def test_the_sm107_opt_in_is_read_through_the_builtin_helper(monkeypatch, value, holds):
+    from tensorrt_llm._torch.models import modeling_musespark_open as builtin
+
+    if value is None:
+        monkeypatch.delenv("MUSESPARK_OPEN_SM107_FUSED_KERNELS", raising=False)
+    else:
+        monkeypatch.setenv("MUSESPARK_OPEN_SM107_FUSED_KERNELS", value)
+    assert dispatch.SM107_FUSED_KERNELS.holds(None, None) is holds
+    assert builtin.fused_kernels_supported((10, 3))
+    assert builtin.fused_kernels_supported((10, 7)) is holds
+    for other in ((10, 0), (9, 0), (12, 0)):
+        assert not builtin.fused_kernels_supported(other)
+
+
+@pytest.mark.parametrize("tp", [4, 8])
+def test_an_sm107_deployment_without_the_opt_in_raises_in_both_modes(
+    monkeypatch, quiet, agreement, tp
+):
+    _stand_in_preconditions(monkeypatch, (True,) * 4)
+    monkeypatch.delenv("MUSESPARK_OPEN_SM107_FUSED_KERNELS", raising=False)
+    model = SimpleNamespace(_prefill_sp_enabled=False)
+    config = _config(tp, _dflash(7))
+    for mode in (_AUTO, _REQUIRE):
+        with pytest.raises(ValueError, match="MUSESPARK_OPEN_SM107_FUSED_KERNELS=1"):
+            dispatch.compose(model, config, mode, modeling.TARGET_PATHS, _SM107)
+    monkeypatch.setenv("MUSESPARK_OPEN_SM107_FUSED_KERNELS", "1")
+    plan = dispatch.compose(model, config, _REQUIRE, modeling.TARGET_PATHS, _SM107)
+    assert plan.paths == modeling.TARGET_PATHS[107, tp].served
+    assert quiet[-1][1].startswith(f"[musespark_open] sm107 tep{tp} on ")
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (9, 0), (12, 0), (10, 1), None])
+def test_an_architecture_without_an_entry_has_no_composition(capability):
+    for tp in (4, 8):
+        config = _config(tp, _dflash(7))
+        assert dispatch.composition(config, modeling.TARGET_PATHS, capability) is None
+        with pytest.raises(ValueError, match="serves no fast path") as raised:
+            dispatch.require_served(config, _REQUIRE, modeling.TARGET_PATHS, capability)
+        arch = "no CUDA device" if capability is None else f"sm{10 * capability[0] + capability[1]}"
+        assert str(raised.value).split(": ", 2)[2].startswith(f"{arch}, tp {tp}, ")
+
+
+def test_sm_of_reads_the_compute_capability():
+    assert dispatch.sm_of((10, 3)) == 103
+    assert dispatch.sm_of((10, 7)) == 107
+    assert dispatch.sm_of((9, 0)) == 90
+    assert dispatch.sm_of(None) is None
 
 
 #: TEP4's composition: the fast paths written for any rank count whose output is
@@ -144,17 +231,17 @@ _TEP4 = {
 
 
 def test_tensor_parallel_size_4_serves_the_bitwise_paths_on_one_tray():
-    tep4 = modeling.TARGET_PATHS[4]
+    tep4 = modeling.TARGET_PATHS[103, 4]
     assert tep4.served == _TEP4
     assert dispatch.closure(tep4.served) == tep4.served
     assert tep4.topology is dispatch.ONE_TRAY_OF_4
     assert tep4.preconditions == (dispatch.NO_PREFILL_SEQUENCE_PARALLEL,)
-    assert dispatch.composition(_config(4, _dflash(7)), modeling.TARGET_PATHS) is tep4
+    assert dispatch.composition(_config(4, _dflash(7)), modeling.TARGET_PATHS, _SM103) is tep4
     for gpus_per_node in (1, 2, 8):
         config = _config(4, _dflash(7), gpus_per_node=gpus_per_node)
-        assert dispatch.composition(config, modeling.TARGET_PATHS) is None, gpus_per_node
+        assert dispatch.composition(config, modeling.TARGET_PATHS, _SM103) is None, gpus_per_node
     for spec in (None, _dflash(3), _dflash(8)):
-        assert dispatch.composition(_config(4, spec), modeling.TARGET_PATHS) is None
+        assert dispatch.composition(_config(4, spec), modeling.TARGET_PATHS, _SM103) is None
 
 
 #: Requirements only the TP8 composition's paths have: a TP4 deployment cannot (the
@@ -175,7 +262,7 @@ _TP8_ONLY = (
 
 
 def test_tensor_parallel_size_4_needs_no_tp8_only_setting():
-    tep4 = modeling.TARGET_PATHS[4]
+    tep4 = modeling.TARGET_PATHS[103, 4]
     required = [p.requirement for p in dispatch.preconditions(tep4.served, tep4)]
     for word in _TP8_ONLY:
         assert not any(word in requirement for requirement in required), word
@@ -200,7 +287,7 @@ def test_a_tp4_model_without_the_tp8_switches_composes_the_whole_tep4_set(
 ):
     """Every precondition of a TP8-only path fails here, every other one holds: TP4
     still gets all of its composition."""
-    tep4 = modeling.TARGET_PATHS[4]
+    tep4 = modeling.TARGET_PATHS[103, 4]
     held = tuple(
         dataclasses.replace(p, holds=lambda model, config, keep=p.needed(tep4.served): keep)
         for p in dispatch.PRECONDITIONS
@@ -208,11 +295,12 @@ def test_a_tp4_model_without_the_tp8_switches_composes_the_whole_tep4_set(
     monkeypatch.setattr(dispatch, "PRECONDITIONS", held)
     model = SimpleNamespace(_prefill_sp_enabled=False)
     for mode in (_AUTO, _REQUIRE):
-        plan = dispatch.compose(model, _config(4, _dflash(7)), mode, modeling.TARGET_PATHS)
+        plan = dispatch.compose(model, _config(4, _dflash(7)), mode, modeling.TARGET_PATHS, _SM103)
         assert plan.paths == _TEP4
     assert quiet[-1] == (
         "info",
-        "[musespark_open] tep4 on one GB300 tray of 4: " + dispatch.Plan(_TEP4).describe(),
+        "[musespark_open] sm103 tep4 on one node of 4 in one NVLink domain: "
+        + dispatch.Plan(_TEP4).describe(),
     )
 
 
@@ -221,7 +309,7 @@ def test_prefill_sequence_parallelism_at_tp4_raises_in_both_modes(monkeypatch, q
     model = SimpleNamespace(_prefill_sp_enabled=True)
     for mode in (_AUTO, _REQUIRE):
         with pytest.raises(ValueError, match="MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL"):
-            dispatch.compose(model, _config(4, _dflash(7)), mode, modeling.TARGET_PATHS)
+            dispatch.compose(model, _config(4, _dflash(7)), mode, modeling.TARGET_PATHS, _SM103)
 
 
 @pytest.mark.parametrize("gpus_per_node, served", [(1, False), (2, False), (4, True), (8, False)])
@@ -229,8 +317,8 @@ def test_the_topology_is_part_of_the_composition(gpus_per_node, served):
     """TP8 is served over two trays of four GPUs only; one node of eight (or TP8 under
     Ray, where ``gpus_per_node`` is the tensor-parallel size) has no composition."""
     config = _config(8, _dflash(7), gpus_per_node=gpus_per_node)
-    expected = modeling.TARGET_PATHS[8] if served else None
-    assert dispatch.composition(config, modeling.TARGET_PATHS) is expected
+    expected = modeling.TARGET_PATHS[103, 8] if served else None
+    assert dispatch.composition(config, modeling.TARGET_PATHS, _SM103) is expected
 
 
 def test_the_topologies_count_the_nodes_of_the_tp_group():
@@ -246,7 +334,7 @@ def test_the_topologies_count_the_nodes_of_the_tp_group():
 def test_a_checkpoint_that_is_not_nvfp4_has_no_composition(quant):
     config = _config(8, _dflash(7), quant=quant)
     assert not dispatch.nvfp4_checkpoint(config)
-    assert dispatch.composition(config, modeling.TARGET_PATHS) is None
+    assert dispatch.composition(config, modeling.TARGET_PATHS, _SM103) is None
 
 
 def test_closure_adds_every_fast_path_built_on_and_rejects_unknown_names():
@@ -305,7 +393,7 @@ def test_only_no_paths_is_false_and_the_description_follows_fast_paths_order():
     assert dispatch.NO_PATHS.describe() == "no fast path"
     plan = dispatch.plan_of("swa_block")
     assert plan.describe() == "3 fast paths: preattn_prep, swa_paged_decode, swa_block"
-    full = dispatch.Plan(modeling.TARGET_PATHS[8].served)
+    full = dispatch.Plan(modeling.TARGET_PATHS[103, 8].served)
     assert full.describe() == "39 fast paths: " + ", ".join(
         path.name for path in dispatch.FAST_PATHS
     )
@@ -334,8 +422,8 @@ def test_only_dflash_drafting_a_linear_chain_of_seven_is_served(name):
     make, linear = _SPECULATION[name]
     spec = make()
     assert dispatch.dflash_linear(spec) is linear
-    served = dispatch.composition(_config(8, spec), modeling.TARGET_PATHS)
-    assert served is (modeling.TARGET_PATHS[8] if linear else None)
+    served = dispatch.composition(_config(8, spec), modeling.TARGET_PATHS, _SM103)
+    assert served is (modeling.TARGET_PATHS[103, 8] if linear else None)
 
 
 def test_a_draft_length_schedule_or_a_tree_is_not_served():
@@ -352,22 +440,28 @@ def test_a_draft_length_schedule_or_a_tree_is_not_served():
 
 def test_a_config_without_a_mapping_has_no_composition():
     config = SimpleNamespace(spec_config=_dflash(7))
-    assert dispatch.composition(config, modeling.TARGET_PATHS) is None
+    assert dispatch.composition(config, modeling.TARGET_PATHS, _SM103) is None
 
 
 @pytest.mark.parametrize("tp, spec", [(2, _dflash(7)), (8, None), (8, _dflash(3))])
 def test_require_raises_before_construction_naming_every_fact_read(tp, spec):
     config = _config(tp, spec)
     with pytest.raises(ValueError, match="modeling_v2='require'") as raised:
-        dispatch.require_served(config, _REQUIRE, modeling.TARGET_PATHS)
+        dispatch.require_served(config, _REQUIRE, modeling.TARGET_PATHS, _SM103)
     message = str(raised.value)
     assert f"tp {tp}" in message and "speculative decoding" in message
     assert "4 GPUs per node, the TP group over" in message
     assert "checkpoint quantization NVFP4" in message
-    assert "tp 4 on one GB300 tray of 4, tp 8 on two GB300 trays of 4" in message
+    assert message.split(": ", 2)[2].startswith(f"sm103, tp {tp}, ")
+    assert (
+        "sm103 tp 4 on one node of 4 in one NVLink domain, "
+        "sm103 tp 8 on two nodes of 4 in one NVLink domain, "
+        "sm107 tp 4 on one node of 4 in one NVLink domain, "
+        "sm107 tp 8 on two nodes of 4 in one NVLink domain"
+    ) in message
     assert "each with DFlash drafting a linear chain of 7 tokens" in message
-    dispatch.require_served(config, _AUTO, modeling.TARGET_PATHS)
-    dispatch.require_served(_SERVED, _REQUIRE, modeling.TARGET_PATHS)
+    dispatch.require_served(config, _AUTO, modeling.TARGET_PATHS, _SM103)
+    dispatch.require_served(_SERVED, _REQUIRE, modeling.TARGET_PATHS, _SM103)
 
 
 # --------------------------------------------------------------------------
@@ -413,7 +507,7 @@ def test_every_precondition_names_its_requirement_and_the_fast_paths_it_serves()
     for precondition in dispatch.PRECONDITIONS:
         assert set(precondition.needed_by) <= dispatch.FAST_PATH_NAMES, precondition
     # tp 8 serves every fast path, so it needs every precondition.
-    full = modeling.TARGET_PATHS[8]
+    full = modeling.TARGET_PATHS[103, 8]
     assert dispatch.preconditions(full.served, full) == dispatch.PRECONDITIONS
 
 
@@ -433,17 +527,19 @@ def test_every_combination_of_missing_preconditions_raises_in_both_modes(
 ):
     """All 2**10 combinations, each under ``auto`` and ``require``: the whole composition
     or ``ValueError`` naming every missing requirement, never ``NO_PATHS`` or a part."""
-    full = dispatch.Plan(modeling.TARGET_PATHS[8].served)
+    full = dispatch.Plan(modeling.TARGET_PATHS[103, 8].served)
     for holds in itertools.product((True, False), repeat=_COMBINATIONS):
         missing = _stand_in_preconditions(monkeypatch, holds)
         for mode in (_AUTO, _REQUIRE):
             if missing:
                 with pytest.raises(ValueError) as raised:
-                    dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS)
+                    dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103)
                 for requirement in missing:
                     assert requirement in str(raised.value)
             else:
-                assert dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS) == full
+                assert (
+                    dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103) == full
+                )
     # One agreement per call, whatever the outcome: every rank reaches the same collectives.
     assert len(agreement) == 2 * 2**_COMBINATIONS
 
@@ -454,7 +550,7 @@ def test_a_precondition_missing_on_a_peer_only_raises_in_both_modes(monkeypatch,
     monkeypatch.setattr(tp_agreement, "agreed_union", lambda mapping, local: list(local) + [peer])
     for mode in (_AUTO, _REQUIRE):
         with pytest.raises(ValueError, match=r"precondition 3 \(on TP ranks \[7\] of 8\)"):
-            dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS)
+            dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103)
 
 
 class _Group:
@@ -480,7 +576,7 @@ def test_the_preconditions_are_agreed_over_the_tp_group(monkeypatch, quiet):
     _stand_in_preconditions(monkeypatch, (True,) * 4)
     for mode in (_AUTO, _REQUIRE):
         with pytest.raises(ValueError, match=r"precondition 0 \(on TP ranks \[7\] of 8\)"):
-            dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS)
+            dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103)
     assert group.gathered == [[], []]
 
 
@@ -500,11 +596,14 @@ def test_an_unserved_deployment_gets_no_paths_without_a_collective(
     monkeypatch, quiet, agreement, config
 ):
     _stand_in_preconditions(monkeypatch, (False,) * 4)
-    assert dispatch.compose(object(), config, _AUTO, modeling.TARGET_PATHS) == dispatch.NO_PATHS
+    assert (
+        dispatch.compose(object(), config, _AUTO, modeling.TARGET_PATHS, _SM103)
+        == dispatch.NO_PATHS
+    )
     assert agreement == []
     assert [level for level, _ in quiet] == ["info"]
     with pytest.raises(ValueError, match="serves no fast path"):
-        dispatch.compose(object(), config, _REQUIRE, modeling.TARGET_PATHS)
+        dispatch.compose(object(), config, _REQUIRE, modeling.TARGET_PATHS, _SM103)
     assert agreement == []
 
 
@@ -521,12 +620,12 @@ def test_missing_preconditions_reads_the_built_model_and_its_config():
 
 def test_the_plan_line_names_the_composition_on_every_rank(monkeypatch, quiet, agreement):
     _stand_in_preconditions(monkeypatch, (True,) * 4)
-    dispatch.compose(object(), _SERVED, _AUTO, modeling.TARGET_PATHS)
+    dispatch.compose(object(), _SERVED, _AUTO, modeling.TARGET_PATHS, _SM103)
     assert quiet == [
         (
             "info",
-            "[musespark_open] tep8 on two GB300 trays of 4: "
-            + dispatch.Plan(modeling.TARGET_PATHS[8].served).describe(),
+            "[musespark_open] sm103 tep8 on two nodes of 4 in one NVLink domain: "
+            + dispatch.Plan(modeling.TARGET_PATHS[103, 8].served).describe(),
         )
     ]
 
@@ -572,7 +671,7 @@ def test_every_environment_gives_the_whole_composition_or_an_error(monkeypatch, 
     )
     assert sum(p is q for p, q in zip(switched, dispatch.PRECONDITIONS)) == 6
     monkeypatch.setattr(dispatch, "PRECONDITIONS", switched)
-    full = dispatch.Plan(modeling.TARGET_PATHS[8].served)
+    full = dispatch.Plan(modeling.TARGET_PATHS[103, 8].served)
     names = list(_ENV_CHOICES)
     for values in itertools.product(*(_ENV_CHOICES[name] for name in names)):
         for name, value in zip(names, values):
@@ -585,10 +684,12 @@ def test_every_environment_gives_the_whole_composition_or_an_error(monkeypatch, 
         )
         for mode in (_AUTO, _REQUIRE):
             if defaults:
-                assert dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS) == full
+                assert (
+                    dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103) == full
+                )
             else:
                 with pytest.raises(ValueError, match="the fast paths need"):
-                    dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS)
+                    dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103)
 
 
 # --------------------------------------------------------------------------
@@ -619,24 +720,31 @@ def test_dependents_are_every_fast_path_built_on_the_names():
 )
 def test_a_full_length_arena_keeps_the_whole_composition(monkeypatch, quiet, agreement, worker):
     _stand_in_preconditions(monkeypatch, (True,) * 4)
-    plan = dispatch.compose(object(), _SERVED, _AUTO, modeling.TARGET_PATHS, spec_worker=worker)
-    assert plan == dispatch.Plan(modeling.TARGET_PATHS[8].served)
+    plan = dispatch.compose(
+        object(), _SERVED, _AUTO, modeling.TARGET_PATHS, _SM103, spec_worker=worker
+    )
+    assert plan == dispatch.Plan(modeling.TARGET_PATHS[103, 8].served)
     assert agreement == [(_SERVED.mapping, [])]
 
 
-@pytest.mark.parametrize("tp", sorted(modeling.TARGET_PATHS))
-def test_a_windowed_arena_leaves_out_the_full_length_arena_paths(monkeypatch, quiet, agreement, tp):
+@pytest.mark.parametrize("key", sorted(modeling.TARGET_PATHS))
+def test_a_windowed_arena_leaves_out_the_full_length_arena_paths(
+    monkeypatch, quiet, agreement, key
+):
     _stand_in_preconditions(monkeypatch, (True,) * 4)
+    monkeypatch.setenv("MUSESPARK_OPEN_SM107_FUSED_KERNELS", "1")
+    sm, tp = key
     config = _config(tp, _dflash(7))
-    served = modeling.TARGET_PATHS[tp].served
+    served = modeling.TARGET_PATHS[key].served
+    capability = divmod(sm, 10)
     for mode in (_AUTO, _REQUIRE):
         plan = dispatch.compose(
-            object(), config, mode, modeling.TARGET_PATHS, spec_worker=_WINDOWED
+            object(), config, mode, modeling.TARGET_PATHS, capability, spec_worker=_WINDOWED
         )
         assert plan.paths == served - _LEFT_OUT
         assert dispatch.closure(plan.paths) == plan.paths
     assert all(local == ["a windowed drafter context arena"] for _, local in agreement)
-    assert quiet[-1][1].startswith(f"[musespark_open] tep{tp} on ")
+    assert quiet[-1][1].startswith(f"[musespark_open] sm{sm} tep{tp} on ")
     assert "with a windowed drafter context arena: " in quiet[-1][1]
 
 
@@ -645,7 +753,9 @@ def test_ranks_that_disagree_on_the_arena_raise(monkeypatch, quiet):
     monkeypatch.setattr(tp_agreement, "Distributed", _Group([]))
     for mode in (_AUTO, _REQUIRE):
         with pytest.raises(ValueError, match="the same drafter context arena on every rank"):
-            dispatch.compose(object(), _SERVED, mode, modeling.TARGET_PATHS, spec_worker=_WINDOWED)
+            dispatch.compose(
+                object(), _SERVED, mode, modeling.TARGET_PATHS, _SM103, spec_worker=_WINDOWED
+            )
 
 
 def test_the_arena_is_read_off_the_worker():
@@ -846,15 +956,17 @@ def test_a_served_shell_adopts_with_the_plan_compose_made(monkeypatch, shell_par
     plan = dispatch.plan_of("preattn_prep")
     composed = []
 
-    def compose(text_model, model_config, mode, compositions, spec_worker=None):
-        composed.append((text_model, model_config, mode, compositions, spec_worker))
+    def compose(text_model, model_config, mode, compositions, compute_capability, spec_worker=None):
+        composed.append(
+            (text_model, model_config, mode, compositions, compute_capability, spec_worker)
+        )
         return plan
 
     monkeypatch.setattr(modeling, "resolved_mode", lambda target: _REQUIRE)
     monkeypatch.setattr(modeling._dispatch, "compose", compose)
     shell = _SHELL(_SERVED)
     assert shell._plan is plan
-    assert composed == [(shell.llm.model, _SERVED, _REQUIRE, modeling.TARGET_PATHS, None)]
+    assert composed == [(shell.llm.model, _SERVED, _REQUIRE, modeling.TARGET_PATHS, _SM103, None)]
     assert shell_parts == ["built-in model", ("adopt", plan)]
 
 
@@ -873,4 +985,32 @@ def test_the_shell_composes_with_the_built_in_dflash_worker(monkeypatch, shell_p
     monkeypatch.setattr(tp_agreement, "agreed_union", lambda mapping, local: list(local))
     _stand_in_preconditions(monkeypatch, (True,) * 4)
     shell = _SHELL(_SERVED)
-    assert shell._plan.paths == modeling.TARGET_PATHS[8].served - _LEFT_OUT
+    assert shell._plan.paths == modeling.TARGET_PATHS[103, 8].served - _LEFT_OUT
+
+
+def test_the_shell_composes_for_the_device_it_reads_once(monkeypatch, shell_parts, quiet):
+    """The capability is read once per shell and keys the composition: on sm107 the plan
+    is the sm107 TEP8 composition."""
+    reads = []
+
+    def capability():
+        reads.append(_SM107)
+        return _SM107
+
+    monkeypatch.setattr(modeling, "device_compute_capability", capability)
+    monkeypatch.setenv("MUSESPARK_OPEN_SM107_FUSED_KERNELS", "1")
+    monkeypatch.setattr(modeling, "resolved_mode", lambda target: _REQUIRE)
+    monkeypatch.setattr(tp_agreement, "agreed_union", lambda mapping, local: list(local))
+    _stand_in_preconditions(monkeypatch, (True,) * 4)
+    shell = _SHELL(_SERVED)
+    assert reads == [_SM107]
+    assert shell._plan.paths == modeling.TARGET_PATHS[107, 8].served
+    assert "attention_output_into_hop" not in shell._plan.paths
+
+
+def test_a_shell_on_an_architecture_without_an_entry_raises_under_require(monkeypatch, shell_parts):
+    monkeypatch.setattr(modeling, "device_compute_capability", lambda: (10, 0))
+    monkeypatch.setattr(modeling, "resolved_mode", lambda target: _REQUIRE)
+    with pytest.raises(ValueError, match="serves no fast path for this deployment: sm100, tp 8"):
+        _SHELL(_SERVED)
+    assert shell_parts == []

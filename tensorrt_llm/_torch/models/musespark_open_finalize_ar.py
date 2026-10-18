@@ -753,8 +753,13 @@ class FinalizeIpcWorkspace:
                 return _UNSUPPORTED, "this system has no usable NVLink fabric"
         elif self._ranks != 4 or ranks_per_node != 1:
             return _UNSUPPORTED, "IPC fusion needs TP4 on one node"
-        if torch.cuda.get_device_capability(self._device) != (10, 3):
-            return _UNSUPPORTED, "the kernel is validated on SM103 only"
+        from .modeling_musespark_open import fused_kernels_supported
+
+        if not fused_kernels_supported(torch.cuda.get_device_capability(self._device)):
+            return _UNSUPPORTED, (
+                "the kernel is validated on SM103 (SM107 needs "
+                "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)"
+            )
         try:
             pdl = _pdl_enabled()
             for cluster in sorted({c for _, c in _CLUSTER_TABLES[self._ranks]}):

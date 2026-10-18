@@ -92,8 +92,8 @@ COMM, WORLD, RANK = _group()
 pytestmark = pytest.mark.skipif(
     WORLD not in (4, 8)
     or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 3),
-    reason="collective test: run under a 4- or 8-rank launch on GB300",
+    or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="collective test: run under a 4- or 8-rank launch on sm_103 or sm_107",
 )
 
 

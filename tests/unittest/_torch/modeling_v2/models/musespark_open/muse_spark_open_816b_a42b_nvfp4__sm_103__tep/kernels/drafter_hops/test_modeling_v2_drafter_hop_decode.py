@@ -57,8 +57,8 @@ pytestmark = pytest.mark.skipif(
     WORLD != 8
     or not _DRAFTER_DIR
     or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 3),
-    reason="needs 8 MPI ranks on GB300 and MUSESPARK_REFERENCE_DRAFTER",
+    or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="needs 8 MPI ranks on sm_103 or sm_107 and MUSESPARK_REFERENCE_DRAFTER",
 )
 
 CTX = 3_000

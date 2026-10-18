@@ -97,12 +97,12 @@ POLLER_CALLS = int(os.environ.get("MODELING_V2_UNPOOL_DIRECT_CALLS", "10240"))
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU GB300 nodes)")
+        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("needs GB300 (sm_103)")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("needs sm_103 or sm_107")
     return comm, rank
 
 

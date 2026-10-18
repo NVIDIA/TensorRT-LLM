@@ -72,8 +72,8 @@ def tp8():
     comm = _comm()
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Requires GB300")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Requires sm_103 or sm_107")
     mapping = Mapping(world_size=8, tp_size=8, rank=rank, gpus_per_node=4)
     return comm, rank, mapping, ProjectionGatherWorkspace(mapping)
 

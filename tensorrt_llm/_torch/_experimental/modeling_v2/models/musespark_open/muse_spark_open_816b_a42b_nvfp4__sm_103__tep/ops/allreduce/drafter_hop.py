@@ -799,8 +799,8 @@ class DrafterHopWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) != (10, 3):
-                raise RuntimeError("the fused drafter hop is validated on SM103 only")
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the fused drafter hop runs on SM103 or SM107 only")
             for tensor in pre_wait:
                 if (
                     tensor.device != self.device

@@ -64,8 +64,8 @@ __extra_import_path__ = ["../../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="full_attention_prep_fold is built for sm_103",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="full_attention_prep_fold is built for sm_103 and sm_107",
 )
 
 op = faf.full_attention_prep_fold

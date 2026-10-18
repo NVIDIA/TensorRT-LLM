@@ -350,7 +350,7 @@ def install(model: torch.nn.Module) -> int:
 
     Raises:
         ValueError: if ``intercepting`` would not reach the built-in decode FMHA
-            (``decode_reachable``), the device is not sm_103, or
+            (``decode_reachable``), the device is not sm_103 or sm_107, or
             a full-attention layer does not carry the prep-append mixin, has no output gate, or is
             not 2 KV heads / 16 query heads of width 64 with the plain softmax scale.
     """
@@ -360,9 +360,12 @@ def install(model: torch.nn.Module) -> int:
             f"[musespark_open] full_attention_split_kv cannot replace the full-attention decode FMHA: "
             f"{reason}"
         )
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 3),
+        (10, 7),
+    ):
         raise ValueError(
-            "[musespark_open] the full_attention_split_kv kernel is built for sm_103 only"
+            "[musespark_open] the full_attention_split_kv kernel is built for sm_103 and sm_107 only"
         )
     full = [layer.self_attn for layer in model.layers if not layer.self_attn.is_sliding]
     refused = []

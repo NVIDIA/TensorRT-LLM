@@ -215,8 +215,8 @@ def test_sharded_fc_tp8_matches_builtin():
         pytest.skip("Requires eight MPI ranks on two NVLink-connected four-GPU nodes")
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Requires GB300")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Requires sm_103 or sm_107")
     mapping = Mapping(world_size=8, tp_size=8, rank=rank, gpus_per_node=4)
     drafter = _drafter(seed=11)  # identical weights on every rank
     assert drafter_worker.install_sharded_fc(drafter, mapping, True) is None

@@ -66,7 +66,6 @@ NVCC_FLAGS = (
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
     "-lineinfo",
-    "-gencode=arch=compute_103a,code=sm_103a",
 )
 #: The torch extension the library is built and loaded as.
 LIBRARY_NAME = "musespark_open_head_sampler"
@@ -91,6 +90,16 @@ _LOCK = threading.Lock()
 _LOADED: Optional[str] = None
 
 
+def _gencode() -> str:
+    """The arch-specific target of the current device: sm_103a or sm_107a."""
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) not in ((10, 3), (10, 7)):
+        raise RuntimeError(
+            f"the head sampler is built for sm_103a / sm_107a, not sm_{major}{minor}"
+        )
+    return f"-gencode=arch=compute_{major}{minor}a,code=sm_{major}{minor}a"
+
+
 def build(verbose: bool = False) -> str:
     """Compile (if needed) and load the library under torch's extension build root; its path."""
     from torch.utils.cpp_extension import load
@@ -98,7 +107,7 @@ def build(verbose: bool = False) -> str:
     path = load(
         name=LIBRARY_NAME,
         sources=[str(SOURCE_DIR / SOURCES[0])],
-        extra_cuda_cflags=list(NVCC_FLAGS),
+        extra_cuda_cflags=list(NVCC_FLAGS) + [_gencode()],
         extra_include_paths=[str(SOURCE_DIR)],
         is_python_module=False,
         verbose=verbose,
@@ -543,8 +552,8 @@ class HeadGatherWorkspace:
         try:
             if self.shard % 4:
                 raise RuntimeError(f"shard {self.shard} is not a whole number of 4-element vectors")
-            if torch.cuda.get_device_capability(self.device) != (10, 3):
-                raise RuntimeError("the head gather is validated on SM103 only")
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the head gather runs on SM103 or SM107 only")
             self.library = load_library()
             total = self.ranks * self.slot_bytes
             self._handle = _make_mnnvl_mcast_buffer(

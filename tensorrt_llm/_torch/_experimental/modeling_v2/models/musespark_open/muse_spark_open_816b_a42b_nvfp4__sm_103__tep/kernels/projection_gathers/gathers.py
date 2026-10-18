@@ -405,7 +405,8 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
         if moe._pool_gather_workspace is None or moe._unpool_gather_workspace is None:
             raise ValueError(
                 "[musespark_open] projection_gathers fuses the sharded projections' gathers; it needs "
-                "MUSESPARK_OPEN_SHARDED_PROJECTIONS=1 (TP8/EP8 on GB300)"
+                "MUSESPARK_OPEN_SHARDED_PROJECTIONS=1 (TP8/EP8; on sm107 with "
+                "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)"
             )
         for module, classes in (
             (layer, (MuseSparkOpenDecoderLayer,)),

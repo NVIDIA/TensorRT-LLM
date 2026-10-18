@@ -260,10 +260,11 @@ class FullAttnSplitKvFold(OpWrapper):
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
-            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
+            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
         ):
             raise ValueError(
-                "full_attention_prep_fold takes, on one sm_103 device and 16-byte aligned: a BF16 raw "
+                "full_attention_prep_fold takes, on one sm_103 or sm_107 device and 16-byte aligned: "
+                "a BF16 raw "
                 f"projection [1..{MAX_ROWS}, {RAW_WIDTH}] (unit last stride, rows a multiple of 8 "
                 f"elements apart), a contiguous FP8 E4M3 pool [blocks, {KV_HEADS}, {PAGE}, "
                 f"{HEAD_DIM}], an int32 [2, pages] block table (unit last stride, at most "

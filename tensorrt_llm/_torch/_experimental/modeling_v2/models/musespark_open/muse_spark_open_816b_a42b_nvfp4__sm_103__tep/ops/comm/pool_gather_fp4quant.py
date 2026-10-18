@@ -134,17 +134,19 @@ if _AVAILABLE:
         """flashinfer's RMSNorm + FP4 quantization, reading its row from the pool inbox."""
 
         def __init__(self, peer_rank: int, stale_poll: bool = False):
+            major, minor = torch.cuda.get_device_capability()
             super().__init__(
                 dtype=cutlass.BFloat16,
                 H=HIDDEN,
                 block_size=BLOCK,
                 output_swizzled=False,
                 is_fp16=False,
-                sm_version=103,
+                sm_version=10 * major + minor,
                 scale_format="e4m3",
             )
             # The configuration the inbox addressing below is written for; it is
-            # what flashinfer selects for H=4096 BF16 on sm_103.
+            # what flashinfer selects for H=4096 BF16 on sm_103 and sm_107 (the
+            # same opt-in shared memory per block).
             if not (
                 self.cluster_n == 1
                 and self.threads_per_row == 64
