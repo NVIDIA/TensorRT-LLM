@@ -53,6 +53,11 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
             "gate_up_clamp": Optional[float],
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # "swiglu" (default) or "quick_geglu"; validated by the epilogue.
+            "gate_activation": OptionalRequirement(str),
+            # Whether __call__ receives fc1_activation_per_token_scale; reserves the epilogue's
+            # SMEM scratch for it. Absent means False.
+            "fc1_activation_per_token_scale": OptionalRequirement(bool),
         }
 
     @classmethod
@@ -90,6 +95,7 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
         self.situ_beta = problem_desc.get("situ_beta")
         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
+        self.gate_activation = problem_desc.get("gate_activation") or "swiglu"
 
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
@@ -281,6 +287,10 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,
         fc2_alpha: Optional[cute.Tensor] = None,
         fc1_norm_const: Optional[cute.Tensor] = None,
+        # (tokens,) fp32, same grouped layout as topk_scores. The activation was quantized from
+        # x / scale; the FC1 epilogue multiplies it back before the gated activation. Requires
+        # problem_desc["fc1_activation_per_token_scale"] = True (the epilogue rejects it otherwise).
+        fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
     ) -> None:
         """Prepare and launch the lean fused FC1+FC2 kernel.
 
@@ -289,6 +299,13 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
         """
         if cutlass.const_expr((expert_token_sizes is None) == (expert_token_prefix_sum is None)):
             raise ValueError("Exactly one of expert_token_sizes and expert_token_prefix_sum must be provided.")
+        if cutlass.const_expr(
+            fc1_activation_per_token_scale is not None
+            and fc1_activation_per_token_scale.element_type is not cutlass.Float32
+        ):
+            raise TypeError(
+                f"fc1_activation_per_token_scale must be Float32, got {fc1_activation_per_token_scale.element_type}."
+            )
         # The quant kind fixes every operand format, so the tensors are where a caller mismatch can
         # still show up. See BlockScaledSwapAbMegaMoeKernel.__call__.
         for operand_name, operand, expected_dtype in (
@@ -486,6 +503,7 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
             fc2_alpha,
             fc1_norm_const,
             topk_scores,
+            fc1_activation_per_token_scale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -526,6 +544,7 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
         topk_scores: Optional[cute.Tensor],
+        fc1_activation_per_token_scale: Optional[cute.Tensor],
     ):
         """Compose Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -599,7 +618,11 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
             fc1_ready_counter_pointer=None,
         )
         optional_epilogue_args = GatedActEpilogueArgs(
-            fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=topk_scores
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=fc1_norm_const,
+            topk_scores=topk_scores,
+            fc1_activation_per_token_scale=fc1_activation_per_token_scale,
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
