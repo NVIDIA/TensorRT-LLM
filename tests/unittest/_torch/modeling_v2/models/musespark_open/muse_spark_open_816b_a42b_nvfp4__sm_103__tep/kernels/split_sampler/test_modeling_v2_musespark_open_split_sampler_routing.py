@@ -434,6 +434,53 @@ def test_the_split_sampler_takes_up_to_the_shipped_wide_block_and_the_inbox_eigh
     assert head_sampler.INBOX_ROWS == target_head.GATHER_ROWS == 8
 
 
+@pytest.mark.parametrize("load_fails", [False, True], ids=["load-ok", "load-fails"])
+def test_the_inbox_workspace_agrees_on_the_library_load_before_its_allocation(
+    monkeypatch, load_fails
+):
+    """The fabric allocation is a collective: a rank whose library load failed must reach
+    the load's agreement, not skip the allocation its peers are in. Here every rank
+    reports this rank's outcome, so a failed load raises before any allocation."""
+    from tensorrt_llm._torch.distributed import ops as dist_ops
+
+    calls = []
+
+    def agree(comm, local_success):
+        calls.append(("agree", local_success))
+        return local_success
+
+    def allocate(comm, size, mapping, multi_node):
+        calls.append(("allocate", size))
+        raise RuntimeError("stop after the allocation")
+
+    def load():
+        calls.append(("load",))
+        if load_fails:
+            raise OSError("library load failed")
+        return "lib"
+
+    monkeypatch.setattr(dist_ops, "_get_mnnvl_workspace_comm", lambda mapping: "comm")
+    monkeypatch.setattr(dist_ops, "_mnnvl_device_index", lambda mapping: 0)
+    monkeypatch.setattr(dist_ops, "_mnnvl_workspace_all_succeeded", agree)
+    monkeypatch.setattr(dist_ops, "_make_mnnvl_mcast_buffer", allocate)
+    monkeypatch.setattr(head_sampler, "load_library", load)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
+    mapping = types.SimpleNamespace(tp_size=8, tp_rank=4, is_multi_node=lambda: True)
+    with pytest.raises(RuntimeError) as raised:
+        head_sampler.HeadGatherWorkspace(mapping, VOCAB // 8)
+    if load_fails:
+        assert calls == [("load",), ("agree", False)]
+        assert "failed to load" in str(raised.value)
+    else:
+        assert calls == [
+            ("load",),
+            ("agree", True),
+            ("allocate", 8 * head_sampler.INBOX_ROWS * (VOCAB // 8) * 2),
+            ("agree", False),
+        ]
+        assert "workspace failed" in str(raised.value)
+
+
 @pytest.mark.parametrize("inbox", [False, True], ids=["split-sampler", "lm-head-inbox"])
 def test_the_head_owns_states_for_every_row_count_it_takes(monkeypatch, inbox):
     """``split_sample`` runs at up to ``MAX_ROWS`` rows also under ``lm_head_inbox`` (every

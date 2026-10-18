@@ -565,9 +565,12 @@ class HeadGatherWorkspace:
     same sequence of calls: whether a step uses the inbox depends only on
     rank-uniform facts (row count, no context rows, host flags).
 
-    Construction is collective over the group (the library load, fabric
-    allocation, sentinel fill and an agreement) and either succeeds on every
-    rank or raises on every rank; ``library`` is the loaded library's path.
+    Construction is collective over the group (the library load and its
+    agreement, then the fabric allocation, sentinel fill and a second agreement)
+    and either succeeds on every rank or raises on every rank; ``library`` is the
+    loaded library's path. The load is agreed before the allocation because the
+    allocation is itself a collective: a rank whose load failed must not skip it
+    while its peers wait in it.
     """
 
     def __init__(self, mapping: Mapping, shard: int):
@@ -593,6 +596,15 @@ class HeadGatherWorkspace:
             if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
                 raise RuntimeError("the head gather runs on SM103 or SM107 only")
             self.library = load_library()
+        except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
+            error = exc
+        if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
+            raise RuntimeError(
+                "[musespark_open] lm_head_inbox: the head sampler library failed to load on at "
+                "least one rank"
+                f"{f' (this rank: {error!r})' if error is not None else ''}"
+            ) from error
+        try:
             total = self.ranks * self.slot_bytes
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, total, mapping, mapping.is_multi_node()
