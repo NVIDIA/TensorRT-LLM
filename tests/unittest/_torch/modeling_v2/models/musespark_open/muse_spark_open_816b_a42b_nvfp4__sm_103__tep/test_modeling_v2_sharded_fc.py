@@ -1,18 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for ``drafter_fc_shard``: the DFlash ``fc`` column-sharded over TP8.
+"""GPU test for ``drafter_fc_shard``: the DFlash ``fc`` column-sharded over TP8 or TP4.
 
 One GPU: the bound ``project_target_hidden`` is driven for each of the eight
-ranks with a stand-in gather that computes every rank's slice the way that
-rank would, so the rank's row range, the gather's column order and the
-composition with ``hidden_norm`` are checked against the built-in projection
-(within the GEMM band) and bitwise against the same composition done by hand;
-a drafter weight reload (a new ``fc``, or new storage under the old one) is
-followed on the next call.
+(or four) ranks with a stand-in gather that computes every rank's slice the
+way that rank would, so the rank's row range, the gather's column order and
+the composition with ``hidden_norm`` are checked against the built-in
+projection (within the GEMM band) and bitwise against the same composition
+done by hand; a drafter weight reload (a new ``fc``, or new storage under the
+old one) is followed on the next call. TP8 runs the built-in above 8 rows;
+TP4 shards every call, at decode and prefill row counts.
 
-Eight MPI ranks on two NVLink-connected four-GPU GB300 nodes
-(``test_sharded_fc_tp8_matches_builtin``; skipped otherwise): the real
-projection-gather workspace, eager and under CUDA-graph replay.
+Eight MPI ranks on two NVLink-connected four-GPU nodes
+(``test_sharded_fc_tp8_matches_builtin``) and four MPI ranks on one node
+(``test_sharded_fc_tp4_matches_builtin``; each skipped otherwise): the real
+gather, eager and under CUDA-graph replay.
 """
 
 import types
@@ -60,21 +62,22 @@ def _drafter(seed=0, device="cuda"):
 
 
 class _EightRankGather:
-    """Stands in for the fabric gather on one GPU: every rank's slice, as that rank computes it.
+    """Stands in for the gather on one GPU: every rank's slice, as that rank computes it.
 
     Reads the drafter's ``fc`` when it gathers, so it follows a weight reload.
     """
 
-    def __init__(self, x, drafter, rank, enable_pdl):
+    def __init__(self, x, drafter, rank, enable_pdl, world=8):
         self.x, self.drafter, self.rank, self.pdl = x, drafter, rank, enable_pdl
+        self.world = world
         self.calls = 0
 
     def gather(self, local):
         weight = self.drafter.fc.weight.detach()
-        rows = weight.shape[0] // 8
+        rows = weight.shape[0] // self.world
         slices = [
             drafter_worker._gemm(self.x, weight[r * rows : (r + 1) * rows], self.pdl)
-            for r in range(8)
+            for r in range(self.world)
         ]
         assert torch.equal(slices[self.rank], local), "the rank's own slice differs"
         self.calls += 1
@@ -102,6 +105,45 @@ def test_each_rank_projects_its_rows_and_the_gather_restores_order(rows):
         )
         assert torch.equal(out, by_hand)
         assert_within_ulp(out, builtin, ELEMENT_ULP, RMS_ULP)
+
+
+@pytest.mark.parametrize("rows", [8, 9, 64, 512, 2048])
+@torch.inference_mode()
+def test_tp4_shards_every_row_count_and_the_gather_restores_order(rows):
+    drafter = _drafter()
+    g = torch.Generator(device="cuda").manual_seed(100 + rows)
+    x = (2.0 * torch.randn(rows, TAPPED * HIDDEN, generator=g, device="cuda")).to(torch.bfloat16)
+    builtin = DFlashForCausalLM.project_target_hidden(drafter, x)
+    for rank in range(4):
+        mapping = SimpleNamespace(tp_size=4, tp_rank=rank, enable_attention_dp=False, cp_size=1)
+        gather = _EightRankGather(x, drafter, rank, True, world=4)
+        drafter.__dict__.pop("project_target_hidden", None)
+        drafter.__dict__.pop("_fc_shard", None)
+        assert drafter_worker.install_sharded_fc(drafter, mapping, True, gather=gather) is None
+        assert (drafter._fc_shard.world, drafter._fc_shard.max_rows) == (4, None)
+        out = drafter.project_target_hidden(x)
+        assert gather.calls == 1
+        by_hand = drafter.hidden_norm(
+            gather.gather(
+                drafter_worker._gemm(x, drafter.fc.weight[rank * 2048 : (rank + 1) * 2048], True)
+            )
+        )
+        assert torch.equal(out, by_hand)
+        assert_within_ulp(out, builtin, ELEMENT_ULP, RMS_ULP)
+
+
+def test_tp4_builds_the_all_gather_and_tp8_keeps_its_row_bound():
+    drafter = _drafter(device="cpu")
+    tp4 = SimpleNamespace(tp_size=4, tp_rank=2, enable_attention_dp=False, cp_size=1)
+    assert drafter_worker.install_sharded_fc(drafter, tp4, True) is None
+    state = drafter._fc_shard
+    assert isinstance(state.gather, drafter_worker.AllGatherColumns)
+    assert (state.rank, state.rows, state.world, state.max_rows) == (2, 2048, 4, None)
+    del drafter.project_target_hidden, drafter._fc_shard
+    tp8 = SimpleNamespace(tp_size=8, tp_rank=7, enable_attention_dp=False, cp_size=1)
+    assert drafter_worker.install_sharded_fc(drafter, tp8, True, gather=object()) is None
+    state = drafter._fc_shard
+    assert (state.rank, state.rows, state.world, state.max_rows) == (7, 1024, 8, 8)
 
 
 @torch.inference_mode()
@@ -165,9 +207,16 @@ def test_a_drafter_weight_reload_is_followed(monkeypatch):
 def test_install_declines_what_it_does_not_cover():
     drafter = _drafter(device="cpu")
     ok = SimpleNamespace(tp_size=8, tp_rank=0, enable_attention_dp=False, cp_size=1)
-    assert "TP size" in drafter_worker.install_sharded_fc(
-        drafter, SimpleNamespace(tp_size=4, tp_rank=0), True, gather=object()
+    for tp_size in (2, 16):
+        assert "TP size" in drafter_worker.install_sharded_fc(
+            drafter, SimpleNamespace(tp_size=tp_size, tp_rank=0), True, gather=object()
+        )
+    narrow = _drafter(device="cpu")
+    narrow.fc = nn.Linear(16, 8 * 512, bias=False, dtype=torch.bfloat16)
+    assert "TP8 gather takes 1024" in drafter_worker.install_sharded_fc(
+        narrow, ok, True, gather=object()
     )
+    del narrow
     assert "attention DP" in drafter_worker.install_sharded_fc(
         drafter, SimpleNamespace(**{**vars(ok), "enable_attention_dp": True}), True, gather=object()
     )
@@ -264,6 +313,68 @@ def test_sharded_fc_tp8_matches_builtin():
         gathered = comm.allgather(out.view(torch.int16).cpu().numpy())
         assert all((peer == gathered[0]).all() for peer in gathered), "ranks disagree"
     comm.Barrier()
+
+
+# --------------------------------------------------------------------------
+# Four ranks, NCCL all-gather
+# --------------------------------------------------------------------------
+@torch.inference_mode()
+def test_sharded_fc_tp4_matches_builtin():
+    from mpi4py import MPI
+
+    from tensorrt_llm.mapping import Mapping
+
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() != 4:
+        pytest.skip("Requires four MPI ranks on one four-GPU node")
+    rank = comm.Get_rank()
+    torch.cuda.set_device(rank % 4)
+    mapping = Mapping(world_size=4, tp_size=4, rank=rank, gpus_per_node=4)
+    drafter = _drafter(seed=11)  # identical weights on every rank
+    assert drafter_worker.install_sharded_fc(drafter, mapping, True) is None
+    assert isinstance(drafter._fc_shard.gather, drafter_worker.AllGatherColumns)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    # Decode rows at MBS 1..64 (K + 1 = 8 per request) and prefill chunks.
+    for rows in (8, 1, 64, 256, 512, 9, 2048, 8192):
+        x = (2.0 * torch.randn(rows, TAPPED * HIDDEN, generator=g, device="cuda")).to(
+            torch.bfloat16
+        )
+        builtin = DFlashForCausalLM.project_target_hidden(drafter, x)
+        out = drafter.project_target_hidden(x)
+        assert_within_ulp(out, builtin, ELEMENT_ULP, RMS_ULP)
+        local = drafter_worker._gemm(x, drafter.fc.weight[rank * 2048 : (rank + 1) * 2048], True)
+        gathered = comm.allgather(out.view(torch.int16).cpu().numpy())
+        assert all((peer == gathered[0]).all() for peer in gathered), "ranks disagree"
+        slices = comm.allgather(local.view(torch.int16).cpu().numpy())
+        joined = torch.cat([torch.from_numpy(s) for s in slices], dim=1).view(torch.bfloat16)
+        assert torch.equal(out.cpu(), drafter.hidden_norm(joined.cuda()).cpu())
+    for rows in (256, 512):
+        x = (2.0 * torch.randn(rows, TAPPED * HIDDEN, generator=g, device="cuda")).to(
+            torch.bfloat16
+        )
+        eager = drafter.project_target_hidden(x)
+        torch.cuda.synchronize()
+        comm.Barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = drafter.project_target_hidden(x)
+        for step in range(4):
+            x.copy_((torch.randn(x.shape, generator=g, device="cuda") * (step + 1)).to(x.dtype))
+            expected = drafter.project_target_hidden(x)
+            torch.cuda.synchronize()
+            comm.Barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, expected), "graph replay differs from the eager call"
+            assert_within_ulp(
+                out,
+                drafter.hidden_norm(drafter_worker.F.linear(x, drafter.fc.weight)),
+                ELEMENT_ULP,
+                RMS_ULP,
+            )
+        assert eager.shape == out.shape
+        del graph
+        comm.Barrier()
 
 
 def test_gemm_helper_uses_the_builtin_for_unlisted_shapes():

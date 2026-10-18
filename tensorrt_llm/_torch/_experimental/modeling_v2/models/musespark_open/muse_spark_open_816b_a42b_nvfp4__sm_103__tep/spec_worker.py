@@ -27,20 +27,31 @@ its name. The shell calls
 call that changed something.
 
 ``drafter_fc_shard`` -- sharded ``fc``. ``project_target_hidden`` (``fc`` then
-``hidden_norm``) runs once per decode step on the ``K + 1`` captured rows of
-the five tapped target layers, ``[8, 5 * 8192]``, which every rank holds. The
-built-in multiplies them by the whole replicated ``[8192, 40960]`` BF16
-weight on every rank: 671 MB per rank per step.
-Here each rank multiplies by its own 1024 output rows of that weight (a view
-of the current ``fc.weight`` taken on every call, no copy, 84 MB) and the
-eight ``[8, 1024]`` slices are gathered over the NVLink fabric with the
-built-in projection-gather kernel (``musespark_open_projection_gather.py``)
-on a workspace of its own; then the built-in ``hidden_norm``. The rank's
-GEMM runs on the fixed low-M tactic listed for its shape
-(``ops/gemm/fixed_low_m_gemm.py``) whether or not ``drafter_fixed_gemms`` is selected. Each
-output element is still one full-K dot product accumulated in fp32 and
-rounded once, but in another kernel's K order, so it can differ from the
-built-in in the last bf16 place.
+``hidden_norm``) runs on the rows of the five tapped target layers,
+``[rows, 5 * 8192]``, which every rank holds: the ``K + 1`` rows per request of
+a decode step, and every token of a prefill chunk. The built-in multiplies
+them by the whole replicated ``[8192, 40960]`` BF16 weight on every rank
+(671 MB per rank per call). Here each of the TP ranks multiplies by its own
+``8192 / TP`` output rows of that weight (a view of the current ``fc.weight``
+taken on every call, no copy) and the slices are gathered in rank order;
+then the built-in ``hidden_norm``. The gather depends on the TP width:
+
+* TP8 (two nodes of four): the eight ``[rows, 1024]`` slices go over the
+  NVLink fabric with the built-in projection-gather kernel
+  (``musespark_open_projection_gather.py``) on a workspace of its own. It is
+  written for decode steps at batch 1, so calls of more than
+  ``FC_SHARD_MAX_ROWS`` rows run the built-in method.
+* TP4 (one node of four): the four ``[rows, 2048]`` slices are joined by the
+  built-in NCCL all-gather (``tensorrt_llm._torch.distributed.allgather``),
+  which takes any row count, so every call is sharded.
+
+The rank's GEMM runs on the fixed low-M tactic listed for its shape
+(``ops/gemm/fixed_low_m_gemm.py``) whether or not ``drafter_fixed_gemms`` is
+selected, and on ``F.linear`` for the shapes no tactic lists. Each output
+element is still one full-K dot product accumulated in fp32 and rounded
+once, but possibly in another kernel's K order, so it can differ from the
+built-in in the last bf16 place. Only the draft tokens can change: the
+target model verifies every draft.
 
 ``fused_accept`` -- fused acceptance. The worker's
 ``_sample_and_accept_draft_tokens_base`` keeps the built-in target-token
@@ -88,12 +99,17 @@ from .ops.spec.dflash_accept import (
     dflash_accept,
 )
 
-#: The sharded ``fc`` path's row bound: decode steps (K + 1 <= 8 rows per
-#: request at batch 1); larger calls (prefill chunks) run the built-in.
+#: The sharded ``fc`` path's row bound at TP8, where the fabric projection
+#: gather serves decode steps at batch 1 (K + 1 <= 8 rows); larger calls
+#: (prefill chunks, batched decode) run the built-in. TP4 has no row bound.
 FC_SHARD_MAX_ROWS = 8
 
-#: TP width the projection-gather kernel is written for.
-FC_SHARD_WORLD = 8
+#: The TP widths the sharded ``fc`` is written for: 8 gathers over the fabric
+#: projection-gather workspace, 4 with the built-in NCCL all-gather.
+FC_SHARD_WORLDS = (4, 8)
+
+#: Output rows of ``fc`` per rank that the TP8 projection gather takes.
+FC_SHARD_TP8_ROWS = 1024
 
 
 def _gemm(x: torch.Tensor, weight: torch.Tensor, enable_pdl: bool) -> torch.Tensor:
@@ -137,18 +153,38 @@ class ShardedFc:
     rows: int
     gather: object
     enable_pdl: bool
+    #: TP width the ``fc`` is sharded over.
+    world: int = 8
+    #: Largest call the gather takes, or None for any row count.
+    max_rows: Optional[int] = FC_SHARD_MAX_ROWS
+
+
+class AllGatherColumns:
+    """The TP4 gather of the sharded ``fc``: the built-in NCCL all-gather, slices joined by columns.
+
+    Takes any row count. Every rank of the TP group makes the matching call
+    with the same row count, as for every other collective of the step.
+    """
+
+    def __init__(self, mapping) -> None:
+        self.mapping = mapping
+
+    def gather(self, local: torch.Tensor) -> torch.Tensor:
+        from tensorrt_llm._torch.distributed import allgather
+
+        return allgather(local, self.mapping, dim=-1)
 
 
 def sharded_project_target_hidden(
     self: DFlashForCausalLM, hidden_states: torch.Tensor
 ) -> torch.Tensor:
-    """The built-in ``project_target_hidden`` with ``fc`` column-sharded over TP8.
+    """The built-in ``project_target_hidden`` with ``fc`` column-sharded over the TP group.
 
     Bound to the drafter as ``project_target_hidden`` by ``install_sharded_fc``.
-    Calls of more than ``FC_SHARD_MAX_ROWS`` rows, or operands the gather does
-    not take, run the built-in method. Every rank sees the same row count and
-    holds the same ``fc`` shapes, so every rank takes the same branch and the
-    gather's call order stays identical across ranks.
+    Calls of more rows than the gather takes (``ShardedFc.max_rows``), or
+    operands it does not take, run the built-in method. Every rank sees the
+    same row count and holds the same ``fc`` shapes, so every rank takes the
+    same branch and the gather's call order stays identical across ranks.
     """
     state: Optional[ShardedFc] = self.__dict__.get("_fc_shard")
     weight = self.fc.weight
@@ -157,10 +193,11 @@ def sharded_project_target_hidden(
         state is None
         or self.fc.bias is not None
         or x.dim() != 2
-        or not 1 <= x.shape[0] <= FC_SHARD_MAX_ROWS
+        or x.shape[0] < 1
+        or (state.max_rows is not None and x.shape[0] > state.max_rows)
         or x.dtype != torch.bfloat16
         or not weight.is_contiguous()
-        or tuple(weight.shape) != (state.rows * FC_SHARD_WORLD, x.shape[1])
+        or tuple(weight.shape) != (state.rows * state.world, x.shape[1])
     ):
         return DFlashForCausalLM.project_target_hidden(self, hidden_states)
     begin = state.rank * state.rows
@@ -184,12 +221,15 @@ def sharded_fc_unsupported_reason(draft_model: nn.Module, mapping) -> Optional[s
         return "the drafter has no bias-free fc + hidden_norm"
     if fc.weight.dtype != torch.bfloat16 or not fc.weight.is_contiguous():
         return f"fc.weight is {fc.weight.dtype}, contiguous={fc.weight.is_contiguous()}"
-    if mapping is None or mapping.tp_size != FC_SHARD_WORLD:
-        return f"TP size is {getattr(mapping, 'tp_size', None)}, the gather is written for {FC_SHARD_WORLD}"
+    world = getattr(mapping, "tp_size", None)
+    if mapping is None or world not in FC_SHARD_WORLDS:
+        return f"TP size is {world}, the gathers are written for {' or '.join(map(str, FC_SHARD_WORLDS))}"
     if getattr(mapping, "enable_attention_dp", False) or getattr(mapping, "cp_size", 1) != 1:
         return "attention DP or context parallelism"
-    if fc.weight.shape[0] % FC_SHARD_WORLD or fc.weight.shape[0] // FC_SHARD_WORLD != 1024:
-        return f"fc has {fc.weight.shape[0]} outputs; the gather takes 1024 per rank"
+    if fc.weight.shape[0] % world:
+        return f"fc has {fc.weight.shape[0]} outputs, not a multiple of TP {world}"
+    if world == 8 and fc.weight.shape[0] // world != FC_SHARD_TP8_ROWS:
+        return f"fc has {fc.weight.shape[0]} outputs; the TP8 gather takes {FC_SHARD_TP8_ROWS} per rank"
     return None
 
 
@@ -227,7 +267,8 @@ def install_sharded_fc(
     if ours and state is not None:
         state.enable_pdl = enable_pdl
         return None
-    if gather is None:
+    world = mapping.tp_size
+    if gather is None and world == 8:
         from tensorrt_llm._torch.models.musespark_open_projection_gather import (
             ProjectionGatherWorkspace,
         )
@@ -236,11 +277,15 @@ def install_sharded_fc(
             gather = ProjectionGatherWorkspace(mapping)
         except ValueError as exc:  # raised alike on every rank (it all-gathers the check)
             return f"projection gather unavailable: {exc}"
+    elif gather is None:
+        gather = AllGatherColumns(mapping)
     draft_model._fc_shard = ShardedFc(
         rank=mapping.tp_rank,
-        rows=draft_model.fc.weight.shape[0] // FC_SHARD_WORLD,
+        rows=draft_model.fc.weight.shape[0] // world,
         gather=gather,
         enable_pdl=enable_pdl,
+        world=world,
+        max_rows=FC_SHARD_MAX_ROWS if world == 8 else None,
     )
     draft_model.project_target_hidden = types.MethodType(sharded_project_target_hidden, draft_model)
     return None
@@ -617,8 +662,14 @@ def install(
         if reason is not None:
             raise ValueError(f"[musespark_open] drafter_fc_shard cannot run here: {reason}")
         if not was_installed:
+            gather = (
+                "a fabric gather"
+                if draft_model._fc_shard.world == 8
+                else "an NCCL all-gather, any row count"
+            )
             logger.info(
-                "[musespark_open] drafter_fc_shard: DFlash fc column-sharded over TP8 with a fabric gather"
+                f"[musespark_open] drafter_fc_shard: DFlash fc column-sharded over "
+                f"TP{draft_model._fc_shard.world} with {gather}"
             )
     if fused_accept:
         if spec_worker is None:
