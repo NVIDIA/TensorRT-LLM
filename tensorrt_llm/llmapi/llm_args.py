@@ -2549,8 +2549,6 @@ class DecodingBaseConfig(StrictBaseModel):
     @property
     def spec_dec_mode(self):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
-        # Use an alias for the import here to avoid name collisions with the one for the
-        # TRT backend.
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
@@ -3646,10 +3644,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
         "of the backend that builds the drafter's own attention modules.\n\n"
         "AUTO resolves per drafter family and is right unless you are pinning a "
-        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
-        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
-        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
-        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
+        "kernel: TRTLLM for a GQA backbone, which degrades when its kernel is "
+        "missing, and CUTEDSL for an MLA one, which raises. TRTLLM needs "
+        "FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA "
+        "decode pass over context and block, on SM100/SM103/SM107. Which "
+        "kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -4267,8 +4266,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None,
         description=
-        "The dynamic batch config to use. This only applies for the TensorRT backend and "
-        "cannot currently be used with the PyTorch backend.")
+        "The dynamic batch configuration used by the scheduler to adjust batch size "
+        "and token limits at runtime. This option currently has no effect since the "
+        "scheduler does not support dynamic batch adjustments in the pytorch backend."
+    )
 
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
@@ -7285,24 +7286,17 @@ class TorchLlmArgs(BaseLlmArgs):
                             f"this configuration: {'; '.join(reasons)}.")
                     self.speculative_config.use_rejection_sampling = False
                 elif self.speculative_config.use_rejection_sampling:
-                    # The non-dynamic-tree one-model rejection path depends on
-                    # FlashInfer (sampling_from_probs /
-                    # chain_speculative_sampling); fail fast if it is missing.
-                    # The dynamic-tree path uses
-                    # verify_dynamic_tree_rejection_out /
-                    # compute_probs_from_logits (CUDA op with a PyTorch
-                    # fallback) and does not require FlashInfer.
-                    rs_dynamic_tree_active = getattr(self.speculative_config,
-                                                     "use_dynamic_tree", False)
-                    if not rs_dynamic_tree_active:
-                        from tensorrt_llm._torch.flashinfer_utils import \
-                            IS_FLASHINFER_AVAILABLE
-                        if not IS_FLASHINFER_AVAILABLE:
-                            raise ValueError(
-                                "use_rejection_sampling=True requires FlashInfer, "
-                                "which is not available in this environment. "
-                                "Install flashinfer-python or set "
-                                "use_rejection_sampling=False.")
+                    # The one-model spec workers require FlashInfer, which the
+                    # advanced sampling modes other than FULL sample through;
+                    # fail fast if it is missing.
+                    from tensorrt_llm._torch.flashinfer_utils import \
+                        IS_FLASHINFER_AVAILABLE
+                    if not IS_FLASHINFER_AVAILABLE:
+                        raise ValueError(
+                            "use_rejection_sampling=True requires FlashInfer, "
+                            "which is not available in this environment. "
+                            "Install flashinfer-python or set "
+                            "use_rejection_sampling=False.")
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.

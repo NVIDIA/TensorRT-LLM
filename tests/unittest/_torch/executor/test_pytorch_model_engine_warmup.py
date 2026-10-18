@@ -314,6 +314,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
     )
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(
@@ -392,6 +393,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _agree_warmup_flag=lambda flag: flag,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
@@ -831,27 +833,30 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
 
 
 class _Tracker:
-    """Records method-call order via mock side_effects."""
+    """Records method-call order (and each call's arguments) via mock side_effects."""
 
     def __init__(self):
         self.calls = []
+        self.call_args = {}
 
     def __call__(self, name):
         def _wrapped(*args, **kwargs):
             self.calls.append(name)
+            self.call_args.setdefault(name, []).append((args, kwargs))
 
         return _wrapped
 
 
 def _run_warmup_tracked(
-    model_engine, resource_manager, *, force_helix_cp=False, capture_logs=False
+    model_engine, resource_manager, *, force_helix_cp=False, capture_logs=False, tracker=None
 ):
     """Patch warmup stages and cleanup operations, then run warmup.
 
-    Optionally force helix CP and capture logs. Returns
-    (call_order_list, log_records_or_None).
+    Optionally force helix CP and capture logs. Pass ``tracker`` to inspect the
+    recorded call arguments. Returns (call_order_list, log_records_or_None).
     """
-    tracker = _Tracker()
+    if tracker is None:
+        tracker = _Tracker()
     # Engines left by earlier tests are cyclic; finalize them before tracking.
     gc.collect()
     # Observe this module's explicit cleanup without counting unrelated
@@ -977,11 +982,17 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         runner = object.__new__(DecoderRunner)
+        runner._moe_workspace_reclaimer = None
+        runner._eager_workspace_reclaim_supported = False
+        runner.mapping = SimpleNamespace(cp_size=1)
         runner._warmup_timer = _WarmupTimer(rank=0)
         runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
         runner._config = SimpleNamespace(
-            dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
+            dtype=torch.float16,
+            cuda_graph_batch_sizes=[1, 4],
+            enable_in_graph_sampling=False,
+            is_spec_decode=False,
         )
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = runner._metrics = {}
@@ -1235,17 +1246,98 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
 
-    def test_step_b_cleanup_skipped_with_helix_cp(self):
-        """With Helix CP, can_run_general_warmup is False AND step (b) is
-        gated off -> no empty_cache calls inside warmup()."""
+    def test_helix_cp_runs_only_the_generation_autotuner_warmup(self):
+        """With Helix CP, can_run_general_warmup is False and the context
+        warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
+        runs, on generation requests, followed by one empty_cache."""
         model_engine, resource_manager = _build_engine_and_resource_manager()
-        calls, _ = _run_warmup_tracked(model_engine, resource_manager, force_helix_cp=True)
-        self.assertNotIn("autotuner", calls, f"Helix CP should skip autotuner; got {calls}")
+        tracker = _Tracker()
+        calls, _ = _run_warmup_tracked(
+            model_engine, resource_manager, force_helix_cp=True, tracker=tracker
+        )
+        self.assertEqual(
+            tracker.call_args["autotuner"],
+            [((resource_manager,), {"generation_only": True})],
+            "Helix CP must tune on generation requests only",
+        )
+        self.assertNotIn("general_warmup", calls, f"Helix CP should skip general; got {calls}")
+        self.assertIn("autotuner", calls, f"Helix CP should run the autotuner; got {calls}")
         self.assertEqual(
             calls.count("empty_cache"),
-            0,
-            f"Helix CP should skip all warmup cleanup; got {calls}",
+            1,
+            f"Helix CP should clean up once, after the autotuner; got {calls}",
         )
+        self.assertEqual(calls[calls.index("autotuner") + 1], "empty_cache")
+
+    @pytest.mark.cpu_only
+    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self):
+        """Helix CP tunes on max_batch_size generation requests (bounded by
+        max_num_tokens), without the context batch."""
+        tuner = SimpleNamespace(
+            setup_distributed_state=Mock(),
+            cache_pp_recv=Mock(),
+            cache_pp_send=Mock(),
+            clean_pp_flag=Mock(),
+            profiling_cache={},
+            print_profiling_cache=Mock(),
+        )
+        get_num_available_tokens = Mock(return_value=4096)
+        engine = SimpleNamespace(
+            _warmup_timer=_WarmupTimer(rank=0),
+            _config=SimpleNamespace(
+                enable_autotuner=True,
+                torch_compile_enabled=False,
+                max_num_tokens=100,
+                max_batch_size=32,
+                max_seq_len=1024,
+                original_max_draft_len=3,
+                max_total_draft_tokens=3,
+                is_spec_decode=True,
+                max_draft_len=3,
+                spec_config=None,
+            ),
+            cuda_graph_runner=SimpleNamespace(enabled=False),
+            model=SimpleNamespace(modules=lambda: []),
+            kv_cache_manager_key="kv_cache",
+            mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+            dist=object(),
+            guided_decoder=None,
+            no_cuda_graph=lambda: contextlib.nullcontext(),
+            _create_warmup_request=Mock(return_value=object()),
+            _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+            _should_run_warmup_batch=Mock(return_value=True),
+            _release_megamoe_profiling_scratch=Mock(),
+            _forward_warmup=Mock(),
+            _completed_autotuner_warmup_num_tokens=None,
+            _agree_warmup_flag=lambda flag: flag,
+        )
+        kv_cache_manager = SimpleNamespace(get_num_available_tokens=get_num_available_tokens)
+        resource_manager = SimpleNamespace(
+            get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+        )
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.AutoTuner.get",
+                return_value=tuner,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.autotune",
+                return_value=contextlib.nullcontext(),
+            ),
+            patch("torch.cuda.synchronize"),
+            patch("torch.cuda.empty_cache"),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.clear_memory_buffers"
+            ),
+        ):
+            DecoderRunner._run_autotuner_warmup(engine, resource_manager, generation_only=True)
+
+        # 100 tokens fit 25 requests of 1 + 3 tokens, below max_batch_size.
+        engine._create_warmup_request.assert_called_once_with(resource_manager, 100, 25)
+        engine._forward_warmup.assert_called_once()
+        get_num_available_tokens.assert_not_called()
+        self.assertEqual(engine._completed_autotuner_warmup_num_tokens, 100)
 
     @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self):
