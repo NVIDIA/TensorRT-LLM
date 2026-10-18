@@ -52,6 +52,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
 - ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
   expert finalize kernels.
+- ``MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP`` (default off): overlap the router with the
+  pool projection for batches of 129..512 tokens too.
 - ``MUSESPARK_OPEN_LARGE_NORM_GATE`` (default off): fuse H64 attention norm/gate with
   the reference reduction order above 128 tokens.
 - ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION`` (default off): overlap two output-projection
@@ -686,6 +688,29 @@ def _fused_finalize_ar_chunked_enabled() -> bool:
     capture.
     """
     return os.environ.get("MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+#: The largest batch whose router and pool projection run on two streams:
+#: 128 tokens by default, decode steps of up to 64 requests at eight rows each
+#: with ``MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP``.
+_PREPARE_OVERLAP_MAX_TOKENS = 128
+_LARGE_PREPARE_OVERLAP_MAX_TOKENS = 512
+
+
+def _large_prepare_overlap_enabled() -> bool:
+    """Whether batches of 129..512 tokens overlap the router with the pool projection.
+
+    Off unless MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP names a truthy value. The
+    overlap only places the same kernels on two streams, so its outputs are
+    bitwise the serial ones. Resolved at module construction, before warmup
+    and any graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP", "0").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -1785,6 +1810,11 @@ class MuseSparkOpenMoE(nn.Module):
         self._finalize_ar_max_tokens = (
             _FINALIZE_AR_CHUNKED_MAX_TOKENS if _fused_finalize_ar_chunked_enabled() else 128
         )
+        self._prepare_overlap_max_tokens = (
+            _LARGE_PREPARE_OVERLAP_MAX_TOKENS
+            if _large_prepare_overlap_enabled()
+            else _PREPARE_OVERLAP_MAX_TOKENS
+        )
         self._bf16x3_router_enabled = (
             os.getenv("MUSESPARK_OPEN_BF16X3_ROUTER", "0") == "1"
             and torch.cuda.is_available()
@@ -2109,7 +2139,9 @@ class MuseSparkOpenMoE(nn.Module):
         overlap = (
             getattr(self, "_prepare_stream", None) is not None
             and hidden_states.is_cuda
-            and 0 < hidden_states.shape[0] <= 128
+            and 0
+            < hidden_states.shape[0]
+            <= getattr(self, "_prepare_overlap_max_tokens", _PREPARE_OVERLAP_MAX_TOKENS)
             and not torch.compiler.is_compiling()
             and getattr(self.experts, "comm", None) is None
         )
