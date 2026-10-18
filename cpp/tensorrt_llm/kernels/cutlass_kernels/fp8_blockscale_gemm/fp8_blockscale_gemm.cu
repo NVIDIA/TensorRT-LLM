@@ -84,9 +84,11 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(__nv_fp8
     __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d, int shape_m, int shape_n, int shape_k,
     float const* scales_a, float const* scales_b, cudaStream_t stream)
 {
-
+    // workspace_ (set via configureWorkspace) is forwarded for SwapAB sliced-K on sm120.
+    // Inputs are pre-quantized fp8, so no internal-quantize workspace is consumed here.
+    auto* workspace_fp32 = reinterpret_cast<float*>(workspace_);
     fp8_gemm_run(const_cast<__nv_fp8_e4m3*>(mat_a), ld_a, const_cast<__nv_fp8_e4m3*>(mat_b), ld_b, mat_d, ld_d, shape_m,
-        shape_n, shape_k, const_cast<float*>(scales_a), const_cast<float*>(scales_b), stream);
+        shape_n, shape_k, const_cast<float*>(scales_a), const_cast<float*>(scales_b), stream, workspace_fp32);
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -199,9 +201,10 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::strideBatchGe
     int num_problems, int shape_m, int shape_n, int shape_k, cudaStream_t stream, float* scales_a, int stride_scales_a,
     float* scales_b)
 {
-
+    // workspace_ (set via configureWorkspace) is forwarded for SwapAB sliced-K on sm120.
+    auto* workspace_fp32 = reinterpret_cast<float*>(workspace_);
     fp8_stride_batch_gemm_run(nullptr, mat_a, scales_a, ld_a, stride_a, stride_scales_a, nullptr, mat_b, scales_b, ld_b,
-        stride_b, mat_d, ld_d, stride_d, num_problems, shape_m, shape_n, shape_k, stream, false, false);
+        stride_b, mat_d, ld_d, stride_d, num_problems, shape_m, shape_n, shape_k, stream, false, false, workspace_fp32);
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -263,7 +266,29 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
     size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k, size_t num_problems)
 {
     expected_m_ = shape_m;
-    return getWorkspaceSizeBase(shape_m * top_k, shape_n, shape_k, num_problems);
+    size_t base = getWorkspaceSizeBase(shape_m * top_k, shape_n, shape_k, num_problems);
+
+    // SwapAB sliced-K workspace (sm120, M<=8). Precise strategy: predict k_slices
+    // and only reserve bytes when sliced-K will actually activate, so most DSV3
+    // shapes (N_blocks * L >= sm_count) incur zero allocation.
+    //
+    // For BMM (num_problems > 1), each batch's N-blocks count independently toward
+    // SM occupancy, so the effective n_blocks for the heuristic is n_blocks * L.
+    // Kernel's atomicAdd indexing includes an L offset (see sm120_fp8_swapab_1d1d.cuh).
+    if (tensorrt_llm::common::getSMVersion() == 120 && shape_m <= 8)
+    {
+        int sm_count = tensorrt_llm::common::getMultiProcessorCount();
+        int n_blocks = static_cast<int>((shape_n + 63) / 64); // TileM = 64
+        int effective_n_blocks = n_blocks * static_cast<int>(num_problems);
+        int k_slices = compute_k_slices_sm120_swapab(effective_n_blocks, static_cast<int>(shape_k), sm_count);
+        if (k_slices > 1)
+        {
+            size_t swapab_bytes = shape_n * shape_m * num_problems * sizeof(float);
+            // Single workspace buffer shared across uses: take the max.
+            base = std::max(base, swapab_bytes);
+        }
+    }
+    return base;
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
