@@ -110,8 +110,29 @@ models/<family>/
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
+  shared/           code two or more targets of the family call that is not an entry
 catalog/<category>/ entries more than one target calls
 ```
+
+The targets, as `models/<family>/<target>`:
+
+* `deepseek_v3/r1_0528_nvfp4__sm_103__dep4`
+* `glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8`: GLM-5.2 NVFP4 low-latency decode with attention
+  and experts tensor-parallel over eight ranks. The fast paths shared by the GLM-5.2 targets are
+  under `glm_moe_dsa/shared/kernels/`, the routed-MoE ones only this target calls under its own
+  `kernels/`, with their C++ kernels and ops in `cpp/tensorrt_llm/kernels/glmMoeDsa` and
+  `cpp/tensorrt_llm/thop/glmMoeDsa`; `shared/dispatch.py` selects them and lists the knobs.
+  The tp8 and tep targets run the layer composition of `shared/layers.py`, each with its own plan.
+* `glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep`: the same checkpoint with attention tensor-parallel
+  over four or eight ranks and the experts expert-parallel over the same ranks. It runs the
+  shared fast paths that take its tensor-parallel size, in front of the built-in
+  expert-parallel MoE.
+* `glm_moe_dsa/glm_5_2_nvfp4__sm_103__dep`: the same checkpoint with attention data parallelism
+  and the experts expert-parallel over the same ranks. Its built-in layers run the shared
+  attention, draft-loop and step-loop fast paths that are rank-local under attention DP; it
+  checks the KV-cache dtype and the MoE backend, which `route` does not read, when it is built.
+* `gpt_oss/gpt_oss_120b__sm_103__tp1`
+* `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain
@@ -281,6 +302,14 @@ names beside the code that reads it, only adds something to forget to update.
 An entry only one target calls lives under that target's `ops/`; one that two
 or more call lives in `catalog/`. A later target that needs an owned entry
 promotes it by moving the file and its test to the shared tree -- the test is
-the certification record, so nothing else has to travel with it. The five
+the certification record, so nothing else has to travel with it.
+
+Code that two or more targets of one family call and that cannot be an entry --
+it holds state across calls (collective workspaces, compiled kernels, a plan the
+kernels read) or registers torch ops when imported, so one copy per process is
+required -- lives in that family's `models/<family>/shared/`, moved there with its
+tests the same way. A target may import its own family's `shared` package and
+the catalog, nothing else (`test_modeling_v2_claims.py`); `shared` imports no
+target. The five
 other out-of-tree targets and the agent definitions are not migrated in this
 batch.
