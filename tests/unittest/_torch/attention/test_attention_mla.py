@@ -13,7 +13,8 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.attention import mla as mla_module
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
+    AttentionInputType, AttentionRuntimeFeatures, MLAParams,
+    PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention.backends.trtllm import \
     TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
@@ -1566,3 +1567,183 @@ def test_kvb_context_layout(monkeypatch, device, num_tokens, case,
     assert captured["latent"] is latent_cache
     assert result is output
     assert projection.call_count == (0 if use_strided else 1)
+
+
+def _mla_generation_only_workspace_bytes(num_contexts: int,
+                                         cached_len: int) -> int:
+    """Workspace that a generation-only MLA call sizes in a mixed batch.
+
+    The batch has `num_contexts` context requests (one new token on top of
+    `cached_len` cached tokens each) followed by one generation request. Only
+    the generation slice is run, as `MLA.forward_absorption_generation` does.
+    """
+    num_heads, kv_lora_rank, qk_rope_head_dim = 128, 512, 64
+    tokens_per_block = 32
+    device = torch.device("cuda")
+    AttentionCls = get_attention_backend("TRTLLM")
+    layer = AttentionCls(
+        layer_idx=0,
+        num_heads=num_heads,
+        head_dim=kv_lora_rank + qk_rope_head_dim,
+        num_kv_heads=1,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value),
+        q_scaling=1.0,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams.from_config(
+                RopeConfig(
+                    rope_scaling={
+                        "beta_fast": 32,
+                        "beta_slow": 1,
+                        "factor": 40.0,
+                        "mscale": 1.0,
+                        "mscale_all_dim": 1.0,
+                        "original_max_position_embeddings": 4096,
+                        "type": "yarn",
+                    })),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=1536,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            qk_nope_head_dim=128,
+            v_head_dim=kv_lora_rank,
+            predicted_tokens_per_seq=1,
+        ),
+    )
+    num_seqs = num_contexts + 1
+    tokens_per_seq = (
+        (cached_len + 1 + tokens_per_block - 1) // tokens_per_block +
+        1) * tokens_per_block
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    kv_cache_manager = KVCacheManager(
+        KvCacheConfig(max_tokens=tokens_per_seq * num_seqs,
+                      enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=kv_lora_rank + qk_rope_head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=tokens_per_seq,
+        max_batch_size=num_seqs,
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(torch.float8_e4m3fn)),
+    )
+    try:
+        for req_id in range(num_seqs):
+            req = LlmRequest(
+                request_id=req_id,
+                max_new_tokens=4,
+                input_tokens=[1] * (cached_len + 1),
+                sampling_config=SamplingConfig(
+                    SamplingParams()._get_sampling_config()),
+                is_streaming=False,
+            )
+            req.paged_kv_block_ids = []
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req_id, cached_len + 1, 1)], [req])
+        kv_buffer = kv_cache_manager.get_buffers(0)
+        kv_buffer.view(torch.uint8).copy_(
+            torch.randint(0,
+                          0x70,
+                          kv_buffer.shape,
+                          dtype=torch.uint8,
+                          device=device))
+        metadata = AttentionCls.Metadata(
+            seq_lens=torch.tensor([1] * num_seqs, dtype=torch.int),
+            request_ids=list(range(num_seqs)),
+            max_num_requests=num_seqs,
+            num_contexts=num_contexts,
+            prompt_lens=[cached_len + 1] * num_contexts + [cached_len],
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[cached_len] * num_seqs,
+            ),
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(
+                chunked_prefill=True,
+                cache_reuse=True,
+                chunk_size=8192,
+                chunked_prefill_buffer_batch_size=16,
+            ),
+        )
+        metadata.prepare()
+        assert int(
+            metadata.host_total_kv_lens[0]) == num_contexts * (cached_len + 1)
+        metadata.workspace = torch.empty((0, ), dtype=torch.int8, device=device)
+
+        torch.manual_seed(0)
+        fused_q = torch.empty(1,
+                              num_heads * (kv_lora_rank + qk_rope_head_dim),
+                              dtype=torch.bfloat16,
+                              device=device).uniform_(-1, 1)
+        q_pe = torch.empty(1,
+                           num_heads,
+                           qk_rope_head_dim,
+                           dtype=torch.bfloat16,
+                           device=device).uniform_(-1, 1)
+        latent_cache = torch.empty(1,
+                                   kv_lora_rank + qk_rope_head_dim,
+                                   dtype=torch.bfloat16,
+                                   device=device).uniform_(-1, 1)
+        cu_q_seqlens = torch.empty(num_seqs + 1,
+                                   dtype=torch.int32,
+                                   device=device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                    dtype=torch.int32,
+                                    device=device)
+        fmha_scheduler_counter = torch.empty(1,
+                                             dtype=torch.uint32,
+                                             device=device)
+        mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+        mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        quant_q_buffer = torch.empty(1,
+                                     num_heads *
+                                     (kv_lora_rank + qk_rope_head_dim),
+                                     dtype=torch.uint8,
+                                     device=device)
+        layer.mla_rope_generation(fused_q, q_pe, latent_cache, metadata,
+                                  cu_q_seqlens, cu_kv_seqlens,
+                                  fmha_scheduler_counter, mla_bmm1_scale,
+                                  mla_bmm2_scale, quant_q_buffer)
+        output = layer.forward(
+            fused_q,
+            None,
+            None,
+            metadata,
+            attention_input_type=AttentionInputType.generation_only,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(output.float()).all()
+        return metadata.workspace.numel()
+    finally:
+        kv_cache_manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or get_sm_version() not in (100, 103, 107),
+                    reason="needs fp8 KV MLA generation on SM100 family")
+def test_mla_generation_only_workspace_ignores_context_requests():
+    """A generation-only call must not size the context requests' workspace.
+
+    In a mixed batch the context half runs in its own call, but the generation
+    call sees the same metadata (`num_contexts`, `host_total_kv_lens[0]`). The
+    fp8 context MLA K/V staging grows with the summed context KV length, so
+    sizing it here grows the generation call's workspace without bound.
+    """
+    cached_len = 2048
+    generation_only = _mla_generation_only_workspace_bytes(0, cached_len)
+    for num_contexts in (1, 4):
+        assert _mla_generation_only_workspace_bytes(
+            num_contexts, cached_len) == generation_only, num_contexts
