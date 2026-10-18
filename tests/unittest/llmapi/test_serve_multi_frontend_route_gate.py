@@ -67,11 +67,10 @@ PER_FRONTEND_SAFE = {
     ("POST", "/_internal/tokenize"): "tokenizer-only",
     ("GET", "/energy_metrics"): "reads GPU energy counters; same devices from every process",
     ("GET", "/v1/data_transceiver_state"): "fetched from the shared executor over RPC",
-    ("GET", "/steady_clock_offset"): "clock probe of the answering process",
     (
-        "POST",
+        "GET",
         "/steady_clock_offset",
-    ): "known limitation: calibrates the answering frontend only (documented)",
+    ): "clock probe; every frontend reads the same host steady clock (the POST is forwarded)",
     # RL control requires AsyncLLM, which is not the classic IPC executor path
     # multi-frontend mode runs on, and runtime control (--enable_sleep_mode)
     # requires num_serve_frontends=1; neither coexists with attached frontends.
