@@ -53,7 +53,7 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
 - ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
   expert finalize kernels.
 - ``MUSESPARK_OPEN_LARGE_NORM_GATE`` (default off): fuse H64 attention norm/gate with
-  the reference reduction order at large token counts.
+  the reference reduction order above 128 tokens.
 - ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION`` (default off): overlap two output-projection
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
@@ -1634,7 +1634,7 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
                 0 < attention_output.shape[0] <= 128
                 or (
                     getattr(self, "_large_norm_gate_enabled", False)
-                    and attention_output.shape[0] >= 512
+                    and attention_output.shape[0] > 128
                     and not torch.compiler.is_compiling()
                     and attention_output.stride(0) % 8 == 0
                     and attention_output.data_ptr() % 16 == 0
@@ -1654,7 +1654,8 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             and gate.numel() == attention_output.numel()
             and (gate.ndim == 2 or gate.shape[-1] == self.head_dim)
         ):
-            if attention_output.shape[0] >= 512:
+            if attention_output.shape[0] > 128:
+                # Bitwise the unfused norm and gate below, at any token count.
                 from ..cute_dsl_kernels.blackwell.rmsnorm_gate import rmsnorm_gate
 
                 return rmsnorm_gate(attention_output, gate, self.o_head_norm.variance_epsilon)
