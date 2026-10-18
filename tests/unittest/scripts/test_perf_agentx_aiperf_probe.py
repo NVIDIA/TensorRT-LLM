@@ -74,7 +74,7 @@ def _make_site(
 
 
 @pytest.fixture
-def run_probe(client, monkeypatch, capsys):
+def run_probe(client, monkeypatch, capfd):
     def _run(site: Path) -> "tuple[bool, str]":
         monkeypatch.setenv("PYTHONPATH", str(site))
         monkeypatch.setenv("PYTHONNOUSERSITE", "1")
@@ -87,7 +87,7 @@ def run_probe(client, monkeypatch, capsys):
 
         monkeypatch.setattr(client.subprocess, "run", _isolated)
         usable = client.aiperf_is_usable()
-        return usable, capsys.readouterr().out
+        return usable, capfd.readouterr().out
 
     return _run
 
