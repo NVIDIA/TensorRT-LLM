@@ -1305,6 +1305,35 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert arguments == "{}"
         assert json.loads(arguments) == {}
 
+    def test_streaming_partial_tool_call_prefix_preserves_normal_text(self):
+        """Test partial tool-call prefixes do not lose surrounding text."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        parser = self.make_parser()
+
+        result = parser.parse_streaming_increment("Hello <tool_cal",
+                                                  [no_parameter_tool])
+        assert result.normal_text == "Hello "
+        assert not result.calls
+
+        result = parser.parse_streaming_increment(
+            "l><function=run_tests></function></tool_call>",
+            [no_parameter_tool])
+        assert result.normal_text == ""
+        assert len(result.calls) == 2
+        assert result.calls[0].name == "run_tests"
+        assert result.calls[0].parameters == ""
+        assert result.calls[1].parameters == "{}"
+
     def test_streaming_parameter_and_parallel_calls_keep_valid_arguments(
             self, sample_tools):
         """Test parameterized and parallel calls retain valid JSON arguments."""
