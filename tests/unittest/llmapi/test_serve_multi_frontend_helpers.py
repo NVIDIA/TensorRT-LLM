@@ -15,9 +15,11 @@
 """CPU coverage for trtllm-serve's multi-frontend helpers.
 
 An attached frontend forwards launcher-owned routes to the launcher over a
-Unix socket and watches the launcher for engine or process death. Both are
-exercised here against a fake launcher, together with the OpenAIServer hooks
-that wire them in; spawning real frontends needs a GPU engine.
+Unix socket, follows the clock offset the launcher publishes, and watches the
+launcher for engine or process death. These are exercised here against a fake
+launcher, together with the OpenAIServer hooks that wire them in (including
+that only the launcher registers the server); spawning real frontends needs a
+GPU engine.
 """
 
 import asyncio
@@ -27,6 +29,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest import mock
 
 import msgspec
 import pytest
@@ -35,11 +38,15 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Match
 
+from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import openai_server
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
     AttachedFrontendWatchdog,
     LauncherForwarder,
+    SharedClockOffset,
+    follow_clock_offset,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -355,3 +362,111 @@ def test_on_launcher_lost_keeps_an_earlier_fatal_error(monkeypatch) -> None:
 
     assert executor.fatal_errors == [] and executor._fatal_error is first
     assert signals == [signal.SIGINT]
+
+
+def test_shared_clock_offset_publish_and_poll(tmp_path) -> None:
+    launcher = SharedClockOffset(str(tmp_path))
+    follower = SharedClockOffset(str(tmp_path))
+    assert follower.poll() is None  # nothing published yet
+    launcher.publish(-12.5)
+    assert follower.poll() == -12.5
+    assert follower.poll() is None  # unchanged since the last poll
+    launcher.publish(-12.5)
+    assert follower.poll() is None  # same value: nothing to apply
+    # Back-to-back publishes: the latest value wins, nothing is skipped.
+    launcher.publish(0.125)
+    launcher.publish(0.25)
+    assert follower.poll() == 0.25
+    # A torn, foreign or non-finite file is ignored rather than applied.
+    for junk in ("not a number", "nan", "inf"):
+        (tmp_path / "clock_offset").write_text(junk)
+        assert follower.poll() is None
+    assert [p.name for p in tmp_path.iterdir()] == ["clock_offset"]
+
+
+def test_follow_clock_offset_applies_each_published_offset(tmp_path) -> None:
+    launcher = SharedClockOffset(str(tmp_path))
+    applied = []
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            follow_clock_offset(SharedClockOffset(str(tmp_path)), applied.append, 0.01)
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert applied == []
+            launcher.publish(3.0)
+            await _wait_for(lambda: applied == [3.0])
+            launcher.publish(-1.5)
+            await _wait_for(lambda: applied == [3.0, -1.5])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def _clock_server(shared) -> OpenAIServer:
+    server = object.__new__(OpenAIServer)
+    server._adjusted_steady_clock = AdjustedSteadyClock(time_source=lambda: 100.0)
+    server._shared_clock_offset = shared
+    return server
+
+
+def test_launcher_shares_the_disagg_clock_offset(tmp_path) -> None:
+    server = _clock_server(SharedClockOffset(str(tmp_path)))
+    response = asyncio.run(server.set_steady_clock_offset(offset=-7.25))
+    assert response.status_code == 200
+    assert server._adjusted_steady_clock.now() == 100.0 - 7.25
+    assert SharedClockOffset(str(tmp_path)).poll() == -7.25
+
+
+def test_unshared_clock_offset_is_reported(tmp_path) -> None:
+    # The disaggregated server warns about misaligned timestamps on non-200.
+    server = _clock_server(SharedClockOffset(str(tmp_path / "gone")))
+    response = asyncio.run(server.set_steady_clock_offset(offset=1.0))
+    assert response.status_code == 500
+
+
+def test_single_frontend_sets_its_clock_only() -> None:
+    server = _clock_server(None)
+    response = asyncio.run(server.set_steady_clock_offset(offset=2.0))
+    assert response.status_code == 200
+    assert server._adjusted_steady_clock.now() == 102.0
+
+
+def _registering_server(registers: bool) -> OpenAIServer:
+    server = object.__new__(OpenAIServer)
+    server._registers_server = registers
+    server.metadata_server = mock.Mock()
+    server.disagg_cluster_config = SimpleNamespace(cluster_uri="etcd://h:2379", cluster_name="c")
+    server.disagg_cluster_worker = None
+    server.server_role = ServerRole.CONTEXT
+    server.model = "m"
+    server.binding_addr = "http://h:8000"
+    server.host, server.port = "h", 8000
+    server.generator = SimpleNamespace(llm_id="h-1-0")
+    return server
+
+
+@pytest.mark.parametrize("is_launcher", [True, False])
+def test_only_the_launcher_registers_the_server(monkeypatch, is_launcher: bool) -> None:
+    storage = mock.Mock()
+    worker_cls = mock.Mock()
+    monkeypatch.setattr(openai_server, "create_cluster_storage_client", storage)
+    monkeypatch.setattr(openai_server, "DisaggClusterWorker", worker_cls)
+    server = _registering_server(registers=is_launcher)
+
+    server._register_server()
+
+    if is_launcher:
+        key, metadata = server.metadata_server.put.call_args.args
+        assert key == "trtllm/h-1-0" and metadata["url"] == "http://h:8000"
+        worker_cls.assert_called_once()
+        assert server.disagg_cluster_worker is worker_cls.return_value
+    else:
+        # Attached frontends serve the launcher's port: one server, one entry.
+        server.metadata_server.put.assert_not_called()
+        storage.assert_not_called()
+        worker_cls.assert_not_called()
+        assert server.disagg_cluster_worker is None

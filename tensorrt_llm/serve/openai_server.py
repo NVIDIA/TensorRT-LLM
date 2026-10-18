@@ -98,7 +98,9 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
-                                               MultiFrontendServing)
+                                               MultiFrontendServing,
+                                               SharedClockOffset,
+                                               follow_clock_offset)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
@@ -612,7 +614,14 @@ class OpenAIServer(_VideoRoutesMixin):
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
-        self.metadata_server = create_metadata_server(metadata_server_cfg)
+        # One server, one registration: attached frontends serve the
+        # launcher's port, so only the launcher advertises it to a metadata
+        # server or disagg cluster. Registering under each process's own
+        # identity listed one server once per frontend.
+        self._registers_server = (multi_frontend_serving is None
+                                  or multi_frontend_serving.is_launcher)
+        self.metadata_server = (create_metadata_server(metadata_server_cfg)
+                                if self._registers_server else None)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
         # Seed media-IO decode defaults from the model's input processor, then
@@ -694,6 +703,13 @@ class OpenAIServer(_VideoRoutesMixin):
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
+        # POST /steady_clock_offset is launcher-owned; the launcher publishes
+        # the offset next to its socket and attached frontends follow it.
+        self._shared_clock_offset: Optional[SharedClockOffset] = (
+            SharedClockOffset(
+                os.path.dirname(multi_frontend_serving.launcher_uds))
+            if multi_frontend_serving is not None else None)
+        self._clock_offset_task: Optional[asyncio.Task] = None
         # Requests finishing on attached frontends never wake the launcher's
         # collector, so the launcher also polls on a fixed cadence.
         self._iteration_stats_poll_interval: Optional[float] = (
@@ -729,27 +745,7 @@ class OpenAIServer(_VideoRoutesMixin):
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             await self._perf_metrics_writer.start()
-            if self.metadata_server is not None:
-                metadata = {
-                    "model": self.model,
-                    "version": VERSION,
-                    "timestamp": datetime.now().isoformat(),
-                    "server_role": server_role.name,
-                    "url": self.binding_addr
-                }
-                # TODO: add more metadata
-                # Register with ETCD using the existing key format
-                self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
-                                         metadata)
-                logger.info(f"trtllm/{self.generator.llm_id} is registered")
-
-            if self.disagg_cluster_config:
-                self.disagg_cluster_storage = create_cluster_storage_client(
-                    self.disagg_cluster_config.cluster_uri,
-                    self.disagg_cluster_config.cluster_name)
-                self.disagg_cluster_worker = DisaggClusterWorker(
-                    self.server_role, self.host, self.port,
-                    self.disagg_cluster_config, self.disagg_cluster_storage)
+            self._register_server()
 
             # VisualGen has no args
             if not self._is_visual_gen:
@@ -774,6 +770,9 @@ class OpenAIServer(_VideoRoutesMixin):
                             self._launcher_forwarder,
                             self._multi_frontend.launcher_pid,
                             self._on_launcher_lost).run())
+                    self._clock_offset_task = asyncio.create_task(
+                        follow_clock_offset(self._shared_clock_offset,
+                                            self._apply_shared_clock_offset))
                     logger.info(
                         "Attached frontend: forwarding launcher-owned routes "
                         f"to {self._multi_frontend.launcher_uds}")
@@ -810,12 +809,13 @@ class OpenAIServer(_VideoRoutesMixin):
             yield
 
             await self._perf_metrics_writer.close()
-            if self._launcher_watchdog_task is not None:
-                self._launcher_watchdog_task.cancel()
-                try:
-                    await self._launcher_watchdog_task
-                except asyncio.CancelledError:
-                    pass
+            for task in (self._launcher_watchdog_task, self._clock_offset_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             if self._launcher_forwarder is not None:
                 await self._launcher_forwarder.close()
             if self.embedding_batcher is not None:
@@ -831,11 +831,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     pass
                 logger.info("Stopped background iteration stats collector task")
 
-            if self.metadata_server is not None:
-                self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
-                logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
-            if self.disagg_cluster_worker:
-                await self.disagg_cluster_worker.deregister_worker()
+            await self._deregister_server()
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
@@ -1708,6 +1704,48 @@ class OpenAIServer(_VideoRoutesMixin):
                                    methods=[method],
                                    include_in_schema=False)
 
+    def _register_server(self) -> None:
+        """Advertise this server to a metadata server and/or disagg cluster.
+
+        Attached frontends skip this (see ``_registers_server``); the disagg
+        cluster worker created here registers once uvicorn serves.
+        """
+        if not self._registers_server:
+            return
+        if self.metadata_server is not None:
+            metadata = {
+                "model": self.model,
+                "version": VERSION,
+                "timestamp": datetime.now().isoformat(),
+                "server_role": self.server_role.name,
+                "url": self.binding_addr
+            }
+            # TODO: add more metadata
+            # Register with ETCD using the existing key format
+            self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
+                                     metadata)
+            logger.info(f"trtllm/{self.generator.llm_id} is registered")
+
+        if self.disagg_cluster_config:
+            self.disagg_cluster_storage = create_cluster_storage_client(
+                self.disagg_cluster_config.cluster_uri,
+                self.disagg_cluster_config.cluster_name)
+            self.disagg_cluster_worker = DisaggClusterWorker(
+                self.server_role, self.host, self.port,
+                self.disagg_cluster_config, self.disagg_cluster_storage)
+
+    async def _deregister_server(self) -> None:
+        if self.metadata_server is not None:
+            self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
+            logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
+        if self.disagg_cluster_worker:
+            await self.disagg_cluster_worker.deregister_worker()
+
+    def _apply_shared_clock_offset(self, offset: float) -> None:
+        self._adjusted_steady_clock.set_reference_offset(offset)
+        logger.info(f"Following the launcher's steady clock offset between "
+                    f"local and disagg server: {offset} second")
+
     def _on_launcher_lost(self, error: BaseException) -> None:
         """Watchdog callback of an attached frontend: fail fast, then shut down.
 
@@ -1859,6 +1897,18 @@ class OpenAIServer(_VideoRoutesMixin):
         logger.info(
             f"The steady clock offset between local and disagg server: {offset} second"
         )
+        # Multi-frontend launcher (attached frontends forward this route
+        # here): every frontend stamps its own requests' perf metrics, so
+        # share the offset with them.
+        shared = getattr(self, "_shared_clock_offset", None)
+        if shared is not None:
+            try:
+                shared.publish(offset)
+            except OSError as e:
+                logger.error(
+                    f"Failed to share the steady clock offset with the "
+                    f"attached frontends: {e}")
+                return Response(status_code=500, content=str(e))
         return Response(status_code=200)
 
     async def get_steady_clock_offset(self) -> JSONResponse:

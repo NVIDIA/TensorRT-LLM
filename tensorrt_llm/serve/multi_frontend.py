@@ -17,16 +17,22 @@
 Several frontend processes share one executor and one ``SO_REUSEPORT`` port,
 and a client cannot choose which of them answers. Anything that needs exactly
 one owner per server therefore lives in the launcher (frontend 0): draining
-the engine's iteration statistics and KV-cache events, runtime profiling, and
-the in-memory Anthropic Message Batches store. The launcher's uvicorn also
-listens on a Unix domain socket in the multi-frontend ipc directory; attached
-frontends forward those routes to it (:class:`LauncherForwarder`) and watch it
-(:class:`AttachedFrontendWatchdog`) so that a dead launcher or engine does not
-leave them answering ``/health`` 200 with nothing behind them.
+the engine's iteration statistics and KV-cache events, runtime profiling, the
+in-memory Anthropic Message Batches store, the disaggregated server's clock
+offset, and the server's registration with a metadata server or disagg
+cluster. The launcher's uvicorn also listens on a Unix domain socket in the
+multi-frontend ipc directory; attached frontends forward those routes to it
+(:class:`LauncherForwarder`), follow the clock offset it publishes there
+(:class:`SharedClockOffset`), and watch it (:class:`AttachedFrontendWatchdog`)
+so that a dead launcher or engine does not leave them answering ``/health``
+200 with nothing behind them.
 """
 
 import asyncio
+import contextlib
+import math
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -39,6 +45,8 @@ from tensorrt_llm.logger import logger
 LAUNCHER_UDS_NAME = "launcher.sock"
 # Carries the launcher's Unix socket path to the attached frontends it spawns.
 LAUNCHER_UDS_ENV = "TLLM_SERVE_LAUNCHER_UDS"
+# The clock offset the launcher publishes in the multi-frontend ipc dir.
+CLOCK_OFFSET_NAME = "clock_offset"
 
 # Routes an attached frontend hands to the launcher, as FastAPI route
 # templates. They are registered before the regular routes, and FastAPI
@@ -49,6 +57,7 @@ FORWARDED_ROUTES = (
     ("POST", "/kv_cache_events"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
+    ("POST", "/steady_clock_offset"),
     ("GET", "/v1/messages/batches"),
     ("POST", "/v1/messages/batches"),
     ("GET", "/v1/messages/batches/{rest:path}"),
@@ -167,6 +176,61 @@ class LauncherForwarder:
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
+
+
+class SharedClockOffset:
+    """The disaggregated server's clock offset, shared by all frontends.
+
+    The disaggregated server measures this server's steady-clock offset and
+    POSTs it once, so it reaches a single frontend, which forwards it to the
+    launcher. Every frontend stamps its own requests' perf metrics with the
+    offset, though, so the launcher publishes it in the multi-frontend ipc dir
+    and the attached frontends follow it (:func:`follow_clock_offset`).
+    """
+
+    def __init__(self, ipc_dir: str):
+        self._path = os.path.join(ipc_dir, CLOCK_OFFSET_NAME)
+        self._seen = None
+
+    def publish(self, offset: float) -> None:
+        """Launcher side: atomically replace the published offset."""
+        fd, tmp = tempfile.mkstemp(prefix=f".{CLOCK_OFFSET_NAME}.", dir=os.path.dirname(self._path))
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(repr(float(offset)))
+            os.replace(tmp, self._path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    def poll(self) -> Optional[float]:
+        """The published offset if it changed since the last poll, else None."""
+        try:
+            with open(self._path) as f:
+                offset = float(f.read())
+        except (OSError, ValueError):
+            return None
+        if not math.isfinite(offset) or offset == self._seen:
+            return None
+        self._seen = offset
+        return offset
+
+
+async def follow_clock_offset(
+    shared: SharedClockOffset, apply: Callable[[float], None], interval_s: float = 0.25
+) -> None:
+    """Attached-frontend loop: apply every offset the launcher publishes.
+
+    The disaggregated server calibrates a server when its router adds it, so
+    only requests routed within ``interval_s`` of that can still be stamped
+    with the previous offset; in exchange the request path never reads the file.
+    """
+    while True:
+        offset = shared.poll()
+        if offset is not None:
+            apply(offset)
+        await asyncio.sleep(interval_s)
 
 
 class AttachedFrontendWatchdog:
