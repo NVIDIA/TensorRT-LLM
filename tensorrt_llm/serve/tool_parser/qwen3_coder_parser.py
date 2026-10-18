@@ -170,6 +170,15 @@ class Qwen3CoderToolParser(BaseToolParser):
                             self.streamed_args_for_tool[self.current_tool_id] = (
                                 current_streamed + "}"
                             )
+                    else:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters="{}",
+                            )
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] = "{}"
 
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]

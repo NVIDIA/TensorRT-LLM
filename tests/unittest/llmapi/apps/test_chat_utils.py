@@ -153,10 +153,36 @@ class TestParseAssistantMessages:
             parse_chat_message_content(message, mock_mm_data_tracker)
 
     @pytest.mark.parametrize(
+        "arguments",
+        ["", "  \t\n", "{}"],
+    )
+    def test_assistant_message_tool_call_accepts_empty_object_arguments(
+        self, mock_mm_data_tracker, arguments
+    ) -> None:
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": arguments,
+                    },
+                }
+            ],
+        }
+
+        result = parse_chat_message_content(message, mock_mm_data_tracker)
+
+        assert result["tool_calls"][0]["function"]["arguments"] == {}
+
+    @pytest.mark.parametrize(
         ("arguments", "match"),
         [
-            ("", r"tool_calls\[0\]\.function\.arguments must be valid JSON"),
             ("[]", r"tool_calls\[0\]\.function\.arguments must be a JSON object"),
+            ('"{}"', r"tool_calls\[0\]\.function\.arguments must be a JSON object"),
             ("0", r"tool_calls\[0\]\.function\.arguments must be a JSON object"),
         ],
     )
