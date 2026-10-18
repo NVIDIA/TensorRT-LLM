@@ -34,6 +34,9 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   TP4 all-reduce.
 - ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL`` (default off): extend finalize fusion
   to TP8/EP8 across two NVLink-connected four-GPU GB300 nodes.
+- ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED`` (default off): serve batches of
+  129..512 tokens with the fused finalize + all-reduce, as consecutive calls of
+  at most 128 tokens.
 - ``MUSESPARK_OPEN_SHARDED_PROJECTIONS`` (default off, experimental): column-shard
   TP8 pool/unpool projections for batches of at most eight tokens.
 - ``MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT`` (default on): fused pre-expert
@@ -661,6 +664,32 @@ def _fused_finalize_ar_enabled() -> bool:
         "false",
         "no",
         "off",
+    )
+
+
+#: The largest batch ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED`` serves with the
+#: fused finalize + all-reduce: decode steps of up to 64 requests at eight rows
+#: each. Larger batches (prefill chunks) keep the unfused finalize and NCCL.
+_FINALIZE_AR_CHUNKED_MAX_TOKENS = 512
+
+
+def _fused_finalize_ar_chunked_enabled() -> bool:
+    """Whether batches of 129..512 tokens take the fused finalize + all-reduce in 128-token calls.
+
+    Off unless MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED names a truthy value.
+    The fused kernel serves at most 128 tokens per call; this runs it once per
+    128-token chunk instead of falling back to the unfused finalize and the
+    NCCL all-reduce. Each token's result is bitwise what the fused kernel
+    returns for it at up to 128 tokens; against the unfused fallback it
+    differs as the fused path does there (per-rank BF16 partials summed in
+    FP32). Resolved at module construction, before warmup and any graph
+    capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -1752,6 +1781,9 @@ class MuseSparkOpenMoE(nn.Module):
         self.metap_multiplier = config.metap_multiplier
         self.mapping = model_config.mapping
         self._large_finalize_4warps = os.getenv("MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS", "0") == "1"
+        self._finalize_ar_max_tokens = (
+            _FINALIZE_AR_CHUNKED_MAX_TOKENS if _fused_finalize_ar_chunked_enabled() else 128
+        )
         self._bf16x3_router_enabled = (
             os.getenv("MUSESPARK_OPEN_BF16X3_ROUTER", "0") == "1"
             and torch.cuda.is_available()
@@ -2256,12 +2288,17 @@ class MuseSparkOpenMoE(nn.Module):
             routing_method.clear_routing_memo()
             with self.nvtx("finalize"):
                 workspace = getattr(self, "_finalize_ar_workspace", None)
-                if (
-                    workspace is not None
-                    and 1 <= num_tokens <= 128
-                    and not torch.compiler.is_compiling()
-                ):
-                    combined = workspace.finalize(
+                # Batches above one fused call's 128 tokens need a workspace
+                # that chunks them; a wrapper without ``finalize_chunked``
+                # leaves them on the unfused path.
+                finalize = None
+                if workspace is not None and not torch.compiler.is_compiling():
+                    if 1 <= num_tokens <= 128:
+                        finalize = workspace.finalize
+                    elif num_tokens <= getattr(self, "_finalize_ar_max_tokens", 128):
+                        finalize = getattr(workspace, "finalize_chunked", None)
+                if finalize is not None:
+                    combined = finalize(
                         gemm2_output,
                         expanded_idx_to_permuted_idx,
                         token_final_scales,
