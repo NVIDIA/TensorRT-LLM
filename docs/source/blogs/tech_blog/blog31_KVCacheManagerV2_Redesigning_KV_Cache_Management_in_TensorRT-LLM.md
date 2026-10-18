@@ -99,8 +99,8 @@ The storage tier count is encoded in the sign bit of the 32-bit block index that
 WindowBlockManager per window size, each with its own pool, free list and eviction policy, alongside a
 disjoint RnnStateManager; show raw pool pointers and offset tables reaching directly into attention
 kernels. Right, V2: one KvCacheManager holding LifeCycleRegistry, BlockRadixTree and a StorageManager
-spanning GPU, host and disk, creating one KvCache per request, which is what yields page indices to the
-kernels. -->
+spanning GPU, host and disk, with one live KvCache per in-flight request; each KvCache yields page
+indices through the same small contract. -->
 
 
 ## KVCacheManagerV2 Design
