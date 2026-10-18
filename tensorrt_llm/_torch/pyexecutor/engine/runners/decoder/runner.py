@@ -2890,6 +2890,21 @@ class DecoderRunner(ScheduledModelRunner):
             self._config.disable_overlap_scheduler, spec_config, attn_metadata
         )
 
+    def _kv_lens_refreshed_again_below(
+        self, attn_meta: AttentionMetadata, *, enable_spec_decode: bool
+    ) -> bool:
+        """Whether overlap correction supersedes the first DSA metadata refresh."""
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+        from tensorrt_llm._torch.speculative.mtp_tail_trim import mtp_tail_trim_enabled
+
+        return (
+            type(attn_meta) is DSAtrtllmAttentionMetadata
+            and enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta.kv_cache_manager is not None
+            and mtp_tail_trim_enabled()
+        )
+
     def _preprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
     ):
@@ -2898,7 +2913,9 @@ class DecoderRunner(ScheduledModelRunner):
         """
         attn_meta = inputs.get("attn_metadata")
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        if attn_meta is not None and not self._kv_lens_refreshed_again_below(
+            attn_meta, enable_spec_decode=enable_spec_decode
+        ):
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:

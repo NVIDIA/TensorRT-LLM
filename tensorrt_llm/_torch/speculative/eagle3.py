@@ -24,6 +24,7 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
+from .mtp_tail_trim import mtp_tail_trim_enabled
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -769,7 +770,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention.backends.sparse.dsa import is_dsa_cache_manager
+        from ..attention.backends.sparse.dsa import (
+            DSAtrtllmAttentionMetadata, is_dsa_cache_manager)
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
@@ -778,6 +780,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
+        dsa_tail_trim = (
+            self.is_mtp_eagle
+            and mtp_tail_trim_enabled()
+            and type(attn_metadata) is DSAtrtllmAttentionMetadata
+        )
         # Sparse backends that can reuse one indexer selection across the draft
         # loop expose this setter; each indexer still decides whether its own
         # config turns the reuse on.
@@ -971,6 +978,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 #   selected above for the LM head carry over as they are.
                 # Eagle3: the EAGLE draft model returns a secondary
                 #   ``hidden_states_to_save`` specifically for this purpose.
+                is_last_step = i + 1 >= runtime_draft_len
                 if i + 1 < runtime_draft_len:
                     if self.is_mtp_eagle:
                         hidden_states = request_hidden_states
@@ -1009,7 +1017,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         self._prepare_flash_mla_generation_layout(
                             attn_metadata, num_contexts, batch_size)
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.update_for_spec_dec()
+                        Eagle3OneModelWorker._update_for_next_draft_step(
+                            attn_metadata, dsa_tail_trim,
+                            is_last_step)
 
                     # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
                     # tokens in the first draft step (attention runs in spec-dec
@@ -1020,7 +1030,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[:batch_size] += 1
-                        attn_metadata.update_for_spec_dec()
+                        Eagle3OneModelWorker._update_for_next_draft_step(
+                            attn_metadata, dsa_tail_trim,
+                            is_last_step)
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all draft layers have run,
@@ -1032,6 +1044,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
         return next_draft_tokens
+
+    @staticmethod
+    def _update_for_next_draft_step(
+        attn_metadata: AttentionMetadata, dsa_tail_trim: bool, is_last_step: bool
+    ) -> None:
+        """Refresh cache mappings while omitting index schedules with no reader."""
+        from ..attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+
+        skip = (
+            dsa_tail_trim
+            and isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
+            and (is_last_step or attn_metadata.mtp_next_step_reuses_topk())
+        )
+        if not skip:
+            attn_metadata.update_for_spec_dec()
+            return
+        attn_metadata.set_skip_indexer_sched_metadata(True)
+        try:
+            attn_metadata.update_for_spec_dec()
+        finally:
+            attn_metadata.set_skip_indexer_sched_metadata(False)
 
     def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
         """Pick the right ``all_rank_num_tokens`` for this draft iteration.

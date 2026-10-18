@@ -640,6 +640,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
 
+        # The draft loop can leave index-only schedules stale until the next
+        # full rebuild, while cache-write mappings are always refreshed.
+        skip_sched = self._skip_indexer_sched_metadata
+
         # Default fused path: collapse the eager DSA decode-metadata chain
         # (req_idx_per_token + slot mappings + the two gen indptr cumsums) into
         # one fused Triton launch. Only for the pure-decode/generation step
@@ -724,47 +728,51 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.int64,
                     out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
                 )
-            gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-            gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
-            self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
-            scheduler_context_lens = self.update_indexer_kv_lens_2d(gen_indexer_kv_lens)
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
-            )
-            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
-                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    scheduler_context_lens.contiguous(),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
+            if skip_sched:
+                self.mtp_sched_metadata_stale = True
+            else:
+                self.mtp_sched_metadata_stale = False
+                gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
+                gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
+                self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
+                scheduler_context_lens = self.update_indexer_kv_lens_2d(gen_indexer_kv_lens)
+                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                    gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
                 )
-                self.scheduler_metadata_buffer_full_next_n.copy_(
-                    scheduler_metadata_buffer_full_next_n, non_blocking=True
-                )
-            if self.use_expanded_buffers_for_mtp:
-                kv_lens_expanded, num_tokens = self.expand_per_gen_token(gen_indexer_kv_lens)
-                self.kv_lens_expanded_cuda[:num_tokens].copy_(kv_lens_expanded)
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True
-                )
-            if self.expand_for_dsl and self.dsl_expand_factor > 1:
-                expand_factor = self.dsl_expand_factor
-                num_tokens = self.num_generations * expand_factor
-                gen_kv_lens_expanded = gen_indexer_kv_lens.repeat_interleave(expand_factor)
-                self.kv_lens_expanded_cuda[:num_tokens].copy_(gen_kv_lens_expanded)
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True
-                )
+                self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
+                if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        scheduler_context_lens.contiguous(),
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    self.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n, non_blocking=True
+                    )
+                if self.use_expanded_buffers_for_mtp:
+                    kv_lens_expanded, num_tokens = self.expand_per_gen_token(gen_indexer_kv_lens)
+                    self.kv_lens_expanded_cuda[:num_tokens].copy_(kv_lens_expanded)
+                    scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                        self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    self.scheduler_metadata_buffer_expanded.copy_(
+                        scheduler_metadata_buffer_expanded, non_blocking=True
+                    )
+                if self.expand_for_dsl and self.dsl_expand_factor > 1:
+                    expand_factor = self.dsl_expand_factor
+                    num_tokens = self.num_generations * expand_factor
+                    gen_kv_lens_expanded = gen_indexer_kv_lens.repeat_interleave(expand_factor)
+                    self.kv_lens_expanded_cuda[:num_tokens].copy_(gen_kv_lens_expanded)
+                    scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                        self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    self.scheduler_metadata_buffer_expanded.copy_(
+                        scheduler_metadata_buffer_expanded, non_blocking=True
+                    )
 
         if fused_eligible:
             if not getattr(self, "_fused_dsa_meta_armed", False):
@@ -776,7 +784,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self._fused_dsa_meta_armed = True
             self._run_fused_dsa_decode_metadata()
 
-        self._compute_kv_lens_row_reorder()
+        if not skip_sched:
+            self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def _run_fused_dsa_decode_metadata(self):
@@ -1468,6 +1477,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def set_skip_topk(self, skip: bool) -> None:
         self.indexer_skip_topk = skip
+
+    _skip_indexer_sched_metadata: bool = False
+    mtp_sched_metadata_stale: bool = False
+
+    def set_skip_indexer_sched_metadata(self, skip: bool) -> None:
+        self._skip_indexer_sched_metadata = skip
+
+    def mtp_next_step_reuses_topk(self) -> bool:
+        """True when a following MTP draft step (which runs with
+        indexer_skip_topk) takes the indexer's reuse-TopK path instead of the
+        MQA-logits + TopK path."""
+        params = self.sparse_metadata_params
+        return (
+            self.in_mtp_draft_loop
+            and params is not None
+            and params.mtp_index_share
+            and self.shared_topk_indices is not None
+        )
 
     def set_in_mtp_draft_loop(self, active: bool) -> None:
         self.in_mtp_draft_loop = active
