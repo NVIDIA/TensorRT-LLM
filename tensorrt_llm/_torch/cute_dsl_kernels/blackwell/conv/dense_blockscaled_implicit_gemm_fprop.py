@@ -119,11 +119,18 @@ class PipelineTmaCpAsyncUmma(PipelineAsync):
             cta_rank_here = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             coord_self = cta_layout_vmnk.get_flat_coord(cta_rank_here)
             coord_peer = (coord_self[0] ^ 1, *coord_self[1:])
-            # Leader cluster rank (v=0 within this V-group). For V=2 the
-            # flat rank is v + m*V + ..., so clearing the V bit yields the
-            # leader. Both leader and peer's cpasync lanes remote-arrive on
-            # leader's sfa_full barrier to close the peer-sSFA race.
-            producer_mask = cta_rank_here & ~cutlass.Int32(1)
+            # SFA cp.async remote-arrive target. Only meaningful for 2CTA, where
+            # the peer CTA's cp.async lands in the leader's SMEM and both CTAs
+            # must remote-arrive on the leader's sfa_full to close the peer-sSFA
+            # race. The 2CTA flat rank is v + m*V + ..., so clearing the V bit
+            # yields the leader rank. In a non-2CTA cluster (V=1) every CTA owns
+            # its SFA locally, so producer_arrive_remote stays on the local
+            # barrier and this value is unused; keep it as self-rank.
+            producer_mask = (
+                cta_rank_here & ~cutlass.Int32(1)
+                if cta_group == cute.nvgpu.tcgen05.CtaGroup.TWO
+                else cta_rank_here
+            )
             mask_a_self = cute.nvgpu.cpasync.create_tma_multicast_mask(
                 cta_layout_vmnk, coord_self, mcast_mode=2
             )
@@ -197,21 +204,6 @@ class PipelineTmaCpAsyncUmma(PipelineAsync):
             _leader_arrive_and_expect_tx,
         )
 
-    def producer_acquire_cpasync(
-        self,
-        state: PipelineState,
-        try_acquire_token: Optional[cutlass.Boolean] = None,
-    ) -> None:
-        """cp.async producer path: only wait for buffer empty; arrive is issued via producer_commit_cpasync."""
-        _if_generate(
-            try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
-        )
-
-    def producer_commit_cpasync(self, state: PipelineState) -> None:
-        """Each cp.async lane contributes one arrive via cp.async.mbarrier.arrive.noinc."""
-        self.sync_object_full.arrive_cp_async_mbarrier(state.index)
-
     def consumer_release(self, state: PipelineState) -> None:
         """UMMA consumer releases the shared empty barrier once per stage (multicast to peer CTAs)."""
         self.sync_object_empty.arrive(state.index, self.consumer_mask, self.cta_group)
@@ -219,13 +211,13 @@ class PipelineTmaCpAsyncUmma(PipelineAsync):
     # ------------------------------------------------------------------
     # Shift-by-K cross-CTA producer commit primitives.
     # In 2CTA clusters, cp.async.mbarrier.arrive.noinc only signals the
-    # local CTA's sfa_full, so the peer's LDGSTS landing on leader SMEM
+    # local CTA's sfa_full, so the peer's cp.async landing on leader SMEM
     # is not covered. Split the commit into commit_group + wait_group(K)
     # + cross-CTA mbarrier.arrive(dst=leader_rank) so that arrives are
-    # deferred by K iters, giving LDGSTS time to land on both CTAs
+    # deferred by K iters, giving cp.async time to land on both CTAs
     # before the leader MMA fires.
     def producer_cp_async_commit(self) -> None:
-        """Register all prior LDGSTS as one cp.async group."""
+        """Register all prior cp.async copies as one cp.async group."""
         cute.arch.cp_async_commit_group()
 
     def producer_cp_async_wait(self, num_inflight: int) -> None:
@@ -233,9 +225,19 @@ class PipelineTmaCpAsyncUmma(PipelineAsync):
         cute.arch.cp_async_wait_group(num_inflight)
 
     def producer_arrive_remote(self, stage_index) -> None:
-        """Remote-arrive on leader's sfa_full[stage_index] via DSMEM."""
+        """Signal SFA cp.async completion on sfa_full[stage_index].
+
+        In a 2CTA cluster the peer CTA's cp.async lands in the leader's SMEM,
+        so both CTAs must arrive on the leader's sfa_full via DSMEM (producer_mask
+        holds the leader rank). In a non-2CTA cluster every CTA owns its SFA
+        locally, so the arrive stays on the local barrier with no DSMEM
+        retargeting.
+        """
         bar = self.sync_object_full.get_barrier(stage_index)
-        cute.arch.mbarrier_arrive(bar, self.producer_mask)
+        if cutlass.const_expr(self.cta_group == cute.nvgpu.tcgen05.CtaGroup.TWO):
+            cute.arch.mbarrier_arrive(bar, self.producer_mask)
+        else:
+            cute.arch.mbarrier_arrive(bar)
 
 
 """
@@ -257,13 +259,13 @@ This implicit-GEMM based convolution works by converting the convolution into a 
 During the load of input tensor to SMEM, the TMA operation performs the im2col transformation on the input tensor A.
 This transforms the A matrix into the required shape for the GEMM operation (NxZxPxQ by TxRxSxC), and may involve replication of the input elements.
 Filter tensor can be loaded to SMEM without any transformation.
-The output tensor D is then stored to GMEM via TMASTG.im2col (no transformation necessary).
+The output tensor D is then stored to GMEM via TMA im2col store (no transformation necessary).
 
 To run this example:
 
 .. code-block:: bash
 
-    python -m tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop \
+    python examples/blackwell/kernel/conv/dense_blockscaled_implicit_gemm_fprop.py \
       --ncdhw 1,128,32,32,32 --ktrs 256,3,3,3                         \
       --use_2cta_instrs --mma_tiler_mn 256,128                        \
       --preferred_cluster_shape_mn 2,1 --fallback_cluster_shape_mn 1,1 \
@@ -274,7 +276,7 @@ To collect performance with NCU profiler:
 
 .. code-block:: bash
 
-    ncu python -m tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop \
+    ncu python examples/blackwell/kernel/conv/dense_blockscaled_implicit_gemm_fprop.py \
       --ncdhw 1,128,32,32,32 --ktrs 256,3,3,3                         \
       --use_2cta_instrs --mma_tiler_mn 256,128                        \
       --preferred_cluster_shape_mn 2,1 --fallback_cluster_shape_mn 1,1 \
@@ -283,29 +285,29 @@ To collect performance with NCU profiler:
       --warmup_iterations 1 --iterations 10 --skip_ref_check
 
 Constraints:
-* A/B data type must be Float4E2M1FN with sf_vec_size=16. Other block-scaled
-  dtypes (fp8, or fp4 with sf_vec_size=32) are not implemented and are rejected
-  by can_implement.
+* A/B data type is Float4E2M1FN (NVFP4) or Float8E4M3FN (MXFP8). Each pins its
+  scale-factor format: NVFP4 takes a Float8E4M3FN scale over 16 channels, MXFP8 a
+  Float8E8M0FNU scale over 32. A block-scaled narrow output takes the same format
+  for its own scale factor, which pairs NVFP4 with an FP4 output and MXFP8 with an
+  FP8 E4M3 one; a 16-bit output carries no scale factor.
 * A/B tensor must have the same data type
-* Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-* Mma tiler N must be 32-256, step 32
+* Mma tiler M must be 128 with use_2cta_instrs=False or 256 with True, the two
+  shapes giving the per-CTA M of 128 that the block-scaled MMA requires
+* Mma tiler N must be a multiple of 32 up to 256. Only 64, 128, 192 and 256 have a
+  per-tile offset into the staged scale-factor chunk, so the others serve problems
+  needing a single N tile
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 * Cluster shape M must be multiple of 2 if use_2cta_instrs=True
 * The contiguous dimension of A/B/D tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 4, 8, and 16 for TFloat32,
   Float16/BFloat16, and Int8/Uint8/Float8, respectively.
-* The GEMM-K tile is not an independent tunable. It is derived from the input
-  channel count C as tile_k = mma_inst_shape_k * min(4, C // mma_inst_shape_k),
-  where mma_inst_shape_k is the MMA instruction K (64 for fp4). This keeps each
-  K tile within a single filter position so that A's im2col RestK matches B's
-  flat RestK. Consequences for C:
-    - C < 256 shrinks tile_k below the full 256 (e.g. C=64 -> tile_k=64,
-      C=192 -> tile_k=192), and C is consumed in one K tile with no RestK loop.
-    - C >= 256 caps tile_k at 256 and iterates the remaining channels over RestK.
-  Because tile_k tracks C this way, C must be a multiple of mma_inst_shape_k (64)
-  and either <= 256 or a multiple of 256; other C leave either a fractional
-  SF-block group (C not a multiple of 64) or a partial trailing K tile (C > 256
-  not a multiple of 256), both of which are rejected by can_implement.
+* The GEMM-K tile is an independent compile-time choice: 64, 128 or 256 channels
+  for NVFP4 (one, two or four MMA K instructions), 128 for MXFP8. It need not
+  divide the input channel count C. A K tile wider than the channels a filter
+  position has left is a partial tile: the im2col TMA zero-fills the A and B
+  channels past C, the SFA transfer is clamped back inside the pixel's
+  scale-factor row, and SFB is addressed per filter position over a span padded
+  out to whole K tiles, so the tail contributes nothing.
 """
 
 
@@ -377,9 +379,9 @@ def _check_swizzle_size(
 class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
     """
     Persistent 3D convolution kernel.
-    The input (A) is expected to be in 5D tensor (NDHWC) format and is loaded via TMALDG.im2col atom.
-    The filter (B) is expected to be in 5D tensor (KTRSC) format and is loaded via TMALDG atom.
-    The output (D) is expected to be in 5D tensor (NZPQK) format and is stored via TMASTG.im2col.
+    The input (A) is expected to be in 5D tensor (NDHWC) format and is loaded via TMA im2col load atom.
+    The filter (B) is expected to be in 5D tensor (KTRSC) format and is loaded via TMA load atom.
+    The output (D) is expected to be in 5D tensor (NZPQK) format and is stored via TMA im2col store.
     This class reuses the kernel from the PersistentDenseGemmKernel class for the implicit GEMM.
 
     :param acc_dtype: Data type for accumulation during computation
@@ -392,9 +394,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
     :type cluster_shape_mn: Tuple[int, int]
     :param filter_trs: Filter dimensions (T, R, S)
     :type filter_trs: Tuple[int, int, int]
-    :param upper_padding_dhw: Upper padding (D, H, W)
+    :param upper_padding_dhw: Upper padding in depth, height, width order
     :type upper_padding_dhw: Tuple[int, int, int]
-    :param lower_padding_dhw: Lower padding (D, H, W)
+    :param lower_padding_dhw: Lower padding in depth, height, width order
     :type lower_padding_dhw: Tuple[int, int, int]
     :param stride_dhw: Stride (Sd, Sh, Sw)
     :type stride_dhw: Tuple[int, int, int]
@@ -484,23 +486,26 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         )
         self.sf_vec_size = sf_vec_size
 
-        # cta_tile_k shapes the compile-time shared-memory allocation. The
-        # runtime tensors provide C and all output geometry, which lets one
-        # cubin serve every shape compatible with this K tile.
+        # cta_tile_k is the compile-time K tile (shapes the SMEM allocation).
+        # The input channel count C is read from the dynamic tensors at runtime and
+        # bounded only by the alignment of the channel axis, so one cubin serves
+        # every C this kernel accepts. All output geometry (N/Z/P/Q/K) is runtime
+        # as well.
         self.cta_tile_k = cta_tile_k
 
-        # Override warp specialization for fp4 conv: 4 LDGSTS_SFA warps + sched warp.
+        # Override warp specialization for fp4 conv: 4 cp.async SFA warps + sched warp.
         self.epilogue_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.ldgsts_sfa_warp_id = (6, 7, 8, 9)
+        self.cpasync_sfa_warp_id = (6, 7, 8, 9)
         self.sched_warp_id = 10
-        # A dedicated residual G2S warp is added in __call__ only when beta != 0.
+        # Dedicated residual G2S warp, only spawned when beta != 0 (has_residual).
+        # threads_per_cta is finalized in __call__ once has_residual is known.
         self.residual_warp_id = 11
         self.base_warp_ids = (
             self.mma_warp_id,
             self.tma_warp_id,
-            *self.ldgsts_sfa_warp_id,
+            *self.cpasync_sfa_warp_id,
             self.sched_warp_id,
             *self.epilogue_warp_id,
         )
@@ -535,18 +540,21 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
-        # SFD path: only supported for FP4 (NVFP4) output. Caller opts in by
-        # passing sfd_tensor; gen_sfd is decided in __call__ from it.
-        # FP8/FP16/BF16/FP32 outputs do not carry SFD. sfd_dtype is bound to
-        # sf_dtype in __call__ (NVFP4 standard: E4M3).
-        # SFD quantizes the output in blocks of 16 elements: the NVFP4 spec
-        # pairs an E4M3 scale factor with a 16-wide FP4 data block.
-        self.sfd_vec_size: int = 16
+        # Block-scaled D (SFD) output. Caller opts in by passing sfd_tensor;
+        # gen_sfd is decided in __call__ from it. A narrow output carries one scale
+        # factor per sfd_vec_size elements; a 16-bit output carries none. The SFD
+        # block is the input SF block -- same element type (bound in
+        # __call__) and same vector size -- so a quantized output feeds the next
+        # operation directly: NVFP4 is E4M3 over 16 channels, MXFP8 E8M0 over 32.
+        self.sfd_vec_size: int = self.sf_vec_size
         # M_D is the largest absolute value representable in the output dtype,
-        # used as the full-scale target when quantizing each block to it. For
-        # FP4 (E2M1) the representable magnitudes are {0, .5, 1, 1.5, 2, 3, 4, 6},
-        # so the max is 6.0. Only FP4 output carries SFD, hence None otherwise.
-        self.M_D: float = 6.0 if self.d_dtype is cutlass.Float4E2M1FN else None
+        # the full-scale target when quantizing each block to it. FP4 (E2M1)
+        # magnitudes are {0,.5,1,1.5,2,3,4,6} so max is 6.0; E4M3 max normal is
+        # 448.0. Only narrow SFD outputs use it, hence None otherwise.
+        self.M_D: Optional[float] = {
+            cutlass.Float4E2M1FN: 6.0,
+            cutlass.Float8E4M3FN: 448.0,
+        }.get(self.d_dtype, None)
 
     def _setup_conv_tma(
         self,
@@ -673,7 +681,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # CLC response size is 4B * 4 elements
         self.num_clc_response_bytes = 16
 
-        # --- D: TMASTG im2col store (cluster-independent) ---
+        # --- D: TMA im2col store (cluster-independent) ---
         mD = cute.make_tensor(d_tensor.iterator, cute.select(d_tensor.layout, mode=[3, 2, 1, 0, 4]))
         mD = cute.group_modes(mD, begin=0, end=4)
 
@@ -759,6 +767,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -768,6 +777,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         )
 
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
@@ -779,8 +789,8 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        # can_implement() validates the runtime C against this compile-time K
-        # tile before compilation.
+        # cta_tile_k is a compile-time choice (64, 128 or 256 for FP4). It sets
+        # how many MMA-instruction K blocks a K tile spans.
         mma_inst_tile_k = self.cta_tile_k // mma_inst_shape_k
         # Expose for overlapping-accum SF column accounting (see below).
         self.mma_inst_tile_k = mma_inst_tile_k
@@ -789,19 +799,29 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             self.mma_tiler[1],
             (mma_inst_shape_k * mma_inst_tile_k,),
         )
-        self.mma_tiler_sfa = (
-            self.mma_inst_shape_mn[0],
-            self.mma_inst_shape_mn[1],
-            # SFA K-mode counts SF blocks: one block per sf_vec_size channels.
-            mma_inst_shape_k * mma_inst_tile_k // self.sf_vec_size,
+        # Scale factors tile K on their own cadence: an SF atom cannot be staged
+        # in part, so a narrower A/B K tile still stages a whole one and the A/B
+        # tiles sharing it each read their own part. Only MXFP8 gets there, with a
+        # 128-channel atom against a 64 tile; NVFP4's atom is 64, at or below
+        # every legal tile, so its ratio is 1 and every SF path keeps the A/B one.
+        self.sf_tile_k = sf_k_tile_channels(self.cta_tile_k, self.sf_vec_size)
+        self.ab_k_tiles_per_sf_k_tile = self.sf_tile_k // self.cta_tile_k
+        self.sf_mma_inst_tile_k = self.sf_tile_k // mma_inst_shape_k
+        # Flat-K tiler the SF layouts (smem, tmem, TMA box) are built from.
+        self.flat_mma_tiler_sf = (
+            self.mma_tiler[0],
+            self.mma_tiler[1],
+            self.sf_tile_k,
         )
         self.mma_tiler_sfb = (
             self.mma_inst_shape_mn_sfb[0],
             self.mma_inst_shape_mn_sfb[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            self.sf_tile_k,
         )
-        # Number of SFA LDGSTS.32 per K tile: each loads 4 SF blocks (4 bytes)
-        self.num_sfa_ldgsts = mma_inst_tile_k  # = K_gemm_tile / (sf_vec_size * 4)
+        # SFA 4-byte cp.async per SF K tile: each carries 4 SF blocks, and an SF
+        # K tile is a whole number of atoms at every legal tile_k, so the count is
+        # at least one and the power of two the group rotation below needs.
+        self.num_sfa_cpasync = self.sf_tile_k // (self.sf_vec_size * 4)
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler[1],
@@ -812,7 +832,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         self.cta_tile_shape_mnk_sfb = (
             self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler_sfb[1],
-            self.mma_tiler_sfb[2],
+            self.sf_tile_k,
         )
 
         # Compute cluster layout
@@ -856,6 +876,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             self.d_layout,
             self.sf_dtype,
             self.sf_vec_size,
+            self.flat_mma_tiler_sf,
             self.smem_capacity,
             self.occupancy,
             self.has_residual,
@@ -866,8 +887,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # otherwise reserved for SFA/SFB so the math mainloop of the next tile
         # can overlap the epilogue of the current tile.
         self.overlapping_accum = self.num_acc_stage == 1
-        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // 32) * self.mma_inst_tile_k
-        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // 32) * self.mma_inst_tile_k
+        # SF columns follow the SF K cadence: TMEM holds whole chunks.
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // 32) * self.sf_mma_inst_tile_k
+        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // 32) * self.sf_mma_inst_tile_k
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         # Reverse-subtile index (raw loop counter) at which acc can release
         # early: the number of whole epilogue subtiles the SFA/SFB-aliased
@@ -888,19 +910,17 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         self.b_smem_layout_staged = utils.sm100.make_smem_layout_b(
             tiled_mma, self.mma_tiler, self.b_dtype, self.num_ab_stage
         )
-        # Flatten hierarchical K for blockscaled utils
-        # Conv uses (K,) tuple for structured K dim, but blockscaled utils expect scalar K
-        flat_k = self.mma_tiler[2] if isinstance(self.mma_tiler[2], int) else self.mma_tiler[2][0]
-        flat_mma_tiler = (self.mma_tiler[0], self.mma_tiler[1], flat_k)
+        # The SF layouts take the flat-K SF tiler: blockscaled utils expect a
+        # scalar K where conv carries a (K,) tuple, and K runs on the SF cadence.
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
-            flat_mma_tiler,
+            self.flat_mma_tiler_sf,
             self.sf_vec_size,
             self.num_ab_stage,
         )
         self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
             tiled_mma,
-            flat_mma_tiler,
+            self.flat_mma_tiler_sf,
             self.sf_vec_size,
             self.num_ab_stage,
         )
@@ -991,13 +1011,13 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         :param d_tensor: Output tensor D - (N, Z, P, Q, K) layout
         :param sfa_tensor: Block scale factor tensor for A
         :param sfb_tensor: Block scale factor tensor for B
-        :param alpha: 1-element FP32 device tensor; applied to the accumulator
-            in FP32 before output quantization
+        :param alpha: 1-element FP32 device tensor; applied to the accumulator in FP32
+            before output quantization
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :param sfd_tensor: Output scale factor tensor (NVFP4 SFD); pass None to skip SFD generation
-        :param norm_const_tensor: 1-element FP32 device tensor; per-tensor
-            amax-derived global FP4 scale, multiplied into the SFD encode step.
-            Required when sfd_tensor is provided.
+        :param norm_const_tensor: Optional 1-element FP32 device tensor; per-tensor amax-derived
+            global FP4 scale, multiplied into the SFD encode step. Only used when
+            sfd_tensor is provided.
         :param bias_tensor: Optional length-K (output channel) device tensor; a
             per-output-channel bias added to the accumulator in FP32 as
             D = epilogue_op(alpha * acc + bias). Pass None to skip bias.
@@ -1016,10 +1036,11 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         """
         self._setup_conv_input_attrs(a_tensor, b_tensor, d_tensor)
         self.sf_dtype: Type[cutlass.Numeric] = sfa_tensor.element_type
-        # SFD shares the input sf_dtype (NVFP4 standard: Float8E4M3FN, vec=16).
+        # SFD shares the input sf_dtype (E4M3 for NVFP4, E8M0 for MXFP8).
         self.sfd_dtype: Type[cutlass.Numeric] = self.sf_dtype
-        # SFD opt-in: caller supplies both the scale-factor destination and its
-        # device-side normalization constant.
+        # SFD opt-in: caller supplies sfd_tensor. SFD is valid only with a narrow
+        # output (FP4 or FP8 E4M3). The normalization constant is required only
+        # for the block-scaled output path.
         self.gen_sfd: bool = sfd_tensor is not None and norm_const_tensor is not None
         # Bias opt-in: caller supplies a length-K per-output-channel tensor.
         self.has_bias: bool = bias_tensor is not None
@@ -1030,15 +1051,19 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         self.has_residual: bool = beta != 0.0
         if cutlass.const_expr(self.has_residual and c_tensor is None):
             raise ValueError("beta != 0 requires a c_tensor")
-        # Keep the non-residual launch unchanged; only residual kernels pay for
-        # the extra warp that overlaps residual TMA loads with the main TMA warp.
+        # Finalize the CTA thread count now that has_residual is known: the
+        # dedicated residual G2S warp only exists when beta != 0, so beta == 0
+        # launches with no extra idle warp.
         if cutlass.const_expr(self.has_residual):
             self.threads_per_cta = 32 * (len(self.base_warp_ids) + 1)
         else:
             self.threads_per_cta = 32 * len(self.base_warp_ids)
-        if cutlass.const_expr(self.gen_sfd and self.d_dtype is not cutlass.Float4E2M1FN):
+        if cutlass.const_expr(
+            self.gen_sfd and self.d_dtype not in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN)
+        ):
             raise ValueError(
-                f"SFD is only supported for Float4E2M1FN (NVFP4) output; got d_dtype={self.d_dtype}"
+                "SFD output is only supported for Float4E2M1FN (NVFP4) or "
+                f"Float8E4M3FN (MXFP8) output; got d_dtype={self.d_dtype}"
             )
         # sf_dtype is derived from SFA alone but also drives the SFB smem layout
         # and barrier transaction bytes; SFB/SFD must match it or scales get
@@ -1074,6 +1099,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         dil_op = (rt_dil_d, rt_dil_h, rt_dil_w)
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
@@ -1111,6 +1137,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # SFB tiled_mma (always 1CTA group for SFB)
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -1136,10 +1163,18 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # partial last tile slice_n runs OOB on the flattened RestN and the TMA load
         # clamps to zeros -> wrong (zero) SFB scaling on that tile. A dynamic N keeps y
         # symbolic, blocks the coalesce, and slice_n decomposes to an in-bounds coord.
-        # C*T*R*S = GEMM-K, with every extent supplied by the runtime filter.
+        # C*T*R*S = GEMM-K; T/R/S come from the dynamic filter tensor (runtime). The
+        # channel extent is the span SFB was allocated at -- C rounded up to whole SF
+        # K tiles -- on two counts. The N-mode rest stride tile_atom_to_shape_SF
+        # derives is the tensor's whole atom count, so a short extent walks the
+        # output-channel axis at the wrong pitch. And the rounding puts every filter
+        # position on a tile boundary, which keeps a K tile inside one position and
+        # lets the consumer's flat K index address the tile directly. The span comes
+        # from the runtime channel count, so one cubin serves every C.
+        sfb_c_extent = cute.ceil_div(b_tensor.shape[4], self.sf_tile_k) * self.sf_tile_k
         b_shape_for_sfb = (
             b_tensor.shape[0],
-            b_tensor.shape[4] * b_tensor.shape[1] * b_tensor.shape[2] * b_tensor.shape[3],
+            sfb_c_extent * b_tensor.shape[1] * b_tensor.shape[2] * b_tensor.shape[3],
             1,
         )
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b_shape_for_sfb, self.sf_vec_size)
@@ -1321,10 +1356,17 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         pad_d, pad_h, pad_w = lower_pad_op
         K_gemm_tile = self.mma_tiler[2][0]  # mma_inst_shape_k * mma_inst_tile_k
 
-        # Build mSFD with a flat runtime M=N*Z*P*Q axis. A hierarchical runtime
-        # mode does not divide correctly in local_tile and can leave rows
-        # unwritten; the backing SFD buffer is already dense row-major NZPQ.
+        # Build mSFD tensor with the (M, K, 1) profile of mD, where M is the
+        # flat NZPQ output-pixel axis and the K dimension is expressed as
+        # (sfd_vec_size, sf_k_padded) with strides (0, 1) so that sfd_vec_size
+        # consecutive K elements share one physical scale factor. Storage layout
+        # matches SFA's K-contig-in-M form: (mn=NZPQ, sf_k_padded, 1) with
+        # mn-stride = sf_k_padded.
         if cutlass.const_expr(self.gen_sfd):
+            # Source N/Z/P/Q/K from the dynamic output tensor (runtime Int) so
+            # one cubin serves any output geometry. The SFD store is a scalar
+            # per-element STG with a static (unrolled) element count, so only the
+            # per-thread tile is static; the global extent/strides can be runtime.
             sfd_N = conv_N
             sfd_Z = conv_Z
             sfd_P = conv_P
@@ -1333,6 +1375,14 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             sf_k = (conv_K + self.sfd_vec_size - 1) // self.sfd_vec_size
             sf_k_padded = ((sf_k + 3) // 4) * 4  # pad sf_k to multiple of 4
             stride_mn = sf_k_padded
+            # The M axis is a single flat extent N*Z*P*Q with a uniform row
+            # stride, not a hierarchical (Q,P,Z,N) tuple. local_tile splits the
+            # leading M mode by the CTA tile, and a runtime-valued hierarchical
+            # mode does not divide correctly there: the store then lands on wrong
+            # rows whenever N>1 (or any spatial extent grows past one tile),
+            # leaving some scale-factor rows unwritten. A flat runtime extent
+            # tiles cleanly because the SFD gmem buffer is dense row-major NZPQ
+            # and a plain STG needs no hierarchical structure.
             sfd_M = sfd_N * sfd_Z * sfd_P * sfd_Q
             mSFD_layout = cute.make_layout(
                 (
@@ -1357,9 +1407,14 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # epilogue reads it through the same partition_C chain as the accumulator
         # and each thread lands on its own N-column bias scalar.
         if cutlass.const_expr(bias_tensor is not None):
-            # Only the channel mode contributes to the address. A static M
-            # extent keeps the partitioned shared-memory read layout static;
-            # the runtime output tensor supplies the channel extent.
+            # The M (spatial) modes are stride-0 broadcast: every output row
+            # reads the same bias[k], so their extent never enters an address and
+            # can be a compile-time value. Using a static M extent keeps the
+            # partitioned smem-read layout static (needed for a vectorized smem load)
+            # while the N (K/channel) axis carries a runtime stride so one cubin
+            # serves any channel count. The M extent only needs to cover the CTA
+            # tile; the real output-M size is supplied at the store site through
+            # the runtime tile coordinate, not through this layout.
             mBias_layout = cute.make_layout(
                 (
                     (self.cta_tile_shape_mnk[0], 1, 1, 1),
@@ -1752,7 +1807,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # For 2CTA (use_2cta_instrs), peer CTA's 128 cpasync threads also
         # remote-arrive on leader's sfa_full via DSMEM (shift-by-K pattern)
         # to eliminate the peer-sSFA race where leader MMA proceeded before
-        # peer's LDGSTS landed. Leader's arrive_count must therefore be
+        # peer's cp.async landed. Leader's arrive_count must therefore be
         # bumped to 129 + 128 = 257.
         # num_tma_producer is provided as kernel parameter (per-cluster)
         sfa_cpasync_arrive_count = 257 if use_2cta_instrs else 129
@@ -1788,8 +1843,8 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             defer_sync=True,
         )
 
-        # Pipeline Init: residual TMA load. The dedicated residual warp issues the
-        # TMA load (single-thread producer arrive) into sC; all epilogue
+        # Pipeline Init: residual TMA load. The dedicated residual warp issues
+        # the TMA load (single-thread producer arrive) into sC; all epilogue
         # warps consume it (one release arrive per warp). No multicast: each CTA
         # loads its own output-tile residual.
         if cutlass.const_expr(mC_mnl is not None):
@@ -1809,10 +1864,12 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             c_pipeline = None
 
         # Pipeline Init: Initialize clc_pipeline (CLC fetch async)
-        # Consumers of CLC response: TMA(1) + LDGSTS_SFA(4) + MMA(1) + Epilogue(4)
+        # Consumers of CLC response: TMA(1) + cp.async SFA(4) + MMA(1) + Epilogue(4)
         # [+ residual(1) when beta != 0] per CTA, * cluster_size; plus sched(1) on
-        # the first CTA only. The residual count must use the same const gate as
-        # the residual warp below or the CLC pipeline can hang.
+        # the first CTA only. The tile-coord query is broadcast to all CTAs in the
+        # cluster. The residual term must gate on the SAME const as the residual
+        # warp's CLC-consume block (mC_mnl is not None) or CLC producer/consumer
+        # counts diverge and the fetch pipeline hangs.
         clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_shape)
         num_residual_clc_warps = 1 if cutlass.const_expr(mC_mnl is not None) else 0
@@ -1821,7 +1878,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             + cluster_size
             * (
                 1
-                + len(self.ldgsts_sfa_warp_id)
+                + len(self.cpasync_sfa_warp_id)
                 + len(self.epilogue_warp_id)
                 + 1
                 + num_residual_clc_warps
@@ -2112,6 +2169,10 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 k_S = cute.size(k_shape, mode=1)
                 k_R = cute.size(k_shape, mode=2)
                 k_T = cute.size(k_shape, mode=3)
+                # SFB boxes per filter position: one box is a whole SF K tile, so a
+                # position holds that many fewer boxes than A/B tiles. Rounding up
+                # matches the span the host padded SFB to.
+                sfb_C_tiles = cute.ceil_div(k_C_tiles, self.ab_k_tiles_per_sf_k_tile)
                 # Traversal shape in S->R->T->C order (colexicographic on this)
                 trav_shape = (k_S, k_R, k_T, k_C_tiles)
                 trav_coord = cute.repeat_like(0, trav_shape)
@@ -2146,12 +2207,14 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                         mcast_mask=b_full_mcast_mask,
                     )
                     # TMA load SFB: compute flat K tile index from (c,s,r,t)
-                    # SFB uses flat layout with C->S->R->T physical order
+                    # SFB uses flat layout with C->S->R->T physical order. The
+                    # channel coordinate is on the SF cadence, so the A/B tiles
+                    # sharing one chunk name the same box and each stages it whole.
                     sfb_flat_k = (
-                        ab_coord[0]
-                        + ab_coord[1] * k_C_tiles
-                        + ab_coord[2] * k_S * k_C_tiles
-                        + ab_coord[3] * k_R * k_S * k_C_tiles
+                        ab_coord[0] // self.ab_k_tiles_per_sf_k_tile
+                        + ab_coord[1] * sfb_C_tiles
+                        + ab_coord[2] * k_S * sfb_C_tiles
+                        + ab_coord[3] * k_R * k_S * sfb_C_tiles
                     )
                     cute.copy(
                         tma_atom_sfb,
@@ -2186,9 +2249,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             ab_sfa_pipeline.producer_tail(ab_producer_state)
 
         #
-        # Specialized LDGSTS SFA warp
+        # Specialized cp.async SFA warp
         #
-        if warp_idx >= self.ldgsts_sfa_warp_id[0] and warp_idx <= self.ldgsts_sfa_warp_id[-1]:
+        if warp_idx >= self.cpasync_sfa_warp_id[0] and warp_idx <= self.cpasync_sfa_warp_id[-1]:
             #
             # Setup SFA CPASYNC copy atom
             #
@@ -2199,7 +2262,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             )
             tidx_in_warpgroup = tidx % 128
 
-            # SFA predicate: dynamically computed per LDGSTS for conv3x3
+            # SFA predicate: dynamically computed per cp.async for conv3x3
             sfa_predicate_tensor = cute.make_rmem_tensor(
                 cute.make_layout((1,)),
                 cutlass.Boolean,
@@ -2234,7 +2297,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             ]
 
             # SFA global tensor: shape (MN, SF_K, L) with K contiguous
-            # For conv3x3 with arbitrary C, each LDGSTS may load from a different
+            # For conv3x3 with arbitrary C, each cp.async may load from a different
             # input element (different M address) depending on the filter position.
             # When C < K_gemm_tile, a single K tile spans multiple filter positions.
 
@@ -2245,11 +2308,25 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             DHW = input_D * input_H * input_W
             HW = input_H * input_W
             CTA_M = self.cta_tile_shape_mnk[0]
-            # SF blocks loaded per k_tile: K blocks of sf_vec_size each within one
-            # K tile (one filter position may span multiple k_tiles when C > K_gemm_tile)
-            sf_k_per_ktile = K_gemm_tile // self.sf_vec_size
-            # Number of C tiles per filter position
-            c_tiles_per_fpos = input_C // K_gemm_tile
+            # SF blocks one SF K tile holds. The SF tile widens to a whole atom
+            # when the A/B K tile is narrower, and every A/B tile sharing it stages
+            # the whole thing.
+            sf_k_per_ktile = self.sf_tile_k // self.sf_vec_size
+            # C tiles per filter position, rounded up: a partial trailing tile still
+            # consumes a k_tile, and its tail reads zero-filled A and B from the TMA.
+            c_tiles_per_fpos = (input_C + K_gemm_tile - 1) // K_gemm_tile
+            # SF blocks a pixel's row holds. The host rounds it up to a whole 4-block
+            # atom and zero-fills the tail, so a group on the last one is in bounds.
+            sfa_sf_k_extent = mSFA_mkl.shape[1]
+            sfa_last_group = sfa_sf_k_extent - 4
+            # Per-carry address deltas for the linear im2col walk: the unclamped
+            # gmem M address decomposes as m_base + t*dil_d*HW + r*dil_h*W +
+            # s*dil_w, so each carry level advances one running delta by a
+            # precomputed step. Steps carry the SFA row stride, so the loop
+            # adds element offsets directly.
+            sfa_step_s = dil_w * sfa_sf_k_extent
+            sfa_step_r = (dil_h * input_W - conv_S * dil_w) * sfa_sf_k_extent
+            sfa_step_t = (dil_d * HW - conv_R * dil_h * input_W) * sfa_sf_k_extent
 
             #
             # Persistent tile scheduling loop
@@ -2306,6 +2383,15 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 sfa_r_idx = 0
                 sfa_t_idx = 0
                 sfa_c_tile_idx = 0
+                sfa_m_base = (
+                    n_clamped * DHW + d_in_base * HW + h_in_base * input_W + w_in_base
+                ) * sfa_sf_k_extent
+                sfa_delta = cutlass.Int32(0)
+                # Running unclamped coords for the predicate, advanced with the
+                # same carry chain as the delta.
+                sfa_d_in = d_in_base + 0
+                sfa_h_in = h_in_base + 0
+                sfa_w_in = w_in_base + 0
 
                 # Peek (try_wait) SFA buffer empty
                 sfa_producer_state.reset_count()
@@ -2315,9 +2401,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
                 #
                 # Shift-by-K cross-CTA commit ringbuffer (K=2). Per iter,
-                # commit the LDGSTS as a cp.async group and wait_group(K);
+                # commit the prior copies as a cp.async group and wait_group(K);
                 # then remote-arrive on leader's sfa_full for the stage from
-                # K iters ago. Guarantees that LDGSTS has landed globally
+                # K iters ago. Guarantees that cp.async has landed globally
                 # before leader MMA sees the barrier full.
                 #
                 sfa_shift_K = 2
@@ -2336,54 +2422,50 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
                     tAsSFA_ktile = tAsSFA[(None, None, None, None, cur_stage)]
 
-                    # Compute unclamped spatial coords from current (t,r,s)
-                    d_in = d_in_base + sfa_t_idx * dil_d
-                    h_in = h_in_base + sfa_r_idx * dil_h
-                    w_in = w_in_base + sfa_s_idx * dil_w
-
-                    # Clamp for safe gmem address
-                    d_cl = d_in if d_in >= 0 else 0
-                    d_cl = d_cl if d_cl < input_D else 0
-                    h_cl = h_in if h_in >= 0 else 0
-                    h_cl = h_cl if h_cl < input_H else 0
-                    w_cl = w_in if w_in >= 0 else 0
-                    w_cl = w_cl if w_cl < input_W else 0
-                    sfa_m_addr = n_clamped * DHW + d_cl * HW + h_cl * input_W + w_cl
-
                     # Predicate: m_valid AND spatial bounds check
                     sfa_pred_val = cutlass.Boolean(0)
                     if m_valid:
-                        if d_in >= 0 and d_in < input_D:
-                            if h_in >= 0 and h_in < input_H:
-                                if w_in >= 0 and w_in < input_W:
+                        if sfa_d_in >= 0 and sfa_d_in < input_D:
+                            if sfa_h_in >= 0 and sfa_h_in < input_H:
+                                if sfa_w_in >= 0 and sfa_w_in < input_W:
                                     sfa_pred_val = cutlass.Boolean(1)
 
-                    # SF K base offset for current C tile within this fpos
-                    sf_k_base = sfa_c_tile_idx * sf_k_per_ktile
+                    # A predicated-off row reads address 0, always in bounds;
+                    # its predicate suppresses the actual copy.
+                    sfa_row_off = (sfa_m_base + sfa_delta) if sfa_pred_val else 0
 
-                    # LDGSTS.32 SFA -- all SI share same fpos.
-                    # Each thread must cover every SI in [0, num_sfa_ldgsts) exactly
+                    # SF K base offset for current C tile within this fpos. A/B
+                    # tiles sharing one SF tile take the same base: they sit in one
+                    # filter position, so one transfer covers them all.
+                    sf_k_base = (sfa_c_tile_idx // self.ab_k_tiles_per_sf_k_tile) * sf_k_per_ktile
+
+                    # 4-byte cp.async SFA -- all SI share same fpos.
+                    # Each thread must cover every SI in [0, num_sfa_cpasync) exactly
                     # once so all SF-K groups of its row get written. XOR (q ^ i) is a
-                    # complete cover only when num_sfa_ldgsts is a power of 2; for a
-                    # non-power-of-2 count (e.g. 3 when input_C == 3 * mma_inst_shape_k)
+                    # complete cover only when num_sfa_cpasync is a power of 2; for a
+                    # non-power-of-2 count (e.g. 3 when cta_tile_k == 3 * mma_inst_shape_k)
                     # it drops SI values on some quarter-warps, leaving SF-K groups
                     # unwritten. Additive rotation (q + i) % num is a complete cyclic
                     # cover for any count and keeps quarter-warps on distinct groups
                     # per timestep.
-                    for i in range(self.num_sfa_ldgsts):
-                        SI = ((tidx_in_warpgroup % 32) // 8 + i) % self.num_sfa_ldgsts
+                    for i in range(self.num_sfa_cpasync):
+                        SI = ((tidx_in_warpgroup % 32) // 8 + i) % self.num_sfa_cpasync
 
-                        # One LDGSTS.32 moves 4 contiguous SF blocks (4 x 1-byte
+                        # One 4-byte cp.async moves 4 contiguous SF blocks (4 x 1-byte
                         # E4M3 = the 4-byte transfer). SI indexes which group of 4,
                         # so its SF-block base is SI * 4 and the copy shape is (4,).
                         sf_k_smem = SI * 4
                         local_sf_k = sf_k_base + (sf_k_smem % sf_k_per_ktile)
+                        # A partial trailing tile reaches past the scale factors this
+                        # pixel owns. Clamping the group start to the row's last whole
+                        # atom keeps it in bounds and finite, which the MMA needs since
+                        # it applies the scale before seeing the zero operand.
+                        local_sf_k = local_sf_k if local_sf_k <= sfa_last_group else sfa_last_group
 
                         sfa_predicate_tensor[0] = sfa_pred_val
 
-                        # Gmem: load from this fpos's M address at local_sf_k offset
-                        sfa_m_slice = mSFA_mkl[(sfa_m_addr, None, 0)]
-                        tAgSFA_slice_ptr = sfa_m_slice.iterator + local_sf_k
+                        # Gmem: this fpos's row offset plus the local SF-K offset
+                        tAgSFA_slice_ptr = mSFA_mkl.iterator + (sfa_row_off + local_sf_k)
                         tAgSFA_slice = cute.make_tensor(
                             tAgSFA_slice_ptr, layout=cute.make_layout((4,))
                         )
@@ -2403,20 +2485,30 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
                     # Increment in S->R->T->C order (S innermost, C outermost)
                     sfa_s_idx = sfa_s_idx + 1
+                    sfa_delta = sfa_delta + sfa_step_s
+                    sfa_w_in = sfa_w_in + dil_w
                     if sfa_s_idx >= conv_S:
                         sfa_s_idx = 0
+                        sfa_w_in = w_in_base + 0
                         sfa_r_idx = sfa_r_idx + 1
+                        sfa_delta = sfa_delta + sfa_step_r
+                        sfa_h_in = sfa_h_in + dil_h
                         if sfa_r_idx >= conv_R:
                             sfa_r_idx = 0
+                            sfa_h_in = h_in_base + 0
                             sfa_t_idx = sfa_t_idx + 1
+                            sfa_delta = sfa_delta + sfa_step_t
+                            sfa_d_in = sfa_d_in + dil_d
                             if sfa_t_idx >= conv_T:
                                 sfa_t_idx = 0
+                                sfa_d_in = d_in_base + 0
+                                sfa_delta = 0
                                 sfa_c_tile_idx = sfa_c_tile_idx + 1
                                 if sfa_c_tile_idx >= c_tiles_per_fpos:
                                     sfa_c_tile_idx = 0
 
-                    # Commit this iter's LDGSTS as one cp.async group and
-                    # gate on <=K inflight. After wait_group(K), the LDGSTS
+                    # Commit this iter's copies as one cp.async group and
+                    # gate on <=K inflight. After wait_group(K), the cp.async
                     # for the stage from K iters ago is guaranteed complete
                     # on every CTA in the cluster.
                     ab_sfa_pipeline.producer_cp_async_commit()
@@ -2439,7 +2531,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                         )
 
                 #
-                # Shift-by-K tail: drain all inflight LDGSTS, then arrive on
+                # Shift-by-K tail: drain all inflight cp.async, then arrive on
                 # the K stages whose arrives were deferred.
                 #
                 ab_sfa_pipeline.producer_cp_async_wait(0)
@@ -2464,10 +2556,13 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         #
         # Specialized residual G2S warp (only spawned when beta != 0).
         #
-        # Keeping residual loads off the A/B/SFB TMA warp allows both input and
-        # epilogue traffic to progress concurrently. The producer must remain on
-        # a different warp from the epilogue consumer to avoid self-deadlocking
-        # on the residual pipeline barrier.
+        # The residual load owns a dedicated warp so it no longer serializes
+        # behind A/B/SFB issue on the TMA warp. Producer and epilogue consumer
+        # still sit on physically separate warps (required: a same-warp
+        # producer/consumer pair on the residual barrier self-deadlocks the
+        # epilogue). It runs its own persistent tile-scheduler loop and consumes
+        # one CLC response per tile, so it is counted in num_clc_consumer_threads
+        # under the SAME const gate (mC_mnl is not None).
         #
         if warp_idx == self.residual_warp_id:
             if cutlass.const_expr(mC_mnl is not None):
@@ -2479,6 +2574,8 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 )
                 work_tile = tile_sched.initial_work_tile_info()
 
+                # The gmem/smem TMA partition is thread-invariant, so recompute
+                # the exact handles the epilogue consumer expects.
                 (
                     tma_atom_c,
                     bGS_sC,
@@ -2487,8 +2584,10 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 c_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_d_stage
                 )
-                # The epilogue consumes overlapping-accum's phase-0 subtiles in
-                # reverse order, so mirror its accumulator phase here.
+                # Overlapping-accum walks output subtiles back-to-front on the
+                # phase-0 tile; mirror the epilogue's acc-consumer phase with a
+                # shadow state so the producer stages subtiles in the same order
+                # the consumer reads them.
                 if cutlass.const_expr(self.overlapping_accum):
                     c_acc_shadow_state = pipeline.make_pipeline_state(
                         pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -2502,8 +2601,13 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                         cur_tile_coord[2],
                     )
 
-                    # Stage one residual tile per output N-subtile, in exactly
-                    # the order consumed by the epilogue warps.
+                    #
+                    # Issue this output tile's residual TMA loads (gmem -> smem),
+                    # one per output N-subtile, walking subtiles in lockstep with
+                    # the epilogue consumer. Whole-warp producer arrive (no
+                    # elect_one): PipelineTmaAsync's single-thread producer group
+                    # self-elects the signaling lane.
+                    #
                     bGS_gC = bGS_gC_partitioned[
                         (
                             None,
@@ -2514,7 +2618,6 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     ]
                     bGS_gC = cute.group_modes(bGS_gC, 1, cute.rank(bGS_gC))
                     subtile_cnt = cute.size(bGS_gC.shape, mode=[1])
-                    num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
                     if cutlass.const_expr(self.overlapping_accum):
                         reverse_subtile = c_acc_shadow_state.phase == 0
                     for subtile_idx in cutlass.range(subtile_cnt):
@@ -2524,23 +2627,31 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                                 real_subtile_idx = (
                                     self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
                                 )
-                        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
+                        # The ring slot comes from the pipeline state, the same
+                        # place the barrier below and the epilogue consumer take
+                        # theirs, so the ring holds at any stage count.
                         c_pipeline.producer_acquire(c_producer_state)
                         cute.copy(
                             tma_atom_c,
                             bGS_gC[(None, real_subtile_idx)],
-                            bGS_sC[(None, c_buffer)],
+                            bGS_sC[(None, c_producer_state.index)],
                             tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
                         )
                         c_producer_state.advance()
                     if cutlass.const_expr(self.overlapping_accum):
                         c_acc_shadow_state.advance()
 
+                    #
+                    # Advance to next tile (CLC consumer)
+                    #
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
 
+                #
+                # Drain the residual TMA load pipeline before exiting.
+                #
                 c_pipeline.producer_tail(c_producer_state)
 
         #
@@ -2595,7 +2706,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             # (MMA, MMA_M, MMA_K)
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma,
-                self.mma_tiler,
+                self.flat_mma_tiler_sf,
                 self.sf_vec_size,
                 cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
             )
@@ -2611,7 +2722,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             # (MMA, MMA_N, MMA_K)
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma,
-                self.mma_tiler,
+                self.flat_mma_tiler_sf,
                 self.sf_vec_size,
                 cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
             )
@@ -2651,6 +2762,12 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
 
+            # Filter positions one channel tile sweeps. The K loop walks S->R->T->C
+            # with C outermost, so the chunk part below has to come from the channel
+            # tile: the running k_tile count keeps advancing across positions.
+            if cutlass.const_expr(self.ab_k_tiles_per_sf_k_tile > 1):
+                sf_fpos_per_c_tile = conv_T * conv_R * conv_S
+
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -2659,6 +2776,11 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
+
+                # Channel tile and its filter-position counter, reset per work tile.
+                if cutlass.const_expr(self.ab_k_tiles_per_sf_k_tile > 1):
+                    sf_c_tile_idx = cutlass.Int32(0)
+                    sf_fpos_idx = cutlass.Int32(0)
 
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
@@ -2723,6 +2845,13 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 # Mma mainloop
                 #
                 for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                    if cutlass.const_expr(self.ab_k_tiles_per_sf_k_tile > 1):
+                        sf_kblock_base = (
+                            sf_c_tile_idx % self.ab_k_tiles_per_sf_k_tile
+                        ) * self.mma_inst_tile_k
+                    else:
+                        sf_kblock_base = 0
+
                     if is_leader_cta:
                         # Merged pipeline: single consumer_wait covers both TMA and cp.async producers.
                         ab_sfa_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
@@ -2765,8 +2894,14 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                                 ab_consumer_state.index,
                             )
 
-                            # Set SFA/SFB tensor to tiled_mma
-                            sf_kblock_coord = (None, None, kblock_idx)
+                            # Set SFA/SFB tensor to tiled_mma. The K blocks this
+                            # tile owns start at its own part of the shared chunk
+                            # (offset 0 for NVFP4, whose ratio is 1).
+                            sf_kblock_coord = (
+                                None,
+                                None,
+                                sf_kblock_base + kblock_idx,
+                            )
                             tiled_mma.set(
                                 tcgen05.Field.SFA,
                                 tCtSFA[sf_kblock_coord].iterator,
@@ -2789,6 +2924,14 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
                         # Merged pipeline: single consumer_release covers both TMA and cp.async producers.
                         ab_sfa_pipeline.consumer_release(ab_consumer_state)
+
+                    # Advance the channel tile once the whole filter has been
+                    # swept, mirroring the S->R->T->C walk of the load warps.
+                    if cutlass.const_expr(self.ab_k_tiles_per_sf_k_tile > 1):
+                        sf_fpos_idx = sf_fpos_idx + 1
+                        if sf_fpos_idx >= sf_fpos_per_c_tile:
+                            sf_fpos_idx = cutlass.Int32(0)
+                            sf_c_tile_idx = sf_c_tile_idx + 1
 
                     # Peek (try_wait) shared AB/SFB + SFA buffer full for k_tile+1
                     ab_consumer_state.advance()
@@ -2935,7 +3078,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 )
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
                 tTR_gBias_partitioned = thr_copy_t2r_bias.partition_D(gBias_epi)
-                # LDS atom: each thread reads its own N columns back from the
+                # smem-load atom: each thread reads its own N columns back from the
                 # CTA-staged sBias row. The per-tile read view is built inside
                 # the loop off the sliced gmem layout (whose N modes already
                 # address [0, cta_tile_n) with the RestN tile-selector removed).
@@ -2956,9 +3099,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 bias_g2s_atom = None
                 bias_elems_per_copy = None
 
-            # Read device-resident scaling values once per warp, outside the
-            # persistent loop. Keeping these values on the device avoids a host
-            # synchronization in callers that derive scales on the GPU.
+            # Read the device-resident scale once per epilogue warp. Dynamic
+            # activation quantization produces this value on the GPU, so keeping
+            # it as a tensor avoids a host synchronization before every conv.
             alpha_scalar = cutlass.Float32(alpha[0])
             if cutlass.const_expr(self.gen_sfd):
                 norm_const_scalar = cutlass.Float32(norm_const_tensor[0])
@@ -2990,8 +3133,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 producer_group=d_producer_group,
             )
 
-            # The residual producer state lives on the dedicated residual warp; the epilogue
-            # only tracks the consumer side of the residual load pipeline.
+            # The residual producer state lives on the dedicated residual warp;
+            # the epilogue only tracks the consumer side of the residual load
+            # pipeline.
             if cutlass.const_expr(mC_mnl is not None):
                 c_consumer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.num_d_stage
@@ -3057,7 +3201,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     ]
                     # The CTA cp.async's this tile's contiguous cta_tile_n bias
                     # values (K stride 1) into sBias, then syncs so every
-                    # epilogue thread can LDS its columns back. One value per
+                    # epilogue thread can load its columns back from smem. One value per
                     # output channel is fetched once and broadcast to all M rows.
                     cta_n = self.cta_tile_shape_mnk[1]
                     n_base = mma_tile_coord_mnl[1] * cta_n
@@ -3083,7 +3227,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     sBias_tiled = cute.make_tensor(sBias.iterator.align(min_align=4), row_layout)
                     # Predicated cp.async: a CTA N-tile rounds up to cta_tile_n,
                     # but K (= output channels = GEMM-N) need not divide it, so
-                    # the tail lanes address bias columns n >= output K that have
+                    # the tail lanes address bias columns n >= K that have
                     # no backing storage. Guard each lane's contiguous vector on
                     # its base channel: in-bounds lanes cp.async from gmem,
                     # out-of-bounds lanes zero-fill sBias (cp.async writes 0 on a
@@ -3109,7 +3253,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     # this thread's N columns into [0, cta_tile_n) with all M
                     # modes stride-0 and the tile-selecting RestN removed, so
                     # the same layout over sBias makes each per-subtile read an
-                    # LDS of exactly this thread's columns. make_tensor flattens
+                    # smem load of exactly this thread's columns. make_tensor flattens
                     # the trailing (EPI_M, EPI_N) hierarchy, so regroup it to
                     # match tTR_gBias's rank-4 (..., subtile) profile.
                     tTR_sBias = cute.group_modes(
@@ -3184,7 +3328,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     tTR_rAcc.store(tTR_rAcc.load() * alpha_scalar)
 
                     # Add per-output-channel bias in FP32 (D = alpha*acc + bias).
-                    # LDS this subtile's bias from the CTA-staged sBias row into a
+                    # Load this subtile's bias from the CTA-staged sBias row into a
                     # register fragment shaped like the acc fragment, then add.
                     # The M-axis stride-0 broadcast means each thread reads only
                     # its own N-column bias.
@@ -3229,8 +3373,10 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     #
                     # SFD generation (NVFP4 output only): per sfd_vec_size
                     # abs-max -> pvscale_f32 -> cast to sf_dtype (E4M3) -> STG.
-                    # Rescale with the E4M3-quantized SFD value so the FP4 output
-                    # and its stored scale remain self-consistent.
+                    # Then rescale acc by norm_const_tensor * rcp(qpvscale_f32), where
+                    # qpvscale_f32 is the SFD value read back after the E4M3 cast
+                    # so D_quant * SFD stays self-consistent, with NaN/inf clamp
+                    # via fmin.
                     #
                     if cutlass.const_expr(self.gen_sfd):
                         # Slice gSFD for this subtile and collapse stride-0 broadcast.
@@ -3261,7 +3407,11 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                         # Reciprocal of the output dtype's full-scale max (M_D).
                         rcp_max = cutlass.Float32(1.0 / self.M_D)
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
-                        # Single-pass: compute amax, quantize SFD, and rescale acc.
+                        # Single-pass: compute amax, quantize SFD, and rescale acc
+                        # in the same loop. The acc rescale reads the SFD value
+                        # back after the E4M3 cast (qpvscale_f32), so the dequant
+                        # identity D_quant * SFD reproduces the pre-quant
+                        # accumulator to within the FP4 data round-off.
                         for i_sf in cutlass.range(n_sf, unroll_full=True):
                             sfgen_slice = sfgen_rAcc[(None, i_sf)]
                             red_ssa = sfgen_slice.load()
@@ -3287,8 +3437,12 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                             sfgen_slice.store(sfgen_slice.load() * acc_scale)
                         # Store SFD to gmem (predicated on both the M and N
                         # bounds; the last m-tile and partial-N overhangs have no
-                        # backing SFD storage). The per-thread element count is
-                        # static, but the global extent and stride are runtime.
+                        # backing SFD storage). Scalar STG per SF element with a
+                        # static (unrolled) index: the gmem address is base +
+                        # i * runtime_stride, so the tensor's global extent may be
+                        # a runtime Int -- only the per-thread element count is
+                        # static. (autovec_copy would require a fully static
+                        # destination and cannot take a runtime-extent tensor.)
                         if sfd_in_bounds:
                             for i_st in cutlass.range(n_sf, unroll_full=True):
                                 t2r_gSFD[i_st] = rSFD[(0, i_st)]
@@ -3619,11 +3773,20 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         d_layout: utils.LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
+        flat_mma_tiler_sf: Tuple[int, int, int],
         smem_capacity: int,
         occupancy: int,
         has_residual: bool = False,
     ) -> Tuple[int, int, int]:
-        """Compute A/B, accumulator, and epilogue stage counts.
+        """Computes the number of stages for A/B/D operands.
+
+        The A/B stage count is chosen so the full SharedStorage (every pipeline
+        mbar, whose count scales with the stage count, plus every operand array
+        with its 1024B alignment padding) fits in smem. The number is derived by
+        constructing the actual SharedStorage struct for a candidate stage count
+        and reading its exact size_in_bytes(), then taking the largest count that
+        fits -- rather than dividing capacity by a per-stage byte estimate that
+        omits the alignment padding and the stage-scaled mbar bytes.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
         :param mma_tiler_mnk: The shape (M, N, K) of the MMA tiler.
@@ -3634,18 +3797,19 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         :param d_layout: Layout enum of operand D.
         :param sf_dtype: Data type of Scale factor.
         :param sf_vec_size: Scale factor vector size.
+        :param flat_mma_tiler_sf: The flat-K mma tiler the SF layouts are built
+            from: the A/B tiler's M and N with the SF cadence on K.
         :param smem_capacity: Total available shared memory capacity in bytes.
-        :param occupancy: CTAs per SM; this persistent kernel uses one.
+        :param occupancy: CTAs per SM. Always 1 for this persistent kernel.
 
-        :return: ACC, A/B, and D stage counts.
+        :return: (ACC stages, A/B operand stages, D stages)
         :rtype: tuple[int, int, int]
         """
-        del occupancy
+        # ACC stages
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
-        num_d_stage = 2
 
-        flat_k = mma_tiler_mnk[2] if isinstance(mma_tiler_mnk[2], int) else mma_tiler_mnk[2][0]
-        flat_mma_tiler_mnk = (mma_tiler_mnk[0], mma_tiler_mnk[1], flat_k)
+        # D stages
+        num_d_stage = 2
 
         buffer_align_bytes = 1024
         num_clc_stage = 1
@@ -3653,19 +3817,28 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         cta_tile_n = mma_tiler_mnk[1]
 
         def smem_bytes(ab_stage: int, d_stage: int) -> int:
-            """Return the exact runtime SharedStorage size for the stage counts."""
+            """Exact SharedStorage byte size for a candidate stage count.
+
+            Builds the operand/SF/epi layouts for this ``ab_stage``/``d_stage``
+            and assembles the SharedStorage this kernel will allocate. Every field
+            mirrors the runtime SharedStorage struct defined in __call__; keep the
+            two in sync so the byte total is exact.
+            """
             a_smem = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, ab_stage)
             b_smem = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, ab_stage)
             sfa_smem = blockscaled_utils.make_smem_layout_sfa(
-                tiled_mma, flat_mma_tiler_mnk, sf_vec_size, ab_stage
+                tiled_mma, flat_mma_tiler_sf, sf_vec_size, ab_stage
             )
             sfb_smem = blockscaled_utils.make_smem_layout_sfb(
-                tiled_mma, flat_mma_tiler_mnk, sf_vec_size, ab_stage
+                tiled_mma, flat_mma_tiler_sf, sf_vec_size, ab_stage
             )
             d_smem = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, d_stage)
 
             @cute.struct
             class ProbeStorage:
+                """Field-for-field mirror of the runtime SharedStorage, sized for
+                this stage count so size_in_bytes() gives the exact allocation."""
+
                 ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ab_stage * 2]
                 sfa_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ab_stage * 2]
                 acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, num_acc_stage * 2]
@@ -3715,33 +3888,46 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
             return ProbeStorage.size_in_bytes()
 
+        # A single A/B stage must fit: a tile whose one-stage SharedStorage already
+        # exceeds capacity is unimplementable and is rejected upstream by
+        # can_implement, so the lower-bound search below can assume >= 1 fits.
         if smem_bytes(1, num_d_stage) > smem_capacity:
             raise RuntimeError(
-                "tile too large for one A/B stage; can_implement should have rejected it"
+                "tile too large for even one A/B stage; can_implement should have "
+                "rejected it before reaching stage selection"
             )
 
-        # Start from a conservative lower bound, then use the exact struct size
-        # to maximize the mainloop and epilogue pipeline depths independently.
+        # Compute a lower bound that is guaranteed to fit, then scan upward once
+        # (never downward) to the largest A/B stage whose exact SharedStorage
+        # fits. Each added stage grows the four staged arrays (sA/sB/sSFA/sSFB) by
+        # their raw per-stage bytes; the Align[1024] rounding of each array is a
+        # one-time boundary crossing over the whole growth, so it contributes at
+        # most 4*1024 B total. Bounding the alignment loss as that constant in the
+        # numerator (rather than inflating every stage's slope) keeps the lower
+        # bound within a few stages of the true maximum while still guaranteeing
+        # cost(lb) <= cost(1) + (lb-1)*slope + 4*1024 <= capacity. A/B depth is
+        # filled first (it dominates mainloop overlap); any smem left over then
+        # deepens the epilogue. size_in_bytes is monotonic in each stage count, so
+        # the upward passes land on the true maximum.
         a_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)
         b_one = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, 1)
         sfa_one = blockscaled_utils.make_smem_layout_sfa(
-            tiled_mma, flat_mma_tiler_mnk, sf_vec_size, 1
+            tiled_mma, flat_mma_tiler_sf, sf_vec_size, 1
         )
         sfb_one = blockscaled_utils.make_smem_layout_sfb(
-            tiled_mma, flat_mma_tiler_mnk, sf_vec_size, 1
+            tiled_mma, flat_mma_tiler_sf, sf_vec_size, 1
         )
-        stage_slope = (
+        slope = (
             cute.cosize(a_one.outer) * a_dtype.width // 8
             + cute.cosize(b_one.outer) * b_dtype.width // 8
             + cute.cosize(sfa_one) * sf_dtype.width // 8
             + cute.cosize(sfb_one) * sf_dtype.width // 8
-            + 2 * 8
-            + 2 * 8
+            + 2 * 8  # ab_full mbar (Int64)
+            + 2 * 8  # sfa_full mbar (Int64)
         )
-        alignment_bound = 4 * buffer_align_bytes
+        align_loss = 4 * buffer_align_bytes
         num_ab_stage = max(
-            1,
-            1 + (smem_capacity - smem_bytes(1, num_d_stage) - alignment_bound) // stage_slope,
+            1, 1 + (smem_capacity - smem_bytes(1, num_d_stage) - align_loss) // slope
         )
         while smem_bytes(num_ab_stage + 1, num_d_stage) <= smem_capacity:
             num_ab_stage += 1
@@ -3750,162 +3936,24 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
         return num_acc_stage, num_ab_stage, num_d_stage
 
-    @staticmethod
-    def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        d_dtype: Type[cutlass.Numeric],
-    ) -> bool:
-        """
-        Check if the dtypes and sf_vec_size are valid combinations
-
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param sf_dtype: The data type of the scale factor
-        :type sf_dtype: Type[cutlass.Numeric]
-        :param sf_vec_size: The vector size of the scale factor
-        :type sf_vec_size: int
-        :param d_dtype: The data type of the output tensor
-        :type d_dtype: Type[cutlass.Numeric]
-
-        :return: True if the dtypes and sf_vec_size are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        # Check valid ab_dtype
-        if ab_dtype not in {
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        # Check valid sf_vec_size
-        if sf_vec_size not in {16, 32}:
-            is_valid = False
-
-        # Check valid sf_dtype
-        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
-            is_valid = False
-
-        # Check valid sf_dtype and sf_vec_size combinations
-        if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
-            is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
-            is_valid = False
-
-        # Check valid d_dtype
-        if d_dtype not in {
-            cutlass.Float32,
-            cutlass.Float16,
-            cutlass.BFloat16,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-            cutlass.Float4E2M1FN,
-        }:
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        d_major: str,
-    ) -> bool:
-        """
-        Check if layouts and dtypes are valid combinations
-
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param d_dtype: The data type of the output tensor
-        :type d_dtype: Type[cutlass.Numeric]
-        :param a_major: The major dimension of the A tensor
-        :type a_major: str
-        :param b_major: The major dimension of the B tensor
-        :type b_major: str
-        :param d_major: The major dimension of the D tensor
-        :type d_major: str
-
-        :return: True if the layouts are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        L: int,
-        ab_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        d_major: str,
-    ) -> bool:
-        """
-        Check if the tensor alignment is valid
-
-        :param m: The number of rows in the A tensor
-        :type m: int
-        :param n: The number of columns in the B tensor
-        :type n: int
-        :param k: The number of columns in the A tensor
-        :type k: int
-        :param L: The number of columns in the D tensor
-        :type L: int
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param d_dtype: The data type of the output tensor
-        :type d_dtype: Type[cutlass.Numeric]
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param d_major: The major axis of the D tensor
-        :type d_major: str
-
-        :return: True if the problem shape is valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
-
-        if (
-            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, L))
-            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, L))
-            or not check_contigous_16B_alignment(d_dtype, d_major == "m", (m, n, L))
-        ):
-            is_valid = False
-        return is_valid
-
     def can_implement(
         self,
         c: int,
         k: int,
         ab_dtype: Type[cutlass.Numeric],
         d_dtype: Type[cutlass.Numeric],
+        sf_dtype: Type[cutlass.Numeric],
         output: cute.Tensor,
+        filter_trs: Tuple[int, int, int],
+        upper_padding_dhw: Tuple[int, int, int],
+        lower_padding_dhw: Tuple[int, int, int],
+        stride_dhw: Tuple[int, int, int],
+        dil_dhw: Tuple[int, int, int],
         c_dtype: Optional[Type[cutlass.Numeric]] = None,
+        has_bias: bool = False,
+        epilogue_op: Optional[cutlass.Constexpr] = None,
     ) -> bool:
-        """Determine if the given tensor configuration can be implemented by this kernel.
-        Supports C >= 64 (4 * sf_vec_size) for LDGSTS.32 alignment.
-        """
+        """Determine if the given tensor configuration can be implemented by this kernel."""
         try:
             # Residual (C) reuses the output D im2col TMA descriptor, so it must
             # match D's dtype exactly. c_dtype is None when no residual is passed.
@@ -3913,19 +3961,77 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 raise testing.CantImplementError(
                     f"Residual c_dtype ({c_dtype}) must equal d_dtype ({d_dtype})."
                 )
-            # Only fp4 A/B with a 16-element scale-factor block is supported. Both
-            # the fp8 path (mma_inst_shape_k=32) and the fp4 sf_vec_size=32 path
-            # produce wrong results for every C tested (SFD dequant far past fp4
-            # round-off), so reject anything but the validated Float4E2M1FN +
-            # sf_vec_size=16 combination up front.
-            if ab_dtype is not cutlass.Float4E2M1FN:
+            # Two input formats, each pinned to one scale-factor format:
+            #   NVFP4  : Float4E2M1FN A/B, Float8E4M3FN scale over 16 channels.
+            #   MXFP8  : Float8E4M3FN A/B, Float8E8M0FNU scale over 32 channels.
+            # The element type is pinned alongside the vector size because it drives
+            # the SFB SMEM layout, the barrier transaction bytes and the SFD rounding
+            # -- a mismatched one is misinterpreted on the device, not refused. SFD
+            # takes the input's format, so this pins both sides.
+            sf_format = {
+                cutlass.Float4E2M1FN: (cutlass.Float8E4M3FN, 16),
+                cutlass.Float8E4M3FN: (cutlass.Float8E8M0FNU, 32),
+            }.get(ab_dtype)
+            if sf_format is None:
                 raise testing.CantImplementError(
-                    f"Only Float4E2M1FN A/B is supported, got {ab_dtype}."
+                    f"Only Float4E2M1FN (NVFP4) and Float8E4M3FN (MXFP8) A/B "
+                    f"are supported, got {ab_dtype}."
                 )
-            if self.sf_vec_size != 16:
+            want_sf_dtype, want_sf_vec_size = sf_format
+            if sf_dtype is not want_sf_dtype or self.sf_vec_size != want_sf_vec_size:
                 raise testing.CantImplementError(
-                    f"Only sf_vec_size=16 is supported, got {self.sf_vec_size}."
+                    f"{ab_dtype} A/B requires sf_dtype={want_sf_dtype} over "
+                    f"{want_sf_vec_size} channels, got sf_dtype={sf_dtype}, "
+                    f"sf_vec_size={self.sf_vec_size}."
                 )
+            # D is either the narrow block-scaled output that pairs with the input
+            # format -- NVFP4 with FP4, MXFP8 with FP8 E4M3 -- or a 16-bit wide output.
+            # The pairing is forced by the SFD: the epilogue rescales the accumulator by
+            # an approximate reciprocal of the quantized scale factor, exact for E8M0's
+            # powers of two but not for E4M3's arbitrary values. FP4's eight magnitudes
+            # absorb that error; FP8 E4M3's few hundred do not, leaving a data-dependent
+            # fraction of elements one step off. A wide output carries no SFD and stops
+            # at 16 bits: FP32 D doubles the epilogue buffer and takes A/B stages with
+            # it, and what reads this kernel's output is narrow or 16-bit.
+            paired_narrow_output = {
+                cutlass.Float4E2M1FN: cutlass.Float4E2M1FN,
+                cutlass.Float8E4M3FN: cutlass.Float8E4M3FN,
+            }[ab_dtype]
+            if d_dtype not in (
+                paired_narrow_output,
+                cutlass.BFloat16,
+                cutlass.Float16,
+            ):
+                raise testing.CantImplementError(
+                    f"d_dtype must be {paired_narrow_output} (the block-scaled narrow "
+                    f"output paired with {ab_dtype} A/B), BFloat16 or Float16, got "
+                    f"{d_dtype}."
+                )
+            # A block-scaled output constrains the whole epilogue. bias and residual
+            # take D's own dtype, so the addend would be FP4 or FP8 -- eight magnitudes
+            # in one case, a few hundred in the other -- making the term's quantization
+            # error the same order as the term itself. And the SFD is taken from the
+            # accumulator before the epilogue op runs, so anything but identity leaves D
+            # scaled by a factor that no longer describes it. The op is matched against
+            # the named non-identity activations: a caller's own pass-through lambda is
+            # identity in effect and must not be refused for being a different object.
+            if d_dtype in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN):
+                if has_bias:
+                    raise testing.CantImplementError(
+                        f"A block-scaled {d_dtype} output does not support a bias."
+                    )
+                if c_dtype is not None:
+                    raise testing.CantImplementError(
+                        f"A block-scaled {d_dtype} output does not support a residual."
+                    )
+                if epilogue_op in {
+                    entry["device"]
+                    for name, entry in EPILOGUE_ACTIVATIONS.items()
+                    if name != "identity"
+                }:
+                    raise testing.CantImplementError(
+                        f"A block-scaled {d_dtype} output only supports the identity epilogue op."
+                    )
             # The kernel emits the NZPQK output with K (the GEMM-N axis) contiguous,
             # i.e. n-major. The SFD store and TMA epilogue assume this; any other
             # leading dim would write the wrong axis. Reject it up front.
@@ -3935,70 +4041,172 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     f"got leading_dim={output.leading_dim}"
                 )
             self.check_mma_tiler_and_cluster_shape()
+            # Blockscaled MMA requires a per-CTA M of 128: make_blockscaled_trivial_tiled_mma
+            # has no M=64 atom and raises "expects the M-mode to be 128, but got 64" at
+            # cute.compile time. The per-CTA M is mma_tiler_m halved under 2CTA, so both
+            # mma_tiler_m=64 (1CTA) and mma_tiler_m=128 (2CTA) hit M=64 and fail. The
+            # parent check_mma_tiler_and_cluster_shape admits both (it allows 64/128 for
+            # 1CTA and 128/256 for 2CTA from the dense-GEMM contract), so reject them here
+            # with a clear message instead of the opaque MMA-builder error. The two viable
+            # shapes are mma_tiler_m=128 (1CTA) and mma_tiler_m=256 (2CTA), both giving M=128.
             per_cta_m = self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1)
             if per_cta_m != 128:
                 raise testing.CantImplementError(
                     f"Blockscaled conv requires per-CTA M=128, got {per_cta_m} from "
                     f"mma_tiler_m={self.mma_tiler_mn[0]}, use_2cta_instrs="
                     f"{self.use_2cta_instrs}. Use mma_tiler_m=128 with 1CTA or "
-                    "mma_tiler_m=256 with 2CTA."
+                    f"mma_tiler_m=256 with 2CTA."
                 )
+            # SFB stages 128 output channels at a time, so an mma_tiler_n below that
+            # puts several N tiles in one chunk, each needing its own Tensor Memory
+            # read offset. That offset exists for 64 (two tiles per chunk) and 192
+            # (the chunk pair reshaped into overlapping 256-wide windows); 128 and 256
+            # sit on chunk boundaries. The rest silently read the chunk's first tile
+            # once there is more than one N tile, so they serve a single one.
+            cta_tile_n = self.mma_tiler_mn[1]
+            if cta_tile_n not in (64, 128, 192, 256):
+                n_tiles = -(-k // cta_tile_n)
+                if n_tiles > 1:
+                    raise testing.CantImplementError(
+                        f"mma_tiler_n={cta_tile_n} has no per-tile SFB chunk offset, "
+                        f"so it only serves a single N tile, but K={k} needs "
+                        f"{n_tiles}. Use mma_tiler_n of 64, 128, 192 or 256."
+                    )
             # 16B output alignment forces Kout % 32 == 0 for FP4 D, which is
             # what makes the SFD N-bound predicate (gates a whole subtile on its
             # first-element N coord) exact -- so no separate Kout guard is needed.
             _check_tensor_alignment(c, k, ab_dtype, d_dtype)
-            # C must be >= 4 * sf_vec_size (typically 64) so that each filter
-            # position has at least 4 SF blocks for LDGSTS.32 alignment.
-            min_c = 4 * self.sf_vec_size
-            if c < min_c:
-                raise testing.CantImplementError(
-                    f"Requires C >= {min_c}, but got C = {c}. "
-                    f"Each filter position needs >= 4 SF blocks for LDGSTS.32 alignment."
-                )
-            # C must be a multiple of 64 and either <= 256 or a multiple of 256.
-            # A C that is not a multiple of 64 leaves a fractional SF-block group
-            # (each SFA LDGSTS.32 covers 4 SF blocks = 64 channels), so some SF-K
-            # groups of a row go unwritten and the dequant output is wrong. A C in
-            # (256, inf) that is not a 256 multiple caps tile_k at 256 and leaves a
-            # partial trailing K tile the SFD store cannot address. Both silently
-            # corrupt the output (no fault, refcheck fails). Legal C: {64, 128, 192,
-            # 256} plus any multiple of 256.
-            if c % 64 != 0 or (c > 256 and c % 256 != 0):
-                raise testing.CantImplementError(
-                    f"Unsupported C = {c}. C must be a multiple of 64 and either "
-                    f"<= 256 or a multiple of 256 (e.g. 64, 128, 192, 256, 512, 768). "
-                    f"Other values silently corrupt the SFD dequant output."
-                )
-            if self.cta_tile_k == 256:
-                if c % 256 != 0:
+            # C legality. Either format takes a partial trailing K tile -- its A and B
+            # arrive zero-filled from the TMA and its scale factors are read in bounds --
+            # so C only has to be aligned, not a whole number of K tiles. The modulus is
+            # the 16-byte alignment of the channel axis: 32 channels for NVFP4's 4-bit
+            # elements, 16 for MXFP8's 8-bit ones.
+            # MXFP8 states its bound explicitly even though the alignment check already
+            # enforces the same 16, because what bounds C on this path is the SFA
+            # cp.async geometry, not the alignment: one 4-byte transfer carries 4 SF
+            # blocks of 32 channels, exactly one 128-channel SF tile. Should either
+            # side move, this has to fail on its own terms rather than silently ride
+            # on a number that happens to agree today.
+            if ab_dtype is cutlass.Float8E4M3FN:
+                if c % 16 != 0:
                     raise testing.CantImplementError(
-                        f"cta_tile_k=256 requires C to be a multiple of 256, got C = {c}."
+                        f"MXFP8 requires C to be a multiple of 16, got C = {c}."
                     )
-            elif c != self.cta_tile_k:
+            # cta_tile_k legality. Both formats need a whole number of MMA K
+            # instructions: mma_inst_tile_k truncates the division, so a tile_k off
+            # that multiple silently runs a narrower tile than asked for. 192 is a
+            # legal multiple but excluded: its SF-K atom count is three, and an odd
+            # count above one cannot be halved when the SFB multicast splits along K
+            # under 2CTA, which deadlocks the tmem-alloc mbarrier. A K tile need not
+            # divide C, so nothing needs it.
+            # MXFP8 stops at 128, the width of its SF atom. Below it the atom is
+            # shared: a 64-channel K tile stages the whole 128-channel atom and reads
+            # half of it, which only works because the two halves divide it exactly.
+            # Above it a K tile would span several atoms per tile, which no
+            # configuration here exercises.
+            # NVFP4's atom is 64 channels, at or below every legal tile, so its upper
+            # end is set by validation instead: 256 is four MMA K instructions, wider
+            # tiles are unvalidated and tracing time climbs past them -- 768 does not
+            # finish in 400 s.
+            allowed_tile_k = (64, 128) if ab_dtype is cutlass.Float8E4M3FN else (64, 128, 256)
+            if self.cta_tile_k not in allowed_tile_k:
                 raise testing.CantImplementError(
-                    f"cta_tile_k={self.cta_tile_k} only serves C == {self.cta_tile_k}, "
-                    f"got C = {c}. Use cta_tile_k=256 for C that is a 256-multiple."
+                    f"{ab_dtype} requires cta_tile_k in {allowed_tile_k}, got {self.cta_tile_k}."
                 )
-            # A 2CTA narrow-N SFB multicast cannot split an odd count of
-            # scale-factor K atoms between its CTAs.
-            sf_k_atoms = self.cta_tile_k // 64
-            if (
-                self.use_2cta_instrs
-                and sf_k_atoms % 2 == 1
-                and sf_k_atoms > 1
-                and self.mma_tiler_mn[1] < 192
+            # Three fields of the 5D im2col tensor map are narrower than the
+            # convolution parameters feeding them, and a 3D convolution always builds
+            # a 5D descriptor. The widths come from the encodings: a 5-bit signed
+            # corner per spatial dimension ([-16, 15]), an unsigned 5-bit coordinate
+            # offset per dimension ([0, 31]), and a 3-bit traversal stride holding the
+            # stride minus one ([1, 8]). A corner is not the padding itself -- the
+            # leading one is -lower_padding, the trailing one
+            # upper_padding - (filter - 1) * dilation -- so padding and dilation only
+            # bind in combination. Overflowing one truncates it and moves the pixel
+            # box, surfacing as an illegal instruction when the shifted box leaves
+            # mapped memory and as a wrong answer when it does not, so computing
+            # correctly past a bound is luck, not contract.
+            corner_lo = -16
+            corner_hi = 15
+            max_filter_offset = 31
+            max_element_stride = 8
+            for dim, flt, dil, pad_up, pad_lo, stride in zip(
+                ("D", "H", "W"),
+                filter_trs,
+                dil_dhw,
+                upper_padding_dhw,
+                lower_padding_dhw,
+                stride_dhw,
+                strict=True,
             ):
-                raise testing.CantImplementError(
-                    f"2CTA cta_tile_k={self.cta_tile_k} with mma_tiler_n="
-                    f"{self.mma_tiler_mn[1]} deadlocks in SFB multicast. "
-                    "Use 1CTA or mma_tiler_n >= 192."
-                )
+                leading_corner = -pad_lo
+                trailing_corner = pad_up - (flt - 1) * dil
+                if not corner_lo <= leading_corner <= corner_hi:
+                    raise testing.CantImplementError(
+                        f"{dim} leading im2col corner is -lower_padding = "
+                        f"{leading_corner}, outside the [{corner_lo}, {corner_hi}] the "
+                        f"descriptor's signed 5-bit corner encodes; lower_padding_"
+                        f"{dim.lower()} must be at most {-corner_lo}"
+                    )
+                if not corner_lo <= trailing_corner <= corner_hi:
+                    raise testing.CantImplementError(
+                        f"{dim} trailing im2col corner is upper_padding - (filter - 1) "
+                        f"* dilation = {pad_up} - ({flt} - 1) * {dil} = "
+                        f"{trailing_corner}, outside the [{corner_lo}, {corner_hi}] the "
+                        f"descriptor's signed 5-bit corner encodes"
+                    )
+                if stride > max_element_stride:
+                    raise testing.CantImplementError(
+                        f"stride_{dim.lower()}={stride} exceeds the {max_element_stride}"
+                        f" a traversal stride encodes, holding the stride minus one in "
+                        f"3 bits"
+                    )
+                # A filter offset is dilation * tap index, so the largest one a
+                # dimension reaches is (filter - 1) * dilation. Overflowing the
+                # unsigned field shifts the filter taps and silently changes the
+                # result, so it is bounded even when both corners are in range.
+                filter_offset = (flt - 1) * dil
+                if filter_offset > max_filter_offset:
+                    raise testing.CantImplementError(
+                        f"{dim} filter offset is (filter - 1) * dilation = ({flt} - 1) "
+                        f"* {dil} = {filter_offset}, past the {max_filter_offset} an "
+                        f"unsigned 5-bit im2col coordinate offset encodes"
+                    )
         except testing.CantImplementError as e:
             print(e)
             return False
         return True
 
 
+def sf_k_tile_channels(cta_tile_k: int, sf_vec_size: int) -> int:
+    """Channels one SF K tile spans.
+
+    The SF atom holds 4 scale-factor blocks along K, so it covers
+    4 * sf_vec_size channels and cannot be staged in part: a narrower A/B K tile
+    still stages a whole atom, and several A/B tiles then share one SF tile. Host
+    and kernel both derive the SF cadence from here so they cannot drift apart.
+    """
+    return max(cta_tile_k, 4 * sf_vec_size)
+
+
+def sfb_per_position_channels(c: int, cta_tile_k: int, sf_vec_size: int) -> int:
+    """Channels of SFB one filter position spans: C rounded up to whole SF K tiles.
+
+    SFB runs channels and filter positions together in one flat K mode, so a K tile
+    that does not divide C would straddle two positions; rounding each position out
+    to whole SF K tiles puts every position on a tile boundary. The bound is the SF
+    tile, the width of the TMA box: a C that a 64-channel A/B tile divides still
+    straddles two positions once a 128-channel SF chunk serves two of those tiles.
+    """
+    span = sf_k_tile_channels(cta_tile_k, sf_vec_size)
+    return -(-c // span) * span
+
+
+# Exempt from the frontend cache-key rule (see indexer/mqa_logits_util.py
+# frontend_cache_token): the key below contains cute.Tensor arguments, which
+# hash by identity and are rebuilt via from_dlpack on every run(), so this
+# cache can never hit across calls, let alone across frontends. If the Tensor
+# arguments are ever dropped from the key or Tensor gains structural hashing,
+# add the frontend token here.
 @lru_cache(maxsize=1)
 def compile_conv(
     ncdhw: Tuple[int, int, int, int, int],
@@ -4038,15 +4246,14 @@ def compile_conv(
     :param filter: Filter tensor in KTRSC format (K, T, R, S, C) with C contiguous
     :param output: Output tensor (N, Z, P, Q, K) with K contiguous
     :param acc_dtype: Accumulator data type
-    :param cta_tile_k: Compile-time GEMM-K tile used to shape shared memory
     :param mma_tiler: MMA tile shape (M, N)
     :param preferred_cluster_shape_mn: Preferred cluster shape (M, N) for CLC dynamic scheduling
     :param fallback_cluster_shape_mn: Fallback cluster shape (M, N) for CLC dynamic scheduling
     :param swizzle_size: Swizzling size in the unit of cluster. 1 means no swizzle
     :param raster_along: Rasterization order of clusters. Only used when swizzle_size > 1
     :param use_2cta_instrs: Whether to use 2CTA instructions
-    :param upper_padding_dhw: Upper padding (D, H, W)
-    :param lower_padding_dhw: Lower padding (D, H, W)
+    :param upper_padding_dhw: Upper padding in depth, height, width order
+    :param lower_padding_dhw: Lower padding in depth, height, width order
     :param stride_dhw: Stride (Sd, Sh, Sw)
     :param dilation_dhw: Dilation (DilD, DilH, DilW)
     :param epilogue_op: Epilogue operation
@@ -4054,6 +4261,7 @@ def compile_conv(
     """
     from cutlass.cute.runtime import make_fake_stream
 
+    # Output spatial dims for the SFD global descriptor (host int, trace-const).
     zpq = compute_zpq(
         ncdhw[2:],
         ktrs[1:],
@@ -4062,6 +4270,8 @@ def compile_conv(
         lower_padding_dhw,
         dilation_dhw,
     )
+    # Host-side swizzle_size guard: reject a swizzle that exceeds the cluster
+    # count in the swizzled dimension (GEMM-M = N*Z*P*Q spatial, GEMM-N = Kout).
     _check_swizzle_size(
         ncdhw[0] * zpq[0] * zpq[1] * zpq[2],
         ktrs[0],
@@ -4073,8 +4283,11 @@ def compile_conv(
         raster_along,
     )
 
-    # Only cta_tile_k shapes this cubin. Runtime tensor layouts provide C and
-    # output geometry; boxed scalars provide pad, stride, and dilation.
+    # Create convolution kernel object. Only cta_tile_k (compile-time K tile) is
+    # a build-time shape parameter; the input channel count C and all output
+    # geometry (N/Z/P/Q/K) are read from the dynamic tensors at runtime, so one
+    # cubin serves every C. Filter T/R/S and pad/stride/dil are likewise runtime
+    # (dynamic filter extents + boxed Int32).
     conv_op = Sm100BlockScaledPersistentDenseImplicitGemmKernel(
         acc_dtype,
         sf_vec_size,
@@ -4093,8 +4306,16 @@ def compile_conv(
         ktrs[0],
         input.element_type,
         output.element_type,
+        sfa.element_type,
         output,
+        ktrs[1:],
+        upper_padding_dhw,
+        lower_padding_dhw,
+        stride_dhw,
+        dilation_dhw,
         residual.element_type if residual is not None else None,
+        bias is not None,
+        epilogue_op,
     )
     if not can_implement:
         raise testing.CantImplementError("The current config is invalid/unsupported.")
@@ -4272,6 +4493,21 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
 
 
+# Compile-time epilogue activations, folded into the cubin as a Constexpr op
+# (one activation per cubin). Each entry pairs the device-side op applied to the
+# output fragment with the torch op used to build the reference.
+EPILOGUE_ACTIVATIONS = {
+    "identity": {
+        "device": lambda x: x,
+        "ref": lambda x: x,
+    },
+    "relu": {
+        "device": lambda x: cute.where(x > 0, x, cute.full_like(x, 0)),
+        "ref": torch.nn.functional.relu,
+    },
+}
+
+
 def run(
     ncdhw: Tuple[int, int, int, int, int],
     ktrs: Tuple[int, int, int, int],
@@ -4299,6 +4535,7 @@ def run(
     skip_ref_check: bool = False,
     use_bias: bool = False,
     beta: float = 0.0,
+    activation: str = "identity",
     **kwargs,
 ):
     """Run 3D convolution and compare against PyTorch reference.
@@ -4308,15 +4545,12 @@ def run(
     :param ncdhw: Input tensor shape (N, C, D, H, W)
     :param ktrs: Filter tensor shape components (K, T, R, S)
     :param stride_dhw: Stride (Sd, Sh, Sw)
-    :param upper_pad_dhw: Upper padding (D, H, W)
-    :param lower_pad_dhw: Lower padding (D, H, W)
+    :param upper_pad_dhw: Upper padding in depth, height, width order
+    :param lower_pad_dhw: Lower padding in depth, height, width order
     :param dil_dhw: Dilation (DilD, DilH, DilW)
     :param ab_dtype: Data type for A/B input tensors
     :param d_dtype: Data type for output tensor D
     :param acc_dtype: Accumulator data type
-    :param cta_tile_k: Compile-time GEMM-K tile. A 256 tile can serve runtime
-        channel counts that are multiples of 256; smaller tiles serve only a
-        matching channel count.
     :param mma_tiler_mn: MMA tiler shape
     :param preferred_cluster_shape_mn: Preferred cluster shape (M, N) for CLC dynamic scheduling
     :param fallback_cluster_shape_mn: Fallback cluster shape (M, N) for CLC dynamic scheduling
@@ -4334,13 +4568,25 @@ def run(
 
     N, C, D, H, W = ncdhw
     K, T, R, S = ktrs
-    if cta_tile_k is None:
-        cta_tile_k = min(256, C)
 
     # Residual (C) shares the output's shape and im2col TMA descriptor, so its
     # dtype defaults to the output dtype when the caller does not set one.
     if c_dtype is None:
         c_dtype = d_dtype
+
+    # cta_tile_k is the compile-time K tile. When unset, take the largest legal tile
+    # that fits in the channel count. A C the tile does not divide is fine -- the
+    # trailing tile is partial. A caller may pass one explicitly to reuse a cubin
+    # across several C, or to trade tile width against channel padding.
+    #
+    # MXFP8 defaults to tile_k=128, the width of its SF atom, so a K tile stages
+    # exactly one atom. tile_k=64 is legal too -- two K tiles then share one staged
+    # atom -- and halves the channel padding on a C that 128 overshoots.
+    if cta_tile_k is None:
+        if ab_dtype is cutlass.Float8E4M3FN:
+            cta_tile_k = 128
+        else:
+            cta_tile_k = max(t for t in (64, 128, 256) if t <= max(64, min(256, C)))
 
     Z, P, Q = compute_zpq(
         (D, H, W),
@@ -4356,8 +4602,8 @@ def run(
     print(f"  Filter shape (K, C, T, R, S): ({K}, {C}, {T}, {R}, {S})")
     print(f"  Output shape (N, K, Z, P, Q): ({N}, {K}, {Z}, {P}, {Q})")
     print(f"  Stride (Sd, Sh, Sw): {stride_dhw}")
-    print(f"  Upper padding (D, H, W): {upper_pad_dhw}")
-    print(f"  Lower padding (D, H, W): {lower_pad_dhw}")
+    print(f"  Upper padding (depth, height, width): {upper_pad_dhw}")
+    print(f"  Lower padding (depth, height, width): {lower_pad_dhw}")
     print(f"  Dilation (DilD, DilH, DilW): {dil_dhw}")
     print(f"  A/B data type: {ab_dtype}")
     print(f"  D data type: {d_dtype}")
@@ -4443,6 +4689,15 @@ def run(
         # prune to mkl for reference check.
         ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
 
+        # Round-trip the reference scale factors through the storage dtype so the
+        # reference dequant uses the exact values the kernel reads. E4M3 keeps
+        # fractional values (near-lossless for the 1..3 init range), but E8M0
+        # (MXFP8) snaps every scale to a power of two, so an un-rounded f32
+        # reference would disagree with the kernel on every non-pow2 block.
+        ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu.to(cutlass_torch.dtype(dtype)).to(
+            torch.float32
+        )
+
         # Create dtype cute torch tensor (cpu)
         cute_tensor, cute_torch_tensor = cutlass_torch.cute_tensor_like(
             cute_f32_torch_tensor_cpu,
@@ -4468,7 +4723,7 @@ def run(
 
         sf_k = ceil_div(k, sf_vec_size)
         # Pad sf_k to multiple of 4 so that the M-direction stride (= sf_k_padded)
-        # satisfies LDGSTS.32's 4-byte alignment requirement.
+        # satisfies the 4-byte cp.async alignment requirement.
         atom_k = 4
         sf_k_padded = ceil_div(sf_k, atom_k) * atom_k
 
@@ -4480,12 +4735,24 @@ def run(
 
         sf_torch = sf_raw.to(dtype=cutlass_torch.dtype(dtype)).cuda()
         sf_tensor = from_dlpack(sf_torch, assumed_align=16)
+        # When the kernel indexes this tensor directly (SFA: the device reads its
+        # gmem through mSFA_mkl's own strides, no host rebuild), the sf_k extent
+        # is C/sf_vec_size and its row stride must stay runtime so one cubin
+        # serves every C. Without this the stride is frozen to the compile C and
+        # a different C reads every row at the wrong offset.
         if mark_dynamic_leading_dim is not None:
             sf_tensor = sf_tensor.mark_layout_dynamic(leading_dim=mark_dynamic_leading_dim)
 
-        # Build f32 reference for verification (only the original sf_k, not padded)
+        # Build f32 reference for verification (only the original sf_k, not
+        # padded). Decode the scale factors through the storage dtype so the
+        # reference matches the values the kernel reads: E8M0 (MXFP8) has no
+        # exact zero (0 stores as the smallest exponent, ~5.9e-39) and only
+        # represents powers of two, so the raw uint8 -> f32 cast would disagree
+        # with the kernel on those blocks. E4M3 decodes the small integers
+        # losslessly, leaving the NVFP4 path unchanged.
         sf_ref = (
             sf_raw[:, :sf_k, :]
+            .to(dtype=cutlass_torch.dtype(dtype))
             .float()
             .permute(2, 0, 1)
             .unsqueeze(-1)
@@ -4505,19 +4772,21 @@ def run(
         sf_dtype,
         mark_dynamic_leading_dim=1,
     )
+    # Allocate SFB at the per-position span: the channels past C pair with the
+    # zero-filled B the TMA produces there, so what they scale is zero.
+    sfb_c_span = sfb_per_position_channels(C, cta_tile_k, sf_vec_size)
     sfb_ref, sfb_, sfb_storage = create_scale_factor_tensor_swizzled(
         1,
         K,
-        C * T * R * S,
+        sfb_c_span * T * R * S,
         sf_vec_size,
         sf_dtype,
     )
-    # SFD: only emitted for NVFP4 (Float4E2M1FN) output. FP8/FP16/BF16/FP32
-    # outputs do not carry SFD.
-    gen_sfd = d_dtype is cutlass.Float4E2M1FN
-    # NVFP4 SFD block size: one E4M3 scale factor per 16 FP4 output elements.
-    sfd_vec_size = 16
-    # SFD shares the input sf_dtype (NVFP4 standard: Float8E4M3FN).
+    # SFD: emitted for a narrow (block-scaled) output; FP16 and BF16 carry none. It
+    # takes the input's scale format outright, so NVFP4 stays E4M3 over 16 channels
+    # and MXFP8 E8M0 over 32 on both sides.
+    gen_sfd = d_dtype in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN)
+    sfd_vec_size = sf_vec_size
     sfd_dtype = sf_dtype
     if gen_sfd:
         _, sfd_, sfd_storage = create_scale_factor_tensor_unswizzled(
@@ -4553,8 +4822,8 @@ def run(
     else:
         c_f32_src, c_storage, c_ = None, None, None
 
-    # Per-tensor FP32 scaling factors stay device-resident, matching the product
-    # path where activation scales can be derived asynchronously on the GPU.
+    # Keep runtime scales device-resident, matching the product path where a
+    # dynamic activation scale is produced asynchronously on the GPU.
     alpha_storage = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     alpha_ = from_dlpack(alpha_storage, assumed_align=4)
     if gen_sfd:
@@ -4562,6 +4831,14 @@ def run(
         norm_const_ = from_dlpack(norm_const_storage, assumed_align=4)
     else:
         norm_const_storage, norm_const_ = None, None
+
+    # Resolve the compile-time epilogue activation. The device op is folded into
+    # the cubin as a Constexpr; the reference op mirrors it on the host.
+    if activation not in EPILOGUE_ACTIVATIONS:
+        raise ValueError(
+            f"Unsupported activation {activation!r}; choose from {sorted(EPILOGUE_ACTIVATIONS)}"
+        )
+    epilogue_op = EPILOGUE_ACTIVATIONS[activation]["device"]
 
     # Compile convolution kernel
     print("Compiling kernel with cute.compile ...")
@@ -4592,6 +4869,7 @@ def run(
         lower_padding_dhw=lower_pad_dhw,
         stride_dhw=stride_dhw,
         dilation_dhw=dil_dhw,
+        epilogue_op=epilogue_op,
     )
 
     # Get current CUDA stream
@@ -4628,6 +4906,7 @@ def run(
         cutlass.Int32(dil_dhw[2]),
         current_stream,
     )
+    torch_stream.synchronize()
 
     if not skip_ref_check:
         print("Verifying results with block-scaled reference...")
@@ -4639,7 +4918,9 @@ def run(
         scaled_input = input_tensor.cuda().float() * sfa_expanded
 
         # Pre-scale filter by SFB: sfb_ref shape (K, C*T*R*S, 1)
-        sfb_expanded = sfb_ref.squeeze(-1).reshape(K, T, R, S, C).cuda()
+        # Drop the per-position padding channels: they scale zero-filled B and have
+        # no counterpart in the reference convolution.
+        sfb_expanded = sfb_ref.squeeze(-1).reshape(K, T, R, S, sfb_c_span)[..., :C].cuda()
         scaled_filter = filter_tensor.cuda().float() * sfb_expanded
 
         # F.conv3d expects (N, C, D, H, W) and (K, C, T, R, S)
@@ -4688,6 +4969,10 @@ def run(
         # kernel loads, so float() reproduces them bit-for-bit.
         if beta != 0.0:
             ref = ref + beta * c_storage.float().reshape(N, Z, P, Q, K).cuda()
+        # Apply the epilogue activation on the full linear combination
+        # (D = activation(alpha*acc + bias + beta*residual)), matching the
+        # device op folded into the kernel.
+        ref = EPILOGUE_ACTIVATIONS[activation]["ref"](ref)
         # Snapshot the un-quantized FP32 ref BEFORE the in-place quantize round-trip
         # below mutates `ref` (shares GPU storage with ref_device).
         ref_unquant_cpu = ref.detach().cpu().clone()
@@ -4721,64 +5006,91 @@ def run(
         ref_quantized = ref_device.cpu()
 
         if gen_sfd:
-            # SFD path: kernel rescales acc by acc_scale before FP4 cast, so
-            # raw kernel D is no longer comparable to a directly-quantized ref.
-            # Do a dequant-equation refcheck: D_kernel * SFD ~= ref (un-quantized).
-            sfd_cpu = sfd_storage.cpu()
+            # SFD path: the kernel rescales acc by norm_const_tensor / SFD before the
+            # FP4 cast, so the raw kernel D is only meaningful together with SFD.
+            # Recompute the reference SFD and the SFD-rescaled reference output
+            # fully on the host -- per-vector amax, scale factor, and rescale are
+            # all derived from the un-quantized reference, independent of the
+            # kernel's own SFD -- then compare SFD and the quantized output
+            # elementwise. The reference block scale is read back after its E4M3
+            # cast so the rescale is self-consistent, matching the kernel.
             sf_k = (K + sfd_vec_size - 1) // sfd_vec_size
-            print(f"sfd_storage dtype = {sfd_cpu.dtype} (kernel sfd_dtype={sfd_dtype})")
-            # Bit-reinterpret storage as raw uint8 bytes (for byte stats only).
-            sfd_bytes_view = sfd_cpu.view(torch.uint8)
-            # Reinterpret as the kernel sfd_dtype, then cast to float for dequant.
-            if sfd_dtype is cutlass.Float8E4M3FN:
-                sfd_typed_view = sfd_bytes_view.view(torch.float8_e4m3fn)
+            # norm_const_ is a device Float32; mirror it as a host float for the
+            # torch-side replay (host path always uses the 1.0 default).
+            norm_const_host = 1.0
+            fp32_max = torch.finfo(torch.float32).max
+
+            # 1. Reference SFD and SFD-rescaled reference output, host-side.
+            #    per-vector amax over sfd_vec_size contiguous K elements
+            #    -> pvscale = amax * norm_const_tensor / M_D
+            #    -> cast to sfd_dtype and read back (sfd_ref)
+            #    -> rescale ref by norm_const_tensor / sfd_ref.
+            # M_D is the output dtype's full-scale max (FP4=6.0, E4M3=448.0);
+            # sfd_dtype is the input sf_dtype (E4M3 for NVFP4, E8M0 for MXFP8).
+            m_d = 6.0 if d_dtype is cutlass.Float4E2M1FN else 448.0
+            sfd_torch_dtype = cutlass_torch.dtype(sfd_dtype)
+            k_pad = sf_k * sfd_vec_size
+            ref_pad = torch.zeros((N, Z, P, Q, k_pad), dtype=torch.float32)
+            ref_pad[..., :K] = ref_unquant_cpu
+            amax = (
+                ref_pad.reshape(N, Z, P, Q, sf_k, sfd_vec_size).abs().amax(dim=5)
+            )  # (N, Z, P, Q, sf_k)
+            pvscale = amax * norm_const_host / m_d
+            if sfd_dtype is cutlass.Float8E8M0FNU:
+                # E8M0 SFD (MXFP8) rounds toward +inf to the next power of two,
+                # matching the device cvt.rp.ue8m0; a plain round-to-nearest cast
+                # would disagree by up to one exponent step. exp2/log2 run on CPU
+                # (the CUDA path goes through nvrtc jiterator). E8M0 has no zero;
+                # its smallest value is 2^-127, which cvt.rp of 0.0 also yields.
+                sfd_ref = torch.exp2(torch.ceil(torch.log2(pvscale)).clamp(-127.0, 127.0))
             else:
-                sfd_typed_view = sfd_bytes_view.view(torch.float8_e8m0fnu)
-            # Layout (mn=NZPQ, sf_k_padded, l=1) -- keep only the live K range.
-            sfd_dequant = sfd_typed_view[:, :sf_k, :].float().squeeze(-1)  # (NZPQ, sf_k)
-            sfd_expanded = (
-                sfd_dequant.unsqueeze(-1)
-                .expand(-1, -1, sfd_vec_size)
-                .reshape(-1, sf_k * sfd_vec_size)[:, :K]
-                .reshape(N, Z, P, Q, K)
+                # E4M3 SFD (NVFP4) has a mantissa; round-to-nearest is exact enough.
+                sfd_ref = pvscale.to(sfd_torch_dtype).to(torch.float32)
+            acc_scale = (norm_const_host / sfd_ref.clamp(min=1e-30)).clamp(max=fp32_max)
+            d_scaled = (
+                ref_unquant_cpu
+                * acc_scale.unsqueeze(-1)
+                .expand(N, Z, P, Q, sf_k, sfd_vec_size)
+                .reshape(N, Z, P, Q, k_pad)[..., :K]
             )
-            d_dequant = d_ref_result * sfd_expanded
-            ref_cpu = ref_unquant_cpu
+
+            # 2. Quantize the rescaled reference through d_dtype (f32 -> FP4 ->
+            #    f32) via the same convert path the kernel output went through.
+            d_ref_narrow_ = torch.empty(
+                (N, Z, P, Q, K), dtype=ref_quant_storage_dtype, device="cuda"
+            )
+            d_ref_narrow = from_dlpack(d_ref_narrow_, assumed_align=16).mark_layout_dynamic(
+                leading_dim=4
+            )
+            d_ref_narrow.element_type = d_dtype
+            d_scaled_dev = d_scaled.contiguous().cuda()
+            d_scaled_tensor = from_dlpack(d_scaled_dev, assumed_align=16).mark_layout_dynamic(
+                leading_dim=4
+            )
+            cute.testing.convert(d_scaled_tensor, d_ref_narrow)
+            cute.testing.convert(d_ref_narrow, d_scaled_tensor)
+            d_ref_quant = d_scaled_dev.cpu()
+
+            # 3. Decode the kernel-written SFD (plain (NZPQ, sf_k_padded, 1)
+            #    layout) to f32 in the same (N, Z, P, Q, sf_k) shape as sfd_ref,
+            #    reinterpreting the raw bytes through the actual SFD dtype.
+            sfd_cpu = sfd_storage.cpu()
+            sfd_bytes_view = sfd_cpu.view(torch.uint8)
+            sfd_kernel = (
+                sfd_bytes_view[:, :sf_k, :]
+                .view(sfd_torch_dtype)
+                .float()
+                .squeeze(-1)
+                .reshape(N, Z, P, Q, sf_k)
+            )
             n_nonzero = (sfd_bytes_view[:, :sf_k, :] != 0).sum().item()
-            n_total = sfd_bytes_view[:, :sf_k, :].numel()
-            print(
-                f"SFD: {n_nonzero}/{n_total} entries non-zero; "
-                f"D_dequant max={d_dequant.abs().max().item():.4g}, "
-                f"ref max={ref_cpu.abs().max().item():.4g}"
-            )
             assert n_nonzero > 0, "SFD is all zero -- kernel did not write SFD"
-            sfd_bytes = sfd_bytes_view[:, :sf_k, :].flatten()
-            print(
-                f"SFD bytes: min={sfd_bytes.min().item()} max={sfd_bytes.max().item()} "
-                f"mean={sfd_bytes.float().mean().item():.2f}"
-            )
-            print(
-                f"D_kernel:  min={d_ref_result.min().item():.4g} max={d_ref_result.max().item():.4g}"
-            )
-            print(f"ref:       min={ref_cpu.min().item():.4g} max={ref_cpu.max().item():.4g}")
-            # Strict dequant refcheck: D_kernel * SFD ~= ref within FP4 round-off.
-            # FP4 (Float4E2M1FN) values are {0, +/-0.5, +/-1, +/-1.5, +/-2, +/-3, +/-4, +/-6} with
-            # max spacing = 2 (between 4 and 6), so max round-to-nearest error per
-            # element after dequant is `1.0 * sfd_scale`. Allow a small slack (1.5x)
-            # for the e8m0 round-up bias.
-            diff = (d_dequant - ref_cpu).abs()
-            err_in_steps = diff / sfd_expanded.clamp(min=1e-6)
-            print(
-                f"\nD_dequant vs ref: max abs diff={diff.max().item():.4g}, "
-                f"max err_in_steps={err_in_steps.max().item():.4g}, "
-                f"mean abs diff={diff.mean().item():.4g}, "
-                f"frac err_in_steps>1.5={(err_in_steps > 1.5).float().mean().item():.4f}"
-            )
-            assert err_in_steps.max().item() < 1.5, (
-                f"SFD dequant exceeds FP4 round-off: max err_in_steps="
-                f"{err_in_steps.max().item():.4g} > 1.5"
-            )
-            print("SFD strict dequant refcheck passed.")
+
+            # Compare SFD first: the output rescale depends on it, so an SFD
+            # mismatch is the more fundamental signal.
+            torch.testing.assert_close(sfd_kernel, sfd_ref, atol=1e-01, rtol=1e-01)
+            torch.testing.assert_close(d_ref_result, d_ref_quant, atol=1e-01, rtol=1e-01)
+            print("SFD dequant refcheck passed.")
         else:
             torch.testing.assert_close(
                 d_ref_result,
@@ -4801,10 +5113,10 @@ def run(
             output_, output_storage = create_cute_tensor(output_tensor, d_dtype, leading_dim=4)
             # Arg order must match the compiled entry exactly (epilogue_op and
             # beta are Constexpr, folded in at cute.compile time, so they are
-            # NOT runtime args): a, b, d, sfa, sfb, alpha, sfd, norm_const,
+            # NOT runtime args): a, b, d, sfa, sfb, alpha, sfd, norm_const_tensor,
             # bias, residual, then the 12 pad/stride/dil runtime Int32, then
             # stream last. Only the A/B/D tensors rotate per cold-L2 workspace;
-            # the SF tensors, alpha/norm_const/bias/residual, and the geometry
+            # the SF tensors, alpha/norm_const_tensor/bias/residual, and the geometry
             # scalars are reused.
             return testing.JitArguments(
                 input_,
@@ -4900,13 +5212,13 @@ if __name__ == "__main__":
         "--upper_pad_dhw",
         type=_parse_comma_separated_ints,
         default=(1, 1, 1),
-        help="Upper padding (D,H,W)",
+        help="Upper padding in depth,height,width order",
     )
     parser.add_argument(
         "--lower_pad_dhw",
         type=_parse_comma_separated_ints,
         default=(1, 1, 1),
-        help="Lower padding (D,H,W)",
+        help="Lower padding in depth,height,width order",
     )
     parser.add_argument(
         "--dil_dhw",
@@ -4921,6 +5233,7 @@ if __name__ == "__main__":
         type=cutlass.dtype,
         choices=[
             cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
         ],
         default=cutlass.Float4E2M1FN,
         help="Data type for A/B input tensors",
@@ -4968,7 +5281,7 @@ if __name__ == "__main__":
         "--cta_tile_k",
         type=int,
         default=None,
-        help="Compile-time GEMM-K tile; defaults to min(256, input C)",
+        help="Compile-time K tile (64/128/192/256). Defaults to min(256, C).",
     )
 
     # Kernel parameters
@@ -5051,6 +5364,16 @@ if __name__ == "__main__":
         help="Residual scaling (D = alpha*acc + bias + beta*residual); "
         "beta != 0 enables the residual path, beta == 0 disables it",
     )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default="identity",
+        choices=sorted(EPILOGUE_ACTIVATIONS),
+        help="Compile-time epilogue activation applied as "
+        "D = activation(alpha*acc + bias + beta*residual). One activation per "
+        "cubin (folded in as a Constexpr). Non-identity is unsupported for FP4 "
+        "output.",
+    )
     args = parser.parse_args()
 
     run(
@@ -5080,5 +5403,6 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_bias,
         args.beta,
+        args.activation,
     )
     print("PASS")
