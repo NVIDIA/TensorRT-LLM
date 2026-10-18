@@ -399,7 +399,10 @@ def _hidden(rows=ROWS, dtype=torch.bfloat16):
     [
         (_hidden(), 0, True, True),
         (_hidden(1), 0, True, True),
-        (_hidden(9), 0, True, False),
+        (_hidden(9), 0, True, True),
+        (_hidden(64), 0, True, True),
+        (_hidden(128), 0, True, True),
+        (_hidden(129), 0, True, False),
         (_hidden(dtype=torch.float32), 0, True, False),
         (_hidden(), 1, True, False),
         (_hidden(), 0, False, False),
@@ -424,6 +427,65 @@ def test_a_guided_decoder_bypasses_the_head_and_logs_once(monkeypatch):
 
 def test_the_poll_timeout_is_a_constant():
     assert head_sampler.POLL_TIMEOUT_S == 600
+
+
+def test_the_split_sampler_takes_up_to_the_shipped_wide_block_and_the_inbox_eight_rows():
+    assert head_sampler.MAX_ROWS == 128
+    assert head_sampler.INBOX_ROWS == target_head.GATHER_ROWS == 8
+
+
+@pytest.mark.parametrize("inbox", [False, True], ids=["split-sampler", "lm-head-inbox"])
+def test_the_head_owns_states_for_every_row_count_it_takes(monkeypatch, inbox):
+    """``split_sample`` runs at up to ``MAX_ROWS`` rows also under ``lm_head_inbox`` (every
+    step but the 8-row ones), so the head's scratch is sized to ``MAX_ROWS``, never the inbox's."""
+    sized = []
+    monkeypatch.setattr(
+        head_sampler, "new_states", lambda rows, device: sized.append(rows) or torch.empty(rows)
+    )
+    workspace = types.SimpleNamespace(library="lib", states=torch.empty(head_sampler.INBOX_ROWS))
+    monkeypatch.setattr(head_sampler, "shared_gather_workspace", lambda mapping, shard: workspace)
+    monkeypatch.setattr(head_sampler, "load_library_agreed", lambda mapping: "lib")
+    processor = types.SimpleNamespace(logit_multiplier=MULTIPLIER, soft_cap=SOFT_CAP)
+    lm_head = types.SimpleNamespace(weight=torch.empty(VOCAB // 8, 16))
+    head = target_head.TargetHead(processor, lm_head, _bare(Below), None, inbox)
+    assert sized == [head_sampler.MAX_ROWS]
+    assert head.states.numel() == head_sampler.MAX_ROWS
+    assert head.states is not workspace.states
+
+
+def test_an_inbox_head_samples_other_row_counts_from_the_builtin_gather(monkeypatch):
+    """Under ``lm_head_inbox`` a 64-row step runs the built-in LM head (its all-gather) and the
+    split sampler on the head's own scratch; only 8-row steps use the inbox."""
+    worker, head = _worker(inbox=True)
+    head.states = torch.empty(head_sampler.MAX_ROWS)
+    rows = 64
+    row = (torch.randn(rows, VOCAB) * 40).to(torch.bfloat16)
+    lm_head_calls = []
+
+    def lm_head(hidden):
+        lm_head_calls.append(hidden.shape[0])
+        return row
+
+    sampled = []
+    monkeypatch.setattr(
+        head_sampler,
+        "split_sample",
+        lambda logits, *args: sampled.append((logits, args[-2])) or torch.zeros(rows),
+    )
+    monkeypatch.setattr(
+        head_sampler, "gather_split_sample", lambda *a: pytest.fail("the inbox gather ran")
+    )
+    logits = head.produce(torch.zeros(rows, 16, dtype=torch.bfloat16), lm_head)
+    assert lm_head_calls == [rows] and logits is row and not head.pending_inbox
+    ones = torch.ones(rows)
+    head.sample(logits, ones, ones.int(), ones, ones, None, None)
+    assert len(sampled) == 1 and sampled[0][0] is row and sampled[0][1] is head.states
+    assert head.pending is None
+
+
+def test_the_library_name_carries_the_arch_target():
+    names = {head_sampler.library_name(t) for t in ("103a", "107a")}
+    assert names == {f"{head_sampler.LIBRARY_NAME}_sm103a", f"{head_sampler.LIBRARY_NAME}_sm107a"}
 
 
 # --------------------------------------------------------------------------

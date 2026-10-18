@@ -94,6 +94,22 @@ class ReplicatedEmbeddingGather(OpWrapper):
             "shard edges: the first and last row of every rank's shard",
             spec=dict(shape=(16,), dtype="int64", ids="edges", table="normal"),
         ),
+        Cell(
+            "64 int32 ids: the decode step of 8 requests",
+            spec=dict(shape=(64,), dtype="int32", ids="valid", table="normal"),
+        ),
+        Cell(
+            "512 int32 ids: the decode step of 64 requests, with signed zeros",
+            spec=dict(shape=(512,), dtype="int32", ids="valid", table="signed_zeros"),
+        ),
+        Cell(
+            "576 int64 ids: the largest call the target serves from the table",
+            spec=dict(shape=(576,), dtype="int64", ids="valid", table="normal"),
+        ),
+        Cell(
+            "[64, 8] int64 ids: 64 requests' blocks, ids no shard owns among them",
+            spec=dict(shape=(64, 8), dtype="int64", ids="mixed", table="signed_zeros"),
+        ),
     )
 
     note = """
@@ -104,7 +120,8 @@ class ReplicatedEmbeddingGather(OpWrapper):
 
     Call sites: ``replicated_embedding.ReplicatedEmbedding.forward``
     (``replicated_embedding``: the target's decode embedding and the drafter's
-    bonus / mask embedding, which share the module) and the DFlash noise block
+    bonus / mask embedding, which share the module, at most 576 ids per call;
+    the cells cover 2 to 576 ids) and the DFlash noise block
     of ``verify_fold`` with ``replicated_embedding`` (``spec_loop_fold.py``).
 
     Numerics: integer moves, bitwise the vocab-parallel embedding + MNNVL

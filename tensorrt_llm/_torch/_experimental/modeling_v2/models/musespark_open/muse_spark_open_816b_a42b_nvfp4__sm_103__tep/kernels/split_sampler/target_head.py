@@ -23,8 +23,10 @@ derived from ``TargetHeadDFlashWorker`` and its current class. Both share one
 ``TargetHead``, which holds the step's pending BF16 row between the two:
 
 * the processor produces the row on decode steps (no context rows) of at most
-  8 rows when no guided decoder is attached -- facts every rank shares, so
-  every rank takes the same path for the same call;
+  ``head_sampler.MAX_ROWS`` (128) rows when no guided decoder is attached --
+  facts every rank shares, so every rank takes the same path for the same
+  call; only steps of exactly 8 rows use the ``lm_head_inbox`` gather, the
+  others the built-in all-gather;
 * the worker's ``_sample_tokens_for_batch`` samples it on non-greedy batches
   with the fused sampling mode; every other consumer first **materializes**
   the built-in FP32 capped logits from it with the built-in torch chain --
@@ -104,7 +106,7 @@ from ...ops.spec import head_sampler as _hs
 #: The feature ids this module installs.
 
 #: Rows the inbox gather runs on: the K = 7 verify block of one request.
-GATHER_ROWS = _hs.MAX_ROWS
+GATHER_ROWS = _hs.INBOX_ROWS
 #: TP width the inbox layout is written for.
 GATHER_WORLD = 8
 
@@ -204,11 +206,12 @@ class TargetHead:
         if gather:
             self.workspace = _hs.shared_gather_workspace(mapping, int(lm_head.weight.shape[0]))
             self.library = self.workspace.library
-            self.states = self.workspace.states
         else:
             self.workspace = None
             self.library = _hs.load_library_agreed(mapping)
-            self.states = _hs.new_states(_hs.MAX_ROWS, self.device)
+        # Kernel A's states for ``split_sample`` at any row count it takes (the inbox
+        # path uses the workspace's own, sized to its slot).
+        self.states = _hs.new_states(_hs.MAX_ROWS, self.device)
         self.load_seconds = time.perf_counter() - start
         self.pending: Optional[torch.Tensor] = None
         self.pending_inbox = False
@@ -324,7 +327,7 @@ class TargetHead:
                 ws.states,
                 ws.status,
                 ws.shard,
-                _hs.MAX_ROWS,
+                _hs.INBOX_ROWS,
                 True,
                 self.pdl,
             )
@@ -360,7 +363,7 @@ class TargetHead:
                 ws.states,
                 ws.status,
                 ws.shard,
-                _hs.MAX_ROWS,
+                _hs.INBOX_ROWS,
                 False,
                 self.pdl,
             )

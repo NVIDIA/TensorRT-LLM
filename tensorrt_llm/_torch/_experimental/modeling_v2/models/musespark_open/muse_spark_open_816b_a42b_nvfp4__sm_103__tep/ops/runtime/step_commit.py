@@ -154,6 +154,29 @@ class StepStaging:
         if count > self._max_count:
             self._max_count = count
 
+    def extend(self, table: np.ndarray, max_count: Optional[int] = None) -> None:
+        """Record a table of descriptors built elsewhere, in the layout ``_add`` writes.
+
+        ``table`` is int64 ``[k, DESC_FIELDS]``; rows with a count of 0 or less
+        are skipped, as ``_add`` skips them. A caller that passes ``max_count``
+        states that every row's count is positive and at most ``max_count``, and
+        the table is copied as it is. The caller asks ``room`` first.
+        """
+        if max_count is None:
+            table = table[table[:, 3] > 0]
+            if table.shape[0] == 0:
+                return
+            max_count = int(table[:, 3].max())
+        k = table.shape[0]
+        if k == 0:
+            return
+        if self.num + k > self._desc_np.shape[0]:
+            raise RuntimeError(f"StepStaging: more than {self._desc_np.shape[0]} descriptors")
+        self._desc_np[self.num : self.num + k] = table
+        self.num += k
+        if max_count > self._max_count:
+            self._max_count = max_count
+
     def copy_bytes(self, dst_addr: int, payload: np.ndarray) -> None:
         """Record ``dst[i] = payload[i]`` for a uint8 payload whose size is a multiple of 4."""
         nbytes = payload.nbytes

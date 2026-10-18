@@ -430,6 +430,182 @@ def test_store_and_copy_out_matches_index_copy_and_snapshots(slots, num_slots):
         assert mine.is_pinned() and torch.equal(mine, ref)
 
 
+def _legacy_store(base, slots, o):
+    """The built-in store update (``index_copy_`` per store tensor) and its host snapshots."""
+    legacy = types.SimpleNamespace(**{k: v.clone() for k, v in vars(base).items()})
+    sl = torch.tensor(slots, dtype=torch.long, device="cuda")
+    legacy.new_tokens.squeeze(-1).T.index_copy_(0, sl, o[0])
+    legacy.next_new_tokens.squeeze(-1).T.index_copy_(0, sl, o[1])
+    legacy.new_tokens_lens.index_copy_(0, sl, o[2])
+    legacy.next_draft_tokens.index_copy_(0, sl, o[3])
+    host = [t.cpu() for t in (legacy.new_tokens, legacy.new_tokens_lens, legacy.next_draft_tokens)]
+    return legacy, host
+
+
+@pytest.mark.parametrize("num_slots", [8, 32, 64, 128, 512])
+@pytest.mark.parametrize("sampled", ["all", "half"])
+def test_store_and_copy_out_at_large_slot_counts(num_slots, sampled):
+    """Store slots = ``max_batch_size``: 8 to the cap of 512, every slot or half of
+    them sampled in a shuffled order. The writer's staging starts at 1024 descriptors; a
+    step it cannot hold (3 per slot + 4 per sampled slot) declines and the block doubles at
+    its next turn, so within a few steps every step is staged, matching ``index_copy_``.
+    The host time of a staged call, and of the built-in arm it replaces (slot upload,
+    four ``index_copy_``, three pinned ``non_blocking`` host copies), is printed (never gated)."""
+    import time
+
+    assert runtime._MAX_STORE_SLOTS == 512
+    g = torch.Generator().manual_seed(num_slots)
+    Tn, Tnn, D = 8, 8, 7
+    order = torch.randperm(num_slots, generator=g).tolist()
+    slots = order if sampled == "all" else order[: num_slots // 2]
+    n = len(slots)
+    writer = runtime.SampleStoreWriter()
+    staged = 0
+    host_us, builtin_us = [], []
+    # The sampler's store tensors live as long as the sampler: one set, refilled per step.
+    mine_store = _store(g, Tn, Tnn, D, num_slots)
+    sampler = types.SimpleNamespace(store=mine_store, _async_worker_active=lambda: False)
+    steps = 40
+    for step in range(steps):
+        base = _store(g, Tn, Tnn, D, num_slots)
+        o = [
+            torch.randint(10, 99, shape, generator=g, dtype=torch.int32).cuda()
+            for shape in ((n, Tn), (n, Tnn), (n,), (n, D))
+        ]
+        legacy, legacy_host = _legacy_store(base, slots, o)
+        for k, v in vars(base).items():
+            getattr(mine_store, k).copy_(v)
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        host = writer.store_and_copy_out(sampler, slots, *o, None)
+        elapsed = time.perf_counter() - start
+        torch.cuda.synchronize()
+        if host is None:
+            assert staged == 0, "a step declined after one was staged"
+            assert writer.counts["sample declined: staging block full"] == step + 1
+            assert all(torch.equal(getattr(mine_store, k), getattr(base, k)) for k in vars(base))
+            continue
+        staged += 1
+        host_us.append(elapsed * 1e6)
+        start = time.perf_counter()
+        sl = torch.as_tensor(slots, dtype=torch.long).to(device="cuda", non_blocking=True)
+        base.new_tokens.squeeze(-1).T.index_copy_(0, sl, o[0])
+        base.next_new_tokens.squeeze(-1).T.index_copy_(0, sl, o[1])
+        base.new_tokens_lens.index_copy_(0, sl, o[2])
+        base.next_draft_tokens.index_copy_(0, sl, o[3])
+        for t in (base.new_tokens, base.new_tokens_lens, base.next_draft_tokens):
+            torch.empty_like(t, device="cpu", pin_memory=True).copy_(t, non_blocking=True)
+        builtin_us.append((time.perf_counter() - start) * 1e6)
+        torch.cuda.synchronize()
+        for k in vars(base):
+            assert torch.equal(getattr(mine_store, k), getattr(legacy, k)), k
+        for mine, ref in zip(host, legacy_host):
+            assert mine.is_pinned() and torch.equal(mine, ref)
+    assert staged >= steps - 4, writer.counts
+    print(
+        f"\n  {num_slots} slots, {n} sampled: {staged} of {steps} steps staged, "
+        f"host {sorted(host_us)[len(host_us) // 2]:.0f} us per staged call, built-in arm "
+        f"{sorted(builtin_us)[len(builtin_us) // 2]:.0f} us (medians)"
+    )
+
+
+def _per_slot_descriptors(stores, targets, outs, host, slots):
+    """The writer's descriptors as one ``StepStaging.gather`` call per descriptor, slot by
+    slot: the plain statement of what ``record_store`` builds a column at a time."""
+    new_tokens, next_new_tokens, lens, drafts = stores
+    t_new_tokens, t_next_new_tokens, t_lens, t_drafts = targets
+    o_new_tokens, o_next_new_tokens, o_lens, o_drafts = outs
+    h_new_tokens, h_lens, h_drafts = host
+    num_slots = lens.shape[0]
+    Tn, Tnn, D = new_tokens.shape[0], next_new_tokens.shape[0], drafts.shape[1]
+    staging = sc.StepStaging(max_descriptors=8 * num_slots + 8)
+
+    def at(t, offset=0):
+        return t.data_ptr() + offset * t.element_size()
+
+    row_of = {s: j for j, s in enumerate(slots)}
+    for s in range(num_slots):
+        j = row_of.get(s)
+        if j is not None:
+            src_nt, nt_stride = at(o_new_tokens, j * o_new_tokens.stride(0)), o_new_tokens.stride(1)
+            src_lens = at(o_lens, j * o_lens.stride(0))
+            src_dr, dr_stride = at(o_drafts, j * o_drafts.stride(0)), o_drafts.stride(1)
+            src_nnt = at(o_next_new_tokens, j * o_next_new_tokens.stride(0))
+            staging.gather(at(t_new_tokens, s), num_slots, src_nt, nt_stride, Tn)
+            staging.gather(
+                at(t_next_new_tokens, s), num_slots, src_nnt, o_next_new_tokens.stride(1), Tnn
+            )
+            staging.gather(at(t_lens, s), 1, src_lens, 0, 1)
+            staging.gather(at(t_drafts, s * D), 1, src_dr, dr_stride, D)
+        else:
+            src_nt, nt_stride = at(new_tokens, s), num_slots
+            src_lens, src_dr, dr_stride = at(lens, s), at(drafts, s * D), 1
+        staging.gather(at(h_new_tokens, s), num_slots, src_nt, nt_stride, Tn)
+        staging.gather(at(h_lens, s), 1, src_lens, 0, 1)
+        staging.gather(at(h_drafts, s * D), 1, src_dr, dr_stride, D)
+    return staging
+
+
+@pytest.mark.parametrize("num_slots, sampled", [(1, 1), (8, 3), (64, 64), (128, 37), (512, 512)])
+def test_record_store_builds_the_per_slot_descriptors(num_slots, sampled):
+    """The vectorized table holds exactly the per-slot loop's descriptors (as a set of
+    rows: no two write the same element, so their order is free), and the same
+    largest count, which sizes the launch grid. Also with a cached layout reused over
+    steps of other slots and other output tensors, and over two steps of the same slots
+    (a steady batch, whose table is reused with new output addresses)."""
+    g = torch.Generator().manual_seed(num_slots + sampled)
+    Tn, Tnn, D = 8, 8, 7
+    stores = tuple(vars(_store(g, Tn, Tnn, D, num_slots)).values())
+    host = tuple(torch.empty_like(stores[i], device="cpu") for i in (0, 2, 3))
+    layouts = {}
+
+    def key(staging):
+        return sorted(map(tuple, staging.desc.numpy()[: staging.num].tolist()))
+
+    slots = None
+    for step, cached in ((0, None), (1, layouts), (2, layouts), (3, layouts), (4, layouts)):
+        if step < 4:
+            n = max(1, sampled - step) if step else sampled
+            slots = torch.randperm(num_slots, generator=g)[:n].tolist()
+        rows = n + 2 + step
+        outs = [
+            torch.zeros(shape, dtype=torch.int32, device="cuda")[1 : 1 + n]
+            for shape in ((rows, Tn), (rows, Tnn), (rows,), (rows, D))
+        ]
+        want = _per_slot_descriptors(stores, stores, outs, host, slots)
+        got = sc.StepStaging(max_descriptors=8 * num_slots + 8)
+        runtime.SampleStoreWriter.record_store(got, stores, stores, outs, host, slots, cached)
+        assert got.num == want.num == 7 * n + 3 * (num_slots - n)
+        assert key(got) == key(want), step
+        assert got._max_count == want._max_count
+    assert len(layouts) == 1
+
+
+def test_extend_skips_empty_rows_and_refuses_overflow():
+    staging = sc.StepStaging(max_descriptors=4)
+    table = torch.zeros((3, sc.DESC_FIELDS), dtype=torch.int64).numpy()
+    table[:, 0] = sc.KIND_GATHER
+    table[:, 3] = (5, 0, 2)
+    staging.extend(table)
+    assert staging.num == 2 and staging._max_count == 5
+    with pytest.raises(RuntimeError, match="more than 4 descriptors"):
+        staging.extend(table.repeat(2, axis=0))
+
+
+def test_store_and_copy_out_declines_above_the_slot_cap():
+    writer = runtime.SampleStoreWriter()
+    g = torch.Generator().manual_seed(3)
+    num_slots = runtime._MAX_STORE_SLOTS + 1
+    st = _store(g, 8, 8, 7, num_slots)
+    sampler = types.SimpleNamespace(store=st, _async_worker_active=lambda: False)
+    o = (torch.zeros((1, 8), dtype=torch.int32, device="cuda"),) * 2 + (
+        torch.zeros((1,), dtype=torch.int32, device="cuda"),
+        torch.zeros((1, 7), dtype=torch.int32, device="cuda"),
+    )
+    assert writer.store_and_copy_out(sampler, [0], *o, None) is None
+    assert writer.counts["sample declined: too many slots"] == 1
+
+
 def test_store_and_copy_out_declines_outside_its_case():
     writer = runtime.SampleStoreWriter()
     st = types.SimpleNamespace(

@@ -364,7 +364,7 @@ def test_the_entry_is_scoped_to_one_forward_call(monkeypatch):
     assert attention._preattn_prep is None
 
 
-def test_more_than_eight_rows_take_the_builtin_prep_without_a_warning(monkeypatch):
+def test_rows_above_the_cap_take_the_builtin_prep_without_a_warning(monkeypatch):
     attention = _ATTN.adopt(_builtin_attention(0, rope=True))
     attention._preattn_prep = preattn_prep
     sentinel = object()
@@ -373,8 +373,9 @@ def test_more_than_eight_rows_take_the_builtin_prep_without_a_warning(monkeypatc
     )
     warnings = []
     monkeypatch.setattr(target_attention.logger, "warning_once", lambda *a, **k: warnings.append(a))
-    qkv = torch.zeros(9, 2304, dtype=torch.bfloat16)
-    assert attention.preprocess_qkv(qkv, torch.zeros(1, 9, dtype=torch.int32)) is sentinel
+    rows = target_attention._PREATTN_PREP_MAX_ROWS + 1
+    qkv = torch.zeros(rows, 2304, dtype=torch.bfloat16)
+    assert attention.preprocess_qkv(qkv, torch.zeros(1, rows, dtype=torch.int32)) is sentinel
     assert warnings == []
     # A decode projection the entry cannot take (here: on the host) falls back, loudly.
     assert attention.preprocess_qkv(qkv[:8], torch.zeros(1, 8, dtype=torch.int32)) is sentinel

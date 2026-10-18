@@ -112,7 +112,17 @@ def _projection(rows: int, seed: int, zero_heads: bool = False) -> torch.Tensor:
 
 
 def _positions(rows: int, seed: int, kind: str = "uniform") -> torch.Tensor:
+    """One position per row: uniform over the table, its last 2048 entries ("tail"),
+    or ("sequences") the K=7 verify blocks of ``rows / 8`` requests, eight
+    consecutive positions each from a random start of its own."""
     g = torch.Generator(device=DEV).manual_seed(seed + 7)
+    if kind == "sequences":
+        assert rows % 8 == 0, rows
+        starts = torch.randint(
+            0, CKPT_MAX_POSITIONS - 8, (rows // 8, 1), generator=g, device=DEV, dtype=torch.int32
+        )
+        steps = torch.arange(8, device=DEV, dtype=torch.int32)
+        return (starts + steps).reshape(1, rows)
     low = CKPT_MAX_POSITIONS - 2048 if kind == "tail" else 0
     return torch.randint(
         low, CKPT_MAX_POSITIONS, (1, rows), generator=g, device=DEV, dtype=torch.int32
@@ -374,19 +384,21 @@ def test_bit_identity_with_the_one_row_low_latency_path() -> None:
         _assert_bits_equal(gate_out, want_gate, "gate")
 
 
-@pytest.mark.parametrize("rows", (1, 4, 8, 9))
+@pytest.mark.parametrize("rows", (1, 4, 8, 9, 16, 64, 512, 513))
 @pytest.mark.parametrize("permuted", (False, True), ids=("ckpt_layout", "ll_layout"))
 @pytest.mark.parametrize("rope", (True, False), ids=("rope", "nope"))
 def test_the_adopted_attention_runs_the_entry_on_decode_rows(rope, permuted, rows, monkeypatch):
-    """The target's attention: with the entry handed in (decode) and at most 8
-    rows it calls the entry, otherwise the built-in prep; the bits are the
-    built-in prep's either way."""
+    """The target's attention: with the entry handed in (decode) and at most
+    ``_PREATTN_PREP_MAX_ROWS`` (512) rows it calls the entry, otherwise the
+    built-in prep; the bits are the built-in prep's either way."""
+    assert target_attention._PREATTN_PREP_MAX_ROWS == 512
     builtin = _attention(ROPE_LAYER if rope else NOPE_LAYER)
     adopted = target_attention.MuseSparkOpenTepAttention.adopt(
         _attention(ROPE_LAYER if rope else NOPE_LAYER)
     )
     projection = _projection(rows, seed=31 * rows + rope)
-    positions = _positions(rows, seed=31 * rows + rope)
+    kind = "sequences" if rows >= 16 and rows % 8 == 0 else "uniform"
+    positions = _positions(rows, seed=31 * rows + rope, kind=kind)
     want_qkv, want_gate = _builtin_prep(builtin, projection.clone(), positions)
 
     operand = projection
@@ -409,7 +421,7 @@ def test_the_adopted_attention_runs_the_entry_on_decode_rows(rope, permuted, row
         got_qkv, got_gate = _builtin_prep(adopted, operand.clone(), positions)
     finally:
         adopted._preattn_prep = None
-    assert calls == ([rows] if rows <= 8 else [])
+    assert calls == ([rows] if rows <= target_attention._PREATTN_PREP_MAX_ROWS else [])
     _assert_bits_equal(got_qkv, want_qkv, "qkv")
     _assert_bits_equal(got_gate.reshape(rows, -1), want_gate.reshape(rows, -1), "gate")
 

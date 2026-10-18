@@ -22,9 +22,11 @@ the install refuses a table holding a subnormal value, the one case where the
 all-reduce kernel's build flags (flush-to-zero) would decide the bits, or a
 NaN or infinity (the fp32 sum canonicalizes a NaN's sign and payload).
 
-Larger calls (prefill chunks) run the built-in path. Every rank sees the same
-row count for a call, so every rank takes the same branch and the all-reduce
-call sequence stays identical across ranks.
+Larger calls (long prefill chunks) run the built-in path; a prefill chunk of
+at most ``MAX_ROWS`` ids takes the gather, with the same bits (the sharded
+partials are one owner row and zero rows, whatever all-reduce sums them).
+Every rank sees the same row count for a call, so every rank takes the same
+branch and the all-reduce call sequence stays identical across ranks.
 """
 
 from __future__ import annotations
@@ -42,10 +44,11 @@ from tensorrt_llm.mapping import Mapping
 from ... import dispatch as _tp_agreement
 from ...ops.embedding.replicated_gather import replicated_embedding_gather
 
-#: Largest call (number of ids) served from the replicated table: a decode
-#: step's target rows (K + 1 = 8), the drafter's bonus + mask ids, the
-#: DFlash noise block, with room for a few requests.
-MAX_ROWS = 16
+#: Largest call (number of ids) served from the replicated table: the target
+#: rows of a decode step of 64 requests (K + 1 = 8 each, 512), with room for
+#: one more row per request (the drafter's bonus and mask ids, the DFlash
+#: noise block). The gather has no row limit of its own.
+MAX_ROWS = 576
 
 #: Shard rows all-gathered per collective while the table is built.
 GATHER_ROWS = 2048

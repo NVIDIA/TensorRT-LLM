@@ -45,6 +45,7 @@ import math
 from collections import Counter
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
@@ -53,13 +54,19 @@ from tensorrt_llm.logger import logger
 
 from .ops.runtime import step_commit as _sc
 
-#: Store slot count above which the sample-store launch declines (one
-#: descriptor group per slot for the host snapshot).
-_MAX_STORE_SLOTS = 64
+#: Store slot count (one per request: the sampler's ``max_batch_size``) above
+#: which the sample-store launch declines. A step records 3 descriptors per
+#: slot (the host snapshot) and 4 per sampled slot, at most 3,584 here, well
+#: within ``step_commit.MAX_DESCRIPTORS``; a step the staging block cannot
+#: hold yet declines and the block grows.
+_MAX_STORE_SLOTS = 512
 #: Pinned host snapshot sets kept in rotation; a set is reused after this many steps.
 _HOST_RING = 4
 #: Staged prepares between two debug lines of the counters.
 _COUNTS_EVERY = 2000
+
+#: Bytes of one element of the sampler store (int32).
+_INT32_BYTES = 4
 
 _INT_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
 
@@ -612,6 +619,14 @@ class SampleStoreWriter:
         self._host_events: list[Optional[torch.cuda.Event]] = [None] * _HOST_RING
         self._host_turn = 0
         self.counts: Counter = Counter()
+        #: ``record_store``'s layouts, one per set of store and host-snapshot tensors.
+        self._layouts: dict = {}
+        #: The store tensors whose dtype, device and layout were last checked, and the result.
+        self._checked_stores: tuple = ()
+        self._stores_reason: Optional[str] = None
+        #: The last slot list found unique and inside the store, and the store's slot count.
+        self._checked_slots: Optional[list] = None
+        self._checked_num_slots = -1
 
     def store_and_copy_out(
         self,
@@ -645,15 +660,11 @@ class SampleStoreWriter:
             reason = "async worker"
         elif not prefer_pinned():
             reason = "no pinned host memory"
-        elif any((not t.is_cuda) or t.dtype != torch.int32 for t in stores + outs):
+        elif any((not t.is_cuda) or t.dtype != torch.int32 for t in outs):
             reason = "dtypes"
-        elif any(not t.is_contiguous() for t in stores):
-            reason = "store layout"
-        elif store.new_tokens_lens.shape[0] > _MAX_STORE_SLOTS:
-            reason = "too many slots"
-        elif len(set(slots)) != len(slots) or any(
-            s < 0 or s >= store.new_tokens_lens.shape[0] for s in slots
-        ):
+        elif (reason := self._check_stores(stores)) is not None:
+            pass
+        elif not self._slots_fit(slots, store.new_tokens_lens.shape[0]):
             reason = "slots"
         elif (
             new_tokens.dim() != 2
@@ -695,55 +706,160 @@ class SampleStoreWriter:
                 for t in (stores[0], stores[2], stores[3])
             )
             self._host_ring[turn] = ring
-        self.record_store(staging, stores, stores, outs, ring, slots)
+        self.record_store(staging, stores, stores, outs, ring, slots, self._layouts)
         staging.launch()
-        event = torch.cuda.Event()
+        # This turn's event was synchronized above, so it can be recorded again.
+        event = self._host_events[turn]
+        if event is None:
+            event = torch.cuda.Event()
+            self._host_events[turn] = event
         event.record()
-        self._host_events[turn] = event
         self.counts["sample staged"] += 1
         return ring
 
+    def _check_stores(self, stores: tuple) -> Optional[str]:
+        """Why the store tensors do not fit the launch, or None; re-checked only when they change.
+
+        The sampler's store tensors live as long as the sampler, and a tensor's
+        dtype, device, shape and strides do not change in place.
+        """
+        if len(stores) != len(self._checked_stores) or any(
+            a is not b for a, b in zip(stores, self._checked_stores)
+        ):
+            if any((not t.is_cuda) or t.dtype != torch.int32 for t in stores):
+                reason = "dtypes"
+            elif any(not t.is_contiguous() for t in stores):
+                reason = "store layout"
+            elif stores[2].shape[0] > _MAX_STORE_SLOTS:
+                reason = "too many slots"
+            else:
+                reason = None
+            self._checked_stores, self._stores_reason = stores, reason
+        return self._stores_reason
+
+    def _slots_fit(self, slots: list, num_slots: int) -> bool:
+        """Whether ``slots`` are distinct and inside the store; a repeat of the last good list is."""
+        if num_slots == self._checked_num_slots and slots == self._checked_slots:
+            return True
+        if len(set(slots)) != len(slots) or (slots and (min(slots) < 0 or max(slots) >= num_slots)):
+            return False
+        self._checked_slots, self._checked_num_slots = list(slots), num_slots
+        return True
+
     @staticmethod
-    def record_store(staging, stores, targets, outs, host, slots) -> None:
+    def record_store(staging, stores, targets, outs, host, slots, layouts=None) -> None:
         """Record the store-row gathers into ``targets`` and the snapshot gathers into ``host``.
 
         ``stores`` are the sampler's store tensors (the rows not sampled this step
-        are snapshotted from them); ``targets`` receive the sampled rows.
+        are snapshotted from them); ``targets`` receive the sampled rows. Every
+        tensor is int32. Per sampled slot ``s`` (output row ``j``): four gathers
+        of row ``j`` into the targets' slot ``s`` and three into the host
+        snapshot's slot ``s``; per other slot, three gathers of the store's slot
+        ``s`` into the host snapshot. No two descriptors write the same element
+        and none reads what another writes, so their order does not matter.
+
+        Everything but the output rows' addresses depends only on the store,
+        target and host tensors, so it is a ``_StoreLayout`` built once per set
+        of them (kept in ``layouts`` when given); a step selects its slots' rows
+        of it and fills in the output addresses, in a few numpy operations.
         """
+        key = (
+            tuple(t.data_ptr() for t in stores + targets + host)
+            + tuple(stores[0].shape[:2])
+            + (stores[1].shape[0], stores[3].shape[1])
+        )
+        layout = None if layouts is None else layouts.get(key)
+        if layout is None:
+            layout = _StoreLayout(stores, targets, host)
+            if layouts is not None:
+                if len(layouts) >= 2 * _HOST_RING:
+                    layouts.clear()
+                layouts[key] = layout
+        layout.record(staging, outs, slots)
+
+
+class _StoreLayout:
+    """The sample-store descriptors of one set of store, target and host tensors.
+
+    ``sampled[s]`` holds slot ``s``'s seven descriptors when it is sampled, with
+    the source address and stride left for the step's output row;
+    ``others[s]`` its three snapshot descriptors when it is not. The table of
+    the last slot list is kept: a step with the same slots in the same order
+    (a steady batch) only rewrites the output rows' addresses in it.
+    """
+
+    def __init__(self, stores, targets, host):
         new_tokens, next_new_tokens, lens, drafts = stores
         t_new_tokens, t_next_new_tokens, t_lens, t_drafts = targets
-        o_new_tokens, o_next_new_tokens, o_lens, o_drafts = outs
         h_new_tokens, h_lens, h_drafts = host
         num_slots = lens.shape[0]
         Tn, Tnn, D = new_tokens.shape[0], next_new_tokens.shape[0], drafts.shape[1]
-        row_of = {s: j for j, s in enumerate(slots)}
-        for s in range(num_slots):
-            j = row_of.get(s)
-            if j is not None:
-                src_nt, nt_stride = (
-                    _addr(o_new_tokens, j * o_new_tokens.stride(0)),
-                    o_new_tokens.stride(1),
+        s = np.arange(num_slots, dtype=np.int64)
+
+        def at(t: torch.Tensor, width: int = 1) -> np.ndarray:
+            return t.data_ptr() + s * (width * _INT32_BYTES)
+
+        def rows(*descriptors) -> np.ndarray:
+            """``[num_slots, len(descriptors), DESC_FIELDS]`` from (dst, dst_stride, src,
+            src_stride, count) per descriptor; ``src`` may be 0 (filled per step)."""
+            table = np.zeros((num_slots, len(descriptors), _sc.DESC_FIELDS), dtype=np.int64)
+            table[..., 0] = _sc.KIND_GATHER
+            for i, (dst, dst_stride, src, src_stride, count) in enumerate(descriptors):
+                table[:, i, 1] = dst
+                table[:, i, 2] = src
+                table[:, i, 3] = count
+                table[:, i, 4] = src_stride
+                table[:, i, 6] = dst_stride
+            return table
+
+        self.num_slots = num_slots
+        sampled = rows(
+            (at(t_new_tokens), num_slots, 0, 0, Tn),
+            (at(t_next_new_tokens), num_slots, 0, 0, Tnn),
+            (at(t_lens), 1, 0, 0, 1),
+            (at(t_drafts, D), 1, 0, 0, D),
+            (at(h_new_tokens), num_slots, 0, 0, Tn),
+            (at(h_lens), 1, 0, 0, 1),
+            (at(h_drafts, D), 1, 0, 0, D),
+        )
+        others = rows(
+            (at(h_new_tokens), num_slots, at(new_tokens), num_slots, Tn),
+            (at(h_lens), 1, at(lens), 0, 1),
+            (at(h_drafts, D), 1, at(drafts, D), 1, D),
+        )
+        # Descriptors of a zero count (an empty store dimension) record nothing.
+        self.sampled_keep = sampled[0, :, 3] > 0
+        self.others_keep = others[0, :, 3] > 0
+        self.sampled = sampled[:, self.sampled_keep]
+        self.others = others[:, self.others_keep]
+        self.max_count = max(Tn, Tnn, D, 1)
+        self._slots: Optional[list] = None
+        self._table: Optional[np.ndarray] = None
+
+    def record(self, staging, outs, slots) -> None:
+        """Record this step's descriptors: ``outs`` row ``j`` is slot ``slots[j]``'s."""
+        o_new_tokens, o_next_new_tokens, o_lens, o_drafts = outs
+        order = [o_new_tokens, o_next_new_tokens, o_lens, o_drafts, o_new_tokens, o_lens, o_drafts]
+        order = [o for o, keep in zip(order, self.sampled_keep) if keep]
+        n = len(slots)
+        if slots != self._slots:
+            sampled = np.asarray(slots, dtype=np.int64)
+            others = np.ones(self.num_slots, dtype=bool)
+            others[sampled] = False
+            self._table = np.concatenate(
+                (
+                    self.sampled[sampled].reshape(-1, _sc.DESC_FIELDS),
+                    self.others[others].reshape(-1, _sc.DESC_FIELDS),
                 )
-                src_lens = _addr(o_lens, j * o_lens.stride(0))
-                src_dr = _addr(o_drafts, j * o_drafts.stride(0))
-                dr_stride = o_drafts.stride(1)
-                src_nnt = _addr(o_next_new_tokens, j * o_next_new_tokens.stride(0))
-                staging.gather(_addr(t_new_tokens, s), num_slots, src_nt, nt_stride, Tn)
-                staging.gather(
-                    _addr(t_next_new_tokens, s),
-                    num_slots,
-                    src_nnt,
-                    o_next_new_tokens.stride(1),
-                    Tnn,
-                )
-                staging.gather(_addr(t_lens, s), 1, src_lens, 0, 1)
-                staging.gather(_addr(t_drafts, s * D), 1, src_dr, dr_stride, D)
-            else:
-                src_nt, nt_stride = _addr(new_tokens, s), num_slots
-                src_lens, src_dr, dr_stride = _addr(lens, s), _addr(drafts, s * D), 1
-            staging.gather(_addr(h_new_tokens, s), num_slots, src_nt, nt_stride, Tn)
-            staging.gather(_addr(h_lens, s), 1, src_lens, 0, 1)
-            staging.gather(_addr(h_drafts, s * D), 1, src_dr, dr_stride, D)
+            )
+            self._slots = list(slots)
+        table = self._table
+        head = table[: n * len(order)].reshape(n, len(order), _sc.DESC_FIELDS)
+        base = np.array([o.data_ptr() for o in order], dtype=np.int64)
+        row_bytes = np.array([o.stride(0) * _INT32_BYTES for o in order], dtype=np.int64)
+        head[:, :, 2] = base + np.arange(n, dtype=np.int64)[:, None] * row_bytes
+        head[:, :, 4] = [o.stride(1) if o.dim() == 2 else 0 for o in order]
+        staging.extend(table, self.max_count)
 
 
 def make_runtime_hooks(model: Any) -> RuntimeHooks:

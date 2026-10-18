@@ -165,7 +165,7 @@ def main():
             ws.states,
             ws.status,
             SHARD,
-            hs.MAX_ROWS,
+            hs.INBOX_ROWS,
             True,
             pdl,
         )
@@ -235,7 +235,7 @@ def main():
                     ws.states,
                     ws.status,
                     SHARD,
-                    hs.MAX_ROWS,
+                    hs.INBOX_ROWS,
                     True,
                     pdl,
                 )
@@ -323,7 +323,7 @@ def main():
                     ws.states,
                     ws.status,
                     SHARD,
-                    hs.MAX_ROWS,
+                    hs.INBOX_ROWS,
                     True,
                     pdl,
                 )
@@ -444,7 +444,7 @@ def main():
                     ws.states,
                     ws.status,
                     SHARD,
-                    hs.MAX_ROWS,
+                    hs.INBOX_ROWS,
                     sample,
                     pdl,
                 )

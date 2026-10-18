@@ -113,10 +113,17 @@ def test_replicated_embedding_tp8_equals_the_sharded_embedding():
     g = torch.Generator(device="cuda").manual_seed(rank)  # different ids per rank are fine here
     pair = torch.randint(0, VOCAB, (2,), generator=g, device="cuda", dtype=torch.int64)
     pair_ok = torch.equal(embedding(pair).view(torch.int16), builtin[pair].view(torch.int16))
-    # A prefill-sized call goes to the built-in path (collective: the same size on every rank).
-    seventeen = torch.arange(1000, 1017, device="cuda", dtype=torch.int32)
+    # The widest call served from the table: the decode step of 64 requests and more.
+    gw = torch.Generator(device="cuda").manual_seed(7)  # the same ids on every rank
+    wide = torch.randint(
+        0, VOCAB, (replicated_embedding.MAX_ROWS,), generator=gw, device="cuda", dtype=torch.int32
+    )
+    wide_ok = torch.equal(embedding(wide).view(torch.int16), builtin[wide.long()].view(torch.int16))
+    # A call above MAX_ROWS goes to the built-in path (collective: the same size on every rank).
+    above = replicated_embedding.MAX_ROWS + 1
+    prefill = torch.arange(1000, 1000 + above, device="cuda", dtype=torch.int32)
     prefill_ok = torch.equal(
-        embedding(seventeen).view(torch.int16), builtin[1000:1017].view(torch.int16)
+        embedding(prefill).view(torch.int16), builtin[1000 : 1000 + above].view(torch.int16)
     )
 
     # CUDA graph: the 8-id call replayed with the ids updated in place.
@@ -144,6 +151,7 @@ def test_replicated_embedding_tp8_equals_the_sharded_embedding():
         negative_zero_out=negative_zero_out,
         pair_ok=bool(pair_ok),
         prefill_ok=bool(prefill_ok),
+        wide_ok=bool(wide_ok),
         graph_ok=bool(graph_ok),
         added_gib=round(added / 2**30, 3),
     )
@@ -154,7 +162,7 @@ def test_replicated_embedding_tp8_equals_the_sharded_embedding():
             json.dump(summary, f)
     assert mismatched_rows == 0, summary
     assert negative_zero_out == 0, summary
-    assert pair_ok and prefill_ok and graph_ok, summary
+    assert pair_ok and wide_ok and prefill_ok and graph_ok, summary
     assert all(d == digests[0] for d in digests), "ranks hold different tables or rows"
     del graph
     comm.Barrier()

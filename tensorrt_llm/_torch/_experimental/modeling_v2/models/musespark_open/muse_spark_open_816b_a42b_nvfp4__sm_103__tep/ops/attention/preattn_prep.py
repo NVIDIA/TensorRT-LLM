@@ -342,20 +342,42 @@ class PreattnPrep(OpWrapper):
                 spec=dict(rows=8, rope=True, zero_heads=True),
             ),
         )
+        + tuple(
+            Cell(
+                why=f"{rows} rows, {'RoPE' if rope else 'NoPE'} layer: {why}",
+                spec=dict(rows=rows, rope=rope, positions="sequences"),
+            )
+            for rows, rope, why in (
+                (16, True, "2 requests of a K=7 verify block"),
+                (64, True, "8 requests of a K=7 verify block"),
+                (64, False, "8 requests of a K=7 verify block"),
+                (512, True, "64 requests of a K=7 verify block, the largest step"),
+                (512, False, "64 requests of a K=7 verify block, the largest step"),
+            )
+        )
+        + (
+            Cell(
+                why="512 rows, low-latency weight layout, RoPE, 64 requests",
+                spec=dict(rows=512, rope=True, permuted=True, positions="sequences"),
+            ),
+        )
     )
 
     note = """
     Metadata consumed: none beyond the per-row positions; every row and head
-    independent. Call site: once per decoder layer per decode step, from the
-    target's attention when the step has no context rows and at most 8 rows
-    (46 RoPE + 16 NoPE layers). Grid (rows, H + G), one warp per program.
+    independent, so a step of several sequences is rows with their own
+    positions. Call site: once per decoder layer per decode step, from the
+    target's attention when the step has no context rows and at most 512
+    rows (46 RoPE + 16 NoPE layers). Grid (rows, H + G), one warp per program.
 
     Bit-identical, gated by its own test against the built-in attention's
     `preprocess_qkv` + `convert_qkv` (the split/chunk copies, the flashinfer
     CuTe-DSL RMSNorm on two streams, the BF16 query multiply, the flashinfer
     cos/sin-cache RoPE, the concat), and against the built-in one-row path of
     the low-latency weight layout: random heads over six decades at every
-    row count 1..8 and at 32768 rows, and heads of special values -- exact
+    row count 1..8, at 16, 64 and 512 rows of K=7 verify blocks (each block
+    eight consecutive positions of its own sequence), at 32768 rows, and heads
+    of special values -- exact
     zeros, subnormal and smallest-normal heads (whose RoPE outputs land in the
     subnormal range and flush to zero in both), heads whose norm output is
     subnormal, infinities, NaN, values near the BF16 maximum. If the
@@ -367,8 +389,9 @@ class PreattnPrep(OpWrapper):
     unit stride in the last dim, width 2 * (H + G) * 64, a contiguous fp32
     `[max_positions, 2, 32]` table and one position per row when RoPE is on.
 
-    Not certified: rows above 8 (the kernel has no row limit; the target does
-    not call it there), head width other than 64, fp16/fp32 activations.
+    Not certified as a cell: rows above 512 (the kernel has no row limit; the
+    target does not call it there; the 32768-row sample above covers the
+    kernel), head width other than 64, fp16/fp32 activations.
     """
 
     def __call__(

@@ -33,10 +33,12 @@ GEMM's bits, negative zeros included.
 Both ops are CUDA C++ built from ``_head_sampler/`` (copies of the shipped
 ``cpp/tensorrt_llm/kernels/fusedSampling`` headers plus ``head_sampler.cu``)
 with ``torch.utils.cpp_extension`` and without ``--use_fast_math`` -- the
-shipped library's arithmetic -- as the extension ``LIBRARY_NAME`` under torch's
+shipped library's arithmetic -- as one extension per device architecture
+(``library_name``: ``LIBRARY_NAME`` and the arch target) under torch's
 extension build root; ``load_library`` builds it there on first use (torch
 rebuilds it when the source or the flags change, and serializes concurrent
-builds) and loads it.
+builds) and loads it. The per-arch name keeps an sm_103a and an sm_107a build
+apart when both share one build root.
 """
 
 from __future__ import annotations
@@ -67,15 +69,21 @@ NVCC_FLAGS = (
     "--expt-extended-lambda",
     "-lineinfo",
 )
-#: The torch extension the library is built and loaded as.
+#: Prefix of the torch extension the library is built and loaded as (``library_name``).
 LIBRARY_NAME = "musespark_open_head_sampler"
 
 #: Threads of the shipped single-CTA block at up to 128 rows; one virtual thread each.
 VIRTUAL_THREADS = 1024
 #: 32-bit words of one virtual thread's online-softmax state (max, sum, argmax).
 STATE_WORDS = 3
-#: Rows the workspace has room for: one request's last accepted token and 7 drafts.
-MAX_ROWS = 8
+#: Rows ``SplitSample`` takes: the shipped sampler's single-CTA block is the
+#: 1024-thread one up to its ``kWideBlockMaxRows`` (128) rows, 16 requests of a
+#: K=7 verify block. Above it the shipped sampler runs a 512-thread block,
+#: which kernel A's virtual threads do not reproduce.
+MAX_ROWS = 128
+#: Rows of one rank's slot of the head-gather inbox (``HeadGatherWorkspace``):
+#: one request's last accepted token and 7 drafts.
+INBOX_ROWS = 8
 #: Threads per CTA of kernel A (8 CTAs per row).
 FOLD_THREADS = 128
 #: A poll waiting longer than this traps: a peer that never published. The trap ends the
@@ -90,29 +98,38 @@ _LOCK = threading.Lock()
 _LOADED: Optional[str] = None
 
 
-def _gencode() -> str:
-    """The arch-specific target of the current device: sm_103a or sm_107a."""
-    major, minor = torch.cuda.get_device_capability()
-    if (major, minor) not in ((10, 3), (10, 7)):
-        raise RuntimeError(
-            f"the head sampler is built for sm_103a / sm_107a, not sm_{major}{minor}"
-        )
-    return f"-gencode=arch=compute_{major}{minor}a,code=sm_{major}{minor}a"
+def arch_target() -> str:
+    """The arch-specific target of the current device: ``103a`` or ``107a``."""
+    capability = torch.cuda.get_device_capability()
+    if capability == (10, 3):
+        return "103a"
+    elif capability == (10, 7):
+        return "107a"
+    raise RuntimeError(
+        f"the head sampler is built for sm_103a / sm_107a, not sm_{capability[0]}{capability[1]}"
+    )
+
+
+def library_name(target: str) -> str:
+    """The torch extension name of the library built for ``target`` (``arch_target``)."""
+    return f"{LIBRARY_NAME}_sm{target}"
 
 
 def build(verbose: bool = False) -> str:
     """Compile (if needed) and load the library under torch's extension build root; its path."""
     from torch.utils.cpp_extension import load
 
+    target = arch_target()
+    name = library_name(target)
     path = load(
-        name=LIBRARY_NAME,
+        name=name,
         sources=[str(SOURCE_DIR / SOURCES[0])],
-        extra_cuda_cflags=list(NVCC_FLAGS) + [_gencode()],
+        extra_cuda_cflags=list(NVCC_FLAGS) + [f"-gencode=arch=compute_{target},code=sm_{target}"],
         extra_include_paths=[str(SOURCE_DIR)],
         is_python_module=False,
         verbose=verbose,
     )
-    return str(path) if path else LIBRARY_NAME
+    return str(path) if path else name
 
 
 def load_library() -> str:
@@ -237,6 +254,26 @@ class SplitSample(OpWrapper):
             why="filtered rows fall back to the shipped body: top-k, top-p, min-p, mixed with neutral rows",
             spec=dict(rows=8, kind="n40", temperature=1.0, rng="row", filters="mixed"),
         ),
+        Cell(
+            why="16 rows: the verify blocks of 2 requests",
+            spec=dict(rows=16, kind="n40", temperature=1.0, rng="row"),
+        ),
+        Cell(
+            why="64 rows: the verify blocks of 8 requests",
+            spec=dict(rows=64, kind="n40", temperature=1.0, rng="row"),
+        ),
+        Cell(
+            why="128 rows: 16 requests, the shipped sampler's widest 1024-thread call",
+            spec=dict(rows=128, kind="n40", temperature=1.0, rng="row"),
+        ),
+        Cell(
+            why="128 rows, shared RNG entry: the row index is the Philox subsequence",
+            spec=dict(rows=128, kind="spiky", temperature=0.7, rng="shared"),
+        ),
+        Cell(
+            why="128 rows with filtered rows on the shipped body, mixed with neutral rows",
+            spec=dict(rows=128, kind="n40", temperature=1.0, rng="row", filters="mixed"),
+        ),
     )
 
     note = """
@@ -247,7 +284,7 @@ class SplitSample(OpWrapper):
 
     Call site: the target DFlash worker's ``_sample_tokens_for_batch`` under
     the ``split_sampler`` fast path (``target_head.py``), on non-greedy batches with the fused
-    sampling mode.
+    sampling mode, on decode steps of at most 128 rows (16 requests at K=7).
 
     Numerics: bitwise the built-in soft cap + ``fused_sample_from_logits``,
     by construction (same per-thread fold order and operations, the shipped
@@ -263,7 +300,8 @@ class SplitSample(OpWrapper):
     rule. The single-walker path runs when exactly one thread claims.
 
     Hard limits
-      rows <= 8 (scratch), vocab % 4 == 0, vocab / 4 <= 64 * 1024 (the walk
+      rows <= 128 (the shipped sampler's 1024-thread block; ``states`` holds
+      ``new_states(rows)``), vocab % 4 == 0, vocab / 4 <= 64 * 1024 (the walk
       stages one virtual thread's vectors in shared memory).
 
     Not certified: torch.compile.
@@ -507,7 +545,7 @@ gather_split_sample = GatherSplitSample()
 class HeadGatherWorkspace:
     """The multicast inbox of the head gather for one tensor-parallel group, and its scratch.
 
-    Layout: ``[ranks][MAX_ROWS][shard]`` BF16; rank ``r``'s GEMM writes rows
+    Layout: ``[ranks][INBOX_ROWS][shard]`` BF16; rank ``r``'s GEMM writes rows
     ``0..rows-1`` of slot ``r`` through the multicast address (``slot``), which
     the fabric delivers to every rank's copy. Every word holds the sentinel
     between calls.
@@ -546,7 +584,7 @@ class HeadGatherWorkspace:
         self.vocab = self.ranks * self.shard
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
         self._comm = _get_mnnvl_workspace_comm(mapping)
-        self.slot_bytes = MAX_ROWS * self.shard * 2
+        self.slot_bytes = INBOX_ROWS * self.shard * 2
         self.library = ""
         error: Optional[BaseException] = None
         try:
@@ -564,9 +602,9 @@ class HeadGatherWorkspace:
             with torch.cuda.device(self.device):
                 self.inbox.fill_(-1)
                 self.gathered = torch.empty(
-                    (MAX_ROWS, self.vocab), dtype=torch.bfloat16, device=self.device
+                    (INBOX_ROWS, self.vocab), dtype=torch.bfloat16, device=self.device
                 )
-                self.states = new_states(MAX_ROWS, self.device)
+                self.states = new_states(INBOX_ROWS, self.device)
                 self.status = torch.zeros(1, dtype=torch.int32, device=self.device)
                 torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
@@ -579,7 +617,7 @@ class HeadGatherWorkspace:
 
     def slot(self, rows: int) -> torch.Tensor:
         """This rank's ``[rows, shard]`` slot at the multicast address: the GEMM's ``out``."""
-        start = self.rank * MAX_ROWS * self.shard
+        start = self.rank * INBOX_ROWS * self.shard
         return self._mc[start : start + rows * self.shard].view(rows, self.shard)
 
     def errors(self) -> int:

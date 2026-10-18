@@ -57,6 +57,11 @@ def _ids(spec, g: torch.Generator) -> torch.Tensor:
         width = VOCAB // 8
         edges = [r * width for r in range(8)] + [(r + 1) * width - 1 for r in range(8)]
         flat = torch.tensor(edges, device="cuda")[:count]
+    elif kind == "mixed":
+        flat = torch.randint(0, VOCAB, (count,), generator=g, device="cuda")
+        holes = torch.rand(count, generator=g, device="cuda") < 0.1
+        flat = torch.where(holes, torch.full_like(flat, -1), flat)
+        flat[::17] = VOCAB + 3
     elif kind == "noise":
         bonus = torch.randint(0, VOCAB, (1,), generator=g, device="cuda")
         flat = torch.cat([bonus, torch.full((count - 1,), 7, device="cuda")])

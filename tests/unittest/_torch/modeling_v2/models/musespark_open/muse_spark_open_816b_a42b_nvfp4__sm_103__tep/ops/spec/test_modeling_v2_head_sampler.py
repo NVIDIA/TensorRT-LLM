@@ -33,7 +33,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
-    reason="SM103 or SM107 only",
+    reason="SM103 / SM107 only",
 )
 
 #: The checkpoint's metap multiplier and output soft cap.
@@ -49,6 +49,14 @@ DEV = "cuda"
 @pytest.fixture(scope="module", autouse=True)
 def library():
     return hs.load_library()
+
+
+def test_the_library_is_built_per_arch(library):
+    """The extension name carries the device's arch target, so an sm_103a and an
+    sm_107a build never share one directory of torch's extension build root."""
+    target = hs.arch_target()
+    assert target == {(10, 3): "103a", (10, 7): "107a"}[torch.cuda.get_device_capability()]
+    assert hs.library_name(target) in os.path.basename(library), library
 
 
 def _raw(kind: str, rows: int, g: torch.Generator) -> torch.Tensor:
@@ -91,15 +99,16 @@ def _params(rows: int, spec: dict, g: torch.Generator, gs: torch.Generator):
     top_ps = torch.ones(rows, device=DEV)
     min_ps = torch.zeros(rows, device=DEV)
     if spec.get("filters") == "mixed":
-        # rows 0..: neutral, top-k, top-p, min-p, top-k + top-p, INT32_MAX top-k, neutral, top-p 0.5
-        if rows >= 8:
-            top_ks[1] = 50
-            top_ps[2] = 0.9
-            min_ps[3] = 0.05
-            top_ks[4] = 64
-            top_ps[4] = 0.8
-            top_ks[5] = 2**31 - 1
-            top_ps[7] = 0.5
+        # rows 0..7 of every 8-row block: neutral, top-k, top-p, min-p, top-k + top-p,
+        # INT32_MAX top-k, neutral, top-p 0.5
+        for b in range(0, rows - 7, 8):
+            top_ks[b + 1] = 50
+            top_ps[b + 2] = 0.9
+            min_ps[b + 3] = 0.05
+            top_ks[b + 4] = 64
+            top_ps[b + 4] = 0.8
+            top_ks[b + 5] = 2**31 - 1
+            top_ps[b + 7] = 0.5
     n = rows if spec.get("rng", "row") == "row" else 1
     seed = torch.randint(0, 2**62, (n,), generator=gs, dtype=torch.int64).to(DEV)
     offset = torch.randint(0, 2**40, (n,), generator=gs, dtype=torch.int64).to(DEV)
@@ -250,7 +259,7 @@ def _inbox_from(raw: torch.Tensor, slot_rows: int) -> torch.Tensor:
 @pytest.mark.parametrize("cell", hs.GatherSplitSample.CELLS, ids=lambda c: c.why[:48])
 def test_gather_split_sample_cells(cell):
     spec = cell.spec
-    rows, slot_rows = spec["rows"], hs.MAX_ROWS
+    rows, slot_rows = spec["rows"], hs.INBOX_ROWS
     sample = spec.get("sample", True)
     g = torch.Generator(device=DEV).manual_seed(17 + rows)
     gs = torch.Generator().manual_seed(19)
@@ -506,12 +515,13 @@ def test_every_lm_head_producer_publishes_each_word_once(tmp_path):
     """
     from torch.utils.cpp_extension import load_inline
 
+    target = hs.arch_target()
     ext = load_inline(
-        "lm_head_inbox_test_poller",
+        f"lm_head_inbox_test_poller_sm{target}",
         _WAITER_CPP,
         cuda_sources=_WAITER_CUDA,
         functions=["poll", "wait_started", "set_done"],
-        extra_cuda_cflags=["-O3", hs._gencode()],
+        extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{target},code=sm_{target}"],
         build_directory=str(tmp_path),
     )
     rows, hidden = 8, 8192

@@ -207,16 +207,19 @@ def test_the_replicated_embedding_serves_small_integer_calls_only(monkeypatch):
     def ids(n, dtype=torch.int32, device="cpu"):
         return torch.zeros(n, dtype=dtype, device=device)
 
+    assert replicated_embedding.MAX_ROWS == 576
     assert module.forward(ids(8)) == "rows"
     assert module.forward(ids(16, torch.int64)) == "rows"
-    assert module.forward(ids(17)) == "built-in"
+    assert module.forward(ids(512)) == "rows"
+    assert module.forward(ids(576, torch.int64)) == "rows"
+    assert module.forward(ids(577)) == "built-in"
     assert module.forward(ids(0)) == "built-in"
     assert module.forward(ids(8, device="meta")) == "built-in"
     assert module.forward(ids(8, torch.float32)) == "built-in"
     assert module.forward(ids(8, torch.bool)) == "built-in"
     del module.__dict__[replicated_embedding.TABLE_ATTR]
     assert module.forward(ids(8)) == "built-in"
-    assert len(served) == 2 and len(builtin) == 6
+    assert len(served) == 4 and len(builtin) == 6
 
 
 def _bf16(bits):

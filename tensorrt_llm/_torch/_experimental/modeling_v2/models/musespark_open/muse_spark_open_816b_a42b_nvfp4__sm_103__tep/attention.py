@@ -28,9 +28,10 @@ from .ops.attention.paged_decode_attention import paged_decode_attention, window
 from .ops.attention.preattn_prep import HEAD_DIM as _PREP_HEAD_DIM
 from .ops.attention.preattn_prep import PreattnPrep, is_rope_table
 
-#: Rows a decode step may carry for ``preattn_prep`` to run: one request's
-#: last accepted token and up to 7 drafts.
-_PREATTN_PREP_MAX_ROWS = 8
+#: Rows a decode step may carry for ``preattn_prep`` to run: 64 requests of a
+#: last accepted token and 7 drafts each. Rows are independent in the op (one
+#: position per row), so a step of several sequences runs it as one of one.
+_PREATTN_PREP_MAX_ROWS = 512
 
 
 def _builtin_prep_kernel_mismatch() -> Optional[str]:
@@ -67,7 +68,8 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
     Never constructed directly: ``adopt`` re-classes a built-in
     ``MuseSparkOpenAttention`` in place, adding methods and one plain attribute.
     A call carrying ``preattn_prep`` -- only ``DecodeTarget`` passes it -- runs
-    the prep as that op when the projection fits it (at most 8 rows); every
+    the prep as that op when the projection fits it (at most
+    ``_PREATTN_PREP_MAX_ROWS`` rows); every
     other call, every prefill step among them, runs the built-in
     ``preprocess_qkv``. Both produce the same bits. The op is launched with
     programmatic dependent launch under the switch the built-in flashinfer
