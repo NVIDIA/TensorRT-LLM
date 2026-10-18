@@ -59,12 +59,11 @@ Packing many layers into one block is the right instinct — managing each layer
 | `num_kv_heads` | Yes — via multiple pools within a window |
 | Attention window size | Yes — via one `WindowBlockManager` per window |
 | `head_dim`, KV dtype | Per window only |
-| `tokens_per_block` | No — one global scalar for the whole model |
 | Buffer count and layout | No |
 
 </div>
 
-`tokens_per_block` is not merely a manager-level scalar; it reaches the attention kernel as `mTokensPerBlockLog2`, which also constrains it to a power of two. A 256-token sliding-window layer group therefore cannot be given a smaller page than a full-attention group, even though that is exactly what memory efficiency wants. This is why Gemma4 hybrid attention and sparse-attention models are routed to V2 unconditionally: their per-layer buffer layouts cannot be represented in V1's unified pool at all.
+Gemma4 hybrid attention and sparse-attention models are routed to V2 unconditionally for this reason: their per-layer buffer layouts cannot be represented in V1's unified pool at all.
 
 ### Sliding Windows as Parallel Managers
 
@@ -117,9 +116,9 @@ Four principles shape the design.
 
 ### Describing a Model
 
-KVCM2 does not accept a model shape as a bag of scalars. It accepts a list of layer descriptions, where each layer is either an attention layer or an SSM layer and carries its own list of buffers. An `AttentionLayerConfig` has a layer ID, a vector of `BufferConfig`, an optional `slidingWindowSize` and an optional `numSinkTokens`; an `SsmLayerConfig` has a layer ID and its buffers. Each `BufferConfig` names a `DataRole` — key, value, block scales, indexer K, conv state, and so on — its size in bytes per page, and optionally a `tokensPerBlockOverride` that must divide the manager's global `tokensPerBlock`.
+KVCM2 does not accept a model shape as a bag of scalars. It accepts a list of layer descriptions, where each layer is either an attention layer or an SSM layer and carries its own list of buffers. An `AttentionLayerConfig` has a layer ID, a vector of `BufferConfig`, an optional `slidingWindowSize` and an optional `numSinkTokens`; an `SsmLayerConfig` has a layer ID and its buffers. Each `BufferConfig` names a `DataRole` — key, value, block scales, indexer K, conv state, and so on — its size in bytes per page.
 
-Everything V1 had to make uniform is per-layer here: the number of buffers, each buffer's byte size, its role, and even its page granularity. A DeepSeek-V4 layer that needs an auxiliary indexer K cache simply declares an extra buffer. A Mamba layer declares its conv state and SSM state as two buffers. Neither requires a new code path in the manager.
+Everything V1 had to make uniform is per-layer here: the number of buffers, each buffer's byte size and its role. A DeepSeek-V4 layer that needs an auxiliary indexer K cache simply declares an extra buffer. A Mamba layer declares its conv state and SSM state as two buffers. Neither requires a new code path in the manager.
 
 Note what a buffer description does *not* contain. There is no head count, no head dimension, no dtype, no element count, and no notion of how keys and values are arranged relative to each other. A buffer is a role and a number of bytes; a page is a range of bytes; a migration is a byte copy. The role is an opaque string key used only for grouping, which is why registering a new one requires no core change.
 
@@ -165,7 +164,7 @@ HalfOpenRange<BlockOrdinal> SsmLifeCycle::getStaleRange(int historyLength, int t
 
 Two lifecycles are equal — and therefore coalescable — when these functions agree for every input. A `LifeCycleRegistry` maps every layer to a lifecycle and deduplicates them into integer `LifeCycleId`s, publicly aliased as `LayerGroupId`. A 36-layer GPT-OSS model with alternating windows collapses to two lifecycles; a hybrid Mamba model collapses to two, one attention and one SSM. Downstream, everything — page allocation, eviction, migration, pool sizing, event reporting, statistics — is indexed by lifecycle rather than by layer or window size.
 
-It is worth being precise about how this differs from V1, because V1 coalesces across layers too. The difference is the equivalence class. V1 merges every layer sharing a window size, a proxy that breaks whenever layers differ in head count, head dimension, dtype, buffer count or page granularity, and that cannot express a recurrent state at all. V2 merges exactly the layers whose retention behavior is provably identical and lets everything else about them differ, since buffers of different sizes simply land in different pools of the same group. V2 is not coalescing *less* than V1; it is coalescing on the right relation, which is what makes it safe to apply aggressively. Adding a new retention behavior means adding a struct with a `getStaleRange` method, and the storage layer discovers a new group to coalesce automatically.
+It is worth being precise about how this differs from V1, because V1 coalesces across layers too. The difference is the equivalence class. V1 merges every layer sharing a window size, a proxy that breaks whenever layers differ in head count, head dimension, dtype or buffer count, and that cannot express a recurrent state at all. V2 merges exactly the layers whose retention behavior is provably identical and lets everything else about them differ, since buffers of different sizes simply land in different pools of the same group. V2 is not coalescing *less* than V1; it is coalescing on the right relation, which is what makes it safe to apply aggressively. Adding a new retention behavior means adding a struct with a `getStaleRange` method, and the storage layer discovers a new group to coalesce automatically.
 
 <div align="center">
 <figure>
@@ -331,7 +330,6 @@ Gemma4 hybrid attention and sparse-attention models route to V2 unconditionally,
 | Buffer contents | Shape, dtype and layout known to the manager | Opaque bytes; role plus size only |
 | What a page coalesces | All layers sharing a window size | All layers sharing a lifecycle, split by buffer size |
 | Per-layer `head_dim` / dtype / layout | Per window only | Per layer |
-| Per-buffer `tokens_per_block` | One global scalar | Per buffer, via override |
 | VSWA pool sizing | Static split fixed at init | Continuously rebalanced |
 | Sliding-window prefix reuse | Not supported end-to-end | Supported |
 | Sliding-window prefill memory | Allocates the full prompt | Window-proportional, via scratch slots |
