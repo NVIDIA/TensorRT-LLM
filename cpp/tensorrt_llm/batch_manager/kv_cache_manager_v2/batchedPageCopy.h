@@ -59,6 +59,16 @@ struct PoolCopyArgs
     uint32_t numPairs = 0;
 };
 
+//! Set to 1 to move host<->GPU pages through the copy engines on coherent (NVLink-C2C) links too, where
+//! the copy kernel is otherwise selected. The copy engines need no SM, so their latency does not grow
+//! when another kernel occupies every SM slot (measured on GB300: a 217 MB page takes 1.0 ms either
+//! way on an idle GPU, 1.0 ms on the copy engines against 3.8 to 4.5 ms on the kernel under a
+//! persistent compute kernel); the kernel reaches a higher ceiling on wide links (355 GB/s on GH200).
+//! Read once per BatchedPageCopier construction. Ignored where pinned host memory is registered in
+//! chunks (see HostMem::shouldUseChunkedRegistration()), which the copy engines cannot span, and
+//! without effect on PCIe-attached GPUs, where the copy engines are already the default.
+inline constexpr char const kPageCopyPreferCopyEngineEnv[] = "TLLM_KV_CACHE_MANAGER_V2_PAGE_COPY_PREFER_COPY_ENGINE";
+
 //! Chooses and launches the host<->device page-copy kernel.
 //!
 //! Construction performs all platform detection and grid sizing once, for both directions, so the
@@ -68,7 +78,9 @@ struct PoolCopyArgs
 //!     platform-independent: 32 KiB for offload, 64 KiB for onboard;
 //!   * CTA count scales with the CPU-GPU link bandwidth, sized via Little's Law;
 //!   * on H100-class PCIe parts the SM store path is far slower than the copy engine, so the
-//!     kernel is disabled and callers should keep using cuMemcpyBatchAsync.
+//!     kernel is disabled and callers should keep using cuMemcpyBatchAsync;
+//!   * on coherent links the kernel is the default; kPageCopyPreferCopyEngineEnv selects the copy
+//!     engines there as well, for deployments whose SMs are saturated while pages migrate.
 class BatchedPageCopier
 {
 public:
