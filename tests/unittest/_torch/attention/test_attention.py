@@ -186,18 +186,23 @@ def kv_cache_manager_from(
         dtype=kv_cache_dtype,
     )
 
-    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    try:
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-    for i in range(s.num_layers):
-        buffer = kv_cache_manager.get_buffers(i)
-        block_ids = [
-            block_id
-            for req_block_ids in kv_cache_manager.get_batch_cache_indices(
-                request_ids, i) for block_id in req_block_ids
-            if block_id is not -1
-        ]
-        for idx, block_id in enumerate(block_ids):
-            buffer[block_id].view_as(kv_cache[i][idx]).copy_(kv_cache[i][idx])
+        for i in range(s.num_layers):
+            buffer = kv_cache_manager.get_buffers(i)
+            block_ids = [
+                block_id
+                for req_block_ids in kv_cache_manager.get_batch_cache_indices(
+                    request_ids, i) for block_id in req_block_ids
+                if block_id is not -1
+            ]
+            for idx, block_id in enumerate(block_ids):
+                buffer[block_id].view_as(kv_cache[i][idx]).copy_(
+                    kv_cache[i][idx])
+    except Exception:
+        kv_cache_manager.shutdown()
+        raise
     return kv_cache_manager
 
 
@@ -233,7 +238,8 @@ def produce_outputs(
     try:
 
         metadata = Attention.Metadata(
-            num_contexts=num_contexts if num_contexts is not None else s.batch_size,
+            num_contexts=num_contexts
+            if num_contexts is not None else s.batch_size,
             kv_cache_params=kv_cache_params,
             seq_lens=seq_lens,
             seq_lens_kv=seq_lens_kv,

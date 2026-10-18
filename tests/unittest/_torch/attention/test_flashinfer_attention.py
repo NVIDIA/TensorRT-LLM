@@ -719,18 +719,24 @@ class TestFlashInferAttention(unittest.TestCase):
                 contexts_per_layer.append((context_qs, context_ks, context_vs))
 
                 gen_qs = [
-                    torch.randn(1, num_heads * head_dim, dtype=dtype, device=device)
-                    for _ in range(num_gens)
+                    torch.randn(1,
+                                num_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(num_gens)
                 ]
 
                 gen_ks = [
-                    torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                    for _ in range(num_gens)
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(num_gens)
                 ]
 
                 gen_vs = [
-                    torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                    for _ in range(num_gens)
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(num_gens)
                 ]
 
                 gens_per_layer.append((gen_qs, gen_ks, gen_vs))
@@ -776,7 +782,8 @@ class TestFlashInferAttention(unittest.TestCase):
 
                 # validate kv cache was updated expectedly
                 cache_buf = kv_cache_manager.get_buffers(
-                    flashinfer_attn.layer_idx, kv_layout=attn_metadata.kv_layout)
+                    flashinfer_attn.layer_idx,
+                    kv_layout=attn_metadata.kv_layout)
                 if attn_metadata.kv_layout == "HND":
                     cache_buf = cache_buf.transpose(2, 3).contiguous()
                 assert cache_buf is not None
@@ -788,12 +795,13 @@ class TestFlashInferAttention(unittest.TestCase):
                 for seq_id in range(len(context_sequence_lengths)):
                     # get a contiguous copy of the cache for the sequence
                     block_ids = block_ids_per_seq[seq_id]
-                    last_block_len = attn_metadata.paged_kv_last_page_len[seq_id]
-                    cached_kvs = torch.concat(cache_buf[block_ids, :].unbind(dim=0),
-                                              dim=1)
+                    last_block_len = attn_metadata.paged_kv_last_page_len[
+                        seq_id]
+                    cached_kvs = torch.concat(
+                        cache_buf[block_ids, :].unbind(dim=0), dim=1)
                     # only look at new tokens added
-                    cached_kvs = cached_kvs[:,
-                                            past_seen_tokens[seq_id]:last_block_len]
+                    cached_kvs = cached_kvs[:, past_seen_tokens[seq_id]:
+                                            last_block_len]
 
                     # compare to input kvs
                     torch.testing.assert_close(
@@ -807,7 +815,8 @@ class TestFlashInferAttention(unittest.TestCase):
                 for gen_seq_id in range(num_gens):
                     seq_id = len(context_sequence_lengths) + gen_seq_id
                     block_ids = block_ids_per_seq[seq_id]
-                    last_block_len = attn_metadata.paged_kv_last_page_len[seq_id]
+                    last_block_len = attn_metadata.paged_kv_last_page_len[
+                        seq_id]
                     cached_kvs = torch.concat(
                         cache_buf[block_ids, :].unbind(dim=0),
                         dim=1)[:, past_seen_tokens[seq_id]:last_block_len]
@@ -1030,20 +1039,26 @@ class TestFlashInferAttention(unittest.TestCase):
 
             for i in range(num_layers):
                 gen_qs.append([
-                    torch.randn(1, num_heads * head_dim, dtype=dtype, device=device)
-                    for _ in range(batch_size)
+                    torch.randn(1,
+                                num_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(batch_size)
                 ])
 
                 kv_heads = num_kv_heads if isinstance(num_kv_heads,
                                                       int) else num_kv_heads[i]
                 gen_ks.append([
-                    torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                    for _ in range(batch_size)
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(batch_size)
                 ])
 
                 gen_vs.append([
-                    torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                    for _ in range(batch_size)
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(batch_size)
                 ])
 
             layers = []

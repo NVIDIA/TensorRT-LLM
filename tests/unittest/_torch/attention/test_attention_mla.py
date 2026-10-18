@@ -1058,7 +1058,8 @@ def _run_test_for_backend(backend_name,
             request_list.append(req)
             if v2_kv_cache:
                 kv_cache = kv_cache_manager._create_kv_cache(req_id, None, None)
-                success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+                success = kv_cache.resume(
+                    torch.cuda.current_stream().cuda_stream)
                 assert success, f"Failed to resume KV cache for request {req_id}"
                 kv_cache.capacity = ctx_len
             else:
@@ -1114,8 +1115,8 @@ def _run_test_for_backend(backend_name,
                     mapping=mapping,
                 )
                 if backend_name == "TRTLLM":
-                    gen_metadata_kwargs["enable_flash_mla"] = (cuda_capability == (
-                        9, 0))
+                    gen_metadata_kwargs["enable_flash_mla"] = (
+                        cuda_capability == (9, 0))
                 attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
                 attn_metadata.prepare()
             for layer_idx in range(num_layers):
@@ -1126,7 +1127,8 @@ def _run_test_for_backend(backend_name,
                     q = inputs_per_layer[layer_idx]["ctx_q"]
                     k = inputs_per_layer[layer_idx]["ctx_k"]
                     v = inputs_per_layer[layer_idx]["ctx_v"]
-                    compressed_kv = inputs_per_layer[layer_idx]["ctx_compressed_kv"]
+                    compressed_kv = inputs_per_layer[layer_idx][
+                        "ctx_compressed_kv"]
                     k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
                     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
                     # q/k will be modified in the forward pass, so we need to clone them
@@ -1151,7 +1153,8 @@ def _run_test_for_backend(backend_name,
                         lc_kpe_rope = apply_mla_rope(lc_kpe, ctx_positions,
                                                      rope_cos_sin).squeeze(1)
                         latent_cache_fwd = torch.cat(
-                            [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
+                            [latent_cache[:, :kv_lora_rank], lc_kpe_rope],
+                            dim=-1)
                     else:
                         q_fwd = q.clone()
                         k_fwd = k.clone()
@@ -1183,12 +1186,14 @@ def _run_test_for_backend(backend_name,
                     for req in request_list:
                         req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 else:
-                    fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][step -
-                                                                              1]
-                    q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step - 1]
+                    fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][
+                        step - 1]
+                    q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step -
+                                                                        1]
                     compressed_kv = inputs_per_layer[layer_idx][
                         "gen_compressed_kv_list"][step - 1]
-                    k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
+                    k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step -
+                                                                        1]
                     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
                     if backend_name == "FLASHINFER":
@@ -1207,11 +1212,13 @@ def _run_test_for_backend(backend_name,
                         lc_kpe_rope = apply_mla_rope(lc_kpe, gen_positions,
                                                      rope_cos_sin).squeeze(1)
                         latent_cache_for_gen = torch.cat(
-                            [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
+                            [latent_cache[:, :kv_lora_rank], lc_kpe_rope],
+                            dim=-1)
                         # Copy RoPE'd q_pe into the rope portion of fused_q
                         num_tokens = fused_q.size(0)
-                        fused_q_3d = fused_q.view(num_tokens, num_heads,
-                                                  kv_lora_rank + qk_rope_head_dim)
+                        fused_q_3d = fused_q.view(
+                            num_tokens, num_heads,
+                            kv_lora_rank + qk_rope_head_dim)
                         fused_q_3d[..., kv_lora_rank:].copy_(q_pe_for_gen)
 
                         result = gen_layers[layer_idx].forward(
@@ -1219,7 +1226,8 @@ def _run_test_for_backend(backend_name,
                             None,
                             None,
                             attn_metadata,
-                            attention_input_type=AttentionInputType.generation_only,
+                            attention_input_type=AttentionInputType.
+                            generation_only,
                             latent_cache=latent_cache_for_gen,
                         )
                     else:
@@ -1262,15 +1270,16 @@ def _run_test_for_backend(backend_name,
                         gen_layers[layer_idx].mla_rope_generation(
                             fused_q, q_pe_for_gen, latent_cache_for_gen,
                             attn_metadata, cu_q_seqlens, cu_kv_seqlens,
-                            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
-                            quant_q_buffer)
+                            fmha_scheduler_counter, mla_bmm1_scale,
+                            mla_bmm2_scale, quant_q_buffer)
 
                         result = gen_layers[layer_idx].forward(
                             fused_q,
                             None,
                             None,
                             attn_metadata,
-                            attention_input_type=AttentionInputType.generation_only,
+                            attention_input_type=AttentionInputType.
+                            generation_only,
                             latent_cache=latent_cache,
                             q_pe=q_pe,
                             cu_q_seqlens=cu_q_seqlens,
