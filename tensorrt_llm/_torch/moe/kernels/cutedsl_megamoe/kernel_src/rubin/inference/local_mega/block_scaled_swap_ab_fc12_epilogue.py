@@ -71,6 +71,11 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             self.swiglu_alpha = float(self.swiglu_alpha)
             self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+        # quick_geglu is Blackwell-only so far; refuse rather than silently computing SwiGLU.
+        if problem_desc.get("gate_activation") not in (None, "swiglu"):
+            raise NotImplementedError(
+                f"Rubin local epilogue does not support gate_activation={problem_desc.get('gate_activation')!r} yet."
+            )
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]

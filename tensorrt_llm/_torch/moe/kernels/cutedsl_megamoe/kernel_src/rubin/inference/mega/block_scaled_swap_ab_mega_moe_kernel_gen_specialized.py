@@ -19,10 +19,9 @@ nothing pushes results back: FC1 gathers straight from the dense received plane,
 and the FC2 epilogue warps send results to their owning rank themselves through
 the bulk reduce-add. Twelve warps cover every role.
 
-The kernel owns the workspace tail reset. Because it outlives the communication
-kernel, it is the only participant that can safely zero the counters, which it
-does between two NVLink barriers so that no rank observes a half-cleared
-workspace or exits before the clearing is visible.
+The kernel owns the workspace tail reset. All warp roles finish before a grid
+barrier allows the epilogue to clear the counters. A final NVLink barrier makes
+the reset visible to every rank before the next launch reuses the workspace.
 """
 
 import hashlib
@@ -1210,31 +1209,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
 
-            epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
-
-            iket.range_push("tail.grid_sync_before_reset")
-            self.tail_barrier.sync(
-                epilogue_thread_count, Int32(self.promised_launchable_sm_count), linear_cta_idx, thread_idx
-            )
-            iket.range_pop()
-
-            iket.range_push("tail.reset_workspace")
-            total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
-            global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
-            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
-            iket.range_pop()
-
-            iket.range_push("tail.nvlink_publish")
-            self.tail_barrier.arrive_and_wait(
-                epilogue_thread_count,
-                Int32(self.promised_launchable_sm_count),
-                linear_cta_idx,
-                thread_idx,
-                prologue_grid_sync=True,
-                epilogue_grid_sync=False,
-            )
-            iket.range_pop()
             iket.range_pop()
 
         if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
@@ -1262,6 +1236,36 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 ab_pipeline_state=gather_b_pipeline_state,
                 sched_consumer=sched_consumer,
                 gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
+            )
+            iket.range_pop()
+
+        # CTAs with no work can finish the epilogue before gather warps pass
+        # their readiness waits. Join every role before clearing those flags.
+        cute.arch.sync_threads()
+        if warp_idx < len(self.epilogue_warp_ids):
+            epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
+
+            iket.range_push("tail.grid_sync_before_reset")
+            self.tail_barrier.sync(
+                epilogue_thread_count, Int32(self.promised_launchable_sm_count), linear_cta_idx, thread_idx
+            )
+            iket.range_pop()
+
+            iket.range_push("tail.reset_workspace")
+            total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
+            global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
+            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            iket.range_pop()
+
+            iket.range_push("tail.nvlink_publish")
+            self.tail_barrier.arrive_and_wait(
+                epilogue_thread_count,
+                Int32(self.promised_launchable_sm_count),
+                linear_cta_idx,
+                thread_idx,
+                prologue_grid_sync=True,
+                epilogue_grid_sync=False,
             )
             iket.range_pop()
 

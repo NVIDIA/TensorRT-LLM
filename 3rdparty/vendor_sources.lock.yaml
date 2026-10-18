@@ -3,7 +3,7 @@ vendors:
   cutedsl-megamoe:
     url: https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe.git
     branch: main
-    commit: 382ce4a6f111d0769f31c4c975e1c643f0dc4f70
+    commit: 7832a3300e24d791f94b09b3f6b37b5429e2fdf5
     source: sources
     destination: tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe
     include:
@@ -19,8 +19,8 @@ vendors:
     - kernel_src/schedulers/[!w]*.py
     - kernel_src/schedulers/work_id_claim.py
     patch: 3rdparty/vendor_patches/cutedsl-megamoe.patch
-    patch_digest: sha256:0676cec5fe7c087f93bb6aec9d15324460660e74f3caa94a86d7fcb7253deda8
-    digest: sha256-tree-v1:bda2e41e83acec2801ecb5020b4fadbab50efb051c1911b5a204e5c0efdba96d
+    patch_digest: sha256:f24f6c5d296410bf3393ee5aafbb967982eee373a6e5f3289aed1b801b9b9d96
+    digest: sha256-tree-v1:6e83535fe953947cc2b3c0e26a22cd8ded0dba1ff7845965e1f6b7ae36b2aac3
   flashinfer-kda-bt16:
     url: https://github.com/flashinfer-ai/flashinfer.git
     branch: main

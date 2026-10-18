@@ -41,6 +41,7 @@ from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs
 
 
 _quant_spec = {
+    "bf16": (cutlass.BFloat16, None, 0),
     "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
     "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
     "mxfp8_e4m3": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
@@ -997,20 +998,42 @@ class _MetadataPushRouter(KernelComponent):
         iket.range_push("router.apply_receive_limit")
         if self._router_thread_idx == Int32(0):
             warp_totals[0] = Int32(0)
+            warp_totals[1] = Int32(0)
         cute.arch.sync_threads()
-        thread_local_total = Int32(0)
-        local_expert_rounds = ceil_div(self.experts_per_rank, block_thread_count)
-        for expert_round in cutlass.range_constexpr(local_expert_rounds):
-            local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
-            if local_expert < Int32(self.experts_per_rank):
-                thread_local_total = thread_local_total + sizes[owner_expert_begin + local_expert]
-        if thread_local_total > Int32(0):
-            cute.arch.atomic_add(warp_totals.iterator, thread_local_total, scope="cta")
+
+        # sizes[] contains the same pre-truncation, all-source expert totals on
+        # every rank once raw_sizes_ready_target has been observed. Compute the
+        # group-wide policy bit locally so no post-kernel collective is needed.
+        # Slot 0 counts overflowing destinations; slot 1 records this rank's
+        # destination bit for local-only truncation.
+        rank_round_count = ceil_div(self.world_size, block_thread_count)
+        for rank_round in cutlass.range_constexpr(rank_round_count):
+            destination_rank = Int32(rank_round * block_thread_count) + self._router_thread_idx
+            if destination_rank < Int32(self.world_size):
+                destination_expert_begin = destination_rank * Int32(self.experts_per_rank)
+                raw_destination_total = Int32(0)
+                for local_expert in cutlass.range_constexpr(self.experts_per_rank):
+                    raw_destination_total = (
+                        raw_destination_total
+                        + sizes[destination_expert_begin + Int32(local_expert)]
+                    )
+                destination_overflow = Int32(
+                    raw_destination_total > Int32(self.max_recv_size_per_rank)
+                )
+                if destination_overflow:
+                    cute.arch.atomic_add(
+                        warp_totals.iterator,
+                        Int32(1),
+                        scope="cta",
+                    )
+                if destination_rank == Int32(self._router_local_rank):
+                    warp_totals[1] = destination_overflow
         cute.arch.sync_threads()
-        raw_local_total = warp_totals[0]
-        did_overflow = Int32(raw_local_total > Int32(self.max_recv_size_per_rank))
+        global_did_overflow = Int32(warp_totals[0] > Int32(0))
+        local_did_overflow = warp_totals[1]
 
         if cutlass.const_expr(self.drop_on_overflow):
+            local_expert_rounds = ceil_div(self.experts_per_rank, block_thread_count)
             for expert_round in cutlass.range_constexpr(local_expert_rounds):
                 local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
                 if local_expert < Int32(self.experts_per_rank):
@@ -1020,17 +1043,22 @@ class _MetadataPushRouter(KernelComponent):
                     remaining_capacity = Int32(self.worst_case_token_count) - pool_expert_base[local_expert]
                     if remaining_capacity > Int32(0):
                         retained_size = cutlass.min(raw_size, remaining_capacity)
-                    if did_overflow:
+                    if local_did_overflow:
                         sizes[owner_expert_begin + local_expert] = retained_size
 
         if self._router_thread_idx == Int32(0):
-            cute.arch.store(self._overflow_flag.iterator, did_overflow, sem="relaxed", scope="sys")
+            cute.arch.store(
+                self._overflow_flag.iterator,
+                global_did_overflow,
+                sem="relaxed",
+                scope="sys",
+            )
         cute.arch.sync_threads()
 
         if cutlass.const_expr(self.drop_on_overflow):
             self._publish_push_table_and_sizes_ready(sizes_ready)
         else:
-            if did_overflow:
+            if global_did_overflow:
                 if self._router_thread_idx == Int32(0):
                     cute.arch.fence_acq_rel_sys()
                     _device_trap()
@@ -1391,6 +1419,8 @@ class TokenCommDeterministic(KernelComponent):
             "token_back_schedule_mode": str,
             "reduce_topk_in_kernel": bool,
             "drop_on_overflow": bool,
+            "token_in_stage_split": OptionalRequirement(bool),
+            "external_dispatch_pool": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1423,6 +1453,9 @@ class TokenCommDeterministic(KernelComponent):
         self.token_back_schedule_mode: TokenBackScheduleMode = impl_desc["token_back_schedule_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.drop_on_overflow = impl_desc["drop_on_overflow"]
+        self.token_in_stage_split = impl_desc.get("token_in_stage_split", False)
+        self._token_in_stage_chunk_count = 2 if self.token_in_stage_split else 1
+        self.external_dispatch_pool = impl_desc.get("external_dispatch_pool", False)
 
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
@@ -1477,15 +1510,34 @@ class TokenCommDeterministic(KernelComponent):
             raise ValueError("fc2_done_signals_per_token_tile must be positive when token-back is enabled.")
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("In-kernel top-k reduction requires BF16 combine data.")
-        element_block = self.activation_sf_vector_size * 4
-        if self.hidden_size % element_block != 0:
-            raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {element_block}.")
+        if self.activation_is_quantized:
+            element_block = self.activation_sf_vector_size * 4
+            if self.hidden_size % element_block != 0:
+                raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {element_block}.")
+        else:
+            # The 1D bulk copies move whole token rows, so each row must be whole 16-byte lines.
+            row_element_block = 128 // int(self.activation_dtype.width)
+            if self.hidden_size % row_element_block != 0:
+                raise ValueError(f"The BF16 wire requires hidden_size divisible by {row_element_block}.")
         if self.sf_padding_block % 128 != 0:
             raise ValueError("sf_padding_block must be a multiple of 128.")
+        if self.token_in_stage_split:
+            # Scale-free wire only: the SF pull and the token-back stage sizing both assume one
+            # whole-row stage per transfer warp.
+            if self.activation_is_quantized or self.token_back_enabled:
+                raise NotImplementedError(
+                    "token_in_stage_split requires the BF16 wire with token_back disabled (epi_warps)."
+                )
+            if self.bytes_per_token % (self._token_in_stage_chunk_count * 16) != 0:
+                raise ValueError("token_in_stage_split must cut a token row into whole 16-byte chunks.")
 
     @property
     def experts_per_rank(self) -> int:
         return self.expert_count // self.world_size
+
+    @property
+    def activation_is_quantized(self) -> bool:
+        return _quant_spec[self.quant_kind][1] is not None
 
     @property
     def activation_dtype(self) -> type:
@@ -1505,6 +1557,8 @@ class TokenCommDeterministic(KernelComponent):
 
     @property
     def activation_sf_hidden_padded(self) -> int:
+        if not self.activation_is_quantized:
+            return 0
         valid_hidden = self.hidden_size // self.activation_sf_vector_size
         elements_per_16_bytes = 128 // int(self.activation_sf_dtype.width)
         return int(round_up(valid_hidden, elements_per_16_bytes))
@@ -1643,6 +1697,10 @@ class TokenCommDeterministic(KernelComponent):
         local_rank: Int32,
         linear_cta_idx: Int32,
     ) -> None:
+        if cutlass.const_expr(self.external_dispatch_pool and token_comm_args.fc1_activation_pool is None):
+            raise ValueError("external_dispatch_pool requires TokenCommArgs.fc1_activation_pool.")
+        if cutlass.const_expr(not self.external_dispatch_pool and token_comm_args.fc1_activation_pool is not None):
+            raise ValueError("TokenCommArgs.fc1_activation_pool is only consumed under external_dispatch_pool.")
         self._device_workspace = device_workspace
         self._token_comm_args = token_comm_args
         self._local_rank = local_rank
@@ -1678,22 +1736,24 @@ class TokenCommDeterministic(KernelComponent):
             buffer_space="local",
             reset="tail_reset",
         )
-        activation_element_count = self.worst_case_token_count * self.hidden_size
-        workspace.register(
-            self.fc1_activation_region,
-            self.activation_dtype,
-            (activation_element_count,),
-            buffer_space="local",
-            byte_alignment=128,
-        )
-        activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
-        workspace.register(
-            self.fc1_activation_sf_region,
-            self.activation_sf_dtype,
-            (activation_sf_element_count,),
-            buffer_space="local",
-            byte_alignment=128,
-        )
+        if not self.external_dispatch_pool:
+            activation_element_count = self.worst_case_token_count * self.hidden_size
+            workspace.register(
+                self.fc1_activation_region,
+                self.activation_dtype,
+                (activation_element_count,),
+                buffer_space="local",
+                byte_alignment=128,
+            )
+        if self.activation_is_quantized:
+            activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
+            workspace.register(
+                self.fc1_activation_sf_region,
+                self.activation_sf_dtype,
+                (activation_sf_element_count,),
+                buffer_space="local",
+                byte_alignment=128,
+            )
         if self.token_back_enabled:
             workspace.register(
                 self.fc2_done_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
@@ -1751,16 +1811,17 @@ class TokenCommDeterministic(KernelComponent):
         token_in_lifetime.register_tensor(
             self.token_in_activation_smem_region,
             self.activation_dtype,
-            (self.transfer_warp_count, self.hidden_size),
+            (self.transfer_warp_count, self.hidden_size // self._token_in_stage_chunk_count),
             byte_alignment=16,
         )
-        token_in_lifetime.register_tensor(
-            self.token_in_sf_smem_region,
-            self.activation_sf_dtype,
-            (self.transfer_warp_count, (self.activation_sf_vector_size, self.activation_sf_hidden_padded)),
-            stride=(self.activation_sf_hidden_padded, (0, 1)),
-            byte_alignment=16,
-        )
+        if self.activation_is_quantized:
+            token_in_lifetime.register_tensor(
+                self.token_in_sf_smem_region,
+                self.activation_sf_dtype,
+                (self.transfer_warp_count, (self.activation_sf_vector_size, self.activation_sf_hidden_padded)),
+                stride=(self.activation_sf_hidden_padded, (0, 1)),
+                byte_alignment=16,
+            )
         if not self.token_back_enabled:
             return
 
@@ -1775,7 +1836,11 @@ class TokenCommDeterministic(KernelComponent):
             available_bytes_per_warp = self.standalone_chunk_bytes
         else:
             activation_bytes = self.bytes_per_token
-            sf_bytes = self.activation_sf_hidden_padded * int(self.activation_sf_dtype.width) // 8
+            sf_bytes = (
+                self.activation_sf_hidden_padded * int(self.activation_sf_dtype.width) // 8
+                if self.activation_is_quantized
+                else 0
+            )
             available_bytes_per_warp = activation_bytes + sf_bytes
 
         if self.token_back_push_data:
@@ -1811,15 +1876,24 @@ class TokenCommDeterministic(KernelComponent):
     def fc1_ready_counter_pointer(self, device_workspace: DeviceWorkspace) -> cute.Pointer:
         return device_workspace.ptr(self.fc1_ready_region)
 
+    @property
+    def dispatch_pool_shape(self) -> Tuple[int, int]:
+        """Row-major ``(pool_capacity, hidden)`` geometry of the dispatch pool, workspace-owned or external."""
+        return (self.worst_case_token_count, self.hidden_size)
+
     @cute.jit
     def fc1_activation_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
+        if cutlass.const_expr(self.external_dispatch_pool):
+            raise ValueError("The dispatch pool is caller-owned under external_dispatch_pool; use the passed tensor.")
         return cute.make_tensor(
             device_workspace.ptr(self.fc1_activation_region),
-            cute.make_layout((self.worst_case_token_count, self.hidden_size), stride=(self.hidden_size, 1)),
+            cute.make_layout(self.dispatch_pool_shape, stride=(self.hidden_size, 1)),
         )
 
     @cute.jit
-    def fc1_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
+    def fc1_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        if cutlass.const_expr(not self.activation_is_quantized):
+            return None
         layout = tile_atom_to_shape_SF(
             (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
         )
@@ -1913,7 +1987,10 @@ class TokenCommDeterministic(KernelComponent):
         source_sf_vectors = cute.zipped_divide(source_sf_values, (4,))
         sf_atom = _copy_atom(self.activation_sf_dtype, 4 * int(self.activation_sf_dtype.width))
         destination_sf = self.fc1_activation_sf_tensor(self._device_workspace)
-        destination_data = self._device_workspace.ptr(self.fc1_activation_region)
+        if cutlass.const_expr(self.external_dispatch_pool):
+            destination_data = self._token_comm_args.fc1_activation_pool.iterator
+        else:
+            destination_data = self._device_workspace.ptr(self.fc1_activation_region)
         ready = self._device_workspace.ptr(self.fc1_ready_region)
         flags = make_flag_batch_tracker(use_async=self.token_in_async_flags, flag_address=Int64(0),
                     accumulated_flags=Int32(0), phase=Int32(0), thread_idx=lane_idx)
@@ -2110,27 +2187,34 @@ class TokenCommDeterministic(KernelComponent):
             iket.range_push("token_in.pull_payload")
             token_in_mbarriers = smem_workspace.ptr(self.token_in_mbarrier_region, smem_base)
             token_in_activation = smem_workspace.tensor(self.token_in_activation_smem_region, smem_base)
-            token_in_sf = smem_workspace.tensor(self.token_in_sf_smem_region, smem_base)
             warp_mbarrier = token_in_mbarriers + transfer_warp_idx
             warp_activation_stage = token_in_activation[transfer_warp_idx, None]
-            warp_sf_stage = token_in_sf[transfer_warp_idx, (None, None)]
+            if cutlass.const_expr(self.activation_is_quantized):
+                token_in_sf = smem_workspace.tensor(self.token_in_sf_smem_region, smem_base)
+                warp_sf_stage = token_in_sf[transfer_warp_idx, (None, None)]
             if lane_idx == Int32(0):
                 cute.arch.mbarrier_init(warp_mbarrier, 1)
             cute.arch.sync_warp()
 
-            fc1_activation_pointer = self._device_workspace.ptr(self.fc1_activation_region)
-            fc1_activation_sf = self.fc1_activation_sf_tensor(self._device_workspace)
+            if cutlass.const_expr(self.external_dispatch_pool):
+                fc1_activation_pointer = self._token_comm_args.fc1_activation_pool.iterator
+            else:
+                fc1_activation_pointer = self._device_workspace.ptr(self.fc1_activation_region)
             fc1_ready_counter = self._device_workspace.ptr(self.fc1_ready_region)
             activation_bytes = cute.cosize(warp_activation_stage) * int(self.activation_dtype.width) // 8
-            activation_sf_bytes = cute.cosize(warp_sf_stage) * int(self.activation_sf_dtype.width) // 8
-            sf_copy_elements = 4
-            source_sf_values = cute.slice_(warp_sf_stage, (0, None))
-            source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
-            sf_copy_atom = _copy_atom(self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width))
+            activation_sf_bytes = 0
+            if cutlass.const_expr(self.activation_is_quantized):
+                fc1_activation_sf = self.fc1_activation_sf_tensor(self._device_workspace)
+                activation_sf_bytes = cute.cosize(warp_sf_stage) * int(self.activation_sf_dtype.width) // 8
+                sf_copy_elements = 4
+                source_sf_values = cute.slice_(warp_sf_stage, (0, None))
+                source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
+                sf_copy_atom = _copy_atom(self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width))
 
             next_dense_token = global_warp_idx
             expert_valid_begin = Int32(0)
-            expert_sf_begin = Int32(0)
+            if cutlass.const_expr(self.activation_is_quantized):
+                expert_sf_begin = Int32(0)
             expert_ready_slot_begin = Int32(0)
             pull_phase = Int32(0)
             flag_tracker = make_flag_batch_tracker(
@@ -2154,7 +2238,6 @@ class TokenCommDeterministic(KernelComponent):
                     dense_token_idx = next_dense_token + Int32(pull_round) * global_warp_count
                     token_in_expert = dense_token_idx - expert_valid_begin
                     pool_token_idx = pool_expert_base + token_in_expert
-                    sf_token_idx = expert_sf_begin + token_in_expert
                     ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
 
                     metadata = TokenSrcMetadata.load(
@@ -2166,73 +2249,112 @@ class TokenCommDeterministic(KernelComponent):
                         + peer_offset
                         + Int64(metadata.src_token) * Int64(self.bytes_per_token)
                     )
-                    remote_sf = cute.make_tensor(
-                        cute.make_ptr(
-                            self._token_comm_args.activation_sf.dtype,
-                            self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
-                            AddressSpace.gmem,
-                            assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
-                        ),
-                        self._token_comm_args.activation_sf.layout,
-                    )
-                    remote_sf_row = remote_sf[Int64(metadata.src_token), None]
-
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            warp_mbarrier, Int32(activation_bytes + activation_sf_bytes)
+                    if cutlass.const_expr(self.activation_is_quantized):
+                        remote_sf = cute.make_tensor(
+                            cute.make_ptr(
+                                self._token_comm_args.activation_sf.dtype,
+                                self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
+                                AddressSpace.gmem,
+                                assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
+                            ),
+                            self._token_comm_args.activation_sf.layout,
                         )
-                        tma_load_1d(
-                            warp_activation_stage.iterator,
-                            Int64(remote_activation_address),
-                            warp_mbarrier,
-                            Int32(activation_bytes),
-                        )
-                        tma_load_1d(
-                            warp_sf_stage.iterator, remote_sf_row.iterator, warp_mbarrier, Int32(activation_sf_bytes)
-                        )
-                    cute.arch.sync_warp()
-                    cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
+                        remote_sf_row = remote_sf[Int64(metadata.src_token), None]
 
-                    destination_activation = cute.make_ptr(
-                        self.activation_dtype,
-                        fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
-                        AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    with cute.arch.elect_one():
-                        cp_async_bulk_s2g(destination_activation, warp_activation_stage.iterator, Int32(activation_bytes))
-                    cute.arch.sync_warp()
-                    cute.arch.cp_async_bulk_commit_group()
+                    if cutlass.const_expr(self.token_in_stage_split):
+                        # Chunked pull: the halved stage bounces each token row in two pieces,
+                        # trading one extra NVLink round trip per token for SMEM.
+                        for chunk_idx in cutlass.range_constexpr(self._token_in_stage_chunk_count):
+                            chunk_offset = Int64(chunk_idx) * Int64(activation_bytes)
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(warp_mbarrier, Int32(activation_bytes))
+                                tma_load_1d(
+                                    warp_activation_stage.iterator,
+                                    Int64(remote_activation_address) + chunk_offset,
+                                    warp_mbarrier,
+                                    Int32(activation_bytes),
+                                )
+                            cute.arch.sync_warp()
+                            cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
+                            pull_phase = pull_phase ^ Int32(1)
 
-                    destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
-                    destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
-                    destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
-                    destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
-                    sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
-                    for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
-                        sf_vector_idx = Int32(sf_round * 32) + lane_idx
-                        if sf_vector_idx < Int32(sf_vector_count):
-                            cute.copy(
-                                sf_copy_atom,
-                                source_sf_vectors[None, sf_vector_idx],
-                                destination_sf_vectors[None, sf_vector_idx],
+                            chunk_destination = cute.make_ptr(
+                                self.activation_dtype,
+                                fc1_activation_pointer.toint()
+                                + Int64(pool_token_idx) * Int64(self.bytes_per_token)
+                                + chunk_offset,
+                                AddressSpace.gmem,
+                                assumed_align=16,
                             )
+                            with cute.arch.elect_one():
+                                cp_async_bulk_s2g(chunk_destination, warp_activation_stage.iterator, Int32(activation_bytes))
+                            cute.arch.sync_warp()
+                            cute.arch.cp_async_bulk_commit_group()
+                            # Drain before the stage is reused by the next chunk (and before the flag).
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            cute.arch.sync_warp()
+                    else:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                warp_mbarrier, Int32(activation_bytes + activation_sf_bytes)
+                            )
+                            tma_load_1d(
+                                warp_activation_stage.iterator,
+                                Int64(remote_activation_address),
+                                warp_mbarrier,
+                                Int32(activation_bytes),
+                            )
+                            if cutlass.const_expr(self.activation_is_quantized):
+                                tma_load_1d(
+                                    warp_sf_stage.iterator, remote_sf_row.iterator, warp_mbarrier, Int32(activation_sf_bytes)
+                                )
+                        cute.arch.sync_warp()
+                        cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
+
+                        destination_activation = cute.make_ptr(
+                            self.activation_dtype,
+                            fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                            AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        with cute.arch.elect_one():
+                            cp_async_bulk_s2g(destination_activation, warp_activation_stage.iterator, Int32(activation_bytes))
+                        cute.arch.sync_warp()
+                        cute.arch.cp_async_bulk_commit_group()
+
+                    if cutlass.const_expr(self.activation_is_quantized):
+                        sf_token_idx = expert_sf_begin + token_in_expert
+                        destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
+                        destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
+                        destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
+                        destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
+                        sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
+                        for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
+                            sf_vector_idx = Int32(sf_round * 32) + lane_idx
+                            if sf_vector_idx < Int32(sf_vector_count):
+                                cute.copy(
+                                    sf_copy_atom,
+                                    source_sf_vectors[None, sf_vector_idx],
+                                    destination_sf_vectors[None, sf_vector_idx],
+                                )
 
                     if cutlass.const_expr(self.token_in_flag_batch == 1):
                         cute.arch.cp_async_bulk_wait_group(0)
-                    else:
+                    elif cutlass.const_expr(not self.token_in_stage_split):
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                     cute.arch.sync_warp()
                     ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                     flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
                     cute.arch.sync_warp()
-                    pull_phase = pull_phase ^ Int32(1)
+                    if cutlass.const_expr(not self.token_in_stage_split):
+                        pull_phase = pull_phase ^ Int32(1)
 
                 next_dense_token = next_dense_token + pull_count * global_warp_count
                 expert_valid_begin = expert_valid_end
-                expert_sf_begin = expert_sf_begin + (
-                    (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
-                ) * Int32(self.sf_padding_block)
+                if cutlass.const_expr(self.activation_is_quantized):
+                    expert_sf_begin = expert_sf_begin + (
+                        (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                    ) * Int32(self.sf_padding_block)
                 expert_ready_slot_begin = expert_ready_slot_begin + (
                     (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
                     // Int32(self.tokens_per_fc1_ready_slot)

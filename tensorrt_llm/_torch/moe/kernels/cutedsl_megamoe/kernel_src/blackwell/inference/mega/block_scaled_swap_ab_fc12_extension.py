@@ -14,7 +14,7 @@ from .....helpers.dsl_helpers import spin_peek, spin_wait
 from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo, peek_ready_bit
 
 
-TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk"]
+TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk", "fc1_act_scale"]
 
 
 @cute.jit
@@ -155,7 +155,8 @@ class BlockScaledSwapAbFc12Extension:
             result = cute.domain_offset((data_token_offset, 0, 0), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
-        if cutlass.const_expr(tensor_name == "topk"):
+        if cutlass.const_expr(tensor_name in ("topk", "fc1_act_scale")):
+            # Both follow the data-token pool (not the independently padded SF pool).
             return (cute.domain_offset((data_token_offset,), tensor), None)
 
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")

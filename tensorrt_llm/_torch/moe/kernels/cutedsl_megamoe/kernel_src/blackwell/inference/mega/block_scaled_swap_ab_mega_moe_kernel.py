@@ -77,11 +77,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "swiglu_beta": OptionalRequirement(Optional[float]),
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # "swiglu" (default) or "quick_geglu"; validated by the epilogue, keyed in name().
+            "gate_activation": OptionalRequirement(str),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
             "max_tokens_per_rank": int,
             "apply_topk_at_fc1": bool,
+            # The FC1 activation was quantized from x / s_t with a per-token fp32 s_t; the kernel
+            # multiplies s_t back before the gated activation. Optional so existing descriptors
+            # stay valid; it keys the compiled kernel (workspace region + epilogue path).
+            "fc1_activation_per_token_scale": OptionalRequirement(bool),
         }
 
     @classmethod
@@ -95,6 +101,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "sf_padding_block": int,
             "work_id_mode": str,
             "fc2_use_bulk": bool,
+            "epi_async_release": OptionalRequirement(bool),
             "epi_flag_batches": tuple,
             "launch_cluster_count": int,
             "fallback_cluster_shape_mn": OptionalRequirement(Optional[tuple]),
@@ -133,11 +140,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.situ_beta = problem_desc.get("situ_beta")
         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
+        self.gate_activation = problem_desc.get("gate_activation") or "swiglu"
         self.world_size = problem_desc["world_size"]
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
+        self.fc1_activation_per_token_scale = bool(problem_desc.get("fc1_activation_per_token_scale", False))
 
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
@@ -246,6 +255,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "communication_enabled": True,
                 "token_back_push_data": self.token_comm.token_back_push_data,
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
+                "epi_async_release": impl_desc.get("epi_async_release", True),
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
             }
         )
@@ -453,7 +463,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"sched{self.schedule_mode}_hint{self.hint}_pad{self.token_padding_block}x{self.sf_padding_block}_"
             f"work{self.work_id_mode}_"
             f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
-            f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
+            f"fc2tmastages{self.epilogue.fc2_tma_stages}_asyncrel{int(self.epilogue.epi_async_release)}_"
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
@@ -463,6 +473,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             "_dlb_v1"
+            # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
+            + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
+            + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -550,6 +563,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
                 fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
+        if self.fc1_activation_per_token_scale:
+            # Local (tokens,) fp32 read by the router on the source rank; only in the ABI when enabled.
+            fake_arguments.update(
+                fc1_activation_per_token_scale=fake_tensor(cutlass.Float32, (tokens,), (0,), {0}, 4),
+            )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
@@ -613,11 +631,39 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
         hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[EP]
         hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
+        # (tokens,) fp32, this rank's own tokens, plain local memory (the router reads it here and
+        # pushes it to the pool). Required iff the descriptor enables fc1_activation_per_token_scale.
+        # Last on purpose: the AOT kwargs wrapper right-aligns its None defaults, so appending keeps
+        # every existing positional caller valid.
+        fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
+
+        if cutlass.const_expr(self.fc1_activation_per_token_scale != (fc1_activation_per_token_scale is not None)):
+            raise ValueError(
+                "fc1_activation_per_token_scale must be passed iff the descriptor enables it "
+                f"(enabled={self.fc1_activation_per_token_scale})."
+            )
+        if cutlass.const_expr(
+            fc1_activation_per_token_scale is not None
+            and fc1_activation_per_token_scale.element_type is not cutlass.Float32
+        ):
+            raise TypeError(
+                f"fc1_activation_per_token_scale must be Float32, got {fc1_activation_per_token_scale.element_type}."
+            )
+        if cutlass.const_expr(fc1_activation_per_token_scale is not None):
+            # The router gathers scale[token] for every routed token, so the scale needs one entry
+            # per topk_indices row. Only checkable when both extents are static (AOT leaves them
+            # dynamic); a short tensor would otherwise read past its end silently.
+            scale_rows = fc1_activation_per_token_scale.shape[0]
+            token_rows = topk_indices.shape[0]
+            if cutlass.const_expr(isinstance(scale_rows, int) and isinstance(token_rows, int) and scale_rows < token_rows):
+                raise ValueError(
+                    f"fc1_activation_per_token_scale has {scale_rows} entries but topk_indices has {token_rows} rows."
+                )
 
         helper_ready_bundle = (
             hot_expert_weight_ready_flags,
@@ -674,6 +720,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             peer_rank_ptr_mapper_host,
             self._device_workspace,
             stream,
+            fc1_activation_per_token_scale,
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
@@ -980,6 +1027,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         token_src_metadata = self.token_comm.token_src_metadata_tensor(self._device_workspace)
         fc2_done_counter = self.token_comm.fc2_done_counter_tensor(self._device_workspace)
         pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(self._device_workspace)
+        pool_activation_scales = self.token_comm.fc1_activation_per_token_scales_tensor(self._device_workspace)
 
         # Bind the active cluster before deriving the AB pipeline arrival count.
         self._mainloop.assign_device_members(
@@ -1028,7 +1076,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
         )
         optional_epilogue_args = GatedActEpilogueArgs(
-            fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=fc1_norm_const,
+            topk_scores=pool_topk_scores,
+            fc1_activation_per_token_scale=pool_activation_scales,
         )
 
         pipeline_init_arrive_mixed_cga(
