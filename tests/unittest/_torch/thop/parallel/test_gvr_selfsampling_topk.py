@@ -435,8 +435,9 @@ def test_selfsampling_topk_varlen_values():
     [
         (16, 40000, 977, 1024),  # R=9 SPLIT + per-row TSH runtime gate (tsh_en=1)
         (200, 6000, 64, 512),  # BLK=512, SPLIT=False, non-big launch mode
+        (200, 40000, 1, 512),  # main streaming path with a larger sampling envelope
     ],
-    ids=["b16_tsh_split", "b200_blk512_nonsplit"],
+    ids=["b16_tsh_split", "b200_blk512_nonsplit", "b200_main_large_envelope"],
 )
 def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
     """Exercise the varlen kernel's other launch modes: the SPLIT + per-row

@@ -547,6 +547,75 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     )
 
 
+@skip_not_sm100
+@pytest.mark.parametrize("epi_dtype", [torch.bfloat16, torch.float16])
+def test_cute_dsl_fp4_paged_mqa_logits_packed_epilogue(epi_dtype):
+    """Exercise packed bf16/fp16 epilogue branches on a minimal paged input."""
+    torch.manual_seed(19)
+    torch.cuda.manual_seed(19)
+
+    batch_size, next_n, num_heads, head_dim = 1, 1, 64, 128
+    phys_block_kv, context_len, max_model_len = 128, 256, 512
+    context_lens = torch.tensor([context_len], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    kv_cache = torch.randn((2, phys_block_kv, 1, head_dim), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, num_heads), device="cuda", dtype=torch.float32)
+
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_simulated = (
+        cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True)
+        .view(batch_size, next_n, num_heads, head_dim)
+        .to(torch.bfloat16)
+    )
+    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
+
+    num_sms = deep_gemm.get_num_sms()
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), 64, num_sms
+    )
+    logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        epi_dtype=epi_dtype,
+        output_dtype=epi_dtype,
+    )
+    torch.cuda.synchronize()
+    assert logits.dtype == epi_dtype
+
+    reference = _ref_paged_mqa_logits(
+        q_simulated.float(),
+        kv_simulated.float(),
+        weights.to(epi_dtype).float(),
+        context_lens,
+        block_table,
+        max_model_len,
+    )
+    # Only positions <= context_len - next_n + nn are defined; the kernel leaves
+    # the tail past the context unwritten, so compare the valid prefix only.
+    rows = batch_size * next_n
+    for row in range(rows):
+        limit = int(context_lens[row // next_n].item()) - next_n + (row % next_n) + 1
+        got = logits[row, :limit].float()
+        ref = reference[row, :limit]
+        assert bool(torch.isfinite(got).all()), f"row {row}: non-finite logits in valid prefix"
+        assert bool(torch.isfinite(ref).all())
+        atol, rtol = ELEM_TOL[(epi_dtype, epi_dtype)]
+        torch.testing.assert_close(got, ref, atol=atol, rtol=rtol)
+        diff = calc_diff(got, ref)
+        assert diff < 0.02, f"row {row}: cosine diff {diff} >= 0.02"
+
+
 # ---------------------------------------------------------------------------
 # Block-meta emission (emit_block_meta — fused-GVR support).
 # ---------------------------------------------------------------------------
