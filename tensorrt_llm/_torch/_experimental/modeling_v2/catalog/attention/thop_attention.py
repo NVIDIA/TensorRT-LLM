@@ -63,6 +63,28 @@ _QWEN4_VISION = dict(
     mask_type=0,
 )
 
+#: The Beam dense block's sliding-attention layer: GQA 48q/8kv d128 over a bf16 pool,
+#: RoPE applied outside, one fresh context per call on the packed path. The window is
+#: 512 and so is the pool's per-sequence capacity (16 pages of 32), so the window equals
+#: max_seq_len and no context the block accepts reaches it.
+_BEAM_DENSE = dict(
+    input_type=STANDARD,
+    num_heads=48,
+    num_kv_heads=8,
+    head_size=128,
+    v_head_dim=128,
+    sinks=False,
+    window=512,
+    quant_mode=0,
+    mask_type=1,
+    tokens_per_block=32,
+    num_blocks=16,
+    max_num_requests=1,
+    use_paged_context_fmha=False,
+    num_contexts=1,
+    predicted_tokens_per_seq=1,
+)
+
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
 #: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
@@ -103,7 +125,8 @@ class ThopAttention(OpWrapper):
     # gpt-oss alternates its two window classes inside one engine, so both of
     # its cells are live every step; deepseek runs context and generation
     # against the same pool. qwen4_exp's cells give `cached` (tokens already in
-    # the pool) and `new` (this call's q rows) per sequence, contexts first.
+    # the pool) and `new` (this call's q rows) per sequence, contexts first, and
+    # so do the Beam dense block component's fresh-context cells.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
@@ -403,6 +426,13 @@ class ThopAttention(OpWrapper):
                 num_contexts=1,
                 predicted_tokens_per_seq=3,
             ),
+        ),
+        *(
+            Cell(
+                why=f"beam dense block: GQA 48q/8kv d128, fresh {tokens}-row context",
+                spec=dict(_BEAM_DENSE, cached=(0,), new=(tokens,)),
+            )
+            for tokens in (1, 17, 129)
         ),
     )
 
