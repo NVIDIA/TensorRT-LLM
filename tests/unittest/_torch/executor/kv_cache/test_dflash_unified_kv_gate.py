@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -25,6 +26,14 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 
 pytestmark = pytest.mark.cpu_only
+
+_SHARED_DRAFT_KV_ENV = "TRTLLM_DISAGG_SHARED_DRAFT_KV"
+
+
+@pytest.fixture(autouse=True)
+def _shared_draft_kv_allowed(monkeypatch):
+    # Tests of the layout rules assume a launcher that allows sharing.
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "1")
 
 
 def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
@@ -137,3 +146,67 @@ def test_per_layer_kv_heads_keep_separate_cache(is_disagg, per_layer_side):
 
     assert not creator._should_unify_dflash_kv_cache()
     assert creator._build_unified_dflash_layer_specs(kv_cache_config=None) == ()
+
+
+class _StopLauncher(Exception):
+    pass
+
+
+def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers):
+    """Run the real disaggregated_mpi_worker up to the rank-communicator split."""
+    from tensorrt_llm.commands import serve
+
+    config = tmp_path / "disagg.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "context_servers": {"num_instances": 1, **context_servers},
+                "generation_servers": {"num_instances": 1, **generation_servers},
+            }
+        )
+    )
+
+    def stop(*args, **kwargs):
+        raise _StopLauncher
+
+    monkeypatch.setattr(
+        serve._command_telemetry, "apply_disaggregated_telemetry_config", lambda *a, **k: None
+    )
+    monkeypatch.setattr(serve, "set_cuda_device", lambda: None)
+    monkeypatch.setattr("tensorrt_llm.llmapi.disagg_utils.split_world_comm", stop)
+    monkeypatch.delenv("TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT", raising=False)
+    with pytest.raises(_StopLauncher):
+        serve.disaggregated_mpi_worker.callback(
+            config_file=str(config), log_level="info", telemetry=False
+        )
+
+
+def test_dflash_on_generation_worker_only_keeps_separate_cache(monkeypatch, tmp_path):
+    _launch_from_disagg_config(
+        monkeypatch,
+        tmp_path,
+        context_servers={},
+        generation_servers={"speculative_config": {"decoding_type": "DFlash"}},
+    )
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+
+    for _role in ("context", "generation"):
+        creator = _creator(is_disagg=True, target=target, draft=draft)
+        assert not creator._should_unify_dflash_kv_cache()
+
+
+def test_dflash_with_different_tp_keeps_separate_cache(monkeypatch, tmp_path):
+    spec = {"decoding_type": "DFlash"}
+    _launch_from_disagg_config(
+        monkeypatch,
+        tmp_path,
+        context_servers={"tensor_parallel_size": 4, "speculative_config": spec},
+        generation_servers={"tensor_parallel_size": 8, "speculative_config": spec},
+    )
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=4, head_dim=128)
+
+    for tp_size in (4, 8):
+        creator = _creator(is_disagg=True, target=target, draft=draft, tp_size=tp_size)
+        assert not creator._should_unify_dflash_kv_cache()
