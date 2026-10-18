@@ -1774,7 +1774,7 @@ def _create_mock_metadata(
     class MockMetadata(DSAtrtllmAttentionMetadata):
         """Mock DSA attention metadata for unit testing indexer operations."""
 
-        def __init__(self):
+        def __init__(self, kv_cache_manager: DSACacheManager | DSACacheManagerV2) -> None:
             """Initialize mock metadata with buffers, block tables, and indexer state."""
             self.num_sms = deep_gemm.get_num_sms()
             self.max_num_tokens = max_num_tokens
@@ -1796,7 +1796,9 @@ def _create_mock_metadata(
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
             self.kv_lens = kv_lens
             self.kv_cache_params = MockKVCacheParams()
-            self.kv_cache_manager = cache_manager
+            # Keep the manager out of the local class's reference cycle so its
+            # CUDA resources are not left for garbage collection on another thread.
+            self.kv_cache_manager = kv_cache_manager
             # Effective tokens-per-block for the indexer k-cache slot mapping,
             # mirroring DSAtrtllmAttentionMetadata.__post_init__ (dsa.py).
             tpb = self.kv_cache_manager.tokens_per_block
@@ -1806,7 +1808,7 @@ def _create_mock_metadata(
             self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
-                [batch_size, cache_manager.max_blocks_per_seq],
+                [batch_size, self.kv_cache_manager.max_blocks_per_seq],
                 device="cuda",
                 dtype=torch.int32,
             )
@@ -1815,7 +1817,7 @@ def _create_mock_metadata(
                 device="cpu",
                 pin_memory=True,
             )
-            block_ids = cache_manager.get_batch_cache_indices(request_ids)
+            block_ids = self.kv_cache_manager.get_batch_cache_indices(request_ids)
             for i in range(len(block_ids)):
                 self.host_indexer_k_cache_block_offsets[i, : len(block_ids[i])] = torch.tensor(
                     block_ids[i], dtype=torch.int32
@@ -2014,7 +2016,7 @@ def _create_mock_metadata(
             """
             return self._num_seqs
 
-    return MockMetadata()
+    return MockMetadata(cache_manager)
 
 
 @pytest.mark.parametrize("disabled_ratio", [0, 1])
