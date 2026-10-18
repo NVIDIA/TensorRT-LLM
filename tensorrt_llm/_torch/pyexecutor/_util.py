@@ -2109,6 +2109,9 @@ class KvCacheCreator:
                 "target and draft KV cache; keeping a separate draft KV cache.",
                 key="dflash_per_layer_kv_heads_fallback")
             return False
+        if self._is_disagg and os.environ.get(
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1":
+            return False
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout, draft_layout):
             logger.info_once(

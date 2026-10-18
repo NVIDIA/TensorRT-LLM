@@ -2544,6 +2544,13 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
+    with_spec = {
+        cfg.type
+        for cfg in disagg_cfg.server_configs
+        if cfg.other_args.get("speculative_config")
+    }
+    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("1" if with_spec
+                                                   == {"ctx", "gen"} else "0")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
