@@ -119,9 +119,15 @@ size_t CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
     {
     case CacheTier::GPU_MEM:
     {
+        // Physical chunk size of the GPU pool: 2 MiB, doubled per power of two of the quota above
+        // 1 GiB, up to 256 MiB. Every chunk is a separate driver allocation mapped into the pool's
+        // virtual range, and the driver's per-process mapping state grows with their count: at
+        // 32 MiB a full-GPU pool is several thousand chunks and makes every later cudaMalloc
+        // markedly slower, which stalls the host on each step that grows the PyTorch cache.
         constexpr size_t kPageSize = 2ULL << 20;
+        constexpr int kMaxExponent = 7;
         size_t const ratio = quota / (kPageSize * 512);
-        int const exponent = ratio == 0 ? 0 : std::min(4, static_cast<int>(std::log2(ratio)));
+        int const exponent = ratio == 0 ? 0 : std::min(kMaxExponent, static_cast<int>(std::log2(ratio)));
         return kPageSize << exponent;
     }
     case CacheTier::HOST_MEM: return HostMem::kAlignment; // 4 KiB
