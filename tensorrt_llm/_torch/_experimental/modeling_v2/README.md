@@ -113,6 +113,18 @@ models/<family>/
 catalog/<category>/ entries more than one target calls
 ```
 
+The targets, as `models/<family>/<target>`:
+
+* `deepseek_v3/r1_0528_nvfp4__sm_103__dep4`
+* `gpt_oss/gpt_oss_120b__sm_103__tp1`
+* `musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep`: MuseSparkOpen 816B-A42B NVFP4
+  low-latency decode with attention tensor-parallel and the experts expert-parallel over the same
+  ranks, at four ranks on one node (TEP4) and eight ranks on two nodes (TEP8). Each fast path's
+  host code is a package under the target's `kernels/<path>/` and its op entries are under `ops/`.
+  `TARGET_PATHS` in `modeling.py` names the paths each tensor-parallel size runs, `dispatch.py`
+  selects them at construction and `layers.py` composes them into the built-in decoder layers.
+* `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`
+
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain
 torch, `is_valid` names the inputs it accepts and answers wrongly, and `CELLS`

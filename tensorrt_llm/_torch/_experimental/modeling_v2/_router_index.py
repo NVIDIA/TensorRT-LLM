@@ -37,7 +37,7 @@ from __future__ import annotations
 import enum
 import os
 from importlib import import_module
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -107,6 +107,20 @@ class NoTarget(Exception):
     """
 
 
+# The mode each target class was last resolved under (the loader builds the class right after resolving it).
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
+
+
 def routing_module(arch: str):
     """Import and return the routing module for ``arch``, or None."""
     name = MODELING_V2_ROUTERS.get(arch)
@@ -149,7 +163,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise NoTarget(
                 f"no routing module for this architecture; routed architectures: {known}"
             )
-        return routing.route(
+        target = routing.route(
             pretrained_config, config.mapping, _device_compute_capability(), config.spec_config
         )
     except NoTarget as why:
@@ -159,3 +173,6 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
+    if target is not None:
+        _RESOLVED_MODES[target] = mode
+    return target
