@@ -146,6 +146,9 @@ a restart:
 Use `--kind local` with the plain command when there is no Slurm. Use a
 **stable** `--handle` that names what the job computes (no timestamps).
 
+`jobs.json` belongs to the wrapper: never write or edit it yourself. Keep
+your own notes about jobs in another file of your node directory.
+
 **Re-attach before you submit.** Read your `jobs.json` first. If a job is
 already recorded under the handle, check it yourself (`squeue -j <id>`, then
 `sacct -j <id> -o State,ExitCode`): still running → keep polling it; finished

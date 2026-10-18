@@ -579,7 +579,15 @@ class ModelingV2OnboardWorkflow:
         jobs_path = self.layout.jobs_path(task_id)
         if not jobs_path.is_file():
             return
-        for entry in JobRegistry(jobs_path).all():
+        try:
+            entries = JobRegistry(jobs_path).all()
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            # The worker wrote the file itself; its jobs are its own to stop.
+            print_message(
+                f"  task {task_id}: jobs.json not read ({exc}); its jobs are left", self._log
+            )
+            return
+        for entry in entries:
             kind = KINDS.get(entry.kind)
             if kind is None:
                 continue

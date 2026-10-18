@@ -356,6 +356,52 @@ def test_a_running_task_can_be_cancelled_and_removed(tmp_path, tmp_git_repo):
     assert _git(tmp_git_repo, "branch", "--list", "node/*") == ""
 
 
+def test_a_jobs_json_the_worker_wrote_itself_does_not_stop_a_cancel(tmp_path, tmp_git_repo):
+    graph = """\
+  - id: a
+    type: new_op
+  - id: stuck
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a, stuck]
+"""
+    without_stuck = """\
+  - id: a
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+"""
+    layout = []
+
+    async def stuck(agent, prompt, attempt):
+        jobs = layout[0].jobs_path("stuck")
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        jobs.write_text('{"run1": {"what": "tests", "log": "run1.log"}}')
+        await asyncio.Event().wait()
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _first_batch(prompt).write_text(_plan_text(graph))
+            return
+        if "stuck" in _states(prompt):
+            _edit_plan(prompt).write_text(_plan_text(without_stuck))
+            _decide(prompt, "FINISH", cancel=["stuck"])
+
+    factory = FakeFactory(planner=planner, worker=_Workers(stuck=stuck))
+    workflow = _workflow(tmp_path, tmp_git_repo, factory)
+    layout.append(workflow.layout)
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    (stuck_agent,) = factory.workers("stuck")
+    assert stuck_agent.closed
+
+
 def test_a_running_task_cannot_be_rewritten_without_cancelling_it(tmp_path, tmp_git_repo):
     release = asyncio.Event()
 
