@@ -809,13 +809,13 @@ def missing_preconditions(
 
 
 #: The fast paths that address the drafter's context-K/V arena by absolute token
-#: column: the context-K/V fork's side chain and commit, the verify fold's
-#: written-out context store, and the drafter block decode's K/V append and
-#: attention. None of them is composed over a windowed arena.
+#: column: the context-K/V fork's side chain and commit, and the verify fold's
+#: written-out context store. None of them is composed over a windowed arena.
+#: (The drafter block decode reads only the physical length the built-in prepare
+#: hands it, so it composes over either arena.)
 FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
     "context_kv_fork",
     "verify_fold",
-    "drafter_block_decode",
 )
 
 

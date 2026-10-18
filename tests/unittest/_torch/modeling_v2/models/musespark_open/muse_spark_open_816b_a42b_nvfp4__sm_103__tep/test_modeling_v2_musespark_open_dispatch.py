@@ -699,10 +699,10 @@ _WINDOWED = SimpleNamespace(windowed_ctx_arena=True)
 _LEFT_OUT = {
     "context_kv_fork",
     "verify_fold",
-    "drafter_block_decode",
-    "drafter_hops",
-    "drafter_pdl_chain",
 }
+#: The drafter paths a windowed arena keeps: the block decode reads the physical
+#: length the built-in prepare hands it, and the hops and the PDL chain build on it.
+_KEPT_DRAFTER = {"drafter_block_decode", "drafter_hops", "drafter_pdl_chain"}
 
 
 def test_dependents_are_every_fast_path_built_on_the_names():
@@ -743,6 +743,8 @@ def test_a_windowed_arena_leaves_out_the_full_length_arena_paths(
         )
         assert plan.paths == served - _LEFT_OUT
         assert dispatch.closure(plan.paths) == plan.paths
+        if tp == 8:
+            assert _KEPT_DRAFTER <= plan.paths
     assert all(local == ["a windowed drafter context arena"] for _, local in agreement)
     assert quiet[-1][1].startswith(f"[musespark_open] sm{sm} tep{tp} on ")
     assert "with a windowed drafter context arena: " in quiet[-1][1]
