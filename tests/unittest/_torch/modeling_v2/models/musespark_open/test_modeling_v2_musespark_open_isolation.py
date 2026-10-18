@@ -26,8 +26,8 @@ _ROUTER_INDEX = _MODELING_V2 / "_router_index.py"
 
 # A reference to the family's modules or to the target's classes.
 _REFERENCE = re.compile(
-    r"models[./]musespark_open\b|muse_spark_open_816b_a42b_nvfp4__sm_103__tep8"
-    r"|ModelingV2MuseSparkOpen|MuseSparkOpenTep8ModelingV2"
+    r"models[./]musespark_open\b|muse_spark_open_816b_a42b_nvfp4__sm_103__tep"
+    r"|ModelingV2MuseSparkOpen|MuseSparkOpenTepModelingV2"
 )
 _ROUTER_LINE = '"MuseSparkOpenOmniForCausalLM": "models.musespark_open.routing",'
 

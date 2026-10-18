@@ -21,7 +21,7 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep8 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
     modeling,
 )
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenModel
@@ -31,8 +31,8 @@ from tensorrt_llm._torch.models.modeling_musespark_open_omni import (
 
 pytestmark = pytest.mark.cpu_only
 
-_CORE = modeling.MuseSparkOpenTep8ModelingV2
-_SHELL = modeling.ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep8
+_CORE = modeling.MuseSparkOpenTepModelingV2
+_SHELL = modeling.ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
 _WIDTH = 4
 
 
@@ -152,7 +152,7 @@ def test_adopt_reclasses_the_builtin_text_model_in_place():
 
 def test_adopt_refuses_anything_but_the_builtin_text_model():
     core = _CORE.adopt(_builtin_text_model())
-    with pytest.raises(TypeError, match="MuseSparkOpenTep8ModelingV2"):
+    with pytest.raises(TypeError, match="MuseSparkOpenTepModelingV2"):
         _CORE.adopt(core)
     with pytest.raises(TypeError, match="Module"):
         _CORE.adopt(nn.Module())
