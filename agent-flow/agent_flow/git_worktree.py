@@ -324,7 +324,7 @@ class GitWorktreeIsolation:
                 report.skipped.append(branch)
                 continue
             returncode, _stdout, stderr = await self._run_git(
-                "merge", "--no-edit", branch, cwd=worktree
+                "merge", "--no-edit", "--signoff", branch, cwd=worktree
             )
             if returncode == 0:
                 report.merged.append(branch)

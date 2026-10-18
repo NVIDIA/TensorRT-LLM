@@ -494,6 +494,25 @@ def test_prepare_different_files_merges_clean(tmp_git_repo, tmp_path):
     assert (worktree / "file_b.txt").read_text() == "beta\n"
 
 
+def test_prepare_signs_off_merges_for_a_checkouts_dco_hook(tmp_git_repo, tmp_path):
+    """A checkout whose commit-msg hook requires a sign-off accepts the merges."""
+    _make_dep_branch(tmp_git_repo, "node/dep_a", "file_a.txt", "alpha\n")
+    _make_dep_branch(tmp_git_repo, "node/dep_b", "file_b.txt", "beta\n")
+    hooks = tmp_git_repo / ".git" / "hooks"
+    (hooks / "commit-msg").write_text('#!/bin/sh\ngrep -q "^Signed-off-by: " "$1"\n')
+    (hooks / "commit-msg").chmod(0o755)
+
+    iso = GitWorktreeIsolation(repo_path=tmp_git_repo, worktrees_root=tmp_path / "wt")
+    merge_node = Node(id="merge", type="merge", kind="merge", depends_on=("dep_a", "dep_b"))
+    dep_nodes = [Node(id="dep_a", type="impl"), Node(id="dep_b", type="impl")]
+    worktree = _worktree_path(iso, merge_node)
+
+    report = anyio.run(iso.prepare, merge_node, dep_nodes, worktree)
+
+    assert report.merged == ["node/dep_a", "node/dep_b"]
+    assert (worktree / "file_b.txt").read_text() == "beta\n"
+
+
 def test_prepare_same_lines_records_conflict_without_aborting(tmp_git_repo, tmp_path):
     """Deps editing the same lines conflict; markers stay, merge is not aborted."""
     # Both branches rewrite the same file (README.md) with incompatible content.
