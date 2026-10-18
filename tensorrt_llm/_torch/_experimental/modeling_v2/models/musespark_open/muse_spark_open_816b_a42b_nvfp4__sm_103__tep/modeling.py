@@ -544,9 +544,12 @@ class DecodeTarget:
 #: TEP8: every fast path.
 _TEP8_PATHS = _dispatch.FAST_PATH_NAMES
 #: TEP4: the fast paths written for any rank count whose output is bitwise the
-#: built-in model's.
+#: built-in model's, and ``drafter_fc_shard``, whose sharded drafter projection
+#: can move a draft token's bf16 last place (the target still verifies every
+#: draft; it shards every row count at TP4).
 _TEP4_PATHS = frozenset(
     {
+        "drafter_fc_shard",
         "preattn_prep",
         "full_attention_prep_append",
         "post_attention_hop",

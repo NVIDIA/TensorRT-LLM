@@ -212,8 +212,9 @@ def test_sm_of_reads_the_compute_capability():
 
 
 #: TEP4's composition: the fast paths written for any rank count whose output is
-#: bitwise the built-in model's.
+#: bitwise the built-in model's, and the sharded drafter projection.
 _TEP4 = {
+    "drafter_fc_shard",
     "preattn_prep",
     "full_attention_prep_append",
     "post_attention_hop",
