@@ -862,9 +862,9 @@ async def test_session_modes_resolve_the_same_client_options(session_mode, tmp_p
 
 @pytest.mark.parametrize("final_estimate, expected", [(0.3, 0.3), (None, 0.2), (0.0, 0.0)])
 def test_usage_carries_latest_available_thread_cost_estimate(final_estimate, expected):
-    from agent_flow.layers import _merge_turn_usage
+    from agent_flow.types import merge_turn_usage
 
-    usage = _merge_turn_usage(
+    usage = merge_turn_usage(
         UsageInfo(input_tokens=10, estimated_thread_cost_usd=0.2),
         UsageInfo(input_tokens=20, estimated_thread_cost_usd=final_estimate),
     )
