@@ -136,9 +136,9 @@ def test_sm103_tensor_parallel_size_8_serves_every_fast_path_and_only_4_and_8_an
             assert dispatch.composition(config, modeling.TARGET_PATHS, capability) is None
 
 
-def test_sm107_tensor_parallel_size_8_serves_every_fast_path_but_the_o_proj_into_the_hop():
+def test_sm107_tensor_parallel_size_8_serves_every_fast_path():
     sm107 = modeling.TARGET_PATHS[107, 8]
-    assert sm107.served == dispatch.FAST_PATH_NAMES - {"attention_output_into_hop"}
+    assert sm107.served == dispatch.FAST_PATH_NAMES
     assert dispatch.closure(sm107.served) == sm107.served
     assert sm107.topology is dispatch.TWO_TRAYS_OF_4
     assert dispatch.composition(_SERVED, modeling.TARGET_PATHS, _SM107) is sm107
@@ -1005,7 +1005,7 @@ def test_the_shell_composes_for_the_device_it_reads_once(monkeypatch, shell_part
     shell = _SHELL(_SERVED)
     assert reads == [_SM107]
     assert shell._plan.paths == modeling.TARGET_PATHS[107, 8].served
-    assert "attention_output_into_hop" not in shell._plan.paths
+    assert "attention_output_into_hop" in shell._plan.paths
 
 
 def test_a_shell_on_an_architecture_without_an_entry_raises_under_require(monkeypatch, shell_parts):

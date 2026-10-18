@@ -125,8 +125,8 @@ S0_KERNELS = {
         8: (_S10, "splitk:64,16,4,8", _S11, _S10, _S10, _S12, _S12, _S10),
     },
 }
-#: The ``dense_gemms`` plan: ``PLAN[site][rows - 1]``.
-PLAN = dense_gemms.default_kernels()
+#: The ``dense_gemms`` plan of this device: ``PLAN[site][rows - 1]``.
+PLAN = dense_gemms.default_kernels(dense_gemms.device_capability())
 
 
 def _operands(m, k, n, seed):

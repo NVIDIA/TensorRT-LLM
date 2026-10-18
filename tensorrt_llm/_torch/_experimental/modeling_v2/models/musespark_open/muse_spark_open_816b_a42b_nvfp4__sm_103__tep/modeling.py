@@ -118,8 +118,9 @@ Hops and boundaries:
 * ``attention_output_into_hop`` changes who publishes the o_proj partial on
   decode steps of 8 rows: the arming also hands every layer's o_proj dispatcher
   (``DenseGemmDispatcher.publish``) this rank's slot of the hop's direct
-  transport for the layer's parity (layer ``l``: ``l mod 2``), so cuBLAS writes
-  the partial into every rank's copy, and the join runs
+  transport for the layer's parity (layer ``l``: ``l mod 2``), so the o_proj kernel
+  (cuBLAS on sm103, flashinfer's split-K on sm107: ``DirectPublish.PRODUCER_FAMILIES``)
+  writes the partial into every rank's copy, and the join runs
   ``post_attn_consumer_hop`` (poll, reset, sum, boundary) instead of the hop.
   Other row counts keep the hop (``DirectPublish``). At those 8 rows o_proj
   forks no prefetch of the pool weight. After the weights load,
@@ -568,10 +569,8 @@ _TEP4_PATHS = frozenset(
 #: checkpoint; every other deployment runs the built-in modules only.
 TARGET_PATHS = {
     (103, 8): _dispatch.TargetPaths(served=_TEP8_PATHS, topology=_dispatch.TWO_TRAYS_OF_4),
-    # sm107 leaves out attention_output_into_hop: its producer check
-    # (post_attn_hop.VALIDATED_PRODUCERS) names only the sm103 o_proj kernel.
     (107, 8): _dispatch.TargetPaths(
-        served=_TEP8_PATHS - {"attention_output_into_hop"},
+        served=_TEP8_PATHS,
         topology=_dispatch.TWO_TRAYS_OF_4,
         preconditions=(_dispatch.SM107_FUSED_KERNELS,),
     ),

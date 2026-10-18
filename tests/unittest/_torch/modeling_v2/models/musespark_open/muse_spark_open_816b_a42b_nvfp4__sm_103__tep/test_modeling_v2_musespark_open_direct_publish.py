@@ -59,8 +59,9 @@ def test_direct_publish_builds_on_the_hop_and_the_dense_gemms():
 
 
 class _Plan:
-    def __init__(self, kernel=dense_gemms.CUBLAS):
+    def __init__(self, kernel=dense_gemms.CUBLAS, capability=(10, 3)):
         self.kernels = {"o_proj": (kernel,) * 8}
+        self.capability = capability
         self.prefetch = False
         self.enable_pdl = False
         self.forks = 0
@@ -167,6 +168,17 @@ def test_the_build_takes_every_layers_o_proj_dispatcher_and_parity(no_fabric):
         )
 
 
+@pytest.mark.parametrize("kernel", ["splitk:64,8,1,12", "direct:64,4"])
+def test_on_sm107_flashinfers_kernels_publish_into_the_slot(no_fabric, kernel):
+    built, _ = no_fabric
+    plan = _Plan(kernel, (10, 7))
+    layers = [_Layer(i, plan) for i in range(4)]
+    direct = target_layers._build_direct_publish(_model(layers), _call(layers))
+    assert len(built) == 1 and len(direct.dispatchers) == 4
+    for dispatcher in direct.dispatchers:
+        assert dispatcher.publish_policy.direct == dense_gemms.FLASHINFER_FAMILIES
+
+
 def test_the_build_refuses_an_o_proj_another_feature_publishes_from(no_fabric):
     built, _ = no_fabric
     plan = _Plan()
@@ -184,12 +196,18 @@ def test_the_build_refuses_an_o_proj_another_feature_publishes_from(no_fabric):
         ("odd", "even count"),
         ("unicast", "without the multicast transport"),
         ("not-dense-gemm", "not on the dense GEMM dispatcher"),
-        ("splitk", "not cuBLAS"),
+        ("splitk", r"publishes directly on SM \(10, 3\) \(\['cublas'\]\)"),
+        ("cublas-sm107", r"publishes directly on SM \(10, 7\) \(\['direct', 'splitk'\]\)"),
+        ("other-sm", r"publishes directly on SM \(10, 0\) \(\[\]\)"),
     ],
 )
 def test_the_build_refuses_before_building_anything(no_fabric, case, message):
     built, _ = no_fabric
-    plan = _Plan("splitk:64,8,1,12" if case == "splitk" else dense_gemms.CUBLAS)
+    plan = {
+        "splitk": _Plan("splitk:64,8,1,12"),
+        "cublas-sm107": _Plan(dense_gemms.CUBLAS, (10, 7)),
+        "other-sm": _Plan(dense_gemms.CUBLAS, (10, 0)),
+    }.get(case, _Plan())
     layers = [_Layer(i, plan) for i in range(3 if case == "odd" else 4)]
     if case == "not-dense-gemm":
         layers[2].self_attn.o_proj = nn.Linear(4, 4)
@@ -578,18 +596,47 @@ def test_verify_direct_publish_captures_layer_0s_armed_dispatcher(monkeypatch):
         target_layers.verify_direct_publish(model)
 
 
-@pytest.mark.parametrize(
-    "nodes, error, accepted",
-    [
-        (["nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"], None, True),
-        (["<CU_GRAPH_NODE_TYPE_MEMSET>", "nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"], None, False),
-        (["nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT", "splitKreduce_kernel"], None, False),
-        (["nvjet_sm103_tst_128x8_64x16_2x1_v_bz_splitK_TNT"], None, False),
-        ([], RuntimeError("capture failed"), False),
-    ],
-    ids=["validated", "memset", "reduce-pass", "other-kernel", "capture-error"],
+_SPLITK_NAME = (
+    "kernel_cutlass_kernel_flashinfergemmkernelsdense_bf16_gemm_sm100_splitkSplitKDenseGemmKernel"
+    "_object_at__tensorptrbf16gmemalign32oi641i64_0"
 )
-def test_check_producer_accepts_exactly_one_validated_kernel(monkeypatch, nodes, error, accepted):
+
+
+@pytest.mark.parametrize(
+    "capability, nodes, error, accepted",
+    [
+        ((10, 3), ["nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"], None, True),
+        (
+            (10, 3),
+            ["<CU_GRAPH_NODE_TYPE_MEMSET>", "nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"],
+            None,
+            False,
+        ),
+        ((10, 3), ["nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT", "splitKreduce_kernel"], None, False),
+        ((10, 3), ["nvjet_sm103_tst_128x8_64x16_2x1_v_bz_splitK_TNT"], None, False),
+        ((10, 3), [_SPLITK_NAME], None, False),
+        ((10, 3), [], RuntimeError("capture failed"), False),
+        ((10, 7), [_SPLITK_NAME], None, True),
+        ((10, 7), ["nvjet_sm107_tst_48x64_64x16_4x1_v_bz_TNN"], None, False),
+        ((10, 7), ["nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"], None, False),
+        ((10, 0), ["nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"], None, False),
+    ],
+    ids=[
+        "validated",
+        "memset",
+        "reduce-pass",
+        "other-kernel",
+        "splitk-on-sm103",
+        "capture-error",
+        "sm107-splitk",
+        "sm107-cublas",
+        "sm103-kernel-on-sm107",
+        "unsupported-arch",
+    ],
+)
+def test_check_producer_accepts_exactly_one_validated_kernel(
+    monkeypatch, capability, nodes, error, accepted
+):
     from tensorrt_llm._torch.distributed import ops as dist_ops
 
     def captured(produce, device, warm):
@@ -605,7 +652,9 @@ def test_check_producer_accepts_exactly_one_validated_kernel(monkeypatch, nodes,
 
     monkeypatch.setattr(hop, "captured_nodes", captured)
     monkeypatch.setattr(dist_ops, "_mnnvl_workspace_all_succeeded", agree)
-    workspace = types.SimpleNamespace(_comm=None, device=torch.device("cpu"), rank=3)
+    workspace = types.SimpleNamespace(
+        _comm=None, device=torch.device("cpu"), rank=3, capability=capability
+    )
     if accepted:
         name = hop.PostAttnDirectWorkspace.check_producer(workspace, lambda: None)
         assert name == nodes[0] and agreed == [True]

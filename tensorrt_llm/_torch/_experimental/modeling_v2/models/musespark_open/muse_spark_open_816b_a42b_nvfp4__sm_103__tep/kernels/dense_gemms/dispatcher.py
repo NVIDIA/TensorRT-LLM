@@ -92,6 +92,30 @@ DEFAULT_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "unpool": ((2, "direct:256,1"), (5, "direct:64,2"), (MAX_ROWS, "splitk:64,8,4,12")),
 }
 
+#: The same table for sm107 (212 SMs), chosen the same way: the direct kernel at two or
+#: four outputs per CTA for QKV at 1-3 rows and for the unpooler slice at 1-7 rows;
+#: split-K 4 for QKV from 4 rows (36 x 4 CTAs is the widest split-K grid at its width);
+#: flashinfer's split-K ``(64, 8, 1, 12)`` for the attention output projection from 3 rows,
+#: where it is faster than cuBLAS on this arch. The pooler keeps the sm103 cells, which
+#: are within the measurement spread of the fastest here.
+SM107_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": (
+        (1, "direct:256,2"),
+        (2, "direct:128,4"),
+        (3, "direct:64,2"),
+        (MAX_ROWS, "splitk:64,8,4,12"),
+    ),
+    "o_proj": ((2, "direct:64,4"), (MAX_ROWS, "splitk:64,8,1,12")),
+    "pool": DEFAULT_KERNELS["pool"],
+    "unpool": ((1, "direct:256,2"), (7, "direct:128,2"), (MAX_ROWS, "splitk:64,8,4,12")),
+}
+
+#: The kernel table of each supported device compute capability.
+KERNELS_BY_SM: Mapping[Tuple[int, int], Mapping[str, Tuple[Tuple[int, str], ...]]] = {
+    (10, 3): DEFAULT_KERNELS,
+    (10, 7): SM107_KERNELS,
+}
+
 
 def _by_rows(steps: Tuple[Tuple[int, str], ...]) -> List[str]:
     kernels, first = [], 1
@@ -102,9 +126,30 @@ def _by_rows(steps: Tuple[Tuple[int, str], ...]) -> List[str]:
     return kernels
 
 
-def default_kernels() -> Dict[str, Tuple[str, ...]]:
-    """The kernel of each site for rows 1..8, from ``DEFAULT_KERNELS``."""
-    return {site: tuple(_by_rows(steps)) for site, steps in DEFAULT_KERNELS.items()}
+def default_kernels(capability: Tuple[int, int] = (10, 3)) -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each site for rows 1..8 on a device of compute ``capability``.
+
+    Raises:
+        ValueError: if ``KERNELS_BY_SM`` has no table for ``capability``.
+    """
+    table = KERNELS_BY_SM.get(tuple(capability))
+    if table is None:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: no kernel table for SM {tuple(capability)} "
+            f"(supported: {sorted(KERNELS_BY_SM)})"
+        )
+    return {site: tuple(_by_rows(steps)) for site, steps in table.items()}
+
+
+def device_capability() -> Tuple[int, int]:
+    """The compute capability whose kernel table ``install`` uses: the current CUDA device's.
+
+    On a host without CUDA, where no kernel launches (the wiring's unit tests), the
+    target's own sm103.
+    """
+    if not torch.cuda.is_available():
+        return (10, 3)
+    return tuple(torch.cuda.get_device_capability())
 
 
 def sharded_projections(model: torch.nn.Module) -> bool:
@@ -266,11 +311,18 @@ class DenseGemmPlan:
     """
 
     def __init__(
-        self, kernels: Mapping[str, Tuple[str, ...]], prefetch: bool, enable_pdl: bool
+        self,
+        kernels: Mapping[str, Tuple[str, ...]],
+        prefetch: bool,
+        enable_pdl: bool,
+        capability: Optional[Tuple[int, int]] = None,
     ) -> None:
         self.kernels = dict(kernels)
         self.prefetch = prefetch
         self.enable_pdl = enable_pdl
+        #: The compute capability of the device the plan serves (``install`` reads it once);
+        #: what an arch-specific producer policy keys on.
+        self.capability = None if capability is None else tuple(capability)
         #: Named forks by name (``add_fork``), each joined by its role's dispatcher.
         self.named_forks: Dict[str, NamedFork] = {}
         self.pending = False
@@ -382,8 +434,9 @@ class PublishPolicy:
     site's dispatcher with its policy (``claim_publish``) when it installs, and arms the
     dispatcher per forward by setting ``DenseGemmDispatcher.publish`` to the rank's slot.
     ``unpool_direct`` claims the unpool sites (flashinfer's kernels store into the slot, cuBLAS is
-    copied); ``direct_publish`` claims the attention output sites with cuBLAS storing into the
-    slot and everything else copied.
+    copied); ``direct_publish`` claims the attention output sites with the device's producer
+    families storing into the slot (cuBLAS on sm103, flashinfer's split-K and direct kernels on
+    sm107) and everything else copied.
 
     Attributes:
         owner: the claiming policy's name (messages, and the one-owner-per-site check).
@@ -648,8 +701,9 @@ def install(
 ) -> DenseGemmPlan:
     """Route every layer's four projections through ``dense_gemm``; return the shared plan.
 
-    ``kernels`` is the kernel of each site per row count (``default_kernels()``
-    when None). Every module is checked before any is re-classed, so a refusal
+    ``kernels`` is the kernel of each site per row count; when None, the table of the
+    device's compute capability (``device_capability``, ``default_kernels``), read once
+    here. Every module is checked before any is re-classed, so a refusal
     leaves the model as it was. Only the weights' shapes are read, so this runs
     on a model whose weights are still on the meta device.
 
@@ -660,14 +714,15 @@ def install(
             pooler GEMM would read the whole replicated weight; if a
             projection cannot be re-classed (see
             ``MuseSparkOpenTepDenseLinear.check``); or if a named kernel cannot
-            serve its site's shape.
+            serve its site's shape, or no table exists for the device.
         TypeError: if a projection is not the built-in ``Linear``.
     """
     if not _low_m_gemm.LOW_M_GEMM_ACTIVE:
         raise ValueError(
             "dense_gemms serves the low-M GEMM dispatch, which TRTLLM_LOW_M_GEMM_BACKEND leaves off"
         )
-    kernels = default_kernels() if kernels is None else dict(kernels)
+    capability = device_capability()
+    kernels = default_kernels(capability) if kernels is None else dict(kernels)
     sharded = sharded_projections(model)
     if prefetch and not sharded:
         raise ValueError(
@@ -675,7 +730,7 @@ def install(
             "(MUSESPARK_OPEN_SHARDED_PROJECTIONS=1); without them the pooler GEMM reads the "
             "whole replicated weight"
         )
-    plan = DenseGemmPlan(kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL)
+    plan = DenseGemmPlan(kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability)
 
     layers = list(model.layers)
     planned = []

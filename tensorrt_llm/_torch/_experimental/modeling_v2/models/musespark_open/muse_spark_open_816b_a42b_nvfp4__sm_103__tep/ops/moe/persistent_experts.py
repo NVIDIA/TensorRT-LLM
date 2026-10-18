@@ -78,10 +78,18 @@ OPTIONS: Dict[str, int] = {
     "fastroute": 0,
 }
 
+#: What each supported device compute capability changes in ``OPTIONS``: sm107 (212 SMs)
+#: runs eight weight stages, which shortens a call there (six on sm103).
+OPTIONS_BY_SM: Dict[Tuple[int, int], Dict[str, int]] = {
+    (10, 3): {},
+    (10, 7): {"num_stages": 8},
+}
+
 _LOCK = threading.Lock()
 _COMPILED: Dict[tuple, object] = {}
 _WORKSPACES: Dict[tuple, "_Workspace"] = {}
 _RESIDENT_SMS: Dict[tuple, int] = {}
+_DEVICE_OPTIONS: Dict[int, Dict[str, int]] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -125,13 +133,35 @@ def _resident_sms(device: torch.device) -> int:
     return sms
 
 
+def _device_options(device: torch.device) -> Dict[str, int]:
+    """``OPTIONS`` with ``device``'s compute-capability changes (``OPTIONS_BY_SM``) applied.
+
+    The capability is read once per device.
+
+    Raises:
+        ValueError: on a device of another compute capability.
+    """
+    index = _device_index(device)
+    changes = _DEVICE_OPTIONS.get(index)
+    if changes is None:
+        capability = tuple(torch.cuda.get_device_capability(index))
+        changes = OPTIONS_BY_SM.get(capability)
+        if changes is None:
+            raise ValueError(
+                f"persistent_experts: no kernel options for SM {capability} "
+                f"(supported: {sorted(OPTIONS_BY_SM)})"
+            )
+        _DEVICE_OPTIONS[index] = changes
+    return {**OPTIONS, **changes}
+
+
 def _config(device: torch.device) -> Tuple[int, Dict[str, int]]:
-    """The grid size and the kernel's compile-time options (``OPTIONS``) for ``device``.
+    """The grid size and the kernel's compile-time options (``OPTIONS_BY_SM``) for ``device``.
 
     The grid is the resident SM count: CTAs spin on tiles of other CTAs, so every
     CTA of the grid must be resident at once.
     """
-    return _resident_sms(device), dict(OPTIONS)
+    return _resident_sms(device), _device_options(device)
 
 
 def _refuse_under_capture(what: str) -> None:

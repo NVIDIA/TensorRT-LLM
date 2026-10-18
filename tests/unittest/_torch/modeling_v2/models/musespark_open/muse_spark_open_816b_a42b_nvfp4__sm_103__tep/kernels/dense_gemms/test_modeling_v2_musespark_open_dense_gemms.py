@@ -60,13 +60,42 @@ def test_the_default_plan_by_row_count():
     )
 
 
-def test_install_takes_a_kernel_table(low_m_on):
+def test_the_sm107_plan_by_row_count():
+    plan = dense_gemms.default_kernels((10, 7))
+    assert plan == {
+        "qkv": ("direct:256,2", "direct:128,4", "direct:64,2") + ("splitk:64,8,4,12",) * 5,
+        "o_proj": ("direct:64,4",) * 2 + ("splitk:64,8,1,12",) * 6,
+        "pool": dense_gemms.default_kernels()["pool"],
+        "unpool": ("direct:256,2",) + ("direct:128,2",) * 6 + ("splitk:64,8,4,12",),
+    }
+    with pytest.raises(ValueError, match=r"no kernel table for SM \(10, 0\)"):
+        dense_gemms.default_kernels((10, 0))
+
+
+def test_install_takes_a_kernel_table(low_m_on, monkeypatch):
+    monkeypatch.setattr(dense_gemms, "device_capability", lambda: (10, 3))
     default = dense_gemms.default_kernels()
     table = dict(default, qkv=("cublas",) * 8)
     plan = dense_gemms.install(_builtin_text_model(), prefetch=False, kernels=table)
-    assert plan.kernels == table
+    assert plan.kernels == table and plan.capability == (10, 3)
     assert dense_gemms.describe(plan.kernels).startswith("qkv=cublas@1-8, o_proj=direct:64,4@1-2|")
     assert dense_gemms.install(_builtin_text_model(), prefetch=False).kernels == default
+
+
+@pytest.mark.parametrize("capability", [(10, 3), (10, 7)])
+def test_install_takes_the_devices_table(low_m_on, monkeypatch, capability):
+    monkeypatch.setattr(dense_gemms, "device_capability", lambda: capability)
+    plan = dense_gemms.install(_builtin_text_model(), prefetch=False)
+    assert plan.kernels == dense_gemms.default_kernels(capability)
+    assert plan.capability == capability
+
+
+def test_install_refuses_a_device_without_a_table(low_m_on, monkeypatch):
+    monkeypatch.setattr(dense_gemms, "device_capability", lambda: (10, 0))
+    model = _builtin_text_model()
+    with pytest.raises(ValueError, match="no kernel table"):
+        dense_gemms.install(model, prefetch=False)
+    assert not any(isinstance(m, _DENSE) for m in model.modules())
 
 
 # --- stand-ins ---------------------------------------------------------------------------------

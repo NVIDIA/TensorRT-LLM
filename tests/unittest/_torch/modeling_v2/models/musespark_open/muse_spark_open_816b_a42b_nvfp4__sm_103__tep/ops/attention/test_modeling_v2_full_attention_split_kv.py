@@ -311,10 +311,14 @@ _SHORT_CASES = [
 ]
 #: The declared budget on the long contexts (max-abs, mean-abs), as fractions of the built-in's.
 LONG_BUDGET = (0.15, 0.035)
-#: (ctx, seed) cases of the 8-seed sweep that exceed the declared budget (mean-abs above
-#: 0.035x). They are asserted to stay outside it, so this list cannot go stale; every case
+#: Per device capability, the (ctx, seed) cases of the 8-seed sweep that exceed the declared
+#: budget (mean-abs above 0.035x); the split count follows the SM count, so the set is per
+#: arch. They are asserted to stay outside it, so this list cannot go stale; every case
 #: still meets the policy bound (no farther from fp64 than the built-in).
-OVER_BUDGET = frozenset({(455031, 3), (455031, 4)})
+OVER_BUDGET_BY_SM = {
+    (10, 3): frozenset({(455031, 3), (455031, 4)}),
+    (10, 7): frozenset(),
+}
 
 
 def _ratios(step: _Step, what: str):
@@ -351,9 +355,9 @@ def test_the_declared_budget_over_seeds(ctx, seed) -> None:
     step = _Step(8, ctx, seed=7919 * seed + ctx + 8)
     r_max, r_mean = _ratios(step, f"rows 8 ctx {ctx} seed {seed}")
     assert r_max <= 1.0 and r_mean <= 1.0, (r_max, r_mean)
-    if (ctx, seed) in OVER_BUDGET:
+    if (ctx, seed) in OVER_BUDGET_BY_SM[torch.cuda.get_device_capability()]:
         assert not _within_budget(r_max, r_mean), (
-            f"ctx {ctx} seed {seed} is listed in OVER_BUDGET but is within it: {r_max}, {r_mean}"
+            f"ctx {ctx} seed {seed} is listed in OVER_BUDGET_BY_SM but is within it: {r_max}, {r_mean}"
         )
         pytest.xfail(
             f"declared budget exceeded: max {r_max:.4f} / mean {r_mean:.4f} of the built-in's "

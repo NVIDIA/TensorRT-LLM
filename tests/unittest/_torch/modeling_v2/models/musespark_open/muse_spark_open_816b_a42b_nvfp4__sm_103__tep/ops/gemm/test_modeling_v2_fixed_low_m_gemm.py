@@ -24,6 +24,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.gemm.fixed_low_m_gemm import (  # noqa: E501
     SPLITK_TACTICS,
+    SPLITK_TACTICS_BY_SM,
+    tactic_for,
     takes,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.gemm.fixed_low_m_gemm import (  # noqa: E501
@@ -69,6 +71,26 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     assert out.shape == (m, n) and out.dtype == torch.bfloat16 and out.is_contiguous()
     ref = op.reference(x, w, tactic, True)
     assert_within_ulp(out, ref, ELEMENT_ULP, RMS_ULP)
+    exact = x.double() @ w.double().t()
+    err = (out.double() - exact).abs().max().item()
+    cublas_err = (F.linear(x, w).double() - exact).abs().max().item()
+    one_ulp = exact.abs().max().item() * ULP[torch.bfloat16]
+    assert err <= cublas_err + one_ulp, (err, cublas_err, one_ulp)
+
+
+@pytest.mark.parametrize("shape", sorted(SPLITK_TACTICS))
+@torch.inference_mode()
+def test_the_devices_tactic_meets_the_cells_band(shape):
+    """``tactic_for`` gives this device's tactic (``SPLITK_TACTICS_BY_SM``) for every listed
+    shape, within the certified cells' band of the fp32 reference and no farther from
+    fp64 than cuBLAS."""
+    m, k, n = shape
+    capability = torch.cuda.get_device_capability()
+    tactic = tactic_for(m, k, n)
+    assert tactic == SPLITK_TACTICS_BY_SM[capability][shape]
+    x, w = _operands(m, k, n, _seed(f"device {shape}"))
+    out = op(x, w, tactic, True)
+    assert_within_ulp(out, op.reference(x, w, tactic, True), ELEMENT_ULP, RMS_ULP)
     exact = x.double() @ w.double().t()
     err = (out.double() - exact).abs().max().item()
     cublas_err = (F.linear(x, w).double() - exact).abs().max().item()

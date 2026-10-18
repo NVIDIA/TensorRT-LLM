@@ -518,13 +518,21 @@ def test_an_aborted_call_is_cleared_by_the_collective_reset(env):
     assert _agree(sum(after) == 0 and not fired), f"rank {RANK}: {after}, guard {fired}"
 
 
+#: Per device compute capability: the o_proj producer ``check_producer`` accepts, and the
+#: GEMM producer it refuses.
+PRODUCER_CHECK = {(10, 3): ("cublas", "splitk"), (10, 7): ("splitk", "cublas")}
+
+
 def test_the_producer_check_reads_a_capture_and_publishes_nothing(env):
-    """``check_producer`` captures the producer into a graph it never replays: cuBLAS into
-    the slot is one validated kernel, and no word of any rank's copy changes; a producer
-    of two kernels (a GEMM elsewhere, then the copy) and flashinfer's split-K kernel (not
-    validated) are refused on every rank."""
+    """``check_producer`` captures the producer into a graph it never replays: the device's
+    validated o_proj kernel into the slot (cuBLAS on sm103, flashinfer's split-K on sm107)
+    is one validated kernel, and no word of any rank's copy changes; a producer of two
+    kernels (a GEMM elsewhere, then the copy) and the other GEMM (not validated on this
+    device) are refused on every rank."""
     ws = env["direct"]["direct"]
     dev = torch.device("cuda", torch.cuda.current_device())
+    capability = torch.cuda.get_device_capability(dev)
+    accepted, other = PRODUCER_CHECK[capability]
     g = torch.Generator().manual_seed(6100 + RANK)
     w = (0.03 * torch.randn(HIDDEN, O_PROJ_K, generator=g)).to(torch.bfloat16).to(dev)
     x = torch.randn(8, O_PROJ_K, generator=g).to(torch.bfloat16).to(dev)
@@ -532,15 +540,15 @@ def test_the_producer_check_reads_a_capture_and_publishes_nothing(env):
     _reset_transport(ws)
 
     name = ws.check_producer(
-        lambda: torch.mm(x, w.t(), out=ws.slot(0, 8)), lambda: torch.mm(x, w.t(), out=local)
+        lambda: _produce(accepted, x, w, ws.slot(0, 8)), lambda: _produce(accepted, x, w, local)
     )
     refused = {}
     for case, produce, warm in (
         ("two kernels", lambda: publish_copy(ws.slot(0, 8), torch.mm(x, w.t())), None),
         (
-            "split-K",
-            lambda: _produce("splitk", x, w, ws.slot(0, 8)),
-            lambda: _produce("splitk", x, w, local),
+            other,
+            lambda: _produce(other, x, w, ws.slot(0, 8)),
+            lambda: _produce(other, x, w, local),
         ),
     ):
         try:
@@ -551,9 +559,9 @@ def test_the_producer_check_reads_a_capture_and_publishes_nothing(env):
     COMM.Barrier()
     untouched = bool((ws._receive == SENTINEL_I32).all())
     if RANK == 0:
-        print(f"\nproducer check: {name}; refused {refused}")
-    assert _agree(validated_producer(name)), f"rank {RANK}: {name}"
-    assert _agree(sorted(refused) == ["split-K", "two kernels"]), f"rank {RANK}: {refused}"
+        print(f"\nproducer check on SM {capability}: {name}; refused {refused}")
+    assert _agree(validated_producer(name, capability)), f"rank {RANK}: {name}"
+    assert _agree(sorted(refused) == sorted([other, "two kernels"])), f"rank {RANK}: {refused}"
     assert _agree(untouched), f"rank {RANK}: a capture published into the transport"
 
 

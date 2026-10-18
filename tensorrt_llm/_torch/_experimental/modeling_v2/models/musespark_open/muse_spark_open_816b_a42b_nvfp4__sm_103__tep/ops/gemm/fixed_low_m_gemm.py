@@ -8,7 +8,7 @@ each rank and caches the winner per rank; ranks can and do settle on
 different kernels for one shape, and plain ``nn.Linear`` / ``F.linear`` call
 sites never reach it. This entry is the split-K kernel the dispatcher would
 launch, with the tactic chosen by the caller: one tactic per shape, the same
-on every rank, measured once on the target GPU (``SPLITK_TACTICS``).
+on every rank, measured once on each target GPU (``SPLITK_TACTICS_BY_SM``).
 
 The kernel accumulates in fp32 and rounds once; its K-split differs from
 cuBLAS's, so results differ from ``F.linear`` in the last bf16 place on a few
@@ -26,7 +26,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     true_fp32_matmul,
 )
 
-#: The split-K tactic ``(mma_m, mma_n, split_k, ab_stages)`` per ``(M, K, N)``,
+#: The split-K tactic ``(mma_m, mma_n, split_k, ab_stages)`` per ``(M, K, N)`` on sm103,
 #: chosen on GB300 with cold weights and PDL on; each one beats cuBLAS at its
 #: shape. Shapes not listed are not taken by this op's callers.
 SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
@@ -44,13 +44,56 @@ SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (8, 40960, 1024): (64, 8, 4, 12),
 }
 
+#: The same shapes on sm107 (212 SMs), each tactic chosen there the same way.
+SM107_SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    (8, 8192, 2048): (64, 8, 4, 10),
+    (8, 8192, 1280): (64, 8, 4, 12),
+    (8, 1024, 8192): (64, 8, 1, 10),
+    (8, 3584, 8192): (64, 8, 1, 12),
+    (8, 8192, 7168): (64, 16, 1, 9),
+    (8, 40960, 1024): (64, 8, 4, 12),
+}
+
+#: The tactic table of each supported device compute capability; each lists the same shapes.
+SPLITK_TACTICS_BY_SM: dict[
+    tuple[int, int], dict[tuple[int, int, int], tuple[int, int, int, int]]
+] = {
+    (10, 3): SPLITK_TACTICS,
+    (10, 7): SM107_SPLITK_TACTICS,
+}
+
 #: The kernel's row limit (the dispatcher's ``_MAX_M``).
 MAX_M = 32
 
+_DEVICE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] | None = None
+
+
+def device_tactics() -> dict[tuple[int, int, int], tuple[int, int, int, int]]:
+    """The tactic table of this process's CUDA device (``SPLITK_TACTICS_BY_SM``), read once.
+
+    On a host without CUDA, where no kernel launches, the target's own sm103 table.
+
+    Raises:
+        ValueError: on a device of another compute capability.
+    """
+    global _DEVICE_TACTICS
+    if _DEVICE_TACTICS is None:
+        capability = (
+            tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else (10, 3)
+        )
+        table = SPLITK_TACTICS_BY_SM.get(capability)
+        if table is None:
+            raise ValueError(
+                f"fixed_low_m_gemm: no split-K tactics for SM {capability} "
+                f"(supported: {sorted(SPLITK_TACTICS_BY_SM)})"
+            )
+        _DEVICE_TACTICS = table
+    return _DEVICE_TACTICS
+
 
 def tactic_for(m: int, k: int, n: int):
-    """The fixed tactic for this shape, or None when the shape is not covered."""
-    return SPLITK_TACTICS.get((m, k, n))
+    """The fixed tactic for this shape on this device, or None when the shape is not covered."""
+    return device_tactics().get((m, k, n))
 
 
 def takes(x: torch.Tensor, weight: torch.Tensor) -> bool:

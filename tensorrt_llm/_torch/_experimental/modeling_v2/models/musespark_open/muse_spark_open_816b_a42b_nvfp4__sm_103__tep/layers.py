@@ -117,6 +117,13 @@ class DirectPublish:
     #: The one row count published directly: the K = 7 verify step. Other row counts keep
     #: the post-attention hop, on its own workspace.
     ROWS = 8
+    #: The o_proj kernel families that store straight into the slot, per device compute
+    #: capability: the families of that arch's ``post_attn_hop.VALIDATED_PRODUCERS``. The
+    #: dense GEMM plan's o_proj kernel at ``ROWS`` must be one of them.
+    PRODUCER_FAMILIES = {
+        (10, 3): frozenset({"cublas"}),
+        (10, 7): frozenset({"splitk", "direct"}),
+    }
 
     def __init__(
         self,
@@ -523,18 +530,21 @@ def _build_direct_publish(
     Checked first, on every layer, and agreed over the TP group before the workspace's
     collective construction (``tp_agreement.agreed_refusal``, itself collective): an even
     layer count (the per-layer parity), the post-attention hop's multicast transport, and
-    every o_proj on the dense GEMM dispatcher with cuBLAS for ``DirectPublish.ROWS`` rows --
-    the kernel whose epilogue stores are known to publish through the multicast address.
+    every o_proj on the dense GEMM dispatcher with a kernel of the device's
+    ``DirectPublish.PRODUCER_FAMILIES`` for ``DirectPublish.ROWS`` rows -- the kernels whose
+    epilogue stores are known to publish through the multicast address (cuBLAS on sm103,
+    flashinfer's split-K and direct kernels on sm107; the device is the dense GEMM plan's).
     ``early_trigger`` gives the consumer hop the hop's early trigger placement. Every o_proj site
-    then lists ``DirectPublish.ROWS`` in its ``skip_prefetch_rows``. The kernel cuBLAS
-    actually picks is checked once the weights are loaded (``verify_direct_publish``).
+    then lists ``DirectPublish.ROWS`` in its ``skip_prefetch_rows``. The kernel the published
+    o_proj actually runs (cuBLAS picks its own) is checked once the weights are loaded
+    (``verify_direct_publish``).
 
     Raises:
         ValueError: on every rank alike, naming what is missing on which ranks; nothing
             has been built then.
     """
     from .kernels.dense_gemms import dispatcher as dense_gemms
-    from .ops.gemm.dense_gemm import CUBLAS, parse_kernel
+    from .ops.gemm.dense_gemm import parse_kernel
 
     layers = list(model.layers)
     reasons = []
@@ -545,20 +555,25 @@ def _build_direct_publish(
     if len(call.joins) != len(layers):
         reasons.append(f"{len(call.joins)} post-attention hop joins for {len(layers)} layers")
     dispatchers = []
+    producer_families = frozenset()
     for layer in layers:
         o_proj = layer.self_attn.o_proj
         if not isinstance(o_proj, dense_gemms.MuseSparkOpenTepDenseLinear):
             reasons.append(f"layer {layer.layer_idx}: o_proj is not on the dense GEMM dispatcher")
             continue
         dispatcher = o_proj._low_m_gemm_dispatcher
+        capability = dispatcher.site.plan.capability
+        families = DirectPublish.PRODUCER_FAMILIES.get(capability, frozenset())
         kernel = dispatcher.site.plan.kernels[dispatcher.site.role][DirectPublish.ROWS - 1]
-        if dispatcher.site.role != "o_proj" or parse_kernel(kernel)[0] != CUBLAS:
+        if dispatcher.site.role != "o_proj" or parse_kernel(kernel)[0] not in families:
             reasons.append(
                 f"layer {layer.layer_idx}: o_proj runs {kernel} at {DirectPublish.ROWS} rows, "
-                "not cuBLAS"
+                f"not a kernel family that publishes directly on SM {capability} "
+                f"({sorted(families)})"
             )
             continue
         dispatchers.append(dispatcher)
+        producer_families = families
     refusal = _tp_agreement.agreed_refusal(
         layers[0].mapping,
         "[musespark_open] attention_output_into_hop cannot publish o_proj directly: "
@@ -568,9 +583,9 @@ def _build_direct_publish(
     )
     if refusal is not None:
         raise ValueError(refusal)
-    # The o_proj sites' producer policy: a cuBLAS call stores into the slot, any other
-    # call's product is copied there.
-    policy = dense_gemms.PublishPolicy("direct_publish", frozenset({CUBLAS}), _hop.publish_copy)
+    # The o_proj sites' producer policy: a call of the device's producer families stores
+    # into the slot, any other call's product is copied there.
+    policy = dense_gemms.PublishPolicy("direct_publish", producer_families, _hop.publish_copy)
     for dispatcher in dispatchers:
         dense_gemms.claim_publish(dispatcher, policy)
     variants = sorted(
@@ -603,8 +618,8 @@ def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
 
     The protocol needs the producer to store each output element exactly once, with no
     reduction through the output (``PostAttnDirectWorkspace``). cuBLAS picks its kernel by
-    heuristic, so the build's check of the dense GEMM plan cannot see it. Here layer 0's real
-    dispatcher publishes a ``DirectPublish.ROWS``-row product of its real weight into slot 0
+    heuristic, so the build's check of the dense GEMM plan's family cannot see it. Here layer
+    0's real dispatcher publishes a ``DirectPublish.ROWS``-row product of its real weight into slot 0
     inside a CUDA graph capture -- as the decode graph does -- that is never replayed (so
     nothing is published), and ``PostAttnDirectWorkspace.check_producer`` reads what was
     captured. Collective; the shell's ``load_weights`` calls it before any graph is
@@ -612,7 +627,7 @@ def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
 
     Raises:
         ValueError: on every rank, if the direct publication was not built, or any rank's
-            capture is not exactly one kernel of ``post_attn_hop.VALIDATED_PRODUCERS``.
+            capture is not exactly one kernel of the device's ``post_attn_hop.VALIDATED_PRODUCERS``.
     """
     call = getattr(text_model, "_post_attn_hop", None)
     direct = getattr(call, "direct", None)
@@ -637,8 +652,10 @@ def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
             dispatcher.publish = None
 
     def warm() -> None:
+        # The same kernel, disarmed, into a fresh output: library state and a flashinfer
+        # kernel's compilation happen outside the capture.
         with torch.inference_mode():
-            torch.mm(x, weight.t())
+            dispatcher.apply(o_proj, x, weight, None)
 
     return direct.workspace.check_producer(publish, warm)
 

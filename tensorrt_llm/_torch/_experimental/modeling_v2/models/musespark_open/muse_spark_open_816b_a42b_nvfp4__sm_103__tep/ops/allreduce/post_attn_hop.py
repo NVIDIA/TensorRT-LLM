@@ -86,7 +86,7 @@ argument the caller fixes per call site (layer ``l`` uses ``l mod 2``, see
 What the direct transport needs from its users, and what checks it. The
 producer must store each output element once and never reduce through its
 output: ``check_producer`` reads the kernels a producer captures into a CUDA
-graph (never replayed) and accepts exactly one of ``VALIDATED_PRODUCERS``.
+graph (never replayed) and accepts exactly one of the device's ``VALIDATED_PRODUCERS``.
 Every published call must be consumed before its buffer is published into
 again; a call sequence that breaks off between the two (a host exception)
 leaves words a later call would take as its own, so ``reset`` refills every
@@ -102,7 +102,7 @@ import functools
 import threading
 import time
 import weakref
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -1088,16 +1088,33 @@ GUARD_WORD = 2
 DIRECT_GUARD_NS = 1 << 33
 #: How often the guard watchdog of a direct workspace reads the guard word, in s.
 DIRECT_WATCHDOG_S = 10.0
-#: The kernels shown to publish into the direct transport correctly: one store per output
-#: element through the multicast address, no reduction through the output (a
-#: concurrent-poller test at every row count; NaN / Inf inputs never store the sentinel
-#: half). cuBLAS's choice for the 8-row o_proj, ``[8, 1024] x [1024, 8192]`` BF16, on SM103.
-VALIDATED_PRODUCERS = frozenset({"nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"})
+#: The kernels shown to publish into the direct transport correctly, per device compute
+#: capability: one store per output element through the multicast address, no reduction
+#: through the output (a concurrent-poller test at every row count; NaN / Inf inputs never
+#: store the sentinel half). A captured kernel matches an entry its name contains.
+#:
+#: * ``(10, 3)``: cuBLAS's choice for the 8-row o_proj, ``[8, 1024] x [1024, 8192]`` BF16.
+#: * ``(10, 7)``: flashinfer's split-K and direct kernels, the o_proj kernels the dense GEMM
+#:   plan names there; cuBLAS's choice on this arch is not one.
+VALIDATED_PRODUCERS: Dict[Tuple[int, int], FrozenSet[str]] = {
+    (10, 3): frozenset({"nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"}),
+    (10, 7): frozenset(
+        {
+            "flashinfergemmkernelsdense_bf16_gemm_sm100_splitkSplitKDenseGemmKernel",
+            "flashinfergemmkernelsdense_bf16_gemm_directDirectDenseGemmKernel",
+        }
+    ),
+}
 
 
-def validated_producer(name: str) -> bool:
-    """Whether a captured kernel ``name`` is one of ``VALIDATED_PRODUCERS``."""
-    return any(validated in name for validated in VALIDATED_PRODUCERS)
+def validated_producers(capability: Tuple[int, int]) -> FrozenSet[str]:
+    """``VALIDATED_PRODUCERS`` of a device of compute ``capability``; empty on any other."""
+    return VALIDATED_PRODUCERS.get(tuple(capability), frozenset())
+
+
+def validated_producer(name: str, capability: Tuple[int, int]) -> bool:
+    """Whether a captured kernel ``name`` is a validated producer on a device of ``capability``."""
+    return any(validated in name for validated in validated_producers(capability))
 
 
 def _driver_check(result) -> tuple:
@@ -1583,13 +1600,16 @@ class PostAttnDirectWorkspace:
         if self.ranks not in (4, MAX_RANKS):
             raise ValueError(f"the direct hop serves 4 or 8 ranks, got {self.ranks}")
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
+        #: The device's compute capability, which selects ``check_producer``'s validated set.
+        self.capability: Optional[Tuple[int, int]] = None
         self._kernels = {}
         self._comm = _get_mnnvl_workspace_comm(mapping)
         error: Optional[BaseException] = None
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+            self.capability = tuple(torch.cuda.get_device_capability(self.device))
+            if self.capability not in ((10, 3), (10, 7)):
                 raise RuntimeError("the direct hop runs on SM103 or SM107 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
@@ -1726,8 +1746,8 @@ class PostAttnDirectWorkspace:
 
         ``produce`` stores into one of this workspace's slots; it is captured into a CUDA
         graph that is never replayed (``captured_nodes``), so nothing is published. The
-        capture must hold exactly one node, a kernel of ``VALIDATED_PRODUCERS``, on every
-        rank. Returns its name.
+        capture must hold exactly one node, a kernel of the device's ``VALIDATED_PRODUCERS``,
+        on every rank. Returns its name.
 
         Raises:
             ValueError: on every rank, naming this rank's nodes, if any rank's capture is not.
@@ -1740,12 +1760,14 @@ class PostAttnDirectWorkspace:
             names = captured_nodes(produce, self.device, warm)
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
             error = exc
-        ok = error is None and len(names) == 1 and validated_producer(names[0])
+        validated = validated_producers(self.capability)
+        ok = error is None and len(names) == 1 and validated_producer(names[0], self.capability)
         if not _mnnvl_workspace_all_succeeded(self._comm, ok):
             raise ValueError(
                 "[musespark_open] attention_output_into_hop: the published o_proj must be exactly one kernel "
                 "validated as a "
-                f"direct-transport producer ({sorted(VALIDATED_PRODUCERS)}) on every rank; "
+                f"direct-transport producer on SM {self.capability} ({sorted(validated)}) on every "
+                "rank; "
                 f"rank {self.rank} captured {names}"
                 + (f" ({error!r})" if error is not None else "")
             )
@@ -1895,7 +1917,7 @@ class PostAttnConsumerHop(OpWrapper):
 
     Loud preconditions: `consumer_hop_supported` must hold. Not certified:
     producers that reduce through their output (split-K through global memory),
-    rows above 8, widths other than 8192; ``check_producer`` accepts only
+    rows above 8, widths other than 8192; ``check_producer`` accepts only the device's
     ``VALIDATED_PRODUCERS``.
     """
 
