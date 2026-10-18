@@ -223,13 +223,17 @@ def sharded_fc_unsupported_reason(draft_model: nn.Module, mapping) -> Optional[s
         return f"fc.weight is {fc.weight.dtype}, contiguous={fc.weight.is_contiguous()}"
     world = getattr(mapping, "tp_size", None)
     if mapping is None or world not in FC_SHARD_WORLDS:
-        return f"TP size is {world}, the gathers are written for {' or '.join(map(str, FC_SHARD_WORLDS))}"
+        widths = " or ".join(map(str, FC_SHARD_WORLDS))
+        return f"TP size is {world}, the gathers are written for {widths}"
     if getattr(mapping, "enable_attention_dp", False) or getattr(mapping, "cp_size", 1) != 1:
         return "attention DP or context parallelism"
     if fc.weight.shape[0] % world:
         return f"fc has {fc.weight.shape[0]} outputs, not a multiple of TP {world}"
     if world == 8 and fc.weight.shape[0] // world != FC_SHARD_TP8_ROWS:
-        return f"fc has {fc.weight.shape[0]} outputs; the TP8 gather takes {FC_SHARD_TP8_ROWS} per rank"
+        return (
+            f"fc has {fc.weight.shape[0]} outputs; "
+            f"the TP8 gather takes {FC_SHARD_TP8_ROWS} per rank"
+        )
     return None
 
 

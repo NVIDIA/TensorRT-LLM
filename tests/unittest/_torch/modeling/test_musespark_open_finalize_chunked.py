@@ -124,7 +124,8 @@ def test_chunked_rows_are_the_fused_calls_rows(tokens: int) -> None:
         ok &= tuple(actual.shape) == (tokens, 4096)
         ok &= torch.equal(actual, _per_chunk(workspace, gemm, indices, weights, norm, 1e-6, tokens))
         if tokens <= 128:
-            ok &= torch.equal(actual, workspace.finalize(gemm, indices, weights, norm, 1e-6, tokens))
+            single = workspace.finalize(gemm, indices, weights, norm, 1e-6, tokens)
+            ok &= torch.equal(actual, single)
         ok &= _within_gates(actual, _reference(nccl, gemm, indices, weights, norm, 1e-6, tokens))
         ok &= _same_on_all_ranks(actual)
     workspace.close()
