@@ -73,8 +73,13 @@ class Qwen3CoderToolParser(BaseToolParser):
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
             if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+                partial_start = self._partial_start_token_length()
+                if partial_start:
+                    normal += self._buf[:-partial_start]
+                    self._buf = self._buf[-partial_start:]
+                else:
+                    normal += self._buf
+                    self._buf = ""
                 break
 
             # Look for tool call start
@@ -146,7 +151,8 @@ class Qwen3CoderToolParser(BaseToolParser):
             if self._function_name_sent:
                 # Process parameters and get any calls to emit
                 param_config = self._get_arguments_config(self._current_function_name, tools)
-                parameter_calls = self._parse_and_stream_parameters(self._buf, param_config)
+                current_call_text = self._buf.split(self.tool_call_end_token, 1)[0]
+                parameter_calls = self._parse_and_stream_parameters(current_call_text, param_config)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
@@ -190,6 +196,13 @@ class Qwen3CoderToolParser(BaseToolParser):
                     break
 
         return StreamingParseResult(normal_text=normal, calls=calls)
+
+    def _partial_start_token_length(self) -> int:
+        """Return the length of an incomplete tool-call start token suffix."""
+        for length in range(min(len(self._buf), len(self.tool_call_start_token)), 0, -1):
+            if self._buf.endswith(self.tool_call_start_token[:length]):
+                return length
+        return 0
 
     def _parse_and_stream_parameters(
         self, text_to_parse: str, param_config: dict

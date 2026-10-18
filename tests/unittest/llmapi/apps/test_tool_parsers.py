@@ -1342,6 +1342,36 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert json.loads("".join(arguments_by_tool[0])) == {"location": "NYC"}
         assert json.loads("".join(arguments_by_tool[1])) == {}
 
+    def test_streaming_parameterless_call_before_parameterized_call(
+            self, sample_tools):
+        """Test adjacent calls in one increment keep arguments isolated."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        parser = self.make_parser()
+        text = ("<tool_call><function=run_tests></function></tool_call>"
+                "<tool_call><function=get_weather>"
+                "<parameter=location>NYC</parameter></function></tool_call>")
+
+        result = parser.parse_streaming_increment(
+            text, sample_tools + [no_parameter_tool])
+        arguments_by_tool = {}
+        for call in result.calls:
+            if call.parameters:
+                arguments_by_tool.setdefault(call.tool_index,
+                                             []).append(call.parameters)
+
+        assert json.loads("".join(arguments_by_tool[0])) == {}
+        assert json.loads("".join(arguments_by_tool[1])) == {"location": "NYC"}
+
     def test_parse_streaming_increment_end_token_handling(
             self, sample_tools, parser):
         """Test streaming parser handles end token correctly."""
