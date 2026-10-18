@@ -683,8 +683,8 @@ class CUDAGraphRunner:
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
-        # Preserve compatibility with direct callers that pass a plain
-        # (batch_size, draft_len) tuple.
+        # Preserve compatibility with direct callers that still pass a plain
+        # (batch_size, draft_len) generation-only tuple.
         key = KeyType(*key)
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]

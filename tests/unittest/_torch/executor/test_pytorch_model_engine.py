@@ -91,9 +91,9 @@ class TestCachedKvTokenLogging(unittest.TestCase):
 
     def test_mtp_padding_before_generation(self) -> None:
         # Input packing is context, extend (including padding), gen.
-        self.check_counts([10, 100, 7, 300],
+        self.check_counts([10, 100, 7, 200],
                           (([self.real], 1), ([self.real, self.padding], 1),
-                           ([self.real], 1)), [10, 100, 300], 7)
+                           ([self.real], 1)), [10, 100, 200], 7)
 
     def test_beams_preserved_after_context_and_padding(self) -> None:
         self.check_counts([10, 100, 101, 7, 7, 200, 201],
