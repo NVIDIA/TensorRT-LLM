@@ -38,6 +38,46 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
+.. _tool-parser-selection:
+
+Tool-call Parser Selection
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Select ``--tool_parser`` to match the tool-call syntax specified by the checkpoint's
+chat template. Models from different families can share a parser when they emit
+the same format.
+
+The ``qwen3_coder`` parser handles the following function/parameter format, shared
+by Qwen3-Coder, Nemotron 3 Nano, Nemotron 3 Super, Nemotron 3 Ultra, and
+Nemotron 3.5 Super VL:
+
+.. code-block:: text
+
+   <tool_call>
+   <function=get_weather>
+   <parameter=city>
+   Taipei
+   </parameter>
+   </function>
+   </tool_call>
+
+The official chat templates specify this syntax and use it to serialize previous
+assistant tool calls:
+
+* `Qwen3-Coder <https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Nano <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Super <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Ultra <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/blob/main/chat_template.jinja>`__
+* `Nemotron 3.5 Super VL <https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/blob/main/chat_template.jinja>`__
+
+Among these Nemotron models, ``--tool_parser auto`` selects ``qwen3_coder`` only
+for Nemotron 3.5 Super VL (``nemotron_h_omni``). For Nemotron 3 Nano, Super, and
+Ultra (``nemotron_h``), specify ``--tool_parser qwen3_coder`` explicitly.
+
+The module ``tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py`` implements this
+shared format. ``--reasoning_parser`` separately controls reasoning extraction;
+``nemotron-v3`` and ``nano-v3`` are aliases for the same Nemotron reasoning parser.
+
 Inference Endpoints
 -------------------
 
