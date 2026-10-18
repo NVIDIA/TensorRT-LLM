@@ -2890,6 +2890,28 @@ class DecoderRunner(ScheduledModelRunner):
             self._config.disable_overlap_scheduler, spec_config, attn_metadata
         )
 
+    def _prepare_decode_metadata(
+        self, attn_metadata: AttentionMetadata, *, enable_spec_decode: bool
+    ) -> None:
+        """Defer index-only writes that speculative overlap refreshes before forward."""
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+
+        if type(attn_metadata) is not DSAtrtllmAttentionMetadata:
+            attn_metadata.prepare()
+            return
+        previous_defer = attn_metadata.defer_indexer_decode_prepare
+        attn_metadata.defer_indexer_decode_prepare = (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and not self.mapping.enable_attention_dp
+            and not self.mapping.has_cp()
+            and os.environ.get("TRTLLM_STEP_PROLOGUE_TRIM", "1").strip() != "0"
+        )
+        try:
+            attn_metadata.prepare()
+        finally:
+            attn_metadata.defer_indexer_decode_prepare = previous_defer
+
     def _preprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
     ):
@@ -4349,7 +4371,7 @@ class DecoderRunner(ScheduledModelRunner):
                     self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
                 ),
             )
-        attn_metadata.prepare()
+        self._prepare_decode_metadata(attn_metadata, enable_spec_decode=enable_spec_decode)
         extra_model_inputs = extra_inputs.build(attn_metadata, resource_manager)
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
