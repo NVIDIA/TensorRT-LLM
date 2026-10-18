@@ -143,7 +143,7 @@ class RunIsolatedTestsSummaryTest(unittest.TestCase):
             mock.patch.object(run_tests, "print_phase_summary") as summary,
         ):
             run_tests.run_isolated_tests(
-                "pytest", str(isolate_list), str(output_dir), str(output_dir), "stage", [], 10
+                "pytest", str(isolate_list), str(output_dir), str(output_dir), "stage", []
             )
         _, passed, failed, _ = summary.call_args.args
         return passed, failed
@@ -153,6 +153,61 @@ class RunIsolatedTestsSummaryTest(unittest.TestCase):
 
     def test_failure_fixed_by_rerun_is_counted_as_passed(self) -> None:
         self.assertEqual(self._run(write_rerun_0=False), (2, 0))
+
+
+class CheckAndRerunTest(unittest.TestCase):
+    def test_reruns_every_eligible_test_without_a_cap(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        output_dir = Path(tmp.name)
+        not_run = [f"unittest/t{i}.py" for i in range(24)]
+
+        def fake_generate(rerun_dir, *args):
+            Path(rerun_dir, "rerun_1.txt").write_text("\n".join(not_run) + "\n")
+
+        def fake_run_pytest(cmd, working_dir, tail_lines=0):
+            Path(output_dir, "rerun", "regular", "rerun_results_1.xml").write_text("<testsuites/>")
+            return 0, 1.0, []
+
+        with (
+            mock.patch.object(
+                run_tests.test_rerun, "generate_rerun_tests_list", side_effect=fake_generate
+            ),
+            mock.patch.object(run_tests, "run_pytest", side_effect=fake_run_pytest) as run,
+        ):
+            is_rerun_failed, xmls = run_tests.check_and_rerun(
+                str(output_dir / "results.xml"),
+                "pytest",
+                str(output_dir),
+                str(output_dir),
+                "regular",
+                [],
+                str(output_dir / "regular.txt"),
+            )
+
+        run.assert_called_once()
+        self.assertFalse(is_rerun_failed)
+        self.assertEqual(len(xmls), 1)
+
+
+class CountXmlResultsTest(unittest.TestCase):
+    def test_counts_passed_and_failed_excluding_skipped(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        xml = Path(tmp.name, "results.xml")
+        xml.write_text(
+            "<testsuites><testsuite>"
+            '<testcase name="a"/>'
+            '<testcase name="b"/>'
+            '<testcase name="c"><failure message="x"/></testcase>'
+            '<testcase name="d"><error message="y"/></testcase>'
+            '<testcase name="e"><skipped/></testcase>'
+            "</testsuite></testsuites>"
+        )
+        self.assertEqual(run_tests.count_xml_results(str(xml)), (2, 2))
+
+    def test_missing_xml_counts_nothing(self) -> None:
+        self.assertEqual(run_tests.count_xml_results("/nonexistent/results.xml"), (0, 0))
 
 
 if __name__ == "__main__":

@@ -68,9 +68,15 @@ def print_banner(title, char="="):
     print(f"{border}\n")
 
 
-def print_phase_summary(phase, passed, failed, duration_s):
-    """Print a summary line after a phase completes."""
-    status = "PASSED" if failed == 0 else "FAILED"
+def print_phase_summary(phase, passed, failed, duration_s, phase_failed=None):
+    """Print a summary line after a phase completes.
+
+    phase_failed overrides the status when pytest failed without recording a
+    failed case (e.g. it was killed by a timeout before writing one).
+    """
+    if phase_failed is None:
+        phase_failed = failed > 0
+    status = "FAILED" if phase_failed else "PASSED"
     print(f"\n>> [{phase}] {status}: {passed} passed, {failed} failed ({duration_s:.1f}s)")
 
 
@@ -395,6 +401,22 @@ def print_xml_failure_summary(xml_path, tail_lines=None):
         print("  [No failure/error nodes found in result XML]")
 
 
+def count_xml_results(xml_path):
+    """Return (passed, failed) test case counts from a pytest JUnit XML.
+
+    Skipped cases count as neither. A missing or unreadable XML yields (0, 0).
+    """
+    try:
+        cases = ET.parse(xml_path).getroot().findall(".//testcase")
+    except (OSError, ET.ParseError):
+        return 0, 0
+    failed = sum(
+        1 for tc in cases if tc.find("failure") is not None or tc.find("error") is not None
+    )
+    skipped = sum(1 for tc in cases if tc.find("skipped") is not None)
+    return len(cases) - failed - skipped, failed
+
+
 def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
     """Drop args matching any prefix in drop_patterns, then append append_args.
 
@@ -515,7 +537,6 @@ def check_and_rerun(
     output_dir,
     rerun_tag,
     fail_signatures,
-    max_rerun_tests,
     test_list_file,
 ):
     """Analyze test failures and rerun eligible tests.
@@ -527,7 +548,6 @@ def check_and_rerun(
         output_dir: Base output directory for the stage.
         rerun_tag: Tag for this rerun (e.g., "regular", "isolated_0").
         fail_signatures: List of failure signature strings.
-        max_rerun_tests: Max number of failed tests that can trigger rerun.
         test_list_file: Path to the test list file that drove this pytest run
             (used to detect tests that never ran).
 
@@ -554,22 +574,12 @@ def check_and_rerun(
         unfinished_test_file,
     )
 
-    # Step 2: Count total failed tests and enforce the cap
-    valid_count = 0
+    # Step 2: Report how many tests will be rerun
     for times in [1, 2]:
         rerun_file = os.path.join(rerun_dir, f"rerun_{times}.txt")
         if os.path.exists(rerun_file):
             lines = [line for line in Path(rerun_file).read_text().splitlines() if line.strip()]
-            count = len(lines)
-            print(f"Found {count} {rerun_tag} tests to rerun {times} time(s)")
-            valid_count += count
-
-    if valid_count > max_rerun_tests:
-        print(
-            f"Too many {rerun_tag} tests to rerun ({valid_count} > max_rerun_tests={max_rerun_tests}). "
-            "Skipping rerun."
-        )
-        return True, []
+            print(f"Found {len(lines)} {rerun_tag} tests to rerun {times} time(s)")
 
     # Step 3: Execute reruns
     # Tests in rerun_0.txt are never rerun; main() reports them via has_unrerun_failures().
@@ -618,7 +628,7 @@ def has_unrerun_failures(output_dir):
 # Regular test execution
 # ---------------------------------------------------------------------------
 def run_regular_tests(
-    pytest_cmd, regular_list, working_dir, output_dir, stage_name, fail_signatures, max_rerun_tests
+    pytest_cmd, regular_list, working_dir, output_dir, stage_name, fail_signatures
 ):
     """Run regular tests and rerun failures if applicable.
 
@@ -629,7 +639,6 @@ def run_regular_tests(
         output_dir: Output directory for the stage.
         stage_name: Name of the test stage.
         fail_signatures: List of failure signature strings.
-        max_rerun_tests: Max number of failed tests that can trigger rerun.
 
     Returns:
         Tuple of (rerun_failed: bool, all_xml_files: list of result XML paths).
@@ -645,7 +654,8 @@ def run_regular_tests(
     rc, elapsed, _tail = run_pytest(pytest_cmd, working_dir)
 
     if rc != 0:
-        print_phase_summary("REGULAR TESTS", 0, 1, elapsed)
+        passed, failed = count_xml_results(result_xml)
+        print_phase_summary("REGULAR TESTS", passed, failed, elapsed, phase_failed=True)
         print_banner(
             f"RERUN — checking failed regular tests for stage [{stage_name}]",
             char="-",
@@ -658,7 +668,6 @@ def run_regular_tests(
                 output_dir,
                 "regular",
                 fail_signatures,
-                max_rerun_tests,
                 regular_list,
             )
             all_xml_files.extend(rerun_xmls)
@@ -675,7 +684,7 @@ def run_regular_tests(
 # Isolated test execution
 # ---------------------------------------------------------------------------
 def run_isolated_tests(
-    pytest_cmd, isolate_list, working_dir, output_dir, stage_name, fail_signatures, max_rerun_tests
+    pytest_cmd, isolate_list, working_dir, output_dir, stage_name, fail_signatures
 ):
     """Run isolated tests one by one, rerunning each on failure.
 
@@ -686,7 +695,6 @@ def run_isolated_tests(
         output_dir: Output directory for the stage.
         stage_name: Name of the test stage.
         fail_signatures: List of failure signature strings.
-        max_rerun_tests: Max number of failed tests that can trigger rerun.
 
     Returns:
         Tuple of (rerun_failed: bool, all_xml_files: list of result XML paths).
@@ -740,7 +748,6 @@ def run_isolated_tests(
                     output_dir,
                     f"isolated_{i}",
                     fail_signatures,
-                    max_rerun_tests,
                     single_test_file,
                 )
                 all_xml_files.extend(rerun_xmls)
@@ -933,9 +940,6 @@ def parse_args():
         help="Comma-separated list of failure signatures for rerun eligibility",
     )
     parser.add_argument(
-        "--max-rerun-tests", type=int, default=5, help="Max failed tests to trigger rerun"
-    )
-    parser.add_argument(
         "--durations-path",
         default=None,
         help="Path to per-cluster .test_durations file for least_duration splitting. "
@@ -952,7 +956,6 @@ def main():
     output_dir = args.output_dir
     stage_name = args.stage_name
     fail_signatures = [s for s in args.fail_signatures.split(",") if s]
-    max_rerun_tests = args.max_rerun_tests
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1021,7 +1024,6 @@ def main():
             output_dir,
             stage_name,
             fail_signatures,
-            max_rerun_tests,
         )
         rerun_failed = rerun_failed or failed
         all_xml_files.extend(xml_files)
@@ -1039,7 +1041,6 @@ def main():
             output_dir,
             stage_name,
             fail_signatures,
-            max_rerun_tests,
         )
         rerun_failed = rerun_failed or failed
         all_xml_files.extend(xml_files)
