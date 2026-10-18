@@ -185,6 +185,24 @@ def test_affine_fp32_weight_matches_eager():
 
 
 # ---------------------------------------------------------------------------
+# Large mean, small spread: the variance must not be lost to FP32 cancellation.
+# ---------------------------------------------------------------------------
+
+
+def test_bf16_large_mean_small_variance():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    x = torch.full((1, D), 15.75, dtype=torch.bfloat16, device="cuda")
+    x[:, :2] = 15.6875
+
+    out = torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, None, None, 1, EPS)
+    ref = _ref_layernorm_plain(x, EPS)
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
 # FP4 correctness: feed quant output through nvfp4_gemm, cosine_sim > 0.98.
 # Pattern from Yiyun's LTX-2 test_fused_dit_gate_resid_norm_shift_scale.py.
 # ---------------------------------------------------------------------------
