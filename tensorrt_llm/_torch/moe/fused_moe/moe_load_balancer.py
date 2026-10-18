@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import errno
 import gc
 import os
 import threading
@@ -57,6 +58,56 @@ def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     mw.pitch = pitch * elt_size
     mw.weight_ptr = t.data_ptr()
     return mw
+
+
+def _create_reserved_shared_memory(name: str,
+                                   size: int) -> shared_memory.SharedMemory:
+    """Create a POSIX shared memory segment whose pages are reserved up front.
+
+    ``SharedMemory(create=True, size=n)`` only ``ftruncate``s a sparse file on
+    the tmpfs behind ``/dev/shm``. When the tmpfs cannot hold ``n`` bytes the
+    segment is still created, and the process dies with SIGBUS (``BUS_ADRERR``)
+    once a write reaches a page the tmpfs cannot allocate. Reserving the whole
+    segment with ``posix_fallocate`` makes that condition an error at creation
+    time; the reservation is atomic, so ranks sharing the same tmpfs cannot
+    over-commit it between a capacity check and the copy.
+
+    Args:
+        name: Shared memory segment name.
+        size: Segment size in bytes.
+
+    Returns:
+        The created segment, with all ``size`` bytes backed by tmpfs pages.
+
+    Raises:
+        RuntimeError: If the shared memory filesystem cannot hold ``size`` bytes.
+    """
+    shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    try:
+        os.posix_fallocate(shm._fd, 0, size)
+    except OSError as e:
+        if e.errno in (errno.EOPNOTSUPP, errno.EINVAL):
+            # The filesystem cannot reserve space; keep the sparse segment.
+            return shm
+        shm.close()
+        shm.unlink()
+        if e.errno not in (errno.ENOSPC, errno.ENOMEM):
+            raise
+        stat = os.statvfs("/dev/shm")
+        free_bytes = stat.f_bavail * stat.f_frsize
+        total_bytes = stat.f_blocks * stat.f_frsize
+        gib = 1 << 30
+        raise RuntimeError(
+            f"Not enough shared memory for EPLB segment '{name}': it needs "
+            f"{size / gib:.2f} GiB but /dev/shm has {free_bytes / gib:.2f} GiB "
+            f"free of {total_bytes / gib:.2f} GiB. Online EPLB "
+            "(layer_updates_per_iter > 0) keeps a host copy of every MoE "
+            "layer's expert weights in shared memory on each node. Enlarge "
+            "/dev/shm (e.g. mount 'tmpfs:/dev/shm:size=640G' into a "
+            "pyxis/enroot container, or pass '--shm-size' to docker), remove "
+            "stale '/dev/shm/moe_shared_*' segments, or disable online EPLB."
+        ) from e
+    return shm
 
 
 class HostMoeTensorSharer:
@@ -199,9 +250,7 @@ class HostMoeTensorSharer:
 
         shm_name = self.get_shared_memory_name()
         try:
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
+            shm = _create_reserved_shared_memory(shm_name, total_size)
         except FileExistsError:
             tensorrt_llm.logger.warning(
                 f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
@@ -209,9 +258,7 @@ class HostMoeTensorSharer:
             existing_shm = shared_memory.SharedMemory(name=shm_name)
             existing_shm.close()
             existing_shm.unlink()
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
+            shm = _create_reserved_shared_memory(shm_name, total_size)
         self.own_shm = shm
 
         offset = 0

@@ -1,16 +1,19 @@
+import errno
 import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from mpi4py import MPI
 from transformers import PretrainedConfig
 
+import tensorrt_llm._torch.moe.fused_moe.moe_load_balancer as mlb_module
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
-    _tensor_to_weight, get_moe_load_balancer, maybe_create_moe_load_balancer,
-    moe_load_balancer_add_single_layer)
+    _create_reserved_shared_memory, _tensor_to_weight, get_moe_load_balancer,
+    maybe_create_moe_load_balancer, moe_load_balancer_add_single_layer)
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -494,6 +497,95 @@ class TestTensorToWeight(unittest.TestCase):
         self.assertFalse(t.is_contiguous())
         with self.assertRaises(AssertionError):
             _tensor_to_weight(t)
+
+
+class _FakeStatvfs:
+
+    def __init__(self, free_bytes: int, total_bytes: int) -> None:
+        self.f_frsize = 4096
+        self.f_bavail = free_bytes // self.f_frsize
+        self.f_blocks = total_bytes // self.f_frsize
+
+
+def _shm_name(tag: str) -> str:
+    return f"trtllm_test_reserved_shm_{tag}_{os.getpid()}"
+
+
+@pytest.mark.cpu_only
+def test_reserved_shared_memory_backs_every_page() -> None:
+    name = _shm_name("ok")
+    size = 3 * 1024 * 1024
+    shm = _create_reserved_shared_memory(name, size)
+    try:
+        assert shm.size >= size
+        assert os.fstat(shm._fd).st_blocks * 512 >= size
+        shm.buf[size - 1] = 7
+        assert shm.buf[size - 1] == 7
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("err", [errno.ENOSPC, errno.ENOMEM])
+def test_reserved_shared_memory_out_of_space_raises_and_unlinks(
+        err: int) -> None:
+    name = _shm_name(f"full{err}")
+    gib = 1 << 30
+
+    def fake_fallocate(fd: int, offset: int, length: int) -> None:
+        raise OSError(err, os.strerror(err))
+
+    with (
+            patch.object(mlb_module.os, "posix_fallocate", fake_fallocate),
+            patch.object(mlb_module.os, "statvfs",
+                         lambda path: _FakeStatvfs(2 * gib, 480 * gib)),
+            pytest.raises(RuntimeError) as excinfo,
+    ):
+        _create_reserved_shared_memory(name, 9 * gib)
+
+    message = str(excinfo.value)
+    assert name in message
+    assert "needs 9.00 GiB" in message
+    assert "2.00 GiB free of 480.00 GiB" in message
+    assert "tmpfs:/dev/shm:size=" in message
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert not os.path.exists(os.path.join("/dev/shm", name))
+
+
+@pytest.mark.cpu_only
+def test_reserved_shared_memory_other_errors_propagate_and_unlink() -> None:
+    name = _shm_name("eio")
+
+    def fake_fallocate(fd: int, offset: int, length: int) -> None:
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    with (
+            patch.object(mlb_module.os, "posix_fallocate", fake_fallocate),
+            pytest.raises(OSError) as excinfo,
+    ):
+        _create_reserved_shared_memory(name, 1024 * 1024)
+
+    assert excinfo.value.errno == errno.EIO
+    assert not os.path.exists(os.path.join("/dev/shm", name))
+
+
+@pytest.mark.cpu_only
+def test_reserved_shared_memory_keeps_sparse_segment_without_fallocate(
+) -> None:
+    name = _shm_name("nofalloc")
+
+    def fake_fallocate(fd: int, offset: int, length: int) -> None:
+        raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+
+    with patch.object(mlb_module.os, "posix_fallocate", fake_fallocate):
+        shm = _create_reserved_shared_memory(name, 1024 * 1024)
+    try:
+        assert shm.size >= 1024 * 1024
+        assert os.path.exists(os.path.join("/dev/shm", name))
+    finally:
+        shm.close()
+        shm.unlink()
 
 
 if __name__ == '__main__':
