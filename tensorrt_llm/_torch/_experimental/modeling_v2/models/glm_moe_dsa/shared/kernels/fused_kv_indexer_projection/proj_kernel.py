@@ -669,7 +669,6 @@ class FusedKvProjKernel:
         done (last MMA warp), 6 main loop done (MMA warp 0), 4 rows stored,
         5 exit."""
         k = self.k
-        stride = self.stride
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())

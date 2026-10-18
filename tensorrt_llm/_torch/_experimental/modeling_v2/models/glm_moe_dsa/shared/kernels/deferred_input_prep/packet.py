@@ -49,6 +49,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import prefer_pinned
+
 KIND_COPY = 0
 KIND_GATHER = 1
 KIND_BLOCK_OFFSETS = 2
@@ -143,9 +145,14 @@ _NEVER_DONE = _NeverDone()
 class _PinnedSlot:
     """One packet's pinned storage and the event that marks its consumption."""
 
+    # The commit kernel reads this storage in place, so it must be pinned. The stager
+    # declines when prefer_pinned() is False, so a packet is only built when it is True.
+
     def __init__(self, max_desc: int, payload_words: int):
-        self.desc = torch.zeros((max_desc, DESC_WORDS), dtype=torch.int64, pin_memory=True)
-        self.payload = torch.zeros((payload_words,), dtype=torch.int32, pin_memory=True)
+        self.desc = torch.zeros(
+            (max_desc, DESC_WORDS), dtype=torch.int64, pin_memory=prefer_pinned()
+        )
+        self.payload = torch.zeros((payload_words,), dtype=torch.int32, pin_memory=prefer_pinned())
         self.desc_np = self.desc.numpy()
         self.payload_np = self.payload.numpy()
         self.event: Optional[torch.cuda.Event] = None

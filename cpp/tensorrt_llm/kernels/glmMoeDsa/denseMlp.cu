@@ -188,8 +188,8 @@ __device__ __forceinline__ void computeChunk(float (&accA)[4], float (&accB)[4],
 //! CTA-reduced accumulator fragment in warp 0 (other warps return false).
 //! acc[0..1] = tile row "group", activation rows 2 * tig + {0, 1}; acc[2..3] = tile row "group + 8".
 template <typename T>
-__device__ __forceinline__ bool streamTile(float (&acc)[4], Bf16 const* __restrict__ x,
-    Bf16 const* __restrict__ weight, int numRows, int kDim, int row0, int row1)
+__device__ __forceinline__ bool streamTile(float (&acc)[4], Bf16 const* __restrict__ x, Bf16 const* __restrict__ weight,
+    int numRows, int kDim, int row0, int row1)
 {
     constexpr int kWarps = T::kWarps;
     constexpr int kSteps = T::kSteps;
@@ -286,8 +286,8 @@ __device__ __forceinline__ float roundToBf16(float v)
 }
 
 template <typename T>
-__global__ void __launch_bounds__(T::kWarps* kWarpSize, T::kMinBlocks) gateUpSwigluKernel(
-    Bf16 const* __restrict__ x, Bf16 const* __restrict__ weight, Bf16* __restrict__ h, int numRows, int hidden, int inter)
+__global__ void __launch_bounds__(T::kWarps* kWarpSize, T::kMinBlocks) gateUpSwigluKernel(Bf16 const* __restrict__ x,
+    Bf16 const* __restrict__ weight, Bf16* __restrict__ h, int numRows, int hidden, int inter)
 {
     int const lane = threadIdx.x % kWarpSize;
     int const group = lane / kQuadThreads;
@@ -315,8 +315,8 @@ __global__ void __launch_bounds__(T::kWarps* kWarpSize, T::kMinBlocks) gateUpSwi
 }
 
 template <typename T>
-__global__ void __launch_bounds__(T::kWarps* kWarpSize, T::kMinBlocks) downKernel(
-    Bf16 const* __restrict__ h, Bf16 const* __restrict__ weight, Bf16* __restrict__ out, int numRows, int inter, int hidden)
+__global__ void __launch_bounds__(T::kWarps* kWarpSize, T::kMinBlocks) downKernel(Bf16 const* __restrict__ h,
+    Bf16 const* __restrict__ weight, Bf16* __restrict__ out, int numRows, int inter, int hidden)
 {
     int const lane = threadIdx.x % kWarpSize;
     int const group = lane / kQuadThreads;
@@ -381,16 +381,16 @@ bool isContractionSupported(int kDim, int variant)
 
 //! Dispatches a variant index to its kernel instance; kGateUp selects the gate/up or the down kernel.
 template <bool kGateUp>
-cudaError_t launchVariant(int variant, Bf16 const* in, Bf16 const* weight, Bf16* out, int numRows, int kDim,
-    int outDim, bool enablePdl, cudaStream_t stream)
+cudaError_t launchVariant(int variant, Bf16 const* in, Bf16 const* weight, Bf16* out, int numRows, int kDim, int outDim,
+    bool enablePdl, cudaStream_t stream)
 {
     auto launch = [&](auto tiling) -> cudaError_t
     {
         using T = decltype(tiling);
         if constexpr (kGateUp)
         {
-            return launchKernel<T>(gateUpSwigluKernel<T>, outDim / kGateUpCols, in, weight, out, numRows, kDim, outDim,
-                enablePdl, stream);
+            return launchKernel<T>(
+                gateUpSwigluKernel<T>, outDim / kGateUpCols, in, weight, out, numRows, kDim, outDim, enablePdl, stream);
         }
         else
         {

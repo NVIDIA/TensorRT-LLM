@@ -198,7 +198,7 @@ __global__ void __launch_bounds__(kRopeThreads) ropeAppendScatterKernel(RopeAppe
     {
         scale = p.quantScaleQ ? p.quantScaleQ[0] : 1.F;
     }
-    auto loadCoef = [&](int32_t pos, float2 (&c)[4])
+    auto loadCoef = [&](int32_t pos, float2(&c)[4])
     {
         float2 const* src = p.cosSin + static_cast<size_t>(kRopeDim) * pos + (vec * kEltsPerVec) / 2;
 #pragma unroll
@@ -415,9 +415,8 @@ __global__ void __launch_bounds__(kBridgeThreads) topkBridgeKernel(TopkBridgePar
         }
         else
         {
-            int64_t const acc = p.numAcceptedIs64
-                ? static_cast<int64_t const*>(p.numAccepted)[i]
-                : static_cast<int64_t>(static_cast<int32_t const*>(p.numAccepted)[i]);
+            int64_t const acc = p.numAcceptedIs64 ? static_cast<int64_t const*>(p.numAccepted)[i]
+                                                  : static_cast<int64_t>(static_cast<int32_t const*>(p.numAccepted)[i]);
             int64_t off = acc - 1;
             off = off < 0 ? 0 : (off > p.nextN - 1 ? p.nextN - 1 : off);
             srcRow = static_cast<int32_t>(static_cast<int64_t>(i) * p.nextN + off);

@@ -27,7 +27,8 @@
 namespace
 {
 
-__global__ void delayedCopyKernel(uint4 const* __restrict__ src, uint4* __restrict__ dst, int64_t numVec, int64_t delayNs)
+__global__ void delayedCopyKernel(
+    uint4 const* __restrict__ src, uint4* __restrict__ dst, int64_t numVec, int64_t delayNs)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;" ::: "memory");

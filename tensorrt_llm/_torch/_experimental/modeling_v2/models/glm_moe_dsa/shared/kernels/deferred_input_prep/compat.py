@@ -42,7 +42,6 @@ garbage and the oracle fails.
 
 from typing import Optional
 
-
 # Executor-loop domain of this process: declared by the overlap loop at its start.
 _LOOP_STATE = {"declared": False, "reason": "", "logged": False}
 _LOOP_UNDECLARED = (

@@ -55,8 +55,7 @@ void launchGateUp(at::Tensor const& x, at::Tensor const& gateUpWeight, at::Tenso
         static_cast<int>(variant), enablePdl, stream));
 }
 
-void launchDownProj(
-    at::Tensor const& h, at::Tensor const& downWeight, at::Tensor& out, int64_t variant, bool enablePdl)
+void launchDownProj(at::Tensor const& h, at::Tensor const& downWeight, at::Tensor& out, int64_t variant, bool enablePdl)
 {
     auto const stream = at::cuda::getCurrentCUDAStream(h.get_device());
     TLLM_CUDA_CHECK(tk::invokeDown(reinterpret_cast<__nv_bfloat16 const*>(h.data_ptr()),

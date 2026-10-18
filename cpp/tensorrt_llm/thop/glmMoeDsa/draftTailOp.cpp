@@ -116,8 +116,8 @@ void draftTail(at::Tensor const& hidden, at::Tensor const& weight, at::Tensor& t
     if (logitsOut.has_value())
     {
         TORCH_CHECK(logitsOut->device() == hidden.device() && logitsOut->scalar_type() == at::kBFloat16
-                && logitsOut->dim() == 2 && logitsOut->size(0) >= hidden.size(0)
-                && logitsOut->size(1) == weight.size(0) && logitsOut->stride(1) == 1,
+                && logitsOut->dim() == 2 && logitsOut->size(0) >= hidden.size(0) && logitsOut->size(1) == weight.size(0)
+                && logitsOut->stride(1) == 1,
             "glm_moe_dsa_draft_tail: logits_out must be a BF16 [rows, vocab_local] tensor with unit last stride");
         p.logitsOut = reinterpret_cast<__nv_bfloat16*>(logitsOut->data_ptr());
         p.logitsOutStride = logitsOut->stride(0);

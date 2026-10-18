@@ -95,7 +95,7 @@ struct TopkBridgeParams
 {
     int32_t const* topk{nullptr}; //!< Source rows [srcRows, numTopk] with row stride topkStride0, unit column stride.
     int64_t topkStride0{0};
-    int32_t numRows{0}; //!< Rows remapped to global indices.
+    int32_t numRows{0};           //!< Rows remapped to global indices.
     int32_t numTopk{0};
 
     int32_t const* reqIdx{nullptr}; //!< [numRows] request index per row, before subtracting reqIdxBias.

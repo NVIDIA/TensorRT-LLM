@@ -187,8 +187,8 @@ class DraftFrontPackKernel:
         mHs: cute.Tensor,
         mWe: cute.Tensor,
         mWh: cute.Tensor,
-        mYe: cute.Tensor,
-        mYh: cute.Tensor,
+        mOutE: cute.Tensor,
+        mOutH: cute.Tensor,
         M: Int64,
         eps_e: Float32,
         eps_h: Float32,
@@ -196,7 +196,7 @@ class DraftFrontPackKernel:
     ):
         tv_layout = self._tv_layout()
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
-        self.kernel(mE, mHs, mWe, mWh, mYe, mYh, M, eps_e, eps_h, tv_layout, tiler_mn).launch(
+        self.kernel(mE, mHs, mWe, mWh, mOutE, mOutH, M, eps_e, eps_h, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), len(self.segments), 1],
             block=[self.num_threads, 1, 1],
             smem=self.smem_bytes(),
@@ -211,8 +211,8 @@ class DraftFrontPackKernel:
         mHs: cute.Tensor,
         mWe: cute.Tensor,
         mWh: cute.Tensor,
-        mYe: cute.Tensor,
-        mYh: cute.Tensor,
+        mOutE: cute.Tensor,
+        mOutH: cute.Tensor,
         M: Int64,
         eps_e: Float32,
         eps_h: Float32,
@@ -233,7 +233,7 @@ class DraftFrontPackKernel:
         )
 
         # Source 0 is the embedding half of the concatenation, source 1 the hidden half.
-        operands = ((mE, mWe, mYe, eps_e), (mHs, mWh, mYh, eps_h))
+        operands = ((mE, mWe, mOutE, eps_e), (mHs, mWh, mOutH, eps_h))
         seg0 = self.segments[0]
         if cutlass.const_expr(len(self.segments) == 1):
             self._normalize_segment(
