@@ -2481,16 +2481,17 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             },
         }
         # MegaMoE CuTe DSL builds its EP ProcessGroup by reusing MASTER_ADDR
-        # / MASTER_PORT when both are set (mega_moe_cute_dsl.py
-        # _pick_rendezvous), and only falls back to picking a free port when
-        # they are not. Under a launcher that exports them -- Slurm in CI --
-        # the context and generation workers are two independent 4-rank jobs
-        # on one node that both inherit the *same* endpoint, so neither group
-        # ever forms: CI showed 68 failed bootstraps against a single
-        # host:port and the generation worker never registered. Hand each
-        # worker its own port so the two rendezvous cannot collide. The
-        # DeepGEMM sibling avoids this by requiring RANK/WORLD_SIZE to be set
-        # too before trusting the launcher's endpoint.
+        # / MASTER_PORT when both are set (ensure_cutedsl_torch_distributed in
+        # tensorrt_llm/_torch/distributed/initialization.py), and only falls
+        # back to picking a free port when they are not. Under a launcher that
+        # exports them -- Slurm in CI -- the context and generation workers are
+        # two independent 4-rank jobs on one node that both inherit the *same*
+        # endpoint, so neither group ever forms: CI showed 68 failed bootstraps
+        # against a single host:port and the generation worker never
+        # registered. Hand each worker its own port so the two rendezvous
+        # cannot collide. The DeepGEMM sibling avoids this by requiring
+        # RANK/WORLD_SIZE to be set too before trusting the launcher's
+        # endpoint.
         ctx_master_port, gen_master_port = pick_distinct_free_ports(2)
 
         # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
