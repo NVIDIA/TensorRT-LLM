@@ -101,6 +101,14 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py::test_fast_path_expand_video_one_bracket_per_temporal_patch
   - unittest/_torch/models/test_minimax_m3_vl.py::test_video_request_lets_the_processor_resize_frames
   - unittest/_torch/models/test_minimax_m3_vl.py::test_float_tensor_media_reach_the_processor_as_uint8_hwc
+  # MiniMax-M3 VL forward under speculative decoding, KV reuse and chunked prefill.
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_speculative_multimodal_prefill_forwards_orig_input_ids
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_full_image_prefix_reuse_hit_skips_fusion
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_partial_image_prefix_reuse_slices_the_uncached_rows
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_chunk_boundary_inside_image_span_keeps_only_the_chunk_rows
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_batched_requests_advance_the_row_cursor_per_request
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_two_images_in_one_request_fuse_in_prompt_order
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_text_only_batch_passes_through
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
