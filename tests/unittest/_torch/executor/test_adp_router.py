@@ -1467,6 +1467,48 @@ class TestConversationAwareADPRouter:
         for turn in turns:
             assert self._route(router, states, [turn])[turn.id] == 2
 
+    def test_uncached_prefill_estimate_published_while_demotion_is_on(self, monkeypatch):
+        """Opener: the whole prompt; a later turn: its growth since the previous turn."""
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._router(tp_size=2)
+        opener = _make_conv_request_item(0, "A", num_tokens=5000)
+        self._route(router, self._states(2), [opener])
+        assert opener.request.py_uncached_prefill_tokens == 5000
+        turn2 = _make_conv_request_item(1, "A", num_tokens=5300)
+        self._route(router, self._states(2), [turn2])
+        assert turn2.request.py_uncached_prefill_tokens == 300
+        no_conv = _make_conv_request_item(2, None, num_tokens=700)
+        self._route(router, self._states(2), [no_conv])
+        assert no_conv.request.py_uncached_prefill_tokens == 700
+        monkeypatch.delenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS")
+        off = _make_conv_request_item(3, "B", num_tokens=5000)
+        self._route(self._router(tp_size=2), self._states(2), [off])
+        assert not isinstance(off.request.py_uncached_prefill_tokens, int)
+
+    def test_uncached_prefill_estimate_is_per_conversation_under_subagent_affinity(
+        self, monkeypatch
+    ):
+        """Sub-agents share their parent's rank but not its prompt history."""
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._router(tp_size=2)
+        parent = _make_conv_request_item(0, "parent", num_tokens=9000)
+        child = _make_conv_request_item(1, "child", num_tokens=4000, subagent_affinity_id="parent")
+        pos = self._route(router, self._states(2), [parent])
+        assert self._route(router, self._states(2), [child])[1] == pos[0]
+        assert child.request.py_uncached_prefill_tokens == 4000
+        child_turn2 = _make_conv_request_item(
+            2, "child", num_tokens=4500, subagent_affinity_id="parent"
+        )
+        self._route(router, self._states(2), [child_turn2])
+        assert child_turn2.request.py_uncached_prefill_tokens == 500
+
+    def test_uncached_prefill_history_is_lru_bounded(self, monkeypatch):
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._router(tp_size=2, max_sessions=2)
+        for i, conv in enumerate(["A", "B", "C"]):
+            self._route(router, self._states(2), [_make_conv_request_item(i, conv)])
+        assert list(router._conv_last_prompt) == ["B", "C"]
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]

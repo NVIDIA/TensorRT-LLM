@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -774,6 +775,18 @@ class ConversationAwareADPRouter(ADPRouter):
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # Uncached-prefill estimate for the V2 scheduler's long-prefill
+        # demotion: within a conversation the prompt only grows and the
+        # previous turn's prompt is what the cache holds, so uncached ~=
+        # prompt_len - previous prompt_len; an unseen conversation is an
+        # opener (uncached == prompt_len). Keyed by conversation_id, not by the
+        # routing key: sub-agents that share a parent's affinity id have their
+        # own prompts. One int per conversation, LRU-bounded by max_sessions.
+        # Published only while demotion is enabled.
+        self._publish_uncached_estimate_enabled = (
+            int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")) > 0
+        )
+        self._conv_last_prompt: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
@@ -820,6 +833,23 @@ class ConversationAwareADPRouter(ADPRouter):
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
 
+    def _publish_uncached_estimate(self, req_item) -> None:
+        """Estimate the request's uncached prefill from the conversation's
+        previous prompt length and publish it on the request (see __init__)."""
+        req = req_item.request
+        if not self._publish_uncached_estimate_enabled or req is None:
+            return
+        conversation_params = getattr(req, "py_conversation_params", None)
+        conv_id = getattr(conversation_params, "conversation_id", None)
+        prompt = _num_input_tokens(req)
+        prev = self._conv_last_prompt.get(conv_id) if conv_id is not None else None
+        req.py_uncached_prefill_tokens = prompt if prev is None else max(prompt - prev, 0)
+        if conv_id is not None:
+            self._conv_last_prompt[conv_id] = prompt
+            self._conv_last_prompt.move_to_end(conv_id)
+            while len(self._conv_last_prompt) > self._max_sessions:
+                self._conv_last_prompt.popitem(last=False)
+
     def _assign_new_conversation_explicit_dp_ranks(
         self,
         requests: List["RequestQueueItem"],
@@ -849,6 +879,7 @@ class ConversationAwareADPRouter(ADPRouter):
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
+                self._publish_uncached_estimate(req_item)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
@@ -968,6 +999,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
 
+            self._publish_uncached_estimate(req_item)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             if self._new_conv_placement == "least_tokens":
