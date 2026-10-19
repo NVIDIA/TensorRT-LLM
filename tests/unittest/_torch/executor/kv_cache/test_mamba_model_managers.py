@@ -410,7 +410,8 @@ def test_common_manager_consumes_model_state_contract(state, monkeypatch):
     assert payload.conv is manager.all_conv_states[0]
     assert payload.temporal is manager.all_ssm_states[0]
     if isinstance(state, KDAReplayState):
-        assert payload.kda_qkg_cache is not None
+        assert payload.kda_k_cache is not None
+        assert payload.kda_g_cache is not None
     elif isinstance(state, (ReplayHistory, GDNReplayState)):
         assert payload.old_x is not None
     else:
@@ -702,12 +703,15 @@ def test_kda_acceptance_reset_relocation_and_transfer():
     state.seed_transferred_slots(torch.tensor([2]))
     for layer, conv in enumerate(manager.all_conv_states):
         for section, replay in enumerate((state.kda_conv_q, state.kda_conv_k, state.kda_conv_v)):
+            assert replay.dtype is torch.bfloat16
             torch.testing.assert_close(
-                replay[layer, 2, :, :3], conv[2, section * 8 : (section + 1) * 8]
+                replay[layer, 2, :, :3],
+                conv[2, section * 8 : (section + 1) * 8].to(torch.bfloat16),
             )
             assert torch.count_nonzero(replay[layer, 2, :, 3:]) == 0
     assert state.prev_num_accepted_tokens[2] == 0
-    assert torch.count_nonzero(state.kda_qkg_cache[:, 2]) == 0
+    assert torch.count_nonzero(state.kda_k_cache[:, 2]) == 0
+    assert torch.count_nonzero(state.kda_g_cache[:, 2]) == 0
 
 
 def test_kda_scratch_cost_matches_allocated_slot_buffers():
@@ -986,7 +990,8 @@ def test_layer_payload_preserves_storage_and_strides(kind, layer):
             "kda_conv_q",
             "kda_conv_k",
             "kda_conv_v",
-            "kda_qkg_cache",
+            "kda_k_cache",
+            "kda_g_cache",
             "kda_v_cache",
             "kda_beta_cache",
         ):

@@ -411,6 +411,43 @@ def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
     assert "kda_replay_num_spec" not in kwargs
 
 
+@pytest.mark.parametrize("max_draft_len, replay_enabled", [(7, True), (8, False)])
+def test_kimi_kda_replay_respects_fused_verify_draft_limit(
+    monkeypatch: pytest.MonkeyPatch, max_draft_len: int, replay_enabled: bool
+) -> None:
+    """Draft lengths beyond the fused KDA verify kernel's limit keep the
+    legacy intermediate buffers (sequential FLA verify) instead of
+    allocating replay caches the kernel would reject."""
+    kda_kernels = "tensorrt_llm._torch.modules.kimi_kda._kda_kernels"
+    monkeypatch.setattr(f"{kda_kernels}.is_kda_mtp_verify_available", lambda: True)
+    monkeypatch.setattr(f"{kda_kernels}.kda_mtp_max_num_spec", lambda: 7)
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
+
+    assert "kda_replay_num_spec" not in kwargs
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.spec_config = spec_config
+    mgr._mamba_ssm_stochastic_rounding = False
+    mgr._requested_num_spec = None
+    mgr._state_layout = SimpleNamespace(spec_config=spec_config, mamba_pp_layers=())
+    state = mgr._initialize_spec_state()
+    assert isinstance(state, KDAReplayState) is replay_enabled
+    if replay_enabled:
+        assert state.num_speculative_tokens == max_draft_len
+
+
+def test_kda_mtp_max_num_spec_fits_the_kernel_chunk() -> None:
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import T_PAD
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import kda_mtp_max_num_spec
+
+    max_num_spec = kda_mtp_max_num_spec()
+    # A verify chunk holds up to max_num_spec replayed drafts plus 1 + max_num_spec new tokens.
+    assert max_num_spec == 7
+    assert 2 * max_num_spec + 1 <= T_PAD
+
+
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3752,11 +3789,12 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches(max_tokens, byte_lim
         assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
-        assert layer_cache.kda_conv_q.dtype is torch.float32
+        assert layer_cache.kda_conv_q.dtype is torch.bfloat16
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_k_cache.shape == (cache_size, 2, 48)
+        assert layer_cache.kda_g_cache.shape == (cache_size, 2, 48)
         assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
-        # Six fp32 heads are 24 bytes, so the row is padded to 32 (stride 8)
+        # Six bf16 heads are 12 bytes, so the row is padded to 16 (stride 8)
         # to keep every nested per-draft view 16-byte aligned for CuTe.
         assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
         assert layer_cache.kda_beta_cache.stride(-2) == 8
@@ -3768,7 +3806,10 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches(max_tokens, byte_lim
                         % _KDA_BETA_CACHE_ALIGNMENT_BYTES
                         == 0
                     )
-        assert layer_cache.kda_qkg_cache.dtype is torch.float32
+        assert layer_cache.kda_k_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_g_cache.dtype is torch.float32
+        assert layer_cache.kda_v_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_beta_cache.dtype is torch.bfloat16
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             policy.prev_num_accepted_tokens.data_ptr()
         )
@@ -3960,7 +4001,8 @@ _KDA_REPLAY_BUFFERS = (
     "kda_conv_q",
     "kda_conv_k",
     "kda_conv_v",
-    "kda_qkg_cache",
+    "kda_k_cache",
+    "kda_g_cache",
     "kda_v_cache",
     "kda_beta_cache",
 )
@@ -4070,7 +4112,7 @@ def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(resume_slot,
         cache = getattr(mgr._kda_replay, name)[0, resume_slot]
         assert torch.equal(cache[:, :3], window[2 * section : 2 * section + 2])
         assert not cache[:, 3:].any()
-    for name in ("kda_qkg_cache", "kda_v_cache", "kda_beta_cache"):
+    for name in ("kda_k_cache", "kda_g_cache", "kda_v_cache", "kda_beta_cache"):
         assert not getattr(mgr._kda_replay, name)[0, resume_slot].any()
     if resume_slot != 0:
         assert _kda_replay_slot(mgr, 0) == (3, [7.0] * len(_KDA_REPLAY_BUFFERS))
@@ -4247,7 +4289,8 @@ def _kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec):
                 A_log=weights["A_log"],
                 dt_bias=weights["dt_bias"],
                 recurrent_state=mgr.all_ssm_states[layer_offset],
-                qkg_cache=mgr._kda_replay.kda_qkg_cache[layer_offset],
+                k_cache=mgr._kda_replay.kda_k_cache[layer_offset],
+                g_cache=mgr._kda_replay.kda_g_cache[layer_offset],
                 v_cache=mgr._kda_replay.kda_v_cache[layer_offset],
                 beta_cache=mgr._kda_replay.kda_beta_cache[layer_offset],
                 ssm_state_indices=slots,
@@ -4330,7 +4373,9 @@ def _run_kda_verify_rounds(accepted_per_round, suspend_after=None, slot_taken=Fa
 @pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
 def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
     """A request is suspended with two accepted drafts pending and resumes; every later verify gives the outputs and
-    leaves the states of the same request never suspended, bit for bit, so its tokens cannot change.
+    leaves the states of the same request never suspended. The verifies up to the suspend match bit for bit. The
+    suspend commits the pending drafts as a chunk of their own, and the tensor-core verify computes each chunk in one
+    WY-form pass, so the later ones match to the kernel's accuracy rather than bit for bit.
 
     slot_taken: while the request is suspended, new caches fill the SSM pool, so the V2 runtime moves its SSM page to
     the host tier and gives its slot to one of them, which overwrites the slot's states; the request resumes in
@@ -4340,14 +4385,20 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
     if not is_kda_mtp_verify_available():
         pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
     accepted_per_round = [2, 1, 2, 0, 2, 1]
+    suspend_after = 2
     expected_outputs, expected_states = _run_kda_verify_rounds(accepted_per_round)
     outputs, states = _run_kda_verify_rounds(
-        accepted_per_round, suspend_after=2, slot_taken=slot_taken
+        accepted_per_round, suspend_after=suspend_after, slot_taken=slot_taken
     )
 
     for round_idx, (actual, expected) in enumerate(zip(outputs, expected_outputs)):
-        assert torch.equal(actual, expected), f"verify round {round_idx}"
-    assert torch.equal(states, expected_states)
+        if round_idx <= suspend_after:
+            assert torch.equal(actual, expected), f"verify round {round_idx}"
+        else:
+            torch.testing.assert_close(
+                actual, expected, atol=2e-2, rtol=2e-2, msg=f"verify round {round_idx}"
+            )
+    torch.testing.assert_close(states, expected_states, atol=1e-3, rtol=1e-3)
 
 
 @skip_no_cuda
@@ -4450,9 +4501,10 @@ def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():
     policy.kda_conv_q = dim_contiguous_conv_cache()
     policy.kda_conv_k = dim_contiguous_conv_cache()
     policy.kda_conv_v = dim_contiguous_conv_cache()
-    policy.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
-    policy.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
-    policy.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+    policy.kda_k_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
+    policy.kda_v_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0, dtype=torch.bfloat16)
     manager = SimpleNamespace(
         conv_state_shape=[6, 4],
         _request_id_to_state_index={101: 1, 202: 3},
@@ -4478,7 +4530,8 @@ def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():
                     conv_state[slot, start : start + 2, :],
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(policy.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_g_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(policy.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(policy.kda_beta_cache[layer_offset, slot]) == 0
             assert policy.prev_num_accepted_tokens[slot] == 0
@@ -4492,8 +4545,9 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     ``extract_mamba_kv_cache_params`` forces the KDA delta-rule (ssm) pool to
     fp32 but leaves the short-convolution pool at the model dtype, so what the
     context rank serializes and the generation rank restores for the conv slot
-    is bf16 while the SA replay caches the generation rank rebuilds from it are
-    fp32. Seeding must widen the restored rows losslessly, keep the logical
+    is bf16, the same dtype as the replay conv caches the generation rank
+    rebuilds from it (k / v / beta replay caches are bf16 too, the gate cache
+    fp32). Seeding must copy the restored rows bit for bit, keep the logical
     shape, leave the restored bf16 pool itself untouched so the decode path
     reuses exactly what was transferred, and clear only the draft scratch of
     the seeded slots.
@@ -4511,15 +4565,18 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     policy._conv_states = tuple(mgr.all_conv_states)
     restored = [conv.clone() for conv in mgr.all_conv_states]
 
+    # Same dtypes as _allocate_pool_replay_buffers: bf16 conv / k / v / beta
+    # replay caches, fp32 gate cache.
     def dim_contiguous_conv_cache() -> torch.Tensor:
-        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+        return torch.full((2, 4, 6, 2), 7.0, dtype=torch.bfloat16).transpose(-1, -2)
 
     policy.kda_conv_q = dim_contiguous_conv_cache()
     policy.kda_conv_k = dim_contiguous_conv_cache()
     policy.kda_conv_v = dim_contiguous_conv_cache()
-    policy.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
-    policy.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
-    policy.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+    policy.kda_k_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
+    policy.kda_v_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0, dtype=torch.bfloat16)
 
     mgr.on_state_transfer_complete([101, 202])
 
@@ -4531,27 +4588,29 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
                 (policy.kda_conv_k, 2),
                 (policy.kda_conv_v, 4),
             ):
-                # fp32 replay cache, logical shape unchanged by the widening.
-                assert replay_buffer.dtype is torch.float32
+                # bf16 replay cache, logical shape unchanged by the seeding.
+                assert replay_buffer.dtype is torch.bfloat16
                 seeded = replay_buffer[layer_offset, slot, :, :4]
                 assert seeded.shape == (2, 4)
-                # bf16 -> fp32 is lossless, so the restored values must survive
-                # the widening bit for bit.
+                # Same dtype on both sides: the restored values are copied bit
+                # for bit.
                 torch.testing.assert_close(
                     seeded,
-                    conv_state[slot, start : start + 2, :].float(),
+                    conv_state[slot, start : start + 2, :],
                     rtol=0,
                     atol=0,
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(policy.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_g_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(policy.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(policy.kda_beta_cache[layer_offset, slot]) == 0
             assert policy.prev_num_accepted_tokens[slot] == 0
         # Slots no request restored keep their pre-seed contents.
         for slot in (0, 2):
             assert (policy.kda_conv_q[layer_offset, slot] == 7.0).all()
-            assert (policy.kda_qkg_cache[layer_offset, slot] == 7.0).all()
+            assert (policy.kda_k_cache[layer_offset, slot] == 7.0).all()
+            assert (policy.kda_g_cache[layer_offset, slot] == 7.0).all()
         # The restored bf16 pool is read-only here: plain decode (speculation
         # off) reuses exactly the state the transfer wrote.
         torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
@@ -5242,3 +5301,53 @@ def test_v2_stack_state_views_rejects_non_affine_layout():
     assert stack([pool[0], pool[1], pool[3]]) is None
     assert stack([pool[0], torch.zeros(5, 8)]) is None
     assert stack([]) is None
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_no_cuda)])
+def test_v2_kda_admission_slot_updates_without_sync(device):
+    """Disagg GEN admission resets, relocates and seeds KDA replay slots; on CUDA none of it may
+    synchronize the stream (the previous step is still queued)."""
+    num_slots, num_layers, num_spec, dim, window = 8, 2, 2, 2, 3
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    policy = KDAReplayState(num_spec)
+    mgr._kda_replay = policy
+    mgr._speculative_state = policy
+    mgr.local_num_mamba_layers = num_layers
+    policy.prev_num_accepted_tokens = torch.arange(
+        1, num_slots + 1, dtype=torch.int32, device=device
+    )
+    # Stale device indices: the reset must take its slots from _host_state_indices.
+    mgr.cuda_state_indices = torch.full((num_slots,), 7, dtype=torch.int32, device=device)
+    mgr._host_state_indices = torch.tensor([5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    mgr._request_id_to_state_index = {10: 4, 11: 2}
+    mgr.conv_state_shape = [3 * dim, window]
+    mgr.conv_section_dims = [dim] * 3
+    mgr.all_conv_states = [
+        torch.randn(num_slots, 3 * dim, window, device=device) for _ in range(num_layers)
+    ]
+    policy.kda_conv_q, policy.kda_conv_k, policy.kda_conv_v = (
+        torch.randn(num_layers, num_slots, dim, window + num_spec, device=device) for _ in range(3)
+    )
+    policy.kda_k_cache, policy.kda_g_cache, policy.kda_v_cache, policy.kda_beta_cache = (
+        torch.randn(num_layers, num_slots, num_spec, dim, device=device) for _ in range(4)
+    )
+
+    policy._conv_states = tuple(mgr.all_conv_states)
+    policy._conv_section_dims = tuple(mgr.conv_section_dims)
+    policy._committed_window = window
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        previous_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        mgr._reset_context_mamba_slots(2)
+        policy.reset_slots(torch.tensor([3]), [3])
+        policy.relocate_slots([1], [6])
+        mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
+    finally:
+        if device == "cuda":
+            torch.cuda.set_sync_debug_mode(previous_mode)
+
+    # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2; 7 untouched.
+    assert policy.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 8]

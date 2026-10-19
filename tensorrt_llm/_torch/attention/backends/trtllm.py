@@ -270,6 +270,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _mla_ctx_cu_seqlens_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+    # CuTe DSL MLA decode plans its per-request split-KV counts once per step
+    # (cute_dsl_mla.py); the plan buffer and the key that marks it current.
+    _cute_dsl_mla_split_plan: Optional[torch.Tensor] = field(init=False,
+                                                             default=None,
+                                                             repr=False)
+    _cute_dsl_mla_split_plan_key: Optional[tuple] = field(init=False,
+                                                          default=None,
+                                                          repr=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
@@ -692,6 +700,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+        self._cute_dsl_mla_split_plan_key = None
 
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
@@ -2465,6 +2474,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                              forward_args)
 
             if fmha is None:
+                if (getattr(forward_args, "qk_fp8_per_tensor", False)
+                        or getattr(forward_args, "v_fp8_per_tensor", False)):
+                    raise RuntimeError(
+                        "The per-tensor FP8 attention recipe needs the PrimTS "
+                        "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
+                        "enabled or does not support this request.")
                 raise RuntimeError(
                     "No TRT-LLM attention FMHA library supports this request.")
             if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:

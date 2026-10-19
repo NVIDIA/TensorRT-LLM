@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
+
 if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
@@ -81,13 +83,14 @@ class KDAReplayLayerCache(MambaLayerCache):
     kda_conv_q: torch.Tensor | None = None
     kda_conv_k: torch.Tensor | None = None
     kda_conv_v: torch.Tensor | None = None
-    kda_qkg_cache: torch.Tensor | None = None
+    kda_k_cache: torch.Tensor | None = None
+    kda_g_cache: torch.Tensor | None = None
     kda_v_cache: torch.Tensor | None = None
     kda_beta_cache: torch.Tensor | None = None
 
     @property
     def has_kda_replay_caches(self) -> bool:
-        return self.kda_qkg_cache is not None
+        return self.kda_k_cache is not None
 
     def commit_conv_window(self, slot_indices: torch.Tensor, conv_pool: torch.Tensor) -> None:
         """Seed the replay convolution windows from the live pool."""
@@ -105,8 +108,18 @@ class KDAReplayLayerCache(MambaLayerCache):
 _KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
 
 
+def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
+    """Copy host slot IDs without synchronizing queued GPU work.
+
+    Each copy uses fresh pinned storage so later host writes cannot race it.
+    """
+    return torch.tensor(
+        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
+    ).to(device, non_blocking=True)
+
+
 def _kda_beta_cache_padded_heads(num_heads: int) -> int:
-    heads_per_alignment = _KDA_BETA_CACHE_ALIGNMENT_BYTES // torch.float32.itemsize
+    heads_per_alignment = _KDA_BETA_CACHE_ALIGNMENT_BYTES // torch.bfloat16.itemsize
     return (num_heads + heads_per_alignment - 1) // heads_per_alignment * heads_per_alignment
 
 
@@ -115,7 +128,7 @@ def _allocate_kda_beta_cache(shape: tuple[int, ...], device: torch.device | None
     return torch.zeros(
         *shape[:-1],
         _kda_beta_cache_padded_heads(shape[-1]),
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=device,
     )[..., : shape[-1]]
 
@@ -142,7 +155,7 @@ def allocate_kda_replay_fields(
             cache_size,
             extended_window,
             section_dim,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             device=device,
         ).transpose(-1, -2)
 
@@ -151,11 +164,18 @@ def allocate_kda_replay_fields(
         "kda_conv_q": allocate_conv_cache(),
         "kda_conv_k": allocate_conv_cache(),
         "kda_conv_v": allocate_conv_cache(),
-        "kda_qkg_cache": torch.zeros(
+        "kda_k_cache": torch.zeros(
             num_local_layers,
             cache_size,
             num_speculative_tokens,
-            3,
+            section_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "kda_g_cache": torch.zeros(
+            num_local_layers,
+            cache_size,
+            num_speculative_tokens,
             section_dim,
             dtype=torch.float32,
             device=device,
@@ -165,7 +185,7 @@ def allocate_kda_replay_fields(
             cache_size,
             num_speculative_tokens,
             section_dim,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             device=device,
         ),
         "kda_beta_cache": _allocate_kda_beta_cache(
@@ -176,7 +196,8 @@ def allocate_kda_replay_fields(
         fields["kda_conv_q"],
         fields["kda_conv_k"],
         fields["kda_conv_v"],
-        fields["kda_qkg_cache"],
+        fields["kda_k_cache"],
+        fields["kda_g_cache"],
         fields["kda_v_cache"],
         fields["kda_beta_cache"],
     ]
@@ -307,7 +328,8 @@ class KDAReplayState:
         self.kda_conv_q: torch.Tensor | None = None
         self.kda_conv_k: torch.Tensor | None = None
         self.kda_conv_v: torch.Tensor | None = None
-        self.kda_qkg_cache: torch.Tensor | None = None
+        self.kda_k_cache: torch.Tensor | None = None
+        self.kda_g_cache: torch.Tensor | None = None
         self.kda_v_cache: torch.Tensor | None = None
         self.kda_beta_cache: torch.Tensor | None = None
         self.intermediate_indices: torch.Tensor | None = None
@@ -337,13 +359,13 @@ class KDAReplayState:
 
     def _layer_bytes_per_slot(self, section_dim: int, committed_window: int, num_heads: int) -> int:
         extended_window = committed_window + self.num_speculative_tokens
-        float_elements = (
+        bf16_elements = (
             3 * section_dim * extended_window
-            + self.num_speculative_tokens * 3 * section_dim
-            + self.num_speculative_tokens * section_dim
+            + self.num_speculative_tokens * 2 * section_dim
             + self.num_speculative_tokens * _kda_beta_cache_padded_heads(num_heads)
         )
-        return float_elements * 4
+        gate_elements = self.num_speculative_tokens * section_dim
+        return bf16_elements * torch.bfloat16.itemsize + gate_elements * torch.float32.itemsize
 
     def bytes_per_slot(self, context: MambaStateLayout, layer_id: int) -> int:
         if not context.mamba_pp_layers:
@@ -449,9 +471,8 @@ class KDAReplayState:
             "kda_conv_q": None if self.kda_conv_q is None else self.kda_conv_q[layer_offset],
             "kda_conv_k": None if self.kda_conv_k is None else self.kda_conv_k[layer_offset],
             "kda_conv_v": None if self.kda_conv_v is None else self.kda_conv_v[layer_offset],
-            "kda_qkg_cache": (
-                None if self.kda_qkg_cache is None else self.kda_qkg_cache[layer_offset]
-            ),
+            "kda_k_cache": None if self.kda_k_cache is None else self.kda_k_cache[layer_offset],
+            "kda_g_cache": None if self.kda_g_cache is None else self.kda_g_cache[layer_offset],
             "kda_v_cache": None if self.kda_v_cache is None else self.kda_v_cache[layer_offset],
             "kda_beta_cache": (
                 None if self.kda_beta_cache is None else self.kda_beta_cache[layer_offset]
@@ -473,7 +494,8 @@ class KDAReplayState:
     def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
         if self.prev_num_accepted_tokens is None or slots.numel() == 0:
             return
-        self.prev_num_accepted_tokens[slots] = 0
+        slots = _host_slots_to_device(host_slots, self.prev_num_accepted_tokens.device)
+        self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
         if self.rand_seed is not None:
             self._seed_request_counter += 1
             seeds = [
@@ -497,16 +519,8 @@ class KDAReplayState:
         if not moves:
             return
         device = self.prev_num_accepted_tokens.device
-        source_slots = torch.tensor(
-            [old for old, _ in moves],
-            dtype=torch.long,
-            device=device,
-        )
-        destination_slots = torch.tensor(
-            [new for _, new in moves],
-            dtype=torch.long,
-            device=device,
-        )
+        source_slots = _host_slots_to_device([old for old, _ in moves], device)
+        destination_slots = _host_slots_to_device([new for _, new in moves], device)
         for replay_buffer in self._layer_replay_buffers():
             replay_buffer.index_copy_(
                 1,
@@ -560,11 +574,16 @@ class KDAReplayState:
                     state_indices,
                     section.to(replay_layer.dtype),
                 )
-        for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache, self.kda_beta_cache):
+        for replay_buffer in (
+            self.kda_k_cache,
+            self.kda_g_cache,
+            self.kda_v_cache,
+            self.kda_beta_cache,
+        ):
             if replay_buffer is None:
                 raise RuntimeError("KDA replay history buffers are not bound")
             replay_buffer.index_fill_(1, state_indices, 0)
-        self.prev_num_accepted_tokens[state_indices] = 0
+        self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
 
     def record_acceptance(
         self,
@@ -609,7 +628,8 @@ class KDAReplayState:
                 self.kda_conv_q[layer],
                 self.kda_conv_k[layer],
                 self.kda_conv_v[layer],
-                self.kda_qkg_cache[layer],
+                self.kda_k_cache[layer],
+                self.kda_g_cache[layer],
                 self.kda_v_cache[layer],
                 self.kda_beta_cache[layer],
                 slots,
@@ -623,7 +643,8 @@ class KDAReplayState:
             self.kda_conv_q,
             self.kda_conv_k,
             self.kda_conv_v,
-            self.kda_qkg_cache,
+            self.kda_k_cache,
+            self.kda_g_cache,
             self.kda_v_cache,
             self.kda_beta_cache,
         )
@@ -641,7 +662,8 @@ class KDAReplayState:
         self.kda_conv_q = None
         self.kda_conv_k = None
         self.kda_conv_v = None
-        self.kda_qkg_cache = None
+        self.kda_k_cache = None
+        self.kda_g_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
         self.intermediate_indices = None
@@ -678,11 +700,9 @@ def get_kda_replay_num_spec(
     """Return the fused-verify replay width when its complete gate passes."""
     if spec_config is None or not manager_supports_replay:
         return None
-    from ._kda_kernels import is_kda_mtp_verify_available
+    from ._kda_kernels import kda_mtp_replay_num_spec
 
-    if not is_kda_mtp_verify_available():
-        return None
-    return spec_config.tokens_per_gen_step - 1
+    return kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
 
 
 class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
@@ -773,9 +793,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if slots:
             with replay.on_cache_stream(self._stream):
                 replay.seed_transferred_slots(
-                    torch.tensor(
-                        slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device
-                    )
+                    _host_slots_to_device(slots, replay.prev_num_accepted_tokens.device)
                 )
 
     @override
@@ -831,9 +849,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._kda_replay.relocate_slots(old_slots, new_slots)
         fresh_slots = [new for old, new in zip(old_slots, new_slots) if old < 0]
         if fresh_slots:
-            slots = torch.tensor(
-                fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
-            )
+            slots = _host_slots_to_device(fresh_slots, self.cuda_state_indices.device)
             self._kda_replay.reset_slots(slots, fresh_slots)
 
     @override
@@ -908,7 +924,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         )
         if slots:
             replay.seed_transferred_slots(
-                torch.tensor(slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device)
+                _host_slots_to_device(slots, replay.prev_num_accepted_tokens.device)
             )
 
     def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:
@@ -920,7 +936,8 @@ def resolve_kimi_ssm_cache_dtype(config) -> torch.dtype:
     """Default KDA state to FP32; BF16 requires an explicit cache configuration.
 
     BF16 prefill, decode and sequential verify stage state through FP32 and
-    round the committed state back to BF16. Fused MTP verify requires FP32.
+    round the committed state back to BF16. Fused MTP verify reads and writes
+    BF16 state directly, rounding the committed state to nearest.
     Checkpoint-declared state dtypes do not override this default.
     """
     from tensorrt_llm._torch.pyexecutor.config_utils import resolve_ssm_cache_dtype
