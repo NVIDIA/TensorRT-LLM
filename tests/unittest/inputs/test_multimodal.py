@@ -13,7 +13,6 @@ import torch
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    DisaggPrefillMultimodalInputs,
     MultimodalEncoderItemMetadata,
     MultimodalInput,
     MultimodalItemMetadata,
@@ -932,30 +931,81 @@ def test_find_mm_token_lengths_rejects_undecoded_video_string():
         )
 
 
-def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
-    """Typed EPD handoff converts back to legacy MultimodalInput fields."""
-    handoff = DisaggPrefillMultimodalInputs(
-        prompt_token_ids=[10, 1001, 1002, 2000, 1003, 20],
+def test_attached_embeddings_share_item_metadata_and_prompt_layout():
+    """Sparse E/P inputs use the same params as local encoder results."""
+    handles = [{"tensor_size": (3, 16)}]
+    metadata = MultimodalItemMetadata([("video", 0)], output_embedding_lengths=[3])
+    params = MultimodalParams.from_embeddings(
+        handles,
+        metadata,
         multimodal_lengths=[4],
         multimodal_positions=[1],
-        multimodal_embedding_lengths=[3],
-        multimodal_item_run_cu_offsets=[0, 1],
-        multimodal_run_positions=[1],
-        multimodal_run_lengths=[4],
+        multimodal_hashes=[[1, 2, 3, 4]],
+        multimodal_item_run_cu_offsets=[0, 2],
+        multimodal_run_positions=[1, 4],
+        multimodal_run_lengths=[2, 2],
         special_token_offsets=[2],
-        item_types=[0],
     )
 
-    multimodal_input = handoff.to_multimodal_input([[1, 2, 3, 4]])
+    assert params.item_metadata is metadata
+    assert params.get_item_layout() == ([("video", 0)], [3])
+    assert params.multimodal_data["multimodal_embedding"] is handles
+    assert (
+        params.multimodal_data["multimodal_embedding_lengths"] is metadata.output_embedding_lengths
+    )
+    assert params.multimodal_data["special_token_offsets"] == [2]
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.multimodal_input.multimodal_lengths == [4]
+    assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
+    assert params.multimodal_input.multimodal_run_positions == [1, 4]
+    assert params.multimodal_input.multimodal_run_lengths == [2, 2]
+    assert params.encoder_state is None
+    assert params.encoder_event is None
 
-    assert multimodal_input.multimodal_positions == [1]
-    assert multimodal_input.multimodal_lengths == [4]
-    assert multimodal_input.multimodal_item_run_cu_offsets == [0, 1]
-    assert multimodal_input.multimodal_run_positions == [1]
-    assert multimodal_input.multimodal_run_lengths == [4]
-    assert handoff.multimodal_embedding_lengths == [3]
-    assert handoff.special_token_offsets == [2]
-    assert handoff.item_types == [0]
+
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_attached_embeddings_accept_tensors_without_cache_hashes(modality):
+    embedding = torch.ones(3, 16)
+    params = MultimodalParams.from_embeddings(
+        [embedding],
+        MultimodalItemMetadata([(modality, 0)], output_embedding_lengths=[3]),
+        multimodal_positions=[1],
+        multimodal_lengths=[3],
+    )
+
+    assert params.multimodal_input is None
+    assert params.item_metadata.item_refs == [(modality, 0)]
+    assert params.multimodal_data["multimodal_embedding"][0] is embedding
+    assert params.item_metadata.encoder_token_lengths is None
+
+
+@pytest.mark.parametrize("with_hashes", [False, True])
+@pytest.mark.parametrize(
+    "updates,match",
+    [
+        ({"multimodal_positions": [-1]}, "non-negative"),
+        ({"multimodal_positions": []}, "length|align"),
+        ({"multimodal_lengths": [0]}, "positive"),
+        ({"multimodal_run_lengths": [2]}, "sum"),
+        ({"special_token_offsets": [-1]}, "non-negative"),
+        ({"embeddings": []}, "align"),
+    ],
+)
+def test_attached_embeddings_validate_prompt_and_item_alignment(with_hashes, updates, match):
+    kwargs = dict(
+        embeddings=[{"tensor_size": (3, 16)}],
+        item_metadata=MultimodalItemMetadata([("audio", 0)], output_embedding_lengths=[3]),
+        multimodal_positions=[1],
+        multimodal_lengths=[3],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[1],
+        multimodal_run_lengths=[3],
+    )
+    if with_hashes:
+        kwargs["multimodal_hashes"] = [[1] * 8]
+    kwargs.update(updates)
+    with pytest.raises(ValueError, match=match):
+        MultimodalParams.from_embeddings(**kwargs)
 
 
 def test_multimodal_input_rejects_invalid_prompt_spans():
