@@ -1589,20 +1589,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(nb::init<size_t>(), nb::arg("quota"))
         .def_rw("quota", &kv::GpuCacheTierConfig::quota)
         .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
-        .def("assert_valid", &kv::GpuCacheTierConfig::assertValid) DEF_COPY(kv::GpuCacheTierConfig);
+        .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(nb::init<size_t, std::optional<size_t>, bool>(), nb::arg("quota"), nb::arg("max_quota") = nb::none(),
+            nb::arg("allow_remote_numa_fallback") = true)
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
+        .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
+        .def_rw("allow_remote_numa_fallback", &kv::HostCacheTierConfig::allowRemoteNumaFallback)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
-        .def("assert_valid", &kv::HostCacheTierConfig::assertValid) DEF_COPY(kv::HostCacheTierConfig);
+        .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
         .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
-        .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
+        .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
         .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
@@ -1707,6 +1710,30 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("max_rewind_len") = 0)
         .def_rw("max_rewind_len", &kv::SwaScratchReuseConfig::maxRewindLen) DEF_COPY(kv::SwaScratchReuseConfig);
 
+    nb::class_<kv::PoolRebalanceConfig>(m, "PoolRebalanceConfig")
+        .def(
+            "__init__",
+            [](kv::PoolRebalanceConfig* cfg, int minSampledKvCaches, double cooldownSecs, int targetRatioUpdateInterval,
+                float ratioTolerance, double movingAverageDecay)
+            {
+                new (cfg) kv::PoolRebalanceConfig();
+                cfg->minSampledKvCaches = minSampledKvCaches;
+                cfg->cooldownSecs = cooldownSecs;
+                cfg->targetRatioUpdateInterval = targetRatioUpdateInterval;
+                cfg->ratioTolerance = ratioTolerance;
+                cfg->movingAverageDecay = movingAverageDecay;
+                cfg->validate();
+            },
+            nb::arg("min_sampled_kv_caches") = 2000, nb::arg("cooldown_secs") = 120.0,
+            nb::arg("target_ratio_update_interval") = 100, nb::arg("ratio_tolerance") = 0.25f,
+            nb::arg("moving_average_decay") = 0.9999)
+        .def_rw("min_sampled_kv_caches", &kv::PoolRebalanceConfig::minSampledKvCaches)
+        .def_rw("cooldown_secs", &kv::PoolRebalanceConfig::cooldownSecs)
+        .def_rw("target_ratio_update_interval", &kv::PoolRebalanceConfig::targetRatioUpdateInterval)
+        .def_rw("ratio_tolerance", &kv::PoolRebalanceConfig::ratioTolerance)
+        .def_rw("moving_average_decay", &kv::PoolRebalanceConfig::movingAverageDecay)
+        .def("validate", &kv::PoolRebalanceConfig::validate) DEF_COPY(kv::PoolRebalanceConfig);
+
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")
         .def(
             "__init__",
@@ -1715,7 +1742,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly, bool enablePartialCommit)
+                bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1739,6 +1766,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
                 cfg->enablePartialCommit = enablePartialCommit;
+                cfg->poolRebalance = std::move(poolRebalance);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1748,7 +1776,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
+            nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{})
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1764,6 +1793,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
+        .def_rw("pool_rebalance", &kv::KVCacheManagerConfig::poolRebalance)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -2325,6 +2355,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::arg("end"), nb::arg("groups") = nb::none());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
+    nb::class_<kv::HostMemPlacement>(mIntrospection, "HostMemPlacement")
+        .def_ro("gpu_numa_node", &kv::HostMemPlacement::gpuNumaNode)
+        .def_ro("strict_binding", &kv::HostMemPlacement::strictBinding)
+        .def_ro("node_page_counts", &kv::HostMemPlacement::nodePageCounts);
+    mIntrospection.def("probe_host_mem_placement", &kv::KvCacheIntrospection::probeHostMemPlacement, nb::arg("size"),
+        nb::arg("allow_remote_numa_fallback"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "is_commit_allowed",
         [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },

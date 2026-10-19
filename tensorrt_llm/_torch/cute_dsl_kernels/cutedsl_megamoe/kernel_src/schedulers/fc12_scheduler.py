@@ -670,8 +670,6 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                     )
                 )
                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
-                if stream_ends_before_target:
-                    fc1_exhausted = Boolean(True)
         return fc1_exhausted
 
     @cute.jit

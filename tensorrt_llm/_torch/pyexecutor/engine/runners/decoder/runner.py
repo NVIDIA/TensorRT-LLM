@@ -27,10 +27,12 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import moe_comm_serving_timeouts
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -108,7 +110,6 @@ from ..common import (
     get_position_id_offset,
     get_top_level_model,
     make_scheduled_inputs,
-    moe_a2a_steady_state_budget_for_capture,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
     ship_multimodal_indices,
@@ -130,6 +131,25 @@ def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> 
     if request.is_last_context_chunk:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
+
+
+def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> None:
+    """Zero ``buffer`` over half-open row spans, merging adjacent spans.
+
+    Used for the input-id rows of CUDA-graph and attention-DP padding requests,
+    which neither the host nor the device input-id copies write.
+    """
+    if not spans:
+        return
+    rows = sorted(spans)
+    merged_begin, merged_end = rows[0]
+    for row_begin, row_end in rows[1:]:
+        if row_begin <= merged_end:
+            merged_end = max(merged_end, row_end)
+            continue
+        buffer[merged_begin:merged_end].fill_(0)
+        merged_begin, merged_end = row_begin, row_end
+    buffer[merged_begin:merged_end].fill_(0)
 
 
 def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
@@ -180,7 +200,6 @@ def _make_single_token_context_graph_batch(
             or request.context_current_position + 1 != request.py_prompt_len
             or request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.is_context_only_request
             or request.is_generation_only_request
             or request.py_disaggregated_params is not None
@@ -199,7 +218,6 @@ def _make_single_token_context_graph_batch(
         if (
             request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.py_disaggregated_params is not None
         ):
             return scheduled_requests, frozenset()
@@ -377,6 +395,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
+        self._initialize_moe_workspace_reclaimer()
 
     @property
     def max_beam_width(self) -> int:
@@ -493,7 +512,10 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
+        self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
+        # Token shape of the last autotuner warmup that ran a forward pass.
+        self._completed_autotuner_warmup_num_tokens: int | None = None
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
@@ -814,9 +836,19 @@ class DecoderRunner(ScheduledModelRunner):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # Helix CP is decode-only and runs into issues with the
-        # autotuner warmup's context requests.
-        if self._context_warmups_supported and not self.mapping.has_cp_helix():
+        # Helix CP is decode-only, so it tunes on generation requests.
+        if self._context_warmups_supported and self.mapping.has_cp_helix():
+            with (
+                self._warmup_timer.phase(
+                    "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
+            ):
+                self._run_autotuner_warmup(resource_manager, generation_only=True)
+            log_mem_snapshot("warmup/after_autotuner")
+            gc.collect()
+            torch.cuda.empty_cache()
+        elif self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
                     "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
@@ -844,25 +876,8 @@ class DecoderRunner(ScheduledModelRunner):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Warm up every graph shape before capturing any graph. Attention
-        # kernels can switch implementations at smaller batch sizes and require
-        # a larger workspace, so the first pass grows the workspace to its
-        # maximum size. The second pass runs the final per-shape warmup and
-        # captures without resizing the workspace.
-        # Capture with the steady-state MoE all-to-all budget: the timeout is a
-        # launch argument and is baked into every later replay.
-        with (
-            self._warmup_timer.phase("cuda_graph_capture"),
-            moe_a2a_steady_state_budget_for_capture(),
-        ):
-            with self.cuda_graph_runner.allow_capture():
-                self.cuda_graph_runner.is_warmup_only = True
-                try:
-                    self._run_cuda_graph_warmup(resource_manager)
-                finally:
-                    self.cuda_graph_runner.is_warmup_only = False
-                self.cuda_graph_runner.padding_dummy_requests = {}
-                self._run_cuda_graph_warmup(resource_manager)
+        with self._warmup_timer.phase("cuda_graph_capture"):
+            self._warmup_and_capture_cuda_graphs(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -916,6 +931,19 @@ class DecoderRunner(ScheduledModelRunner):
         maybe_bolt_clear_counters()
 
         self._freeze_eager_workspace_floor()
+
+    def _initialize_moe_workspace_reclaimer(self) -> None:
+        """Create the native workspace owner for this runner's lifetime."""
+        self._moe_workspace_reclaimer = None
+        if (
+            os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
+            and not self._config.is_spec_decode
+            and self.mapping.cp_size == 1
+            and self._eager_workspace_reclaim_supported
+            and self._torch_compile_backend is None
+            and self.breakable_cuda_graph_runner is None
+        ):
+            self._moe_workspace_reclaimer = CutlassWorkspaceReclaimer()
 
     def _freeze_eager_workspace_floor(self) -> None:
         if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
@@ -1053,7 +1081,8 @@ class DecoderRunner(ScheduledModelRunner):
         completion-flag deadline. It is a partial mitigation only: other
         first-touch compiles remain inside collective-bearing forwards, and some
         sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
+        The warmup MoE communication timeout (see ``moe_comm_timeout_guard.py``)
+        covers the general case.
 
         Only the fallback tactics are compiled -- what an eager, cache-miss
         forward selects. The runner's kernel cache key excludes m/n/k, so one
@@ -1492,8 +1521,14 @@ class DecoderRunner(ScheduledModelRunner):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
-        """Runs forward passes to populate the autotuner cache."""
+    def _run_autotuner_warmup(
+        self, resource_manager: ResourceManager, generation_only: bool = False
+    ) -> None:
+        """Runs forward passes to populate the autotuner cache.
+
+        ``generation_only`` tunes on one batch of ``max_batch_size`` generation
+        requests instead of a context batch, for Helix CP generation workers.
+        """
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
             MXFP8GemmRunner,
@@ -1586,26 +1621,59 @@ class DecoderRunner(ScheduledModelRunner):
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
+        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        if generation_only:
+            tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
+            num_gen_requests = min(
+                self._config.max_batch_size,
+                self._config.max_num_tokens // tokens_per_gen_request,
+            )
+            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        else:
+            token_num_upper_bound = min(
+                self._config.max_num_tokens,
+                self._config.max_batch_size * (self._config.max_seq_len - 1),
+            )
+            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num_upper_bound,
+                max_num_draft_tokens=self._config.original_max_draft_len,
+            )
+
+        # The warmup runs again after the KV cache is rebuilt; when the token
+        # shape is unchanged and no MXFP8 tuning is pending, the profiling
+        # cache already holds every tactic this pass would tune. The token
+        # shape comes from this rank's free KV capacity, so the whole forward
+        # group must agree before any rank skips the collective-bearing pass.
+        skip_completed_warmup = self._agree_warmup_flag(
+            self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
+            and not enable_flashinfer_mxfp8_autotuner
+            and not enable_native_mxfp8_autotuner
+        )
+        if skip_completed_warmup:
+            logger.info(
+                "Skipping duplicate autotuner warmup for already completed "
+                f"num_tokens={curr_max_num_tokens}"
+            )
+            # Release what earlier warmup phases cached, as the full pass does
+            # below, so it does not inflate the memory baseline.
+            clear_memory_buffers()
+            torch.cuda.empty_cache()
+            return
+
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})..."
         )
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        token_num_upper_bound = min(
-            self._config.max_num_tokens,
-            self._config.max_batch_size * (self._config.max_seq_len - 1),
-        )
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self._config.original_max_draft_len,
-        )
 
-        warmup_configs = [(curr_max_num_tokens, 0)]
-        if self.guided_decoder is None and not self.mapping.has_pp():
-            # Add generation request to warmup the autotuner cache.
-            warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
+        if generation_only:
+            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
+        else:
+            warmup_configs = [(curr_max_num_tokens, 0)]
+            if self.guided_decoder is None and not self.mapping.has_pp():
+                # Add generation request to warmup the autotuner cache.
+                warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
@@ -1707,6 +1775,8 @@ class DecoderRunner(ScheduledModelRunner):
         # profiler, reducing memory available for activations during inference.
         clear_memory_buffers()
         torch.cuda.empty_cache()
+        if ran_native_forward:
+            self._completed_autotuner_warmup_num_tokens = curr_max_num_tokens
 
     def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager) -> None:
         """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
@@ -1981,6 +2051,27 @@ class DecoderRunner(ScheduledModelRunner):
         if should_capture_no_spec:
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes for draft_len in draft_lengths]
+
+    def _warmup_and_capture_cuda_graphs(self, resource_manager: ResourceManager) -> None:
+        """Warm up every CUDA-graph shape, then capture the graphs.
+
+        Attention kernels can switch implementations at smaller batch sizes and
+        require a larger workspace, so the first pass grows the workspace to its
+        maximum size without capturing. The second pass runs the final
+        per-shape warmup and captures without resizing the workspace.
+        """
+        with self.cuda_graph_runner.allow_capture():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
+                self._run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
+            self.cuda_graph_runner.padding_dummy_requests = {}
+            # Captured graphs keep the MoE communication timeouts that were
+            # current at capture, and serving replays them, so capture with the
+            # serving timeouts. The warmup-only pass above keeps the warmup ones.
+            with moe_comm_serving_timeouts():
+                self._run_cuda_graph_warmup(resource_manager)
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
@@ -3539,7 +3630,6 @@ class DecoderRunner(ScheduledModelRunner):
         extend_requests = []
         extend_dummy_requests = []
         generation_requests = []
-        first_draft_requests = []
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
@@ -3569,8 +3659,6 @@ class DecoderRunner(ScheduledModelRunner):
                     extend_dummy_requests.append(request)
                 else:
                     extend_requests.append(request)
-            elif request.py_is_first_draft:
-                first_draft_requests.append(request)
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
@@ -3619,6 +3707,10 @@ class DecoderRunner(ScheduledModelRunner):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        # Half-open token-row spans of padding requests (CUDA-graph and
+        # attention-DP dummies) whose input ids are not appended to the host
+        # ``input_ids`` list; zero-filled after the input-id copies below.
+        unwritten_input_id_rows = []
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
@@ -3674,6 +3766,12 @@ class DecoderRunner(ScheduledModelRunner):
                 position_ids.extend(
                     list(range(past_seen_token_num, past_seen_token_num + 1 + num_draft_tokens))
                 )
+                if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
+                    # One position per token row, in batch order, so the rows
+                    # this request owns are the position_ids it just added.
+                    unwritten_input_id_rows.append(
+                        (len(position_ids) - (1 + num_draft_tokens), len(position_ids))
+                    )
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens
                 )
@@ -3747,35 +3845,6 @@ class DecoderRunner(ScheduledModelRunner):
                     prompt_lengths.append(request.py_prompt_len)
 
             extra_inputs.add_generation_request(request)
-
-        for request in first_draft_requests:
-            request_ids.append(request.py_request_id)
-            draft_lens.append(0)
-            # Only the length and the last (original_max_draft_len+1) tokens are
-            # needed here; get_num_tokens is O(1) and get_tokens_range copies only
-            # the requested window, whereas get_tokens(0) marshals the whole
-            # O(seq_len) VecTokens into a Python list.
-            _num_tokens = request.get_num_tokens(0)
-            begin_compute = _num_tokens - self._config.original_max_draft_len - 1
-            end_compute = begin_compute + self._config.original_max_draft_len + 1
-            prompt_tokens = request.get_tokens_range(0, begin_compute, end_compute)
-            position_ids.extend(range(begin_compute, begin_compute + len(prompt_tokens)))
-            input_ids.extend(prompt_tokens)
-            gather_ids.append(
-                len(input_ids)
-                - 1
-                - (self._config.original_max_draft_len - request.py_num_accepted_draft_tokens)
-            )
-            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
-
-            sequence_lengths.append(1 + self._config.original_max_draft_len)
-            prompt_lengths.append(request.py_prompt_len)
-            past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
-            extra_inputs.add_generation_request(request)
-
-            # update batch index
-            request.py_batch_idx = request.py_seq_slot
 
         # Cache invariant method result to avoid repeated calls per-request
         _n_gen = len(generation_requests)
@@ -3977,6 +4046,11 @@ class DecoderRunner(ScheduledModelRunner):
 
                 request.py_batch_idx = request.py_seq_slot
                 extra_inputs.add_generation_request(request, repeat=beam_width)
+                if request.is_cuda_graph_dummy:
+                    # beam_width token rows were added without input ids.
+                    unwritten_input_id_rows.append(
+                        (len(position_ids) - beam_width, len(position_ids))
+                    )
                 # Do not add a gen_request_seq_slot for CUDA graph dummy requests
                 # to prevent access errors due to None values
                 if not request.is_cuda_graph_dummy:
@@ -4118,6 +4192,12 @@ class DecoderRunner(ScheduledModelRunner):
             # when writing key/values to the KV cache.
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
+
+        # The host copy covers input_ids_cuda[:num_tokens] and the device copies
+        # cover the previous-batch rows; padding-request rows are covered by
+        # neither, so without this the embedding would gather stale contents
+        # of the uninitialized buffer, which may exceed the vocabulary size.
+        _zero_fill_row_spans(self.input_ids_cuda, unwritten_input_id_rows)
 
         position_ids = apply_position_id_offset(position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
@@ -4434,12 +4514,7 @@ class DecoderRunner(ScheduledModelRunner):
                 total_num_tokens=total_num_tokens,
             )
 
-        num_generation_tokens = (
-            len(generation_requests)
-            + len(extend_requests)
-            + sum(draft_lens)
-            + len(first_draft_requests)
-        )
+        num_generation_tokens = len(generation_requests) + len(extend_requests) + sum(draft_lens)
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         self.iter_states["num_generation_tokens"] = num_generation_tokens
@@ -4451,7 +4526,6 @@ class DecoderRunner(ScheduledModelRunner):
                 (
                     (scheduled_requests.context_requests, 1),
                     (extend_requests, 1),
-                    (first_draft_requests, 1),
                     (generation_requests, beam_width if generation_requests else 1),
                 ),
             )
@@ -4485,7 +4559,6 @@ class DecoderRunner(ScheduledModelRunner):
                 and not _has_cp_helix
                 and num_ctx_requests == 0
                 and not extend_requests
-                and not first_draft_requests
                 and _n_gen > 0
                 and previous_batch_len == _n_gen
                 and num_tokens == 0
@@ -4946,7 +5019,11 @@ class DecoderRunner(ScheduledModelRunner):
             and isinstance(metadata, TrtllmAttentionMetadata)
             else contextlib.nullcontext()
         )
-        with reclaim_scope:
+        moe_reclaimer = self._moe_workspace_reclaimer
+        moe_scope = contextlib.nullcontext()
+        if moe_reclaimer is not None:
+            moe_scope = moe_reclaimer.forward(warmup=is_dummy, num_tokens=metadata.num_tokens)
+        with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
     @nvtx_range("_forward_step")
