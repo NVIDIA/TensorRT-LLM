@@ -203,7 +203,8 @@ def worker_turn_prompt(task: WorkerTask) -> str:
         lines += [
             "",
             "Earlier attempts at this task failed; read their results first and "
-            "do not repeat what they ruled out:",
+            "do not repeat what they ruled out. Your worktree carries on from the last "
+            "attempt's branch: check what it left before you build on it.",
         ]
         lines += [f"- `{path}`" for path in task.previous_attempts]
     lines += [

@@ -140,6 +140,11 @@ class Layout:
         return self.inbox_dir / "consumed"
 
     @property
+    def abandoned_path(self) -> Path:
+        """What every abandoned task left behind, for a human to clean up."""
+        return self.workspace / "abandoned.md"
+
+    @property
     def worktrees_dir(self) -> Path:
         return self.workspace / "worktrees"
 
@@ -151,7 +156,7 @@ class Layout:
         return self.results_dir / f"task_result_{node_id_to_slug(task_id)}.md"
 
     def attempt_path(self, task_id: str, attempt: int) -> Path:
-        """Where a superseded result is kept once its task is reset."""
+        """Where a superseded result is kept once its task is retried."""
         return self.results_dir / f"task_result_{node_id_to_slug(task_id)}.attempt{attempt}.md"
 
     def previous_attempts(self, task_id: str) -> list[Path]:

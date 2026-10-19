@@ -397,8 +397,8 @@ that is still in flight then goes on **beside** the main line instead.
   none), and merge them like any other work:
   - final task not started: join them through a `merge` task and an
     `e2e_accuracy` gate, and make the final task depend on the gate;
-  - final task running: also list it under `cancel`; its changes to the
-    checkout are undone and it starts again once the new gate is `DONE`;
+  - final task running: it cannot be cancelled. Let it finish, then do as
+    for a `DONE` final task;
   - final task `DONE`: add a `merge` task that depends on the final task and
     on the work to merge (it starts from the landed code), an
     `e2e_accuracy` gate on it, and a new `merge` task with
@@ -429,8 +429,8 @@ What you may change depends on each task's state:
 | state | what you may do |
 |---|---|
 | `DONE` | nothing but its `priority` and `side`: its graph entry and its section are fixed and it stays in the plan. Follow-up work on finished code is a new task that depends on it. |
-| `RUNNING` | nothing, unless you list it under `cancel`: it is stopped, its branch is dropped, and it starts over from its (possibly rewritten) definition, or goes away if you remove it. Cancel only work that has become wrong or useless. |
-| `FAILED` | rewrite it (it re-runs from scratch on a fresh branch), list it under `retry` to re-run it unchanged, or remove it. Until you do one of these, it stays `FAILED` and every task depending on it waits. Its result, and every earlier attempt, stays available to the next attempt. |
+| `RUNNING` | nothing, unless you list it under `cancel` and remove it from the plan in the same turn. That **abandons** it: its worker is stopped and everything it left (worktree, branch, notes, GPU jobs, which run to their end) is kept as it is but never used. Its id is retired; redo the work, if needed, as a task with a new id. Cancel only work that has become wrong or useless. The final task (`isolation: shared`) cannot be cancelled. |
+| `FAILED` | rewrite it (it re-runs, carrying on from its own branch; to start from scratch, remove it and add a task with a new id), list it under `retry` to re-run it unchanged, or remove it (which abandons it, as `cancel` does). Until you do one of these, it stays `FAILED` and every task depending on it waits. Its result, and every earlier attempt, stays available to the next attempt. |
 | `PENDING` | anything: rewrite, rewire, remove. |
 | new | add as many as the free slots and the goal call for. |
 
@@ -449,7 +449,7 @@ decision: CONTINUE   # CONTINUE | FINISH | ABORT
 summary: |
   what you changed and why
 retry: []            # FAILED tasks to run again unchanged
-cancel: []           # RUNNING tasks to stop
+cancel: []           # RUNNING tasks to abandon (remove them from the plan too)
 planning: false      # true: the plan is not complete; wake me again at once
 gpu_nodes: null      # grow the GPU pool to this many nodes
 ```

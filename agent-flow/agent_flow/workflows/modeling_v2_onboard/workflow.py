@@ -13,7 +13,7 @@
            and may, while the others keep running:
              - add tasks, or rewrite, rewire or remove tasks not yet started;
              - retry, rewrite or remove FAILED tasks;
-             - cancel RUNNING tasks;
+             - cancel RUNNING tasks, which abandons them;
              - mark ``perf`` tasks ``side`` (not merged) or merge them again;
              - FINISH: let the final task start once its dependencies are DONE;
              - ABORT the run.
@@ -21,6 +21,13 @@
            ``side_wait_minutes`` to finish, side tasks not started never start,
            and the planner may still chain a new landing task after the final one
     done   nothing is left to run, or the planner aborted
+
+Cancelling a task abandons it: its worker's session is stopped and nothing
+else is touched. Its worktree, branch, notes and GPU jobs stay as they are
+(the jobs run to their end), it leaves the plan, and its id is never used
+again; :data:`abandoned.md <Layout.abandoned_path>` lists what it left for a
+human to clean up. A retried or rewritten ``FAILED`` task carries on from its
+own branch; redoing work from scratch is a task with a new id.
 
 A run that lands keeps every side task's branch as
 ``<landed branch>-unmerged/<id>`` and commits ``UNMERGED_OPTIMIZATIONS.md``
@@ -64,7 +71,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from agent_flow.console import print_message, print_rule
-from agent_flow.git_worktree import GitWorktreeIsolation
+from agent_flow.git_worktree import GitWorktreeIsolation, node_id_to_slug
 from agent_flow.jobs.kinds import KINDS
 from agent_flow.jobs.registry import JobRegistry
 from agent_flow.logger import get_logger
@@ -136,12 +143,9 @@ class _State:
     tasks: dict[str, NodeState] = field(default_factory=dict)
     # Tasks that finished since the planner's last turn: (id, status, summary).
     finished: list[tuple[str, str, str]] = field(default_factory=list)
-    # The checkout's HEAD when each landing task started, to restore it when
-    # the task is reset.
-    landing_base: dict[str, str] = field(default_factory=dict)
-    # Tasks the planner reset whose workers, jobs, notes and branches are not
-    # yet all dropped; a resumed run drops them first.
-    resetting: list[str] = field(default_factory=list)
+    # Tasks cancelled, or removed after they had started: their ids are
+    # never used again.
+    abandoned: list[str] = field(default_factory=list)
 
     def save(self, path: Path) -> None:
         data = {"version": _STATE_VERSION, **asdict(self)}
@@ -167,8 +171,7 @@ class _State:
             gpu_nodes=data.get("gpu_nodes"),
             tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
             finished=[tuple(item) for item in data.get("finished", [])],
-            landing_base=data.get("landing_base", {}),
-            resetting=data.get("resetting", []),
+            abandoned=data.get("abandoned", []),
         )
 
 
@@ -179,9 +182,12 @@ class _Change:
     decision: PlannerDecision
     plan: PlanSpec
     old_plan: PlanSpec
-    # Tasks whose worker, branch and jobs are dropped: cancelled, retried,
-    # rewritten after FAILED, or removed.
-    reset: set[str]
+    # FAILED tasks run again, retried or rewritten: their last result
+    # becomes an earlier attempt.
+    rerun: set[str]
+    # Tasks that leave the plan after they had started: cancelled, or
+    # removed while FAILED.
+    abandoned: set[str]
     removed: set[str]
 
 
@@ -328,6 +334,7 @@ class ModelingV2OnboardWorkflow:
             layout.priorities_path,
             layout.test_commands_path,
             layout.primers_path,
+            layout.abandoned_path,
         ):
             path.unlink(missing_ok=True)
         for directory in (
@@ -396,7 +403,7 @@ class ModelingV2OnboardWorkflow:
 
     def _startable(self, node: Node) -> bool:
         tasks = self._state.tasks
-        if node.id in self._running or node.id in self._resetting:
+        if node.id in self._running:
             return False
         if tasks[node.id] == NodeState.RUNNING:
             # Started before the orchestrator restarted: resume it.
@@ -473,15 +480,12 @@ class ModelingV2OnboardWorkflow:
 
         Returns ``None`` for a side task stopped at the deadline. What a
         stopped worker left in its worktree is still committed to its branch,
-        so a resumed task starts from it.
+        so a resumed task starts from it. An abandoned task's worktree is left
+        exactly as its worker left it.
         """
         plan = self._plan
         landing = plan.is_landing(node.id)
         dep_nodes = [plan.graph.by_id[dep] for dep in node.depends_on]
-        if landing and node.id not in self._state.landing_base:
-            head = _git(self.repo_path, "rev-parse", "HEAD")
-            self._state.landing_base[node.id] = head.stdout.strip()
-            self._save()
         path = await self._git(self.isolation.acquire, node)
         try:
             if dep_nodes:
@@ -492,6 +496,8 @@ class ModelingV2OnboardWorkflow:
                     node, path, plan.tags[node.id], landing, node.id in plan.side, primer
                 )
             except asyncio.CancelledError:
+                if node.id in self._abandoned:
+                    raise
                 if node.id not in self._overdue:
                     if node.isolation != "shared":
                         await self._git(self.isolation.commit, node, path)
@@ -499,7 +505,8 @@ class ModelingV2OnboardWorkflow:
                 result = None
             await self._git(self.isolation.commit, node, path)
         finally:
-            await self._git(self.isolation.release, node)
+            if node.id not in self._abandoned:
+                await self._git(self.isolation.release, node)
         return result
 
     async def _primer_for(self, node: Node) -> Primer | None:
@@ -631,16 +638,6 @@ class ModelingV2OnboardWorkflow:
         await self._git(self.isolation.release, node)
         await self._git(self.isolation.reclaim, node)
 
-    def _restore_checkout(self, task_id: str) -> None:
-        """Undo what a reset landing task did to the checkout, commits included."""
-        base = self._state.landing_base.pop(task_id, None)
-        self._save()
-        if base is None:
-            return
-        repo = self.repo_path
-        for args in (("merge", "--abort"), ("reset", "--hard", base), ("clean", "-fd")):
-            _git(repo, *args)
-
     # ---------------------------------------------------------------- planner
 
     async def _converse(self, prompt: str, check: Callable[[], T]) -> T:
@@ -718,6 +715,11 @@ class ModelingV2OnboardWorkflow:
             if tasks.get(tid) != NodeState.RUNNING:
                 state = tasks[tid].value if tid in tasks else "not in the plan"
                 problems.append(f"`cancel`: task {tid!r} is not running ({state})")
+            elif self._plan.graph.by_id[tid].isolation == "shared":
+                problems.append(
+                    f"`cancel`: task {tid!r} works in the checkout itself and cannot be "
+                    "abandoned; let it finish, then add the follow-up work after it"
+                )
         for tid in decision.retry:
             if tasks.get(tid) != NodeState.FAILED:
                 state = tasks[tid].value if tid in tasks else "not in the plan"
@@ -746,6 +748,17 @@ class ModelingV2OnboardWorkflow:
                 "`planning: true` but this turn changes nothing: add the tasks you have "
                 "settled, or write `planning: false` if the plan is complete"
             )
+        for tid in decision.cancel:
+            if tid in plan.graph.by_id:
+                problems.append(
+                    f"`cancel`: task {tid!r} is still in the plan. A cancelled task is "
+                    "abandoned: remove it, and redo its work, if needed, as a task with a new id"
+                )
+        for tid in sorted(set(plan.graph.by_id) & set(self._state.abandoned)):
+            problems.append(
+                f"task {tid!r} was abandoned and its id cannot be used again; give the task "
+                "a new id"
+            )
         if problems:
             raise PlanError(problems)
 
@@ -758,8 +771,17 @@ class ModelingV2OnboardWorkflow:
             and tasks.get(tid) == NodeState.FAILED
             and old.entry(tid) != plan.entry(tid)
         }
-        reset = set(decision.cancel) | set(decision.retry) | rewritten_failed | removed
-        return _Change(decision=decision, plan=plan, old_plan=old, reset=reset, removed=removed)
+        abandoned = set(decision.cancel) | {
+            tid for tid in removed if tasks.get(tid) == NodeState.FAILED
+        }
+        return _Change(
+            decision=decision,
+            plan=plan,
+            old_plan=old,
+            rerun=set(decision.retry) | rewritten_failed,
+            abandoned=abandoned,
+            removed=removed,
+        )
 
     @property
     def _max_gpu_nodes(self) -> int:
@@ -788,19 +810,24 @@ class ModelingV2OnboardWorkflow:
         """Apply a validated turn to the run state; return the cancelled workers."""
         cancelled = []
         for tid in change.decision.cancel:
+            self._abandoned.add(tid)
             task = self._running.pop(tid)
             task.cancel()
             cancelled.append(task)
-        self._resetting |= change.reset
-        self._state.resetting = sorted(self._resetting)
         self._adopt(change.plan)
         tasks = self._state.tasks
-        for tid in sorted(change.reset):
-            if tid in change.removed:
-                tasks.pop(tid, None)
-                print_message(f"  task {tid}: removed", self._log)
+        for tid in sorted(change.removed):
+            tasks.pop(tid, None)
+            if tid in change.abandoned:
+                print_message(f"  task {tid}: abandoned", self._log)
             else:
-                self._set(tid, NodeState.PENDING)
+                print_message(f"  task {tid}: removed", self._log)
+        for tid in sorted(change.rerun):
+            self._set(tid, NodeState.PENDING)
+        if change.abandoned:
+            self._abandoned |= change.abandoned
+            self._state.abandoned += sorted(change.abandoned)
+            self._write_abandoned()
         for node in change.plan.graph.nodes:
             if node.id not in tasks:
                 self._set(node.id, NodeState.PENDING)
@@ -816,41 +843,40 @@ class ModelingV2OnboardWorkflow:
         self._save()
         return cancelled
 
-    async def _reset(self, change: _Change, cancelled: list[asyncio.Task[None]]) -> None:
-        """Drop the reset tasks' workers, jobs, notes and branches.
+    async def _settle(self, change: _Change, cancelled: list[asyncio.Task[None]]) -> None:
+        """Wait for the abandoned workers to stop; keep rerun tasks' last results.
 
-        Each reset task's last result is kept as an earlier attempt for the
-        next worker and the planner to read.
+        Nothing an abandoned task left is touched. A rerun task's last result
+        becomes an earlier attempt for its next worker and the planner to read.
         """
         await asyncio.gather(*cancelled, return_exceptions=True)
-        for tid in sorted(change.reset):
-            node = change.plan.graph.by_id.get(tid) or change.old_plan.graph.by_id[tid]
-            await self._drop(node)
+        for tid in sorted(change.rerun):
+            result = self.layout.result_path(tid)
+            if result.is_file():
+                attempt = len(self.layout.previous_attempts(tid)) + 1
+                result.replace(self.layout.attempt_path(tid, attempt))
 
-    async def _drop(self, node: Node) -> None:
-        """Drop one reset task's jobs, notes, branch and checkout changes."""
-        tid = node.id
-        self._cancel_jobs(tid)
-        result = self.layout.result_path(tid)
-        if result.is_file():
-            attempt = len(self.layout.previous_attempts(tid)) + 1
-            result.replace(self.layout.attempt_path(tid, attempt))
-        shutil.rmtree(self.layout.node_dir(tid), ignore_errors=True)
-        await self._discard(node)
-        self._restore_checkout(tid)
-        self._resetting.discard(tid)
-        self._state.resetting = sorted(self._resetting)
-        self._save()
-
-    async def _finish_resets(self) -> None:
-        """Finish the resets a stopped run left half done."""
-        for tid in list(self._state.resetting):
-            node = self._plan.graph.by_id.get(tid)
-            if node is None:
-                # Removed from the plan: what is left of it is a worktree task's.
-                node = Node(id=tid, type="removed")
-            self._resetting.add(tid)
-            await self._drop(node)
+    def _write_abandoned(self) -> None:
+        """List what every abandoned task left behind."""
+        lines = [
+            "# Abandoned tasks",
+            "",
+            "Each was cancelled, or removed after it had started. Nothing it left was "
+            "touched: its worktree, branch, notes and GPU jobs (which ran to their end) "
+            "are listed here for a human to clean up.",
+            "",
+        ]
+        for tid in self._state.abandoned:
+            worktree = self.layout.worktrees_dir / node_id_to_slug(tid)
+            lines += [
+                f"## `{tid}`",
+                "",
+                f"- branch: `{self.isolation.branch_prefix}{tid}` in `{self.repo_path}`",
+                f"- worktree: `{worktree}`" + ("" if worktree.exists() else " (none)"),
+                f"- notes and jobs: `{self.layout.node_dir(tid)}`",
+                "",
+            ]
+        self.layout.abandoned_path.write_text("\n".join(lines), encoding="utf-8")
 
     def _describe(self, node: Node) -> str:
         tasks = self._state.tasks
@@ -932,7 +958,7 @@ class ModelingV2OnboardWorkflow:
             path.replace(self.layout.consumed_dir / path.name)
         decision = change.decision
         print_message(f"planner: {decision.decision} — {decision.summary}", self._log)
-        await self._reset(change, cancelled)
+        await self._settle(change, cancelled)
         self._dispatch()
         if self.gpu_pool is not None and decision.gpu_nodes is not None:
             note = await asyncio.to_thread(self.gpu_pool.top_up)
@@ -1067,7 +1093,8 @@ class ModelingV2OnboardWorkflow:
 
     async def _main(self) -> RunOutcome:
         self._running: dict[str, asyncio.Task[None]] = {}
-        self._resetting: set[str] = set()
+        # Abandoned tasks; a worker of one leaves its worktree as it is.
+        self._abandoned: set[str] = set(self._state.abandoned)
         # Concurrent worktree adds/removes, merges and commits in one
         # repository race on shared metadata under .git; see _git.
         self._git_lock = asyncio.Lock()
@@ -1102,7 +1129,6 @@ class ModelingV2OnboardWorkflow:
             if resumed:
                 text = self.layout.running_plan_path.read_text(encoding="utf-8")
                 self._adopt(parse_plan(text))
-                await self._finish_resets()
             else:
                 await self._initial_plan()
             print_rule(f"[bold cyan]Run (up to {self.max_parallel} workers)[/bold cyan]", self._log)

@@ -18,7 +18,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_flow.orchestration.isolation import IsolationError
 from agent_flow.workflows.modeling_v2_onboard import gpu_pool
 from agent_flow.workflows.modeling_v2_onboard.files import Layout
 from agent_flow.workflows.modeling_v2_onboard.plan import PlanError
@@ -281,7 +280,12 @@ def test_a_failed_task_holds_only_its_dependents_and_reruns(tmp_path, tmp_git_re
         await failure_seen.wait()
 
     async def c(agent, prompt, attempt):
-        return "FAILED" if attempt == 1 else None
+        if attempt == 1:
+            (agent.cwd / "first-try.txt").write_text("x\n")
+            return "FAILED"
+        # A rerun carries on from its own branch.
+        assert (agent.cwd / "first-try.txt").is_file()
+        return None
 
     async def on_turn(agent, prompt):
         states = _states(prompt)
@@ -311,8 +315,7 @@ def test_a_failed_task_holds_only_its_dependents_and_reruns(tmp_path, tmp_git_re
     assert (tmp_git_repo / "a.txt").is_file() and (tmp_git_repo / "c.txt").is_file()
 
 
-def test_a_running_task_can_be_cancelled_and_removed(tmp_path, tmp_git_repo):
-    graph = """\
+_WITH_STUCK = """\
   - id: a
     type: new_op
   - id: stuck
@@ -323,7 +326,7 @@ def test_a_running_task_can_be_cancelled_and_removed(tmp_path, tmp_git_repo):
     isolation: shared
     depends_on: [a, stuck]
 """
-    without_stuck = """\
+_WITHOUT_STUCK = """\
   - id: a
     type: new_op
   - id: land
@@ -333,16 +336,18 @@ def test_a_running_task_can_be_cancelled_and_removed(tmp_path, tmp_git_repo):
     depends_on: [a]
 """
 
+
+def test_a_cancelled_task_is_abandoned_and_left_as_it_was(tmp_path, tmp_git_repo):
     async def stuck(agent, prompt, attempt):
         (agent.cwd / "partial.txt").write_text("x")
         await asyncio.Event().wait()
 
     async def planner(agent, prompt):
         if "Write the plan to" in prompt:
-            _first_batch(prompt).write_text(_plan_text(graph))
+            _first_batch(prompt).write_text(_plan_text(_WITH_STUCK))
             return
         if "stuck" in _states(prompt):
-            _edit_plan(prompt).write_text(_plan_text(without_stuck))
+            _edit_plan(prompt).write_text(_plan_text(_WITHOUT_STUCK))
             _decide(prompt, "FINISH", cancel=["stuck"])
 
     workers = _Workers(stuck=stuck)
@@ -352,9 +357,51 @@ def test_a_running_task_can_be_cancelled_and_removed(tmp_path, tmp_git_repo):
     assert workflow.run() == RunOutcome.SUCCEEDED
     (stuck_agent,) = factory.workers("stuck")
     assert stuck_agent.closed
-    assert not (tmp_git_repo / "partial.txt").exists()
+    assert (tmp_path / "ws" / "worktrees" / "stuck" / "partial.txt").is_file()
+    assert "node/stuck" in _git(tmp_git_repo, "branch", "--list", "node/*")
+    assert "## `stuck`" in workflow.layout.abandoned_path.read_text()
     assert (tmp_git_repo / "a.txt").is_file()
-    assert _git(tmp_git_repo, "branch", "--list", "node/*") == ""
+    assert not (tmp_git_repo / "partial.txt").exists()
+
+
+def test_a_cancelled_task_leaves_the_plan_and_its_id_is_not_reused(tmp_path, tmp_git_repo):
+    with_stuck_2 = _WITHOUT_STUCK.replace(
+        "  - id: land", "  - id: stuck-2\n    type: new_op\n  - id: land"
+    ).replace("depends_on: [a]", "depends_on: [a, stuck-2]")
+    fixes: list[str] = []
+    last: dict[str, Path] = {}
+
+    async def stuck(agent, prompt, attempt):
+        await asyncio.Event().wait()
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _first_batch(prompt).write_text(_plan_text(_WITH_STUCK))
+            return
+        if "cannot be run as written" in prompt:
+            fixes.append(prompt)
+            if "is still in the plan" in prompt:
+                last["plan"].write_text(_plan_text(_WITHOUT_STUCK))
+            else:
+                last["plan"].write_text(_plan_text(with_stuck_2))
+            return
+        last["plan"] = _edit_plan(prompt)
+        states = _states(prompt)
+        if states.get("stuck") == "running":
+            _decide(prompt, cancel=["stuck"])
+        elif "stuck" not in states and "stuck-2" not in states:
+            _edit_plan(prompt).write_text(_plan_text(_WITH_STUCK))
+            _decide(prompt)
+        else:
+            _finish_when_ready(prompt)
+
+    workers = _Workers(stuck=stuck)
+    workflow = _workflow(tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=workers))
+
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert "is still in the plan" in fixes[0]
+    assert "cannot be used again" in fixes[1]
+    assert workers.attempts == {"a": 1, "stuck": 1, "stuck-2": 1, "land": 1}
 
 
 def test_a_jobs_json_the_worker_wrote_itself_does_not_stop_a_cancel(tmp_path, tmp_git_repo):
@@ -401,58 +448,6 @@ def test_a_jobs_json_the_worker_wrote_itself_does_not_stop_a_cancel(tmp_path, tm
     assert workflow.run() == RunOutcome.SUCCEEDED
     (stuck_agent,) = factory.workers("stuck")
     assert stuck_agent.closed
-
-
-def test_a_reset_a_crash_interrupted_is_finished_on_resume(tmp_path, tmp_git_repo):
-    graph = """\
-  - id: a
-    type: new_op
-  - id: stuck
-    type: new_op
-  - id: land
-    type: merge
-    kind: merge
-    isolation: shared
-    depends_on: [a, stuck]
-"""
-    without_stuck = """\
-  - id: a
-    type: new_op
-  - id: land
-    type: merge
-    kind: merge
-    isolation: shared
-    depends_on: [a]
-"""
-
-    async def stuck(agent, prompt, attempt):
-        await asyncio.Event().wait()
-
-    async def planner(agent, prompt):
-        if "Write the plan to" in prompt:
-            _first_batch(prompt).write_text(_plan_text(graph))
-            return
-        if "stuck" in _states(prompt):
-            _edit_plan(prompt).write_text(_plan_text(without_stuck))
-            _decide(prompt, cancel=["stuck"])
-        else:
-            _finish_when_ready(prompt)
-
-    workflow = _workflow(
-        tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=_Workers(stuck=stuck))
-    )
-
-    async def broken_reclaim(node):
-        raise IsolationError("git branch -D failed")
-
-    workflow.isolation.reclaim = broken_reclaim
-    with pytest.raises(IsolationError):
-        workflow.run()
-    assert "node/stuck" in _git(tmp_git_repo, "branch", "--list", "node/*")
-
-    workflow = _workflow(tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=_Workers()))
-    assert workflow.run() == RunOutcome.SUCCEEDED
-    assert _git(tmp_git_repo, "branch", "--list", "node/*") == ""
 
 
 def test_a_running_task_cannot_be_rewritten_without_cancelling_it(tmp_path, tmp_git_repo):
@@ -1209,30 +1204,13 @@ def test_side_work_is_merged_after_landing_when_asked(tmp_path, tmp_git_repo):
     assert _git(tmp_git_repo, "branch", "--list", "*unmerged*") == ""
 
 
-def test_a_cancelled_final_task_leaves_the_checkout_as_it_found_it(tmp_path, tmp_git_repo):
-    with_s = """\
-  - id: a
-    type: new_op
-  - id: s
-    type: perf
-    depends_on: [a]
-  - id: land
-    type: merge
-    kind: merge
-    isolation: shared
-    depends_on: [a, s]
-"""
-    land_started = asyncio.Event()
+def test_the_final_task_cannot_be_cancelled(tmp_path, tmp_git_repo):
+    land_started, refused = asyncio.Event(), asyncio.Event()
+    fixes: list[str] = []
 
     async def land(agent, prompt, attempt):
-        if attempt > 1:
-            return None
-        (agent.cwd / "half.txt").write_text("x\n")
-        _git(agent.cwd, "add", "half.txt")
-        _git(agent.cwd, "commit", "-m", "half-landed")
-        (agent.cwd / "stray.txt").write_text("x\n")
         land_started.set()
-        await asyncio.Event().wait()
+        await refused.wait()
 
     async def s(agent, prompt, attempt):
         await land_started.wait()
@@ -1247,19 +1225,18 @@ def test_a_cancelled_final_task_leaves_the_checkout_as_it_found_it(tmp_path, tmp
                 )
             )
             return
-        states = _states(prompt)
-        if states.get("land") == "running" and states.get("s") == "done":
-            _edit_plan(prompt).write_text(_plan_text(with_s))
+        if "cannot be run as written" in prompt:
+            fixes.append(prompt)
+            refused.set()
+            return
+        if _states(prompt).get("land") == "running" and not refused.is_set():
             _decide(prompt, cancel=["land"])
         else:
             await _finish_once_done("a")(agent, prompt)
 
     workers = _Workers(s=s, land=land)
-    factory = FakeFactory(planner=planner, worker=workers)
-    workflow = _workflow(tmp_path, tmp_git_repo, factory)
+    workflow = _workflow(tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=workers))
 
     assert workflow.run() == RunOutcome.SUCCEEDED
-    assert workers.attempts["land"] == 2
-    assert (tmp_git_repo / "s.txt").is_file()
-    assert not (tmp_git_repo / "half.txt").exists() and not (tmp_git_repo / "stray.txt").exists()
-    assert "half-landed" not in _git(tmp_git_repo, "log", "--format=%s")
+    assert "cannot be abandoned" in fixes[0]
+    assert workers.attempts["land"] == 1
