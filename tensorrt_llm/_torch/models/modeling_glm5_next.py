@@ -283,6 +283,39 @@ class Glm5NextContextRows:
         )
 
 
+@dataclass(frozen=True)
+class Glm5NextGenerationRows:
+    """Device-side rows of the generation requests of one forward.
+
+    Built once per forward from the live ``kv_lens`` and shared by every sparse
+    layer, so each derived length tensor is one kernel per forward rather than
+    per layer. ``positions`` is ``[B]`` for plain decode and ``[B, T]`` while a
+    target verifies ``T - 1`` drafts; ``visible[i]`` is row ``i``'s visible
+    prefix length and ``num_candidates[i]`` its complete-pool count (int32).
+    """
+
+    positions: torch.Tensor
+    visible: torch.Tensor
+    num_candidates: torch.Tensor
+
+    @classmethod
+    def build(
+        cls, kv_lens: torch.Tensor, tokens_per_request: int, kpool: int
+    ) -> Glm5NextGenerationRows:
+        if tokens_per_request <= 1:
+            positions = kv_lens - 1
+            visible = kv_lens
+        else:
+            steps = torch.arange(tokens_per_request, device=kv_lens.device)
+            positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps
+            visible = (positions + 1).reshape(-1)
+        return cls(
+            positions=positions,
+            visible=visible,
+            num_candidates=(visible // kpool).to(torch.int32),
+        )
+
+
 @dataclass
 class Glm5NextRuntimeContext:
     """Per-forward schedule shared by all layers of a context-first packed batch.
@@ -312,6 +345,9 @@ class Glm5NextRuntimeContext:
     #: Context-row schedules by pool size, built on first use and shared by
     #: all sparse layers of this forward (prefill only, never captured).
     ctx_rows_cache: dict[int, Glm5NextContextRows] = field(default_factory=dict)
+    #: Generation-row lengths by pool size, built on first use and shared by
+    #: all sparse layers of this forward (inside a captured graph, too).
+    gen_rows_cache: dict[int, Glm5NextGenerationRows] = field(default_factory=dict)
 
     def context_rows(self, kpool: int, device: torch.device) -> Glm5NextContextRows:
         rows = self.ctx_rows_cache.get(kpool)
@@ -320,6 +356,15 @@ class Glm5NextRuntimeContext:
                 self.ctx_cu_seqlens, self.cached_lens[: self.num_contexts], kpool, device
             )
             self.ctx_rows_cache[kpool] = rows
+        return rows
+
+    def generation_rows(self, kpool: int) -> Glm5NextGenerationRows:
+        rows = self.gen_rows_cache.get(kpool)
+        if rows is None:
+            rows = Glm5NextGenerationRows.build(
+                self.kv_lens[self.num_contexts :], self.gen_tokens_per_request, kpool
+            )
+            self.gen_rows_cache[kpool] = rows
         return rows
 
 
@@ -1272,13 +1317,15 @@ class Glm5NextSparseAttention(nn.Module):
         reduce: bool = True,
         request_ids: torch.Tensor | None = None,
         max_visible: int | None = None,
+        num_candidates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score pools, select members and tail, then attend to paged latent rows.
 
         visible gives each query's prefix length. Packed context uses request_ids;
         verification uses rows_per_request. Single-token decode reads live lengths
         from metadata. All device work uses fixed buffer shapes for graph replay.
-        max_visible is an optional host bound on visible that limits scoring work.
+        max_visible is an optional host bound on visible that limits scoring work;
+        num_candidates, if given, is visible // index_kpool as int32.
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
@@ -1298,7 +1345,11 @@ class Glm5NextSparseAttention(nn.Module):
             request_ids=request_ids,
             max_kv_len=max_visible,
         )
-        num_cand = (visible // indexer.index_kpool).to(torch.int32)
+        num_cand = (
+            (visible // indexer.index_kpool).to(torch.int32)
+            if num_candidates is None
+            else num_candidates
+        )
         selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=scores.device)
         indexer.pool_top_k(
             scores,
@@ -1384,6 +1435,7 @@ class Glm5NextSparseAttention(nn.Module):
         kv_lens: torch.Tensor,
         metadata: AttentionMetadata,
         reduce: bool = True,
+        runtime_ctx: Glm5NextRuntimeContext | None = None,
     ) -> torch.Tensor:
         """Decode one token per request using device-resident visible lengths.
 
@@ -1395,8 +1447,13 @@ class Glm5NextSparseAttention(nn.Module):
         the incomplete tail pool or its final complete pool.
         """
         batch = hidden_states.shape[0]
-        positions = kv_lens - 1  # [B]
         indexer = self.indexer
+        rows = (
+            Glm5NextGenerationRows.build(kv_lens, 1, indexer.index_kpool)
+            if runtime_ctx is None
+            else runtime_ctx.generation_rows(indexer.index_kpool)
+        )
+        positions = rows.positions  # [B]
         q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent.unsqueeze(1), packed.unsqueeze(1), positions.unsqueeze(1), metadata
@@ -1413,6 +1470,7 @@ class Glm5NextSparseAttention(nn.Module):
             metadata,
             AttentionInputType.generation_only,
             reduce=reduce,
+            num_candidates=rows.num_candidates,
         )
 
     def forward(
@@ -1449,7 +1507,11 @@ class Glm5NextSparseAttention(nn.Module):
             lengths = ctx.kv_lens[ctx.num_contexts :]
             if ctx.gen_tokens_per_request == 1:
                 out = self.forward_decode(
-                    generation, kv_lens=lengths, metadata=ctx.metadata, reduce=False
+                    generation,
+                    kv_lens=lengths,
+                    metadata=ctx.metadata,
+                    reduce=False,
+                    runtime_ctx=ctx,
                 )
             else:
                 out = self.forward_verify(
@@ -1458,6 +1520,7 @@ class Glm5NextSparseAttention(nn.Module):
                     metadata=ctx.metadata,
                     tokens_per_request=ctx.gen_tokens_per_request,
                     reduce=False,
+                    runtime_ctx=ctx,
                 )
             parts.append(out)
         out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
@@ -1470,6 +1533,7 @@ class Glm5NextSparseAttention(nn.Module):
         metadata: AttentionMetadata,
         tokens_per_request: int,
         reduce: bool = True,
+        runtime_ctx: Glm5NextRuntimeContext | None = None,
     ) -> torch.Tensor:
         """Verify packed [batch * tokens_per_request, hidden] generation rows.
 
@@ -1480,7 +1544,9 @@ class Glm5NextSparseAttention(nn.Module):
         """
         tokens_per_request = int(tokens_per_request)
         if tokens_per_request <= 1:
-            return self.forward_decode(hidden_states, kv_lens, metadata, reduce=reduce)
+            return self.forward_decode(
+                hidden_states, kv_lens, metadata, reduce=reduce, runtime_ctx=runtime_ctx
+            )
         num_tokens = hidden_states.shape[0]
         batch = num_tokens // tokens_per_request
         if batch * tokens_per_request != num_tokens or kv_lens.shape[0] != batch:
@@ -1488,9 +1554,13 @@ class Glm5NextSparseAttention(nn.Module):
                 f"glm5_next sparse verify: {num_tokens} tokens for {kv_lens.shape[0]} requests "
                 f"at {tokens_per_request} tokens per request"
             )
-        device = hidden_states.device
-        steps = torch.arange(tokens_per_request, device=device)
-        positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps  # [B, T]
+        kpool = self.indexer.index_kpool
+        rows = (
+            Glm5NextGenerationRows.build(kv_lens, tokens_per_request, kpool)
+            if runtime_ctx is None
+            else runtime_ctx.generation_rows(kpool)
+        )
+        positions = rows.positions  # [B, T]
         q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent.view(batch, tokens_per_request, -1),
@@ -1509,11 +1579,12 @@ class Glm5NextSparseAttention(nn.Module):
             q_resid,
             query,
             index_weights,
-            (positions + 1).reshape(-1),
+            rows.visible,
             metadata,
             AttentionInputType.generation_only,
             rows_per_request=tokens_per_request,
             reduce=reduce,
+            num_candidates=rows.num_candidates,
         )
 
 
