@@ -285,6 +285,50 @@ def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
     score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
 
 
+def test_verify_rows_index_tables_like_repeated_tables():
+    """Verification rows addressing their tables by request id score and expand
+    exactly like rows reading per-row copies of the generation tables."""
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    requests, tokens, heads, pages = 3, 4, 8, 16
+    slots = (requests + 1) * pages + 8
+    pool = _strided_index_pool(slots, gen)
+    # Row 0 is a context request's table; the generation tables follow it.
+    tables = _paged_tables(requests + 1, pages, slots, gen)
+    repeated = tables[1:].repeat_interleave(tokens, dim=0)
+    request_ids = torch.arange(1, requests + 1, dtype=torch.int32, device="cuda")
+    request_ids = request_ids.repeat_interleave(tokens)
+    first = torch.randint(KPOOL, pages * TPB - tokens, (requests, 1), generator=gen, device="cuda")
+    visible = (first + torch.arange(1, tokens + 1, device="cuda")).reshape(-1)
+    n = requests * tokens
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(
+        num_pools_max=pages * TPB // KPOOL, head_dim=HD, kpool=KPOOL, q_scale=HD**-0.5, w_scale=1.0
+    )
+    want = kpool_score(q, w, pool, repeated, visible, TPB, precision="bf16", **kwargs)
+    got = kpool_score(
+        q,
+        w,
+        pool,
+        tables,
+        visible,
+        TPB,
+        precision="bf16",
+        request_ids=request_ids,
+        **kwargs,
+    )
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    selected = torch.randint(-1, 32, (n, 8), generator=gen, device="cuda", dtype=torch.int32)
+    expand = dict(base_row=2, rows_per_slot=TPB + 4, kpool=KPOOL, out_width=64)
+    torch.testing.assert_close(
+        kpool_expand(selected, visible, tables, TPB, request_ids=request_ids, **expand),
+        kpool_expand(selected, visible, repeated, TPB, **expand),
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_pool_scores_broadcast_table_single_context_request():
     """One context request: a stride-0 broadcast table with rows_per_program=16."""
     gen = torch.Generator(device="cuda").manual_seed(3)

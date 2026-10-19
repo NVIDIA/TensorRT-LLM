@@ -337,10 +337,12 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Select generation tables, or all tables for packed context request IDs.
+        """Select generation tables, or all tables for per-row request IDs.
 
-        Verification repeats generation tables per token; callers supply each
-        query's visible length for verification and packed context rows.
+        Rows with request_ids (packed context, or verification rows given their
+        tables' batch rows) index all tables; otherwise verification repeats
+        generation tables per token. Callers supply each query's visible length
+        for verification and packed context rows.
         """
         if request_ids is not None:
             return state.block_tables, None
@@ -393,7 +395,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         """Score complete pools into FP32 [rows, pool_capacity].
 
         q is [rows, heads, head_dim], weights is [rows, heads]. Packed context uses
-        request_ids; verification repeats generation tables rows_per_request times.
+        request_ids; verification either does too or repeats generation tables
+        rows_per_request times.
         Both supply per-query kv_lens. Single-token decode uses live metadata lengths.
         Incomplete/invisible pools receive the FP32 minimum before top-k. Eager
         callers that know a host bound on the visible lengths pass max_kv_len so
@@ -440,9 +443,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             # dot is an fp32 accumulation of exact products, like tf32 on the
             # widened operands (measured: identical selections).
             precision="bf16",
-            # Context rows: the query tokens of a request share its block
-            # table, so a program gathers each pool-key block once for 16 rows.
-            rows_per_program=1 if request_ids is None else 16,
+            # Packed context rows share their request's block table, so a program
+            # gathers each pool-key block once for 16 rows. Verification batches
+            # are small; one row per program keeps more programs in flight.
+            rows_per_program=16 if request_ids is not None and rows_per_request == 1 else 1,
             request_ids=request_ids,
             max_kv_len=max_kv_len,
         )
