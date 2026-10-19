@@ -722,17 +722,14 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     // Private recovery pages have no reusable source. Their contents are
     // initialized by the caller before inference, after all allocations succeed.
     std::vector<CUevent> privateReadyEvents;
-    std::vector<CachedCudaEvent> busyPrivateSlots;
     for (auto const& slots : privateSlots)
     {
         for (auto const& slot : slots)
         {
             privateReadyEvents.push_back(slot.readyEvent.handle());
-            busyPrivateSlots.push_back(slot.readyEvent);
         }
     }
     streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(privateReadyEvents));
-    _extendAllocationFence(std::move(busyPrivateSlots));
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
         for (size_t i = 0; i < privateSlots[lc].size(); ++i)
@@ -822,13 +819,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
                 iterationStats.iterOnboardBytes = sumSlotBytes(storageMgr, sourceLevel, lcIdx);
             }
             _recordDirectIterationStats(lcIdx, iterationStats);
-        }
-        if (deferredCopiesStarted)
-        {
-            // Queued behind the slots' ready events, so this also covers their previous owners.
-            std::vector<CachedCudaEvent> copies;
-            copies.emplace_back(reinterpret_cast<CudaStream>(cudaStr));
-            _extendAllocationFence(std::move(copies));
         }
 
         // Unlock source pages — recordEventScope captures all prior CUDA work
@@ -1769,18 +1759,11 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         // which are not covered by the earlier wait on newly allocated slots.
         {
             std::vector<CUevent> readyEvents;
-            std::vector<CachedCudaEvent> busySlots;
             for (auto const& lcSlots : slots)
-            {
                 for (auto const& slot : lcSlots)
-                {
                     readyEvents.push_back(slot.readyEvent.handle());
-                    busySlots.push_back(slot.readyEvent);
-                }
-            }
             if (!readyEvents.empty())
                 streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(readyEvents));
-            _extendAllocationFence(std::move(busySlots));
         }
 
         // Scratch and stale blocks do not consume per-request KV pages, so exclude them from allocation stats.
@@ -3307,31 +3290,6 @@ void KvCache::recordPageStorageRead(CudaStream stream)
         throw LogicError("Page storage reads must finish submission before the request is deactivated");
     CachedCudaEvent completion(stream);
     completion.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
-}
-
-void KvCache::_extendAllocationFence(std::vector<CachedCudaEvent> events)
-{
-    mAllocationFence.erase(std::remove_if(mAllocationFence.begin(), mAllocationFence.end(),
-                               [](CachedCudaEvent const& event) { return event.queryComplete(); }),
-        mAllocationFence.end());
-    for (auto& event : events)
-    {
-        if (!event.isClosed())
-            mAllocationFence.push_back(std::move(event));
-    }
-}
-
-void KvCache::waitAllocationFence()
-{
-    KVCM2_API_GUARD();
-    CachedCudaEvent fence = CachedCudaEvent::makeNull();
-    {
-        auto const apiLock = mManager->lockExclusive();
-        fence = mergeEvents(mAllocationFence);
-        mAllocationFence.clear();
-    }
-    // A copy is independent of the member it came from, so it can be waited on unlocked.
-    fence.synchronize();
 }
 
 void KvCache::_checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const

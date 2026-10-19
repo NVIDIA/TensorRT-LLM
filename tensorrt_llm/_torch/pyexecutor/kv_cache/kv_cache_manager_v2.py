@@ -1797,6 +1797,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
+        # See `wait_allocation_fences`.
+        self._allocation_stream: torch.cuda.Stream | None = None
+        self._on_allocation_stream: set[int] = set()
+        self._allocation_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
@@ -3190,8 +3194,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def wait_allocation_fences(self, request_ids: Iterable[int]) -> None:
         """Block until the pages given to these requests are free of earlier GPU work.
 
-        For writers no CUDA stream orders, such as the NIC. Covers the pages
-        given since each request's previous wait.
+        For writers no CUDA stream orders, such as the NIC. Caches the connector
+        may write into are allocated on a side stream until their batch is
+        reported, so waiting for them skips the execution stream. Any other
+        request waits for the execution stream.
 
         Args:
             request_ids: Requests whose pages are about to be written.
@@ -3200,10 +3206,59 @@ class KVCacheManagerV2(BaseResourceManager):
             # The diagnostic fill writes fresh pages on the stream, after the
             # allocation, and only the stream orders the NIC behind it.
             self._stream.synchronize()
+            return
+        events = []
         for request_id in request_ids:
+            ready = self._allocation_ready.get(request_id)
+            if ready is not None:
+                events.append(ready)
+            elif request_id in self.kv_cache_map:
+                self._stream.synchronize()
+                return
+        for ready in events:
+            ready.synchronize()
+
+    def _cache_stream(self, request_id: int) -> int:
+        """The stream a request's cache is resumed on before its batch is reported."""
+        if request_id in self._on_allocation_stream:
+            return self._allocation_stream.cuda_stream
+        return self._stream.cuda_stream
+
+    def _place_on_allocation_stream(self, req: LlmRequest, kv_cache: _KVCache | None) -> None:
+        """Allocate a connector-served context cache on the side stream.
+
+        An active cache stays where it is, since moving it would make the side
+        stream wait for the execution stream.
+        """
+        if kv_cache is not None and kv_cache.is_active:
+            return
+        if not self._connector_may_serve(req) or req.py_connector_allocation_reported:
+            return
+        if self._allocation_stream is None:
+            self._allocation_stream = torch.cuda.Stream(device=self._stream.device)
+        self._on_allocation_stream.add(req.py_request_id)
+
+    def _adopt_allocation_stream(self, scheduled_batch: ScheduledRequests) -> None:
+        """Move the batch's caches from the side stream to the execution stream.
+
+        Setting an active cache's stream makes the new stream wait for the old
+        one, so the forward pass stays ordered behind the allocation.
+        """
+        adopted = [
+            req.py_request_id
+            for req in scheduled_batch.context_requests
+            if req.py_request_id in self._on_allocation_stream
+        ]
+        if not adopted:
+            return
+        ready = torch.cuda.Event()
+        ready.record(self._allocation_stream)
+        for request_id in adopted:
+            self._on_allocation_stream.discard(request_id)
+            self._allocation_ready[request_id] = ready
             kv_cache = self.kv_cache_map.get(request_id)
             if kv_cache is not None:
-                kv_cache.wait_allocation_fence()
+                kv_cache.cuda_stream = self._stream.cuda_stream
 
     def is_attention_layer(self, layer_idx: int) -> bool:
         """Return whether ``layer_idx`` uses attention KV cache storage."""
@@ -3714,12 +3769,11 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if kv_cache.is_active:
             return True
+        stream = self._cache_stream(req_id)
         if not (
-            kv_cache.resume(self._stream.cuda_stream)
+            kv_cache.resume(stream)
             if optional_reuse_groups is None
-            else kv_cache.resume(
-                self._stream.cuda_stream, optional_reuse_groups=optional_reuse_groups
-            )
+            else kv_cache.resume(stream, optional_reuse_groups=optional_reuse_groups)
         ):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
@@ -3779,6 +3833,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            self._place_on_allocation_stream(req, kv_cache)
             # Stays None when the cache was resumed rather than freshly
             # matched, which is also the case where no branch point applies.
             num_lookup_tokens = None
@@ -3806,7 +3861,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 if kv_cache is None:
                     return None
-                kv_cache.cuda_stream = self._stream.cuda_stream
+                kv_cache.cuda_stream = self._cache_stream(req.py_request_id)
 
             if not self.enable_block_reuse:
                 kv_cache.stop_committing()
@@ -4351,6 +4406,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.kv_connector_manager is not None and not self.is_draft:
             if finalize_prefix_reservations and self._connector_reservations_enabled():
                 self._accept_connector_prefix_reservations(scheduled_batch)
+            self._adopt_allocation_stream(scheduled_batch)
             self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
         # Connector acceptance can resize requests after prepare_resources.
         self._publish_sparse_metadata()
@@ -5703,6 +5759,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
+        self._on_allocation_stream.discard(request.py_request_id)
+        self._allocation_ready.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -5978,6 +6036,8 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._disagg_receive_ready.clear()
+        self._on_allocation_stream.clear()
+        self._allocation_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies

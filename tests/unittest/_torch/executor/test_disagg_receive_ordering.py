@@ -53,6 +53,8 @@ def _manager() -> Mock:
     manager._sharing = None  # no lender: free_resources closes and removes the cache itself
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager._pending_preemption = {}
     manager.is_draft = False
     manager.kv_connector_manager = None

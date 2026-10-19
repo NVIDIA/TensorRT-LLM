@@ -462,11 +462,11 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
-    def test_allocation_fence_waits_for_a_busy_recycled_slot(self) -> None:
+    def test_side_stream_waits_for_a_busy_recycled_slot(self) -> None:
         """A full pool hands out a slot its previous owner's stream still writes.
 
-        Streams order themselves behind the slot's ready event; a writer outside
-        every stream, such as the NIC, has only the fence.
+        The cache's stream waits for the slot, so a writer outside every stream,
+        such as the NIC, can allocate on a side stream and synchronize only it.
         """
         import torch
 
@@ -480,14 +480,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         )
         owner_stream = torch.cuda.Stream()
         loader_stream = torch.cuda.Stream()
-
-        fresh = self.manager.create_kv_cache()
-        self.assertTrue(fresh.resume(loader_stream.cuda_stream))
-        self.assertTrue(fresh.resize(tokens_per_block))
-        # Nothing was in flight on a never-used slot.
-        fresh.wait_allocation_fence()
-        fresh.close()
-        loader_stream.synchronize()
+        execution_stream = torch.cuda.Stream()
 
         owner = self.manager.create_kv_cache()
         self.assertTrue(owner.resume(owner_stream.cuda_stream))
@@ -505,13 +498,13 @@ class TestNoBatching(TestKVCacheManagerV2):
             self.assertTrue(loader.resume(loader_stream.cuda_stream))
             self.assertTrue(loader.resize(tokens_per_block))
             self.assertFalse(owner_done.query(), "the owner's work finished before the check")
-            loader.wait_allocation_fence()
+            loader_stream.synchronize()
             self.assertTrue(owner_done.query())
-            # Consumed: a second wait has nothing left to cover.
-            loader.wait_allocation_fence()
+            # Adopting the cache orders the new stream behind the old one.
+            loader.cuda_stream = execution_stream.cuda_stream
         finally:
             loader.close()
-        loader_stream.synchronize()
+        execution_stream.synchronize()
 
     def test_batch_publishes_sparse_gpu_metadata(self) -> None:
         import torch

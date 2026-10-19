@@ -325,11 +325,6 @@ public:
     // Snapshot acquisition, read submission and this call belong to the request's owning thread.
     void recordPageStorageRead(CudaStream stream);
 
-    // Block until the pages given to this cache since the previous call are free of earlier GPU
-    // work, for writers no CUDA stream orders, such as the NIC. Returns at once unless a slot was
-    // handed out while still busy. The API lock is not held while waiting.
-    void waitAllocationFence();
-
     // ---- Committing tokens -------------------------------------------------
 
     // Commit tokens: finalises the oldest uncommitted block and makes it
@@ -801,10 +796,6 @@ private:
     bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
-    // Busy slots' ready events and copies into new pages, pruned once complete. Guarded by the
-    // exclusive API lock.
-    std::vector<CachedCudaEvent> mAllocationFence;
-    void _extendAllocationFence(std::vector<CachedCudaEvent> events);
     int mTokensPerBlock;
     Average mAvgHistoryLength;
     Average mAvgCapacity;
