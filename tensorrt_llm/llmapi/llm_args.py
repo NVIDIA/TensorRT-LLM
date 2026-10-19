@@ -7046,6 +7046,7 @@ class TorchLlmArgs(BaseLlmArgs):
                     # verified against the target, so this costs acceptance
                     # rather than correctness: warn, do not reject.
                     logger.warning(
+                        "[dsb overlay: disagg DFlash refusal removed] "
                         "DFlash acceptance is degraded under disaggregated "
                         "serving: the cache transceiver moves the target KV "
                         "cache, but the drafter's context is built during "
@@ -7054,13 +7055,13 @@ class TorchLlmArgs(BaseLlmArgs):
                         "unaffected; expect a lower acceptance rate than the "
                         "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # DFlash on a disaggregated engine silently collapses
-                # acceptance (see disagg_dflash_error); refuse before touching
-                # the drafter checkpoint.
-                disagg_error = disagg_dflash_error(
-                    self.speculative_config, self.cache_transceiver_config)
-                if disagg_error is not None:
-                    raise ValueError(disagg_error)
+                # From the disaggregated-serving-benchmarking overlay (TRT-LLM aa7db814):
+                # the disagg_dflash_error refusal is dropped so gen-only SOL
+                # ladders can run DFlash on a disaggregated gen. Acceptance is
+                # forced (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS), so the
+                # collapsed acceptance the refusal guards against does not
+                # reach the measurement; the drafter still runs every step.
+                # Only valid as a throughput measurement, never for quality.
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
                 # covers only the token budget), and CachedModelLoader repeats
