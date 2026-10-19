@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2-NVFP4 checkpoint tensors mapped onto the tp16 target's parameters.
 
-The target's modules are the built-in GLM-5.2 modules (see ``modeling.py``),
-so the checkpoint loads through the built-in loader into exactly the shapes
-and layouts the context server uses. The MTP draft steps also derive operands
-from two of the MTP layer's checkpoint tensors (``DraftWeights``), taken before
-the built-in loader shards them.
+The target owns its GLM-5.2 modules and loader. The checkpoint loads into
+the same shapes and layouts the context server uses. The MTP draft steps derive
+operands from two of the MTP layer's checkpoint tensors (``DraftWeights``), taken before
+the target loader shards them.
 """
 
 from __future__ import annotations
@@ -19,19 +18,20 @@ import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3WeightLoader
 from tensorrt_llm._torch.modules.linear import TensorParallelMode, load_weight_shard
+
+from ._weight_loader import Glm52WeightLoader
 
 
 def normalize_model_config(
     model_config: ModelConfig[PretrainedConfig],
 ) -> ModelConfig[PretrainedConfig]:
-    """The two config rewrites the built-in implementation applies before building modules.
+    """Normalize checkpoint names and the engine-facing config alias for GLM.
 
     - Legacy checkpoints name the fused q_a / kv_a projection ``fused_a`` in their
       per-module quant config; the modules call it ``kv_a_proj_with_mqa``.
-    - GLM-5.2 publishes ``model_type = glm_moe_dsa``; its attention is DeepSeek-V3.2's
-      (MLA with the DSA indexer), which the modules select by ``deepseek_v32``.
+    - Preserve the engine-facing ``deepseek_v32`` config alias for GLM's
+      MLA attention with the DSA indexer.
     """
     if model_config.quant_config_dict is not None:
         model_config = copy.deepcopy(model_config)
@@ -73,14 +73,14 @@ class DraftWeights:
 
 
 def load_weights(model, weights, draft: bool) -> Optional[DraftWeights]:
-    """Load the checkpoint into the target's modules with the built-in loader.
+    """Load the checkpoint into the target's modules with the target loader.
 
-    With ``draft``, first take the MTP layer's ``DraftWeights`` (the built-in loader releases
+    With ``draft``, first take the MTP layer's ``DraftWeights`` (the target loader releases
     checkpoint tensors once it has copied them) and return them; None without ``draft`` or
     when the checkpoint has no MTP layer.
     """
     draft_weights = _draft_weights(model, weights) if draft else None
-    DeepseekV3WeightLoader(model).load_weights(weights)
+    Glm52WeightLoader(model).load_weights(weights)
     return draft_weights
 
 

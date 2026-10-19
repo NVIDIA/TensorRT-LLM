@@ -369,11 +369,6 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
-    @torch.library.register_fake("trtllm::glm_lowm_bf16_moe")
-    def _(x, router_logits, e_score_correction_bias, w3_w1, w2, top_k,
-          routed_scaling_factor):
-        return x.new_empty((x.shape[0], w2.shape[1]))
-
     @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_mxfp8_quant")
     def _(scores, bias, hidden_states, routed_scaling_factor):
         num_tokens = scores.shape[0]
@@ -959,35 +954,6 @@ def _register_fake():
             logits.new_empty(logits.shape, dtype=torch.float32),
         )
 
-    @torch.library.register_fake("trtllm::glm_verify_head_accept")
-    def _(target_tokens: torch.Tensor, draft_tokens: torch.Tensor,
-          num_contexts: int, accepted_tokens: Optional[torch.Tensor],
-          force_pool: Optional[torch.Tensor],
-          force_counter: Optional[torch.Tensor], force_mode: int,
-          force_base: int, force_max: int, force_frac: float,
-          counter_stride: int, slot_stride: int, pool_size: int):
-        return draft_tokens.new_empty((num_contexts + draft_tokens.shape[0], ))
-
-    @torch.library.register_fake("trtllm::glm_draft_sample_glue")
-    def _(logits, exchange_buffer, exchange_flags, group_size, draft_tokens,
-          draft_step, embed_table, hidden, enorm_weight, hnorm_weight, eps,
-          col_lo, col_hi, glue_out, positions_in, positions_out, gather_ids,
-          seq_lens, fill_seq_lens, kv_lens, kv_update, rewind_accepted,
-          draft_len, block_offsets, dsa_layout, req_idx_per_token,
-          slot_mapping_fp8, slot_mapping_scale, gen_kv_indptr,
-          gen_cached_token_indptr, accepted_tokens, batch_indices, num_accepted,
-          next_new_tokens):
-        return None
-
-    @torch.library.register_fake("trtllm::glm_draft_ehproj_table")
-    def _(logits, exchange_buffer, exchange_flags, group_size, draft_tokens,
-          draft_step, hidden_half, token_table, norm_weight, eps, normed_out,
-          residual_out, positions_in, positions_out, gather_ids, seq_lens,
-          fill_seq_lens, kv_lens, kv_update, rewind_accepted, draft_len,
-          block_offsets, dsa_layout, req_idx_per_token, slot_mapping_fp8,
-          slot_mapping_scale, gen_kv_indptr, gen_cached_token_indptr):
-        return None
-
     @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
     def _(
         logits: torch.Tensor,
@@ -1052,39 +1018,6 @@ def _register_fake():
         packed = pe.new_empty((M, head_dim // 2), dtype=torch.int8)
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
-
-    @torch.library.register_fake("trtllm::glm_fused_embedding")
-    def _(input: torch.Tensor, weight: torch.Tensor):
-        return weight.new_empty((*input.shape, weight.shape[1]))
-
-    @torch.library.register_fake("trtllm::glm_dense_mlp_small_m")
-    def _(x, gate_up_weight, down_weight, gate_up_tiling=-1, down_tiling=-1):
-        return x.new_empty((x.shape[0], down_weight.shape[0]))
-
-    @torch.library.register_fake("trtllm::glm_fused_a_gemm")
-    def _(hidden_states, weight, l2_prefetch):
-        return hidden_states.new_empty(
-            (hidden_states.shape[0], weight.shape[0]))
-
-    @torch.library.register_fake("trtllm::glm_router_gemm")
-    def _(hidden_states, weight):
-        return hidden_states.new_empty(
-            (hidden_states.shape[0], weight.shape[0]), dtype=torch.float32)
-
-    @torch.library.register_fake("trtllm::glm_mnnvl_hop")
-    def _(input, residual, gamma, epsilon, comm_buffer, buffer_flags,
-          shard_published):
-        return [torch.empty_like(residual), torch.empty_like(residual)]
-
-    @torch.library.register_fake("trtllm::glm_mnnvl_moe_finalize_hop")
-    def _(gemm2_output, expert_weights, expanded_idx_to_permuted_idx, addend,
-          residual, gamma, epsilon, comm_buffer, buffer_flags):
-        return [torch.empty_like(residual), torch.empty_like(residual)]
-
-    @torch.library.register_fake("trtllm::glm_mnnvl_allgather")
-    def _(input, comm_buffer, buffer_flags, group_size):
-        return input.new_empty((input.shape[0], input.shape[1] * group_size),
-                               dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
     def _(input: torch.Tensor,

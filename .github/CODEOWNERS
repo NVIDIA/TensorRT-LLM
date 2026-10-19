@@ -401,7 +401,7 @@
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/thop/glm*Op.cpp @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

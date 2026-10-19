@@ -3,10 +3,9 @@
 """GLM-5.2-NVFP4 on 16 Rubin GPUs (sm107), tp16: model construction and forward.
 
 This target serves the generation side of a disaggregated deployment. Its
-context server runs the built-in GLM-5.2 implementation (modeling_deepseekv3)
-and hands over the MLA KV cache and the DSA indexer K cache it wrote, so this
-target builds the same modules and loads the same weights: the caches it reads
-are laid out exactly as they were written. Forwards that carry context rows
+context server hands over its MLA KV cache and DSA indexer K cache. The target
+owns its modules and weight loader, with checkpoint and cache layouts matching
+the context server. Forwards that carry context rows
 (engine warm-up, an aggregated deployment) run that same decoder stack in
 ``PrefillTarget``. Generation-only forwards -- every serving step of the
 generation server -- run ``DecodeTarget``. With one-model MTP-Eagle, the draft
@@ -23,9 +22,6 @@ from typing import Any, List, Literal, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
-    fp4_quantize,
-)
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -37,11 +33,7 @@ from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareMe
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM, DeepseekV3Model
-from tensorrt_llm._torch.models.modeling_speculative import (
-    SpecDecOneEngineForCausalLM,
-    _slice_spec_position_ids,
-)
+from tensorrt_llm._torch.models.modeling_speculative import _slice_spec_position_ids
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.swiglu import swiglu
@@ -60,6 +52,9 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.utils import EventType
 
 from . import weights as _weights
+from ._model import Glm52Model
+from ._model import setup_aliases as _setup_aliases
+from ._speculative import Glm52SpecDecOneEngineForCausalLM
 from .ops.attention.mla_kv_half_append import mla_kv_half_append
 from .ops.attention.sparse_mla_flash_decode import sparse_mla_flash_decode
 from .ops.comm._mnnvl_workspace import (
@@ -104,6 +99,7 @@ from .ops.moe.routed_experts import (
     make_fused_router_workspace,
     routed_experts,
 )
+from .ops.quantization.fp4_quantize import fp4_quantize
 from .ops.spec._draft_exchange import HIDDEN_SIZE as DRAFT_HIDDEN_SIZE
 from .ops.spec._draft_exchange import DraftExchangeWorkspace, ehproj_table_supports_tp
 from .ops.spec._draft_token_table import build_draft_token_table
@@ -137,7 +133,7 @@ class PrefillTarget:
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        return DeepseekV3Model.forward(
+        return Glm52Model.forward(
             self.core,
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -1469,7 +1465,7 @@ class DecodeTarget:
         return mla.o_proj(output, all_reduce_params=all_reduce_params, layer_idx=mla.layer_idx)
 
 
-class Glm52Nvfp4Sm107Tp16Core(DeepseekV3Model):
+class Glm52Nvfp4Sm107Tp16Core(Glm52Model):
     """The decoder stack, with the per-step choice between the two targets."""
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
@@ -1849,7 +1845,7 @@ class MTPDraftWorker(MTPEagleWorker):
 
 
 class ModelingV2Glm52Nvfp4Sm107Tp16(
-    SpecDecOneEngineForCausalLM[Glm52Nvfp4Sm107Tp16Core, PretrainedConfig]
+    Glm52SpecDecOneEngineForCausalLM[Glm52Nvfp4Sm107Tp16Core, PretrainedConfig]
 ):
     """GLM-5.2-NVFP4, sm107, tp16."""
 
@@ -1963,7 +1959,7 @@ class ModelingV2Glm52Nvfp4Sm107Tp16(
         )
 
     def setup_aliases(self) -> None:
-        DeepseekV3ForCausalLM.setup_aliases(self)
+        _setup_aliases(self)
 
     def post_load_weights(self):
         super().post_load_weights()
