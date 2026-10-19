@@ -650,6 +650,21 @@ class _DummyModelEngine(PyTorchModelEngine):
         )
 
 
+# KVCM2 requires a current CUDA context on whatever thread destroys it. A manager
+# left for the cyclic GC is freed on whichever thread runs the collection -- under
+# pytest's watchdog that thread has no context, and the first driver call in
+# teardown fails with CUDA error 201, poisoning KVCM2 for the rest of the process.
+# Releasing them here keeps teardown on the test's own thread.
+_KV_CACHE_MANAGERS_TO_SHUTDOWN = []
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_kv_cache_managers():
+    yield
+    while _KV_CACHE_MANAGERS_TO_SHUTDOWN:
+        _KV_CACHE_MANAGERS_TO_SHUTDOWN.pop().shutdown()
+
+
 def _build_engine_and_resource_manager():
     tokens_per_block = 1
     max_tokens = 258
@@ -678,6 +693,7 @@ def _build_engine_and_resource_manager():
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
+    _KV_CACHE_MANAGERS_TO_SHUTDOWN.append(kv_cache_manager)
     resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     return model_engine, resource_manager
 
