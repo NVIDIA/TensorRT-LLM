@@ -32,6 +32,10 @@ using Grain = uint4;
 constexpr uint32_t ctaSize = 128;
 constexpr uint32_t copyBlockCtaSize = 128;
 constexpr uint32_t copyBlocknbBufs = 2;
+// Loop iterations (copyBlockCtaSize packed loads each) one CTA of the block
+// offsets copy covers. The copy is latency bound, so a row is split over
+// gridDim.z CTAs rather than walked by one CTA two loads deep.
+constexpr uint32_t copyBlockItersPerCta = 2;
 constexpr uint32_t nbBufs = 4;
 constexpr uint32_t grainBytes = sizeof(Grain);
 
@@ -186,6 +190,7 @@ CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, 
 
 // dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]
 // dst_tensor[:, :num_seqs, 1] = dst_tensor[:, :num_seqs, 0] + 1
+// Grid: (pool, sequence, tile of copyBlockItersPerCta loop iterations).
 __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
     SizeType32* __restrict__ dstPtr, SizeType32 const srcMaxNumSequences, SizeType32 const dstMaxNumSequences,
     SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex, SizeType32 const* __restrict__ indexScales,
@@ -200,14 +205,19 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
     auto const tid = threadIdx.x;
     auto const poolIdx = blockIdx.x;
     auto const seqIdx = blockIdx.y;
+    uint32_t const iterBeg = blockIdx.z * copyBlockItersPerCta;
+    uint32_t const numIters = iterPerSeq - iterBeg < copyBlockItersPerCta ? iterPerSeq - iterBeg : copyBlockItersPerCta;
+    uint32_t const tileOffset = iterBeg * copyBlockCtaSize * elemPerAccess;
     auto const seqDimStride = kvFactor * numBlocksPerSeq;
-    uint32_t const srcIdxBeg = tid * elemPerAccess + (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride;
-    uint32_t const dstIdxKBeg = tid * elemPerAccess + (poolIdx * dstMaxNumSequences + seqIdx) * seqDimStride;
+    uint32_t const srcIdxBeg
+        = tid * elemPerAccess + tileOffset + (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride;
+    uint32_t const dstIdxKBeg
+        = tid * elemPerAccess + tileOffset + (poolIdx * dstMaxNumSequences + seqIdx) * seqDimStride;
     uint32_t const dstIdxVBeg = dstIdxKBeg + numBlocksPerSeq;
 
     uint32_t const srcIdxEnd = (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride + numBlocksPerSeq;
 
-    for (uint32_t i = 0; i < iterPerSeq + copyBlocknbBufs; i++)
+    for (uint32_t i = 0; i < numIters + copyBlocknbBufs; i++)
     {
         uint32_t const idxBuf = i % copyBlocknbBufs;
         if (i >= copyBlocknbBufs)
@@ -237,7 +247,7 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
         PackedInt* const dst = &data[idxBuf][tid];
         uint32_t const srcIdx = srcIdxBeg + copyBlockCtaSize * ldIter * elemPerAccess;
         PackedInt const* const src = reinterpret_cast<PackedInt const*>(srcPtr + srcIdx);
-        if (srcIdx < srcIdxEnd)
+        if (ldIter < numIters && srcIdx < srcIdxEnd)
         {
             uint32_t const size = sizeof(PackedInt);
             asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"l"(__cvta_generic_to_shared(dst)),
@@ -282,7 +292,8 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
         "Not implemented case: numBlocksPerSeq * sizeof(SizeType32) = %zu must be a multiple of %zu.",
         static_cast<size_t>(numBlocksPerSeq * sizeof(SizeType32)), static_cast<size_t>(sizeof(PackedInt)));
 
-    dim3 gridDim(numPools, numSeqs, 1);
+    auto const iterPerSeq = divUp(numBlocksPerSeq * sizeof(SizeType32), sizeof(PackedInt) * copyBlockCtaSize);
+    dim3 gridDim(numPools, numSeqs, divUp(iterPerSeq, copyBlockItersPerCta));
     dim3 blockDim(copyBlockCtaSize);
 
     copyBatchBlockOffsetsToDeviceKernel<<<gridDim, blockDim, 0, stream>>>(srcPtr, dstPtr, srcMaxNumSequences,
