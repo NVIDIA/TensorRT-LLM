@@ -28,6 +28,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
@@ -54,6 +55,7 @@ DEFAULT_CAPABILITIES = DriverCapabilities(
     probe=True,
     max_rows_per_op=None,
     absent_is_miss=True,
+    device_memory=True,  # a DEVICE region is plain memory in-process; the plumbing is what counts
     multi_span=True,
 )
 MAX_PROBES_IN_FLIGHT = 4
@@ -213,6 +215,12 @@ class _Probe:
     finished: threading.Event
 
 
+@dataclass(eq=False)
+class _Worker:
+    thread: threading.Thread
+    finished: threading.Event
+
+
 def _gather(spans: Sequence[Span]) -> bytes:
     return b"".join(ctypes.string_at(span.address, span.nbytes) for span in spans)
 
@@ -232,10 +240,15 @@ class MemoryDriver:
         store: MemoryStore,
         *,
         controlled: bool = False,
+        background: bool = False,
         capabilities: DriverCapabilities = DEFAULT_CAPABILITIES,
     ) -> None:
+        if controlled and background:
+            raise ValueError("a driver is controlled or runs in the background, not both")
         self.store = store
         self.controlled = controlled
+        self.background = background  # put/get return once recorded; a thread executes them
+        self._workers: list[_Worker] = []
         self._capabilities = capabilities
         self._lock = threading.Condition(threading.RLock())
         self._registrations: list[_Registration] = []
@@ -263,6 +276,7 @@ class MemoryDriver:
             raise DriverRejected(str(error)) from None
         if layout.nbytes > nbytes:
             raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
+        self._check_region_kind(layout)
         with self._lock:
             self._require_accepting()
             for other in self._registrations:
@@ -369,8 +383,11 @@ class MemoryDriver:
             self._check_closable()
             self._closed = True
             probes, self._probes = self._probes, []
+            workers, self._workers = self._workers, []
         for probe in probes:  # all finished; join only lets the threads exit
             probe.worker.join()
+        for worker in workers:  # all finished too; see _quiet
+            worker.thread.join()
 
     # Controlled mode: the test releases each stage.
 
@@ -527,6 +544,10 @@ class MemoryDriver:
                 if first.overlaps(second):
                     raise DriverRejected(f"spans {first} and {second} overlap within one get")
 
+    def _check_region_kind(self, layout: RegionLayout) -> None:
+        if layout.memory_kind is MemoryKind.DEVICE and not self._capabilities.device_memory:
+            raise DriverRejected("this driver registers host memory only")
+
     def _check_registered(self, rows: Sequence[RowIO]) -> None:
         for io in rows:
             for span in io.spans:
@@ -564,9 +585,12 @@ class MemoryDriver:
         return self._quiet() or any(op.unprovable and not op.access_ended for op in self._ops)
 
     def _quiet(self) -> bool:
-        """Nothing can still touch memory and no background work is running."""
-        return all(op.access_ended for op in self._ops) and all(
-            probe.finished.is_set() for probe in self._probes
+        """Nothing can still touch memory and no background work is running. An operation's
+        access ending is not enough: its worker may still be on its way out."""
+        return (
+            all(op.access_ended for op in self._ops)
+            and all(probe.finished.is_set() for probe in self._probes)
+            and all(worker.finished.is_set() for worker in self._workers)
         )
 
     # Internals.
@@ -586,10 +610,34 @@ class MemoryDriver:
             self._ops.append(op)
             if hint is not None:
                 self.hints_seen.append(hint)
-        if not self.controlled:
+            if self.background:
+                # Recorded, started and registered under one lock, so a drain or close that
+                # follows sees a worker that exists and has started.
+                finished = threading.Event()
+                thread = threading.Thread(
+                    target=self._run, args=(op, finished), name="memory-driver-op", daemon=True
+                )
+                try:
+                    thread.start()
+                except RuntimeError as error:
+                    # The thread never ran, so no row started: the recorded operation concludes
+                    # as faults and, having touched nothing, has ended its access.
+                    self._fail_unstarted(op, f"no worker thread: {error}")
+                else:
+                    self._workers.append(_Worker(thread, finished))
+        if not self.background and not self.controlled:
+            self._run(op, None)
+        return op
+
+    def _run(self, op: MemoryOp, finished: threading.Event | None) -> None:
+        try:
             self._before_execute(op)
             self._execute(op)
-        return op
+        finally:
+            if finished is not None:
+                finished.set()
+                with self._lock:
+                    self._lock.notify_all()
 
     def _before_execute(self, op: MemoryOp) -> None:
         """Between recording an operation and executing it; a test races a drain here."""
@@ -654,6 +702,13 @@ class MemoryDriver:
     def _verify(self, io: RowIO, stored: StoredObject) -> str | None:
         """Why the stored object may not be delivered as ``io``, or ``None``."""
         return check_trailer(stored.trailer, io.key.encode(), io.nbytes, stored.payload)
+
+    def _fail_unstarted(self, op: MemoryOp, reason: str) -> None:
+        """Every row FAULT and access over, for an operation none of whose rows started."""
+        for row in op.rows:
+            row.published = faulted(reason)
+        op.access_ended = True
+        self._lock.notify_all()
 
     def _cancel_unstarted(self, op: MemoryOp) -> None:
         for row in op.rows:

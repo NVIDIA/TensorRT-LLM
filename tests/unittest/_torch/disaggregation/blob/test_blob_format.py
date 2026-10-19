@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.keys import FORMAT_VERSION, encode_key
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
@@ -82,6 +83,8 @@ def test_span_and_layout_validate_their_numbers() -> None:
         with pytest.raises(ValueError):
             RegionLayout(slot_bytes, slot_count)
     assert RegionLayout(8, 4).nbytes == 32
+    assert RegionLayout(8, 4).memory_kind is MemoryKind.HOST
+    assert RegionLayout(8, 4, "kv", MemoryKind.DEVICE).memory_kind is MemoryKind.DEVICE
 
 
 def test_a_row_is_a_key_and_disjoint_spans_in_the_order_given() -> None:

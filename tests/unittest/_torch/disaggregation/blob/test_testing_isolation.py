@@ -21,12 +21,7 @@ PACKAGE_DIR = TESTING_DIR.parents[2]  # .../tensorrt_llm
 def _package_of(path: pathlib.Path) -> str:
     """The package a module at ``path`` resolves relative imports against."""
     relative = path.resolve().relative_to(PACKAGE_DIR.parent).with_suffix("")
-    parts = list(relative.parts)
-    if parts[-1] != "__init__":
-        parts.pop()
-    else:
-        parts.pop()
-    return ".".join(parts) if path.name == "__init__.py" else ".".join(parts)
+    return ".".join(relative.parts[:-1])  # a module's parent; a package's own name
 
 
 def _testing_imports(source: str, package: str) -> list[str]:

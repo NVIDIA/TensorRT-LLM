@@ -5,8 +5,8 @@
 A driver moves whole rows between registered memory and one store. It answers two questions
 separately: what each row's logical result is (:meth:`StoreDriver.poll`), and whether an operation
 can still touch the caller's memory (:meth:`StoreDriver.access_ended`). Neither answer implies the
-other. Nothing here belongs to the public backend contract in ``base/``; the backend translates
-between the two.
+other. Nothing here belongs to the public backend contract in ``base/``, from which only
+``MemoryKind`` is shared; the backend translates between the two.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import enum
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+from ..base.memory import MemoryKind
 
 Hint = Any
 """The caller's hint for where a get or probe should look, handed to the driver unchanged. A hint
@@ -69,8 +71,10 @@ class RowStatus(enum.Enum):
     store's "already exists" counts only once that object is committed."""
 
     MISS = "miss"
-    """For a get: the store holds no object under the key. Only a driver that declares
-    ``absent_is_miss`` can tell this apart from a failure; another reports FAULT for such a key."""
+    """For a get: the store reported that it holds no object under the key, and the row's memory
+    was not touched. Every driver answers MISS only for a reported absence and FAULT for any
+    failure; a driver that declares ``absent_is_miss`` adds that an absent key always concludes
+    MISS."""
 
     NOT_READY = "not_ready"
     """The key is held by a write that has not finished: a get delivered nothing, a put published
@@ -146,11 +150,14 @@ class RegionLayout:
     """How a registered region is divided: ``slot_count`` slots of ``slot_bytes``, back to back.
 
     ``label`` is an opaque layout label, equal for regions laid out alike; it is not an identity.
+    ``memory_kind`` says whether the region is host or device memory; a transport registers the
+    two differently.
     """
 
     slot_bytes: int
     slot_count: int
     label: str = ""
+    memory_kind: MemoryKind = MemoryKind.HOST
 
     def __post_init__(self) -> None:
         if self.slot_bytes <= 0 or self.slot_count <= 0:
@@ -228,11 +235,10 @@ class DriverCapabilities:
         max_rows_per_op: Rows one ``put``/``get`` accepts, or ``None`` for no limit.
         hints: ``get`` and ``probe`` read a caller's hint; without it the backend rejects a
             submission carrying a hint before dispatch and the driver is called without one.
-        absent_is_miss: A get of a key the store does not hold concludes MISS. Without it the
-            store cannot tell absence from failure, such a get may conclude FAULT, and the
-            backend's fault accounting counts misses too.
-        device_memory: The driver can register regions of device memory; without it every region
-            handed to it is host memory.
+        absent_is_miss: A get of a key the store does not hold always concludes MISS. Without
+            it the store may not tell absence from failure, and such a get may conclude FAULT.
+        device_memory: The driver registers regions whose ``memory_kind`` is DEVICE; without it
+            every region handed to it is host memory and it rejects a DEVICE one.
         multi_span: ``put`` and ``get`` take rows of more than one span; without it every row
             handed to it has exactly one.
     """
@@ -293,11 +299,14 @@ class StoreDriver(Protocol):
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> RegionHandle:
         """Register one region the driver may read and write.
 
-        The region is host memory unless the driver declares ``device_memory``, in which case the
-        caller may also hand it device regions.
+        ``layout.memory_kind`` says whether the region is host or device memory; a DEVICE region
+        is handed only to a driver that declares ``device_memory``. The kind is checked at this
+        entry: a driver without ``device_memory`` rejects a DEVICE region before the store is
+        asked or the memory touched, so the mismatch never reaches a registration or a transfer.
 
         Raises:
-            DriverRejected: Bad geometry or overlap with a live registration; nothing escaped.
+            DriverRejected: Bad geometry, overlap with a live registration, or a DEVICE region
+                for a driver without ``device_memory``; nothing escaped.
             RegistrationError: The store refused; ``handle`` is set when the store may have
                 registered the region anyway.
         """
@@ -316,13 +325,13 @@ class StoreDriver(Protocol):
         """Publish ``rows``; may return before any byte moved.
 
         The caller guarantees that the rows' spans hold the payload and stay unchanged until
-        ``access_ended`` is true.
+        ``access_ended`` is true, and hands a row of more than one span only to a driver that
+        declares ``multi_span``; a driver may treat an unexpected one as a programming error.
 
         Raises:
             DriverRejected: ``put`` is not declared, the driver is draining or closed, a key
-                appears twice in ``rows``, ``rows`` exceed ``max_rows_per_op``, a row has more
-                than one span without ``multi_span``, or a span lies outside a live registration;
-                nothing escaped.
+                appears twice in ``rows``, ``rows`` exceed ``max_rows_per_op``, or a span lies
+                outside a live registration; nothing escaped.
         """
         ...
 

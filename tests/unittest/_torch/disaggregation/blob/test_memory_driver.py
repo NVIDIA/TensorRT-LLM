@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
@@ -22,7 +23,6 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     RegionLayout,
     RegistrationError,
     RowIO,
-    RowResult,
     RowStatus,
     Span,
     StoreDriver,
@@ -30,7 +30,10 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     concluded,
     faulted,
 )
-from tensorrt_llm._torch.disaggregation.testing.broken_drivers import BROKEN_CONFORMANCE
+from tensorrt_llm._torch.disaggregation.testing.broken_drivers import (
+    BROKEN_ASYNC_CONFORMANCE,
+    BROKEN_CONFORMANCE,
+)
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
     SLOT,
     UNRELEASED_ENDPOINTS,
@@ -41,11 +44,13 @@ from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
     Unblock,
     key_of,
     statuses,
+    wait_until,
 )
 from tensorrt_llm._torch.disaggregation.testing.host_memory import GUARD, HostBuffer, MemoryWindow
 from tensorrt_llm._torch.disaggregation.testing.memory_store import (
     DEFAULT_CAPABILITIES,
     MAX_PROBES_IN_FLIGHT,
+    Commit,
     Kind,
     MemoryDriver,
     MemoryOp,
@@ -73,7 +78,7 @@ class FailingStore(MemoryStore):
         self._fail_on = fail_on_commit
         self._commits = 0
 
-    def commit(self, key: str, payload: bytes, trailer: bytes):  # type: ignore[no-untyped-def]
+    def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         self._commits += 1
         if self._commits == self._fail_on:
             raise StoreError("connection dropped")
@@ -96,7 +101,7 @@ class TimeoutStore(MemoryStore):
 class CrashingStore(MemoryStore):
     """Raises something that is not a ``StoreError`` from inside a commit, as a binding bug would."""
 
-    def commit(self, key: str, payload: bytes, trailer: bytes):  # type: ignore[no-untyped-def]
+    def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         raise RuntimeError("binding returned garbage")
 
 
@@ -116,7 +121,7 @@ class GatedStore(MemoryStore):
             self.waiting.set()
             self.gate.wait()
 
-    def commit(self, key: str, payload: bytes, trailer: bytes):  # type: ignore[no-untyped-def]
+    def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         self._hold(key)
         return super().commit(key, payload, trailer)
 
@@ -154,11 +159,14 @@ class TestMemoryDriverConformance(DriverConformance):
 
     driver_cls: type[MemoryDriver] = MemoryDriver
     capabilities = DEFAULT_CAPABILITIES
+    background = False  # True: put/get return once recorded and a thread executes them
 
     def _driver(self, store: MemoryStore | None = None) -> MemoryDriver:
         # An empty store is falsy (it has a length), so test for None explicitly.
         return self.driver_cls(
-            store if store is not None else MemoryStore(), capabilities=self.capabilities
+            store if store is not None else MemoryStore(),
+            background=self.background,
+            capabilities=self.capabilities,
         )
 
     def make_driver(self) -> StoreDriver:
@@ -190,6 +198,20 @@ class TestMemoryDriverConformance(DriverConformance):
         store.fail_next_presence("connection dropped")
         return self._driver(store), STAGED_KEY
 
+    def make_failing_get(self) -> tuple[StoreDriver, str]:
+        return self._driver(TimeoutStore(STAGED_KEY)), STAGED_KEY
+
+    def make_unprovable_get(self) -> tuple[StoreDriver, Callable[[OpHandle], None]]:
+        driver = self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
+
+        def lose_the_evidence(op: OpHandle) -> None:
+            assert isinstance(op, MemoryOp)
+            driver.transfer(op)
+            driver.publish_results(op)
+            driver.mark_unprovable(op)
+
+        return driver, lose_the_evidence
+
 
 class _HintFreeSignatures(MemoryDriver):
     """A driver written before hints existed: ``get`` and ``probe`` take no hint. With
@@ -204,6 +226,13 @@ class _HintFreeSignatures(MemoryDriver):
 
 class TestHintFreeDriverConformance(TestMemoryDriverConformance):
     driver_cls = _HintFreeSignatures
+
+
+class TestAsyncMemoryDriverConformance(TestMemoryDriverConformance):
+    """The same driver returning handles before the store answers, as a real SDK does."""
+
+    background = True
+    handles_before_completion = True
 
 
 SHARED_STORE = MemoryStore()
@@ -234,8 +263,8 @@ class TestPoolDriverConformance(DriverConformance):
         self.next_offset = 0
         return driver
 
-    def allocate(self, nbytes: int, fill: int) -> Allocation:
-        start = self.next_offset + GUARD
+    def allocate(self, nbytes: int, fill: int, memory_kind: MemoryKind) -> Allocation:
+        start = self.next_offset + GUARD  # host memory stands in for either kind in-process
         self.next_offset = start + nbytes + GUARD
         assert self.next_offset <= self.POOL_BYTES, "the pool is too small for this check"
         return MemoryWindow(self.pool.address + start, nbytes, fill, owner=self.pool), self.handle
@@ -686,6 +715,34 @@ class TestMemoryDriver:
         assert len(store) == 0
         assert driver.drain(TIMEOUT) is True
 
+    def test_a_worker_that_cannot_start_leaves_a_faulted_operation_with_its_handle(self) -> None:
+        """Background mode records the operation before its thread starts. When the thread cannot
+        start, nothing ran: every row is a fault, access is over, and the driver goes on."""
+        store = MemoryStore()
+        driver = self.make(store, background=True)
+        writer = endpoint(driver, ["A", "B"])
+        writer.fill_row(0, b"aaaaaaaa")
+        writer.fill_row(1, b"bbbbbbbb")
+
+        def refuse(thread: threading.Thread) -> None:
+            raise RuntimeError("can't start new thread")
+
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(threading.Thread, "start", refuse)
+            try:
+                op = driver.put(writer.rows())
+            except Exception as error:  # noqa: BLE001 - the check is that the handle comes back
+                pytest.fail(f"put raised instead of returning its handle: {error!r}")
+        results = driver.poll(op)
+        assert [r.status for r in results] == [RowStatus.FAULT, RowStatus.FAULT]
+        assert results[0].fault == "no worker thread: can't start new thread"
+        assert driver.access_ended(op)
+        assert len(store) == 0
+        later = driver.put(writer.rows())  # nothing stale stands in the way of the next thread
+        wait_until(lambda: concluded(driver.poll(later)), "the next operation", TIMEOUT)
+        assert statuses(driver, later) == [RowStatus.READY, RowStatus.READY]
+        self._shutdown(driver)
+
     def test_unregister_is_refused_while_an_operation_may_access_the_region(self) -> None:
         driver = self.make(controlled=True)
         reader = endpoint(driver, ["A"])
@@ -934,19 +991,6 @@ class TestMemoryDriver:
 # Drivers that break one rule only the in-memory tests can observe.
 
 
-class _UnregistersBusyRegions(MemoryDriver):
-    def _check_region_idle(self, registration: object) -> None:
-        pass
-
-
-class _CallsATimeoutAMiss(MemoryDriver):
-    def _get_row(self, io: RowIO) -> RowResult:
-        try:
-            return super()._get_row(io)
-        except StoreError:
-            return RowResult(RowStatus.MISS)
-
-
 class _SkipsTheIntegrityCheck(MemoryDriver):
     def _verify(self, io: RowIO, stored: StoredObject) -> str | None:
         return None
@@ -984,21 +1028,13 @@ class _ExecutesWithTheControls(MemoryDriver):
         self.end_access(op)
 
 
-class _DrainWaitsForEveryone(MemoryDriver):
-    def _drain_can_return(self) -> bool:
-        return self._quiet()
+class _LeavesAnUnstartedOperationPending(MemoryDriver):
+    def _fail_unstarted(self, op: MemoryOp, reason: str) -> None:
+        pass
 
 
 # rule -> (driver breaking it, the memory-driver check that must fail)
 BROKEN_MEMORY: dict[str, tuple[type[MemoryDriver], str]] = {
-    "unregister needs an idle region": (
-        _UnregistersBusyRegions,
-        "test_unregister_is_refused_while_an_operation_may_access_the_region",
-    ),
-    "a store timeout is a fault": (
-        _CallsATimeoutAMiss,
-        "test_a_store_timeout_is_a_fault_not_a_miss",
-    ),
     "integrity is verified on every get": (
         _SkipsTheIntegrityCheck,
         "test_a_corrupted_object_is_a_fault_and_never_lands",
@@ -1027,9 +1063,9 @@ BROKEN_MEMORY: dict[str, tuple[type[MemoryDriver], str]] = {
         _ExecutesWithTheControls,
         "test_a_drain_racing_a_submission_leaves_a_cancelled_operation_with_its_handle",
     ),
-    "drain returns at once on an unprovable operation": (
-        _DrainWaitsForEveryone,
-        "test_drain_returns_false_at_once_even_while_another_operation_is_still_provable",
+    "a worker that cannot start concludes its operation": (
+        _LeavesAnUnstartedOperationPending,
+        "test_a_worker_that_cannot_start_leaves_a_faulted_operation_with_its_handle",
     ),
 }
 
@@ -1048,12 +1084,12 @@ def _run_check(suite: object, check: str) -> None:
         raise UnexpectedSkip(f"{check} skipped instead of running: {skipped}") from None
 
 
-def _conformance(driver_cls: type[MemoryDriver], caps: DriverCapabilities) -> DriverConformance:
-    suite = type(
-        "Suite",
-        (TestMemoryDriverConformance,),
-        {"driver_cls": driver_cls, "capabilities": caps, "timeout": 0.3},
-    )
+def _conformance(
+    driver_cls: type[MemoryDriver],
+    caps: DriverCapabilities,
+    base: type[TestMemoryDriverConformance] = TestMemoryDriverConformance,
+) -> DriverConformance:
+    suite = type("Suite", (base,), {"driver_cls": driver_cls, "capabilities": caps, "timeout": 0.3})
     return suite()  # type: ignore[no-any-return]
 
 
@@ -1065,6 +1101,17 @@ def test_each_conformance_check_passes_the_driver_and_fails_the_one_breaking_its
     _run_check(_conformance(MemoryDriver, capabilities), check)
     with pytest.raises(CHECK_FAILED):
         _run_check(_conformance(broken, capabilities), check)
+
+
+@pytest.mark.parametrize("rule", sorted(BROKEN_ASYNC_CONFORMANCE))
+def test_each_async_conformance_check_passes_the_driver_and_fails_the_one_breaking_its_rule(
+    rule: str,
+) -> None:
+    broken, capabilities, check = BROKEN_ASYNC_CONFORMANCE[rule]
+    asynchronous = TestAsyncMemoryDriverConformance
+    _run_check(_conformance(MemoryDriver, capabilities, asynchronous), check)
+    with pytest.raises(CHECK_FAILED):
+        _run_check(_conformance(broken, capabilities, asynchronous), check)
 
 
 @pytest.mark.parametrize("rule", sorted(BROKEN_MEMORY))
@@ -1086,10 +1133,11 @@ def test_a_skip_on_the_broken_side_is_not_an_expected_failure() -> None:
 
 
 def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> None:
-    conformance = [cls for cls, _, _ in BROKEN_CONFORMANCE.values()]
+    pairings = [*BROKEN_CONFORMANCE.values(), *BROKEN_ASYNC_CONFORMANCE.values()]
+    conformance = [cls for cls, _, _ in pairings]
     memory = [cls for cls, _ in BROKEN_MEMORY.values()]
     assert len(set(conformance + memory)) == len(conformance) + len(memory)
-    checks = {check for _, _, check in BROKEN_CONFORMANCE.values()}
+    checks = {check for _, _, check in pairings}
     assert checks <= {name for name in dir(DriverConformance) if name.startswith("test_")}
     checks = {check for _, check in BROKEN_MEMORY.values()}
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}

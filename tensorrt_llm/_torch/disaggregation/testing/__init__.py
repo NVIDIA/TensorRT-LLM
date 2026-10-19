@@ -11,3 +11,12 @@ This package depends on pytest and is imported by tests only. No engine module i
 test guards that. It provides no public configuration: the in-memory driver cannot be selected
 in a deployment.
 """
+
+import pytest
+
+# The checks are library modules, which pytest does not rewrite on its own; registered here, a
+# failing check shows the values it compared rather than a bare AssertionError.
+pytest.register_assert_rewrite(
+    "tensorrt_llm._torch.disaggregation.testing.driver_conformance",
+    "tensorrt_llm._torch.disaggregation.testing.broken_drivers",
+)
