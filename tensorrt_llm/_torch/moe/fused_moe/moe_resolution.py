@@ -631,6 +631,7 @@ def resolve_moe_impl(
         raise ValueError(
             f"MoE backend {requested} was requested with degradation disallowed "
             f"but cannot serve this layer{location}. {report.describe()}"
+            f" Each candidate's reason: {report.describe_rejections()}"
         )
 
     if winner_cls is None:

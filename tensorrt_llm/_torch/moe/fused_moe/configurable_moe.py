@@ -106,6 +106,10 @@ class ConfigurableMoE(MoE):
         aux_stream_dict: Auxiliary CUDA streams for overlap
         weight_loading_mode: Weight loading mode
         layer_idx: Layer index
+        accepts_global_routed_output: Under attention TP with
+            ``reduce_results=False``, take a ``FUSED_COMM`` backend's globally
+            combined output on every rank instead of a rank partial. Only for
+            callers that skip the routed all-reduce for such backends.
         **kwargs: Additional arguments
             - tune_max_num_tokens: Max tokens for profiling (passed to backend)
             - Other backend-specific arguments
@@ -159,6 +163,7 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"] = None,
         moe_cls: Optional[Type] = None,
         communication_method: Optional[str] = None,
+        accepts_global_routed_output: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -181,6 +186,7 @@ class ConfigurableMoE(MoE):
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
         self.communication_method = communication_method
+        self.accepts_global_routed_output = accepts_global_routed_output
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -412,6 +418,16 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
+
+    @property
+    def returns_global_routed_output(self) -> bool:
+        """True only for a ``FUSED_COMM`` backend whose caller opted in with
+        ``accepts_global_routed_output``; ``FusedCommMoEScheduler`` otherwise
+        hands back a rank partial under attention TP."""
+        return (
+            self.accepts_global_routed_output
+            and self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
 
     @property
     def num_fused_shared_expert(self) -> int:
