@@ -6893,15 +6893,15 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         local = self.layer_offsets[layer_idx]
         if local not in self.high_layers:
             return super().get_buffers(layer_idx, kv_layout)
-        layer, dtype, width = {
-            "low": (
-                local,
-                torch.uint8,
+        if mixed_precision_pool == "low":
+            layer, dtype = local, torch.uint8
+            width = (
                 self.get_layer_bytes_per_token(local, Role.KEY)
-                // self.num_kv_heads_per_layer[local],
-            ),
-            "high": (self.high_layers[local], self.dtype, self.head_dim_per_layer[local]),
-        }[mixed_precision_pool]
+                // self.num_kv_heads_per_layer[local]
+            )
+        else:
+            layer, dtype = self.high_layers[local], self.dtype
+            width = self.head_dim_per_layer[local]
         address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [
             self.impl.get_page_index_upper_bound(layer, Role.KEY) // self.kv_factor,

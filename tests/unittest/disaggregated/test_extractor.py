@@ -524,14 +524,13 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         ),
         pool_group_descs=[pg_desc],
     )
-    manager = SimpleNamespace(
+    return SimpleNamespace(
         impl=impl,
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
     )
-    return manager
 
 
 def test_v2_builder_stamps_homogeneous_pool_kinds():
