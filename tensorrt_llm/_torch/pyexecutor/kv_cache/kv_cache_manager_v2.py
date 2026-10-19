@@ -74,7 +74,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CacheLevel,
     CacheTier,
     CacheTierConfig,
-    CuError,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
@@ -87,6 +86,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
+    PoolRebalanceConfig,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -99,7 +99,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
@@ -481,9 +480,8 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
 class _KVCacheManagerInitStatus(IntEnum):
     # The numeric order is part of the allreduce(MAX) protocol: more severe
     # outcomes must have larger values.
-    KEEP_HOST = 0
-    USE_NO_HOST = 1
-    ABORT = 2
+    OK = 0
+    ABORT = 1
 
 
 def _sync_kv_cache_manager_init_status(
@@ -1743,7 +1741,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         else:
             init_error: Optional[Exception] = None
-            local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            local_init_status = _KVCacheManagerInitStatus.OK
             try:
                 candidate = KVCacheManagerPy(
                     config,
@@ -1751,11 +1749,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     cold_page_codec=create_cold_page_codec(config),
                 )
             except Exception as error:
-                if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
-                    local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
-                else:
-                    init_error = error.with_traceback(None)
-                    local_init_status = _KVCacheManagerInitStatus.ABORT
+                init_error = error.with_traceback(None)
+                local_init_status = _KVCacheManagerInitStatus.ABORT
 
             init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
 
@@ -1765,50 +1760,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 if init_error is not None:
                     raise init_error
                 raise RuntimeError("KV cache manager initialization failed on another rank")
-
-            if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
-                logger.warning(
-                    "At least one rank could not use the KV cache manager host tier "
-                    "(cuMemHostRegister may have failed). Rebuilding without the "
-                    "host cache tier on all ranks."
-                )
-                fallback_error: Optional[Exception] = None
-                try:
-                    if candidate is not None:
-                        candidate.shutdown()
-                    candidate = None
-                    config = replace(
-                        config,
-                        cache_tiers=[
-                            tier
-                            for tier in config.cache_tiers
-                            if not isinstance(tier, HostCacheTierConfig)
-                        ],
-                    )
-                    candidate = KVCacheManagerPy(
-                        config,
-                        event_manager=event_sink,
-                        cold_page_codec=create_cold_page_codec(config),
-                    )
-                except Exception as error:
-                    fallback_error = error.with_traceback(None)
-
-                local_fallback_status = (
-                    _KVCacheManagerInitStatus.USE_NO_HOST
-                    if fallback_error is None
-                    else _KVCacheManagerInitStatus.ABORT
-                )
-                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
-
-                if fallback_status == _KVCacheManagerInitStatus.ABORT:
-                    if candidate is not None:
-                        candidate.shutdown()
-                    if fallback_error is not None:
-                        raise fallback_error
-                    raise RuntimeError(
-                        "KV cache manager initialization without the host cache tier "
-                        "failed on another rank"
-                    )
 
         assert candidate is not None
         self.kv_cache_manager_py_config = config
@@ -1859,6 +1810,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
 
         self._allocated_draft_lens: dict[int, int] = {}
+
+        # Draft widths of generation allocations that update_resources has not
+        # reconciled yet, oldest first. Under the overlap scheduler step N+1 is
+        # allocated (and possibly reverted or padded) before step N's update,
+        # so the latest width in _allocated_draft_lens belongs to step N+1;
+        # update_resources must rewind step N by the width step N was given.
+        self._inflight_draft_lens: dict[int, list[int]] = {}
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -3049,6 +3007,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
             # radix hashing; BufferConfig.size above stays the physical page.
@@ -3083,6 +3042,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
+            pool_rebalance=PoolRebalanceConfig(
+                min_sampled_kv_caches=rebalance_cfg.min_sampled_kv_caches,
+                cooldown_secs=rebalance_cfg.cooldown_secs,
+                target_ratio_update_interval=rebalance_cfg.target_ratio_update_interval,
+                ratio_tolerance=rebalance_cfg.ratio_tolerance,
+                moving_average_decay=rebalance_cfg.moving_average_decay,
+            ),
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -3595,6 +3561,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # same step instead of skipping one.
             req.py_helix_decode_group_index += 1
         self._allocated_draft_lens[request_id] = draft_slots
+        self._inflight_draft_lens.setdefault(request_id, []).append(draft_slots)
         return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
@@ -3614,6 +3581,12 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
             return
+        # The reverted allocation is the newest in-flight one.
+        inflight = self._inflight_draft_lens.get(request_id)
+        if inflight:
+            inflight.pop()
+            if not inflight:
+                del self._inflight_draft_lens[request_id]
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
@@ -4067,6 +4040,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(target capacity {new_capacity})"
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
+        # The padding widens the newest in-flight allocation.
+        inflight = self._inflight_draft_lens.get(request.py_request_id)
+        if inflight:
+            inflight[-1] = current_draft_len
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
@@ -5702,6 +5679,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -6435,6 +6413,13 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            # This update reconciles the oldest in-flight allocation (this
+            # step's). Consume its width even when the resize below is
+            # skipped, so the next update reads the next step's width.
+            inflight = self._inflight_draft_lens.get(req.py_request_id)
+            step_draft_slots = inflight.pop(0) if inflight else None
+            if inflight is not None and not inflight:
+                del self._inflight_draft_lens[req.py_request_id]
             # In the overlap scheduler, the scheduler for iteration N+1
             # may suspend a gen request's KV cache (via self-eviction or
             # victim eviction) while iteration N's update_resources still
@@ -6444,14 +6429,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             accepted_draft_len = req.py_num_accepted_draft_tokens
             runtime_draft_len = req.py_rewind_len + accepted_draft_len
-            # No entry: this manager did not grow through the scheduler (e.g.
-            # disagg), so fall back to _generation_draft_slots' width.
-            allocated_draft_slots = self._allocated_draft_lens.get(
-                req.py_request_id,
-                max(runtime_draft_len, self._kv_reserve_draft_tokens)
-                if self.is_draft
-                else runtime_draft_len,
-            )
+            if step_draft_slots is not None:
+                # The width this step was allocated with. Under the overlap
+                # scheduler _allocated_draft_lens already holds step N+1's
+                # width; rewinding by that would free pages step N+1 is still
+                # writing whenever the draft width grows between steps.
+                allocated_draft_slots = step_draft_slots
+            else:
+                # No entry: this manager did not grow through the scheduler
+                # (e.g. disagg), so fall back to _generation_draft_slots' width.
+                allocated_draft_slots = self._allocated_draft_lens.get(
+                    req.py_request_id,
+                    max(runtime_draft_len, self._kv_reserve_draft_tokens)
+                    if self.is_draft
+                    else runtime_draft_len,
+                )
             # Reclaim every reserved slot that was not occupied by an accepted
             # draft token.
             rewind_len = max(allocated_draft_slots - accepted_draft_len, 0)

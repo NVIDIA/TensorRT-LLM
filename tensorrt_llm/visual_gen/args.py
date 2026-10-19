@@ -158,6 +158,17 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (1, 4, 1)),
             },
         }
+        # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
+        PRIMSTS_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -186,12 +197,18 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            sm_version = get_sm_version()
+            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
+                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
                     f"{sorted(recipes)}."
+                )
+            if q_config.smooth_k and q_config.q_block_size == 0:
+                raise ValueError(
+                    "smooth_k is a SageAttention option and does not apply to the per-tensor "
+                    f"recipe {recipe!r}."
                 )
         elif q_config.smooth_k:
             raise ValueError(
@@ -355,6 +372,21 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    tp_layout: Optional[Literal["replicated", "token_sharded"]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Activation layout between TP projections: 'replicated' (all-reduce TP; the default "
+            "when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each "
+            "all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires "
+            "tp_size > 1 and no ulysses/ring/attn2d."
+        ),
+    )
+
+    @property
+    def token_sharded_tp(self) -> bool:
+        """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
+        return self.tp_layout == "token_sharded"
 
     @property
     def seq_parallel_size(self) -> int:
@@ -395,6 +427,25 @@ class ParallelConfig(StrictBaseModel):
                     "async_ulysses forces SEPARATE_QKV which bypasses the "
                     "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
                     f"(got ring_size={self.ring_size})."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tp_layout(self) -> "ParallelConfig":
+        # async_ulysses is excluded transitively (it requires ulysses_size > 1).
+        if self.token_sharded_tp:
+            if self.tp_size == 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' requires tp_size > 1 "
+                    f"(got tp_size={self.tp_size}). Set tp_size > 1 or leave tp_layout unset."
+                )
+            if self.seq_parallel_size > 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' cannot be combined with "
+                    f"ulysses_size/ring_size/attn2d_size yet (got ulysses_size={self.ulysses_size}, "
+                    f"ring_size={self.ring_size}, attn2d_size={tuple(self.attn2d_size)}): both "
+                    "shard the token dimension of the transformer's residual stream. Use "
+                    "cfg_size x tp_size with the token-sharded layout, or unset tp_layout."
                 )
         return self
 

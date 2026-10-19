@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ void testRoundTrip(BufferManager& manager)
     auto outputCpu = manager.copyFrom(*inputGpu, MemoryType::kPINNEDPOOL);
     EXPECT_EQ(inputCpu.size(), outputCpu->getSize());
     manager.getStream().synchronize();
-    auto outputCpuTyped = bufferCast<T>(*outputCpu);
+    auto outputCpuTyped = outputCpu->template getBufferPtr<T>();
     for (size_t i = 0; i < inputCpu.size(); ++i)
     {
         EXPECT_EQ(inputCpu[i], outputCpuTyped[i]);
@@ -132,7 +132,7 @@ TEST_F(BufferManagerTest, Pointers)
     // This buffer is on the CPU for convenient testing. In real code, this would be on the GPU.
     auto pointers = mBufferManager->allocate(MemoryType::kCPU, batchSize, trtPointerType);
     // We cast to the correct C++ pointer type checking that the underlying storage type is int64_t.
-    auto pointerBuf = bufferCast<cppPointerType>(*pointers);
+    auto pointerBuf = pointers->getBufferPtr<cppPointerType>();
 
     // Create the GPU tensors.
     std::vector<ITensor::UniquePtr> tensors(batchSize);
@@ -142,7 +142,7 @@ TEST_F(BufferManagerTest, Pointers)
     for (auto i = 0u; i < batchSize; ++i)
     {
         tensors[i] = mBufferManager->allocate(MemoryType::kGPU, shape, TRTDataType<cppBaseType>::value);
-        pointerBuf[i] = bufferCast<cppBaseType>(*tensors[i]);
+        pointerBuf[i] = tensors[i]->getBufferPtr<cppBaseType>();
     }
 
     // Test that all pointers are valid
