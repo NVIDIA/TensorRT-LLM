@@ -30,6 +30,7 @@
 
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -359,12 +360,16 @@ void invokeDwdpFabricGatherTma(void* const* dsts, void const* const* srcs, int64
     TLLM_CHECK_WITH_INFO(dwdpFabricGatherTmaSupported(dev),
         "dwdp_fabric_gather (tma) needs SM90+ and %d bytes of opt-in shared memory per block", kDynamicSmemBytes);
 
-    // Opt in to more than 48 KB of dynamic shared memory, once per device.
-    static bool attrSet[kMaxDevices] = {};
-    if (dev >= 0 && dev < kMaxDevices && !attrSet[dev])
+    // Opt in to more than 48 KB of dynamic shared memory, once per device; call_once keeps concurrent
+    // first launches from different host threads race-free.
+    static std::once_flag attrOnce[kMaxDevices];
+    if (dev >= 0 && dev < kMaxDevices)
     {
-        TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmemBytes));
-        attrSet[dev] = true;
+        std::call_once(attrOnce[dev],
+            [kernel] {
+                TLLM_CUDA_CHECK(
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmemBytes));
+            });
     }
 
     // One elected thread drives the ring, so anything above kMaxThreads only costs launch slots.
