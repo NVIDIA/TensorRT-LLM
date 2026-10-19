@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.utils import ActivationType
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+    from .communication.nccl_ep import NcclEPWindow
     from .impl_base import MoEImplBase
     from .moe_load_balancer import SingleLayerMoeLoadBalancer
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
@@ -686,6 +687,7 @@ class MoECommPlan:
     recv_expert_count: Optional[torch.Tensor] = None
     deep_ep_expert_capacity: Optional[int] = None
     use_deep_ep_direct_metadata: bool = False
+    combine_window: Optional["NcclEPWindow"] = None
 
 
 @dataclass(frozen=True)

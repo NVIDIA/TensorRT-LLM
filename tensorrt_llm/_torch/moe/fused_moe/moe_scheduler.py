@@ -717,6 +717,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
             final_hidden_states = moe.comm.combine(
                 final_hidden_states,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
+                **(
+                    {"window": ctx.comm_plan.combine_window} if isinstance(moe.comm, NcclEP) else {}
+                ),
             )
         else:
             # Non-comm path: attention TP or single rank; only AllReduce if reduce_results
@@ -1104,6 +1107,31 @@ class ExternalCommMoEScheduler(MoEScheduler):
             output_dtype=output_dtype,
             do_finalize=do_finalize,
         )
+        combine_window = None
+        if (
+            isinstance(moe.comm, NcclEP)
+            and do_finalize
+            and moe.backend.supports_moe_output_in_alltoall_workspace()
+        ):
+            from tensorrt_llm.bindings.internal.thop import BufferKind
+
+            from .communication.nccl_ep import NcclEPWindow
+
+            comm = moe.comm
+            comm_ctx = comm._get_context()
+            if comm_ctx.window_buffers_supported and output_dtype in (None, torch.bfloat16):
+                output, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
+                    comm_ctx.output_tokens_buf,
+                    int(BufferKind.NCCL_WINDOW),
+                    comm.mapping.moe_ep_group,
+                    [comm.max_recv_tokens, comm.hidden_size],
+                    torch.bfloat16,
+                )
+                if kind == int(BufferKind.NCCL_WINDOW) and handle:
+                    moe_output = output
+                    combine_window = NcclEPWindow(
+                        handle, output.data_ptr(), output.numel(), output.dtype, output.device
+                    )
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
@@ -1119,6 +1147,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             input_sf_swizzled=not supports_post_quant,
             enable_alltoall=moe.enable_alltoall,
             moe_output=moe_output,
+            combine_window=combine_window,
             payload_in_workspace=payload_in_workspace,
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,

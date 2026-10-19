@@ -28,6 +28,8 @@
 
 #include "tensorrt_llm/thop/outputTensor.h"
 
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/custom_class.h>
 #include <torch/extension.h>
 
 #include <vector>
@@ -36,6 +38,88 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+
+//! A context-owned checkout, independent of operation-scoped tensor leases.
+//! Construction and release must occur in identical rank order outside capture.
+//! Before use, callers must drain prior users on every rank. Before release,
+//! callers must drain all users on every rank and retire graphs using this tensor.
+class NCCLWindowReservation : public torch::CustomClassHolder
+{
+public:
+    NCCLWindowReservation(at::Tensor like, std::vector<int64_t> group)
+        : mTensor(like)
+    {
+        TORCH_CHECK(like.is_cuda(), "NCCL window reservations require a CUDA tensor");
+        c10::cuda::CUDAGuard const guard(like.device());
+        cudaStreamCaptureStatus status{};
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream().stream(), &status));
+        TORCH_CHECK(status == cudaStreamCaptureStatusNone, "Reserve NCCL windows before CUDA graph capture");
+#if ENABLE_MULTI_DEVICE
+        std::set<int> const ranks(group.begin(), group.end());
+        mComm = getComm(ranks);
+        if (!mComm || !*mComm)
+        {
+            return;
+        }
+        mBuffer = common::nccl_util::NCCLWindowAllocator::getInstance().requestBuffer(
+            *mComm, like.nbytes(), at::cuda::getCurrentCUDAStream().stream());
+        if (mBuffer.isValid())
+        {
+            // Deliberately do not register a temporary tensor lease. The reservation
+            // owns the checkout; tensor views cannot transfer it to a module scope.
+            mTensor = torch::from_blob(mBuffer.ptr, like.sizes(), [comm = mComm](void*){}, like.options());
+        }
+#endif
+    }
+
+    ~NCCLWindowReservation() override
+    {
+#if ENABLE_MULTI_DEVICE
+        if (mBuffer.isValid())
+        {
+            // Missing explicit release must never make storage eligible via GC timing.
+            common::nccl_util::NCCLWindowAllocator::getInstance().releaseBufferFromDestructor(
+                *mComm, mBuffer.ptr, mBuffer.leaseId);
+        }
+#endif
+    }
+
+    at::Tensor tensor() const
+    {
+        return mTensor;
+    }
+
+    int64_t window() const
+    {
+#if ENABLE_MULTI_DEVICE
+        return static_cast<int64_t>(reinterpret_cast<uintptr_t>(mBuffer.window));
+#else
+        return 0;
+#endif
+    }
+
+    //! Release after the caller's collective quiescence boundary; idempotent.
+    void release()
+    {
+#if ENABLE_MULTI_DEVICE
+        if (mBuffer.isValid())
+        {
+            c10::cuda::CUDAGuard const guard(mTensor.device());
+            common::nccl_util::NCCLWindowAllocator::getInstance().releaseBuffer(
+                *mComm, mBuffer.ptr, at::cuda::getCurrentCUDAStream().stream());
+            mBuffer = {};
+        }
+#endif
+        mTensor = at::Tensor();
+    }
+
+private:
+    at::Tensor mTensor;
+#if ENABLE_MULTI_DEVICE
+    std::shared_ptr<ncclComm_t> mComm;
+    common::nccl_util::NCCLWindowBuffer mBuffer{};
+#endif
+};
 
 std::tuple<at::Tensor, int64_t> allocateOutputOp(at::Tensor const& like, int64_t output_buffer_kind,
     c10::optional<torch::List<int64_t>> group, c10::optional<at::IntArrayRef> shape,
@@ -93,6 +177,11 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.class_<tensorrt_llm::torch_ext::NCCLWindowReservation>("NCCLWindowReservation")
+        .def(torch::init<at::Tensor, std::vector<int64_t>>())
+        .def("tensor", &tensorrt_llm::torch_ext::NCCLWindowReservation::tensor)
+        .def("window", &tensorrt_llm::torch_ext::NCCLWindowReservation::window)
+        .def("release", &tensorrt_llm::torch_ext::NCCLWindowReservation::release);
     m.def(
         "allocate_output(Tensor like, int output_buffer_kind, int[]? group, "
         "int[]? shape=None, ScalarType? out_dtype=None) -> (Tensor, int)");

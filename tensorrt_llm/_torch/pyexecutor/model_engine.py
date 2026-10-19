@@ -1268,6 +1268,21 @@ class ModelEngine:
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
+    def _release_nccl_ep_communications(self) -> None:
+        """Release this model's EP handles after graphs and GPU work are drained."""
+        from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import \
+            NcclEP
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        released = set()
+        for module in model.modules():
+            comm = getattr(module, "comm", None)
+            if isinstance(comm, NcclEP) and id(comm) not in released:
+                comm.destroy()
+                released.add(id(comm))
+
     def _release_model_owned_cuda_graphs(
         self,
         *,

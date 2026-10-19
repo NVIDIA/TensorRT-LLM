@@ -1019,3 +1019,41 @@ needed for pure scratch. The replacement is allocated before releasing the old
 block so a small allocation does not split and pin the burst-sized segment;
 on allocation OOM, release the old scratch and retry without requiring extra
 headroom. Do not count individual layer/chunk calls as forwards.
+
+### NCCL-EP registered dispatch destinations
+
+NCCL-EP LL dispatch can write directly into peer receive windows. Local stream
+ordering alone does not make such a destination reusable: a peer can reach the
+next dispatch while this rank is still reading an earlier allocation.
+
+The shared NCCL-EP context holds a pool reservation for its dispatch receive
+window. The reservation is not a temporary tensor lease, so module scopes and
+graph-owner release cannot return it to the general pool. Acquisition occurs
+before capture, followed by device synchronization and an EP-rank barrier to
+drain any prior pool users before remote writes begin. Every rank must acquire
+reservations in identical order. The same address is used by eager execution
+and all serialized graph replays for this context.
+
+The supported ordering is dispatch, all receive-buffer consumers, combine,
+then the next dispatch. Auxiliary-stream consumers must join the combine stream
+first. Correct reuse also requires NCCL-EP's peer signaling to order those
+consumers before subsequent remote writes; a synchronization somewhere inside
+dispatch or combine is not by itself sufficient. The reservation isolates
+storage but does not introduce a destination-readiness protocol.
+Combine is not a barrier for work queued after it. Do not retain dispatch
+outputs for later reads, issue another dispatch without combine, or overlap
+operations/replays sharing an EP group. A graph-pool owner isolates allocations;
+it does not add execution dependencies between graph replays.
+
+A reservation miss uses the persistent unregistered dispatch buffer; NCCL-EP
+stages the incoming payload and copies it locally in stream order. Combine
+inputs can still use ordinary operation-scoped window leases: the pinned LL
+implementation reads these inputs locally before sending to internal staging.
+
+At final context teardown, all local streams are synchronized and EP ranks
+rendezvous before the reservation is explicitly released. Graphs referencing
+the context must be retired first. No synchronization or acquisition is added
+to dispatch, combine, or replay. Registered storage remains owned by the pool;
+the context neither registers nor deregisters it. Fixed receive addresses also
+avoid rotation when a backend binds its outputs at handle creation, but future
+NCCL-EP implementations still require an ordering audit.
