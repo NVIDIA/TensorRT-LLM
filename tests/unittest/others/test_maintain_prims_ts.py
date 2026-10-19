@@ -385,7 +385,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
 
 
 def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
-    world: World, capsys: pytest.CaptureFixture
+    world: World, capfd: pytest.CaptureFixture
 ) -> None:
     assert (
         m.main(
@@ -409,7 +409,7 @@ def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
         )
         == 0
     )
-    assert "DRY RUN" in capsys.readouterr().out
+    assert "DRY RUN" in capfd.readouterr().out
     assert all(method == "GET" for method, _, _ in world.calls)
     assert not any(args[0] in ("push", "commit", "worktree") for args in world.git_calls)
     plan = m._make_plan(world.args(), world)
@@ -1035,7 +1035,7 @@ def test_canonical_branch_name_on_developer_fork(world: World, same_fork: bool) 
     assert actual == {**plan.reviewed.to_mapping(), "url": plan.previous.url}
 
 
-def test_unpaired_cli_dry_run(world: World, capsys: pytest.CaptureFixture) -> None:
+def test_unpaired_cli_dry_run(world: World, capfd: pytest.CaptureFixture) -> None:
     assert (
         m.main(
             [
@@ -1058,7 +1058,7 @@ def test_unpaired_cli_dry_run(world: World, capsys: pytest.CaptureFixture) -> No
         )
         == 0
     )
-    assert '"refresh_policy": "retain"' in capsys.readouterr().out
+    assert '"refresh_policy": "retain"' in capfd.readouterr().out
     assert not any(args[0] == "push" for args in world.git_calls)
 
 
@@ -1086,14 +1086,14 @@ def test_canonical_branch_must_be_explicit_and_match(world: World, branch: str) 
 
 
 def test_completed_promotion_ignores_later_live_state(
-    world: World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    world: World, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture
 ) -> None:
     world.state = "CLEAN"
     args = world.args(publish=True, auto_merge=True)
     plan = m._make_plan(args, world)
     m._publish(args, world, plan)
     merged = world.main
-    assert f"Squash commit: {merged}" in capsys.readouterr().out
+    assert f"Squash commit: {merged}" in capfd.readouterr().out
     _git(world.consumer, "switch", "--detach", world.main)
     _write(world.consumer, "later.txt", "later main commit\n")
     world.main = _commit(world.consumer, "later main update")
