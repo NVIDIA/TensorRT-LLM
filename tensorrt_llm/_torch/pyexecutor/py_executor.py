@@ -413,36 +413,42 @@ class PyExecutor:
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
     def __init__(
-            self,
-            resource_manager,
-            scheduler: RequestScheduler,
-            model_engine: ModelEngine,
-            sampler: Sampler,
-            dist: Distributed,
-            max_num_sequences: int,
-            drafter: Optional[Drafter] = None,
-            disable_overlap_scheduler: bool = False,
-            enable_early_first_token_response: bool = False,
-            max_input_len: int = 0x7fffffff,
-            max_batch_size: int = 8,
-            max_beam_width: int = 1,
-            max_draft_len: int = 0,
-            max_total_draft_tokens: int = 0,
-            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-            guided_decoder: Optional[GuidedDecoder] = None,
-            garbage_collection_gen0_threshold: Optional[int] = None,
-            start_worker: bool = True,
-            kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-            resource_governor_queue=None,
-            max_seq_len: Optional[int] = None,
-            peft_cache_config: Optional[PeftCacheConfig] = None,
-            virtual_memory_pools: Optional[dict] = None,
-            hang_detection_timeout: Optional[int] = None,
-            execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-            adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None,
-            enable_kv_pool_rebalance: bool = False):
+        self,
+        resource_manager,
+        scheduler: RequestScheduler,
+        model_engine: ModelEngine,
+        sampler: Sampler,
+        dist: Distributed,
+        max_num_sequences: int,
+        drafter: Optional[Drafter] = None,
+        disable_overlap_scheduler: bool = False,
+        enable_early_first_token_response: bool = False,
+        max_input_len: int = 0x7fffffff,
+        max_batch_size: int = 8,
+        max_beam_width: int = 1,
+        max_draft_len: int = 0,
+        max_total_draft_tokens: int = 0,
+        kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+        guided_decoder: Optional[GuidedDecoder] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
+        start_worker: bool = True,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        resource_governor_queue=None,
+        max_seq_len: Optional[int] = None,
+        peft_cache_config: Optional[PeftCacheConfig] = None,
+        virtual_memory_pools: Optional[dict] = None,
+        hang_detection_timeout: Optional[int] = None,
+        execution_stream: Optional[torch.cuda.Stream] = None,
+        waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+        adp_router: Optional[ADPRouter] = None,
+        dwdp_manager: Optional[DwdpManager] = None,
+        enable_kv_pool_rebalance: bool = False,
+        kv_pool_rebalance_check_interval: int = KV_POOL_REBALANCE_CHECK_INTERVAL
+    ):
+        if kv_pool_rebalance_check_interval <= 0:
+            raise ValueError(
+                "kv_pool_rebalance_check_interval must be positive, got "
+                f"{kv_pool_rebalance_check_interval}")
         super(PyExecutor, self).__init__()
         self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
@@ -555,7 +561,7 @@ class PyExecutor:
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
-        self._rebalance_check_interval = KV_POOL_REBALANCE_CHECK_INTERVAL
+        self._rebalance_check_interval = kv_pool_rebalance_check_interval
         # Countdown of drain iterations remaining before a pipeline-parallel
         # rebalance can run; None when no rebalance is pending.  Only
         # _executor_loop_pp uses it -- see _start_pp_rebalance_drain.
@@ -3213,7 +3219,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
-                if not can_queue:
+                    self._finalize_adp_dummy_allocation(False)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -4073,6 +4079,21 @@ class PyExecutor:
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         if cross_kv_cache_manager is not None:
             cross_kv_cache_manager.update_context_resources(scheduled_batch)
+
+    def _terminate_attention_dp_dummy_requests(self) -> None:
+        """Terminate every local attention-DP dummy without assuming its position.
+
+        Requests activated after the dummy was appended can follow it in
+        ``active_requests``; a dummy left behind keeps its KV cache and blocks
+        the next iteration from padding again.
+        """
+        for request in list(self.active_requests):
+            if not request.is_attention_dp_dummy:
+                continue
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -6702,8 +6723,14 @@ class PyExecutor:
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
-            total_num_active_requests = len(active_requests)
-            total_num_live_requests = total_num_active_requests
+            total_num_live_requests = len(active_requests)
+            total_num_active_requests = total_num_live_requests
+            if self.adp_router.exclude_retiring_requests:
+                # Retiring requests hold a seat from the overlap headroom, not
+                # one that admission hands out (see
+                # should_enable_overlap_headroom). They still count as live.
+                total_num_active_requests -= count_retiring_requests(
+                    active_requests)
             all_ranks_num_active_requests = None
             all_rank_states = None
 
@@ -8473,14 +8500,8 @@ class PyExecutor:
             strip_mm_data_for_generation(mm_data)
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
-        # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        # handle potential attention dp dummy requests
+        self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests

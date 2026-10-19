@@ -92,7 +92,7 @@ class TestCaptureReplayStaticTensors:
         """
         batch_size = 1
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=use_mrope)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
 
         # Identity, not equality, is what replay() checks against the
@@ -136,7 +136,7 @@ class TestCaptureReplayStaticTensors:
         in the static input buffer."""
         batch_size = 4
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=use_mrope, max_num_tokens=128)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = object()
 
@@ -165,7 +165,7 @@ class TestCaptureReplayStaticTensors:
         """
         batch_size = 4
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=use_mrope, max_num_tokens=128)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = object()
 
@@ -203,7 +203,7 @@ class TestCaptureReplayStaticTensors:
         """
         batch_size = 4
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=True, max_num_tokens=128)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = object()
 
@@ -232,7 +232,7 @@ class TestCaptureReplayStaticTensors:
         """
         batch_size = 1
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=True)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = object()
         dummy_seq_slot = runner.config.max_num_tokens * runner.config.mapping.pp_size
@@ -268,7 +268,7 @@ class TestCaptureReplayStaticTensors:
         """
         batch_size = 1
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=True)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = object()
         dummy_seq_slot = runner.config.max_num_tokens * runner.config.mapping.pp_size
@@ -307,7 +307,7 @@ class TestCaptureReplayStaticTensors:
         """
         batch_size = 1
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=False)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = object()
 
@@ -367,7 +367,7 @@ class TestStrictBufferCheck:
         monkeypatch.setattr(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", True)
         batch_size = 1
         runner = create_mock_cuda_graph_runner(batch_size)
-        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = _MetadataStub(value)
         input_ids = torch.zeros((num_tokens,), device="cuda", dtype=torch.int32)
