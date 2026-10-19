@@ -202,33 +202,36 @@ std::string encodeHandshake(BounceHandshake const& handshake)
 bool decodeHandshake(std::string const& blob, BounceHandshake& out)
 {
     namespace su = tensorrt_llm::executor::serialize_utils;
-    std::istringstream is(blob);
-    auto const magic = su::deserialize<std::uint32_t>(is);
-    auto const formatVersion = su::deserialize<std::uint16_t>(is);
-    if (is.fail() || magic != kHandshakeMagic || formatVersion != kHandshakeFormatVersion)
+    try
     {
-        return false; // absent / foreign / future-format blob -> peer treated as non-bounce
+        std::istringstream is(blob);
+        auto const magic = su::deserialize<std::uint32_t>(is);
+        auto const formatVersion = su::deserialize<std::uint16_t>(is);
+        if (magic != kHandshakeMagic || formatVersion != kHandshakeFormatVersion)
+        {
+            return false; // absent / foreign / future-format blob -> peer treated as non-bounce
+        }
+        out.wireVersion = su::deserialize<std::uint16_t>(is);
+        out.controlKind = static_cast<BounceControlKind>(su::deserialize<std::uint8_t>(is));
+        out.arenaUsableCapacityBytes = su::deserialize<std::uint64_t>(is);
+        out.maxChunkSizeBytes = su::deserialize<std::uint64_t>(is);
+        out.requestTimeoutMs = su::deserialize<std::int32_t>(is);
+        auto const endpointLen = su::deserialize<std::size_t>(is);
+        // The endpoint is the final field, so its length must equal exactly the bytes left in the blob.
+        // Bounding it here keeps the "malformed blob -> false" contract: handing a corrupt 64-bit length
+        // to std::string would throw (length_error/bad_alloc) out of a peer-input path instead.
+        auto const consumed = static_cast<std::size_t>(is.tellg());
+        if (endpointLen != blob.size() - consumed)
+        {
+            return false;
+        }
+        out.endpoint = blob.substr(consumed);
+        return true;
     }
-    out.wireVersion = su::deserialize<std::uint16_t>(is);
-    out.controlKind = static_cast<BounceControlKind>(su::deserialize<std::uint8_t>(is));
-    out.arenaUsableCapacityBytes = su::deserialize<std::uint64_t>(is);
-    out.maxChunkSizeBytes = su::deserialize<std::uint64_t>(is);
-    out.requestTimeoutMs = su::deserialize<std::int32_t>(is);
-    auto const endpointLen = su::deserialize<std::size_t>(is);
-    if (is.fail())
+    catch (tensorrt_llm::common::TllmException const&)
     {
-        return false; // truncated fixed fields (deserialize on a failed stream yields garbage)
+        return false; // Malformed serialized fields mean the peer is not bounce-capable.
     }
-    // The endpoint is the final field, so its length must equal exactly the bytes left in the blob.
-    // Bounding it here keeps the "malformed blob -> false" contract: handing a corrupt 64-bit length
-    // to std::string would throw (length_error/bad_alloc) out of a peer-input path instead.
-    auto const consumed = static_cast<std::size_t>(is.tellg());
-    if (endpointLen != blob.size() - consumed)
-    {
-        return false;
-    }
-    out.endpoint = blob.substr(consumed);
-    return true;
 }
 
 bool decodeWant(std::string const& blob, BounceMsgHeader const& header, std::vector<std::uint32_t>& outChunkBytes,
