@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.speculative import dflash
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 
 pytestmark = pytest.mark.skipif(
@@ -48,8 +49,13 @@ def _worker(lengths):
         _ctx_len=torch.tensor(lengths, dtype=torch.long, device="cuda"),
         _ctx_len_host=list(lengths),
         _batch_to_slot=torch.zeros(8, dtype=torch.long, device="cuda"),
+        # TLLM_DFLASH_PREFILL_CTX_SNAPSHOT state: not bound to the draft pool.
+        _ctx_offsets_src=None,
+        _ctx_counts_snapshot=None,
+        _ctx_block_tables=None,
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
+    w._snapshot_ctx_block_counts = partial(DFlashWorker._snapshot_ctx_block_counts, w)
     w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)
     w._assign_slot = lambda rid, *a, **k: None
     return w
@@ -70,7 +76,14 @@ def _cuda(values):
     return torch.tensor(values, dtype=torch.long, device="cuda")
 
 
-def test_padded_steps_keep_the_dummy_slot_empty():
+@pytest.fixture(params=[False, True], ids=["ctx-snapshot-off", "ctx-snapshot-on"])
+def prefill_ctx_snapshot(request, monkeypatch):
+    """prepare() with and without TLLM_DFLASH_PREFILL_CTX_SNAPSHOT."""
+    monkeypatch.setattr(dflash, "_PREFILL_CTX_SNAPSHOT", request.param)
+    return request.param
+
+
+def test_padded_steps_keep_the_dummy_slot_empty(prefill_ctx_snapshot):
     worker = _worker([40, 300, 7, 0, 0])
     # Three requests in a graph of five.
     _prepare(worker, [11, 12, 13, FLOOR + 1, FLOOR + 1], num_generations=5)
@@ -102,7 +115,7 @@ def test_dummy_slot_reset_replays_in_a_cuda_graph():
         assert worker._ctx_len.tolist() == [40 + 2 * step, 300 + 3 * step, 7, 0, 0], step
 
 
-def test_prepare_resets_only_evicted_slots():
+def test_prepare_resets_only_evicted_slots(prefill_ctx_snapshot):
     worker = _worker([40, 300, 7, 0, 96])
     written = []
     write = worker._write_ctx_len
@@ -117,3 +130,5 @@ def test_prepare_resets_only_evicted_slots():
     assert written == [{}, {1: 0}]
     assert worker._ctx_len.tolist() == [40, 0, 7, 0, 96]
     assert 1 in worker._free_slots and 12 not in worker._req_to_slot
+    # Generation-only steps take no snapshot.
+    assert worker._ctx_counts_snapshot is None
