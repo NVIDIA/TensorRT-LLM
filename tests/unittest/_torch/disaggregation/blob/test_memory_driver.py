@@ -557,7 +557,16 @@ class TestMemoryDriver:
 
     def test_a_blocked_probe_holds_drain_until_the_store_answers(self) -> None:
         store = GatedStore(held={KEY_A})
-        driver = self.make(store)
+        base = self.driver_cls
+
+        class BudgetEndsAtTheGate(base):  # type: ignore[misc,valid-type]
+            # The wait ends once the worker is stuck at the gate, not after a wall-clock budget:
+            # by then B is answered and A, C are not, whatever the scheduler did.
+            def _wait_probe(self, finished: threading.Event, budget_s: float) -> bool:
+                assert store.waiting.wait(TIMEOUT), "the probe worker never reached the gate"
+                return False  # as if the budget had run out
+
+        driver = BudgetEndsAtTheGate(store)
         self._publish(driver, {"B": b"bbbbbbbb"})
         store.gate.clear()
         try:

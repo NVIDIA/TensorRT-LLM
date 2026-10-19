@@ -347,7 +347,7 @@ class MemoryDriver:
             self._probes.append(_Probe(worker, finished))
             self._probe_workers.append(worker)
             worker.start()
-        if finished.wait(budget_s):
+        if self._wait_probe(finished, budget_s):
             worker.join()  # it is exiting; leave no thread behind a call that got its answer
         if errors:
             raise errors[0]
@@ -551,6 +551,11 @@ class MemoryDriver:
 
     def _probe_slot_free(self) -> bool:
         return len(self._probes) < MAX_PROBES_IN_FLIGHT
+
+    def _wait_probe(self, finished: threading.Event, budget_s: float) -> bool:
+        """Waits for the probe worker up to the budget; True when it finished in time. A test
+        that must not depend on scheduling overrides this to end the wait on its own signal."""
+        return finished.wait(budget_s)
 
     def _start_draining(self) -> None:
         self._draining = True
