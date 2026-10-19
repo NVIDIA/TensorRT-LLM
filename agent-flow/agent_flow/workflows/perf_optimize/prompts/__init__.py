@@ -2,7 +2,10 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from agent_flow.workflows.perf_analyze.prompts import build_remote_execution_context
+from agent_flow.workflows.perf_analyze.prompts import (
+    PROMPTS_DIRNAME,
+    build_remote_execution_context,
+)
 from agent_flow.workflows.perf_analyze.prompts._common import CASEBOOK_DISABLED
 
 from ._common import (
@@ -246,6 +249,7 @@ __all__ = [
     "INTEGRATOR_SYSTEM_PROMPT",
     "OPTIMIZER_SYSTEM_PROMPT",
     "PROJECTOR_SYSTEM_PROMPT",
+    "PROMPTS_DIRNAME",
     "REMOTE_SLURM_EXECUTION",
     "PromptBundle",
     "QA_SYSTEM_PROMPT",

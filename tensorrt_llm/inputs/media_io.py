@@ -284,6 +284,81 @@ def _load_and_convert_image(image):
     return convert_image_mode(image, "RGB")
 
 
+def _jpeg_frame_header(data: bytes) -> Optional[Tuple[int, int, int, int]]:
+    """Return ``(precision, height, width, components)`` of a common JPEG frame.
+
+    Only accepts the APPn, COM, DQT, DHT, and DRI segments that may precede a
+    baseline, extended, or progressive Huffman frame header. Any other layout
+    returns ``None`` so that Pillow keeps handling it.
+    """
+    if data[:2] != b"\xff\xd8":
+        return None
+    pos = 2
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker == 0xFF:  # Fill byte before a marker.
+            pos += 1
+            continue
+        length = int.from_bytes(data[pos + 2 : pos + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):  # SOF0/SOF1/SOF2 (baseline, extended, progressive).
+            if length < 8 or pos + 10 > len(data):
+                return None
+            return (
+                data[pos + 4],
+                int.from_bytes(data[pos + 5 : pos + 7], "big"),
+                int.from_bytes(data[pos + 7 : pos + 9], "big"),
+                data[pos + 9],
+            )
+        # APP0-APP15, DHT, DQT, DRI, COM.
+        if length < 2 or not (0xE0 <= marker <= 0xEF or marker in (0xC4, 0xDB, 0xDD, 0xFE)):
+            return None
+        pos += 2 + length
+    return None
+
+
+def _decode_jpeg_image(data: bytes) -> Optional[torch.Tensor]:
+    """Decode an 8-bit RGB or grayscale JPEG to a uint8 RGB ``(3, H, W)`` tensor.
+
+    torchvision decodes straight into a tensor, and `_jpeg_frame_header`
+    stands in for a Pillow header parse, which would hold the GIL. Like the
+    Pillow path, EXIF orientation is not applied.
+
+    Returns ``None`` for every other input, including images larger than
+    ``Image.MAX_IMAGE_PIXELS``, so the caller keeps the Pillow path and its
+    decompression-bomb check.
+    """
+    header = _jpeg_frame_header(data)
+    if header is None:
+        return None
+    precision, height, width, components = header
+    max_pixels = Image.MAX_IMAGE_PIXELS
+    if (
+        precision != 8
+        or components not in (1, 3)
+        or height == 0
+        or width == 0
+        or (max_pixels is not None and height * width > max_pixels)
+    ):
+        return None
+
+    from torchvision.io import ImageReadMode, decode_image
+
+    try:
+        decoded = decode_image(
+            torch.frombuffer(bytearray(data), dtype=torch.uint8),
+            mode=ImageReadMode.UNCHANGED,
+            apply_exif_orientation=False,
+        )
+    except RuntimeError:
+        # Let Pillow decode the input or raise its usual error.
+        return None
+    if decoded.shape[0] != components:
+        return None
+    return decoded.expand(3, -1, -1) if components == 1 else decoded
+
+
 def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
     """Convert a PyAV audio frame to a NumPy array, averaging channels if mono."""
     chunk = frame.to_ndarray()
@@ -957,13 +1032,32 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
             return np.asarray(image)
         return image
 
+    def _postprocess_decoded(self, image: torch.Tensor) -> Union[torch.Tensor, np.ndarray]:
+        """Match `_postprocess` for a uint8 RGB ``(3, H, W)`` tensor.
+
+        Keeps torch calls to a minimum: each one releases and re-acquires the
+        GIL, which is slow while other threads are running Python code.
+        """
+        if self._format == "np":
+            # torchvision decodes into an HWC buffer, so RGB needs no copy here.
+            return np.ascontiguousarray(image.numpy().transpose(1, 2, 0))
+        return (
+            image.to(dtype=torch.get_default_dtype(), memory_format=torch.contiguous_format)
+            .div_(255)
+            .to(device=self._device)
+        )
+
     def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
+        if self._format in ("np", "pt"):
+            decoded = _decode_jpeg_image(data)
+            if decoded is not None:
+                return self._postprocess_decoded(decoded)
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
     def load_base64(
         self, media_type: str, data: str
     ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
+        return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))

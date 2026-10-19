@@ -147,6 +147,9 @@ class StubTransformer(nn.Module):
         self.device = torch.device("cpu")
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_real_text_lens = None
+        self.cached_real_text_lens_host = None
+        self.cached_text_lengths_uniform = None
         self.calls = []
         self.reset_calls = 0
 
@@ -154,10 +157,13 @@ class StubTransformer(nn.Module):
         self.reset_calls += 1
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_real_text_lens = None
+        self.cached_real_text_lens_host = None
+        self.cached_text_lengths_uniform = None
 
     def forward(self, *, hidden_states, timestep, raw_timestep, text_ids, text_mask, **kwargs):
-        del text_mask
         token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
+        real_text_lens = text_mask.sum(dim=1).to(device="cpu", dtype=torch.int32)
         control_latents = kwargs.get("control_latents")
         offload_context = kwargs.get("offload_context")
         torch.testing.assert_close(timestep, raw_timestep / self.calls_num_train_timesteps)
@@ -166,12 +172,18 @@ class StubTransformer(nn.Module):
                 "token": token,
                 "has_control": control_latents is not None,
                 "offload_context": offload_context,
+                "real_text_lens": real_text_lens.tolist(),
             }
         )
         if self.cached_kv is None:
             marker = torch.tensor([token], dtype=torch.float32)
             self.cached_kv = [(marker, marker + 100)]
             self.cached_freqs_gen = (marker + 200, marker + 300)
+            self.cached_real_text_lens = real_text_lens
+            self.cached_real_text_lens_host = [int(length) for length in real_text_lens.tolist()]
+            self.cached_text_lengths_uniform = True
+        else:
+            torch.testing.assert_close(self.cached_real_text_lens, real_text_lens)
         control_bonus = 100 if control_latents is not None else 0
         video = torch.full_like(hidden_states, float(token + control_bonus))
         return TransformerOutput(video=video, image=video)
@@ -786,6 +798,26 @@ class TestDiffuseTransferCFG:
             (2, True),
         ]
         torch.testing.assert_close(result, torch.full_like(latents, 508.0))
+
+    def test_restores_text_lengths_with_each_branch_cache(self):
+        pipeline = _make_pipeline()
+        self._run(
+            pipeline,
+            timesteps=[7, 3],
+            guidance_scale=3.0,
+            control_guidance=1.0,
+            cond_ids=torch.tensor([[2, 2]], dtype=torch.long),
+            cond_mask=torch.tensor([[1, 1]], dtype=torch.long),
+            uncond_ids=torch.tensor([[1, 0]], dtype=torch.long),
+            uncond_mask=torch.tensor([[1, 0]], dtype=torch.long),
+        )
+
+        assert [call["real_text_lens"] for call in pipeline.transformer.calls] == [
+            [2],
+            [1],
+            [2],
+            [1],
+        ]
 
 
 # =============================================================================

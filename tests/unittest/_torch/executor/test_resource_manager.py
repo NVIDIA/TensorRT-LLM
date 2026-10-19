@@ -1180,6 +1180,59 @@ class TestResourceManager(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+class TestKVCacheManagerConnectorReporting(unittest.TestCase):
+    """Which allocations the V1 manager reports to an attached connector."""
+
+    @staticmethod
+    def _make_manager(connector) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.is_draft = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.kv_connector_manager = connector
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        manager.get_cache_indices = MagicMock(return_value=[4, 5])
+        return manager
+
+    @staticmethod
+    def _context_batch() -> ScheduledRequests:
+        request = SimpleNamespace(py_request_id=1,
+                                  prompt_len=64,
+                                  py_beam_width=1,
+                                  py_draft_tokens=[],
+                                  is_first_context_chunk=True,
+                                  is_last_context_chunk=True)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_a_fresh_allocation_is_reported(self):
+        connector = MagicMock(capacity_only=False)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        connector.update_state_after_alloc.assert_called_once()
+        self.assertEqual(connector.update_state_after_alloc.call_args.args[1],
+                         [4, 5])
+
+    def test_a_capacity_only_connector_is_told_of_no_allocation(self):
+        """It cannot reach these blocks, so gathering indices is wasted."""
+        connector = MagicMock(capacity_only=True)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        manager.get_cache_indices.assert_not_called()
+        connector.update_state_after_alloc.assert_not_called()
+
+
+@pytest.mark.cpu_only
 class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
 
     @staticmethod

@@ -149,11 +149,16 @@ def build_perf_analyze_prompts(
     return bundle
 
 
+# Where the CLI snapshots the composed prompts inside the workspace.
+PROMPTS_DIRNAME = "prompts"
+
+
 __all__ = [
     "ANALYZER_SYSTEM_PROMPT",
     "BENCHMARKER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",
     "PROJECTOR_SYSTEM_PROMPT",
+    "PROMPTS_DIRNAME",
     "PromptBundle",
     "REPORTER_SYSTEM_PROMPT",
     "build_remote_execution_context",

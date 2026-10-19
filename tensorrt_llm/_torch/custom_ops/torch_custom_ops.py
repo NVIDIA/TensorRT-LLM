@@ -37,7 +37,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig, autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
@@ -48,8 +49,8 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
 from ..modules.multi_stream_utils import do_multi_stream
-from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+from ..modules.swiglu import silu_and_mul_2in_kernel, silu_and_mul_kernel
+from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
@@ -59,6 +60,10 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
+
+if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4RubinLinear
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -280,6 +285,7 @@ def fused_moe(
     gated_slot_lora_ranks: Optional[torch.Tensor] = None,
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -380,6 +386,7 @@ def fused_moe(
             fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
+    run_moe_args.append(swiglu_clamp_after_silu)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:
@@ -453,7 +460,8 @@ def _(input: torch.Tensor,
       fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
-      token_to_slot: Optional[torch.Tensor] = None):
+      token_to_slot: Optional[torch.Tensor] = None,
+      swiglu_clamp_after_silu: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
@@ -1307,6 +1315,42 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         """Check if this is the only backend in allowed_backends (explicitly forced)."""
         return self.allowed_backends == [backend_name]
 
+    def _get_cutedsl_runner(self,
+                            *,
+                            required: bool = False) -> Optional[TunableRunner]:
+        """Select a CuTe DSL runner compatible with the device and output allocation."""
+        sm_version = get_sm_version()
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            error = "CuteDSL backend is not available. Please check CuteDSL installation."
+        elif sm_version in (100, 103):
+            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
+                                               self.output_buffer_kind,
+                                               self.group)
+        elif sm_version == 107:
+            if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+                error = "CuteDSL NVFP4 SM107 backend requires Rubin CuTe DSL support."
+            elif self.output_dtype != torch.bfloat16:
+                error = "CuteDSL NVFP4 SM107 backend only supports bfloat16 output."
+            elif self.output_buffer_kind not in (int(BufferKind.DEFAULT),
+                                                 int(BufferKind.USERBUFFERS)):
+                error = (
+                    "CuteDSL NVFP4 SM107 backend only supports DEFAULT and "
+                    "USERBUFFERS output buffers.")
+            else:
+                return CuteDSLNVFP4RubinLinear(
+                    self.output_dtype,
+                    to_userbuffers=self.output_buffer_kind == int(
+                        BufferKind.USERBUFFERS))
+        else:
+            error = (
+                "CuteDSL NVFP4 backend requires SM 100 (B200), SM 103 (B300), "
+                f"or SM 107 (Rubin), but got SM {sm_version}.")
+
+        if required or self._is_only_backend("cutedsl"):
+            raise ValueError(error +
+                             " Please add other backends to allowed_backends.")
+        return None
+
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
                           **kwargs) -> List[Tuple[str, int]]:
@@ -1388,47 +1432,25 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
 
         # Add CuteDSL tactics if available
         if self._is_backend_allowed("cutedsl"):
-            if IS_CUTLASS_DSL_AVAILABLE:
-                # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
-                sm_version = get_sm_version()
-                if sm_version not in [100, 103]:
-                    if self._is_only_backend("cutedsl"):
-                        # Explicitly forced CuteDSL but SM version not supported
-                        raise ValueError(
-                            f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
-                            f"CuteDSL NVFP4 is not supported on this GPU architecture. "
-                            "Please add other backends to allowed_backends.")
-                else:
-                    # SM version OK, check if CuteDSL supports the current shape
-                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
-                        self.output_dtype)
-                    # get_valid_tactics ranks/prunes with nvMatmulHeuristics
-                    # internally when TRTLLM_CUTEDSL_NVMMH_ENABLE=1 (no-op
-                    # otherwise), so the returned list already reflects any
-                    # opt-in pruning before it enters the unified tactic list.
-                    cutedsl_tactics = cutedsl_runner.get_valid_tactics(
-                        inputs, profile)
-
-                    if cutedsl_tactics:
-                        # CuteDSL supports this shape
-                        tactics.extend([("cutedsl", tactic)
-                                        for tactic in cutedsl_tactics])
-                    elif self._is_only_backend("cutedsl"):
-                        # Explicitly forced CuteDSL but it doesn't support this shape
-                        m, n, k = inputs[0].shape[0], inputs[1].shape[
-                            0], inputs[0].shape[1] * 2
-                        raise ValueError(
-                            f"CuteDSL backend does not support the current shape:\n"
-                            f"  M={m}, N={n}, K={k}\n"
-                            f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
-                            f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
-                            f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
-                            f"Please add other backends to allowed_backends.")
-            elif self._is_only_backend("cutedsl"):
-                raise ValueError(
-                    "CuteDSL backend is not available. "
-                    "Please check CuteDSL installation or add other backends to allowed_backends."
-                )
+            cutedsl_runner = self._get_cutedsl_runner()
+            if cutedsl_runner is not None:
+                # The Blackwell runner applies opt-in nvMatmulHeuristics
+                # pruning before returning its tactics.
+                cutedsl_tactics = cutedsl_runner.get_valid_tactics(
+                    inputs, profile)
+                if cutedsl_tactics:
+                    tactics.extend([("cutedsl", tactic)
+                                    for tactic in cutedsl_tactics])
+                elif self._is_only_backend("cutedsl"):
+                    m, n, k = inputs[0].shape[0], inputs[1].shape[
+                        0], inputs[0].shape[1] * 2
+                    raise ValueError(
+                        f"CuteDSL backend does not support the current shape:\n"
+                        f"  M={m}, N={n}, K={k}\n"
+                        f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
+                        f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
+                        f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
+                        f"Please add other backends to allowed_backends.")
 
         return tactics
 
@@ -1476,11 +1498,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                            tactic=sub_tactic,
                                                            bias=bias)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
-                                               self.output_buffer_kind,
-                                               self.group)(inputs,
-                                                           tactic=sub_tactic,
-                                                           bias=bias)
+            cutedsl_runner = self._get_cutedsl_runner(required=True)
+            assert cutedsl_runner is not None
+            return cutedsl_runner(inputs, tactic=sub_tactic, bias=bias)
         elif backend == "marlin":
             return MarlinNVFP4Runner(self.output_buffer_kind,
                                      self.output_dtype)(inputs,
@@ -1507,7 +1527,7 @@ def nvfp4_gemm(
     This function automatically chooses the best backend from the allowed list:
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
-    - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
+    - CuteDSL: Blackwell/Rubin persistent kernels (when available and inputs are valid)
     - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
     - Marlin: Ada/Hopper W4A16 NVFP4 implementation (requires SM 89-99)
 
@@ -2074,8 +2094,6 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-# deep_gemm_gen_tuning_buckets is imported from ..utils
-
 _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
                                            "1") == "1"
 
@@ -2147,7 +2165,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # every process startup.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
     )
 
@@ -2195,9 +2213,12 @@ class fp8SwapABGemmRunner(TunableRunner):
 class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
     """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
 
+    # The same step-16 grid as the other two DeepGemm runners: a layout no
+    # bucket selects is compiled mid-inference instead, and DeepGemm forks
+    # nvcc while holding the GIL.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
@@ -2340,12 +2361,17 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The runner is used to trigger deepgemm jit during autotune.
+# The runner is used to trigger deepgemm jit during autotune. Only Hopper has
+# work to do: on SM100 this GEMM dispatches to TrtllmGenGemmRunner's prebuilt
+# cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
+    # Without exclude_from_cache, a warm disk cache short-circuits tuning and
+    # the JIT warmup never runs.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         tune_max_num_tokens=4096,
+        exclude_from_cache=True,
     )
 
     def get_valid_tactics(
@@ -2484,6 +2510,117 @@ def _(
 
     o_dtype = dtype or x.dtype
     return x.new_empty((b, d), dtype=o_dtype)
+
+
+# Launch parameters for silu_and_mul_2in_kernel, keyed on SM version, as
+# (block_elements, num_warps) per output dtype. ``block_elements`` is how many
+# elements one Triton program handles -- Triton's BLOCK_SIZE -- not a thread
+# count; threads are num_warps * 32.
+#
+# The output dtype sets the read/write balance: an FP8 output writes one byte
+# per element where BF16 writes two, leaving the FP8 case more read-dominated
+# and better served by more elements in flight. From a sweep over block_elements
+# {1024..8192} x num_warps {2, 4, 8} at the Cosmos3 shapes on sm_100, FP8 output
+# was ~5% faster at 4096 than at 2048, while the BF16 candidates tied within
+# 0.6%. An sm_103 sweep landed within 0.4% of the same configuration, so it
+# shares the row rather than carrying a copy.
+_SILU_AND_MUL_2IN_LAUNCH_PARAMS = {
+    100: {
+        torch.float8_e4m3fn: (4096, 4),
+        None: (2048, 4)
+    },
+}
+_SILU_AND_MUL_2IN_LAUNCH_PARAMS[103] = _SILU_AND_MUL_2IN_LAUNCH_PARAMS[100]
+# Untuned SM versions borrow this row. They are not rejected and no performance
+# claim is made for them; tune one by adding its own entry above.
+_SILU_AND_MUL_2IN_FALLBACK_SM = 100
+
+
+@lru_cache(maxsize=None)
+def _silu_and_mul_2in_launch_params(sm_version: int,
+                                    out_dtype: torch.dtype) -> Tuple[int, int]:
+    row = _SILU_AND_MUL_2IN_LAUNCH_PARAMS.get(
+        sm_version,
+        _SILU_AND_MUL_2IN_LAUNCH_PARAMS[_SILU_AND_MUL_2IN_FALLBACK_SM])
+    return row.get(out_dtype, row[None])
+
+
+@torch.library.custom_op("trtllm::silu_and_mul_2in", mutates_args=())
+def silu_and_mul_2in(gate: torch.Tensor,
+                     up: torch.Tensor,
+                     scale: Optional[torch.Tensor] = None,
+                     dtype: Optional[torch.dtype] = None,
+                     swiglu_limit: Optional[float] = None,
+                     swiglu_alpha: Optional[float] = None,
+                     swiglu_beta: Optional[float] = None) -> torch.Tensor:
+    """silu_and_mul for gate and up held in separate tensors.
+
+    Equivalent to silu_and_mul(cat([gate, up], -1), ...) with no concatenation.
+    """
+    # Rank-agnostic: the kernel walks a flat run of numel() elements, so any
+    # matching contiguous shape works. Models carry rank-3 [batch, seq, hidden]
+    # activations, and requiring rank 2 here would force callers to reshape.
+    # Raises rather than asserts: assert statements are not emitted under
+    # `python -O`, and every condition below is one the kernel cannot detect for
+    # itself. Skipping them does not surface an error later, it reads the wrong
+    # memory and returns plausible garbage.
+    if gate.shape != up.shape:
+        raise ValueError(
+            f"gate and up must have the same shape, got {tuple(gate.shape)} and "
+            f"{tuple(up.shape)}")
+    if gate.dtype != up.dtype:
+        raise ValueError(
+            f"gate and up must have the same dtype, got {gate.dtype} and {up.dtype}"
+        )
+    if gate.device != up.device:
+        raise ValueError(
+            f"gate and up must be on the same device, got {gate.device} and "
+            f"{up.device}")
+    # The kernel indexes both operands as flat contiguous runs, so a strided
+    # view would read the wrong addresses and silently return garbage. Linear
+    # outputs are contiguous; reject anything else rather than copying.
+    if not (gate.is_contiguous() and up.is_contiguous()):
+        raise ValueError(
+            f"gate and up must be contiguous, got strides {gate.stride()} and "
+            f"{up.stride()} for shape {tuple(gate.shape)}")
+
+    o_dtype = dtype or gate.dtype
+    o = torch.empty(gate.shape, dtype=o_dtype, device=gate.device)
+
+    block_elements, num_warps = _silu_and_mul_2in_launch_params(
+        get_sm_version(), o_dtype)
+    n_elements = gate.numel()
+
+    silu_and_mul_2in_kernel[(triton.cdiv(n_elements, block_elements), )](
+        o_ptr=o,
+        o_scale_ptr=scale,
+        gate_ptr=gate,
+        up_ptr=up,
+        n_elements=n_elements,
+        swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
+        BLOCK_SIZE=block_elements,
+        HAS_O_SCALE=scale is not None,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
+        num_warps=num_warps,
+    )
+
+    return o
+
+
+@silu_and_mul_2in.register_fake
+def _(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = None,
+    swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+) -> torch.Tensor:
+    o_dtype = dtype or gate.dtype
+    return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
 class AllReduceRunner(TunableRunner):

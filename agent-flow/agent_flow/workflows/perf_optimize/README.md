@@ -483,6 +483,7 @@ running the CLI.
 ```
 <workspace>/
 ├── task.yaml                        # resolved spec (defaults filled in)
+├── prompts/<role>.md                # composed system prompt per role, snapshotted at launch
 ├── roadmap.yaml                     # the ranked plan; statuses/gains updated as the loop runs
 ├── sol_projection.md                # projector's SOL ceiling + baseline-vs-SOL gap (blank when sol.enabled: false)
 ├── sol_work/peaks.json              # projector's machine-readable peaks (analyzer's correlation joins against it)

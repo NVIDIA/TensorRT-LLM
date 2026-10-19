@@ -121,6 +121,9 @@ class MoEProblem:
     activation_constants: frozenset[str] = frozenset()
     #: ``RoutingMethodType`` member name; None means the call site did not say.
     routing: Optional[str] = None
+    #: True when a clamped SwiGLU must clamp its activated gate rather than
+    #: preserving the historical raw-gate clamp order.
+    clamp_after_silu: bool = False
 
     @property
     def routing_method_type(self) -> Optional["RoutingMethodType"]:
@@ -503,6 +506,7 @@ class MoEResolutionReport:
                 "bias": self.problem.bias,
                 "activation": self.problem.activation,
                 "activation_constants": sorted(self.problem.activation_constants),
+                "clamp_after_silu": self.problem.clamp_after_silu,
                 "routing": self.problem.routing,
             },
             "deployment": {
@@ -605,6 +609,10 @@ class MoERunContext:
     # produced by quantize_input
     x: torch.Tensor  # activations [num_tokens, hidden_size]
     x_sf: Optional[torch.Tensor]  # scale factors, when the input is quantized
+    # set when x/x_sf were produced on an auxiliary stream (async input
+    # quantization); the impl must wait on it before the first kernel that
+    # reads x/x_sf. None when quantization ran on the main stream.
+    x_ready_event: Optional[torch.cuda.Event] = None
     # produced by the outer forward
     output_dtype: Optional[torch.dtype] = None
     do_finalize: bool = True

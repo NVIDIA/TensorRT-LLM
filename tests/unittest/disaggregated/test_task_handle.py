@@ -81,6 +81,7 @@ def _stub_receiver():
     """Only what a receive session calls on its receiver; dispatch is what the peers would do."""
     receiver = MagicMock()
     receiver._enforce_physical_ownership = False
+    receiver._ownership_poisoned = None
     receiver._bounce.is_bounced.return_value = False
     return receiver
 

@@ -43,7 +43,6 @@ class Page;
 class KvCache;
 class CopyEngine;
 class StagingBufferManager;
-struct BatchedLockTarget;
 
 using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
@@ -100,18 +99,15 @@ class CacheLevelManager
 public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-        PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
-
-    // Compute pool size granularity for a given cache tier and quota.
-    static size_t cacheTierGranularity(CacheTier tier, size_t quota);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
+        HostMemBackingOptions const& options = {});
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
     std::unique_ptr<CacheLevelStorage> storage;
     PerLevelEvictionController controller;
 
-    PoolGroupIndex numPoolGroups() const noexcept
+    [[nodiscard]] PoolGroupIndex numPoolGroups() const noexcept
     {
         TLLM_CHECK_DEBUG_WITH_INFO(
             storage->numPoolGroups() == controller.numPoolGroups(), "Storage and controller disagree on numPoolGroups");
@@ -171,7 +167,7 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
-    // Ensure numFreeSlots[pgIdx] free GPU slots exist (evicting pages as needed).
+    // Ensure the requested free slots exist at this level (evicting pages as needed).
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
@@ -189,12 +185,22 @@ public:
 
     // ---- Migration ---------------------------------------------------------
 
-    // Migrate a batch of pages to GPU (used by batchedLockToGpu).
-    void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder);
+    // Migrate pages excluded from eviction to one destination level. Locked pages cannot move.
+    void batchedMigrate(
+        CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
+
+    //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
+    //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
+    void offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+
+    //! Promote locked sparse host pages into one shared GPU allocation per page, updating all owners.
+    //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves host ownership.
+    void promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
-    // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
-    // nothing, which in practice means slot preparation failed before anything moved.
+    // it moved off the disk tier. If a later batch fails, earlier batches may already have migrated.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
@@ -274,8 +280,10 @@ public:
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
 
     // Compute lifecycle allocation weights, then project them onto a cache level's pool grouping.
-    TypedVec<LifeCycleId, float> ratioFromLength(
-        CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
+    // `beamWidth` / `promptLength` describe the typical request the weights are derived from; only
+    // the blocks from the prompt tail onward are replicated per beam (see KVCacheDesc).
+    TypedVec<LifeCycleId, float> ratioFromLength(CacheLevel level, int tokensPerBlock, int historyLength, int capacity,
+        int beamWidth = 1, int promptLength = 0) const;
     TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
         CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
 
@@ -355,6 +363,15 @@ private:
         TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
+    //! Allocation granularity for a tier, decided once from its configured
+    //! quota. Fixed for the tier's lifetime, so every size derived from it stays
+    //! consistent with what the pools were built for.
+    [[nodiscard]] size_t tierCommitUnit(CacheTierConfig const& tierConfig) const;
+
+    //! Backing options for a tier: its fixed allocation unit together with the
+    //! page-placement policy the tier's config asks for.
+    [[nodiscard]] HostMemBackingOptions tierBackingOptions(CacheTierConfig const& tierConfig) const;
+
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
@@ -377,6 +394,8 @@ private:
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
         bool defrag = false);
+    void _migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
+        KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,

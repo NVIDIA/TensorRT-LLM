@@ -37,7 +37,8 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            StaticDim, TunableRunner,
                                            TuningConfig, autotune)
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
+from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
+                                       get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
@@ -1744,6 +1745,52 @@ def test_post_tune_merge_tactics_single_rank_noop():
     assert tuner.profiling_cache.cache == original
 
 
+@pytest.mark.parametrize("tp_size,cp_size", [(1, 4), (2, 2)])
+def test_parallel_tactics_split_across_helix_cp_ranks(tp_size, cp_size):
+    """Helix CP ranks share the PARALLEL tactic sweep with the TP ranks."""
+    from tensorrt_llm.mapping import CpType
+
+    world_size = tp_size * cp_size
+    tactics = list(range(11))
+    shares = []
+    for rank in range(world_size):
+        tuner = autotuner.AutoTuner()
+        mapping = Mapping(world_size=world_size,
+                          rank=rank,
+                          tp_size=tp_size,
+                          cp_size=cp_size,
+                          cp_config={"cp_type": CpType.HELIX})
+        tuner.setup_distributed_state(mapping, dist=object())
+        assert tuner._is_distributed()
+        assert tuner._tuning_group() == (world_size, rank)
+        shares.append(
+            tuner._maybe_parallelize_tactics(
+                tactics, DistributedTuningStrategy.PARALLEL))
+        assert tuner._maybe_parallelize_tactics(
+            tactics, DistributedTuningStrategy.MERGE) == tactics
+
+    # Every tactic is tuned on exactly one rank.
+    assert sorted(t for share in shares for t in share) == tactics
+
+
+def test_parallel_tactics_split_skips_non_helix_cp_ranks():
+    """Non-Helix CP keeps the TP-only tuning group."""
+    from tensorrt_llm.mapping import CpType
+
+    tuner = autotuner.AutoTuner()
+    mapping = Mapping(world_size=4,
+                      rank=3,
+                      tp_size=1,
+                      cp_size=4,
+                      cp_config={"cp_type": CpType.ULYSSES})
+    tuner.setup_distributed_state(mapping, dist=object())
+    assert tuner._tuning_group() == (1, 0)
+    assert not tuner._is_distributed()
+    tactics = list(range(5))
+    assert tuner._maybe_parallelize_tactics(
+        tactics, DistributedTuningStrategy.PARALLEL) == tactics
+
+
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
     # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
     # ast.literal_eval-parsable, so the cache serializes tactic.value instead.
@@ -1867,3 +1914,29 @@ def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
                               *zip(*[(world_size, )] * world_size)))
     for got in results:
         assert got == ["rank0", "rank1"]
+
+
+def test_deep_gemm_jit_warmup_buckets():
+    # A bucket left out leaves a DeepGemm layout uncompiled, so it compiles
+    # under traffic while holding the GIL. The layout is constant on each
+    # 16-aligned window of M, so every window must hold a bucket.
+    for max_m in (4096, 6144, 8192):
+        b = deep_gemm_jit_warmup_buckets(max_m)
+        assert list(b) == sorted(set(b)), "must be sorted and duplicate-free"
+        assert b[-1] == max_m, "the bound itself must be a bucket"
+
+        assert all(hi - lo <= 16 for lo, hi in zip(b, b[1:])), \
+            "no gap may exceed 16: it would skip a 16-aligned window of M"
+        windows = {(m - 1) // 16 for m in b}
+        missing = [j for j in range((max_m - 1) // 16 + 1) if j not in windows]
+        assert not missing, \
+            f"windows with no bucket (M from {[16 * j + 1 for j in missing]})"
+
+    # Clamping keeps a small bound from skipping warmup for larger M,
+    # and a huge one from exploding the bucket count.
+    assert deep_gemm_jit_warmup_buckets(256) == deep_gemm_jit_warmup_buckets(
+        4096)
+    # But a decode-only worker (M = batch x MTP) stays in the low band.
+    assert max(deep_gemm_jit_warmup_buckets(32)) < 128
+    assert deep_gemm_jit_warmup_buckets(16384) == deep_gemm_jit_warmup_buckets(
+        8192)

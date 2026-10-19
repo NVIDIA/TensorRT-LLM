@@ -1007,3 +1007,78 @@ def test_projector_driving_prompt_fails_open_when_the_probe_could_not_run(tmp_pa
     # ...and the agent is handed both spellings, since the name is a guess.
     assert "trtllm-agent-toolkit:internal-perf-sol-analysis" in prompt
     assert "if the bare name is not found" in prompt
+
+
+# --------------------------------------------------- the workspace prompt snapshot
+
+
+_AGENT_ROLES = ("benchmarker", "projector", "analyzer", "reporter")
+
+
+def test_the_cli_snapshots_the_prompts_before_the_first_agent_runs(tmp_path, monkeypatch):
+    """The prompts must be on disk while the campaign is still live.
+
+    They exist only in the launching process's memory otherwise, so a run
+    in flight — or one read back later — has nothing to check its agents'
+    instructions against. Written before ``run``, from the bundle the
+    workflow was actually handed.
+    """
+    from agent_flow.workflows.perf_analyze import cli as cli_module
+    from agent_flow.workflows.perf_analyze.prompts import PROMPTS_DIRNAME
+
+    # `sol.enabled: false` keeps the CLI from probing the live skill list.
+    task = _write_task(tmp_path, sol=False)
+    ws = tmp_path / "ws"
+    seen: dict = {}
+
+    class _FakeWorkflow:
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+            self.prompts = kwargs["prompts"]
+            self.workspace.mkdir(parents=True, exist_ok=True)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def run(self, task_path):
+            directory = self.workspace / PROMPTS_DIRNAME
+            seen["snapshot"] = {
+                path.stem: path.read_text(encoding="utf-8") for path in directory.glob("*.md")
+            }
+            seen["bundle"] = self.prompts
+
+    monkeypatch.setattr(cli_module, "PerfAnalyzeWorkflow", _FakeWorkflow)
+    cli_module.main(["--task", str(task), "--workspace", str(ws)])
+
+    bundle = seen["bundle"]
+    # Equality against the handed bundle covers both halves: every role is
+    # there, and each file is that role's *composed* prompt — a snapshot
+    # rebuilt from the defaults would miss what the task spec switched on.
+    assert seen["snapshot"] == {role: getattr(bundle, role) for role in _AGENT_ROLES}
+
+
+def test_a_workspace_the_workflow_refuses_keeps_its_previous_snapshot(tmp_path):
+    """A refused launch must not overwrite the last run's record of its prompts.
+
+    The fresh-run guard exists so a forgotten workspace is never scribbled
+    over; the snapshot is written after it for exactly that reason.
+    """
+    from agent_flow.workflows.perf_analyze import cli as cli_module
+    from agent_flow.workflows.perf_analyze.prompts import PROMPTS_DIRNAME
+
+    task = _write_task(tmp_path, sol=False)
+    ws = tmp_path / "ws"
+    (ws / PROMPTS_DIRNAME).mkdir(parents=True)
+    (ws / PROMPTS_DIRNAME / "analyzer.md").write_text("the previous run's\n", encoding="utf-8")
+    # A prior run's output, with no checkpoint to resume from.
+    (ws / "benchmark_results.md").write_text("## Baseline\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        cli_module.main(["--task", str(task), "--workspace", str(ws)])
+
+    assert (ws / PROMPTS_DIRNAME / "analyzer.md").read_text(encoding="utf-8") == (
+        "the previous run's\n"
+    )
