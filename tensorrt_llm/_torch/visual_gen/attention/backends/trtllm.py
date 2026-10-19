@@ -42,10 +42,8 @@ from ...cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout
 
 # The only page size with shipped trtllm-gen paged context kernels: every paged
-# context cubin under kernels/trtllmGenKernels/fmha/cubin is a ``P32`` variant, and
-# log2(tokens per page) is part of the kernel hash, so any other value has no kernel
-# and the attention op refuses the configuration. Nothing in the tree exposes this
-# number; it lives in the cubin inventory only.
+# context cubin under kernels/trtllmGenKernels/fmha/cubin is a ``P32`` variant,
+# so any other value has no kernel and the attention op refuses the configuration.
 TRTLLM_GEN_TOKENS_PER_PAGE = 32
 
 
@@ -201,10 +199,10 @@ class TrtllmAttentionMetadata:
         One object per (cache, geometry, blocking) for the life of the cache, shared
         by every layer through the model-scoped state. It is built once, eagerly, and
         then bound to the cache's own device tensors: the block offsets and the
-        per-block key counts the kernel reads are the cache's, rewritten in place by
+        per-block key counts read by kernel are owned by the cache, rewritten in place by
         ``commit``. So nothing here changes after a commit, and a CUDA graph captured
-        around the forward replays correctly with no refresh. The host-side lengths
-        the op also takes are upper bounds, fixed at the geometry's capacity.
+        around the forward replays correctly with no refresh. The host-side lengths taken
+        by the op bear upper bound values, fixed at the geometry's capacity.
         """
         cache_key = (
             "kv_cache",
