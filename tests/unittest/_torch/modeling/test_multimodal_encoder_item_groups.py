@@ -20,11 +20,14 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
+    MultimodalInput,
     MultimodalItemPartition,
     MultimodalParams,
+    MultimodalRuntimeData,
 )
 
 HIDDEN = 4
@@ -311,6 +314,134 @@ def test_full_and_item_order_can_differ_from_raw_payload_order(use_metadata: boo
         ]
 
     torch.testing.assert_close(model.encode_multimodal_inputs([request]), expected, rtol=0, atol=0)
+
+
+def _attach_cache_metadata(request, item_lengths):
+    request.multimodal_input = MultimodalInput.from_components(
+        [[i + 1] * 8 for i in range(len(item_lengths))],
+        [sum(item_lengths[:i]) for i in range(len(item_lengths))],
+        list(item_lengths),
+    )
+    request.multimodal_runtime = MultimodalRuntimeData(
+        0, sum(item_lengths), torch.arange(1, sum(item_lengths) + 1, dtype=torch.int64)
+    )
+    request.multimodal_data["mm_processor_kwargs_hash"] = "test"
+
+
+@pytest.mark.parametrize("metadata_format", ["typed", "typed_only", "legacy"])
+@pytest.mark.parametrize("reversed_order", [False, True])
+def test_partial_cache_uses_prompt_refs_and_lengths(metadata_format, reversed_order):
+    model = _GroupedEncoderModel()
+    model._multimodal_encoder_cache = TensorLRUCache(4096)
+    request = _make_request(["image", "image"])
+    metadata = request.item_metadata
+    if reversed_order:
+        metadata = MultimodalEncoderItemMetadata([("image", 1), ("image", 0)], [3, 2], [3, 2])
+        request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    lengths = metadata.output_embedding_lengths
+    request.multimodal_data["multimodal_embedding_lengths"] = lengths
+    if metadata_format == "typed_only":
+        request.multimodal_data.pop("multimodal_embedding_lengths")
+    elif metadata_format == "legacy":
+        request.mm_item_order = [
+            {"modality": modality, "index": index} for modality, index in metadata.item_refs
+        ]
+        request.multimodal_data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    _attach_cache_metadata(request, lengths)
+    expected = model.encode_multimodal_inputs([request])
+    keys = model._encoder_cache_keys(request)
+    model._multimodal_encoder_cache.put(keys[0], expected[: lengths[0]])
+
+    actual = model._get_or_encode_multimodal_embeddings([request])
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        model._multimodal_encoder_cache.get(keys[1]), expected[lengths[0] :], rtol=0, atol=0
+    )
+    assert model.encoder_calls[-1] == lengths[1]
+    if metadata_format != "legacy":
+        assert request.item_metadata is metadata
+
+
+def test_full_cache_write_uses_canonical_lengths_without_legacy_fields():
+    model = _GroupedEncoderModel()
+    model._multimodal_encoder_cache = TensorLRUCache(4096)
+    request = _make_request(["image", "image"])
+    lengths = request.item_metadata.output_embedding_lengths
+    request.multimodal_data.pop("multimodal_embedding_lengths")
+    _attach_cache_metadata(request, lengths)
+    expected = model.encode_multimodal_inputs([request])
+    calls_before = len(model.encoder_calls)
+
+    actual = model._get_or_encode_multimodal_embeddings([request])
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(model.encoder_calls) == calls_before + 1
+    for key, rows in zip(
+        model._encoder_cache_keys(request), torch.split(expected, lengths), strict=True
+    ):
+        torch.testing.assert_close(model._multimodal_encoder_cache.get(key), rows, rtol=0, atol=0)
+
+
+def test_partial_cache_batches_mixed_vision_and_audio_misses():
+    model = _GroupedEncoderModel()
+    model.mm_encoder_groups += (
+        EncoderGroup(
+            ("audio",),
+            model._encode,
+            lambda params: {
+                "pixel_values": torch.cat(
+                    [p.multimodal_data["audio"]["input_features"].flatten(0, 1) for p in params]
+                )
+            },
+        ),
+    )
+    model._multimodal_encoder_cache = TensorLRUCache(4096)
+    request = _make_request(["image", "video", "image"])
+    request.multimodal_data["audio"] = {
+        "input_features": torch.stack([torch.full((1, HIDDEN), value) for value in (10.0, 20.0)])
+    }
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalEncoderItemMetadata(
+        [("video", 0), ("audio", 0), ("image", 1), ("image", 0), ("audio", 1)],
+        [4, 1, 3, 2, 1],
+        [4, 1, 3, 2, 1],
+    )
+    request.multimodal_data.pop("multimodal_embedding_lengths")
+    lengths = request.item_metadata.output_embedding_lengths
+    _attach_cache_metadata(request, lengths)
+    expected = model.encode_multimodal_inputs([request])
+    expected_items = torch.split(expected, lengths)
+    keys = model._encoder_cache_keys(request)
+    for i in (0, 3):
+        model._multimodal_encoder_cache.put(keys[i], expected_items[i])
+    calls_before = len(model.encoder_calls)
+
+    actual = model._get_or_encode_multimodal_embeddings([request])
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Image misses share one vision call; audio misses share one audio call.
+    assert model.encoder_calls[calls_before:] == [3, 2]
+    for key, rows in zip(keys, expected_items, strict=True):
+        torch.testing.assert_close(model._multimodal_encoder_cache.get(key), rows, rtol=0, atol=0)
+
+
+def test_alternating_item_selection_validates_each_request_once(monkeypatch):
+    model = _GroupedEncoderModel()
+    requests = [_make_request(["image", "video"] * 4) for _ in range(2)]
+    validated = []
+    validate = MultimodalEncoderItemMetadata.validate
+
+    def record_validation(metadata):
+        validated.append(metadata)
+        validate(metadata)
+
+    monkeypatch.setattr(MultimodalEncoderItemMetadata, "validate", record_validation)
+
+    model.prepare_multimodal_encoder_inputs(
+        [(request, i) for request in requests for i in range(8)]
+    )
+
+    assert len(validated) == len(requests)
 
 
 @pytest.mark.parametrize("shared_vision_encoder", [False, True])

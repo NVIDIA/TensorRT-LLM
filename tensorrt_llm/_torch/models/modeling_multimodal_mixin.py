@@ -141,6 +141,17 @@ def _lengths_by_modality(
     for item_refs, lengths in item_layouts:
         if not item_refs:
             continue
+        modality = item_refs[0][0]
+        if (
+            len(item_refs) == len(lengths)
+            and modality in by_modality
+            and all(
+                item_modality == modality and index == expected
+                for expected, (item_modality, index) in enumerate(item_refs)
+            )
+        ):
+            by_modality[modality].extend(lengths)
+            continue
         request_lengths: dict[str, list[tuple[int, int]]] = {m: [] for m in modalities}
         for (modality, index), length in zip(item_refs, lengths, strict=True):
             if modality in request_lengths:
@@ -483,7 +494,11 @@ class MultimodalModelMixin:
             modality,
             item_metadata,
         ) in self._runs_by_request_modality(selected_items):
-            item_refs = item_metadata.item_refs
+            item_refs = (
+                item_metadata.item_refs
+                if item_metadata is not None
+                else multimodal_param.get_item_layout()[0]
+            )
             # The two slicers take different index spaces. The raw-tensor
             # slicer indexes the modality's own payload, so it gets the
             # modality-local indices (plus the modality, which also lets it
@@ -495,7 +510,9 @@ class MultimodalModelMixin:
                     [item_refs[i][1] for i in run_indices],
                     modality=modality,
                 )
-                self._apply_metadata_slice(residual, multimodal_param, run_indices)
+                self._apply_metadata_slice(
+                    residual, multimodal_param, run_indices, item_metadata=item_metadata
+                )
             except MultimodalEncoderContractError:
                 raise
             except (KeyError, IndexError, TypeError, ValueError) as error:
@@ -505,7 +522,7 @@ class MultimodalModelMixin:
             encoder_inputs.append(
                 (
                     residual,
-                    [int(item_metadata.output_embedding_lengths[i]) for i in run_indices],
+                    residual.multimodal_data["multimodal_embedding_lengths"],
                     modality,
                 )
             )
@@ -514,7 +531,7 @@ class MultimodalModelMixin:
     @staticmethod
     def _runs_by_request_modality(
         selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> Iterator[tuple[MultimodalParams, list[int], str, "MultimodalEncoderItemMetadata"]]:
+    ) -> Iterator[tuple[MultimodalParams, list[int], str, Optional[MultimodalEncoderItemMetadata]]]:
         """Split scheduler order into maximal same-request, same-modality runs.
 
         Only adjacent items merge, so the flattened result keeps the
@@ -526,6 +543,7 @@ class MultimodalModelMixin:
         run_param: Optional[MultimodalParams] = None
         run_modality: Optional[str] = None
         run_metadata: Optional[MultimodalEncoderItemMetadata] = None
+        item_refs: list[tuple[str, int]] = []
         run_indices: list[int] = []
         for multimodal_param, item_idx in selected_items:
             try:
@@ -536,16 +554,17 @@ class MultimodalModelMixin:
                 )
             except (TypeError, ValueError) as error:
                 raise MultimodalEncoderContractError(str(error)) from error
-            if metadata is None:
-                raise MultimodalEncoderContractError(
-                    "MM item metadata is required for item encoding"
+            if multimodal_param is not run_param:
+                item_refs = (
+                    metadata.item_refs
+                    if metadata is not None
+                    else multimodal_param.get_item_layout()[0]
                 )
-            if item_idx < 0 or item_idx >= len(metadata.item_refs):
+            if item_idx < 0 or item_idx >= len(item_refs):
                 raise MultimodalEncoderContractError(
-                    f"MM item index {item_idx} is out of range for "
-                    f"{len(metadata.item_refs)} item(s)"
+                    f"MM item index {item_idx} is out of range for {len(item_refs)} item(s)"
                 )
-            modality = metadata.item_refs[item_idx][0]
+            modality = item_refs[item_idx][0]
             if run_indices and (multimodal_param is not run_param or modality != run_modality):
                 yield run_param, run_indices, run_modality, run_metadata
                 run_indices = []
@@ -1372,13 +1391,15 @@ class MultimodalModelMixin:
         residual: MultimodalParams,
         source: MultimodalParams,
         item_indices: Sequence[int],
+        *,
+        item_metadata: Optional[MultimodalEncoderItemMetadata] = None,
     ) -> None:
         """Overwrite `residual`'s per-item metadata to match the sliced items.
 
         Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
         the parallel per-item metadata slice so every model gets it identically.
         """
-        metadata = source.item_metadata
+        metadata = item_metadata if item_metadata is not None else source.item_metadata
         if metadata is not None:
             selected = metadata.select(item_indices)
             residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = selected
@@ -1419,29 +1440,17 @@ class MultimodalModelMixin:
             if param.encoder_event is not None:
                 torch.cuda.current_stream().wait_event(param.encoder_event)
 
-        # Build every residual, then run one batched encoder call over the whole set.
-        residuals: list[MultimodalParams] = []
-        per_param_miss_lengths: list[list[int]] = []
-        for param, partition in partials:
-            residual = self.build_multimodal_encoder_input(param, partition.miss_indices)
-            self._apply_metadata_slice(residual, param, partition.miss_indices)
-            residuals.append(residual)
-            per_param_miss_lengths.append(
-                [
-                    param.multimodal_data["multimodal_embedding_lengths"][i]
-                    for i in partition.miss_indices
-                ]
-            )
-
-        batched_output = self.encode_multimodal_inputs(residuals)
-        per_param_slabs = torch.split(
-            batched_output, [sum(lengths) for lengths in per_param_miss_lengths], dim=0
+        encoder_inputs = self.prepare_multimodal_encoder_inputs(
+            [(param, i) for param, partition in partials for i in partition.miss_indices]
         )
+        # Keep one call across requests and modalities so EncoderGroup can
+        # batch modalities that share an encoder.
+        batched_output = self.encode_multimodal_inputs([param for param, _, _ in encoder_inputs])
+        output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
+        encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
-        for (param, partition), slab, miss_lengths in zip(
-            partials, per_param_slabs, per_param_miss_lengths, strict=True
-        ):
-            miss_tensors = torch.split(slab, miss_lengths, dim=0)
+        for param, partition in partials:
+            miss_tensors = [next(encoded_items) for _ in partition.miss_indices]
 
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
             for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
@@ -1487,7 +1496,7 @@ class MultimodalModelMixin:
             )
             return
 
-        embedding_lengths = param.multimodal_data["multimodal_embedding_lengths"]
+        _, embedding_lengths = param.get_item_layout()
         if sum(embedding_lengths) != embedding.shape[0]:
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping write because embedding row count "
