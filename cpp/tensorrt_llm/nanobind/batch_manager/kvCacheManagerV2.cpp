@@ -1962,8 +1962,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
-        .def("record_connector_reuse", &kv::KvCache::recordConnectorReuse, nb::arg("token_begin"),
-            nb::arg("token_end"), nb::call_guard<nb::gil_scoped_release>())
+        .def("record_connector_reuse", &kv::KvCache::recordConnectorReuse, nb::arg("token_begin"), nb::arg("token_end"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("drop_cached_token_attribution", &kv::KvCache::dropCachedTokenAttribution,
             nb::call_guard<nb::gil_scoped_release>())
         .def("drop_partial_block_cached_token_attribution", &kv::KvCache::dropPartialBlockCachedTokenAttribution,
