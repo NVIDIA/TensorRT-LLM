@@ -861,8 +861,10 @@ class Sender(SenderBase):
             expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
             if self._is_req_ready(unique_rid, expected_count):
                 with tx_session.lock:
-                    tx_session.receiver_ready = True
+                    # The executor reads both without the lock, so publish the
+                    # time first: a ready session always carries its time.
                     tx_session.peer_ready_time = time.monotonic()
+                    tx_session.receiver_ready = True
         return
 
     def _get_session(self, unique_rid: Optional[int]) -> Optional["TxSession"]:
@@ -1849,8 +1851,9 @@ class Sender(SenderBase):
         if self._is_req_ready(req_info.unique_rid, expected_transfers):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
-                session.receiver_ready = True
+                # Time before flag, as in setup_session.
                 session.peer_ready_time = time.monotonic()
+                session.receiver_ready = True
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)

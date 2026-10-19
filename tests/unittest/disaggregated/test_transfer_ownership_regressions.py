@@ -1902,6 +1902,61 @@ def test_send_session_records_when_every_peer_rank_asked(monkeypatch) -> None:
     assert (session.receiver_ready, session.peer_ready_time) == (True, 53.0)
 
 
+class _ReadinessOrderSession(SimpleNamespace):
+    """Send session stub that fails if it is marked ready before it has a ready time."""
+
+    def __setattr__(self, name, value) -> None:
+        if name == "receiver_ready" and value:
+            assert getattr(self, "peer_ready_time", None) is not None, (
+                "receiver_ready was published before peer_ready_time"
+            )
+        super().__setattr__(name, value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peers_asked_first", [False, True])
+def test_send_session_publishes_peer_ready_time_before_receiver_ready(
+    peers_asked_first: bool, monkeypatch
+) -> None:
+    """The executor reads receiver_ready and peer_ready_time without the session lock.
+
+    Seeing the flag without the time would measure the send from when it was
+    posted and could expire it right after its peers asked. Both the peer's
+    last REQUEST_DATA and a session set up after its peers asked mark it ready.
+    """
+    rid = 114
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: 70.0)
+    sender = object.__new__(transfer_mod.Sender)
+    sender._sessions_lock = threading.Lock()
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests, sender._peer_requests_timestamps = {}, {}
+    sender._shutdown_requested = False
+    sender._retired_rids, sender._pre_cancelled_rids, sender._sessions = {}, {}, {}
+    sender._enforce_physical_ownership = True
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(dp_rank=0)),
+        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0])),
+    )
+    session = _ReadinessOrderSession(
+        disagg_request_id=rid, lock=threading.Lock(), receiver_ready=False, peer_ready_time=None
+    )
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+    )
+
+    if peers_asked_first:
+        sender._save_peer_req_info(info)
+        sender.setup_session(session)
+    else:
+        sender.setup_session(session)
+        sender._save_peer_req_info(info)
+    assert (session.receiver_ready, session.peer_ready_time) == (True, 70.0)
+
+
 @pytest.mark.cpu_only
 def test_cleared_session_markers_expire_oldest_first(monkeypatch) -> None:
     """Expired markers are dropped from the front; younger ones are kept."""
