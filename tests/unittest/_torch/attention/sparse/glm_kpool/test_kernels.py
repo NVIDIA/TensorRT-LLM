@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     compact_sparse_rows,
     kpool_expand,
     kpool_score,
+    kpool_score_fp8,
     kpool_update,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -318,6 +319,64 @@ def test_pool_scores_broadcast_table_single_context_request():
             rows_per_program=16,
             **kwargs,
         )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+)
+@pytest.mark.parametrize("single_request", [True, False], ids=["one_table", "two_tables"])
+def test_fp8_pool_scores_track_bf16_selection(single_request):
+    """FP8 context scoring keeps the BF16 scorer's top pools on packed context rows."""
+    gen = torch.Generator(device="cuda").manual_seed(10)
+    heads, tpb, slots = 32, 32, 400
+    lens = [6000] if single_request else [6000, 2500]
+    pages = [(length + tpb - 1) // tpb for length in lens]
+    pool = torch.randn(slots, 2, tpb, 3 * HD, generator=gen, device="cuda").to(torch.bfloat16)[:, 1]
+    perm = torch.randperm(slots, generator=gen, device="cuda")
+    tables = torch.zeros(len(lens), max(pages), dtype=torch.int64, device="cuda")
+    start = 0
+    for i, count in enumerate(pages):
+        tables[i, :count] = perm[start : start + count]
+        start += count
+    request_ids = torch.cat(
+        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
+    ).cuda()
+    kv_lens = torch.cat([torch.arange(1, length + 1, dtype=torch.int32) for length in lens]).cuda()
+    n = kv_lens.shape[0]
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.randn(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(
+        head_dim=HD,
+        kpool=KPOOL,
+        q_scale=HD**-0.5,
+        w_scale=heads**-0.5,
+        request_ids=request_ids,
+        max_kv_len=max(lens),
+    )
+    want = kpool_score(
+        q,
+        w,
+        pool,
+        tables,
+        kv_lens,
+        tpb,
+        num_pools_max=max(pages) * tpb // KPOOL,
+        precision="bf16",
+        rows_per_program=16,
+        **kwargs,
+    )
+    got = kpool_score_fp8(q, w, pool, tables, kv_lens, tpb, **kwargs)
+    assert got is not None and got.stride(1) == 1 and got.stride(0) % 4 == 0
+    overlaps = []
+    for row in torch.randint(0, n, (64,), generator=gen, device="cuda").tolist():
+        visible = int(kv_lens[row]) // KPOOL
+        if visible < 64:
+            continue
+        k = visible // 2
+        a = set(want[row, :visible].topk(k).indices.tolist())
+        b = set(got[row, :visible].topk(k).indices.tolist())
+        overlaps.append(len(a & b) / k)
+    assert overlaps and sum(overlaps) / len(overlaps) > 0.97 and min(overlaps) > 0.9
 
 
 def test_pool_expansion_graph_replay_tracks_request_tables_and_tails():

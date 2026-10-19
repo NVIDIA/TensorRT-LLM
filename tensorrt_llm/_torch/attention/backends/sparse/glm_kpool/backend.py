@@ -27,11 +27,12 @@ lengths provide the same cache contract for prefill, decode and verification.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ...interface import (
     AttentionForwardArgs,
@@ -46,6 +47,7 @@ from .kernels import (
     gather_fp8_kv_rows,
     kpool_expand,
     kpool_score,
+    kpool_score_fp8,
     kpool_update,
 )
 from .metadata import Glm5NextMamba2Metadata
@@ -210,6 +212,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: construction). A float lets the kernel take it as an argument, without a
         #: per-call device multiply.
         self._native_bmm1_scale: float | None = None
+        #: Packed context rows score pools in FP8 with DeepGEMM MQA logits on SM100-family
+        #: GPUs; TRTLLM_GLM_INDEXER_BF16=1 keeps the BF16 Triton scorer for them.
+        self._indexer_fp8 = is_sm_100f() and os.environ.get("TRTLLM_GLM_INDEXER_BF16", "0") != "1"
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -393,12 +398,32 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         Incomplete/invisible pools receive the FP32 minimum before top-k. Eager
         callers that know a host bound on the visible lengths pass max_kv_len so
         only reachable pools are scored; columns past it are left unwritten and
-        the top-k must scan only each row's complete pools.
+        the top-k must scan only each row's complete pools. Packed context rows
+        with such a bound use the FP8 scorer on SM100-family GPUs, whose result
+        may be a strided view.
         """
         state = self._cache_state(metadata)
         tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
         capacity = state.block_tables.shape[1] * state.tokens_per_block
         kpool = self.sparse_params.index_kpool
+        if self._indexer_fp8 and request_ids is not None and max_kv_len is not None:
+            scores = kpool_score_fp8(
+                q,
+                weights,
+                state.index_pool,
+                # Packed context rows only reference the context requests' tables.
+                tables[: state.num_contexts],
+                kv_lens,
+                state.tokens_per_block,
+                head_dim=self.sparse_params.index_head_dim,
+                kpool=kpool,
+                q_scale=q_scale,
+                w_scale=w_scale,
+                request_ids=request_ids,
+                max_kv_len=max_kv_len,
+            )
+            if scores is not None:
+                return scores
         return kpool_score(
             q,
             weights,
