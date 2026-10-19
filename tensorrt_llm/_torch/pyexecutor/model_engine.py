@@ -1049,7 +1049,7 @@ class PyTorchModelEngine(ModelEngine):
             if record_msa:
                 jit_prefetch_msa.stop_recording()
         try:
-            self._init_jit_prefetch()
+            self._init_jit_prefetch(resource_manager)
         except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
             logger.warning(
                 f"[JIT prefetch] setup failed, serving without prefetch: "
@@ -1084,7 +1084,9 @@ class PyTorchModelEngine(ModelEngine):
             logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: "
                            f"{type(e).__name__}: {e}")
 
-    def _init_jit_prefetch(self) -> None:
+    def _init_jit_prefetch(self,
+                           resource_manager: Optional[ResourceManager] = None
+                           ) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
         ``tensorrt_llm/_torch/jit_prefetch.py``)."""
         from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
@@ -1160,11 +1162,18 @@ class PyTorchModelEngine(ModelEngine):
             if publish_provider:
                 prefetcher.enable_csa2_publish(publish_provider)
         from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
+        kv_cache_manager = (resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+                            if resource_manager is not None else None)
+        get_ssm_dtype = getattr(kv_cache_manager, "get_mamba_ssm_cache_dtype",
+                                None)
         la_provider = LinearAttnProvider(
             self.model,
             max_num_tokens=self.max_num_tokens,
             chunk_size=getattr(self.attn_metadata, "mamba_chunk_size", 0)
-            if getattr(self, "attn_metadata", None) is not None else 0)
+            if getattr(self, "attn_metadata", None) is not None else 0,
+            max_batch_size=self.batch_size,
+            ssm_state_dtype=get_ssm_dtype() if get_ssm_dtype else None)
         if la_provider and prefetcher.register("linear_attn", la_provider):
             logger.info(f"[JIT prefetch] GDN/KDA provider: "
                         f"{len(la_provider.shapes)} distinct layer shape(s)")

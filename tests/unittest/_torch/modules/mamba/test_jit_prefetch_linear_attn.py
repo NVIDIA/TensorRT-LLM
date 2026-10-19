@@ -60,7 +60,7 @@ def _gdn(k_heads=4, v_heads=8, k_dim=128, v_dim=128, fp8=False):
 
 def _kda(heads=12, head_dim=128):
     s = la._KdaShape.__new__(la._KdaShape)
-    s.heads, s.head_dim, s.dtype = heads, head_dim, torch.bfloat16
+    s.heads, s.head_dim, s.head_k_dim, s.dtype = heads, head_dim, head_dim, torch.bfloat16
     return s
 
 
@@ -72,6 +72,9 @@ def _provider(shapes):
     p._seen = set()
     p._num_sms = None
     p.chunk_size = 64
+    p.max_batch_size = 0
+    p.kda_staged = False
+    p._reset_planned = set()
     return p
 
 
@@ -233,6 +236,50 @@ def test_provider_finds_real_gdn_and_kda_layers():
     assert (kda_shape.heads, kda_shape.head_dim) == (4, 128)
     batch = type("B", (), {"ctx_chunk_lens": [100], "gen_tokens": 0})()
     assert p(batch), "no launches planned for a prefill batch"
+
+
+def _real_kda_reset(s, n):
+    """KimiKDALinearAttention.forward_prefill's reset on a BF16 state cache:
+    the batch's rows staged into a dense FP32 copy, addressed by position."""
+    from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurrent_state_rows
+
+    pool = torch.zeros(
+        n + 7, s.heads, s.head_dim, s.head_k_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    slots = torch.randperm(n + 7, device="cuda")[:n]
+    staged = pool.index_select(0, slots).float()
+    arange = torch.arange(64 + 1, dtype=torch.int, device="cuda")
+    has_init = torch.zeros(64, dtype=torch.bool, device="cuda")[:n]
+    with jp.shadow_launches() as rec:
+        reset_recurrent_state_rows(staged, arange[:n], has_init)
+    return list(rec)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 16, 17])
+def test_kda_staged_reset_planned_per_request_count(n):
+    s = _kda()
+    p = _provider([s])
+    p.max_batch_size, p.kda_staged, p._reset_planned = 32, True, set()
+    batch = type("B", (), {"ctx_chunk_lens": [64] * n, "gen_tokens": 0})()
+    planned = _keys(p(batch))
+    real = _keys(_real_kda_reset(s, n))
+    assert {name for name, _ in real} == {"_reset_recurrent_state_rows_kernel"}, real
+    assert real <= planned, f"unplanned: {sorted(real - planned)}"
+    # Each request count is planned once, and enumeration covers them all.
+    assert not _keys(p(batch)) & real
+    enumerated = set()
+    for b in p.enumerate_batches():
+        enumerated |= _keys(p(b, seen=set()))
+    assert real <= enumerated
+
+
+def test_kda_reset_not_planned_for_fp32_state():
+    p = la.LinearAttnProvider(torch.nn.Module(), max_num_tokens=256, max_batch_size=8,
+                              ssm_state_dtype=torch.float32)  # fmt: skip
+    p.shapes = [_kda()]
+    batch = type("B", (), {"ctx_chunk_lens": [64, 64], "gen_tokens": 0})()
+    names = {c.label for c in p(batch)}
+    assert "_reset_recurrent_state_rows_kernel" not in names
 
 
 def test_enumeration_covers_chunk_index_classes():

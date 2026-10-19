@@ -29,6 +29,14 @@ Covered kernels, each a builder in ``_BUILDERS`` / ``_PRECOMPILED``:
   specializers (heads, varlen, bias, safe gate, beta sigmoid, chunk alignment
   ``varlen_pure``, cu/ci dtypes); shapes are runtime arguments, and which
   variant a batch needs is known on the host before the forward pass.
+* the persistent K4 kernel of the same prefill (``_launch_k4_persistent``).
+  The op keys its compile cache on the full layout of the recurrent-state
+  pool it updates. With a BF16 state cache the KDA mixer stages the batch's
+  rows into a dense FP32 copy, so that pool has one row per context request,
+  and a batch with a new request count compiles K4 again (~1.4 s). The pool
+  goes in with dynamic extents and strides, so all those compiles produce
+  the same function: one export per (heads, head dims, stride width) serves
+  every request count.
 * FlashInfer's CuTe DSL RMSNorm and fused add + RMSNorm (TVM-FFI kernels).
   The compiled form depends on dtype, hidden size, weight bias, PDL, SM
   version and whether the rows are contiguous (``flashinfer.norm``'s own
@@ -60,6 +68,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 KIND = "cute_dsl"
 _K123 = "kda_fused_k123"
+_K4 = "kda_k4_persistent"
 _FI_NORM = "flashinfer_norm"
 _BT = 64
 _K_DIM = 128
@@ -111,6 +120,48 @@ def k123_spec_from_cache_key(cache_key: tuple) -> Optional[str]:
         beta_sig,
         str(beta_dt).replace("torch.", ""),
     )
+
+
+def k4_spec(num_sm: int, H: int, K: int, V: int, pool_32bit_stride: bool) -> str:
+    """Spec for one persistent K4 variant (``_launch_k4_persistent``).
+
+    The op passes the state pool with every extent and every stride but the
+    innermost (1) dynamic, and the state indices as a vector of dynamic
+    extent, so the compiled function does not depend on the pool's row
+    count: the op's ``_k4p_cache`` key separates pools of different row
+    counts, but every such key maps to one spec. What does change the
+    compiled function is whether the pool's dynamic strides are 32-bit.
+    """
+    return json.dumps(
+        {
+            "kernel": _K4,
+            "num_sm": int(num_sm),
+            "H": int(H),
+            "K": int(K),
+            "V": int(V),
+            "pool_32bit": bool(pool_32bit_stride),
+        },
+        sort_keys=True,
+    )
+
+
+def k4_spec_from_cache_key(cache_key: tuple) -> Optional[str]:
+    """Spec for a ``_k4p_cache`` key, or None if its layout is not one the
+    builder reproduces: an FP32 [slots, H, V, K] pool whose innermost stride
+    is 1, and int32 state indices with 32-bit strides."""
+    _dev, num_sm, H, K, V, pool_key, indices_key = cache_key
+    pool_dtype, pool_shape, pool_stride, pool_32 = pool_key
+    indices_dtype, indices_stride, indices_32 = indices_key
+    if (
+        str(pool_dtype) != "torch.float32"
+        or len(pool_shape) != 4
+        or pool_stride[-1] != 1
+        or str(indices_dtype) != "torch.int32"
+        or tuple(indices_stride) != (1,)
+        or not indices_32
+    ):
+        return None
+    return k4_spec(num_sm, H, K, V, pool_32)
 
 
 def fi_norm_spec(
@@ -230,6 +281,73 @@ def _build_k123(s: Dict[str, Any]):
         cute.runtime.make_fake_stream(),
     ]
     return host_fn, args, ""
+
+
+def _build_k4(s: Dict[str, Any]):
+    """Return (host_fn, fake_args, compile_options) for one persistent K4 variant.
+
+    The fake tensors reproduce the CuTe types ``_launch_k4_persistent`` passes:
+    the [T, H, dim] activations and scratch with every extent and every stride
+    but the innermost dynamic (``mark_layout_dynamic``, 64-bit strides); the
+    [slots, H, V, K] state pool likewise, with 32-bit strides when its rows
+    fit in int32 offsets (``_dynamic_dlpack_arg``); the state indices,
+    cu_seqlens and chunk offsets as vectors of dynamic extent; the tensormap
+    workspace static (one slot per SM of the persistent grid).
+    """
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import (
+        BYTES_PER_TENSORMAP,
+        NUM_TENSORMAPS,
+        make_host_fn,
+    )
+
+    num_sm = s["num_sm"]
+
+    def act(dtype):
+        return cute.runtime.make_fake_tensor(
+            dtype,
+            (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+            (cute.sym_int64(), cute.sym_int64(), 1),
+            assumed_align=16,
+        )
+
+    width = 32 if s["pool_32bit"] else 64
+    pool = cute.runtime.make_fake_tensor(
+        cutlass.Float32,
+        tuple(cute.sym_int() for _ in range(4)),
+        (cute.sym_int(width), cute.sym_int(width), cute.sym_int(width), 1),
+        assumed_align=16,
+    )
+
+    def vec(align):
+        return cute.runtime.make_fake_tensor(
+            cutlass.Int32, (cute.sym_int(),), (1,), assumed_align=align
+        )
+
+    bf, f32 = cutlass.BFloat16, cutlass.Float32
+    tm = cute.runtime.make_fake_tensor(
+        cutlass.Uint8, (num_sm * NUM_TENSORMAPS * BYTES_PER_TENSORMAP,), (1,), assumed_align=16
+    )
+    args = [
+        act(bf),  # A_kk
+        act(bf),  # k_scaled
+        act(bf),  # v
+        act(bf),  # q_scaled
+        act(bf),  # A_qk
+        act(bf),  # kg
+        act(bf),  # o
+        act(f32),  # gk_last_exp
+        pool,
+        vec(16),  # state_indices
+        vec(4),  # cu_seqlens
+        vec(4),  # chunk offsets
+        tm,
+        cutlass.Int32(1),  # num_seqs
+        cute.runtime.make_fake_stream(),
+    ]
+    return make_host_fn(num_sm=num_sm), args, ""
 
 
 def _build_fi_norm(s: Dict[str, Any]):
@@ -403,7 +521,12 @@ def _build_csa2_publish(s: Dict[str, Any]):
     return fn, args, ""
 
 
-_BUILDERS = {_K123: _build_k123, _FI_NORM: _build_fi_norm, _CSA2_PUBLISH: _build_csa2_publish}
+_BUILDERS = {
+    _K123: _build_k123,
+    _K4: _build_k4,
+    _FI_NORM: _build_fi_norm,
+    _CSA2_PUBLISH: _build_csa2_publish,
+}
 # Builders that return an already compiled kernel instead of (fn, args, options).
 _PRECOMPILED = {_TOPK: _build_topk}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
@@ -555,7 +678,7 @@ def install_device_shim(props: Dict[str, Any]) -> None:
 
 
 class KdaPrefillProvider:
-    """K123 variants a Kimi K3 KDA prefill batch needs.
+    """K123 and K4 variants a Kimi K3 KDA prefill batch needs.
 
     The heads / bias / gate / beta settings come from the model's KDA layers
     (all layers share them); a batch selects ``varlen_pure`` from its context
@@ -563,10 +686,11 @@ class KdaPrefillProvider:
     batch shape seen for the first time finds it compiled.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, num_sm: Optional[int] = None):
         from .modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
 
         cfgs = set()
+        heads = set()
         for mod in model.modules():
             if not isinstance(mod, KimiKDALinearAttention):
                 continue
@@ -577,7 +701,20 @@ class KdaPrefillProvider:
             # The mixer passes safe_gate = (gate_lower_bound is not None).
             safe_gate = getattr(mod, "gate_lower_bound", None) is not None
             cfgs.add((int(H), bool(has_bias), bool(safe_gate)))
+            heads.add((int(H), int(mod.head_k_dim), int(mod.head_dim)))
         self.cfgs = sorted(cfgs)
+        self.k4_specs: List[str] = []
+        if heads and num_sm is None:
+            try:
+                from .custom_ops import cute_dsl_kimi_k3_custom_ops as ops
+            except ImportError:
+                heads = set()  # the KDA prefill op is unavailable: nothing to prefetch
+            else:
+                # The persistent-grid ceiling the op compiles K4 for.
+                num_sm = inspect.signature(ops._launch_k4_persistent).parameters["num_sm"].default
+        # The pool's dynamic strides are 32-bit whenever its rows fit in int32
+        # offsets, as a staged pool of max_batch_size rows does.
+        self.k4_specs = [k4_spec(num_sm, H, K, V, True) for H, K, V in sorted(heads)]
 
     def __bool__(self):
         return bool(self.cfgs)
@@ -597,10 +734,10 @@ class KdaPrefillProvider:
         # variant (see _chunk_kda_fwd), so only a multi-sequence batch with an
         # unaligned length needs the ragged one.
         pure = len(ctx_chunk_lens) == 1 or all(n % _BT == 0 for n in ctx_chunk_lens)
-        return self.specs(pure)
+        return self.specs(pure) + self.k4_specs
 
     def enumerate_specs(self) -> List[str]:
-        return self.specs(True) + self.specs(False)
+        return self.specs(True) + self.specs(False) + self.k4_specs
 
 
 class FlashInferNormProvider:

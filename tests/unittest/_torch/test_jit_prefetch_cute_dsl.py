@@ -20,6 +20,7 @@ variant. The real ``trtllm::kda_prefill`` then loads it in place of
 in-process compile, on batches of several shapes, without compiling.
 """
 
+import inspect
 import json
 import os
 import subprocess
@@ -382,3 +383,78 @@ def test_provider_plans_the_variant_the_op_keys_on():
     assert p.plan([64, 128]) == aligned
     assert p.plan([100]) == aligned  # single sequence: sentinel-padded onto aligned
     assert set(p.enumerate_specs()) == set(ragged + aligned)
+
+
+def test_k4_export_serves_every_request_count(tmp_path):
+    """One K4 export, built by the GPU-less helper, is what the op runs for
+    staged state pools of any row count (the KDA mixer stages one row per
+    context request of a BF16 cache): bitwise the same output and state as
+    an in-process compile, and the op compiles nothing."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops as ops
+
+    out_dir = str(tmp_path / "aot")
+    num_sm = inspect.signature(ops._launch_k4_persistent).parameters["num_sm"].default
+    spec = jcd.k4_spec(num_sm, H, K, K, True)
+    replies = _helper_build(out_dir, [spec])
+    assert replies[0]["ok"] and replies[0]["built"], replies
+
+    # A single sequence must be a chunk multiple here (the dispatcher pads it).
+    batches = [[256], [100, 37], [64, 128, 77], [17] * 5, [130] * 16]
+    ref = []
+    ops.k4_loader = None
+    ops._k4p_cache.clear()
+    for i, lengths in enumerate(batches):
+        ref.append(_run(_inputs(lengths, 30 + i)))
+    keys = list(ops._k4p_cache)
+    # The op keys on the pool's row count: one compile per request count.
+    assert len(keys) == len({len(b) for b in batches}), keys
+    assert {jcd.k4_spec_from_cache_key(k) for k in keys} == {spec}
+
+    loads = []
+
+    def loader(cache_key):
+        fn = jcd.load(jcd.k4_spec_from_cache_key(cache_key), out_dir)
+        loads.append(fn is not None)
+        return fn
+
+    compiles = []
+    orig = ops.cute.compile
+
+    class _Count:
+        def __call__(self, fn, *a, **kw):
+            if getattr(fn, "__qualname__", "").startswith("make_host_fn"):
+                compiles.append(fn)
+            return orig(fn, *a, **kw)
+
+        def __getitem__(self, opts):
+            return orig[opts]
+
+    ops._k4p_cache.clear()
+    ops.k4_loader = loader
+    ops.cute.compile = _Count()
+    try:
+        for i, lengths in enumerate(batches):
+            out, state = _run(_inputs(lengths, 30 + i))
+            assert torch.equal(out, ref[i][0]), f"output differs at {lengths}"
+            assert torch.equal(state, ref[i][1]), f"state differs at {lengths}"
+    finally:
+        ops.cute.compile = orig
+        ops.k4_loader = None
+    assert not compiles, f"the op compiled K4 {len(compiles)} time(s)"
+    assert loads and all(loads), loads
+
+
+def test_kda_provider_lists_one_k4_variant_per_layer_shape():
+    p = jcd.KdaPrefillProvider(torch.nn.Module(), num_sm=148)
+    assert p.k4_specs == [] and not p
+    p.cfgs = [(H, True, True)]
+    p.k4_specs = [jcd.k4_spec(148, H, K, K, True)]
+    assert p.k4_specs[0] in p.plan([100, 37]) and p.k4_specs[0] in p.enumerate_specs()
+    # Keys of pools of any row count map to that one spec; other layouts to none.
+    for rows in (1, 3, 16):
+        key = (0, 148, H, K, K, (torch.float32, (rows, H, K, K), (H * K * K, K * K, K, 1), True),
+               (torch.int32, (1,), True))  # fmt: skip
+        assert jcd.k4_spec_from_cache_key(key) == p.k4_specs[0]
+    bf16_pool = (0, 148, H, K, K, (torch.bfloat16, (3, H, K, K), (H * K * K, K * K, K, 1), True),
+                 (torch.int32, (1,), True))  # fmt: skip
+    assert jcd.k4_spec_from_cache_key(bf16_pool) is None

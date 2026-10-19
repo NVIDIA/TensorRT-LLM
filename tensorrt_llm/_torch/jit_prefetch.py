@@ -1294,7 +1294,7 @@ class JitPrefetcher:
         return fn
 
     def enable_cute_dsl(self, kda_provider) -> bool:
-        """Start CuTe DSL helpers and install the KDA K123 loader.
+        """Start CuTe DSL helpers and install the KDA K123 and K4 loaders.
 
         Helpers compile from fake tensors for this rank's arch and export
         ``<dir>/<key>.o``; at the point the KDA op would call ``cute.compile``
@@ -1313,10 +1313,18 @@ class JitPrefetcher:
             spec = jcd.k123_spec_from_cache_key(cache_key)
             return None if spec is None else self._cute_dsl_load(spec)
 
+        def _k4_loader(cache_key):
+            spec = jcd.k4_spec_from_cache_key(cache_key)
+            return None if spec is None else self._cute_dsl_load(spec)
+
         kda_ops.k123_loader = _loader
+        kda_ops.k4_loader = _k4_loader
         for spec in kda_provider.enumerate_specs():
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
-        self._event(f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s)")
+        self._event(
+            f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s), "
+            f"{len(kda_provider.k4_specs)} K4 variant(s)"
+        )
         return True
 
     def enable_cute_dsl_topk(self, topk_provider, next_ns=(1,)) -> bool:

@@ -23,6 +23,11 @@ batch, outside the CUDA graphs that warmup captures:
 * GDN prefill / mixed-batch input prep: ``_extract_transpose_prefill_kernel``
   and ``_fused_gdn_post_conv_kernel`` (``HAS_DECODE`` and the prefill / decode
   token counts' integer classes).
+* KDA prefill on a BF16 state cache: ``_reset_recurrent_state_rows_kernel``
+  zeroes the fresh rows of the dense FP32 copy the mixer stages the batch's
+  rows into. That copy has one row per context request, and its row count
+  is a constexpr of the kernel, so each request count up to
+  ``max_batch_size`` is a variant of its own.
 
 Each launcher is replayed unchanged on ``meta`` tensors under
 ``shadow_launches()``, with the tensors entering it laid out as the mixer
@@ -70,10 +75,11 @@ class _KdaShape:
     def __init__(self, m):
         self.heads = m.num_heads
         self.head_dim = m.head_dim
+        self.head_k_dim = getattr(m, "head_k_dim", m.head_dim)
         self.dtype = torch.bfloat16
 
     def key(self):
-        return ("kda", self.heads, self.head_dim)
+        return ("kda", self.heads, self.head_dim, self.head_k_dim)
 
 
 @contextlib.contextmanager
@@ -101,7 +107,14 @@ class LinearAttnProvider:
     (pure generation batches at a captured size) are skipped by the caller.
     """
 
-    def __init__(self, model, max_num_tokens: int = 0, chunk_size: int = 0):
+    def __init__(
+        self,
+        model,
+        max_num_tokens: int = 0,
+        chunk_size: int = 0,
+        max_batch_size: int = 0,
+        ssm_state_dtype: Optional[torch.dtype] = None,
+    ):
         from .gdn_mixer import Qwen3NextGatedDeltaNet
 
         try:
@@ -122,8 +135,17 @@ class LinearAttnProvider:
         # Mamba2Metadata.chunk_size (the model config's chunk_size, else 128):
         # sizes the chunk-index kernel the metadata launches for cached prefixes.
         self.chunk_size = int(chunk_size) or 128
+        # KimiKDALinearAttention.forward_prefill stages the rows of a non-FP32
+        # state pool, as long as the optimized prefill kernel runs.
+        self.max_batch_size = int(max_batch_size)
+        self.kda_staged = (
+            ssm_state_dtype is not None
+            and ssm_state_dtype != torch.float32
+            and any(isinstance(s, _KdaShape) for s in self.shapes)
+        )
         self.device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
         self._seen: set = set()
+        self._reset_planned: set = set()
         self._num_sms = None
 
     def __bool__(self):
@@ -135,6 +157,7 @@ class LinearAttnProvider:
         "tensorrt_llm._torch.modules.mamba.layernorm_gated",
         "tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops",
         "tensorrt_llm._torch.modules.mamba.mamba2_metadata",
+        "tensorrt_llm._torch.modules.mamba.recurrent_state_cache",
     )
 
     def _sms(self) -> int:
@@ -172,17 +195,29 @@ class LinearAttnProvider:
                 _int_class(t), tuple(pdl), chunk_idx)  # fmt: skip
 
     def __call__(self, batch_ctx: Any, seen: Optional[set] = None) -> List[KernelCall]:
+        reset_counts = getattr(batch_ctx, "kda_reset_counts", None)
+        if reset_counts is not None:
+            return [c for n in reset_counts for c in self._plan_kda_reset(n)]
         ctx_lens = list(batch_ctx.ctx_chunk_lens)
         gen_tokens = int(getattr(batch_ctx, "gen_tokens", 0))
         any_cached = bool(getattr(batch_ctx, "any_ctx_cached", False))
         if not ctx_lens and gen_tokens == 0:
             return []
+        calls: List[KernelCall] = []
+        # A scheduled batch: its request count's reset variant, once.
+        if (
+            seen is None
+            and self.kda_staged
+            and ctx_lens
+            and len(ctx_lens) not in self._reset_planned
+        ):
+            self._reset_planned.add(len(ctx_lens))
+            calls.extend(self._plan_kda_reset(len(ctx_lens)))
         seen = self._seen if seen is None else seen
         key = self.batch_key(ctx_lens, gen_tokens, any_cached)
         if key in seen:
-            return []
+            return calls
         seen.add(key)
-        calls: List[KernelCall] = []
         if key[-1] is not None:
             calls.extend(self._plan_chunk_indices(ctx_lens))
         for s in self.shapes:
@@ -229,6 +264,11 @@ class LinearAttnProvider:
                     continue
                 seen.add(k)
                 yield SimpleNamespace(ctx_chunk_lens=lens, gen_tokens=0, any_ctx_cached=True)
+        # The staged KDA reset: one variant per context request count.
+        if self.kda_staged and self.max_batch_size > 0:
+            yield SimpleNamespace(
+                kda_reset_counts=range(1, self.max_batch_size + 1), ctx_chunk_lens=[], gen_tokens=0
+            )
 
     # -- per-layer planners ------------------------------------------------
     def _plan_chunk_indices(self, ctx_lens: List[int]) -> List[KernelCall]:
@@ -284,6 +324,27 @@ class LinearAttnProvider:
                                     s.v_heads, s.v_dim)  # fmt: skip
             self._gated_norm(t, s.v_heads, s.v_dim, z, s.fp8_norm, "silu")
         return list(rec)
+
+    def _plan_kda_reset(self, n: int) -> List[KernelCall]:
+        """The fresh-row reset of a batch of ``n`` context requests on a
+        staged state copy (``KimiKDALinearAttention.forward_prefill``): an
+        ``[n, H, V, K]`` FP32 copy addressed by ``_arange_buffer[:n]``, the
+        fresh-request flags ``has_initial_states[:n]``, no convolution pool."""
+        from .recurrent_state_cache import reset_recurrent_state_rows
+
+        meta = torch.device("meta")
+        calls: List[KernelCall] = []
+        for s in self.shapes:
+            if not isinstance(s, _KdaShape):
+                continue
+            rows = torch.empty(n, s.heads, s.head_dim, s.head_k_dim, dtype=torch.float32,
+                               device=meta)  # fmt: skip
+            indices = torch.empty(n, dtype=torch.int32, device=meta)
+            has_init = torch.empty(n, dtype=torch.bool, device=meta)
+            with shadow_launches() as rec:
+                reset_recurrent_state_rows(rows, indices, has_init)
+            calls.extend(rec)
+        return calls
 
     def _plan_kda(self, s: _KdaShape, p: int, d: int) -> List[KernelCall]:
         from .fuse_elementwise_ops import extract_transpose_prefill_slice
