@@ -3,7 +3,6 @@
 
 import math
 import weakref
-from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -989,9 +988,10 @@ class Attention(nn.Module):
 
         mixed_precision_kv_view = get_mixed_precision_kv_view(
             attn_metadata, self.attn.layer_idx)
-        with (mixed_precision_kv_view.use_staging(attn_metadata,
-                                                  self.attn.layer_idx)
-              if mixed_precision_kv_view is not None else nullcontext()):
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.convert(self.attn.layer_idx)
+            native_kv = mixed_precision_kv_view.swap_staging(attn_metadata)
+        try:
             attn_output = self.attn.forward(
                 q,
                 k,
@@ -1015,6 +1015,11 @@ class Attention(nn.Module):
                     relative_attention_max_distance=
                     relative_attention_max_distance,
                 ))
+        finally:
+            if mixed_precision_kv_view is not None:
+                mixed_precision_kv_view.swap_staging(attn_metadata, native_kv)
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.convert(self.attn.layer_idx, writeback=True)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output

@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Convert mixed-precision KV pools to and from native Attention views."""
 
-from contextlib import contextmanager
-from typing import Iterator
-
 import torch
 
 from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
@@ -75,6 +72,7 @@ class MixedPrecisionKVView:
         self.low_dtype = manager.low_dtype
         self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
+        self.kv_cache_block_offsets = None
 
     def update(self, metadata: AttentionMetadata) -> None:
         manager = metadata.kv_cache_manager
@@ -134,36 +132,23 @@ class MixedPrecisionKVView:
             )
             self.kv_cache_block_offsets = block_offsets
 
-    @contextmanager
-    def use_staging(self, metadata: AttentionMetadata, layer_idx: int) -> Iterator[None]:
-        """Read and write this layer's KV through the native staging buffer."""
-        from .trtllm import TrtllmAttentionMetadata
-
-        self.convert(layer_idx)
-        if not isinstance(metadata, TrtllmAttentionMetadata):
-            yield
-            self.convert(layer_idx, writeback=True)
-            return
+    def swap_staging(self, metadata: AttentionMetadata, kv=None):
+        """Select staging KV or restore the supplied cache state."""
+        if self.kv_cache_block_offsets is None:
+            return None
         saved = (
             metadata.kv_cache_manager,
             metadata.kv_layout,
             metadata.use_paged_context_fmha,
             metadata.kv_cache_block_offsets,
         )
-        try:
-            metadata.kv_cache_manager = self
-            metadata.kv_layout = self.layout
-            metadata.use_paged_context_fmha = True
-            metadata.kv_cache_block_offsets = self.kv_cache_block_offsets
-            yield
-        finally:
-            (
-                metadata.kv_cache_manager,
-                metadata.kv_layout,
-                metadata.use_paged_context_fmha,
-                metadata.kv_cache_block_offsets,
-            ) = saved
-        self.convert(layer_idx, writeback=True)
+        (
+            metadata.kv_cache_manager,
+            metadata.kv_layout,
+            metadata.use_paged_context_fmha,
+            metadata.kv_cache_block_offsets,
+        ) = kv if kv is not None else (self, self.layout, True, self.kv_cache_block_offsets)
+        return saved
 
     def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
         from ...cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv

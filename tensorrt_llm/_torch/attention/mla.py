@@ -17,7 +17,6 @@ import functools
 import math
 import os
 import weakref
-from contextlib import nullcontext
 from typing import Dict, Optional, cast
 
 import torch
@@ -971,11 +970,10 @@ class MLA(nn.Module):
 
         mixed_precision_kv_view = get_mixed_precision_kv_view(attn_metadata, self.layer_idx)
 
-        with (
-            mixed_precision_kv_view.use_staging(attn_metadata, self.layer_idx)
-            if mixed_precision_kv_view is not None
-            else nullcontext()
-        ):
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.convert(self.layer_idx)
+            native_kv = mixed_precision_kv_view.swap_staging(attn_metadata)
+        try:
             self._forward_impl(
                 position_ids,
                 hidden_states,
@@ -983,6 +981,11 @@ class MLA(nn.Module):
                 attn_output[0],
                 latent_cache_gen=latent_cache_gen,
             )
+        finally:
+            if mixed_precision_kv_view is not None:
+                mixed_precision_kv_view.swap_staging(attn_metadata, native_kv)
+        if mixed_precision_kv_view is not None:
+            mixed_precision_kv_view.convert(self.layer_idx, writeback=True)
 
     def _forward_impl(
         self,
