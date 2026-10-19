@@ -210,11 +210,17 @@ def _register_fake():
         return torch.empty_like(layer_residual)
 
     @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_fwd")
-    def _(layer_residual: torch.Tensor, layer_residual_add: torch.Tensor,
-          block_residual: torch.Tensor, res_weight: torch.Tensor,
-          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
-          rms_eps: float,
-          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _(
+        layer_residual: torch.Tensor,
+        layer_residual_add: torch.Tensor,
+        block_residual: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        output_rms_weight: torch.Tensor,
+        rms_eps: float,
+        output_rms_eps: float,
+        layer_residual_add2: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (updated_layer_residual, output), both [T, B, H] like the
         # layer residual.
         return torch.empty_like(layer_residual), torch.empty_like(

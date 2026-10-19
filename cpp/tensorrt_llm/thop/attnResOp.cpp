@@ -186,9 +186,11 @@ at::Tensor attn_res_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor block_resi
     return output;
 }
 
+//! layer_residual_add2 (optional): updated = bf16(layer_residual + bf16(layer_residual_add + layer_residual_add2)),
+//! the two additions of a MoE tail (routed + shared, then the prefix) folded into this kernel.
 std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor layer_residual_add,
     at::Tensor block_residual, at::Tensor res_weight, at::Tensor rms_weight, at::Tensor output_rms_weight,
-    double rms_eps, double output_rms_eps)
+    double rms_eps, double output_rms_eps, std::optional<at::Tensor> layer_residual_add2)
 {
     TORCH_CHECK(layer_residual.dim() == 3, "attn_res_add_rmsnorm_fwd: layer_residual must be [T, B, H]");
     TORCH_CHECK(layer_residual_add.sizes() == layer_residual.sizes(),
@@ -225,6 +227,17 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_res
     TORCH_CHECK(layer_residual.is_contiguous() && layer_residual_add.is_contiguous() && block_residual.is_contiguous()
             && res_weight.is_contiguous() && rms_weight.is_contiguous() && output_rms_weight.is_contiguous(),
         "attn_res_add_rmsnorm_fwd: inputs must be contiguous");
+    if (layer_residual_add2.has_value())
+    {
+        TORCH_CHECK(layer_residual_add2->sizes() == layer_residual.sizes(),
+            "attn_res_add_rmsnorm_fwd: layer_residual_add2 must match layer_residual");
+        TORCH_CHECK(layer_residual_add2->is_cuda() && layer_residual_add2->device() == layer_residual.device(),
+            "attn_res_add_rmsnorm_fwd: layer_residual_add2 must be on the device of layer_residual");
+        TORCH_CHECK(layer_residual_add2->scalar_type() == at::kBFloat16,
+            "attn_res_add_rmsnorm_fwd: layer_residual_add2 must be bf16");
+        TORCH_CHECK(
+            layer_residual_add2->is_contiguous(), "attn_res_add_rmsnorm_fwd: layer_residual_add2 must be contiguous");
+    }
     TORCH_CHECK(block_residual.sizes() == at::IntArrayRef({N - 1, T, B, H}),
         "attn_res_add_rmsnorm_fwd: block_residual shape must match layer_residual");
     TORCH_CHECK(res_weight.numel() == H, "attn_res_add_rmsnorm_fwd: res_weight must have H elements");
@@ -237,6 +250,9 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_res
     params.blockResidual = N > 1 ? reinterpret_cast<__nv_bfloat16 const*>(block_residual.const_data_ptr()) : nullptr;
     params.layerResidual = reinterpret_cast<__nv_bfloat16 const*>(layer_residual.const_data_ptr());
     params.layerResidualAdd = reinterpret_cast<__nv_bfloat16 const*>(layer_residual_add.const_data_ptr());
+    params.layerResidualAdd2 = layer_residual_add2.has_value()
+        ? reinterpret_cast<__nv_bfloat16 const*>(layer_residual_add2->const_data_ptr())
+        : nullptr;
     params.resWeight = reinterpret_cast<__nv_bfloat16 const*>(res_weight.const_data_ptr());
     params.rmsWeight = reinterpret_cast<__nv_bfloat16 const*>(rms_weight.const_data_ptr());
     params.outputRmsWeight = reinterpret_cast<__nv_bfloat16 const*>(output_rms_weight.const_data_ptr());
@@ -250,7 +266,14 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_res
     params.outputRmsEps = static_cast<float>(output_rms_eps);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    kernels::kimiK3AttnRes::invokeAttnResAddRmsNormFwd(params, stream);
+    if (layer_residual_add2.has_value())
+    {
+        kernels::kimiK3AttnRes::invokeAttnResAdd2RmsNormFwd(params, stream);
+    }
+    else
+    {
+        kernels::kimiK3AttnRes::invokeAttnResAddRmsNormFwd(params, stream);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {updated_layer_residual, output};
 }
@@ -368,7 +391,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "attn_res_add_rmsnorm_fwd(Tensor layer_residual, Tensor layer_residual_add, "
         "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
-        "float rms_eps, float output_rms_eps) -> (Tensor, Tensor)");
+        "float rms_eps, float output_rms_eps, Tensor? layer_residual_add2=None) -> (Tensor, Tensor)");
     m.def(
         "attn_res_add_rmsnorm_persistent_fwd(Tensor layer_residual, Tensor? layer_residual_add, "
         "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "

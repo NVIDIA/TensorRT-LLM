@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the fused Kimi K3 attention-residual op."""
 
+from unittest import mock
+
 import pytest
 import torch
 from torch import nn
@@ -178,3 +180,84 @@ def test_preallocated_snapshot_bank_matches_legacy_growth() -> None:
         assert snapshot_bank.data_ptr() == bank_ptr
 
     torch.testing.assert_close(snapshot_bank[:num_snapshots], legacy_block_residual, rtol=0, atol=0)
+
+
+class _SplitMoE(nn.Module):
+    """Stand-in for ``KimiK3MoERuntime``: distinct routed and shared outputs."""
+
+    def forward(
+        self, hidden_states: torch.Tensor, _all_rank_num_tokens=None, return_parts: bool = False
+    ):
+        routed = hidden_states * 0.5 + 1.0
+        shared = hidden_states * 0.25 - 0.5
+        return (routed, shared) if return_parts else routed + shared
+
+
+def _make_moe_test_layer(layer_idx: int) -> kimi_modeling.KimiLinearDecoderLayer:
+    layer = _make_snapshot_test_layer(layer_idx)
+    layer.is_moe = layer_idx % 2 == 1
+    layer.block_sparse_moe = _SplitMoE()
+    return layer
+
+
+@pytest.mark.parametrize("capture_layer", [None, 6])
+def test_deferred_moe_tail_add_matches_eager_add(
+    capture_layer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chain that defers every MoE tail add reproduces the eager chain bitwise.
+
+    On CPU the fused kernel is unavailable, so the consumer takes its fallback;
+    this covers the hand-off itself: which layer materializes, which folds, and
+    that a capture tap sees the materialized prefix sum.
+    """
+    monkeypatch.setattr(kimi_modeling, "_can_defer_moe_tail_add", lambda *_: True)
+    torch.manual_seed(0)
+    eager_hidden = torch.randn(2, 4)
+    deferred_hidden = eager_hidden.clone()
+    eager_bank = torch.empty(3, 2, 4)
+    deferred_bank = torch.empty(3, 2, 4)
+    eager_snapshots = deferred_snapshots = 0
+    eager_taps, deferred_taps = {}, {}
+
+    def _capture(taps):
+        spec = mock.Mock()
+        spec.maybe_capture_hidden_states.side_effect = lambda lid, h, _r: taps.__setitem__(
+            lid, h.clone()
+        )
+        return spec
+
+    eager_spec, deferred_spec = _capture(eager_taps), _capture(deferred_taps)
+    num_pending = 0
+    for layer_idx in range(25):
+        layer = _make_moe_test_layer(layer_idx)
+        tap = layer_idx == capture_layer
+        eager_hidden, eager_snapshots = layer(
+            eager_hidden,
+            eager_bank,
+            eager_snapshots,
+            None,
+            capture=(eager_spec, layer_idx - 1) if tap else None,
+        )
+        deferred_hidden, deferred_snapshots = layer(
+            deferred_hidden,
+            deferred_bank,
+            deferred_snapshots,
+            None,
+            capture=(deferred_spec, layer_idx - 1) if tap else None,
+            defer_moe_tail_add=layer.is_moe,
+        )
+        if layer.is_moe:
+            assert isinstance(deferred_hidden, kimi_modeling._MoeTailPending)
+            num_pending += 1
+            torch.testing.assert_close(deferred_hidden.materialize(), eager_hidden, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(deferred_hidden, eager_hidden, rtol=0, atol=0)
+        assert deferred_snapshots == eager_snapshots
+
+    assert num_pending == 12
+    torch.testing.assert_close(
+        deferred_bank[:deferred_snapshots], eager_bank[:eager_snapshots], rtol=0, atol=0
+    )
+    assert deferred_taps.keys() == eager_taps.keys()
+    for lid, tapped in eager_taps.items():
+        torch.testing.assert_close(deferred_taps[lid], tapped, rtol=0, atol=0)

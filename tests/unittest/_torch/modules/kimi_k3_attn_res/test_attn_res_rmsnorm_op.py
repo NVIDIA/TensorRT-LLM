@@ -596,3 +596,162 @@ def test_model_helper_keeps_rmsnorm_split_above_token_ceiling() -> None:
     cosine, relative_l2 = _similarity(actual, expected)
     assert cosine > 0.9999
     assert relative_l2 < 5e-3
+
+
+def _fused_add2(
+    layer_residual: torch.Tensor,
+    layer_residual_add: torch.Tensor,
+    layer_residual_add2: torch.Tensor,
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    score_rms_weight: torch.Tensor,
+    output_rms_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.trtllm.attn_res_add_rmsnorm_fwd(
+        layer_residual,
+        layer_residual_add,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+        ATTN_RES_RMS_EPS,
+        OUTPUT_RMS_EPS,
+        layer_residual_add2=layer_residual_add2,
+    )
+
+
+def _moe_tail_parts(layer_residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    routed = (torch.randn_like(layer_residual) * 0.05).contiguous()
+    shared = (torch.randn_like(layer_residual) * 0.05).contiguous()
+    return routed, shared
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "num_snapshots"),
+    [
+        (1, 0),  # N=1 single-CTA
+        (1, 1),
+        (1, 2),
+        (1, 3),  # N=4 single-CTA, last single-CTA instantiation
+        (1, 4),  # N=5 split-K, first cluster instantiation
+        (1, 7),
+        (1, 8),
+        (1, 11),  # N=12 split-K
+        (8, 3),
+        (8, 8),
+        (16, 3),
+        (32, 3),
+        (32, 8),
+    ],
+)
+@torch.no_grad()
+def test_attn_res_add2_rmsnorm_matches_presummed_add(
+    num_tokens: int,
+    num_snapshots: int,
+) -> None:
+    """Two addends give bitwise what one addend holding their BF16 sum gives."""
+    inputs = _make_inputs(num_tokens, num_snapshots)
+    routed, shared = _moe_tail_parts(inputs[0])
+    expected_updated, expected_output = _fused_add(inputs[0], routed + shared, *inputs[1:])
+    actual_updated, actual_output = _fused_add2(inputs[0], routed, shared, *inputs[1:])
+
+    assert torch.equal(actual_updated, inputs[0] + (routed + shared))
+    assert torch.equal(actual_updated, expected_updated)
+    assert torch.equal(actual_output, expected_output)
+
+
+@pytest.mark.parametrize("num_snapshots", [3, 8])
+@torch.no_grad()
+def test_attn_res_add2_rmsnorm_keeps_subnormal_sums(num_snapshots: int) -> None:
+    """The two additions round like the BF16 tensor additions, subnormals included."""
+    inputs = _make_inputs(num_tokens=1, num_snapshots=num_snapshots)
+    layer_residual = inputs[0].clone()
+    routed, shared = _moe_tail_parts(layer_residual)
+    smallest_normal = torch.finfo(torch.bfloat16).smallest_normal
+    width = 256
+    layer_residual[..., :width] = 0
+    routed[..., :width] = smallest_normal * 0.75
+    shared[..., :width] = -smallest_normal * 0.25
+    layer_residual[..., width : 2 * width] = -smallest_normal * 0.5
+    routed[..., width : 2 * width] = smallest_normal * 0.375
+    shared[..., width : 2 * width] = smallest_normal * 0.375
+
+    expected_updated = layer_residual + (routed + shared)
+    actual_updated, _ = _fused_add2(layer_residual, routed, shared, *inputs[1:])
+
+    subnormal = expected_updated[..., : 2 * width]
+    assert (subnormal != 0).all() and (subnormal.abs() < smallest_normal).all()
+    assert torch.equal(actual_updated, expected_updated)
+
+
+def _attn_res_modules(
+    res_weight: torch.Tensor,
+    score_rms_weight: torch.Tensor,
+    output_rms_weight: torch.Tensor,
+) -> tuple[nn.Linear, KimiK3RMSNorm, RMSNorm]:
+    projection = nn.Linear(HIDDEN_SIZE, 1, bias=False, dtype=torch.bfloat16, device="cuda")
+    score_norm = KimiK3RMSNorm(
+        HIDDEN_SIZE, eps=ATTN_RES_RMS_EPS, dtype=torch.bfloat16, device=torch.device("cuda")
+    )
+    output_norm = RMSNorm(
+        hidden_size=HIDDEN_SIZE,
+        eps=OUTPUT_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    projection.weight.copy_(res_weight.reshape(1, -1))
+    score_norm.weight.copy_(score_rms_weight)
+    output_norm.weight.copy_(output_rms_weight)
+    return projection, score_norm, output_norm
+
+
+@pytest.mark.parametrize("num_snapshots", [3, 8])
+@torch.no_grad()
+def test_model_helper_dispatches_fused_add2(
+    num_snapshots: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer_residual, block_residual, *weights = _make_inputs(1, num_snapshots)
+    routed, shared = _moe_tail_parts(layer_residual)
+    modules = _attn_res_modules(*weights)
+    prefix_sum = layer_residual[:, 0, :]
+    block_kernel_layout = block_residual[:, :, 0, :]
+    expected_updated, expected_output = _apply_attn_res_add_and_rmsnorm(
+        prefix_sum, (routed + shared)[:, 0, :], block_kernel_layout, *modules
+    )
+
+    unexpected_fallback = mock.Mock(
+        side_effect=AssertionError("model helper did not dispatch the fused add2")
+    )
+    monkeypatch.setattr(modeling_kimi_linear, "_apply_attn_res_and_rmsnorm", unexpected_fallback)
+    actual_updated, actual_output = _apply_attn_res_add_and_rmsnorm(
+        prefix_sum,
+        routed[:, 0, :],
+        block_kernel_layout,
+        *modules,
+        addend2=shared[:, 0, :],
+    )
+
+    unexpected_fallback.assert_not_called()
+    assert torch.equal(actual_updated, expected_updated)
+    assert torch.equal(actual_output, expected_output)
+
+
+@torch.no_grad()
+def test_model_helper_add2_leaves_persistent_kernel_to_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persistent kernel has no second addend: the caller must add first."""
+    monkeypatch.setattr(modeling_kimi_linear, "_ATTN_RES_TOPOLOGY", "persistent")
+    layer_residual, block_residual, *weights = _make_inputs(1, 3)
+    routed, shared = _moe_tail_parts(layer_residual)
+    assert (
+        _apply_attn_res_add_rmsnorm_fused(
+            layer_residual[:, 0, :],
+            routed[:, 0, :],
+            block_residual[:, :, 0, :],
+            *_attn_res_modules(*weights),
+            addend2=shared[:, 0, :],
+        )
+        is None
+    )
