@@ -155,8 +155,8 @@ def test_native_common_reuse_and_window_retention(make_manager):
         assert full.num_committed_tokens == 640
         assert full.resume(stream)
     with closing(native.create_kv_cache(None, tokens[:512])) as shortened:
-        # A different endpoint must also have its required high tail.
-        assert shortened.num_committed_tokens == 512
+        # Reuse follows the native snapshot policy and required high tail.
+        assert shortened.num_committed_tokens == (128 if config.commit_min_snapshot else 512)
         assert shortened.resume(stream)
 
 
