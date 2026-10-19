@@ -1649,6 +1649,31 @@ def _is_helix_a2a(model_config: ModelConfig) -> bool:
     return mapping.enable_attention_dp and mapping.helix_repurposed_cp_size > 1
 
 
+_K3_ROUTER_BF16_ENV = "KIMI_K3_ROUTER_BF16"
+
+
+def _k3_router_gemm_bf16(tp_group_shares_requests: bool) -> bool:
+    """Return whether the K3 MoE router gate GEMM takes bf16 inputs.
+
+    ``KIMI_K3_ROUTER_BF16`` takes the `get_env_flag` values or ``legacy``.
+    Unset, blank or on selects bf16 on every rank. Off selects the fp32 upcast
+    (TF32 cuBLAS) on every rank. ``legacy`` selects bf16 only where every rank
+    of the TP group serves the same requests, and the upcast elsewhere.
+
+    Args:
+        tp_group_shares_requests: ``Mapping.tp_group_shares_requests`` of this rank.
+
+    Raises:
+        ValueError: The variable holds any other value.
+    """
+    if os.environ.get(_K3_ROUTER_BF16_ENV, "").strip().lower() == "legacy":
+        return tp_group_shares_requests
+    try:
+        return get_env_flag(_K3_ROUTER_BF16_ENV, True)
+    except ValueError as error:
+        raise ValueError(f"{error}, or legacy") from None
+
+
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
@@ -1699,8 +1724,9 @@ class KimiK3MoERuntime(nn.Module):
         # GEMM pair. The other path upcasts both inputs to fp32 (TF32 cuBLAS).
         # Every product is exact in both paths, so they differ only in
         # summation order, and the upcast is not more accurate.
-        # KIMI_K3_ROUTER_BF16=0 selects the upcast.
-        _router_bf16 = get_env_flag("KIMI_K3_ROUTER_BF16", True)
+        # KIMI_K3_ROUTER_BF16=0 selects the upcast on every rank, and =legacy
+        # selects it only where the TP group does not share requests.
+        _router_bf16 = _k3_router_gemm_bf16(model_config.mapping.tp_group_shares_requests)
         # The router-logits kernel serves the MoE blocks after KDA attention: there the earlier
         # routing shortens the MoE front, while after MLA attention it lands in the burst of
         # latent_down and the shared expert's first GEMM and the front gets longer.
