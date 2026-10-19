@@ -1241,6 +1241,10 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     # ----- engine-facing surface (delegate to the inner causal LM) -------
 
     @property
+    def language_model(self) -> nn.Module:
+        return self.llm
+
+    @property
     def multimodal_data_device_paths(self) -> List[str]:
         # Restrict the H2D copy to the tensors the vision tower actually
         # consumes on GPU. ``num_patches`` / ``patch_newline_mask`` are metadata

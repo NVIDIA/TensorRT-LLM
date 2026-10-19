@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import dataclasses
 from typing import Any, List, Literal, Optional, Tuple
@@ -271,6 +274,10 @@ class Gemma3VLM(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        return self.llm
 
     @property
     def vocab_size_padded(self) -> int:

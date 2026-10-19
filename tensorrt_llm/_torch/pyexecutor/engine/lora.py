@@ -43,6 +43,8 @@ def make_cuda_graph_lora_manager(
     max_num_tokens: int,
 ) -> CudaGraphLoraManager:
     """Build the CUDA-graph LoRA manager. Only call this when graphs are enabled."""
+    # Multimodal encoders have separate layer indices and do not receive decoder adapters.
+    model = getattr(model, "language_model", model)
     max_lora_size = lora_config.max_loras or 8  # Default fallback
     manager = CudaGraphLoraManager(
         max_lora_size=max_lora_size,

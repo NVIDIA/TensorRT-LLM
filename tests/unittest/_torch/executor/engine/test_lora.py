@@ -1,24 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the LoRA parameter builder.
-
-These cover the eager construction path, which has no test coverage upstream:
-the union-set padding across a mixed batch, and the speculative-decoding
-re-labelling. The latter is the reason the builder takes ``enable_spec_decode``
-and ``runtime_draft_len`` per call instead of snapshotting them -- warmup and
-CUDA-graph capture rewrite both repeatedly, and a snapshot would produce wrong
-token counts silently.
-"""
+"""Unit tests for LoRA parameter construction and CUDA-graph model scope."""
 
 from collections.abc import Sequence
+from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.engine.lora import LoraParamBuilder
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.pyexecutor.engine.lora import (
+    LoraParamBuilder,
+    make_cuda_graph_lora_manager,
+)
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -386,3 +391,244 @@ def test_eager_fallback_releases_evicted_adapter_slots() -> None:
     assert manager.evicted_for == [peft_cache_manager]
     assert manager.base_only_calls == []
     assert manager.tokens_per_seq_calls == []
+
+
+class _LoraBlock(torch.nn.Module):
+    def __init__(
+        self,
+        layer_idx: int | None,
+        output_sizes: list[int],
+        module_types: Sequence[LoraModuleType] = (LoraModuleType.ATTENTION_Q,),
+    ) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.lora = LoraLayer(list(module_types), output_sizes)
+        self.workspace_reservations: list[tuple[int, int, int]] = []
+        self.forward_calls = 0
+
+    def reserve_moe_lora_cuda_graph_workspace(
+        self, max_tokens: int, max_rank: int, max_adapters: int
+    ) -> None:
+        self.workspace_reservations.append((max_tokens, max_rank, max_adapters))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        self.forward_calls += 1
+        return value + 1
+
+
+class _MultimodalLoraModel(torch.nn.Module):
+    def __init__(self, layer_idx: int | None = 7) -> None:
+        super().__init__()
+        self.encoder = torch.nn.Sequential(_LoraBlock(layer_idx, [24]))
+        self.language_model = torch.nn.Sequential(_LoraBlock(layer_idx, [96]))
+        self.model_config = SimpleNamespace(extra_attrs={})
+
+    def forward(self, value: torch.Tensor, attn_metadata: object) -> torch.Tensor:
+        return self.language_model(self.encoder(value))
+
+
+@pytest.fixture
+def graph_lora_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[LoraConfig, LoraModelConfig]:
+    # Keep the real layer-key equality and discovery; only tensor allocation needs CUDA.
+    monkeypatch.setattr(CudaGraphLoraParams, "__init__", lambda self, **kwargs: None)
+    return (
+        LoraConfig(max_loras=4, max_lora_rank=8, lora_target_modules=["attn_q"]),
+        LoraModelConfig(
+            lora_target_modules=["attn_q"],
+            trtllm_modules_to_hf_modules={},
+            hidden_size=96,
+            dtype="float16",
+        ),
+    )
+
+
+def _graph_manager(
+    model: torch.nn.Module,
+    settings: tuple[LoraConfig, LoraModelConfig],
+    max_num_tokens: int = 17,
+) -> CudaGraphLoraManager:
+    return make_cuda_graph_lora_manager(
+        model,
+        *settings,
+        max_batch_size=3,
+        max_tokens_per_seq=2,
+        max_num_tokens=max_num_tokens,
+    )
+
+
+@pytest.mark.parametrize("layer_idx", [7, None])
+def test_cuda_graph_lora_excludes_encoder_with_same_local_key(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig], layer_idx: int | None
+) -> None:
+    model = _MultimodalLoraModel(layer_idx)
+    encoder_lora = model.encoder[0].lora
+
+    manager = _graph_manager(model, graph_lora_settings)
+
+    key = CudaGraphLoraParams.LoraLayerKey(layer_idx, (LoraModuleType.ATTENTION_Q,))
+    assert manager.layer_info == {
+        key: CudaGraphLoraParams.LoraLayerInfo(module_num=1, output_sizes=[96])
+    }
+    assert model.encoder[0].lora is encoder_lora
+    assert encoder_lora.output_hidden_sizes == [24]
+
+
+def test_cuda_graph_lora_excludes_encoder_without_layer_indices(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+) -> None:
+    model = _MultimodalLoraModel()
+    del model.encoder[0].layer_idx
+    del model.language_model[0].layer_idx
+    model.encoder[0].lora = LoraLayer([LoraModuleType.MLP_H_TO_4H], [24])
+    model.language_model[0].lora = LoraLayer([LoraModuleType.MLP_H_TO_4H], [96])
+    graph_lora_settings[0].lora_target_modules = ["mlp_h_to_4h"]
+    graph_lora_settings[1].lora_target_modules = ["mlp_h_to_4h"]
+
+    manager = _graph_manager(model, graph_lora_settings)
+
+    key = CudaGraphLoraParams.LoraLayerKey(None, (LoraModuleType.MLP_H_TO_4H,))
+    assert manager.layer_info == {
+        key: CudaGraphLoraParams.LoraLayerInfo(module_num=1, output_sizes=[96])
+    }
+
+
+@pytest.mark.parametrize("layer_idx", [7, None])
+def test_cuda_graph_lora_still_rejects_duplicate_decoder_keys(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig], layer_idx: int | None
+) -> None:
+    model = _MultimodalLoraModel(layer_idx)
+    model.encoder = torch.nn.Identity()
+    model.language_model.append(_LoraBlock(layer_idx, [112]))
+
+    with pytest.raises(AssertionError, match="already exists"):
+        _graph_manager(model, graph_lora_settings)
+
+
+def test_cuda_graph_lora_filters_targets_before_duplicate_detection(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+) -> None:
+    model = _MultimodalLoraModel()
+    fused_types = (
+        LoraModuleType.ATTENTION_Q,
+        LoraModuleType.ATTENTION_K,
+        LoraModuleType.ATTENTION_V,
+    )
+    model.language_model = torch.nn.Sequential(
+        _LoraBlock(7, [96, 32, 32], fused_types),
+        _LoraBlock(7, [96], (LoraModuleType.ATTENTION_DENSE,)),
+        _LoraBlock(7, [96], (LoraModuleType.ATTENTION_DENSE,)),
+    )
+    graph_lora_settings[0].lora_target_modules = ["attn_k"]
+    graph_lora_settings[1].lora_target_modules = ["attn_k"]
+
+    manager = _graph_manager(model, graph_lora_settings)
+
+    key = CudaGraphLoraParams.LoraLayerKey(7, fused_types)
+    assert manager.layer_info == {
+        key: CudaGraphLoraParams.LoraLayerInfo(module_num=3, output_sizes=[96, 32, 32])
+    }
+
+
+def test_cuda_graph_lora_keeps_text_only_model_scope(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+) -> None:
+    model = torch.nn.Sequential(_LoraBlock(7, [96]))
+
+    manager = _graph_manager(model, graph_lora_settings)
+
+    key = CudaGraphLoraParams.LoraLayerKey(7, (LoraModuleType.ATTENTION_Q,))
+    assert manager.layer_info == {
+        key: CudaGraphLoraParams.LoraLayerInfo(module_num=1, output_sizes=[96])
+    }
+
+
+@pytest.mark.parametrize(("max_num_tokens", "reserved_tokens"), [(4, 6), (17, 17)])
+def test_cuda_graph_lora_reserves_workspace_only_on_decoder(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+    max_num_tokens: int,
+    reserved_tokens: int,
+) -> None:
+    model = _MultimodalLoraModel()
+    model.encoder[0].layer_idx = 11
+
+    _graph_manager(model, graph_lora_settings, max_num_tokens)
+
+    assert model.encoder[0].workspace_reservations == []
+    assert model.language_model[0].workspace_reservations == [(reserved_tokens, 8, 4)]
+
+
+def _runner_for_lora(
+    runner_type: type[DecoderRunner],
+    model: torch.nn.Module,
+    lora_model_config: LoraModelConfig,
+) -> DecoderRunner:
+    runner = runner_type.__new__(runner_type)
+    runner.model = model
+    runner._model_caller = ModelCaller(model)
+    runner.lora_model_config = lora_model_config
+    runner.cuda_graph_runner = SimpleNamespace(enabled=True)
+    runner._config = SimpleNamespace(
+        is_spec_decode=True,
+        original_max_draft_len=1,
+        max_batch_size=3,
+        max_num_tokens=17,
+        spec_config=None,
+        attention_backend=object(),
+    )
+    return runner
+
+
+def test_runner_lora_initialization_preserves_outer_multimodal_forward(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+) -> None:
+    model = _MultimodalLoraModel()
+    runner = _runner_for_lora(DecoderRunner, model, graph_lora_settings[1])
+
+    runner.init_cuda_graph_lora_manager(graph_lora_settings[0])
+
+    assert runner.model is model
+    assert runner._lora.cuda_graph_manager is not None
+    with model_extra_attrs({}):
+        output = runner._model_caller(value=torch.tensor([1]), attn_metadata=model)
+    assert output.tolist() == [3]
+    assert model.encoder[0].forward_calls == 1
+    assert model.language_model[0].forward_calls == 1
+
+
+def test_encoder_decoder_runner_inherits_lora_model_fallback(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+) -> None:
+    model = torch.nn.Sequential(_LoraBlock(7, [96]))
+    runner = _runner_for_lora(EncoderDecoderRunner, model, graph_lora_settings[1])
+
+    runner.init_cuda_graph_lora_manager(graph_lora_settings[0])
+
+    key = CudaGraphLoraParams.LoraLayerKey(7, (LoraModuleType.ATTENTION_Q,))
+    assert runner._lora.cuda_graph_manager.layer_info == {
+        key: CudaGraphLoraParams.LoraLayerInfo(module_num=1, output_sizes=[96])
+    }
+    assert runner.model is model
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("gemma3vl", "Gemma3VLM"),
+        ("phi4mm", "Phi4MMForCausalLM"),
+        ("qwen2vl", "Qwen2VLModelBase"),
+        ("step3p7vl", "Step3p7VLForConditionalGeneration"),
+        ("nemotron_h_multimodal", "NemotronHMultimodalModel"),
+        ("mistral", "Mistral3VLM"),
+    ],
+)
+def test_multimodal_language_model_property_returns_llm(module_name: str, class_name: str) -> None:
+    model_type = getattr(
+        import_module(f"tensorrt_llm._torch.models.modeling_{module_name}"), class_name
+    )
+    model = model_type.__new__(model_type)
+    torch.nn.Module.__init__(model)
+    model.llm = torch.nn.Module()
+
+    assert model.language_model is model.llm

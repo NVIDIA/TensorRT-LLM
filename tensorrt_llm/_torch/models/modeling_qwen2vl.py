@@ -2246,6 +2246,10 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
     @property
+    def language_model(self) -> torch.nn.Module:
+        return self.llm
+
+    @property
     def mm_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
 
