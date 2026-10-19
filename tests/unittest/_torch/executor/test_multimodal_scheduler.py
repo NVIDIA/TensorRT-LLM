@@ -801,7 +801,7 @@ def test_mm_admission_does_not_charge_ready_active_request():
 
 @pytest.mark.parametrize(
     ("chunk_unit", "eager", "expected_admitted"),
-    [(2, False, [2]), (None, False, []), (2, True, [])],
+    [(2, False, [2]), (4, False, [2]), (None, False, []), (2, True, [])],
 )
 def test_mm_admission_charges_only_eligible_active_items(chunk_unit, eager, expected_admitted):
     active = make_mm_request(1, [4, 4], interleaved=True)
@@ -815,6 +815,23 @@ def test_mm_admission_charges_only_eligible_active_items(chunk_unit, eager, expe
 
     assert [item.id for item in admitted] == expected_admitted
     assert [item.id for item in waiting] == ([] if expected_admitted else [2])
+
+
+def test_mm_admission_charges_next_chunk_after_context_advance() -> None:
+    active = make_mm_request(1, [4, 4], ready=(0,), interleaved=True)
+    active.context_chunk_size = 2
+    active.move_to_next_context_chunk()
+    assert active.context_current_position == 2
+    assert active.context_chunk_size == 0
+
+    waiting = FCFSWaitingQueue([_waiting_item(2, [4]), _waiting_item(3)])
+    executor = _executor_for_mm_admission([active], max_batch_size=1, max_num_tokens=4)
+    executor.scheduler.context_chunk_unit_size = 2
+
+    admitted = executor._pop_from_waiting_queue(waiting, 1)
+
+    assert not admitted
+    assert [item.id for item in waiting] == [2, 3]
 
 
 def test_mm_admission_passes_oversized_request_to_validation():

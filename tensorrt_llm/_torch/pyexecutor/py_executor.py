@@ -6586,9 +6586,12 @@ class PyExecutor:
             if (self.scheduler.context_chunk_unit_size is not None
                     and not self.scheduler.prepares_future_items):
                 begin = get_mm_context_chunk_start(request)
+                # A completed chunk resets its size before the next scheduling pass.
+                chunk_size = (request.context_chunk_size
+                              or self.scheduler.context_chunk_unit_size)
                 pending_item_indices = [
                     item_idx for item_idx in get_mm_items_for_chunk(
-                        request, begin, begin + request.context_chunk_size)
+                        request, begin, begin + chunk_size)
                     if not state.item_ready[item_idx]
                 ]
             else:
