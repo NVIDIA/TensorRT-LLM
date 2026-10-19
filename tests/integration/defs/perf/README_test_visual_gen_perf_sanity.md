@@ -50,16 +50,18 @@ history selection. Change this mapping to switch measurement paths; reassess
 compatibility explicitly if timing semantics change under the same path.
 
 CI excludes missing or incompatible sources before latest-main and baseline
-selection. It ignores inherited `d_baseline_*` values and recomputes from
-compatible history plus the current measurement, preserving threshold overrides
-and stored records. Defaults remain 10% pre-merge and 5% post-merge; the shared
+selection, preserving compatible fixed baselines, threshold overrides, and stored
+records. Without a fixed baseline it uses the shared rolling baseline algorithm.
+Defaults remain 10% pre-merge and 5% post-merge; the shared
 baseline algorithm is described in `README_perf_regression_system.md`.
 
 Existing client results need source-verified timing metadata backfill before
-reuse; dates alone do not establish compatibility. Without compatible history,
-the baseline starts from the current measurement, so a first passing run alone
-does not establish historical regression coverage. Backfill is a separate,
-reviewed operation that must preserve recorded measurements.
+reuse; dates alone do not establish compatibility. In the same atomic document
+update that adds source metadata, validate the baseline's timing source or clear
+unverified `d_baseline_*` fields without changing measurements. Audit custom
+thresholds and retain applicable overrides or obtain approval for resets.
+Backfill is separate from CI. Without compatible history, the first run has no
+usable baseline; verify that a subsequent run uses the uploaded client history.
 
 ## Match Keys
 

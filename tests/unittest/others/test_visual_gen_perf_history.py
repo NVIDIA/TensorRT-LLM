@@ -152,7 +152,7 @@ def modules(monkeypatch: pytest.MonkeyPatch) -> _Modules:
     return loaded[0], loaded[1], search.OpenSearchDB
 
 
-def test_history_selection_strips_baselines_but_preserves_thresholds_and_raw_rows(
+def test_history_selection_preserves_compatible_baselines_thresholds_and_raw_rows(
     modules: _Modules,
 ) -> None:
     db, _, search = modules
@@ -160,7 +160,7 @@ def test_history_selection_strips_baselines_but_preserves_thresholds_and_raw_row
     new = _client_row(
         0.9433,
         "2026-09-14T00:00:00Z",
-        d_baseline_median_generation=0.8554,
+        d_baseline_median_generation=0.94,
         d_threshold_post_merge_median_generation=0.05,
         d_threshold_pre_merge_median_generation=0.1,
     )
@@ -175,10 +175,12 @@ def test_history_selection_strips_baselines_but_preserves_thresholds_and_raw_row
     assert latest[0]["s_commit"] == _CLIENT_COMMIT
     assert [r["s_commit"] for r in history[0]] == [_CLIENT_COMMIT]
     assert baseline[0] == {
+        "d_baseline_median_generation": 0.94,
         "d_threshold_post_merge_median_generation": 0.05,
         "d_threshold_pre_merge_median_generation": 0.1,
     }
-    assert "d_baseline_median_generation" not in latest[0]
+    assert latest[0]["d_baseline_median_generation"] == 0.94
+    assert latest[0] is not new
     assert new == original
 
 
@@ -212,8 +214,8 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
     post_merge: bool,
 ) -> None:
     _, pipeline, search = modules
-    old = _row(_SERVER_COMMIT, 1.2, "2026-10-14T00:00:00Z")
-    good = _client_row(0.9433, "2026-09-14T00:00:00Z", d_baseline_median_generation=0.8554)
+    old = _row(_SERVER_COMMIT, 1.2, "2026-10-14T00:00:00Z", d_baseline_median_generation=0.8554)
+    good = _client_row(0.9433, "2026-09-14T00:00:00Z")
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [old, good]
     monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": post_merge})
     for value, should_fail in [(0.9433, False), (1.2, True)]:
@@ -236,21 +238,69 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
         assert current["b_is_regression"] == should_fail
 
 
-def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
+def test_fixed_client_baseline_and_custom_threshold_remain_effective(
     modules: _Modules, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _, pipeline, search = modules
+    good = _client_row(
+        1.03,
+        "2026-10-14T00:00:00Z",
+        d_baseline_median_generation=1.0,
+        d_threshold_post_merge_median_generation=0.02,
+    )
+    search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: [good]
+    monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": True})
+    current = _client_row(1.03, "2026-10-15T00:00:00Z")
+    pipeline.process_and_upload_test_results(
+        new_data_dict={0: current},
+        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
+        maximize_metrics=[],
+        minimize_metrics=["d_median_generation"],
+        regression_metrics=["d_median_generation"],
+        upload_to_db=False,
+        history_transform=transform_visual_gen_history,
+    )
+    assert current["b_is_regression"] is True
+    assert current["d_baseline_median_generation"] == 1.0
+    assert current["d_threshold_post_merge_median_generation"] == 0.02
+    assert "baseline=1.0000" in current["s_regression_info"]
+    assert "threshold=2.00%" in current["s_regression_info"]
+
+
+def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
+    modules: _Modules, monkeypatch: pytest.MonkeyPatch, producer: types.ModuleType
+) -> None:
     db, pipeline, search = modules
-    history = [_row(_SERVER_COMMIT, 0.8554, "2026-09-11T00:00:00Z")]
+    first = producer.build_visual_gen_db_entry(
+        gpu_type="b200",
+        model_name="flux2",
+        server_name="flux2",
+        server_config={},
+        client_config={"backend": "openai-images", "num_inference_steps": 50, "max_concurrency": 1},
+        result_data=_benchmark_result("openai-images"),
+    )
+    history = [
+        _row(
+            _SERVER_COMMIT,
+            0.8554,
+            "2026-09-11T00:00:00Z",
+            s_test_case_name=first["s_test_case_name"],
+        )
+    ]
     original = dict(history[0])
     search.queryPerfDataFromOpenSearchDB = lambda *args, **kwargs: history
 
     def upload(rows: list[dict], project: str) -> bool:
-        history.extend(dict(row) for row in rows)
+        history.extend(
+            {**row, "@timestamp": "2026-10-14T00:00:00Z", "ts_created": 1791936000000}
+            for row in rows
+        )
         return True
 
     search.postToOpenSearchDB = upload
-    monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": True})
-    first = _client_row(0.9433, "2026-10-14T00:00:00Z")
+    monkeypatch.setattr(
+        pipeline, "get_job_info", lambda: {"b_is_post_merge": True, "s_commit": _CLIENT_COMMIT}
+    )
     kwargs = dict(
         match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
         maximize_metrics=[],
@@ -260,7 +310,8 @@ def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
     )
     pipeline.process_and_upload_test_results(new_data_dict={0: first}, **kwargs)
     assert first["b_is_regression"] is False
-    assert "baseline=0.9433" in first["s_regression_info"]
+    assert "@timestamp" not in first and "ts_created" not in first
+    assert "baseline=" not in first["s_regression_info"]
     assert history[0] == original
     assert len(history) == 2
     assert history[-1]["s_generation_timing_source"] == "client_e2e_latency"
@@ -271,12 +322,13 @@ def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
     assert len(compatible[0]) == 1
 
     monkeypatch.setattr(pipeline, "get_job_info", lambda: {"b_is_post_merge": False})
-    slower = _client_row(1.2, "2026-10-15T00:00:00Z")
+    slower = {**first, "d_median_generation": 1.2}
     with pytest.raises(RuntimeError, match="Regression"):
         pipeline.process_and_upload_test_results(
             new_data_dict={0: slower}, upload_to_db=False, **kwargs
         )
     assert slower["b_is_regression"] is True
+    assert "baseline=0.9400" in slower["s_regression_info"]
 
 
 @pytest.fixture
