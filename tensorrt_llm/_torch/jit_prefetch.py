@@ -1088,6 +1088,10 @@ class JitPrefetcher:
             self._event(f"DeepGEMM: {n} {label} request(s) queued")
         return n
 
+    def deep_gemm_enabled(self) -> bool:
+        """Whether ``enable_deep_gemm`` has started the DeepGEMM helpers."""
+        return self._dg is not None
+
     def enable_deep_gemm(self, provider, moe_provider=None) -> bool:
         """Start the DeepGEMM helpers and planning (needs the patched DeepGEMM).
 

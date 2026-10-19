@@ -264,7 +264,7 @@ class MegaMoEProvider:
 class FP8LinearDeepGemmProvider:
     """Plans the DeepGEMM FP8 GEMMs a batch with M tokens will run."""
 
-    def __init__(self, model, max_num_tokens: int):
+    def __init__(self, model, max_num_tokens: int, priority_ms=()):
         from .modules.linear import FP8BlockScalesLinearMethod, Linear
 
         # Kimi K3's FP8 weight-read projections (attention, shared experts)
@@ -293,6 +293,11 @@ class FP8LinearDeepGemmProvider:
             shapes.add((n, k))
         self.shapes = sorted(shapes)
         self.max_num_tokens = int(max_num_tokens)
+        # Token counts known to run before serving (the CUDA graph shapes):
+        # enumerated first, so they are built before warmup reaches them.
+        self.priority_ms = sorted(
+            {int(m) for m in priority_ms if 0 < int(m) <= self.max_num_tokens}
+        )
         self._seen_m: set = set()
 
     def __bool__(self):
@@ -319,13 +324,20 @@ class FP8LinearDeepGemmProvider:
         Every rank enumerates every M, so coverage never depends on how ranks
         share ``DG_JIT_CACHE_DIR``. Ranks that do share one start at different
         points of the list (``rank``/``world``), so they compile different
-        variants first and find the rest already on disk.
+        variants first and find the rest already on disk. ``priority_ms``
+        come before all of them, in the same rotated order.
         """
         ms = list(range(1, 17)) + list(range(32, self.max_num_tokens + 1, 16))
         if self.max_num_tokens not in ms:
             ms.append(self.max_num_tokens)
-        start = (len(ms) * (rank % max(1, world))) // max(1, world)
-        for m in ms[start:] + ms[:start]:
+        world = max(1, world)
+        first = self.priority_ms
+        rest = [m for m in ms if m not in set(first)]
+        order = []
+        for part in (first, rest):
+            start = (len(part) * (rank % world)) // world
+            order += part[start:] + part[:start]
+        for m in order:
             if m in self._seen_m:
                 continue
             for s in self.specs_for_m(m):

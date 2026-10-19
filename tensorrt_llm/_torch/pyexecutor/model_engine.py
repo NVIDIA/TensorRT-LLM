@@ -1041,9 +1041,19 @@ class PyTorchModelEngine(ModelEngine):
             jit_prefetch_msa.start_recording()
             if self._uses_minimax_m3_msa():
                 self._start_msa_fmha_builds(resource_manager)
+        # The DeepGEMM helpers start once the runner's pre-JIT prewarms are
+        # done, before its first warmup forward: started earlier, their
+        # start-up competes with those in-process nvcc builds for the CPU.
+        early_start = record_decode and hasattr(
+            self._runner, "before_warmup_forwards_callable")
+        if early_start:
+            self._runner.before_warmup_forwards_callable = (
+                self._start_deep_gemm_prefetch)
         try:
             self._runner.warmup(resource_manager)
         finally:
+            if early_start:
+                self._runner.before_warmup_forwards_callable = None
             if record_decode:
                 jit_prefetch_decode.stop_recording()
             if record_msa:
@@ -1084,6 +1094,61 @@ class PyTorchModelEngine(ModelEngine):
             logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: "
                            f"{type(e).__name__}: {e}")
 
+    def _start_deep_gemm_prefetch(self) -> None:
+        """Start building the DeepGEMM FP8 Linear and MoE kernels in CPU-only
+        helpers before warmup's first forward, rather than once warmup ends.
+
+        Their variants follow from the weight shapes and the engine limits
+        alone, and with prefetch on warmup no longer sweeps the swap-AB GEMM's
+        M buckets, so warmup's own forwards are the first to reach most M:
+        each CUDA graph shape runs ``batch_size * (1 + draft)`` tokens. Started
+        here, the helpers build those first (``FP8LinearDeepGemmProvider``'s
+        ``priority_ms``) while the eager warmup forwards run, and a warmup
+        launch of a variant a helper has queued waits for its cubin instead of
+        compiling it on the executor. ``_init_jit_prefetch`` then adds the
+        providers that plan from what warmup recorded. Once per process.
+        """
+        try:
+            from .. import jit_prefetch_deep_gemm as jdg
+            from ..jit_prefetch import JitPrefetcher
+            prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
+            if prefetcher is None or prefetcher.deep_gemm_enabled():
+                return
+            if get_sm_version() not in (100, 103) or not jdg.supported():
+                return
+            dg_provider, dg_moe = self._deep_gemm_providers()
+            if dg_provider or dg_moe:
+                prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(
+                f"[JIT prefetch] DeepGEMM helpers not started early: "
+                f"{type(e).__name__}: {e}")
+
+    def _deep_gemm_providers(self):
+        """The DeepGEMM FP8 Linear and MoE providers of this engine."""
+        from .. import jit_prefetch_deep_gemm as jdg
+
+        # MLA with a cached prefix runs kv_b_proj over up to chunk_size x
+        # chunked_prefill_buffer_batch_size cached tokens per loop, more
+        # than max_num_tokens rows.
+        rf = self.attn_runtime_features
+        max_m = self.max_num_tokens
+        if rf.chunked_prefill and rf.cache_reuse:
+            max_m = max(
+                max_m,
+                int(rf.chunk_size or 0) *
+                int(rf.chunked_prefill_buffer_batch_size or 1))
+        # Every CUDA graph shape's token count, built first: warmup and graph
+        # capture launch them all before serving.
+        tokens_per_request = 1 + self.original_max_total_draft_tokens
+        graph_bs = self._cuda_graph_batch_sizes or []
+        graph_ms = sorted({bs * tokens_per_request
+                           for bs in graph_bs} | set(graph_bs))
+        dg_provider = jdg.FP8LinearDeepGemmProvider(self.model,
+                                                    max_num_tokens=max_m,
+                                                    priority_ms=graph_ms)
+        return dg_provider, jdg.DeepGemmMoEProvider(self.model)
+
     def _init_jit_prefetch(self,
                            resource_manager: Optional[ResourceManager] = None
                            ) -> None:
@@ -1108,27 +1173,16 @@ class PyTorchModelEngine(ModelEngine):
             return
         from .. import jit_prefetch_deep_gemm as jdg
         if jdg.supported():
-            # MLA with a cached prefix runs kv_b_proj over up to chunk_size x
-            # chunked_prefill_buffer_batch_size cached tokens per loop, more
-            # than max_num_tokens rows.
-            rf = self.attn_runtime_features
-            max_m = self.max_num_tokens
-            if rf.chunked_prefill and rf.cache_reuse:
-                max_m = max(
-                    max_m,
-                    int(rf.chunk_size or 0) *
-                    int(rf.chunked_prefill_buffer_batch_size or 1))
-            dg_provider = jdg.FP8LinearDeepGemmProvider(self.model,
-                                                        max_num_tokens=max_m)
-            dg_moe = jdg.DeepGemmMoEProvider(self.model)
             from ..attention.backends.sparse.dsa import indexer as dsa_indexer
             has_dsa = (bool(dsa_indexer.DG_INDEXER_VARIANTS)
                        and jdg.supports_indexer())
             from ..moe.fused_moe.mega_moe import mega_moe_deepgemm as mmd
             has_mega = bool(
                 mmd.MEGA_MOE_LAYER_CONFIGS) and jdg.supports_mega_moe()
-            if dg_provider or dg_moe or has_dsa or has_mega:
-                prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+            if not prefetcher.deep_gemm_enabled():
+                dg_provider, dg_moe = self._deep_gemm_providers()
+                if dg_provider or dg_moe or has_dsa or has_mega:
+                    prefetcher.enable_deep_gemm(dg_provider, dg_moe)
             if has_dsa:
                 spec_cfg = getattr(self, "spec_config", None)
                 max_draft = getattr(spec_cfg, "max_draft_len", 0) or 0

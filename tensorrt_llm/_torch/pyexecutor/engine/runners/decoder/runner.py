@@ -377,6 +377,9 @@ class DecoderRunner(ScheduledModelRunner):
         self.sample_in_graph_callable = None
         # Stages (or clears) in-graph sampling state once the batch is settled.
         self._stage_in_graph_sampling = None
+        # Called once the pre-JIT prewarms are done, before the first warmup
+        # forward (the engine starts JIT prefetch helpers there).
+        self.before_warmup_forwards_callable: Callable[[], None] | None = None
 
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
@@ -791,6 +794,8 @@ class DecoderRunner(ScheduledModelRunner):
             if kv_cache_manager is None:
                 logger.info("Skipping warm up as no KV Cache manager allocated.")
                 return
+            if self.before_warmup_forwards_callable is not None:
+                self.before_warmup_forwards_callable()
             self._warmup_scheduled_forwards(resource_manager, kv_cache_manager, sampling_in_helper)
         finally:
             if kv_cache_manager is not None:

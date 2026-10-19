@@ -145,6 +145,26 @@ def test_provider_enumeration_windows():
     assert p.plan_tokens(37) and not p.plan_tokens(37)
 
 
+def test_provider_enumerates_priority_tokens_first():
+    # CUDA graph token counts (batch size x tokens per request) come first,
+    # including ones off the 16-row grid; then the grid, without repeats.
+    graph_ms = [1, 2, 6, 12, 30, 600]
+    p = jdg.FP8LinearDeepGemmProvider(
+        torch.nn.Module(), max_num_tokens=100, priority_ms=graph_ms + [0, 101]
+    )
+    p.shapes = [(128, 512)]
+    ms = [json.loads(s)["m"] for s in p.enumerate_specs()]
+    # Out-of-range counts are dropped; the rest lead, in ascending order.
+    assert ms[:5] == [1, 2, 6, 12, 30]
+    grid = list(range(1, 17)) + [32, 48, 64, 80, 96, 100]
+    assert ms[5:] == [m for m in grid if m not in (1, 2, 6, 12)]
+    # Ranks sharing a cache start the priority list at different points, but
+    # each still covers every M once.
+    other = [json.loads(s)["m"] for s in p.enumerate_specs(rank=1, world=2)]
+    assert other[0] != ms[0] and sorted(other) == sorted(ms)
+    assert sorted(other[:5]) == ms[:5]
+
+
 # A DeepSeek-V3-like expert slice (G experts per rank, gate+up / down), at
 # batch sizes far apart: one helper compile must serve all of them.
 @pytest.mark.parametrize("g,n,k", [(32, 4096, 7168), (32, 7168, 2048)])

@@ -979,6 +979,72 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine._runner.warmup.assert_called_once_with(resource_manager)
 
     @pytest.mark.cpu_only
+    def test_jit_prefetch_deep_gemm_starts_after_prewarms_before_forwards(self) -> None:
+        """With JIT prefetch on, the DeepGEMM helpers start once the pre-JIT
+        prewarms (sampling module, Engram, CSA2 sparse indexer) are done and
+        before the first warmup forward; with it off they never start. The
+        engine's hook is unset again after warmup."""
+        runner = object.__new__(DecoderRunner)
+        runner._warmup_timer = _WarmupTimer(rank=0)
+        runner._metrics = {}
+        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        runner.before_warmup_forwards_callable = None
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine._metrics = runner._metrics
+        model_engine.moe_load_balancer = None
+        model_engine.is_warmup = False
+        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._runner = runner
+        model_engine.model = torch.nn.Module()
+        model_engine.llm_args = SimpleNamespace(sparse_attention_config=None)
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = Mock()
+        events = []
+
+        def record(name):
+            return lambda *args, **kwargs: events.append(name)
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
+                side_effect=record("sampling"),
+            ),
+            patch(
+                "tensorrt_llm._torch.jit_prefetch.start_flashinfer_build",
+                return_value=False,
+            ),
+            patch.object(runner, "_tunes_flashinfer_mxfp8", return_value=False),
+            patch.object(runner, "_prewarm_engram_kernels", side_effect=record("engram")),
+            patch.object(runner, "_prewarm_csa2_sparse_indexer", side_effect=record("csa2")),
+            patch.object(runner, "_warmup_scheduled_forwards", side_effect=record("forwards")),
+            patch.object(
+                model_engine, "_start_deep_gemm_prefetch", side_effect=record("dg_helpers")
+            ),
+            patch.object(model_engine, "_init_jit_prefetch", side_effect=record("init_prefetch")),
+            patch(
+                "tensorrt_llm._torch.modules.mamba.jit_prefetch_decode.start_recording",
+                side_effect=record("record"),
+            ),
+            patch(
+                "tensorrt_llm._torch.modules.mamba.jit_prefetch_decode.stop_recording",
+                side_effect=record("stop_record"),
+            ),
+        ):
+            for prefetch in (True, False):
+                with self.subTest(prefetch=prefetch):
+                    events.clear()
+                    env = {"TLLM_JIT_PREFETCH": "1"} if prefetch else {}
+                    with patch.dict(os.environ, env, clear=False):
+                        if not prefetch:
+                            os.environ.pop("TLLM_JIT_PREFETCH", None)
+                        model_engine._warmup_impl(resource_manager)
+                    warmup = ["sampling", "engram", "csa2", "forwards"]
+                    if prefetch:
+                        warmup = ["record", *warmup[:3], "dg_helpers", "forwards", "stop_record"]
+                    self.assertEqual(events, [*warmup, "init_prefetch"])
+                    self.assertIsNone(runner.before_warmup_forwards_callable)
+
+    @pytest.mark.cpu_only
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         runner = object.__new__(DecoderRunner)
