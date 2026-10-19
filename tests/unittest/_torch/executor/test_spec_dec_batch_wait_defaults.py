@@ -10,6 +10,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     SPEC_DEC_CTX_COALESCE_ITERS,
     SPEC_DEC_CTX_COALESCE_MAX_TOKENS_RATIO,
+    PyExecutor,
     resolve_spec_dec_batch_wait_defaults,
 )
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
@@ -44,6 +45,8 @@ def test_eagle3_one_model_gets_coalescing_default():
         {"batch_wait_timeout_iters": 4},
         {"batch_wait_max_tokens_ratio": 0.0},
         {"batch_wait_max_tokens_ratio": 0.3},
+        {"batch_wait_timeout_ms": 0.0},
+        {"batch_wait_timeout_ms": 5.0},
     ],
 )
 def test_explicit_user_batch_wait_config_is_respected(user_kwargs):
@@ -92,3 +95,43 @@ def test_not_applied_in_disaggregated_serving():
 
 def test_non_pydantic_llm_args_are_left_untouched():
     assert resolve_spec_dec_batch_wait_defaults(MagicMock(), _engine(), False) is None
+
+
+def _bare_executor(llm_args, engine=None):
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.llm_args = llm_args
+    executor.model_engine = engine if engine is not None else _engine()
+    executor.enable_attention_dp = False
+    return executor
+
+
+def test_executor_init_enables_batch_waiting_for_eagle3():
+    executor = _bare_executor(TorchLlmArgs(model="dummy"))
+    executor._init_batch_waiting(is_disaggregated=False)
+    assert (
+        executor.batch_wait_timeout_iters,
+        executor.batch_wait_max_tokens_ratio,
+    ) == _DEFAULT
+    assert executor.batch_wait_timeout_ms == 0
+    assert executor.enable_batch_waiting
+
+
+def test_executor_init_respects_explicit_opt_out():
+    executor = _bare_executor(TorchLlmArgs(model="dummy", batch_wait_timeout_iters=0))
+    executor._init_batch_waiting(is_disaggregated=False)
+    assert executor.batch_wait_timeout_iters == 0
+    assert executor.batch_wait_max_tokens_ratio == 0
+    assert not executor.enable_batch_waiting
+
+
+@pytest.mark.parametrize(
+    "engine, is_disaggregated",
+    [(_engine(mode=None), False), (_engine(), True)],
+    ids=["no_spec", "disaggregated"],
+)
+def test_executor_init_leaves_batch_waiting_off_elsewhere(engine, is_disaggregated):
+    executor = _bare_executor(TorchLlmArgs(model="dummy"), engine)
+    executor._init_batch_waiting(is_disaggregated=is_disaggregated)
+    assert executor.batch_wait_timeout_iters == 0
+    assert executor.batch_wait_max_tokens_ratio == 0
+    assert not executor.enable_batch_waiting
