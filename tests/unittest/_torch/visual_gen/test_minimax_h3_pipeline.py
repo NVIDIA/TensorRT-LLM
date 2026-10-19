@@ -706,6 +706,83 @@ def test_text_encoder_attention_mapping_preserves_explicit_tp_group(
     assert mapping.tp_group == [0, 1]
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_tp_keyframes_rejected_before_encode_or_broadcast(
+    monkeypatch: pytest.MonkeyPatch, rank: int
+) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.text_encoder_tp_size = 2
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 4))
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("Unsupported keyframes must be rejected before encoding or broadcasting")
+
+    monkeypatch.setattr(pipeline, "_encode_prompt_local", unexpected_call)
+    monkeypatch.setattr(pipeline, "_broadcast_tensor_from_rank0", unexpected_call)
+    with pytest.raises(NotImplementedError, match="text_encoder_tp_size=1"):
+        MiniMaxH3Pipeline._encode_prompt(pipeline, "test", [Image.new("RGB", (16, 16))])
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("encoder_tp,with_keyframe", [(2, False), (1, True)])
+def test_prompt_encoding_keeps_supported_owner_and_broadcast_paths(
+    monkeypatch: pytest.MonkeyPatch, rank: int, encoder_tp: int, with_keyframe: bool
+) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.torch_dtype = torch.float32
+    pipeline.text_encoder_tp_size = encoder_tp
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 4))
+    keyframes = [Image.new("RGB", (16, 16))] if with_keyframe else []
+    embeds = torch.ones(1, 2, 4)
+    tags = torch.zeros(2, dtype=torch.long)
+    encoded = []
+    broadcasts = []
+    broadcast_dtypes = []
+
+    def encode(prompt, images):
+        encoded.append((prompt, images))
+        return embeds, tags
+
+    def broadcast(tensor, *, dtype):
+        broadcasts.append(tensor)
+        broadcast_dtypes.append(dtype)
+        return tags if dtype == torch.long else embeds
+
+    monkeypatch.setattr(pipeline, "_encode_prompt_local", encode)
+    monkeypatch.setattr(pipeline, "_broadcast_tensor_from_rank0", broadcast)
+    actual_embeds, actual_tags = MiniMaxH3Pipeline._encode_prompt(pipeline, "test", keyframes)
+    assert encoded == ([("test", keyframes)] if rank < encoder_tp else [])
+    assert len(broadcasts) == 2
+    assert broadcast_dtypes == [torch.float32, torch.long]
+    assert broadcasts[0] is (embeds if rank < encoder_tp else None)
+    assert broadcasts[1] is (tags if rank < encoder_tp else None)
+    torch.testing.assert_close(actual_embeds, embeds)
+    torch.testing.assert_close(actual_tags, tags)
+
+
+def test_single_rank_keyframe_encoding_does_not_broadcast(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.text_encoder_tp_size = 1
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 1))
+    keyframes = [Image.new("RGB", (16, 16))]
+    expected = (torch.ones(1, 2, 4), torch.zeros(2, dtype=torch.long))
+    calls = []
+
+    def encode(prompt, images):
+        calls.append((prompt, images))
+        return expected
+
+    def unexpected_broadcast(*args, **kwargs):
+        pytest.fail("Single-rank prompt encoding must not broadcast")
+
+    monkeypatch.setattr(pipeline, "_encode_prompt_local", encode)
+    monkeypatch.setattr(pipeline, "_broadcast_tensor_from_rank0", unexpected_broadcast)
+    assert MiniMaxH3Pipeline._encode_prompt(pipeline, "test", keyframes) is expected
+    assert calls == [("test", keyframes)]
+
+
 def test_tensor_parallel_text_encoder_encode_does_not_require_hf_config() -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
     pipeline.pipeline_config.torch_dtype = torch.float32
