@@ -3635,14 +3635,14 @@ class MXFP8LinearMethod(LinearMethodBase):
         return "weight_scale"
 
     def load_weight_scales(
-            self,
-            weights: List[Dict],
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            tp_mode: Optional[TensorParallelMode] = None,
-            pad_missing: bool = False,
-            module: Optional[Linear] = None,
-            shard_names: Optional[Sequence[Optional[str]]] = None,
+        self,
+        weights: List[Dict],
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        tp_mode: Optional[TensorParallelMode] = None,
+        pad_missing: bool = False,
+        module: Optional[Linear] = None,
+        shard_names: Optional[Sequence[Optional[str]]] = None,
     ) -> List[torch.Tensor]:
         """Load per-shard UE8M0 block scales.
 
@@ -3666,10 +3666,17 @@ class MXFP8LinearMethod(LinearMethodBase):
             if scale_name in w:
                 if module is not None:
                     key = shard_names[index] if shard_names is not None else None
+                    # Explicit tp_sharding bounds count weight columns. A row-parallel
+                    # layer splits K, where one scale covers BLOCK_SIZE columns, so the
+                    # bounds have to be divided by that span (as the other quant methods
+                    # do). Column-parallel layers split rows, which scales share.
+                    scale_span = (self.BLOCK_SIZE if module.tp_mode
+                                  == TensorParallelMode.ROW else 1)
                     s = module.load_shard(w,
                                           scale_name,
                                           device=device,
-                                          name=key)
+                                          name=key,
+                                          scale_span=scale_span)
                 else:
                     s = load_weight_shard(w[scale_name],
                                           tp_size,

@@ -35,11 +35,13 @@ import torch
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     MXFP8LinearMethod,
+    TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
     get_quant_method,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -372,3 +374,117 @@ def test_repeated_finalize_does_not_reswizzle():
     for _ in range(3):
         lin.process_weights_after_loading()
     _assert_same(lin, first, "repeated finalize")
+
+
+class _FakeTpMapping(Mapping):
+    """A tensor-parallel Mapping for one rank, without initializing torch.distributed."""
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+
+    def __init__(self, tp_size, rank):
+        super().__init__(world_size=tp_size, rank=rank, tp_size=tp_size)
+        self.tp_rank = rank
+
+
+def _make_row_linear(in_features, out_features, tp_size, rank):
+    """A standalone row-parallel MXFP8 Linear: it is built with weights, so its TP sharding is the
+    explicit (start, end) bounds a model only gets for a layer created outside the deferred
+    ``skip_create_weights_in_init`` path."""
+    return Linear(
+        in_features=in_features,
+        out_features=out_features,
+        bias=False,
+        dtype=DTYPE,
+        mapping=_FakeTpMapping(tp_size, rank),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        reduce_output=False,
+        quant_config=_quant_config(),
+        weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
+    ).cuda()
+
+
+def _staged_scales(lin):
+    """The row-major [O, K/32] scales as loaded, before the swizzle."""
+    return lin.tmp_weight_scale_raw if hasattr(lin, "tmp_weight_scale_raw") else lin.weight_scale
+
+
+def _check_row_tp_scale_slices(w, s, tp_size):
+    """Each rank of a row-parallel layer gets its K/tp_size weight columns and the matching
+    K/(32*tp_size) scale columns."""
+    in_f = w.shape[1]
+    for rank in range(tp_size):
+        lin = _make_row_linear(in_f, w.shape[0], tp_size, rank)
+        assert lin.tp_sharding is not None, "the layer should carry explicit TP sharding bounds"
+        lin.load_weights([{"weight": w, "weight_scale_inv": s}], allow_partial_loading=True)
+
+        w_cols = slice(rank * in_f // tp_size, (rank + 1) * in_f // tp_size)
+        s_cols = slice(w_cols.start // BLOCK_SIZE, w_cols.stop // BLOCK_SIZE)
+        assert torch.equal(_bits(lin.weight.data), _bits(w[:, w_cols].cuda())), (
+            f"rank {rank} weight"
+        )
+        assert torch.equal(_bits(_staged_scales(lin).data), _bits(s[:, s_cols].cuda())), (
+            f"rank {rank}: scales must be the K/{BLOCK_SIZE} columns that match the weight shard"
+        )
+
+
+@requires_cuda
+def test_row_parallel_scales_follow_the_weight_shard():
+    """Synthetic weights: the scale slice of a row-parallel layer is in scale columns, not weight
+    columns (a scale covers 32 weight columns)."""
+    w, s = _mxfp8(256, 1024, seed=101)
+    _check_row_tp_scale_slices(w, s, tp_size=2)
+
+
+def _qwen3_0p6b_layer0_weights():
+    """Real weights of Qwen3-0.6B layer 0 (``o_proj`` and ``down_proj`` are its row-parallel
+    projections)."""
+    from safetensors import safe_open
+    from utils.llm_data import llm_models_root
+
+    checkpoint = llm_models_root() / "Qwen3" / "Qwen3-0.6B"
+    files = sorted(checkpoint.glob("*.safetensors"))
+    if not files:
+        pytest.skip(f"Qwen3-0.6B checkpoint not found under {checkpoint}")
+    wanted = {
+        "o_proj": "model.layers.0.self_attn.o_proj.weight",
+        "down_proj": "model.layers.0.mlp.down_proj.weight",
+    }
+    weights = {}
+    for file in files:
+        with safe_open(str(file), framework="pt") as f:
+            for short, name in wanted.items():
+                if name in f.keys():
+                    weights[short] = f.get_tensor(name).to(DTYPE)
+    assert set(weights) == set(wanted), f"missing {set(wanted) - set(weights)} in {checkpoint}"
+    return weights
+
+
+@requires_cuda
+def test_row_parallel_scales_follow_the_weight_shard_qwen3_0p6b():
+    """The same check on a real weight: Qwen3-0.6B ``down_proj`` (K = 3072), TP2."""
+    w, s = quant_bf16_to_mxfp8(_qwen3_0p6b_layer0_weights()["down_proj"], BLOCK_SIZE)
+    _check_row_tp_scale_slices(w, s, tp_size=2)
+
+
+@requires_cutlass
+def test_row_parallel_forward_matches_bf16_qwen3_0p6b():
+    """End to end on Qwen3-0.6B ``o_proj``: the two row-parallel ranks' partial outputs add up to
+    the BF16 projection."""
+    bf16 = _qwen3_0p6b_layer0_weights()["o_proj"]
+    w, s = quant_bf16_to_mxfp8(bf16, BLOCK_SIZE)
+    out_f, in_f = bf16.shape
+    tp_size = 2
+    torch.manual_seed(0)
+    x = torch.randn(16, in_f, dtype=DTYPE, device="cuda") * 0.1
+
+    total = torch.zeros(16, out_f, dtype=torch.float32, device="cuda")
+    for rank in range(tp_size):
+        lin = _make_row_linear(in_f, out_f, tp_size, rank)
+        lin.load_weights([{"weight": w, "weight_scale_inv": s}])
+        cols = slice(rank * in_f // tp_size, (rank + 1) * in_f // tp_size)
+        total += lin(x[:, cols].contiguous()).float()
+
+    expected = x.float() @ bf16.float().cuda().t()
+    rel_err = (total - expected).norm() / expected.norm()
+    assert rel_err < 0.1, f"relative error {rel_err:.3f} against the BF16 projection"
