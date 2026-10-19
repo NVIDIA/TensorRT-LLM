@@ -34,6 +34,15 @@ from .params import (
 )
 
 
+def _is_native_mxfp8_sm() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+
+
+def supports_native_mxfp8() -> bool:
+    """Whether native MXFP8 projections can be built on the current device."""
+    return _is_native_mxfp8_sm() and hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm")
+
+
 class DeepseekV41Attention(nn.Module):
     """Attention component with explicit CED and paged-cache inputs.
 
@@ -109,12 +118,9 @@ class DeepseekV41Attention(nn.Module):
             raise ValueError("CSA2 packed output RoPE requires interleaved rotary channels")
         quant_config = None
         if projection_quantization == "mxfp8":
-            if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
-                (10, 0),
-                (10, 3),
-            ):
+            if not _is_native_mxfp8_sm():
                 raise ValueError("CSA2 native MXFP8 projections require SM100/SM103")
-            if not hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm"):
+            if not supports_native_mxfp8():
                 raise RuntimeError("CSA2 native MXFP8 GEMM is not compiled")
             quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8)
         if self._fuse_index_q and (

@@ -40,6 +40,7 @@ from ..attention.backends.sparse.csa2.decoder_replay import (
 )
 from ..attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from ..attention.backends.sparse.csa2.module import DeepseekV41Attention as CSA2Attention
+from ..attention.backends.sparse.csa2.module import supports_native_mxfp8
 from ..attention.backends.sparse.csa2.params import CSA2Mode
 from ..configs.deepseek_v41 import (
     DeepseekV41QuantLayout,
@@ -129,6 +130,7 @@ class DeepseekV41Attention(CSA2Attention):
             raise ValueError("DeepSeek-V4.1 requires CSA2 sparse attention configuration")
         params = sparse_config.to_sparse_params(pretrained_config=config)
         positional = _deepseek_v41_pos_embd_params(config, model_config, layer_idx)
+        projection_quantization = "mxfp8" if supports_native_mxfp8() else "bf16"
         super().__init__(
             params.layout,
             layer_idx,
@@ -145,9 +147,7 @@ class DeepseekV41Attention(CSA2Attention):
             eps=config.rms_norm_eps,
             mapping=model_config.mapping,
             sparse_params=params,
-            projection_quantization=(
-                "mxfp8" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "bf16"
-            ),
+            projection_quantization=projection_quantization,
             aux_stream=(aux_stream_dict or {}).get(AuxStreamType.MlaCompressor),
             allreduce_strategy=model_config.allreduce_strategy,
             kv_cache_dtype=model_config.extra_attrs.get("kv_cache_dtype", "auto"),

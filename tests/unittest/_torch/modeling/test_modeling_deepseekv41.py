@@ -3038,14 +3038,27 @@ def test_attention_uses_native_mxfp8_projections_only_on_sm100_and_sm103():
     torch.cuda.empty_cache()
 
 
+def _mock_csa2_device(monkeypatch, capability, gemm_compiled, cuda_available=True):
+    trtllm_ops = SimpleNamespace(mxfp8_mxfp8_gemm=Mock()) if gemm_compiled else SimpleNamespace()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(torch.ops, "trtllm", trtllm_ops)
+
+
 # The CSA2 module can only be built on a GPU, so this records the projection
 # the adapter requests instead of constructing it.
 @pytest.mark.parametrize(
-    ("capability", "expected"),
-    [((9, 0), "bf16"), ((10, 0), "mxfp8"), ((10, 3), "mxfp8"), ((12, 0), "bf16")],
+    ("capability", "gemm_compiled", "expected"),
+    [
+        ((9, 0), True, "bf16"),
+        ((10, 0), True, "mxfp8"),
+        ((10, 3), True, "mxfp8"),
+        ((12, 0), True, "bf16"),
+        ((10, 0), False, "bf16"),
+    ],
 )
 def test_attention_projection_quantization_follows_device_capability(
-    monkeypatch, capability, expected
+    monkeypatch, capability, gemm_compiled, expected
 ):
     requested = []
 
@@ -3055,10 +3068,28 @@ def test_attention_projection_quantization_follows_device_capability(
         self.o_b_proj = SimpleNamespace()
 
     model_config, _ = _tiny_v41_model_config()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+    _mock_csa2_device(monkeypatch, capability, gemm_compiled)
     monkeypatch.setattr(v41.CSA2Attention, "__init__", record_csa2_init)
     DeepseekV41Attention(model_config, layer_idx=0)
     assert requested == [expected]
+
+
+@pytest.mark.parametrize(
+    ("cuda_available", "capability", "gemm_compiled", "error", "message"),
+    [
+        (False, (10, 0), True, ValueError, "CSA2 native MXFP8 projections require SM100/SM103"),
+        (True, (9, 0), True, ValueError, "CSA2 native MXFP8 projections require SM100/SM103"),
+        (True, (10, 0), False, RuntimeError, "CSA2 native MXFP8 GEMM is not compiled"),
+    ],
+)
+def test_csa2_rejects_native_mxfp8_projections_the_device_cannot_run(
+    monkeypatch, cuda_available, capability, gemm_compiled, error, message
+):
+    model_config, _ = _tiny_v41_model_config()
+    _mock_csa2_device(monkeypatch, capability, gemm_compiled, cuda_available)
+    monkeypatch.setattr(v41, "supports_native_mxfp8", lambda: True)
+    with pytest.raises(error, match=f"^{message}$"):
+        DeepseekV41Attention(model_config, layer_idx=0)
 
 
 @skip_pre_blackwell
