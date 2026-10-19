@@ -81,8 +81,8 @@ from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
-                        MultimodalScheduler, PreallocatedContextScheduler,
-                        SimpleScheduler, SimpleUnifiedScheduler)
+                        MultimodalScheduler, SimpleScheduler,
+                        SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -4471,9 +4471,6 @@ def create_py_executor_instance(
         if encoder_cache is None:
             raise RuntimeError(
                 "MM encoder item scheduling requires its unified output cache")
-        if not isinstance(kv_cache_manager, KVCacheManagerV2):
-            scheduler = PreallocatedContextScheduler(scheduler,
-                                                     resource_manager)
         scheduler = scheduler_cls(
             scheduler,
             max_batch_size=model_engine.encoder_batch_size,
@@ -4483,8 +4480,12 @@ def create_py_executor_instance(
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
             retain_cache_entries=model_engine.model.encoder_cache_active,
-            context_chunk_unit_size=(ctx_chunk_config[1]
-                                     if ctx_chunk_config is not None else None),
+            # V2 resolves actual KV reuse before encoder item selection.
+            # V1 keeps whole-request encoder scheduling.
+            context_chunk_unit_size=(
+                ctx_chunk_config[1]
+                if isinstance(kv_cache_manager, KVCacheManagerV2)
+                and ctx_chunk_config is not None else None),
         )
 
     config = model_engine.model.model_config.pretrained_config

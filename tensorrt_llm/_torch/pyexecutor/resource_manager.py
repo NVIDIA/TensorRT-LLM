@@ -50,8 +50,7 @@ from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
-                          rewind_context_after_cache_drop)
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import ScheduledRequests
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
@@ -237,21 +236,6 @@ class BaseResourceManager(ABC):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
-    def prepare_context_resources(self, requests: list[LlmRequest]) -> None:
-        """Reserve contexts early when resources determine their prompt windows.
-
-        Managers with deferred context allocation override this method. Normal
-        ``prepare_resources`` must consume accepted reservations without
-        allocating them again.
-        """
-
-    def release_unused_contexts(self, keep_request_ids: set[int]) -> None:
-        """Discard unexecuted context reservations outside the accepted batch.
-
-        The owning manager releases its resources and rewinds any request
-        state it changed, without publishing uncomputed data for reuse.
-        """
-
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
@@ -373,7 +357,6 @@ class KVCacheManager(BaseResourceManager):
     # prepare_resources reads it on such test-built instances. Zero disables
     # the spec recompute tail.
     _spec_recompute_tail: int = 0
-    _preprepared_context_requests: dict[int, LlmRequest] | None = None
     # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
     # Mamba/GDN managers override this: a reused request's recurrent slot
     # already summarizes the matched prefix, so a partial rewind would apply
@@ -1177,9 +1160,6 @@ class KVCacheManager(BaseResourceManager):
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
         if req.py_request_id in self._preprepared_dummy_request_ids:
             return None
-        if (self._preprepared_context_requests is not None
-                and req.py_request_id in self._preprepared_context_requests):
-            return None
         if is_cross:
             if (getattr(req, "py_skip_cross_kv_projection", False)
                     or not req.is_first_context_chunk
@@ -1195,40 +1175,6 @@ class KVCacheManager(BaseResourceManager):
                 req):
             return None
         return req.prompt_len
-
-    def prepare_context_resources(self, requests: List[LlmRequest]) -> None:
-        """Resolve actual reuse and recompute before exposing a prompt window."""
-        if self.kv_cache_type == CacheTypeCpp.CROSS:
-            return
-        contexts = [
-            req for req in requests
-            if self._context_seq_len(req, is_cross=False) is not None
-        ]
-        if not contexts:
-            return
-        batch = ScheduledRequests()
-        batch.reset_context_requests(contexts)
-        self.prepare_resources(batch)
-        if self._preprepared_context_requests is None:
-            self._preprepared_context_requests = {}
-        self._preprepared_context_requests.update(
-            (req.py_request_id, req) for req in contexts)
-
-    def release_unused_contexts(self, keep_request_ids: set[int]) -> None:
-        """Undo first-chunk KV claims that will not reach a forward pass."""
-        if not self._preprepared_context_requests:
-            return
-        released = [
-            req
-            for request_id, req in self._preprepared_context_requests.items()
-            if request_id not in keep_request_ids
-        ]
-        batch = ScheduledRequests()
-        batch.reset_context_requests(released)
-        with request_context(self.is_draft, batch):
-            for req in released:
-                self.free_resources(req)
-                rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
@@ -1290,9 +1236,6 @@ class KVCacheManager(BaseResourceManager):
         # `context_requests_last_chunk` in `add_sequence` due to KV cache
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
-        if self._preprepared_context_requests is not None:
-            for req in scheduled_batch.context_requests:
-                self._preprepared_context_requests.pop(req.py_request_id, None)
 
     def _maybe_apply_spec_recompute_tail(
             self, batch_llm_requests: List[LlmRequest]) -> None:
@@ -1676,22 +1619,9 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        # Native dummy release discards unexecuted claims without publishing KV.
-        prepared_only = (self._preprepared_context_requests is not None
-                         and request.py_request_id
-                         in self._preprepared_context_requests)
-        was_dummy = request.is_dummy_request if prepared_only else False
-        if prepared_only:
-            request.is_dummy_request = True
-        try:
-            result = self.impl.remove_sequence(request.py_request_id, request,
-                                               pin_on_release)
-        finally:
-            if prepared_only:
-                request.is_dummy_request = was_dummy
+        result = self.impl.remove_sequence(request.py_request_id, request,
+                                           pin_on_release)
         self._preprepared_dummy_request_ids.discard(request.py_request_id)
-        if self._preprepared_context_requests is not None:
-            self._preprepared_context_requests.pop(request.py_request_id, None)
         return result
 
     def store_blocks_for_reuse(self,
@@ -3241,19 +3171,6 @@ class ResourceManager:
         if kv_cache_manager is not None and hasattr(kv_cache_manager,
                                                     "maybe_fit_token_budget"):
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
-
-    def prepare_context_resources(self,
-                                  context_requests: List[LlmRequest]) -> None:
-        """Resolve context windows through each manager's reservation interface."""
-        for manager in self.resource_managers.values():
-            manager.prepare_context_resources(context_requests)
-
-    def release_unused_contexts(self,
-                                context_requests: List[LlmRequest]) -> None:
-        """Let each manager discard reservations absent from the accepted batch."""
-        keep_request_ids = {req.py_request_id for req in context_requests}
-        for manager in self.resource_managers.values():
-            manager.release_unused_contexts(keep_request_ids)
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

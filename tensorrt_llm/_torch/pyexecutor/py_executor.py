@@ -4056,9 +4056,10 @@ class PyExecutor:
         revert that growth so it does not accumulate across skipped
         iterations and overflow the host page-index buffer.
 
-        V1 multimodal contexts also claim their prefix during scheduling so
-        encoder selection sees the actual reuse. Release those unused claims
-        before retrying; V1 generation growth still happens after the vote.
+        Only applies to KV cache manager V2 + scheduler V2, because the V2
+        scheduler allocates KV cache capacity during scheduling, before the
+        can_queue check.  V1 allocates in prepare_resources() after the
+        can_queue check, so no revert is needed.
         """
         if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
@@ -4069,8 +4070,6 @@ class PyExecutor:
                 self.kv_cache_manager.revert_allocate_generation(req)
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
-        elif getattr(self, "_mm_encoder_item_scheduling_enabled", False):
-            self.resource_manager.release_unused_contexts([])
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Update self, draft, and cross caches after a context forward."""
@@ -4882,8 +4881,8 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     self._release_unused_connector_reservations()
-                    self._revert_gen_alloc(scheduled_batch)
                     if self._is_kv_manager_v2:
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -4898,10 +4897,6 @@ class PyExecutor:
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
-
-                if self._mm_encoder_item_scheduling_enabled:
-                    self.resource_manager.release_unused_contexts(
-                        scheduled_batch.context_requests)
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
@@ -5762,8 +5757,8 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     self._release_unused_connector_reservations()
-                    self._revert_gen_alloc(scheduled_batch)
                     if self._is_kv_manager_v2:
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -5774,10 +5769,6 @@ class PyExecutor:
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
-
-                if self._mm_encoder_item_scheduling_enabled:
-                    self.resource_manager.release_unused_contexts(
-                        scheduled_batch.context_requests)
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
@@ -8535,7 +8526,8 @@ class PyExecutor:
                     request.context_current_position +
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
-                if request.py_mm_encoder_state is not None:
+                if (self._is_kv_manager_v2
+                        and request.py_mm_encoder_state is not None):
                     release_consumed_mm_items(
                         request, self.model_engine.mm_encoder_cache)
             if request.context_remaining_length == 0:

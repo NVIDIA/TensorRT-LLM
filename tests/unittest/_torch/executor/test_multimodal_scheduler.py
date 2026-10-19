@@ -31,16 +31,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     release_consumed_mm_items,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager,
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
     MultimodalScheduler,
-    PreallocatedContextScheduler,
     ScheduledRequests,
     SchedulerOutput,
     SimpleScheduler,
@@ -48,14 +42,18 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
-from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalParams,
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    CapacitySchedulerPolicy,
+    ContextChunkingPolicy,
+    MultimodalEncoderSchedulingPolicy,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -115,11 +113,8 @@ def _scheduler(
     base_scheduler=None,
     scheduler_cls=MultimodalScheduler,
     context_chunk_unit_size=None,
-    resource_manager=None,
 ):
     scheduler = base_scheduler or _BaseScheduler()
-    if resource_manager is not None:
-        scheduler = PreallocatedContextScheduler(scheduler, resource_manager)
     return scheduler_cls(
         scheduler,
         max_batch_size=max_batch_size,
@@ -130,6 +125,107 @@ def _scheduler(
         retain_cache_entries=False,
         context_chunk_unit_size=context_chunk_unit_size,
     )
+
+
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("chunked", [False, True], ids=["whole", "chunked"])
+@pytest.mark.parametrize("eager", [False, True], ids=["default", "eager"])
+def test_executor_factory_enables_chunk_item_scheduling_only_for_v2(
+    use_v2, chunked, eager, monkeypatch
+):
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    mapping = Mapping()
+    manager = Mock(spec=KVCacheManagerV2 if use_v2 else KVCacheManager)
+    manager.impl = Mock()
+    base = _BaseScheduler(chunk_size=4)
+    for name in ("KVCacheV2Scheduler", "SimpleScheduler", "SimpleUnifiedScheduler"):
+        monkeypatch.setattr(_util, name, Mock(return_value=base))
+    monkeypatch.setattr(_util, "BindCapacityScheduler", Mock())
+    monkeypatch.setattr(_util, "BindMicroBatchScheduler", Mock())
+    monkeypatch.setattr(_util, "create_kv_cache_transceiver", Mock(return_value=None))
+    executor_cls = Mock()
+    monkeypatch.setattr(_util, "PyExecutor", executor_cls)
+    engine = SimpleNamespace(
+        spec_config=None,
+        mapping=mapping,
+        mm_encoder_item_scheduling_enabled=True,
+        mm_encoder_cache=TensorLRUCache(8),
+        encoder_batch_size=1,
+        encoder_max_num_tokens=8,
+        bytes_per_mm_encoder_embedding=4,
+        get_mm_encoder_item_cache_keys=_item_cache_keys,
+        model=SimpleNamespace(
+            encoder_cache_active=False,
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(), is_encoder_decoder=False
+            ),
+        ),
+    )
+    args = TorchLlmArgs(
+        model="/tmp/dummy_mm_chunk_model",
+        skip_tokenizer_init=True,
+        disable_overlap_scheduler=True,
+        scheduler_config={},
+        multimodal_config={
+            "encoder_scheduling_policy": (
+                MultimodalEncoderSchedulingPolicy.EAGER
+                if eager
+                else MultimodalEncoderSchedulingPolicy.DEFAULT
+            ),
+        },
+    )
+    _util.create_py_executor_instance(
+        dist=Mock(),
+        resources={ResourceManagerType.KV_CACHE_MANAGER: manager},
+        mapping=mapping,
+        llm_args=args,
+        scheduler_config=args.scheduler_config,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 4) if chunked else None,
+        model_engine=engine,
+        start_worker=False,
+        sampler=Mock(),
+        drafter=None,
+        max_seq_len=128,
+        max_batch_size=8,
+        max_beam_width=1,
+        max_num_tokens=8,
+    )
+    scheduler = executor_cls.call_args.args[1]
+    assert scheduler.context_chunk_unit_size == (4 if use_v2 and chunked else None)
+    request = make_mm_request(1, [4, 4], prompt_len=9)
+    mask = torch.zeros(9, dtype=torch.int64)
+    mask[[1, 5]] = 1
+    request.py_multimodal_data["multimodal_embed_mask_cumsum"] = mask.cumsum(0)
+
+    output = scheduler.schedule_request([request], set())
+
+    assert output.scheduled_mm_encoder_items == {1: [0]}
+    assert output.context_requests == ([request] if use_v2 and chunked else [])
+
+
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+def test_executor_releases_consumed_encoder_outputs_per_chunk_only_for_v2(use_v2):
+    request = make_mm_request(1, [4, 4], interleaved=True)
+    cache = TensorLRUCache(8)
+    state = request.py_mm_encoder_state
+    cache_keys = _item_cache_keys(request)
+    for item_idx, cache_key in enumerate(cache_keys):
+        cache.acquire(cache_key, 4, retain_after_release=False)
+        cache.commit(cache_key, torch.ones(1))
+        state.set_item_cache_key(item_idx, cache_key, ready=True)
+    request.context_chunk_size = 2
+    executor = SimpleNamespace(
+        _is_kv_manager_v2=use_v2,
+        _terminate_attention_dp_dummy_requests=lambda: None,
+        model_engine=SimpleNamespace(mm_encoder_cache=cache),
+    )
+
+    PyExecutor._update_request_states_tp(executor, SimpleNamespace(context_requests=[request]))
+
+    assert request.context_current_position == 2
+    assert state.item_cache_keys == ([None, cache_keys[1]] if use_v2 else cache_keys)
+    assert cache.stats().in_use_bytes == (4 if use_v2 else 8)
 
 
 def test_mm_encoder_token_lengths_distinguishes_missing_and_invalid_data():
@@ -522,245 +618,6 @@ def test_completed_context_chunk_releases_only_consumed_items():
 
     assert state.item_cache_keys == [None, cache_keys[1]]
     assert cache.stats().item_count == 1
-
-
-def _native_prefix_manager(*, reuse=0, recompute_tail=0):
-    manager = object.__new__(KVCacheManager)
-    manager.mapping = Mapping()
-    manager.is_draft = False
-    manager.num_extra_kv_tokens = 0
-    manager.kv_cache_type = CacheType.SELF
-    manager.kv_connector_manager = None
-    manager._kv_reserve_draft_tokens = 0
-    manager._preprepared_dummy_request_ids = set()
-    manager._spec_recompute_tail = recompute_tail
-    manager.max_attention_window_vec = [128]
-    manager.max_seq_len = 128
-    manager.max_num_tokens = 128
-    manager.tokens_per_block = 4
-    manager.enable_chunked_prefill = True
-
-    def add_sequences(infos, requests):
-        for request in requests:
-            request.set_prepopulated_prompt_len(reuse, manager.tokens_per_block)
-
-    removed_as_dummy = []
-    manager.impl = SimpleNamespace(
-        sync_transfer_manager_with_buffer_manager=Mock(),
-        add_sequence_batch=Mock(side_effect=add_sequences),
-        refresh_blocks=Mock(),
-        remove_sequence=Mock(
-            side_effect=lambda _, req, __: removed_as_dummy.append(req.is_dummy_request)
-        ),
-        removed_as_dummy=removed_as_dummy,
-    )
-    return manager
-
-
-@pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])
-@pytest.mark.parametrize(
-    "reuse,recompute_tail,expected_start", [(0, 0, 0), (8, 0, 8), (8, -1, 0), (8, 8, 4)]
-)
-@pytest.mark.parametrize("attention_dp", [False, True])
-def test_native_prefix_is_resolved_before_encoder_selection(
-    scheduler_cls, attention_dp, reuse, recompute_tail, expected_start
-):
-    request = make_mm_request(1, [1], prompt_len=12)
-    mask = torch.zeros(12, dtype=torch.int64)
-    mask[5] = 1
-    request.py_multimodal_data["multimodal_embed_mask_cumsum"] = mask.cumsum(0)
-    request.estimated_reusable_tokens = 8
-    manager = _native_prefix_manager(reuse=reuse, recompute_tail=recompute_tail)
-    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    scheduler = _scheduler(
-        max_batch_size=1,
-        max_num_tokens=8,
-        context_chunk_unit_size=4,
-        scheduler_cls=scheduler_cls,
-        resource_manager=resources,
-    )
-
-    output = scheduler.schedule_request([request], set())
-
-    assert output.context_requests == [request]
-    assert request.context_current_position == expected_start
-    assert request.estimated_reusable_tokens == 8
-    if expected_start <= 5:
-        assert output.scheduled_mm_encoder_items == {1: [0]}
-        record_output(request.py_mm_encoder_state, 0)
-    else:
-        assert output.scheduled_mm_encoder_items is None
-    batch = ScheduledRequests()
-    batch.reset_context_requests(output.context_requests)
-    executor = object.__new__(PyExecutor)
-    executor.enable_attention_dp = attention_dp
-    executor.dist = SimpleNamespace(tp_allgather_int64=lambda _: torch.tensor([[1], [1]]))
-    can_queue, _ = executor._can_queue(batch)
-    assert can_queue
-
-    resources.prepare_resources(batch)
-
-    assert batch.context_requests == [request]
-    assert batch.batch_size == 1
-    assert is_mm_context_chunk_ready(request, request.context_current_position)
-    manager.impl.add_sequence_batch.assert_called_once()
-    assert not manager._preprepared_context_requests
-    manager.free_resources(request)
-    manager.impl.remove_sequence.assert_called_once_with(1, request, False)
-    assert manager.impl.removed_as_dummy == [False]
-
-
-def test_context_preparation_uses_the_resource_interface_without_native_kv_type_checks():
-    request = make_mm_request(1, [1, 1], interleaved=True)
-    manager = Mock(spec=BaseResourceManager)
-
-    def prepare_contexts(requests):
-        for context in requests:
-            context.set_prepopulated_prompt_len(2, 1)
-
-    manager.prepare_context_resources.side_effect = prepare_contexts
-    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    scheduler = _scheduler(
-        max_batch_size=1,
-        max_num_tokens=1,
-        context_chunk_unit_size=1,
-        resource_manager=resources,
-    )
-
-    output = scheduler.schedule_request([request], set())
-
-    assert output.context_requests == [request]
-    assert output.scheduled_mm_encoder_items == {1: [1]}
-    assert request.context_current_position == 2
-    assert request.estimated_reusable_tokens == 0
-    manager.prepare_context_resources.assert_called_once_with([request])
-    manager.release_unused_contexts.assert_called_once_with({1})
-
-
-@pytest.mark.parametrize("chunk_unit", [None, 4])
-def test_encoder_slot_wait_releases_native_prefix_and_retains_ready_outputs(chunk_unit):
-    request = make_mm_request(1, [4, 4], interleaved=True)
-    manager = _native_prefix_manager()
-    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    scheduler = _scheduler(
-        max_batch_size=1,
-        max_num_tokens=8,
-        cache_capacity=8,
-        base_scheduler=_BaseScheduler(chunk_size=chunk_unit),
-        context_chunk_unit_size=chunk_unit,
-        resource_manager=resources,
-    )
-
-    first = scheduler.schedule_request([request], set())
-
-    assert first.context_requests == []
-    assert first.scheduled_mm_encoder_items == {1: [0]}
-    manager.impl.remove_sequence.assert_called_once_with(1, request, False)
-    assert manager.impl.removed_as_dummy == [True]
-    assert not request.is_dummy_request
-    assert request.context_current_position == request.prepopulated_prompt_len == 0
-    record_output(request.py_mm_encoder_state, 0)
-
-    second = scheduler.schedule_request([request], set())
-
-    assert second.context_requests == [request]
-    assert second.scheduled_mm_encoder_items == {1: [1]}
-    assert request.py_mm_encoder_state.item_ready[0]
-
-
-def test_attention_dp_veto_releases_native_context_claims_for_retry():
-    request = make_mm_request(1, [1], prompt_len=12)
-    manager = _native_prefix_manager(reuse=8)
-    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    resources.prepare_context_resources([request])
-    batch = ScheduledRequests()
-    batch.reset_context_requests([request])
-    executor = object.__new__(PyExecutor)
-    executor.enable_attention_dp = True
-    executor._is_kv_manager_v2 = False
-    executor._mm_encoder_item_scheduling_enabled = True
-    executor.resource_manager = resources
-    executor.dist = SimpleNamespace(tp_allgather_int64=lambda _: torch.tensor([[1], [0]]))
-
-    can_queue, _ = executor._can_queue(batch)
-    assert not can_queue
-    executor._revert_gen_alloc(batch)
-
-    assert not manager._preprepared_context_requests
-    assert request.context_current_position == request.prepopulated_prompt_len == 0
-    manager.impl.remove_sequence.assert_called_once_with(1, request, False)
-    assert manager.impl.removed_as_dummy == [True]
-    assert not request.is_dummy_request
-
-
-def test_failed_native_claim_release_preserves_request_kind():
-    request = make_mm_request(1, [1])
-    manager = _native_prefix_manager()
-    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    resources.prepare_context_resources([request])
-    manager.impl.remove_sequence.side_effect = RuntimeError("release failed")
-
-    with pytest.raises(RuntimeError, match="release failed"):
-        resources.release_unused_contexts([])
-
-    assert not request.is_dummy_request
-    assert manager._preprepared_context_requests == {1: request}
-
-
-def test_aborted_context_reservations_rewind_target_and_draft_state():
-    request = make_mm_request(1, [1], prompt_len=12)
-    target = _native_prefix_manager(reuse=8)
-    draft = _native_prefix_manager(reuse=4)
-    draft.is_draft = True
-    resources = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_MANAGER: target,
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
-        }
-    )
-
-    resources.prepare_context_resources([request])
-    assert request.context_current_position == 8
-    request.use_draft_model = True
-    assert request.context_current_position == 4
-    request.use_draft_model = False
-
-    resources.release_unused_contexts([])
-
-    assert not request.use_draft_model
-    for manager in (target, draft):
-        request.use_draft_model = manager.is_draft
-        assert request.context_current_position == request.prepopulated_prompt_len == 0
-        assert request.context_chunk_size == request.prompt_len
-        assert not manager._preprepared_context_requests
-        assert manager.impl.removed_as_dummy == [True]
-    request.use_draft_model = False
-    assert not request.is_dummy_request
-
-
-def test_native_context_admission_waits_for_paused_sequences_to_be_freed():
-    request = make_mm_request(1, [1])
-    paused = make_llm_request(2)
-    manager = _native_prefix_manager()
-    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    base = _BaseScheduler()
-    base.capacity_scheduler.schedule_request = Mock(return_value=([request], [], [paused]))
-    scheduler = _scheduler(
-        max_batch_size=1, max_num_tokens=8, base_scheduler=base, resource_manager=resources
-    )
-
-    output = scheduler.schedule_request([request, paused], set())
-
-    assert output.context_requests == []
-    assert output.paused_requests == [paused]
-    manager.impl.add_sequence_batch.assert_not_called()
-
-    base.capacity_scheduler.schedule_request.return_value = ([request], [], [])
-    output = scheduler.schedule_request([request, paused], set())
-
-    assert output.context_requests == [request]
-    assert output.scheduled_mm_encoder_items == {1: [0]}
-    manager.impl.add_sequence_batch.assert_called_once()
 
 
 def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():

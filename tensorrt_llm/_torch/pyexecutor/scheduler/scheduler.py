@@ -10,7 +10,7 @@ from collections import namedtuple
 from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, TypeVar, cast
+from typing import Any, Callable, Optional, TypeAlias, TypeVar, cast
 
 import torch
 from strenum import StrEnum
@@ -40,9 +40,6 @@ PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
 # plain tuple; the alias documents the production type.
 BlockKey: TypeAlias = tb_internal.batch_manager.BlockKey
 T = TypeVar("T")
-
-if TYPE_CHECKING:
-    from ..resource_manager import ResourceManager
 
 
 def _zero_prefix_reuse_summary() -> PrefixReuseSummary:
@@ -375,82 +372,6 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
-    def prepare_context_chunks(
-        self, requests: RequestList, paused_requests: RequestList
-    ) -> list[ContextChunk]:
-        """Resolve actual prompt windows before a consumer selects external inputs.
-
-        The default is for schedulers that resolve KV reuse during scheduling.
-        Schedulers with deferred allocation must prepare their resources first;
-        see ``PreallocatedContextScheduler``. Requests that cannot be prepared
-        this pass are omitted, without advancing their prefill progress.
-        """
-        return [ContextChunk.from_request(request) for request in requests]
-
-    def finish_context_scheduling(
-        self,
-        chunks: list[ContextChunk],
-        runnable_requests: RequestList,
-        release_request_ids: set[int],
-    ) -> None:
-        """Reconcile context reservations after a consumer filters the batch.
-
-        ``release_request_ids`` identifies deferred requests that cannot keep
-        their admission while waiting for input capacity. Other deferred
-        requests may retain reservations for retry. A backend may instead
-        discard all unused provisional reservations. Runnable reservations
-        remain provisional until resource preparation commits the batch.
-        """
-        for chunk in chunks:
-            if chunk.request.py_request_id in release_request_ids:
-                self.release_context_admission(chunk.request)
-
-
-class PreallocatedContextScheduler(RequestScheduler):
-    """Adapt deferred context allocation to the prepared-window contract.
-
-    Only requests passed to ``prepare_context_chunks`` acquire resources early.
-    Their unexecuted reservations are discarded when withheld from the batch;
-    accepted reservations are consumed by normal resource preparation.
-    """
-
-    def __init__(self, scheduler: RequestScheduler, resource_manager: "ResourceManager") -> None:
-        self.scheduler = scheduler
-        self.resource_manager = resource_manager
-
-    @property
-    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
-        return self.scheduler.scheduling_state_range
-
-    def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
-    ) -> SchedulerOutput:
-        return self.scheduler.schedule_request(active_requests, inflight_request_ids)
-
-    def can_schedule(self, requests: RequestList) -> bool:
-        return self.scheduler.can_schedule(requests)
-
-    def prepare_context_chunks(
-        self, requests: RequestList, paused_requests: RequestList
-    ) -> list[ContextChunk]:
-        # Paused sequences are freed by the executor after scheduling, so
-        # their pages cannot back new first-chunk reservations in this pass.
-        contexts = [
-            request
-            for request in requests
-            if not paused_requests or not request.is_first_context_chunk
-        ]
-        self.resource_manager.prepare_context_resources(contexts)
-        return [ContextChunk.from_request(request) for request in contexts]
-
-    def finish_context_scheduling(
-        self,
-        chunks: list[ContextChunk],
-        runnable_requests: RequestList,
-        release_request_ids: set[int],
-    ) -> None:
-        self.resource_manager.release_unused_contexts(runnable_requests)
-
 
 @dataclass
 class SerializableSchedulerOutput:
@@ -750,10 +671,11 @@ class MultimodalScheduler(RequestScheduler):
     attention sequences. Those attention metadata capacities are derived
     separately from the token budget and model geometry.
 
-    A request needs only the items that its remaining prompt uses: an item
-    wholly inside the estimated reusable KV prefix is never encoded, and the
-    executor releases an item once confirmed prefill progress passes it. Each
-    pass selects items in one of two ways:
+    With KV cache manager V2, a request needs only the items that its remaining
+    prompt uses: an item wholly inside the confirmed reusable KV prefix is
+    never encoded, and the executor releases it once prefill moves past it.
+    V1 keeps whole-request encoder scheduling. Each pass selects items in one
+    of two ways:
 
     * Whole request: acquire every remaining item of a request and admit it to
       the LLM batch once all of them are ready. ``DEFAULT`` uses this while the
@@ -791,7 +713,7 @@ class MultimodalScheduler(RequestScheduler):
         self.get_item_cache_keys = get_item_cache_keys
         self.bytes_per_encoder_embedding = bytes_per_encoder_embedding
         self.retain_cache_entries = retain_cache_entries
-        # `None` when context chunking is disabled.
+        # Only V2 supplies resolved prompt windows; V1 leaves this unset.
         self.context_chunk_unit_size = context_chunk_unit_size
 
     @property
@@ -1293,22 +1215,7 @@ class MultimodalScheduler(RequestScheduler):
         proposed_context_requests = [
             request for request in active_requests if request.py_request_id in context_ids
         ]
-        prepared_chunks = self.scheduler.prepare_context_chunks(
-            [
-                request
-                for request in proposed_context_requests
-                if request.py_mm_encoder_state is not None
-            ],
-            scheduler_output.paused_requests,
-        )
-        chunks_by_id = {chunk.request.py_request_id: chunk for chunk in prepared_chunks}
-        chunks = [
-            ContextChunk.from_request(request)
-            if request.py_mm_encoder_state is None
-            else chunks_by_id[request.py_request_id]
-            for request in proposed_context_requests
-            if request.py_mm_encoder_state is None or request.py_request_id in chunks_by_id
-        ]
+        chunks = [ContextChunk.from_request(request) for request in proposed_context_requests]
         context_requests = [chunk.request for chunk in chunks]
         selects_whole_requests = self._selects_whole_requests(context_requests)
         output_capacity_blocked_ids: set[int] = set()
@@ -1333,12 +1240,12 @@ class MultimodalScheduler(RequestScheduler):
 
         held_bytes, held_keys = self._cache_claims(active_requests)
         runnable_ids = {request.py_request_id for request in context_requests}
-        release_ids: set[int] = set()
-        for chunk in prepared_chunks:
+        for chunk in chunks:
             request = chunk.request
             state = cast(MultimodalEncoderRequestState, request.py_mm_encoder_state)
             if (
-                request.py_request_id in runnable_ids
+                state is None
+                or request.py_request_id in runnable_ids
                 or not request.is_first_context_chunk
                 or any(cache_key is not None for cache_key in state.item_cache_keys)
                 or request.py_request_id in step.selected
@@ -1349,8 +1256,7 @@ class MultimodalScheduler(RequestScheduler):
             else:
                 output_capacity_blocked = request.py_request_id in output_capacity_blocked_ids
             if output_capacity_blocked:
-                release_ids.add(request.py_request_id)
-        self.scheduler.finish_context_scheduling(prepared_chunks, context_requests, release_ids)
+                self.scheduler.release_context_admission(request)
         self.encoder_cache.ensure_capacity(step.output_bytes)
         return scheduler_output._replace(
             context_requests=[
