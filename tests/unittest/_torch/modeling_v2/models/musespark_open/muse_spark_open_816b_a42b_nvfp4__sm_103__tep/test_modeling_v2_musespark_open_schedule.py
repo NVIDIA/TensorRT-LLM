@@ -2813,6 +2813,13 @@ def _short_prefill_problems(selection, short_counts: dict) -> list:
     return problems
 
 
+def _served_qkv_kernels() -> tuple:
+    """The QKV kernel per row count that ``dense_gemms.install`` serves on this device: the
+    kernel table of the device's compute capability."""
+    dense_gemms = importlib.import_module(_PKG + ".kernels.dense_gemms.dispatcher")
+    return dense_gemms.default_kernels(dense_gemms.device_capability())["qkv"]
+
+
 def _expected_counts(selection, rows: int, head_kind: str) -> dict:
     selected = _selection(selection)
     expected = {}
@@ -2827,13 +2834,11 @@ def _expected_counts(selection, rows: int, head_kind: str) -> dict:
             expected["unpool_direct_boundary"] = 0
     if expected.get("l2_prefetch") and "early_release" in selected and "gathers" in selected:
         # early_release drops gemm_prefetch's prefetch of the next QKV weight behind every fused boundary, at
-        # the widths whose QKV kernel loads its weight before its wait (split-K). No layer
+        # the widths whose served QKV kernel loads its weight before its wait (split-K). No layer
         # here is a DFlash capture layer: the head reads the layer outputs through this
         # test's hooks.
-        dense_gemms = importlib.import_module(_PKG + ".kernels.dense_gemms.dispatcher")
         pdl_triggers = importlib.import_module(_PKG + ".kernels.boundary_early_release.triggers")
-        qkv = dense_gemms.default_kernels()["qkv"]
-        if rows in pdl_triggers.weights_before_wait_rows(qkv):
+        if rows in pdl_triggers.weights_before_wait_rows(_served_qkv_kernels()):
             expected["l2_prefetch"] -= ENTRIES["unpool_gather_boundary"][1]
     if "moe_prologue" in selected and rows <= 8:
         for entry, sites in PROLOGUE_REPLACES.items():
@@ -2841,9 +2846,8 @@ def _expected_counts(selection, rows: int, head_kind: str) -> dict:
                 expected[entry] -= sites
     if expected.get("qkv_prefetch_prefetch"):
         # qkv_prefetch prefetches for a QKV kernel that loads weight k-tiles after its wait (split-K).
-        dense_gemms = importlib.import_module(_PKG + ".kernels.dense_gemms.dispatcher")
         pdl_triggers = importlib.import_module(_PKG + ".kernels.boundary_early_release.triggers")
-        if rows not in pdl_triggers.weights_before_wait_rows(dense_gemms.default_kernels()["qkv"]):
+        if rows not in pdl_triggers.weights_before_wait_rows(_served_qkv_kernels()):
             expected["qkv_prefetch_prefetch"] = 0
     if "router_fork" in selected and rows <= 8:
         # router_fork launches the router shard on its side stream instead.

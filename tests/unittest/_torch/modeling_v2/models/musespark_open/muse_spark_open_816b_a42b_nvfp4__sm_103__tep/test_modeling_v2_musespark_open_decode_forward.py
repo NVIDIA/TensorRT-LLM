@@ -1317,6 +1317,16 @@ def _distance(got: dict, want: dict) -> dict:
     }
 
 
+def _served_qkv_kernels() -> tuple:
+    """The QKV kernel per row count that ``dense_gemms.install`` serves on this device: the
+    kernel table of the device's compute capability."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.dense_gemms import (  # noqa: E501
+        dispatcher as dense_gemms,
+    )
+
+    return dense_gemms.default_kernels(dense_gemms.device_capability())["qkv"]
+
+
 def _expected_counts(selected: frozenset, rows: int, graph: bool = False) -> dict:
     expected = {}
     for entry, (ids, sites, widest) in ENTRIES.items():
@@ -1330,18 +1340,16 @@ def _expected_counts(selected: frozenset, rows: int, graph: bool = False) -> dic
             expected["unpool_direct_boundary"] = 0
     if expected.get("l2_prefetch") and "early_release" in selected:
         # early_release drops gemm_prefetch's prefetch on the edges it converts, at the widths whose consumer
-        # loads its weight before its wait (split-K QKV, from 3 rows): the unpooler's of the
-        # next QKV weight behind every fused boundary (5 here; no DFlash capture layers in
-        # this model).
+        # loads its weight before its wait (the served QKV kernel is split-K: from 3 rows on
+        # sm103, from 4 on sm107): the unpooler's of the next QKV weight behind every fused
+        # boundary (5 here; no DFlash capture layers in this model).
         from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.boundary_early_release import (  # noqa: E501
             triggers as pdl_triggers,
         )
-        from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.dense_gemms import (  # noqa: E501
-            dispatcher as dense_gemms,
-        )
 
-        kernels = dense_gemms.default_kernels()
-        if "gathers" in selected and rows in pdl_triggers.weights_before_wait_rows(kernels["qkv"]):
+        if "gathers" in selected and rows in pdl_triggers.weights_before_wait_rows(
+            _served_qkv_kernels()
+        ):
             expected["l2_prefetch"] -= ENTRIES["unpool_gather_boundary"][1]
     if "moe_prologue" in selected and rows <= 8:
         for entry, sites in PROLOGUE_REPLACES.items():
@@ -1352,11 +1360,8 @@ def _expected_counts(selected: frozenset, rows: int, graph: bool = False) -> dic
         from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.boundary_early_release import (  # noqa: E501
             triggers as pdl_triggers,
         )
-        from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.dense_gemms import (  # noqa: E501
-            dispatcher as dense_gemms,
-        )
 
-        if rows not in pdl_triggers.weights_before_wait_rows(dense_gemms.default_kernels()["qkv"]):
+        if rows not in pdl_triggers.weights_before_wait_rows(_served_qkv_kernels()):
             expected["qkv_prefetch_prefetch"] = 0
     if "router_fork" in selected and rows <= 8:
         # router_fork launches the router shard on its side stream instead.
