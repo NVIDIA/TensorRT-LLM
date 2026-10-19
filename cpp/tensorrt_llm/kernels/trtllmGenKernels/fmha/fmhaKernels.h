@@ -850,7 +850,10 @@ private:
         {
 #ifndef _MSC_VER
             auto isExecutable = [](std::string const& path)
-            { return std::filesystem::is_regular_file(path) && access(path.c_str(), X_OK) == 0; };
+            {
+                std::error_code ec;
+                return std::filesystem::is_regular_file(path, ec) && access(path.c_str(), X_OK) == 0;
+            };
             for (char const* rootVar : {"CUDA_HOME", "CUDA_PATH"})
             {
                 char const* root = std::getenv(rootVar);
