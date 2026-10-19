@@ -28,7 +28,7 @@ selects it; with neither set DWDP uses the MPI sub-communicator as before.
 from __future__ import annotations
 
 import os
-import pickle
+import pickle  # nosec B403
 from datetime import timedelta
 from typing import Any, List, Optional
 
@@ -168,7 +168,10 @@ class StoreDwdpGroup:
 
         self._store.set(keys[self._rank], pickle.dumps(obj))
         self._store.wait(keys, self._timeout)
-        return [pickle.loads(self._store.get(key)) for key in keys]
+        # Trust boundary: the store is served by DWDP rank 0 and written only by the
+        # context workers of this launch; its port must stay on the trusted cluster
+        # network, as for the MPI communicator this replaces.
+        return [pickle.loads(self._store.get(key)) for key in keys]  # nosec B301
 
     def Barrier(self) -> None:
         """Match ``MPI_Barrier``; waiting for every key is the synchronization."""

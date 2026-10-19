@@ -233,7 +233,8 @@ def _run_workers(target, ranks):
         except BaseException as exc:  # surfaced below on the main thread
             errors[rank] = exc
 
-    threads = [threading.Thread(target=wrap, args=(r,)) for r in ranks]
+    # Daemon threads: a peer stuck in ``store.wait`` must not keep pytest alive.
+    threads = [threading.Thread(target=wrap, args=(r,), daemon=True) for r in ranks]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -244,7 +245,9 @@ def _run_workers(target, ranks):
 
 def test_two_groups_rendezvous_over_a_localhost_tcpstore():
     """Two groups of two workers share one TCPStore hosted by DWDP rank 0."""
-    master = StoreDwdpGroup(global_rank=0, dwdp_size=2, master_addr=_LOCALHOST, master_port=0)
+    master = StoreDwdpGroup(
+        global_rank=0, dwdp_size=2, master_addr=_LOCALHOST, master_port=0, timeout_s=60
+    )
     port = master._store.port
     groups = {0: master}
     results = {}
@@ -253,12 +256,15 @@ def test_two_groups_rendezvous_over_a_localhost_tcpstore():
         group = groups.get(rank) or StoreDwdpGroup(
             global_rank=rank, dwdp_size=2, master_addr=_LOCALHOST, master_port=port, timeout_s=60
         )
+        groups[rank] = group
         results[rank] = group.allgather(torch.tensor([rank]))
         group.Barrier()
         results[rank] = [int(t) for t in results[rank]] + group.allgather(f"pid-{rank}")
-        group.Free()
 
     _run_workers(worker, ranks=(0, 1, 2, 3))
+    # Rank 0 hosts the store both groups use, so it is freed last, after every worker is done.
+    for rank in (3, 2, 1, 0):
+        groups[rank].Free()
 
     assert results == {
         0: [0, 1, "pid-0", "pid-1"],
@@ -272,7 +278,9 @@ def test_free_on_rank0_shuts_the_store_down():
     """Teardown releases the TCPStore: once rank 0 frees, nothing can connect."""
     from torch.distributed import TCPStore
 
-    master = StoreDwdpGroup(global_rank=0, dwdp_size=2, master_addr=_LOCALHOST, master_port=0)
+    master = StoreDwdpGroup(
+        global_rank=0, dwdp_size=2, master_addr=_LOCALHOST, master_port=0, timeout_s=60
+    )
     port = master._store.port
     peer = StoreDwdpGroup(
         global_rank=1, dwdp_size=2, master_addr=_LOCALHOST, master_port=port, timeout_s=10
