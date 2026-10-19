@@ -36,6 +36,11 @@ namespace kernels
 void invokeDwdpFabricGatherTma(void* const* dsts, void const* const* srcs, int64_t const* lines,
     int64_t const* rowStarts, int64_t rows, int64_t blocksPerRow, int64_t threads, cudaStream_t stream);
 
+//! Whether `device` can run the TMA variant: bulk copies and cluster launch need SM90+, and the stage
+//! ring needs its dynamic shared memory under the per-block opt-in limit.  Callers fall back to the
+//! register gather otherwise.
+bool dwdpFabricGatherTmaSupported(int device);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

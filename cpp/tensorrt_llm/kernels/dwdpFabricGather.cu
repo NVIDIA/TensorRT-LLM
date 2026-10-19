@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/dwdpFabricGather.h"
 #include "tensorrt_llm/kernels/dwdpFabricGatherTma.h"
 
@@ -114,17 +115,34 @@ bool gatherUsesTma()
 void invokeDwdpFabricGather(void* const* dsts, void const* const* srcs, int64_t const* lines, int64_t const* rowStarts,
     int64_t rows, int64_t blocksPerRow, int64_t threads, cudaStream_t stream)
 {
+    int dev = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
     if (gatherUsesTma())
     {
-        invokeDwdpFabricGatherTma(dsts, srcs, lines, rowStarts, rows, blocksPerRow, threads, stream);
-        return;
+        if (dwdpFabricGatherTmaSupported(dev))
+        {
+            invokeDwdpFabricGatherTma(dsts, srcs, lines, rowStarts, rows, blocksPerRow, threads, stream);
+            return;
+        }
+        static bool warned = false;
+        if (!warned)
+        {
+            TLLM_LOG_WARNING(
+                "dwdp_fabric_gather: TRTLLM_DWDP_GATHER_KERNEL=tma needs SM90+ and enough opt-in shared memory; "
+                "using the register gather on device %d",
+                dev);
+            warned = true;
+        }
     }
     TLLM_CHECK_WITH_INFO(threads > 0 && threads <= kMaxThreads,
         "dwdp_fabric_gather: threads must be in [1, %d], got %lld", kMaxThreads, static_cast<long long>(threads));
     dim3 const grid(static_cast<unsigned int>(blocksPerRow), static_cast<unsigned int>(rows));
     auto const* typedDsts = reinterpret_cast<uint4* const*>(dsts);
     auto const* typedSrcs = reinterpret_cast<uint4 const* const*>(srcs);
-    int const cluster = gatherClusterSize();
+    // Thread block clusters need SM90+; older devices take the plain launch.
+    int ccMajor = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&ccMajor, cudaDevAttrComputeCapabilityMajor, dev));
+    int const cluster = ccMajor >= 9 ? gatherClusterSize() : 1;
     cudaError_t err = cudaSuccess;
     if (cluster > 1 && blocksPerRow % cluster == 0)
     {

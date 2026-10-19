@@ -337,15 +337,31 @@ int gatherTmaClusterSize()
 }
 } // namespace
 
+bool dwdpFabricGatherTmaSupported(int device)
+{
+    int major = 0;
+    int smemOptin = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
+        || cudaDeviceGetAttribute(&smemOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
+    {
+        return false;
+    }
+    return major >= 9 && smemOptin >= kDynamicSmemBytes;
+}
+
 void invokeDwdpFabricGatherTma(void* const* dsts, void const* const* srcs, int64_t const* lines,
     int64_t const* rowStarts, int64_t rows, int64_t blocksPerRow, int64_t threads, cudaStream_t stream)
 {
     auto* const kernel = &dwdpFabricGatherTmaKernel;
 
+    int dev = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
+    TLLM_CHECK_WITH_INFO(dwdpFabricGatherTmaSupported(dev),
+        "dwdp_fabric_gather (tma) needs SM90+ and %d bytes of opt-in shared memory per block", kDynamicSmemBytes);
+
     // Opt in to more than 48 KB of dynamic shared memory, once per device.
     static bool attrSet[kMaxDevices] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < kMaxDevices && !attrSet[dev])
+    if (dev >= 0 && dev < kMaxDevices && !attrSet[dev])
     {
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmemBytes));
         attrSet[dev] = true;
