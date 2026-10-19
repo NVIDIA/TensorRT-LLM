@@ -34,6 +34,9 @@ _CKPT = dict(
     k_layout="qkv_slice",
     table_layout="dense",
     hole=None,
+    # Heads of further columns after v in each row: 27 is the target's fused input
+    # projection row [q | k | v | gate | index | pad] (55 heads of 256).
+    row_pad_heads=0,
     values="randn",
 )
 
@@ -137,6 +140,14 @@ class QsaPagedKvStore(OpWrapper):
         Cell(
             why="fp16 rows into a bf16 pool: one conversion",
             spec=_spec(((0, 1), (1, 1), (2, 1), (3, 1)), pages=8, row_dtype=torch.float16),
+        ),
+        Cell(
+            why="decode: k/v as head slices of the fused projection row (row stride 14080)",
+            spec=_spec(_DECODE, pages=64, row_pad_heads=27),
+        ),
+        Cell(
+            why="prefill 1024 rows off the fused projection row (row stride 14080)",
+            spec=_spec(((0, 256),) * 4, pages=160, row_pad_heads=27),
         ),
         Cell(
             why="head-major rows: k/v last-dim stride != 1",
