@@ -326,6 +326,8 @@ class KVCacheLayerSpec:
         if any(role in scale_roles for role in self.buffer_roles) and self.dtype != DataType.NVFP4:
             raise ValueError("block-scale roles require NVFP4 KV-cache dtype")
         if self.dtype == DataType.NVFP4:
+            if self.head_dim % 2 != 0:
+                raise ValueError(f"NVFP4 head_dim must be even, got {self.head_dim}")
             expected_scale_roles = {Role.KEY_BLOCK_SCALE}
             if Role.VALUE in self.buffer_roles:
                 expected_scale_roles.add(Role.VALUE_BLOCK_SCALE)

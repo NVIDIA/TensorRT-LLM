@@ -85,6 +85,19 @@ MAX_SEQ_LEN = 16
 
 
 @pytest.mark.cpu_only
+def test_nvfp4_layer_spec_rejects_odd_head_dim() -> None:
+    with pytest.raises(ValueError, match="NVFP4 head_dim must be even"):
+        KVCacheLayerSpec(
+            global_layer_id=0,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.NVFP4,
+            num_kv_heads=16,
+            head_dim=1,
+            buffer_roles=(Role.KEY, Role.KEY_BLOCK_SCALE),
+        )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "prompt,rewind,ordinal,window,sinks,expected",
     [
