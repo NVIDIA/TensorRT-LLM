@@ -3,7 +3,7 @@
 import json
 import math
 import re
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -19,7 +19,7 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 # vllm/tool_parsers/utils.py), so the same model output yields the same
 # arguments from both servers.
 
-_TYPE_ALIASES: Dict[str, str] = {
+_TYPE_ALIASES: dict[str, str] = {
     "str": "string",
     "text": "string",
     "varchar": "string",
@@ -48,6 +48,10 @@ _TYPE_ALIASES: Dict[str, str] = {
 # The order in which the types a parameter accepts are tried.
 _TYPE_PRIORITY = ("null", "integer", "number", "boolean", "object", "array", "string")
 
+# A parameter's opening tag, and the start of one that may be cut short.
+_PARAMETER_OPENING_TAG = re.compile(r"<\s*parameter\s*=\s*([^>]*)>")
+_PARAMETER_TAG_START = re.compile(r"<\s*parameter\s*=")
+
 
 def _trim_wrapping_newlines(value: str) -> str:
     """Strip the one newline the chat template puts on each side of a value."""
@@ -58,7 +62,15 @@ def _trim_wrapping_newlines(value: str) -> str:
     return value
 
 
-def _extract_types_from_schema(schema: Any) -> List[str]:
+def _strip_function_end(text: str) -> str:
+    """Drop the ``</function>`` tag that closes a function body, if it does."""
+    stripped = text.rstrip()
+    if stripped.endswith("</function>"):
+        return stripped[: -len("</function>")]
+    return text
+
+
+def _extract_types_from_schema(schema: Any) -> list[str]:
     """Return every JSON Schema type a parameter accepts.
 
     Reads ``type`` (a string or a list), infers types from ``enum`` values and
@@ -111,7 +123,7 @@ def _is_json_finite(value: Any) -> bool:
         return False
 
 
-def _coerce_to_schema_type(value: str, schema_type: Union[str, List[str]]) -> Any:
+def _coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     """Convert a raw parameter value to the first accepted type it parses as.
 
     Types are tried in the order null, integer, number, boolean, object, array,
@@ -185,8 +197,11 @@ class Qwen3CoderToolParser(BaseToolParser):
         self.tool_call_regex = re.compile(
             r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
         )
+        # A function's body ends at the </function> that is followed by the next
+        # function or by the end of the tool call, so a value that contains
+        # "</function>" stays whole. Without </function> the body runs to the end.
         self.tool_call_function_regex = re.compile(
-            r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
+            r"<function=([^>]*)>(.*?)(?:</function>\s*(?=<function=|\Z)|\Z)", re.DOTALL
         )
         # A parameter ends at its closing tag or, when the model leaves that
         # out, at the next parameter tag.
@@ -198,8 +213,8 @@ class Qwen3CoderToolParser(BaseToolParser):
 
         # Streaming state variables
         self._current_function_name: str = ""
-        self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[
+        self._current_parameters: dict[str, Any] = {}
+        self._streamed_parameters: dict[
             str, str
         ] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
@@ -208,14 +223,14 @@ class Qwen3CoderToolParser(BaseToolParser):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
         self._buf += new_text
         normal = ""
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
         # Build tool indices for validation
         if not hasattr(self, "_tool_indices"):
@@ -303,6 +318,13 @@ class Qwen3CoderToolParser(BaseToolParser):
                 # Check if tool call is complete
                 if self.tool_call_end_token in self._buf:
                     end_pos = self._buf.find(self.tool_call_end_token)
+                    # The function body is complete, so a last parameter with
+                    # no closing tag can now end with it.
+                    calls.extend(
+                        self._parse_and_stream_parameters(
+                            _strip_function_end(self._buf[:end_pos]), param_config, final=True
+                        )
+                    )
 
                     # Add closing brace to complete the JSON object
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
@@ -334,8 +356,8 @@ class Qwen3CoderToolParser(BaseToolParser):
         return StreamingParseResult(normal_text=normal, calls=calls)
 
     def _parse_and_stream_parameters(
-        self, text_to_parse: str, param_config: dict
-    ) -> List[ToolCallItem]:
+        self, text_to_parse: str, param_config: dict, final: bool = False
+    ) -> list[ToolCallItem]:
         """Parse complete parameter blocks from text and return any tool call items to emit.
 
         This method:
@@ -346,23 +368,21 @@ class Qwen3CoderToolParser(BaseToolParser):
 
         Args:
             text_to_parse: The text to search for parameter blocks
+            param_config: The parameter schemas of the current tool
+            final: Whether ``text_to_parse`` is the whole function body, so a
+                last parameter with no closing tag ends where it ends
 
         Returns:
             List of ToolCallItem objects to emit (may be empty)
         """
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
-        # Find all complete parameter patterns
-        param_matches = list(self.tool_call_parameter_regex.finditer(text_to_parse))
-
-        # Build new parameters dictionary
-        new_params = {}
-        for match in param_matches:
-            param_name = match.group(1)
-            param_value = _trim_wrapping_newlines(match.group(2))
-            new_params[param_name] = self._convert_param_value(
-                param_value, param_name, param_config, self._current_function_name
-            )
+        new_params = {
+            name: self._convert_param_value(value, name, param_config, self._current_function_name)
+            for name, value in self._parameter_values(
+                text_to_parse, self._current_function_name, final
+            ).items()
+        }
 
         # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
@@ -428,9 +448,9 @@ class Qwen3CoderToolParser(BaseToolParser):
         self._streamed_parameters = {}
         self.current_tool_name_sent = False
 
-    def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+    def _extract(self, text: str, tools: list[Tool]) -> tuple[str, list[ToolCallItem]]:
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         cursor = 0
         while True:
             s = text.find(self.tool_call_start_token, cursor)
@@ -442,25 +462,21 @@ class Qwen3CoderToolParser(BaseToolParser):
             if e == -1:
                 normal_parts.append(text[s:])
                 break
-            block = text[s : e + len(self.tool_call_end_token)]
+            # Without </tool_call>, a function missing </function> ends where
+            # the tool call does.
+            block = text[s:e]
             cursor = e + len(self.tool_call_end_token)
             calls.extend(self._parse_block(block, tools))
         return "".join(normal_parts), calls
 
-    def _parse_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
-        res: List[ToolCallItem] = []
-        for m in self.tool_call_function_regex.findall(block):
-            txt = m[0] if m[0] else m[1]
-            if ">" not in txt:
-                continue
-            idx = txt.index(">")
-            fname = txt[:idx].strip()
-            body = txt[idx + 1 :]
-            params: Dict[str, Any] = {}
+    def _parse_block(self, block: str, tools: list[Tool]) -> list[ToolCallItem]:
+        res: list[ToolCallItem] = []
+        for function_match in self.tool_call_function_regex.finditer(block):
+            fname = function_match.group(1).strip()
+            body = function_match.group(2)
+            params: dict[str, Any] = {}
             param_config = self._get_arguments_config(fname, tools)
-            for pm in self.tool_call_parameter_regex.finditer(body):
-                pname = pm.group(1)
-                pval = _trim_wrapping_newlines(pm.group(2))
+            for pname, pval in self._parameter_values(body, fname, final=True).items():
                 params[pname] = self._convert_param_value(pval, pname, param_config, fname)
             res.append(
                 ToolCallItem(
@@ -470,6 +486,36 @@ class Qwen3CoderToolParser(BaseToolParser):
                 )
             )
         return res
+
+    def _parameter_values(self, body: str, func_name: str, final: bool) -> dict[str, str]:
+        """Return the raw value of each parameter in ``body``, in the order written.
+
+        A value ends at its closing tag or at the next parameter's opening tag.
+        When ``final`` is set, ``body`` is the whole function body, so a last
+        parameter whose closing tag is missing ends where the body ends.
+        """
+        values = {}
+        end = 0
+        for match in self.tool_call_parameter_regex.finditer(body):
+            values[match.group(1)] = _trim_wrapping_newlines(match.group(2))
+            end = match.end()
+        if not final:
+            return values
+
+        tail = body[end:]
+        opening = _PARAMETER_OPENING_TAG.search(tail)
+        if opening:
+            name = opening.group(1)
+            values[name] = _trim_wrapping_newlines(tail[opening.end() :])
+            logger.warning(
+                f"Parameter '{name}' of tool '{func_name}' has no closing </parameter> tag; "
+                "its value runs to the end of the function."
+            )
+        elif _PARAMETER_TAG_START.search(tail):
+            logger.warning(
+                f"Dropping a parameter of tool '{func_name}' whose opening tag is incomplete."
+            )
+        return values
 
     def supports_structural_tag(self) -> bool:
         return False

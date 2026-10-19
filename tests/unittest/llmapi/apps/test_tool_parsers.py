@@ -1872,6 +1872,100 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert type(value) is type(expected)
         assert streamed == whole.calls[0].parameters
 
+    @pytest.mark.parametrize("function_end", ["</function>\n", ""])
+    def test_unterminated_last_parameter_ends_with_function(
+            self, parser, function_end):
+        """A last parameter with no closing tag runs to the end of the function.
+
+        This holds whole and streamed alike, also when </function> is missing,
+        and a warning names the parameter.
+        """
+        from unittest.mock import patch
+
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "integer"
+                        },
+                        "b": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("\n<function=f>\n<parameter=a>\n1\n</parameter>\n"
+                "<parameter=b>\nnever closed\n" + function_end)
+        logger_path = "tensorrt_llm.serve.tool_parser.qwen3_coder_parser.logger"
+
+        with patch(logger_path) as mock_logger:
+            whole = parser.detect_and_parse(
+                "<tool_call>" + body + "</tool_call>", [tool])
+        assert json.loads(whole.calls[0].parameters) == {
+            "a": 1,
+            "b": "never closed"
+        }
+        assert mock_logger.warning.call_count == 1
+        assert "'b'" in mock_logger.warning.call_args.args[0]
+
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        with patch(logger_path) as mock_logger:
+            for delta in deltas:
+                for call in streaming_parser.parse_streaming_increment(
+                        delta, [tool]).calls:
+                    streamed += call.parameters or ""
+        assert streamed == whole.calls[0].parameters
+        assert mock_logger.warning.call_count == 1
+        assert "'b'" in mock_logger.warning.call_args.args[0]
+
+    def test_value_containing_function_tags_stays_whole(self, parser):
+        """Function tags inside a closed value are part of the value."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string"
+                        },
+                        "n": {
+                            "type": "integer"
+                        },
+                    },
+                },
+            ),
+        )
+        code = 'print("</function>", "<function=g>")'
+        body = (f"\n<function=f>\n<parameter=code>\n{code}\n</parameter>\n"
+                "<parameter=n>\n2\n</parameter>\n</function>\n")
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        for delta in deltas:
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        assert [call.name for call in whole.calls] == ["f"]
+        assert json.loads(whole.calls[0].parameters) == {"code": code, "n": 2}
+        assert streamed == whole.calls[0].parameters
+
 
 # ============================================================================
 # DeepSeek Parser Tests
