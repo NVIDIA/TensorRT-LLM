@@ -41,6 +41,8 @@ def _compare(
 PAD_SLOT_ID = -1
 #: Rows of prefill ahead of the decode rows in the mixed-batch cell.
 _PREFILL_ROWS = 37
+#: Columns past q|k|v in the target's one GDN input-projection output: z | a | b.
+_IN_PROJ_TAIL = 6144 + 2 * 48
 
 
 def _build(spec, seed):
@@ -59,6 +61,10 @@ def _build(spec, seed):
     elif x_form == "2d_row_slice":
         extras["buf"] = randn(_PREFILL_ROWS + batch, dim)
         x = extras["buf"][_PREFILL_ROWS:]
+    elif x_form == "2d_in_proj":
+        extras["buf"] = randn(_PREFILL_ROWS + batch, dim + _IN_PROJ_TAIL)
+        x = extras["buf"][_PREFILL_ROWS:, :dim]
+        assert x.stride() == (dim + _IN_PROJ_TAIL, 1)
     elif x_form == "token_major":
         x = randn(batch, seqlen, dim).transpose(1, 2)
         assert x.stride() == (seqlen * dim, 1, dim)
@@ -91,7 +97,7 @@ def _run(args, extras):
     got = list(args)
     if "buf" in extras:
         got_buf = extras["buf"].clone()
-        got[0] = got_buf[_PREFILL_ROWS:]
+        got[0] = got_buf[_PREFILL_ROWS:, : args[0].shape[1]]
     else:
         got[0] = args[0].clone()
     if "wide" in extras:
@@ -103,6 +109,8 @@ def _run(args, extras):
     assert returned is got[0], "returns the x it was handed"
     if "buf" in extras:
         assert torch.equal(got_buf[:_PREFILL_ROWS], extras["buf"][:_PREFILL_ROWS])
+        dim = args[0].shape[1]
+        assert torch.equal(got_buf[:, dim:], extras["buf"][:, dim:]), "columns past x written"
     if "wide" in extras:
         assert torch.equal(got_wide[:, :, 1::2], extras["wide"][:, :, 1::2])
     return returned, got[1]
@@ -179,3 +187,27 @@ def test_op_rejects_every_metadata_violation_loudly(case: str) -> None:
     with pytest.raises(RuntimeError, match=fragment.replace("(", r"\(").replace(")", r"\)")):
         with validating(op):
             op(*args)
+
+
+@pytest.mark.parametrize("rows", [64, 121, 128])
+def test_decode_rows_match_the_trtllm_kernel_bitwise(rows: int) -> None:
+    """From 64 rows the decode shape runs the CuTe kernel: x and the whole pool
+    bitwise what `torch.ops.trtllm.causal_conv1d_update` leaves, a pad row untouched.
+    x is the q|k|v column view of an in_proj output; the pool a per-layer view of a
+    two-layer buffer, as the engine hands both over."""
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    dim = 10240
+    proj = torch.randn(rows, dim + _IN_PROJ_TAIL, generator=g, device="cuda").to(torch.bfloat16)
+    pool = torch.randn(ENGINE_SLOTS, 2, dim, 3, generator=g, device="cuda").to(torch.bfloat16)[:, 1]
+    weight = (torch.randn(dim, 4, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+    slots = (torch.randperm(ENGINE_SLOTS, generator=g, device="cuda")[:rows]).to(torch.int32)
+    slots[rows // 3] = PAD_SLOT_ID
+    x_ref, pool_ref = proj.clone(), pool.clone()
+    torch.ops.trtllm.causal_conv1d_update(
+        x_ref[:, :dim].unsqueeze(-1), pool_ref, weight, None, True, None, slots, PAD_SLOT_ID
+    )
+    x_got, pool_got = proj.clone(), pool.clone()
+    op(x_got[:, :dim], pool_got, weight, None, True, None, slots, PAD_SLOT_ID)
+    assert torch.equal(x_got, x_ref), "x differs from the TRT-LLM kernel"
+    assert torch.equal(pool_got, pool_ref), "the pool differs from the TRT-LLM kernel"
+    assert torch.equal(x_got[rows // 3], proj[rows // 3]), "the pad row was written"

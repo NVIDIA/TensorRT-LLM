@@ -20,8 +20,10 @@ from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
 )
 
 #: The GDN mixer's packed `[q|k|v]` width for this checkpoint; the target hands
-#: the whole row to this op.
+#: this op the `[q|k|v]` column view of its one input-projection output.
 GDN_MIXED_QKV_WIDTH = 10240
+#: That output's width: `[q|k|v | z | a | b]` = 10240 + 6144 + 48 + 48.
+GDN_IN_PROJ_WIDTH = 16480
 
 
 class ExtractTransposePrefillSlice(OpWrapper):
@@ -88,6 +90,21 @@ class ExtractTransposePrefillSlice(OpWrapper):
                     width=GDN_MIXED_QKV_WIDTH,
                     dtype=torch.bfloat16,
                 ),
+            ),
+            *(
+                Cell(
+                    why=f"GDN prefill, the q|k|v column view of the in_proj, {n} tokens",
+                    spec=dict(
+                        num_rows=n,
+                        num_cols=GDN_IN_PROJ_WIDTH,
+                        col_slice=(0, GDN_MIXED_QKV_WIDTH),
+                        n=n,
+                        start_col=0,
+                        width=GDN_MIXED_QKV_WIDTH,
+                        dtype=torch.bfloat16,
+                    ),
+                )
+                for n in (33, 8192)
             ),
             Cell(
                 why="column-slice view: row stride wider than the extracted width",

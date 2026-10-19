@@ -61,6 +61,9 @@ def _compare(
 DEV = "cuda"
 NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 16, 48, 128, 128
 MIXED_QKV_WIDTH = 2 * NUM_K_HEADS * HEAD_K_DIM + NUM_V_HEADS * HEAD_V_DIM  # 10240
+#: The target's one GDN input-projection output: [q|k|v | z | a | b], 16480 wide.
+IN_PROJ_A = MIXED_QKV_WIDTH + NUM_V_HEADS * HEAD_V_DIM  # 16384
+IN_PROJ_WIDTH = IN_PROJ_A + 2 * NUM_V_HEADS
 SOFTPLUS_BETA, SOFTPLUS_THRESHOLD = 1.0, 20.0
 _LAYERS = 3
 _TAIL = 5
@@ -84,7 +87,11 @@ def _build(spec, seed):
     seq_lens = spec["seq_lens"]
     total = sum(seq_lens)
     layout = spec.get("layout", "varlen")
-    mixed = torch.randn(total, MIXED_QKV_WIDTH, generator=g, device=DEV, dtype=torch.bfloat16)
+    if spec.get("ab") == "in_proj":
+        proj = torch.randn(total, IN_PROJ_WIDTH, generator=g, device=DEV, dtype=torch.bfloat16)
+        mixed = proj[:, :MIXED_QKV_WIDTH]
+    else:
+        mixed = torch.randn(total, MIXED_QKV_WIDTH, generator=g, device=DEV, dtype=torch.bfloat16)
     kd = NUM_K_HEADS * HEAD_K_DIM
     q = mixed[:, :kd].view(1, total, NUM_K_HEADS, HEAD_K_DIM)
     k = mixed[:, kd : 2 * kd].view(1, total, NUM_K_HEADS, HEAD_K_DIM)
@@ -93,7 +100,11 @@ def _build(spec, seed):
         for t in (q, k):
             tf = t.float()
             t.copy_(tf / (tf.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6))
-    if spec.get("ab", "packed") == "separate":
+    if spec.get("ab") == "in_proj":
+        a = proj[:, IN_PROJ_A : IN_PROJ_A + NUM_V_HEADS]
+        b = proj[:, IN_PROJ_A + NUM_V_HEADS :]
+        assert mixed.stride(0) == a.stride(0) == b.stride(0) == IN_PROJ_WIDTH
+    elif spec.get("ab", "packed") == "separate":
         a = torch.randn(total, NUM_V_HEADS, generator=g, device=DEV, dtype=torch.bfloat16)
         b = torch.randn(total, NUM_V_HEADS, generator=g, device=DEV, dtype=torch.bfloat16)
     else:

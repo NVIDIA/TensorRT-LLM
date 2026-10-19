@@ -72,7 +72,8 @@ class CausalConv1dTritonUpdate(OpWrapper):
 
     # spec keys: dim, width (4), state_len (pool columns, 3), seqlen (2), batch,
     # pool_slots, slots ("random" | tuple | None), dtype, bias, activation
-    # ("silu"), pad_slot_id, x_form ("token_major" | "contiguous" | "2d"),
+    # ("silu"), pad_slot_id, x_form ("token_major" | "in_proj" (token_major
+    # over the q|k|v columns of a [n * p, 16480] projection) | "contiguous" | "2d"),
     # snapshots (rows of the snapshot buffer, or 0 for none), snapshot_steps
     # (the buffer's step depth, default seqlen), accepted, launch_dependent_kernels.
     CELLS: tuple[Cell, ...] = (
@@ -115,6 +116,21 @@ class CausalConv1dTritonUpdate(OpWrapper):
                     snapshot_steps=8,
                 ),
             ),
+        )
+        + tuple(
+            Cell(
+                why=f"verify, x over the [n*p, 16480] in_proj, batch {batch}, {seqlen} tok/row",
+                spec=dict(
+                    dim=CKPT_DIM,
+                    batch=batch,
+                    seqlen=seqlen,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_pinned(batch),
+                    snapshots=ENGINE_SNAPSHOT_ROWS,
+                    x_form="in_proj",
+                ),
+            )
+            for batch, seqlen in ((1, 2), (32, 3))
         )
         + tuple(
             Cell(

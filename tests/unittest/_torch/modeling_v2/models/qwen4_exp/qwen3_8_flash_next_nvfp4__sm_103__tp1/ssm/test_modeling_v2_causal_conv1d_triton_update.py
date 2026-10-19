@@ -61,6 +61,12 @@ def _build(spec, seed):
         x = randn(batch, dim)
     elif x_form == "contiguous":
         x = randn(batch, dim, seqlen)
+    elif x_form == "in_proj":
+        # The call site under the one input GEMM: the q|k|v columns of an
+        # [n * p, C + 6240] projection, reshaped [n, p, C] and seen as [n, C, p].
+        wide = dim + 6144 + 2 * 48
+        x = randn(batch * seqlen, wide)[:, :dim].reshape(batch, seqlen, dim).transpose(1, 2)
+        assert x.stride() == (seqlen * wide, 1, wide)
     else:  # the call site: an [n, p, C] block seen as [n, C, p]
         x = randn(batch, seqlen, dim).transpose(1, 2)
     conv_state = randn(spec["pool_slots"], dim, state_len)
