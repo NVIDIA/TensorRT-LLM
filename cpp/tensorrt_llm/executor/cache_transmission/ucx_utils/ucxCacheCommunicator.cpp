@@ -49,6 +49,7 @@ namespace tensorrt_llm::executor::kv_cache
 {
 
 constexpr int64_t kMaxUcxCmMessageBytes = 64 * 1024;
+constexpr int kUcxCmRequestTimeoutMs = 30000;
 
 class UcxCmMessage
 {
@@ -449,6 +450,10 @@ UcxConnectionManager::UcxConnectionManager()
                                 || (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS
                                     && ucxCmessage.mWorkerAddress.has_value()),
                             "Invalid UCX connection message");
+                        if (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS)
+                        {
+                            addConnection(ucxCmessage.mWorkerAddress.value());
+                        }
                     }
                     catch (std::exception const& e)
                     {
@@ -460,16 +465,12 @@ UcxConnectionManager::UcxConnectionManager()
 
                     if (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS)
                     {
-                        // add Connection
-                        TLLM_CHECK_WITH_INFO(ucxCmessage.mWorkerAddress.has_value(), "workerAddress is null");
-                        std::string workerAddress = ucxCmessage.mWorkerAddress.value();
                         std::string selfWorkerAddress = mWorkerAddress;
                         UcxCmMessage serverMessage(UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS, selfWorkerAddress);
                         std::ostringstream oStream;
                         UcxCmMessage::serialize(serverMessage, oStream);
                         std::string serverMessageStr = oStream.str();
                         mZmqRepSocket.send(zmq::buffer(serverMessageStr), zmq::send_flags::none);
-                        addConnection(workerAddress);
                     }
                     else if (ucxCmessage.mType == UcxCmMessage::MessageType::STOP)
                     {
@@ -589,15 +590,24 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
             reqSocket.set(zmq::sockopt::ipv6, 1);
             reqSocket.set(zmq::sockopt::maxmsgsize, kMaxUcxCmMessageBytes);
+            reqSocket.set(zmq::sockopt::sndtimeo, kUcxCmRequestTimeoutMs);
+            reqSocket.set(zmq::sockopt::rcvtimeo, kUcxCmRequestTimeoutMs);
+            // Discard pending messages when a failed exchange destroys this per-request socket.
+            reqSocket.set(zmq::sockopt::linger, 0);
             reqSocket.connect(build_zmq_endpoint(ip, port));
             UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
             std::ostringstream oStream;
             UcxCmMessage::serialize(getWorkerAddressMessage, oStream);
             std::string getWorkerAddressMessageStr = oStream.str();
-            reqSocket.send(zmq::buffer(getWorkerAddressMessageStr), zmq::send_flags::none);
+            TLLM_CHECK_WITH_INFO(getWorkerAddressMessageStr.size() <= kMaxUcxCmMessageBytes,
+                "Serialized UCX connection request exceeds the maximum size");
+            auto const sent = reqSocket.send(zmq::buffer(getWorkerAddressMessageStr), zmq::send_flags::none);
+            TLLM_CHECK_WITH_INFO(
+                sent, "Timed out sending UCX connection request to %s:%u", ip.c_str(), static_cast<unsigned>(port));
             zmq::message_t reply;
             auto ret = reqSocket.recv(reply);
-            TLLM_CHECK_WITH_INFO(ret, "zmq socket.recv failed");
+            TLLM_CHECK_WITH_INFO(
+                ret, "Timed out waiting for UCX connection reply from %s:%u", ip.c_str(), static_cast<unsigned>(port));
             std::string replyStr(static_cast<char*>(reply.data()), reply.size());
             std::istringstream is(replyStr);
             UcxCmMessage serverMessage = UcxCmMessage::deserialize(is);
