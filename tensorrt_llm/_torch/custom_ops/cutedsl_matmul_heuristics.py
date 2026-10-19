@@ -15,9 +15,10 @@ ranking so callers fall back to the full tactic list and never regress.
 """
 
 import ctypes
+import importlib.metadata
 import re
 from functools import lru_cache
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from typing import Callable, Iterable, List, NamedTuple, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -28,6 +29,20 @@ try:
 except (ImportError, OSError):
     _nvmmh = None
     IS_NVMMH_AVAILABLE = False
+
+
+@lru_cache(maxsize=1)
+def nvmmh_library_version() -> str:
+    """Return the installed nvMatmulHeuristics distribution version.
+
+    Rankings change between wheels, so callers include this in persistent
+    tactic-search cache keys.
+    """
+    try:
+        return importlib.metadata.version("nvidia-matmul-heuristics")
+    except importlib.metadata.PackageNotFoundError:
+        return getattr(_nvmmh, "__version__", "unknown")
+
 
 # NVFP4 dense GEMM precision/layout for nvMatmulHeuristics, fixed to the
 # CuteDSLNVFP4BlackwellRunner kernel: A/B are Float4E2M1FN (fp4), the output is
@@ -55,11 +70,6 @@ BF16_LAYOUT = "TN_ROW_MAJOR"
 FP8_BF16_OUTPUT_PRECISION = "QQTST"
 FP8_FP16_OUTPUT_PRECISION = "QQHSH"
 FP8_LAYOUT = "TN_ROW_MAJOR"
-
-# nvMatmulHeuristics often recommends non-power-of-two split counts. The BF16
-# filter accepts model-recommended values through this conservative cap after a
-# successful query; get_valid_tactics itself remains unchanged.
-BF16_MAX_HEURISTIC_SPLIT_K = 8
 
 # Rubin's native split-K scheduler currently requires more than 20 K tiles per
 # split. That lower bound hides useful split factors for the relatively small-K
@@ -119,11 +129,11 @@ class HeuristicConfig(NamedTuple):
 def nvmmh_cta_order_to_cute_raster(cta_order: int) -> str:
     """Translate CUTLASS3 nvMMH CTA order to CuTe's raster name.
 
-    CUTLASS's nvMMH adapter maps order 0 to ``along_m`` and order 1 to
-    ``along_n`` (python/cutlass_library/heuristics_provider.py in CUTLASS,
-    see https://github.com/NVIDIA/cutlass/blob/main/python/cutlass_library/heuristics_provider.py#L222).
-    Keep this conversion at the adapter boundary because the public nvMMH
-    header's row/column wording differs from this CUTLASS3 mapping.
+    Order 0 is ``AlongM`` and order 1 is ``AlongN``, as in CUTLASS's nvMMH
+    provider (https://github.com/NVIDIA/cutlass/blob/78e46228a1bfc5c972e2f9a634223af784cd6949/python/cutlass_library/heuristics_provider.py#L222)
+    and nvMMH's own CUTLASS swizzler model. Keep this conversion at the
+    adapter boundary because the public nvMMH header's row/column wording
+    differs from this CUTLASS3 mapping.
     """
     if cta_order == 0:
         return "m"
@@ -139,21 +149,6 @@ def cute_raster_to_nvmmh_cta_order(raster_along: str) -> int:
     if raster_along == "n":
         return 1
     raise ValueError(f"Unsupported CuTe raster {raster_along!r}; expected 'm' or 'n'")
-
-
-def _pin_split_k_to_rank1(
-    ranked_configs: List[HeuristicConfig],
-) -> List[HeuristicConfig]:
-    """Use rank-1 split-K for every precision while preserving other fields."""
-    if not ranked_configs:
-        return ranked_configs
-
-    rank1_split_k = max(1, int(ranked_configs[0].split_k))
-    pinned = [
-        config if int(config.split_k) == rank1_split_k else config._replace(split_k=rank1_split_k)
-        for config in ranked_configs
-    ]
-    return list(dict.fromkeys(pinned))
 
 
 @lru_cache(maxsize=None)
@@ -293,6 +288,38 @@ def _extract_config(config) -> Optional[HeuristicConfig]:
     return HeuristicConfig(cta, cluster, max(1, swizzle), cta_order, max(1, split_k))
 
 
+def _set_tile_validity_check(interface, backend, tiles: frozenset) -> None:
+    """Restrict a backend's search to the per-CTA tiles a runner can launch.
+
+    NVMMH calls the check for every candidate it would otherwise rank. Without
+    it the model can spend its whole ranking on tiles the CuTe DSL kernel does
+    not implement (e.g. CTA_M=64 on block-scaled Rubin GEMMs), and the caller
+    then falls back to the full sweep. Clusters stay unrestricted: runners
+    either materialize model clusters or substitute legal ones per tile.
+    """
+
+    def admit(config) -> int:
+        return int((int(config.cta[0]), int(config.cta[1])) in tiles)
+
+    def admit_pointer(config_ptr, _problem_ptr) -> int:
+        return admit(config_ptr.contents)
+
+    set_callback = getattr(interface, "backendSetCallbackProperty", None)
+    callback = admit
+    if set_callback is None:
+        # nvMatmulHeuristics 0.1.0.27 spells it setBackendCallbackProperty and
+        # passes a configuration pointer plus an unused problem pointer.
+        set_callback = getattr(interface, "setBackendCallbackProperty", None)
+        callback = admit_pointer
+    if set_callback is None:
+        raise AttributeError("nvMatmulHeuristics interface cannot set a validity callback")
+    set_callback(
+        backend,
+        _nvmmh.NvMatmulHeuristicsBackendPropertyCallbackKind.KERNEL_ADDITIONAL_VALIDITY_CHECK,
+        callback,
+    )
+
+
 def rank_configs(
     m: int,
     n: int,
@@ -301,13 +328,22 @@ def rank_configs(
     count: int,
     layout_name: str = NVFP4_LAYOUT,
     split_k_kind: Optional[str] = None,
+    batch_size: int = 1,
+    tiles: Optional[Iterable[Tuple[int, int]]] = None,
 ) -> List[HeuristicConfig]:
     """Return up to ``count`` HeuristicConfig entries ranked best-first.
 
-    Every returned precision uses the first parsed rank's split-K value. Returns
-    an empty list if heuristics are unavailable or the query fails, so
-    callers can fall back to their full tactic list.
+    Each entry retains its own model-recommended split-K value. Returns an
+    empty list if heuristics are unavailable or the query fails, so callers
+    can fall back to their full tactic list. In-place queries preserve the
+    backend's native split-K search range.
+
+    ``tiles`` lists the per-CTA (M, N) tiles the caller can launch. When
+    given, the model only ranks configurations with one of those tiles.
     """
+    tiles = None if tiles is None else frozenset((int(m_), int(n_)) for m_, n_ in tiles)
+    if tiles is not None and not tiles:
+        return []
     interface = _get_interface(precision)
     if interface is None:
         return []
@@ -320,19 +356,45 @@ def rank_configs(
             interface.loadInternalDiscoverySet(layout, None)
         except Exception as e:  # noqa: BLE001 - discovery data is optional
             logger.debug(f"[nvMatmulHeuristics] loadInternalDiscoverySet skipped: {e}")
-        if split_k_kind is None:
-            configs = interface.get_with_mnk(int(m), int(n), int(k), layout, int(count), None)
+
+        def _method(*names):
+            """Resolve a supported method name across NVMMH Python API versions."""
+            for name in names:
+                method = getattr(interface, name, None)
+                if method is not None:
+                    return method
+            raise AttributeError(f"nvMatmulHeuristics interface has none of {names!r}")
+
+        if split_k_kind is None and batch_size == 1 and tiles is None:
+            get_with_mnk = getattr(interface, "get_with_mnk", None)
+            if get_with_mnk is not None:
+                configs = get_with_mnk(int(m), int(n), int(k), layout, int(count), None)
+            else:
+                configs = _method("getWithMNK")((int(m), int(n), int(k)), layout, int(count))
+        elif split_k_kind is None:
+            backend = _method("createBackend", "create_backend")(
+                _nvmmh.NvMatmulHeuristicsTarget.CUTLASS3
+            )
+            try:
+                if tiles is not None:
+                    _set_tile_validity_check(interface, backend, tiles)
+                make_problem = _method(
+                    "makeNvMatmulHeuristicsProblem", "make_nv_matmul_heuristics_problem"
+                )
+                try:
+                    problem = make_problem(
+                        (int(m), int(n), int(k)), layout, batch_size=int(batch_size)
+                    )
+                except TypeError:
+                    problem = make_problem(
+                        int(m), int(n), int(k), layout, batch_size=int(batch_size)
+                    )
+                configs = _method("getEx", "get_ex")(problem, int(count), backend)
+            finally:
+                _method("destroyBackend", "destroy_backend")(backend)
         else:
             if split_k_kind != IN_PLACE_SPLIT_K_KIND:
                 raise ValueError(f"Unsupported nvMatmulHeuristics split-K kind {split_k_kind!r}")
-
-            def _method(*names):
-                """Resolve a supported method name across NVMMH Python API versions."""
-                for name in names:
-                    method = getattr(interface, name, None)
-                    if method is not None:
-                        return method
-                raise AttributeError(f"nvMatmulHeuristics interface has none of {names!r}")
 
             backend = None
             try:
@@ -361,14 +423,20 @@ def rank_configs(
                         ctypes.byref(property_buffer),
                         ctypes.sizeof(property_buffer),
                     )
+                if tiles is not None:
+                    _set_tile_validity_check(interface, backend, tiles)
                 make_problem = _method(
                     "makeNvMatmulHeuristicsProblem", "make_nv_matmul_heuristics_problem"
                 )
                 try:
-                    problem = make_problem((int(m), int(n), int(k)), layout, batch_size=1)
+                    problem = make_problem(
+                        (int(m), int(n), int(k)), layout, batch_size=int(batch_size)
+                    )
                 except TypeError:
                     # Older wheels take M, N, and K as separate arguments.
-                    problem = make_problem(int(m), int(n), int(k), layout, batch_size=1)
+                    problem = make_problem(
+                        int(m), int(n), int(k), layout, batch_size=int(batch_size)
+                    )
                 get_ex = _method("getEx", "get_ex")
                 configs = get_ex(problem, int(count), backend)
             finally:
@@ -377,7 +445,8 @@ def rank_configs(
     except Exception as e:  # noqa: BLE001 - any failure must degrade gracefully
         logger.warning_once(
             f"[nvMatmulHeuristics] Query failed for "
-            f"precision={precision}, mnk=({m},{n},{k}), "
+            f"precision={precision}, mnk=({m},{n},{k}), batch_size={batch_size}, "
+            f"tiles={None if tiles is None else sorted(tiles)}, "
             f"split_k_kind={split_k_kind}: {e}. "
             f"Falling back to full tactic list.",
             key="nvmmh_query_failure",
@@ -395,13 +464,15 @@ def rank_configs(
     # ``runtime`` value may be estimated with the interface's default backend,
     # so sorting it again could reorder the IN_PLACE split-K recommendation
     # using OUT_OF_PLACE costs.
+    # A tile restriction only filters candidates, so non-split queries keep the
+    # same runtime ordering with or without it.
     ordered = list(configs) if split_k_kind is not None else sorted(configs, key=_runtime)
     ranked: List[HeuristicConfig] = []
     for c in ordered:
         cfg = _extract_config(c)
         if cfg is not None and cfg not in ranked:
             ranked.append(cfg)
-    return _pin_split_k_to_rank1(ranked)
+    return ranked
 
 
 def rank_tile_cluster_configs(
@@ -428,12 +499,16 @@ def filter_fp8_tactics(
     max_tactics: int,
     tactic_signature: Callable[[tuple, set], Optional[tuple]],
     sweep_cluster_n: bool = False,
+    local_cluster_sweep: bool = False,
 ) -> List[tuple]:
     """Keep FP8 tactics matching the top model-visible field signatures.
 
     Instruction shape, B-reuse, TMA-store mode, and other runner-local fields
     stay swept because ``tactic_signature`` deliberately omits them. Rubin may
     additionally sweep cluster-N within each selected (CTA, cluster-M) family.
+    ``local_cluster_sweep`` also keeps every cluster of the rank-1 tile and the
+    small (<= 2 CTA) clusters of the other selected tiles; see
+    ``_widened_cluster``.
     An empty query or intersection returns the original validated tactic list.
     """
     if not tactics or not ranked_configs or not fields:
@@ -456,6 +531,11 @@ def filter_fp8_tactics(
     if not kept_signatures:
         return tactics
 
+    widen = (
+        _widened_cluster(kept_signatures)
+        if local_cluster_sweep and fields & {"tile", "cluster"}
+        else (lambda signature: False)
+    )
     if sweep_cluster_n and fields & {"tile", "cluster"}:
 
         def _cluster_n_family(signature):
@@ -467,43 +547,55 @@ def filter_fp8_tactics(
         selected = []
         for tactic in tactics:
             signature = tactic_signature(tactic, fields)
-            if signature is not None and _cluster_n_family(signature) in kept_families:
+            if signature is not None and (
+                _cluster_n_family(signature) in kept_families or widen(signature)
+            ):
                 selected.append(tactic)
     else:
         kept = set(kept_signatures)
-        selected = [tactic for tactic in tactics if tactic_signature(tactic, fields) in kept]
+        selected = []
+        for tactic in tactics:
+            signature = tactic_signature(tactic, fields)
+            if signature is not None and (signature in kept or widen(signature)):
+                selected.append(tactic)
     return selected if selected else tactics
+
+
+def _widened_cluster(ranked_signatures: List[tuple]) -> Callable[[tuple], bool]:
+    """Admit locally swept clusters around model-ranked (tile, cluster) keys.
+
+    On Rubin the model ranks tiles well but over-values large clusters (4x1,
+    4x2, 2x4), while the measured winner often uses the same tile with a
+    1x1/1x2/2x1 cluster. Keep every cluster of the rank-1 tile and the
+    small clusters of the other ranked tiles. Keys are (tile, cluster, *rest);
+    ``rest`` (e.g. a model CTA order) must match a ranked key of that tile.
+    """
+    if not ranked_signatures:
+        return lambda signature: False
+    rank1_tile = ranked_signatures[0][0]
+    ranked_rest = {(signature[0], tuple(signature[2:])) for signature in ranked_signatures}
+
+    def admit(signature: tuple) -> bool:
+        cta, cluster, *rest = signature
+        if (cta, tuple(rest)) not in ranked_rest:
+            return False
+        return cta == rank1_tile or int(cluster[0]) * int(cluster[1]) <= 2
+
+    return admit
 
 
 def expand_bf16_tactics_with_heuristic_splits(
     tactics: List[tuple], ranked_configs: List[HeuristicConfig]
 ) -> List[tuple]:
-    """Add only the rank-1 model split count after a successful BF16 query.
+    """Make model-recommended split counts available for per-config matching.
 
     The runner has already validated each base tactic's tile and cluster. Split
-    count does not participate in ``can_implement``, so a six-field split tactic
-    can be derived safely from those validated templates. Baseline tactics are
-    returned byte-for-byte when the model has no supported split recommendation.
+    count does not participate in ``can_implement``. The caller must ensure
+    its output shape supports direct reduction before expanding the validated
+    templates. Every positive model-recommended split is retained, including
+    values absent from the baseline sweep.
     """
-    # ``get_valid_tactics`` only emits a split greater than one when the
-    # runner's split-K shape guard passes.  Preserve that eligibility decision
-    # before adding non-power-of-two model recommendations.
-    split_k_eligible = any(
-        isinstance(tactic, tuple)
-        and len(tactic) == 6
-        and tactic[0] == "base"
-        and int(tactic[5]) > 1
-        for tactic in tactics
-    )
-    if not split_k_eligible:
-        return tactics
-
-    ranked_configs = _pin_split_k_to_rank1(ranked_configs)
-    recommended = {
-        int(config.split_k)
-        for config in ranked_configs
-        if 1 < int(config.split_k) <= BF16_MAX_HEURISTIC_SPLIT_K
-    }
+    recommended = {int(config.split_k) for config in ranked_configs if int(config.split_k) > 1}
     if not recommended:
         return tactics
 
@@ -622,6 +714,11 @@ def _bf16_structural_config_signature(config: HeuristicConfig, fields: set) -> t
     return _bf16_config_signature(config, structural_fields)
 
 
+def _bf16_tile_family(signature: tuple) -> tuple:
+    """Drop the cluster from a tile/cluster-led BF16 key; keep the rest."""
+    return (signature[0],) + tuple(signature[2:])
+
+
 def _apply_bf16_scheduler_config(tactic: tuple, config: HeuristicConfig, fields: set) -> tuple:
     """Copy selected scheduler values from one NVMMH config to a base tactic."""
     split_k = max(1, int(tactic[5]))
@@ -643,40 +740,76 @@ def filter_bf16_tactics(
     max_tactics: int,
     include_known_good: bool = True,
     fallback_tactics: Optional[List[tuple]] = None,
+    local_cluster_sweep: bool = False,
 ) -> List[tuple]:
     """Return top model-matched BF16 tactics with direct scheduler annotation.
+
+    ``local_cluster_sweep`` (Rubin) also keeps every legal cluster of the
+    rank-1 matched tile and the small (<= 2 CTA) clusters of the other
+    matched tiles; see ``_widened_cluster``.
 
     Only base tactics participate in model matching. Valid preferred/fallback
     cluster schedulers cannot be represented directly by the model's one cluster
     field, so only the validated q_b known-good tactic is supplemented when its
-    implicit split-K=1 agrees with rank 1. When split-K is selected, every lower
-    rank keeps its other fields but uses the rank-1 split count. An empty
+    implicit split-K=1 agrees with a matched model configuration. Each model
+    configuration keeps its own split count during matching. An empty
     intersection returns ``fallback_tactics`` (normally the exact list produced
     by ``get_valid_tactics``).
     """
     fallback = tactics if fallback_tactics is None else fallback_tactics
     if not tactics or not ranked_configs or not fields:
         return fallback
-    allow_known_good_supplement = include_known_good
-    if "split_k" in fields:
-        ranked_configs = _pin_split_k_to_rank1(ranked_configs)
-        allow_known_good_supplement = include_known_good and int(ranked_configs[0].split_k) == 1
-
     valid_signatures = {
         signature
         for tactic in tactics
         if (signature := _bf16_structural_tactic_signature(tactic, fields)) is not None
     }
+    # The model sometimes ranks a supported tile with a cluster the kernel
+    # cannot launch (SM107 rejects CTA_N=256 with cluster_n=2). Dropping that
+    # config discards the tile entirely, even when it is the fastest one, so
+    # keep the tile and let the autotuner pick among its legal clusters. The
+    # substituted family counts as one model key.
+    substitute_cluster = bool(fields & {"tile", "cluster"})
+    signatures_by_tile = {}
+    if substitute_cluster:
+        for signature in valid_signatures:
+            signatures_by_tile.setdefault(_bf16_tile_family(signature), set()).add(signature)
     config_by_signature = {}
+    model_keys = 0
     for config in ranked_configs:
         signature = _bf16_structural_config_signature(config, fields)
-        if signature in valid_signatures and signature not in config_by_signature:
-            config_by_signature[signature] = config
-            if len(config_by_signature) >= max(1, int(max_tactics)):
-                break
+        if signature in valid_signatures:
+            matched = [signature]
+        elif substitute_cluster:
+            matched = sorted(signatures_by_tile.get(_bf16_tile_family(signature), ()))
+        else:
+            matched = []
+        matched = [s for s in matched if s not in config_by_signature]
+        if not matched:
+            continue
+        for s in matched:
+            config_by_signature[s] = config
+        model_keys += 1
+        if model_keys >= max(1, int(max_tactics)):
+            break
     if not config_by_signature:
         return fallback
+    if local_cluster_sweep and substitute_cluster:
+        # Insertion order follows the model ranking, so the first key is the
+        # rank-1 matched tile family.
+        ranked_signatures = list(config_by_signature)
+        config_by_family = {}
+        for signature, config in config_by_signature.items():
+            config_by_family.setdefault(_bf16_tile_family(signature), config)
+        widen = _widened_cluster(ranked_signatures)
+        for signature in sorted(valid_signatures):
+            if signature not in config_by_signature and widen(signature):
+                config_by_signature[signature] = config_by_family[_bf16_tile_family(signature)]
 
+    allow_known_good_supplement = include_known_good and (
+        "split_k" not in fields
+        or any(int(config.split_k) == 1 for config in config_by_signature.values())
+    )
     selected = []
     for tactic in tactics:
         signature = _bf16_structural_tactic_signature(tactic, fields)

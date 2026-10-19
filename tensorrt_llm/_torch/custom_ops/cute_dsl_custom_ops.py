@@ -36,8 +36,8 @@ from .cutedsl_matmul_heuristics import (
     FP8_BF16_OUTPUT_PRECISION, FP8_FP16_OUTPUT_PRECISION, FP8_LAYOUT,
     IN_PLACE_SPLIT_K_KIND, IS_NVMMH_AVAILABLE, NVFP4_LAYOUT, NVFP4_PRECISION,
     cute_raster_to_nvmmh_cta_order, expand_bf16_tactics_with_heuristic_splits,
-    filter_bf16_tactics, filter_fp8_tactics, is_sm107_nvmmh_split_k_eligible,
-    nvmmh_cta_order_to_cute_raster, rank_configs)
+    filter_bf16_tactics, filter_fp8_tactics, nvmmh_cta_order_to_cute_raster,
+    nvmmh_library_version, rank_configs)
 
 try:
     from cuda.bindings import driver as cuda
@@ -112,20 +112,27 @@ def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
     return next_positive_power_of_2(num_tokens)
 
 
-_CUTEDSL_NVMMH_TACTIC_SEARCH_CACHE_VERSION = "cutedsl-nvmmh-v1"
+# Bump only when NVMMH-emitted tactic tuples change shape, so that cached
+# entries could no longer be parsed by the runners. Selection changes do not
+# need a bump: cached winners stay valid tactics.
+_CUTEDSL_NVMMH_TACTIC_CACHE_SCHEMA = 1
 
 
 def _cutedsl_nvmmh_tactic_search_cache_key():
-    """Return the cache discriminator for NVMMH-aware tactic generation."""
+    """Return the cache discriminator for NVMMH-aware tactic generation.
+
+    The key covers the policy (fields, tactic budget) and the installed NVMMH
+    wheel, whose ranking decides the candidate set.
+    """
     config = AutoTuner.get().nvmmh_config
     if not config.enabled or not config.fields or not IS_NVMMH_AVAILABLE:
         # These paths preserve the pre-NVMMH candidate list, so policy details
         # cannot affect tactic search or fragment its cache identity.
         return None
     return (
-        _CUTEDSL_NVMMH_TACTIC_SEARCH_CACHE_VERSION,
-        bool(config.enabled),
-        bool(IS_NVMMH_AVAILABLE),
+        "cutedsl-nvmmh",
+        _CUTEDSL_NVMMH_TACTIC_CACHE_SCHEMA,
+        nvmmh_library_version(),
         tuple(sorted(config.fields)),
         int(config.max_tactics),
     )
@@ -10308,14 +10315,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if c_needs_copy:
                 c_tensor.copy_(c_buf)
 
-        def _rank_prune_tactics(self, tactics, m, n, k, output_dtype):
+        def _rank_prune_tactics(self,
+                                tactics,
+                                m,
+                                n,
+                                k,
+                                output_dtype,
+                                *,
+                                allow_split_k: bool = True):
             """Rank/prune BF16 GEMM tactics with nvMatmulHeuristics.
 
             Called at the end of get_valid_tactics. The model controls only
             fields selected by the AutoTuner NVMMH policy. Emitted tuples are
-            from the runner's validated tactic list. On SM107, split-K itself
-            remains a bounded local CUPTI sweep because the installed NVMMH
-            cannot expose its native K-tile lower bound.
+            from the runner's validated tactic families. When split-K is
+            selected, each model configuration retains its own split count.
             Any query or matching failure keeps the validated tactic families.
             """
             nvmmh_config = AutoTuner.get().nvmmh_config
@@ -10324,8 +10337,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return tactics
 
             fields = set(nvmmh_config.fields)
-            if self.target_sm != "rubin":
-                # Main supports direct split-K only in the Rubin runner.
+            if self.target_sm != "rubin" or not allow_split_k:
+                # Direct reduction requires Rubin and a matching output shape.
                 fields.discard("split_k")
             if not fields:
                 return tactics
@@ -10344,6 +10357,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # same runner-visible key. Over-query so those duplicates do not
                 # crowd out valid CTA/cluster/split matches.
                 query_count = max(max_tactics * 16, 64)
+                split_k_kind = (IN_PLACE_SPLIT_K_KIND
+                                if self.target_sm == "rubin"
+                                and "split_k" in fields else None)
                 ranked_configs = rank_configs(
                     m,
                     n,
@@ -10351,94 +10367,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     precision,
                     query_count,
                     layout_name=BF16_LAYOUT,
+                    split_k_kind=split_k_kind,
                 )
                 if not ranked_configs:
                     return fallback_tactics
 
                 candidate_tactics = tactics
-                model_fields = fields
-                if self.target_sm == "rubin" and "split_k" in fields:
-                    # NVMMH's native minTilesKLowerBound is not configurable in
-                    # this wheel. Admit Rubin splits with TRT-LLM's shared
-                    # lower bound, then let CUPTI select among the runner's
-                    # normal full-sweep candidates.
-
-                    def _split_k(tactic):
-                        """Read the tactic split factor, defaulting unsplit variants to one."""
-                        if (isinstance(tactic, tuple) and len(tactic) >= 6
-                                and tactic[0] == "base"):
-                            return max(1, int(tactic[5]))
-                        return 1
-
-                    candidate_tactics = [
-                        tactic for tactic in candidate_tactics
-                        if is_sm107_nvmmh_split_k_eligible(
-                            k, self.nvmmh_split_k_cta_k, _split_k(tactic))
-                    ]
-                    model_fields = fields - {"split_k"}
-                    non_split_tactics = [
-                        tactic for tactic in candidate_tactics
-                        if _split_k(tactic) == 1
-                    ]
-                    split_tactics = [
-                        tactic for tactic in candidate_tactics
-                        if _split_k(tactic) > 1
-                    ]
-
-                    if model_fields:
-                        selected_non_split = filter_bf16_tactics(
-                            non_split_tactics,
-                            ranked_configs,
-                            model_fields,
-                            max_tactics,
-                            include_known_good=not bool(
-                                model_fields & {"swizzle", "cta_order"}),
-                            fallback_tactics=[],
-                        )
-                        if not selected_non_split:
-                            return fallback_tactics
-                    else:
-                        selected_non_split = non_split_tactics
-
-                    # Rubin's split-K reduction path has fixed scheduler
-                    # defaults, so swizzle/CTA order cannot participate in its
-                    # model match. Tile/cluster still can when requested.
-                    split_model_fields = model_fields - {"swizzle", "cta_order"}
-                    if split_tactics and split_model_fields:
-                        selected_split = filter_bf16_tactics(
-                            split_tactics,
-                            ranked_configs,
-                            split_model_fields,
-                            max_tactics,
-                            include_known_good=False,
-                            fallback_tactics=[],
-                        )
-                        if not selected_split:
-                            return fallback_tactics
-                    else:
-                        selected_split = split_tactics
-                    selected = list(
-                        dict.fromkeys(selected_non_split + selected_split))
-                else:
-                    if "split_k" in fields:
-                        candidate_tactics = (
-                            expand_bf16_tactics_with_heuristic_splits(
-                                tactics, ranked_configs))
-                    selected = filter_bf16_tactics(
-                        candidate_tactics,
-                        ranked_configs,
-                        fields,
-                        max_tactics,
-                        include_known_good=not bool(fields
-                                                    & {"swizzle", "cta_order"}),
-                        fallback_tactics=fallback_tactics,
-                    )
+                if "split_k" in fields:
+                    candidate_tactics = expand_bf16_tactics_with_heuristic_splits(
+                        tactics, ranked_configs)
+                selected = filter_bf16_tactics(
+                    candidate_tactics,
+                    ranked_configs,
+                    fields,
+                    max_tactics,
+                    include_known_good=not bool(fields
+                                                & {"swizzle", "cta_order"}),
+                    fallback_tactics=fallback_tactics,
+                    local_cluster_sweep=self.target_sm == "rubin",
+                )
                 logger.debug(
                     f"CuTe DSL BF16 nvMatmulHeuristics: {len(tactics)} baseline "
                     f"/ {len(candidate_tactics)} candidates "
                     f"-> {len(selected)} tactics for M={m}, N={n}, K={k}, "
                     f"precision={precision}, fields={sorted(fields)}, "
-                    f"model_fields={sorted(model_fields)}")
+                    f"model_fields={sorted(fields)}")
                 return selected
             except Exception as e:  # noqa: BLE001 - tuning must keep working
                 logger.warning_once(
@@ -10710,6 +10663,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """SM107 BF16 batched GEMM: [B, M, K] @ [B, N, K] -> [B, M, N]."""
         kernel_cache = dict()
 
+        def tactic_search_cache_key(self):
+            """Include the batch-aware NVMMH policy in the profiling key."""
+            return _cutedsl_nvmmh_tactic_search_cache_key()
+
         # The output's M dim (inputs[2] dim 1) must track input0's bucketed
         # M: without the constraint, profiling-cache keys embed the raw
         # tuning-time M and every other runtime M misses the cache and falls
@@ -10735,9 +10692,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return []
             batch_size, m, k = inputs[0].shape
             n = inputs[1].shape[1]
-            return _sm107_bf16_valid_tactics(
+            tactics = _sm107_bf16_valid_tactics(
                 m, n, k, batch_size, cutlass.BFloat16,
                 _SM107_BF16_MMA_TILER_MN_CANDIDATES, None)
+            config = AutoTuner.get().nvmmh_config
+            fields = set(config.fields) & {"tile", "cluster"}
+            if not config.enabled or not IS_NVMMH_AVAILABLE or not fields:
+                return tactics
+            ranked_configs = rank_configs(m,
+                                          n,
+                                          k,
+                                          BF16_PRECISION,
+                                          max(config.max_tactics * 16, 64),
+                                          layout_name=BF16_LAYOUT,
+                                          batch_size=batch_size)
+            # The shared BF16 matcher includes an explicit unsplit field.
+            normalized = {
+                tactic + (1, ) if tactic[0] == "base" else tactic: tactic
+                for tactic in tactics
+            }
+            selected = filter_bf16_tactics(list(normalized),
+                                           ranked_configs,
+                                           fields,
+                                           config.max_tactics,
+                                           local_cluster_sweep=True)
+            return [normalized[tactic] for tactic in selected]
 
         def forward(
             self,
@@ -11269,7 +11248,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tactics = _sm107_bf16_valid_tactics(m, n, k, 1, c_dtype_cutlass,
                                                 mma_tiler_mn_candi,
                                                 split_k_candi)
-            return self._rank_prune_tactics(tactics, m, n, k, inputs[2].dtype)
+            return self._rank_prune_tactics(
+                tactics,
+                m,
+                n,
+                k,
+                inputs[2].dtype,
+                allow_split_k=inputs[2].shape[0] == m)
 
         def forward(
             self,
@@ -13528,6 +13513,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_class = SM107BlockwiseGemmKernel
             kernel_cache = dict()
 
+            def tactic_search_cache_key(self):
+                """Include the batch-aware NVMMH policy in the profiling key."""
+                return _cutedsl_nvmmh_tactic_search_cache_key()
+
+            @staticmethod
+            def _nvmmh_tactic_signature(tactic, fields):
+                """Map the blockwise BMM instruction tile to a per-CTA tile."""
+                use_2cta, mma_tiler, _, cluster_shape = tactic
+                cta_group = 2 if use_2cta else 1
+                return ((int(mma_tiler[0]) // cta_group, int(mma_tiler[1])),
+                        tuple(cluster_shape))
+
             def __init__(
                 self,
                 output_dtype: torch.dtype = torch.bfloat16,
@@ -13552,31 +13549,61 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 batch_size, m, k = inputs[0].shape
                 n = inputs[1].shape[1]
 
-                return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
-                         cluster_shape_mn) for use_2cta_instrs, mma_tiler,
-                        mma_inst_shape in _SM107_FP8_BLOCKWISE_MMA_CANDIDATES
-                        for cluster_shape_mn in
-                        _SM107_FP8_BLOCKWISE_CLUSTER_CANDIDATES
-                        if (not self.fp8_quantize_1x128 or mma_tiler[0] //
-                            (2 if use_2cta_instrs else 1) == 128)
-                        and self.__class__.kernel_class.can_implement(
-                            cutlass.Float8E4M3FN,
-                            cutlass.Float8E4M3FN,
-                            cutlass.Float32,
-                            (cutlass.Float8E4M3FN if self.
-                             fp8_quantize_1x128 else cutlass.BFloat16),
-                            use_2cta_instrs,
-                            mma_tiler,
-                            mma_inst_shape,
-                            cluster_shape_mn,
-                            m,
-                            n,
-                            k,
-                            batch_size,
-                            "k",
-                            "k",
-                            "n",
-                        )]
+                tactics = [(use_2cta_instrs, mma_tiler, mma_inst_shape,
+                            cluster_shape_mn) for use_2cta_instrs, mma_tiler,
+                           mma_inst_shape in _SM107_FP8_BLOCKWISE_MMA_CANDIDATES
+                           for cluster_shape_mn in
+                           _SM107_FP8_BLOCKWISE_CLUSTER_CANDIDATES
+                           if (not self.fp8_quantize_1x128 or mma_tiler[0] //
+                               (2 if use_2cta_instrs else 1) == 128)
+                           and self.__class__.kernel_class.can_implement(
+                               cutlass.Float8E4M3FN,
+                               cutlass.Float8E4M3FN,
+                               cutlass.Float32,
+                               (cutlass.Float8E4M3FN if self.
+                                fp8_quantize_1x128 else cutlass.BFloat16),
+                               use_2cta_instrs,
+                               mma_tiler,
+                               mma_inst_shape,
+                               cluster_shape_mn,
+                               m,
+                               n,
+                               k,
+                               batch_size,
+                               "k",
+                               "k",
+                               "n",
+                           )]
+
+                config = AutoTuner.get().nvmmh_config
+                fields = set(config.fields) & {"tile", "cluster"}
+                if (not config.enabled or not IS_NVMMH_AVAILABLE or not fields
+                        or self.fp8_quantize_1x128):
+                    return tactics
+                # Only rank tiles this blockwise kernel implements: for skinny
+                # M the unrestricted model returns CTA_M=64 tiles that match no
+                # tactic, so the full sweep was kept. Cluster-N stays swept
+                # within each matched (tile, cluster-M) family, as for the
+                # dense Rubin FP8 runner.
+                tiles = {
+                    self._nvmmh_tactic_signature(tactic, fields)[0]
+                    for tactic in tactics
+                }
+                ranked_configs = rank_configs(m,
+                                              n,
+                                              k,
+                                              FP8_BF16_OUTPUT_PRECISION,
+                                              max(config.max_tactics * 16, 64),
+                                              layout_name=FP8_LAYOUT,
+                                              batch_size=batch_size,
+                                              tiles=tiles)
+                return filter_fp8_tactics(tactics,
+                                          ranked_configs,
+                                          fields,
+                                          config.max_tactics,
+                                          self._nvmmh_tactic_signature,
+                                          sweep_cluster_n=True,
+                                          local_cluster_sweep=True)
 
             def forward(
                 self,
@@ -13975,6 +14002,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             nvmmh_layout: ClassVar[Optional[str]] = None
             nvmmh_supported_fields: ClassVar[frozenset] = frozenset()
             nvmmh_sweep_cluster_shape: ClassVar[bool] = False
+            # Sweep cluster-M locally inside the model's rank-1 tile family.
+            nvmmh_sweep_cluster_m: ClassVar[bool] = False
             nvmmh_supplement_mixed_clusters: ClassVar[bool] = False
             raster_order_candidates: ClassVar[Tuple[str, ...]] = ("m", )
             scheduler_mode_candidates: ClassVar[Tuple[str,
@@ -14404,15 +14433,80 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     annotated.append(swizzle_size)
                 return tuple(annotated)
 
+            def _expand_nvmmh_clusters(
+                self,
+                tactics: List[Tuple],
+                ranked_configs_by_swap: dict,
+                fields: set,
+                m: int,
+                n: int,
+                real_k: int,
+            ) -> List[Tuple]:
+                """Materialize model clusters beyond the default sweep domain.
+
+                Retain the runner's validated instruction/B-reuse templates.
+                A new cluster must pass kernel legality checks for the actual
+                problem and split-K. Mixed-cluster pairs remain runner-local.
+                """
+                if (not fields & {"tile", "cluster"}
+                        or self.nvmmh_sweep_cluster_shape):
+                    return tactics
+
+                templates_by_key = {}
+                for tactic in tactics:
+                    if tactic[0] != "base":
+                        continue
+                    signature = self._nvmmh_tactic_signature(tactic, fields)
+                    if signature is None:
+                        continue
+                    key = self._nvmmh_cluster_family(signature, fields, True)
+                    templates_by_key.setdefault(key, []).append(tactic)
+
+                expanded = dict.fromkeys(tactics)
+                validity = {}
+                for swap_ab, configs in ranked_configs_by_swap.items():
+                    kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                    for config in configs:
+                        signature = self._nvmmh_config_signature(
+                            config, fields, swap_ab)
+                        key = self._nvmmh_cluster_family(
+                            signature, fields, True)
+                        cluster = tuple(config.cluster)
+                        for tactic in templates_by_key.get(key, ()):
+                            candidate = (*tactic[:3], cluster, *tactic[4:])
+                            if candidate in expanded:
+                                continue
+                            split_k = tactic[8] if len(tactic) >= 9 else 1
+                            check_key = (tactic[1], tactic[2], cluster, swap_ab,
+                                         split_k)
+                            if check_key not in validity:
+                                validity[
+                                    check_key] = self.kernel_class.can_implement(
+                                        (kernel_m, kernel_n, real_k, 1),
+                                        self.a_dtype,
+                                        self.b_dtype,
+                                        self.sf_dtype,
+                                        cutlass.BFloat16,
+                                        "k",
+                                        "k",
+                                        "m" if swap_ab else "n",
+                                        self.sf_vec_size,
+                                        tactic[1],
+                                        tactic[2],
+                                        cluster,
+                                        split_k,
+                                    )
+                            if validity[check_key]:
+                                expanded[candidate] = None
+                return list(expanded)
+
             def _rank_prune_tactics(self, tactics, m, n, real_k):
                 """Rank/prune Rubin block-scaled tactics with NVMMH.
 
-                Split-K uses TRT-LLM's SM107 K-tile admission policy and remains
-                a local CUPTI sweep field. This is necessary because the native
-                scheduler's hard-coded lower bound can prevent useful factors
-                from being modeled at all. NVMMH still controls every other
-                selected field. Scheduler values are copied directly from the
-                matched model config instead of being locally swept.
+                Model cluster shapes are materialized and validated even when
+                absent from the default sweep. Selected split-K values still
+                participate in structural matching. Scheduler values are copied
+                from the matched config. Unsupported results retain fallback.
 
                 MXFP8 uses the generic E4M3 FP8 compute model because NVMMH
                 does not encode scale-factor formats. Runner-native fields
@@ -14429,10 +14523,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if not fields:
                     return tactics
                 fallback_tactics = tactics
-                # The installed NVMMH has no public property for overriding
-                # minTilesKLowerBound. Treat split-K as an admitted local sweep
-                # dimension instead of matching its native rank-1 value.
-                model_fields = fields - {"split_k"}
+                model_fields = fields
                 scheduler_fields = model_fields & {"swizzle", "cta_order"}
                 match_fields = model_fields - scheduler_fields
 
@@ -14440,21 +14531,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m, n, real_k = int(m), int(n), int(real_k)
                     max_tactics = nvmmh_config.max_tactics
                     candidate_tactics = tactics
-                    if "split_k" in fields:
-
-                        def _split_k(tactic):
-                            """Read the tactic split factor, defaulting unsplit variants to one."""
-                            if (isinstance(tactic, tuple) and tactic
-                                    and tactic[0] == "base"
-                                    and len(tactic) >= 9):
-                                return int(tactic[8])
-                            return 1
-
-                        candidate_tactics = [
-                            tactic for tactic in candidate_tactics
-                            if is_sm107_nvmmh_split_k_eligible(
-                                real_k, self.mma_tiler_k, _split_k(tactic))
-                        ]
                     if not model_fields:
                         return candidate_tactics or fallback_tactics
 
@@ -14470,6 +14546,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     valid_swaps = sorted(
                         {signature[-1]
                          for signature in baseline_signatures})
+                    # Per-CTA tiles each orientation can launch. The model
+                    # otherwise ranks tiles this kernel never implements
+                    # (CTA_M=64, CTA_N=32/96) for skinny shapes, and nothing
+                    # matches. Clusters stay open: model clusters outside the
+                    # sweep are materialized and validated below.
+                    tiles_by_swap = {}
+                    if match_fields & {"tile", "cluster"}:
+                        for signature in baseline_signatures:
+                            tiles_by_swap.setdefault(signature[-1],
+                                                     set()).add(signature[0])
                     query_count = max(max_tactics * 16, 64)
                     ranked_configs_by_swap = {}
                     for swap_ab in valid_swaps:
@@ -14478,6 +14564,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         if "split_k" in fields:
                             query_kwargs["split_k_kind"] = (
                                 IN_PLACE_SPLIT_K_KIND)
+                        if swap_ab in tiles_by_swap:
+                            query_kwargs["tiles"] = tiles_by_swap[swap_ab]
                         ranked_configs = rank_configs(
                             kernel_m,
                             kernel_n,
@@ -14488,8 +14576,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         )
                         ranked_configs_by_swap[swap_ab] = ranked_configs
 
+                    candidate_tactics = self._expand_nvmmh_clusters(
+                        tactics, ranked_configs_by_swap, match_fields, m, n,
+                        real_k)
+                    candidate_signatures = {
+                        signature
+                        for tactic in candidate_tactics
+                        if (signature := self._nvmmh_tactic_signature(
+                            tactic, match_fields)) is not None
+                    }
+
+                    # The model's top tile is right far more often than its
+                    # cluster: small-M MXFP8 ranks only cluster 4x1 although
+                    # 1x1/2x1 often win. Sweep cluster-M inside the rank-1
+                    # tile family of each orientation; other tiles keep the
+                    # model cluster so the pool stays small.
+                    sweep_tile_by_swap = {}
+                    if (self.nvmmh_sweep_cluster_m
+                            and match_fields & {"tile", "cluster"}
+                            and not self.nvmmh_sweep_cluster_shape):
+                        for swap_ab, configs in ranked_configs_by_swap.items():
+                            if configs:
+                                sweep_tile_by_swap[swap_ab] = tuple(
+                                    configs[0].cta)
+
                     def model_key(signature):
                         """Drop locally swept cluster fields from a model-matching signature."""
+                        if sweep_tile_by_swap.get(
+                                signature[-1]) == signature[0]:
+                            cta, cluster, *remaining = signature
+                            return (cta, int(cluster[1]), *remaining)
                         return self._nvmmh_cluster_family(
                             signature,
                             match_fields,
@@ -14498,7 +14614,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     valid_keys = {
                         model_key(signature)
-                        for signature in baseline_signatures
+                        for signature in candidate_signatures
                     }
                     config_by_key = {}
                     rank1_config_by_swap = {}
@@ -14542,7 +14658,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         if annotated is not None:
                             selected.append(annotated)
                     selected.extend(
-                        tactic for tactic in candidate_tactics
+                        tactic for tactic in fallback_tactics
                         if ((signature := self._nvmmh_tactic_signature(
                             tactic, match_fields)) is not None
                             and signature[-1] in unmatched_swaps))
@@ -14569,6 +14685,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             swap_ab = bool(tactic[5])
                             config = rank1_config_by_swap.get(swap_ab)
                             if config is None:
+                                continue
+                            if "split_k" in fields and int(config.split_k) != 1:
                                 continue
                             annotated = self._apply_nvmmh_scheduler(
                                 tactic, config, scheduler_fields)
@@ -15120,11 +15238,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             nvmmh_precision = FP8_BF16_OUTPUT_PRECISION
             nvmmh_layout = FP8_LAYOUT
             # NVMMH can prune tile/cluster choices or fix the rank-1 scheduler
-            # tuple. Split-K uses the shared SM107 admission rule and remains
-            # locally profiled.
+            # tuple. Selected split-K values follow the model recommendation.
             nvmmh_supported_fields = frozenset(
                 {"tile", "cluster", "swizzle", "cta_order", "split_k"})
             nvmmh_supplement_mixed_clusters = True
+            nvmmh_sweep_cluster_m = True
             a_dtype = cutlass.Float8E4M3FN
             b_dtype = cutlass.Float8E4M3FN
             sf_dtype = cutlass.Float8E8M0FNU
