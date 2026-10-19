@@ -18,11 +18,9 @@ import pytest
 
 from tensorrt_llm.inputs import prefix_token_cache
 from tensorrt_llm.inputs.prefix_token_cache import (
-    ENABLE_ENV_VAR,
     PrefixTokenCache,
     PrefixTokenCacheConfig,
     create_prefix_token_cache,
-    prefix_cache_enabled,
 )
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.sampling_params import SamplingParams
@@ -247,19 +245,6 @@ def test_error_disables_cache_and_still_returns_ids() -> None:
     assert not cache._entries
 
 
-@pytest.mark.parametrize(
-    "value,expected", [(None, False), ("0", False), ("", False), ("true", False), ("1", True)]
-)
-def test_enabled_only_for_exactly_one(
-    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
-) -> None:
-    if value is None:
-        monkeypatch.delenv(ENABLE_ENV_VAR, raising=False)
-    else:
-        monkeypatch.setenv(ENABLE_ENV_VAR, value)
-    assert prefix_cache_enabled() is expected
-
-
 def test_config_from_env_reads_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", "7")
     monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", "100")
@@ -278,17 +263,15 @@ def test_config_from_env_rejects_invalid_values(
         PrefixTokenCacheConfig.from_env()
 
 
-def test_create_returns_none_for_slow_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_returns_none_for_slow_tokenizer() -> None:
     class Slow:
         is_fast = False
 
-    monkeypatch.setenv(ENABLE_ENV_VAR, "1")
     assert create_prefix_token_cache(Slow()) is None
     assert create_prefix_token_cache(None) is None
 
 
 def test_create_raises_on_invalid_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ENABLE_ENV_VAR, "1")
     monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", "many")
     with pytest.raises(ValueError):
         create_prefix_token_cache(_MergeTokenizer())
@@ -298,12 +281,8 @@ def test_create_raises_on_invalid_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _processor(monkeypatch: pytest.MonkeyPatch, enabled: bool = True) -> DefaultInputProcessor:
-    if enabled:
-        monkeypatch.setenv(ENABLE_ENV_VAR, "1")
-        monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
-    else:
-        monkeypatch.delenv(ENABLE_ENV_VAR, raising=False)
-    return DefaultInputProcessor(None, None, _MergeTokenizer())
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
+    return DefaultInputProcessor(None, None, _MergeTokenizer(), enable_tokenization_cache=enabled)
 
 
 def test_processor_uses_cache_for_eligible_prompts(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -443,6 +443,8 @@ def _client_config(
         "role": StoreRole(pool.role).value,
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
+        "async_load": pool.async_load,
+        "async_load_workers": pool.async_load_workers,
     }
     return config
 

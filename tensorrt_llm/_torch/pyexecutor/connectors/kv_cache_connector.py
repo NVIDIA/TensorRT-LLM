@@ -37,7 +37,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
 
 import torch
 
@@ -252,6 +252,46 @@ class KvCacheConnectorWorker(ABC):
         owners do not participate in its completion.
         """
 
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests this worker could not load every offered page for.
+
+        The runtime has already counted those positions as computed, so such a
+        request cannot take part in the forward pass. Reporting it asks the
+        executor to drop its allocation and let the scheduler admit it again.
+        Implementations clear the set on return.
+
+        Returns:
+            The affected request IDs. Empty by default, which is what a
+            connector whose failed load raises has to report.
+        """
+        return set()
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> int:
+        """Drop these requests' saves from the metadata bound for this pass.
+
+        A request that leaves the batch after its metadata was built computes
+        none of its scheduled tail, so none of it may be published.
+
+        Returns:
+            The number of save entries removed. Zero by default, which suits a
+            connector that does not bind saves per pass.
+        """
+        return 0
+
+    def take_failed_async_load_requests(self) -> Set[int]:
+        """Parked requests whose asynchronous load could not fetch every page.
+
+        These are reported complete by `get_finished` like any other load, so
+        the request leaves its parked state; this is how the executor learns
+        to restart it rather than run it. Implementations clear the set on
+        return.
+
+        Returns:
+            The affected request IDs. Empty by default, which is what a
+            connector that loads synchronously has to report.
+        """
+        return set()
+
     def shutdown(self) -> None:
         """Release whatever this worker holds, once the executor is done with it.
 
@@ -335,6 +375,26 @@ class KvCacheConnectorScheduler(ABC):
             request: The request that was allocated resources.
             block_ids: The KV cacheblock IDs that were allocated.
         """
+
+    def update_state_after_alloc_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: Dict[int, List[int]]
+    ) -> None:
+        """Per-layer-group companion to `update_state_after_alloc`.
+
+        Both describe the same allocation, and wherever the manager can report
+        page indices per layer group both are called, the flat hook first. A
+        page index is scoped to a layer group, so a sliding-window or hybrid
+        model has no correct flat list and reaches the connector only here.
+        The default is a no-op, which leaves a connector that does not reason
+        about layer groups behaving exactly as before.
+
+        Args:
+            request: The request that was allocated resources.
+            block_ids_by_layer_group: Allocated page indices per layer group.
+                A block with no page in a group reads back as
+                `BAD_PAGE_INDEX` in place, so ordinals line up across groups.
+        """
+        return
 
     def cancel_load(self, request: LlmRequest, start: int, end: int):
         """
@@ -806,6 +866,33 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests the worker could not load every offered page for this iteration.
+
+        See `PyExecutor._recover_failed_connector_loads` for what happens to
+        them.
+        """
+        return self.worker.take_failed_load_requests()
+
+    def take_failed_async_load_requests(self) -> Set[int]:
+        """Parked requests the worker could not load every offered page for.
+
+        See `PyExecutor._recover_failed_async_loads` for what happens to them.
+        """
+        return self.worker.take_failed_async_load_requests()
+
+    def forget_request(self, req: LlmRequest) -> None:
+        """Drop everything keyed to a request that is about to restart from scratch.
+
+        Saves bound for this pass go first, since the request computes none of
+        its scheduled tail. `reset_request_state` then retires the
+        per-allocation bookkeeping, the connector's own included.
+        """
+        if req.is_dummy_request:
+            return
+        self.worker.drop_bound_saves([req.request_id])
+        self.reset_request_state(req)
+
     def reset_request_state(self, req: LlmRequest) -> None:
         """
         Retire the bookkeeping keyed to an allocation released for replay.
@@ -884,10 +971,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
 
-    def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]) -> None:
+    def update_state_after_alloc(
+        self,
+        req: LlmRequest,
+        block_ids: List[int],
+        block_ids_by_layer_group: Optional[Dict[int, List[int]]] = None,
+    ) -> None:
         if req.is_dummy_request or self.scheduler is None:
             return
         self.scheduler.update_state_after_alloc(req, block_ids)
+        if block_ids_by_layer_group is not None:
+            self.scheduler.update_state_after_alloc_by_layer_group(req, block_ids_by_layer_group)
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output

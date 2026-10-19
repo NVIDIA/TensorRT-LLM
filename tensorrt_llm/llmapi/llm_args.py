@@ -2005,6 +2005,21 @@ class MooncakeStoreConfig(StrictBaseModel):
         "registering the KV pools with Mooncake. An escape hatch for a host "
         "whose HCA cannot pin GPU pages; costs a copy each way. Ignored when "
         "role is 'capacity', which registers no pages at all.")
+    async_load: bool = Field(
+        False,
+        telemetry=False,
+        description="Load a served prefix on a background thread while the "
+        "runtime parks the request, so the transfer does not sit inside the "
+        "executor iteration that every attention-DP rank waits on. The "
+        "request rejoins the batch once its pages have landed. Requires "
+        "attention DP or a single rank: each owner loads its own whole pages.")
+    async_load_workers: PositiveInt = Field(
+        1,
+        telemetry=False,
+        description="Threads serving asynchronous loads, each with its own "
+        "CUDA stream and staging slots, which the pinned-memory budget is "
+        "split across. Requests are taken from one queue by the first free "
+        "worker, so several parked requests transfer at once.")
     run_dir: Optional[str] = Field(
         None,
         telemetry=False,
@@ -5205,6 +5220,12 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
+        status="prototype")
+
+    enable_tokenization_cache: bool = Field(
+        default=False,
+        description=
+        "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
         status="prototype")
 
     enable_iter_req_stats: bool = Field(

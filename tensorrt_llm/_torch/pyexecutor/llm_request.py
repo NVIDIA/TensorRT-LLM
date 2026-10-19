@@ -823,6 +823,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_connector_prefix_end: Optional[int] = None
         self.py_connector_load_async = False
         self.py_connector_delivered = False
+        # Set once a connector failed to fill an offered prefix. The request is
+        # then served from the local cache alone, so a store that keeps
+        # advertising pages it cannot read cannot restart it indefinitely.
+        self.py_connector_load_failed = False
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,

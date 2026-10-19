@@ -2263,6 +2263,25 @@ class KVCacheManagerV2(BaseResourceManager):
         if pre_cap > 0:
             kv_cache.suspend()
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Give up a context request's allocation and progress so it restarts from scratch.
+
+        For a request skipped past a connector prefix whose pages then could not
+        be filled: those positions already count as computed, so the only
+        correct outcome is to recompute them. The scheduler re-admits the
+        request from whatever the radix tree still holds. The connector is
+        still queried, so it keeps tracking the request for saves, but its
+        offer is handed back: a store that reports pages present and then
+        fails to read them would otherwise restart the request every time.
+        """
+        req.py_ctx_pre_resize_cap = None
+        self._release_preempted(req)
+        req.py_connector_load_failed = True
+        req.set_prepopulated_prompt_len(0, self.tokens_per_block)
+        req.context_current_position = 0
+        req.context_chunk_size = req.prompt_len
+        req.estimated_reusable_tokens = 0
+
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
 
@@ -2415,6 +2434,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # loses at most one token, which the forward recomputes.
             req.py_connector_prefix_start = local_end
             offered_end = local_end + num_tokens
+            if req.py_connector_load_failed:
+                # This request already lost a load from this connector; trust
+                # only the local match from now on and hand the offer back.
+                if offered_end > local_end:
+                    self.kv_connector_manager.cancel_load(req, local_end, offered_end)
+                req.py_connector_prefix_end = local_end
+                req.py_connector_load_async = False
+                return kv_cache.num_committed_tokens
             req.py_connector_prefix_end = min(offered_end, req.prompt_len - 1)
             # Hand back what that clamp just dropped, because nothing
             # downstream can: `_deliver_connector_prefix` and
@@ -2514,6 +2541,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_connector_manager.commit_new_matched_tokens(
             req, recorded, req.py_connector_load_async
         )
+        if recorded > 0 and kv_cache is not None:
+            # Phase 2 booked these blocks as misses; the stats commit for this
+            # batch has not run yet. A block the forward pass still writes part
+            # of stays a miss.
+            tokens_per_block = self.tokens_per_block
+            kv_cache.record_connector_reuse(
+                (committed + tokens_per_block - 1) // tokens_per_block, end // tokens_per_block
+            )
 
     def _release_undelivered_connector_prefix(self, req: LlmRequest) -> None:
         """Hand back an offer for a request that died before it was delivered.
@@ -2804,12 +2839,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             self._deliver_connector_prefix(request)
             request.py_connector_delivered = True
-            # Connectors that do not reason about layer groups see the single
-            # group's indices; with several groups there is no correct flat
-            # list, so report none and leave them to the layer-group-aware
-            # metadata carried on RequestData.
+            # Both forms are reported, as `RequestData` reports both: the flat
+            # list is empty unless the model has a single layer group. A
+            # request parked for an asynchronous load never reaches
+            # `build_scheduler_output`, so this is its only route to either.
             self.kv_connector_manager.update_state_after_alloc(
-                request, self.get_connector_page_indices(request)
+                request,
+                self.get_connector_page_indices(request),
+                self.get_page_indices_by_layer_group(request),
             )
 
         self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
@@ -3191,6 +3228,7 @@ class KVCacheManagerV2(BaseResourceManager):
         primary_peak_stats,
         secondary_peak_stats_by_level,
         reuse_delta,
+        connector_reused_blocks: int = 0,
     ) -> KVCacheV2LifeCycleIterationStats:
         pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         assert kind == "attention"
@@ -3208,6 +3246,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 reuse_delta,
                 KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
             ),
+            connector_reused_blocks=connector_reused_blocks,
         )
 
     @staticmethod
@@ -3281,6 +3320,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        connector_reused_blocks = self.impl.get_and_reset_iteration_connector_reused_blocks()
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
         primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)
@@ -3344,6 +3384,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 primary_peak_stats,
                 secondary_peak_stats_by_level,
                 reuse_delta,
+                connector_reused_blocks.get(LifeCycleId(life_cycle_id), 0),
             )
             for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
         }

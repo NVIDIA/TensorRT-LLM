@@ -1737,15 +1737,19 @@ class MiniMaxM3VLInputProcessor:
     ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
     """
 
+    supports_tokenization_cache = True
+
     def __init__(
         self,
         model_path: str,
         config: Any,
         tokenizer: Any = None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs: Any,
     ):
         from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+        from tensorrt_llm.logger import logger
 
         BaseMultimodalInputProcessor.__init__(
             self,
@@ -1770,10 +1774,15 @@ class MiniMaxM3VLInputProcessor:
             use_fast=self._use_fast,
             trust_remote_code=trust_remote_code,
         )
-        # Opt-in prefix-tokenization cache (TLLM_PREFIX_TOKEN_CACHE=1), shared with
-        # DefaultInputProcessor, which MiniMax-M3 text-only chat prompts never reach:
-        # this processor tokenizes them through the HF MiniMaxVLProcessor instead.
-        self._prefix_token_cache = self._create_prefix_token_cache()
+        # The HF processor tokenizes with add_special_tokens=True and the cache with False,
+        # so their ids match only if the tokenizer adds no special tokens.
+        if enable_tokenization_cache and self._processor.tokenizer.num_special_tokens_to_add() != 0:
+            logger.warning(
+                "enable_tokenization_cache is ignored: the MiniMax-M3 tokenizer adds "
+                "special tokens, so cached ids would differ from the HF processor's."
+            )
+            enable_tokenization_cache = False
+        self._init_tokenization_cache(enable_tokenization_cache, self._processor.tokenizer)
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
             self._dtype = getattr(text_cfg, "torch_dtype", torch.bfloat16)
@@ -1799,36 +1808,6 @@ class MiniMaxM3VLInputProcessor:
         self._video_token_id = int(config.video_token_index)
         self._vision_start_token_id = self._resolve_token_id(MINIMAX_M3_VL_VISION_START_TOKEN)
         self._vision_end_token_id = self._resolve_token_id(MINIMAX_M3_VL_VISION_END_TOKEN)
-
-    def _create_prefix_token_cache(self):
-        """Prefix-tokenization cache for text-only prompts, or None when disabled or not exact.
-
-        Driven by the HF processor's own tokenizer, so cached ids come from the same tokenizer
-        as the processor path. The cache encodes with ``add_special_tokens=False``; it is used
-        only if the processor yields the same ids for a probe prompt, i.e. adds no special
-        tokens on this checkpoint. A probe failure disables the cache instead of failing
-        model loading.
-        """
-        from tensorrt_llm.inputs.prefix_token_cache import create_prefix_token_cache
-        from tensorrt_llm.logger import logger
-
-        tokenizer = self._processor.tokenizer
-        cache = create_prefix_token_cache(tokenizer)
-        if cache is None:
-            return None
-        probe = "]~b]user\nhello 你好 <mm:think>x</mm:think> ]<]minimax[>[<tool_call>[e~[\n]~b]ai\n"
-        try:
-            ids = self._processor(text=[probe], return_tensors="pt")["input_ids"]
-            expected = tokenizer(probe, add_special_tokens=False)["input_ids"]
-            same = ids[0].tolist() == list(expected)
-        except Exception as e:  # a cache problem must never fail model loading
-            same = False
-            logger.warning(f"MiniMax-M3 prefix token cache probe failed: {e!r}")
-        if not same:
-            logger.warning(
-                "Prefix token cache disabled for MiniMax-M3: HF processor and tokenizer ids differ"
-            )
-        return cache if same else None
 
     def _resolve_token_id(self, token: str) -> int:
         """Look ``token`` up via the tokenizer. Raise if the tokenizer has
@@ -2084,16 +2063,8 @@ class MiniMaxM3VLInputProcessor:
                 templated_text = "\n".join(explicit)
         else:
             templated_text = text_prompt or ""
-
-        # Text-only fast path: splice cached prefix ids (opt-in, exact; see _create_prefix_token_cache).
-        if self._prefix_token_cache is not None and not images and not videos:
-            # Same eligibility as DefaultInputProcessor: no special tokens added, no truncation.
-            eligible = sampling_params is None or (
-                not sampling_params.add_special_tokens
-                and sampling_params.truncate_prompt_tokens is None
-            )
-            if eligible:
-                ids = self._prefix_token_cache.encode(self._processor.tokenizer, templated_text)
+            ids = self._encode_with_tokenization_cache(templated_text, sampling_params)
+            if ids is not None:
                 return ids, {"multimodal_data": {}}
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors

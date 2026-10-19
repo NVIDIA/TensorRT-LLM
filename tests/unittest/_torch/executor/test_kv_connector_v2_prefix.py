@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorScheduler
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
 TOKENS_PER_BLOCK = 32
@@ -51,7 +52,11 @@ class FakeKvCache:
         self.resize_ok = resize_ok
         self.is_active = active
         self.resize_calls = []
+        self.connector_reuse_calls = []
         self.trace = trace if trace is not None else []
+
+    def record_connector_reuse(self, block_begin, block_end):
+        self.connector_reuse_calls.append((block_begin, block_end))
 
     def resume(self, cuda_stream):
         self.is_active = True
@@ -97,6 +102,7 @@ class FakeRequest:
         self.py_connector_prefix_end = None
         self.py_connector_load_async = False
         self.py_connector_delivered = False
+        self.py_connector_load_failed = False
 
     def set_prepopulated_prompt_len(self, prepopulated_prompt_len, tokens_per_block):
         assert prepopulated_prompt_len < self.prompt_len, (
@@ -420,6 +426,51 @@ class TestWriteRangeAtDelivery:
         assert req.context_current_position - recorded == 64
 
 
+class TestConnectorReuseStats:
+    """Delivered blocks are rebooked from missed to reused.
+
+    Phase 2's ``resize`` books every block it allocates as a miss. Only the
+    blocks the connector fills completely, past the current commit boundary,
+    are reused.
+    """
+
+    def test_the_transferred_full_blocks_are_rebooked(self):
+        connector = FakeConnectorManager(num_matched=96)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=32)
+
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert kv_cache.connector_reuse_calls == [(1, 4)]
+
+    def test_a_partially_filled_last_block_stays_a_miss(self):
+        connector = FakeConnectorManager(num_matched=PROMPT_LEN)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0)
+
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert req.py_connector_prefix_end == PROMPT_LEN - 1
+        assert kv_cache.connector_reuse_calls == [(0, PROMPT_LEN // TOKENS_PER_BLOCK - 1)]
+
+    def test_nothing_is_rebooked_when_nothing_is_transferred(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0)
+
+        prepare(manager, req, kv_cache)
+        kv_cache.num_committed_tokens = 128
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert kv_cache.connector_reuse_calls == []
+
+
 class TestResidency:
     def test_capacity_and_history_move_together(self):
         """After a reuse match both equal the local match.
@@ -596,6 +647,53 @@ class TestAsyncLoad:
         assert connector.cancels == [(0, PROMPT_LEN - 1, PROMPT_LEN)]
 
 
+class TestFailedLoadRestart:
+    """A request restarted after a failed load is not offered a prefix again.
+
+    A store whose lookup keeps reporting a key present while its reads fail
+    would otherwise offer the same prefix on every admission, and the request
+    would restart forever without computing a token.
+    """
+
+    @staticmethod
+    def restart(manager, req):
+        manager.free_resources = lambda request: None
+        manager.drop_context_allocation(req)
+
+    def test_the_restarted_request_runs_from_the_local_match(self):
+        connector = FakeConnectorManager(num_matched=64, load_async=True)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        assert prepare(manager, req, FakeKvCache(committed=0)) == 64
+        for _ in range(2):
+            self.restart(manager, req)
+            kv_cache = FakeKvCache(committed=0)
+
+            assert prepare(manager, req, kv_cache) == 0
+            assert kv_cache.resize_calls == []
+            assert req.context_current_position == 0
+            assert req.py_connector_load_async is False
+
+        # Still asked, so the connector keeps tracking the request for saves,
+        # but every later offer is handed back whole.
+        assert connector.queries == [(0, 0)] * 3
+        assert connector.cancels == [(0, 0, 64)] * 2
+        manager._deliver_connector_prefix(req)
+        assert connector.commits == [(0, 0, False)]
+
+    def test_the_local_match_still_applies(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0))
+        self.restart(manager, req)
+
+        assert prepare(manager, req, FakeKvCache(committed=32)) == 32
+        assert connector.cancels == [(0, 32, 96)]
+
+
 class TestPhasesMustAgree:
     """Phase 3 refuses to report a load phase 2 never made room for.
 
@@ -638,3 +736,47 @@ class TestPhasesMustAgree:
         manager._deliver_connector_prefix(req)
 
         assert connector.commits == [(0, 64, False)]
+
+
+class FlatOnlyScheduler(KvCacheConnectorScheduler):
+    """A connector that knows nothing of layer groups, as most do."""
+
+    def __init__(self):
+        self.flat_calls = []
+
+    def build_connector_meta(self, scheduler_output):
+        raise NotImplementedError
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        raise NotImplementedError
+
+    def request_finished(self, request, cache_block_ids):
+        raise NotImplementedError
+
+    def update_state_after_alloc(self, request, block_ids):
+        self.flat_calls.append(list(block_ids))
+
+
+class TestPerGroupAllocHook:
+    """`update_state_after_alloc_by_layer_group` is additive.
+
+    A page index is scoped to a layer group, so the flat list is only correct
+    for a model with one group. The per-group hook carries the general form,
+    and defaults to a no-op so that a connector written against the flat hook
+    alone is told exactly what it was told before.
+    """
+
+    def test_the_default_leaves_the_flat_hook_as_the_only_report(self):
+        scheduler = FlatOnlyScheduler()
+
+        scheduler.update_state_after_alloc(FakeRequest(), [7, 8, 9])
+        scheduler.update_state_after_alloc_by_layer_group(FakeRequest(), {0: [7, 8, 9]})
+
+        assert scheduler.flat_calls == [[7, 8, 9]]
+
+    def test_the_default_accepts_several_groups_without_guessing_a_flat_list(self):
+        scheduler = FlatOnlyScheduler()
+
+        scheduler.update_state_after_alloc_by_layer_group(FakeRequest(), {0: [7, 8], 1: [9, 10]})
+
+        assert scheduler.flat_calls == []

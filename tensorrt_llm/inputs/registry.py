@@ -86,13 +86,15 @@ class DefaultInputProcessor(InputProcessor):
                  model_path,
                  config,
                  tokenizer,
-                 trust_remote_code: bool = True) -> None:
+                 trust_remote_code: bool = True,
+                 enable_tokenization_cache: bool = False) -> None:
         self.tokenizer = tokenizer
         self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
-        # Opt-in via TLLM_PREFIX_TOKEN_CACHE=1; None when disabled.
-        self._prefix_token_cache = create_prefix_token_cache(tokenizer)
+        # None when disabled or the tokenizer cannot support the cache.
+        self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
+                                    if enable_tokenization_cache else None)
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -189,6 +191,10 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
+    # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
+    # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
+    supports_tokenization_cache: ClassVar[bool] = False
+
     def __init__(self,
                  model_path,
                  config,
@@ -202,6 +208,27 @@ class BaseMultimodalInputProcessor(ABC):
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
+
+    def _init_tokenization_cache(self, enable_tokenization_cache: bool,
+                                 tokenizer: PreTrainedTokenizerBase) -> None:
+        """Build the cache on `tokenizer` if `enable_tokenization_cache`.
+
+        Enable it only if this processor's ids for a text-only prompt equal
+        `tokenizer(prompt, add_special_tokens=False)`.
+        """
+        self._prefix_token_cache_tokenizer = tokenizer
+        self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
+                                    if enable_tokenization_cache else None)
+
+    def _encode_with_tokenization_cache(
+            self, prompt: str,
+            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
+        if (self._prefix_token_cache is None or sampling_params is None
+                or sampling_params.add_special_tokens
+                or sampling_params.truncate_prompt_tokens is not None):
+            return None
+        return self._prefix_token_cache.encode(
+            self._prefix_token_cache_tokenizer, prompt)
 
     def attach_multimodal_embeddings(
         self,
@@ -921,6 +948,7 @@ def create_input_processor(
     tokenizer,
     checkpoint_format: Optional[str] = "HF",
     trust_remote_code: bool = True,
+    enable_tokenization_cache: bool = False,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -932,6 +960,10 @@ def create_input_processor(
             config loading; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
+        enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
+            the tokenization of recent prompts. Ignored for model-specific
+            (multimodal) input processors unless they set
+            ``supports_tokenization_cache``.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -978,13 +1010,20 @@ def create_input_processor(
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
+            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
+                    and input_processor_cls.supports_tokenization_cache):
+                kwargs["enable_tokenization_cache"] = enable_tokenization_cache
             return input_processor_cls(model_path_or_dir,
                                        config,
                                        tokenizer,
                                        trust_remote_code=trust_remote_code,
                                        **kwargs)
 
-    return DefaultInputProcessor(None, None, tokenizer)
+    return DefaultInputProcessor(
+        None,
+        None,
+        tokenizer,
+        enable_tokenization_cache=enable_tokenization_cache)
 
 
 def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:
