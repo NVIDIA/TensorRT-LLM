@@ -60,6 +60,7 @@ from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fp32_router_gemm import MAX_GEMV_TOKENS, fp32_router_gemm
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -586,7 +587,10 @@ class MiniMaxM3Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
+        # Router runs in fp32 to match SGLang. Only small batches take the custom
+        # op; larger ones stay on the plain path to avoid the op's dispatch cost.
+        if hidden_states.shape[0] <= MAX_GEMV_TOKENS:
+            return fp32_router_gemm(hidden_states, self.weight)
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
