@@ -624,8 +624,11 @@ class DecoderModelForCausalLM(nn.Module,
         # Quant config for lm_head (applies to both the attention-DP replicated
         # and TP lm_head below); None keeps it unquantized.
         lm_head_quant_config = self._resolve_lm_head_quant_config(config)
+        # The LM head sees every row; under helix + attention DP at tp_size 1
+        # the TP group shares requests, so it stays vocab-parallel.
+        lm_head_mapping = config.mapping.mapping_for_full_rows()
 
-        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+        if lm_head_mapping.enable_attention_dp and not lm_head_mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
@@ -654,7 +657,7 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                mapping=config.mapping,
+                mapping=lm_head_mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=config.lm_head_gather_output,
                 reduce_output=False,
