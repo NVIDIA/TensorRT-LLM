@@ -777,7 +777,7 @@ def test_qsa_paged_index_scores_match_reference(rows: int, head_dim: int) -> Non
 
 @pytest.mark.parametrize(
     "num_index_heads, expected",
-    [(1, 16), (2, 8), (4, 4), (8, 2), (16, 1), (3, 1), (12, 1), (24, 1), (0, 1)],
+    [(1, 128), (2, 64), (4, 32), (8, 16), (16, 8), (128, 1), (3, 1), (12, 1), (24, 1), (0, 1)],
 )
 def test_qsa_index_scores_query_tile_divides_the_dot_width(
     num_index_heads: int, expected: int
@@ -785,7 +785,7 @@ def test_qsa_index_scores_query_tile_divides_the_dot_width(
     query_tile = _qsa_index_scores_query_tile(num_index_heads)
     assert query_tile == expected
     if query_tile > 1:
-        assert query_tile * num_index_heads == 16
+        assert query_tile * num_index_heads == 128
 
 
 def _paged_index_scores_reference(
@@ -824,7 +824,7 @@ def test_qsa_paged_index_scores_query_tile_matches_row_wise(
     head_dim = 16
     # The query tile only replaces the row-wise kernel above the prefill row
     # boundary, so keep the launch there or the comparison is vacuous.
-    assert _qsa_index_scores_query_tile(num_heads) == 4
+    assert _qsa_index_scores_query_tile(num_heads) == 32
     if rows_per_request == "many":
         # Request boundaries deliberately land inside a query tile.
         lengths = [101, 157, 42]
