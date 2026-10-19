@@ -245,11 +245,9 @@ class TrtllmAttentionMetadata:
         # inside the block's private pages. Both tensors are the cache's.
         metadata.kv_cache_block_offsets = kv_cache.block_offsets(size)[:, :n]
         metadata.kv_lens_cuda_runtime = kv_cache.causal_block_lengths(size)[1][:n]
-        # host_past_key_value_lengths and the context total only bound the kernel's
-        # work; the per-block lengths come from the device tensor above. The bound is
-        # the pool, the most that can ever be resident on it: pin_tokens is not part of
-        # the geometry, so a later rollout of this geometry may hold more than the
-        # current one and still reuse this metadata and the graphs captured over it.
+        # Actual per-block lengths come from the device tensor above. Use pool capacity
+        # as the host upper bound so this metadata and captured graphs remain valid
+        # when the same geometry is reopened with a longer pinned prefix.
         bound = kv_cache.pool_tokens
         metadata.kv_lens_runtime = torch.full((n,), bound, dtype=torch.int32)
         metadata.host_total_kv_lens[0] = n * bound
@@ -446,11 +444,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             k: Key tensor [B, S_kv, H_kv, D] or None if fused
             v: Value tensor [B, S_kv, H_kv, D] or None if fused
             batch_size: Batch size
-            seq_len: Number of real query tokens. Without ``kv_cache`` it equals
-                ``S``. With ``kv_cache`` it may be smaller: rows of ``q``/``k``/``v``
-                past ``seq_len`` are padding added so the sequence splits evenly
-                across ranks; they are neither written to the cache nor attended,
-                and their output rows are zero.
+            seq_len: Query length used for metadata and reshaping. Without ``kv_cache``,
+                the Attention module supplies ``S``, including padding. With ``kv_cache``,
+                the caller supplies the real query length, which may be smaller than
+                ``S``; trailing padding is neither cached nor attended and outputs zero.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
             sparse_backend_args: Module-predicted sparse inputs handed to the core
