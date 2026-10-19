@@ -2075,7 +2075,11 @@ def collectTestResults(pipeline, testFilter, globalVars)
                             --glob 'cov/.cbtscov.*.sqlite' \
                             --out-sqlite cov/cbts_touchmap.sqlite \
                             --out-dir cov/cbts_report \
-                            --source-root llm/tensorrt_llm
+                            --source-root llm --repository-root llm \\
+                            --include 'tensorrt_llm/*.py' --include 'examples/*.py' \\
+                            --include 'scripts/*.py' --include 'tests/test_common/*.py' \\
+                            --include 'conftest.py' --include 'tests/conftest.py' \\
+                            --include 'tests/*/conftest.py'
                     """
                     // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
                     sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"

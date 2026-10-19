@@ -25,7 +25,7 @@ from typing import Optional
 SCHEMA_VERSION = "4"
 STORAGE_SCHEMA = "compact-v1"
 
-_CANON_RE = re.compile(r"(tensorrt_llm/.*)$")
+_CANON_RE = re.compile(r"(?:^|/)(tensorrt_llm/.*)$")
 _REQUIRED_COLUMNS = {
     "stage": {"id", "name"},
     "case_stage": {"id", "test", "stage_id"},
@@ -57,8 +57,15 @@ _REQUIRED_COLUMNS = {
 }
 
 
-def canonicalize_path(path: str) -> str:
-    """Collapse an install/source path to the product-relative database form."""
+def canonicalize_path(path: str, repository_root: Optional[str] = None) -> str:
+    """Collapse a checkout or installed-package path to its repository-relative form."""
+    if not os.path.isabs(path):
+        return path
+    if repository_root:
+        root = os.path.abspath(repository_root).rstrip("/") + "/"
+        absolute = os.path.abspath(path)
+        if absolute.startswith(root):
+            return absolute[len(root) :]
     match = _CANON_RE.search(path)
     return match.group(1) if match else path
 
@@ -334,6 +341,7 @@ def write_leaf_database(
     expected_workers: Mapping[str, int],
     taints: Iterable[tuple[str, str, str, str]] = (),
     diagnostics: Optional[Mapping[str, Mapping[str, str]]] = None,
+    repository_root: Optional[str] = None,
 ) -> None:
     """Write one process snapshot in the same compact schema used by aggregates.
 
@@ -366,7 +374,9 @@ def write_leaf_database(
         case_ids = dict(connection.execute("SELECT test, id FROM case_stage"))
 
         canonical_touches = {
-            test: {(canonicalize_path(file), qualname) for file, qualname in symbols}
+            test: {
+                (canonicalize_path(file, repository_root), qualname) for file, qualname in symbols
+            }
             for test, symbols in touches.items()
         }
         symbol_keys = {symbol for symbols in canonical_touches.values() for symbol in symbols}

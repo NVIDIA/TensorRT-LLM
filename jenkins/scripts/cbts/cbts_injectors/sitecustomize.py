@@ -59,8 +59,8 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
 
     _CONFIG = os.getenv("CBTS_COVERAGE_CONFIG")
 
-    # Read [run] source (product roots) and data_file (dir + stage name) from the rendered rcfile.
-    def _read_config(path: str) -> tuple[list[str], str]:
+    # Source roots bound collection; include patterns match repository-relative Python paths.
+    def _read_config(path: str) -> tuple[list[str], str, Optional[str], list[str]]:
         cp = configparser.ConfigParser()
         try:
             if not cp.read(path):
@@ -68,13 +68,13 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                     f"[cbts] CBTS_COVERAGE_CONFIG={path!r} could not be read; coverage disabled",
                     file=sys.stderr,
                 )
-                return [], "."
+                return [], ".", None, []
         except configparser.Error as exc:
             print(
                 f"[cbts] CBTS_COVERAGE_CONFIG={path!r} is malformed: {exc}; coverage disabled",
                 file=sys.stderr,
             )
-            return [], "."
+            return [], ".", None, []
         src = [ln.strip() for ln in cp.get("run", "source", fallback="").splitlines() if ln.strip()]
         if not src:
             print(
@@ -82,9 +82,13 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             )
         data_file = cp.get("run", "data_file", fallback="")
         data_dir = os.path.dirname(data_file) or "."
-        return src, data_dir
+        repository_root = cp.get("run", "repository_root", fallback="").strip() or None
+        include = [
+            ln.strip() for ln in cp.get("run", "include", fallback="").splitlines() if ln.strip()
+        ]
+        return src, data_dir, repository_root, include
 
-    _src, _data_dir = _read_config(_CONFIG)
+    _src, _data_dir, _repository_root, _include = _read_config(_CONFIG)
     # Named by whoever renders the rcfile (make_coveragerc.sh writes it into data_file too, but
     # that copy is a filename, not an interface).
     _stage = os.environ.get("CBTS_STAGE", "").strip() or "stage"
@@ -98,7 +102,9 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     # process exit sends LEAVE instead of leaving the producer to infer a crash from a bare EOF.
     _subscriber: Optional["ContextSubscriber"] = None
 
-    _tracker = PyStartTracker(_src, _data_dir, _stage)
+    _tracker = PyStartTracker(
+        _src, _data_dir, _stage, repository_root=_repository_root, include=_include
+    )
 
     def _log_taint(nodeid: Optional[str], kind: str, reason: str) -> None:
         """Record and log a taint this process observed about itself.
@@ -326,7 +332,11 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             except ValueError:
                 _activate_max = 120.0
             # Product top-level import names taken from the coverage source roots (e.g. "tensorrt_llm").
-            _product_tops = {str(os.path.basename(p.rstrip("/"))) for p in _src if p}
+            _product_tops = {
+                os.path.basename(p.rstrip("/"))
+                for p in _src
+                if p and os.path.abspath(p) != _tracker.repository_root
+            }
             _watched_imports.update(dict.fromkeys(_product_tops, _activate_tracker))
             sys.meta_path.insert(0, ImportCompletionWatcher(_watched_imports))
 
