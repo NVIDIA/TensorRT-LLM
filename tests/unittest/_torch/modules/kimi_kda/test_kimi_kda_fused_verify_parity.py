@@ -215,8 +215,10 @@ def _assert_fused_epilogue_call(call, runtime, use_full_rank_gate):
     onorm_g = call["onorm_g"]
     assert onorm_g.stride(-1) == 1 and onorm_g.stride(-2) == K
     if use_full_rank_gate:
-        # The gate and q/k/v stay strided views of the fused QKVG output.
-        row_stride = 4 * runtime.proj_size
+        # The gate and q/k/v stay strided views of the fused QKVG output (or
+        # of the stacked qkvg + [f_a | b] verify projection).
+        fused = runtime._qkvgbfa_proj_weight
+        row_stride = 4 * runtime.proj_size if fused is None else fused.shape[0]
         assert onorm_g.stride(1) == row_stride
         for name in ("x_q", "x_k", "x_v"):
             assert call[name].stride(1) == row_stride
@@ -234,20 +236,31 @@ def _rep(name, a, b):
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("num_heads", "use_full_rank_gate", "checkpoint_fp8", "large_state_stride"),
+    ("num_heads", "use_full_rank_gate", "checkpoint_fp8", "large_state_stride", "fuse_verify_proj"),
     [
-        (H, True, False, False),
-        (H, True, True, False),
-        (16, False, False, False),
-        (64, False, False, False),
-        (64, False, False, True),
+        (H, True, False, False, False),
+        (H, True, False, False, True),
+        (H, True, True, False, False),
+        (16, False, False, False, False),
+        (64, False, False, False, False),
+        (64, False, False, True, False),
     ],
-    ids=["full-rank-bf16", "full-rank-fp8", "low-rank-h16", "low-rank-h64", "large-state-stride"],
+    ids=[
+        "full-rank-bf16",
+        "full-rank-bf16-fused-verify-projection",
+        "full-rank-fp8",
+        "low-rank-h16",
+        "low-rank-h64",
+        "large-state-stride",
+    ],
 )
 def test_fused_vs_sequential_two_rounds(
-    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride
+    monkeypatch, num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride, fuse_verify_proj
 ):
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_FUSE_VERIFY_PROJECTION", fuse_verify_proj)
 
     torch.manual_seed(0)
     B = 4
@@ -278,6 +291,17 @@ def test_fused_vs_sequential_two_rounds(
     else:
         assert rt_fused._qkvg_proj_weight is not None
         assert rt_fused._bfa_proj_weight is not None
+    fused = rt_fused._qkvgbfa_proj_weight
+    assert (fused is not None) == fuse_verify_proj
+    if fuse_verify_proj:
+        # Every projection weight is a row view of the stacked buffer.
+        n_qkvg = rt_fused._qkvg_proj_weight.shape[0]
+        assert fused.shape[0] == n_qkvg + rt_fused._bfa_proj_weight.shape[0]
+        assert rt_fused._qkvg_proj_weight.data_ptr() == fused.data_ptr()
+        assert rt_fused._bfa_proj_weight.data_ptr() == fused[n_qkvg:].data_ptr()
+        for name in ("q_proj", "k_proj", "v_proj", "g_proj", "f_a_proj", "b_proj"):
+            weight = getattr(rt_fused, name).weight
+            assert weight.untyped_storage().data_ptr() == fused.untyped_storage().data_ptr()
     assert rt_fused._onorm_w_f32 is not None
     mtp_calls = _capture_mtp_verify(rt_fused)
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")

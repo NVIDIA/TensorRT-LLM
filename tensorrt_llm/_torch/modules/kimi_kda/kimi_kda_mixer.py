@@ -48,6 +48,10 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 # projection kernels. Verify intentionally counts B * num_steps because those
 # flattened token rows form the projection GEMMs' M dimension.
 _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
+# TLLM_KDA_FUSE_VERIFY_PROJECTION=1 (read at import; BF16 full-rank gate only):
+# stack the fused qkvg and [f_a | b] weights into one buffer so the verify
+# projection is a single GEMM instead of two GEMMs on two streams.
+_KDA_FUSE_VERIFY_PROJECTION = os.environ.get("TLLM_KDA_FUSE_VERIFY_PROJECTION", "0") == "1"
 
 
 class _KdaPrequantizedCore(NamedTuple):
@@ -294,6 +298,9 @@ class KimiKDALinearAttention(nn.Module):
         # and batched [f_b; g_b]. FP8 fusion remains full-rank only.
         self._qkvg_proj_weight: Optional[torch.Tensor] = None
         self._bfa_proj_weight: Optional[torch.Tensor] = None
+        # TLLM_KDA_FUSE_VERIFY_PROJECTION: [q | k | v | g | f_a | b | pad]; the
+        # two weights above are row views of it.
+        self._qkvgbfa_proj_weight: Optional[torch.Tensor] = None
         # Low-rank gate only: ``[2, head_dim, D]`` transposed view of the
         # stacked ``[f_b; g_b]`` weights for one batched GEMM.
         self._gate_b_t: Optional[torch.Tensor] = None
@@ -364,7 +371,33 @@ class KimiKDALinearAttention(nn.Module):
                 self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
                 self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
             self._bfa_proj_weight = self._merge_projection_weights(bfa_modules, pad_rows_to=8)
+            if (
+                _KDA_FUSE_VERIFY_PROJECTION
+                and self.use_full_rank_gate
+                and self._qkvg_proj_weight is not None
+            ):
+                self._fuse_verify_projection_weights(qkvg_modules, bfa_modules)
             self._build_decode_kernel_constants()
+
+    def _fuse_verify_projection_weights(
+        self, qkvg_modules: tuple[nn.Linear, ...], bfa_modules: tuple[nn.Linear, ...]
+    ) -> None:
+        """Stack the fused qkvg and [f_a | b] weights into one buffer.
+
+        ``_qkvg_proj_weight``, ``_bfa_proj_weight`` and the source projections
+        are repointed to row views of it, so prefill and decode keep their
+        GEMMs and no weight is stored twice.
+        """
+        n_qkvg = self._qkvg_proj_weight.shape[0]
+        fused = torch.cat([self._qkvg_proj_weight, self._bfa_proj_weight], dim=0).contiguous()
+        self._qkvg_proj_weight = fused[:n_qkvg]
+        self._bfa_proj_weight = fused[n_qkvg:]
+        for modules, offset in ((qkvg_modules, 0), (bfa_modules, n_qkvg)):
+            for module in modules:
+                rows = module.weight.shape[0]
+                module.weight.data = fused[offset : offset + rows]
+                offset += rows
+        self._qkvgbfa_proj_weight = fused
 
     @staticmethod
     def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:
@@ -568,9 +601,12 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache.commit_conv_window(slot_indices, conv_pool)
 
     def _project_gate_inputs(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, bfa: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """``(beta, forget_gate, onorm_g)`` from the fused ``[f_a | (g_a) | b]`` GEMM.
+
+        ``bfa`` is that GEMM's output when the caller already has it (the
+        stacked verify projection of TLLM_KDA_FUSE_VERIFY_PROJECTION).
 
         ``onorm_g`` is the low-rank output gate ``g_b(g_a(x))`` (from the
         batched ``[f_b; g_b]`` GEMM) or ``None`` for the full-rank gate, whose
@@ -578,7 +614,8 @@ class KimiKDALinearAttention(nn.Module):
         ``finalize_decode_weights`` to have published ``_bfa_proj_weight``.
         """
         hd, H = self.head_dim, self.num_heads
-        bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+        if bfa is None:
+            bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
         if self.use_full_rank_gate:
             return bfa[..., hd : hd + H], self.f_b_proj(bfa[..., :hd]), None
         beta = bfa[..., 2 * hd : 2 * hd + H]
@@ -1178,7 +1215,16 @@ class KimiKDALinearAttention(nn.Module):
             return fused_qkvg(x)
 
         onorm_lowrank = None
-        if self._bfa_proj_weight is not None:
+        fused_weight = self._qkvgbfa_proj_weight
+        if fused_weight is not None and qkvg_weight is not None:
+            # One GEMM; qkvg and [f_a | b] are column views of its rows.
+            qkvgbfa = torch.nn.functional.linear(x, fused_weight)
+            n_qkvg = qkvg_weight.shape[0]
+            qkvg = qkvgbfa[..., :n_qkvg]
+            beta, forget_gate, onorm_lowrank = self._project_gate_inputs(
+                x, bfa=qkvgbfa[..., n_qkvg:]
+            )
+        elif self._bfa_proj_weight is not None:
             projection_aux_stream = (
                 self._projection_aux_stream
                 if 0 < num_rows <= _KDA_BFA_MULTISTREAM_MAX_ROWS
