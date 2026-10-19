@@ -40,7 +40,7 @@ def main(file_path, substitutions, in_place):
         'max_queue_delay_microseconds': 0,
     }
     for sub in split(substitutions, ","):
-        key, value = split(sub, ":")
+        key, value = sub.split(":", 1)
         sub_dict[key] = value
 
         assert key in pbtxt.template, f"key '{key}' does not exist in the file {file_path}."
