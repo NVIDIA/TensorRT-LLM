@@ -164,7 +164,8 @@ class GitWorktreeIsolation:
         Removes only the worktree directory. The node's branch — its durable
         output — is deliberately kept alive so a later fan-in node can merge it;
         it is deleted later by :meth:`reclaim`. Tolerates an already-removed
-        worktree so a redundant release cannot fail.
+        worktree, and a directory git no longer counts as one, so a redundant
+        or interrupted release cannot fail.
 
         Raises:
             IsolationError: If the ``git worktree remove`` command fails for a
@@ -177,7 +178,21 @@ class GitWorktreeIsolation:
         if not path.exists():
             # Nothing to free: the worktree was already removed (idempotent).
             return
-        await self._git("worktree", "remove", "--force", str(path))
+        returncode, _stdout, stderr = await self._run_git(
+            "worktree", "remove", "--force", str(path)
+        )
+        if returncode == 0:
+            return
+        if (path / ".git").exists():
+            raise IsolationError(
+                f"git worktree remove --force {path} failed (exit code {returncode}): "
+                f"{stderr.strip()}"
+            )
+        # Without its ``.git`` file the directory is no longer a worktree to git
+        # (an earlier removal stopped partway, or something wrote into it
+        # afterwards): what is left is plain files.
+        shutil.rmtree(path, ignore_errors=True)
+        await self._git("worktree", "prune", check=False)
 
     async def reclaim(self, node: Node) -> None:
         """Free ``node``'s durable output: delete its branch and prune worktrees.

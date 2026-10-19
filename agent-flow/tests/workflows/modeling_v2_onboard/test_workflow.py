@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_flow.orchestration.isolation import IsolationError
 from agent_flow.workflows.modeling_v2_onboard import gpu_pool
 from agent_flow.workflows.modeling_v2_onboard.files import Layout
 from agent_flow.workflows.modeling_v2_onboard.plan import PlanError
@@ -400,6 +401,58 @@ def test_a_jobs_json_the_worker_wrote_itself_does_not_stop_a_cancel(tmp_path, tm
     assert workflow.run() == RunOutcome.SUCCEEDED
     (stuck_agent,) = factory.workers("stuck")
     assert stuck_agent.closed
+
+
+def test_a_reset_a_crash_interrupted_is_finished_on_resume(tmp_path, tmp_git_repo):
+    graph = """\
+  - id: a
+    type: new_op
+  - id: stuck
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a, stuck]
+"""
+    without_stuck = """\
+  - id: a
+    type: new_op
+  - id: land
+    type: merge
+    kind: merge
+    isolation: shared
+    depends_on: [a]
+"""
+
+    async def stuck(agent, prompt, attempt):
+        await asyncio.Event().wait()
+
+    async def planner(agent, prompt):
+        if "Write the plan to" in prompt:
+            _first_batch(prompt).write_text(_plan_text(graph))
+            return
+        if "stuck" in _states(prompt):
+            _edit_plan(prompt).write_text(_plan_text(without_stuck))
+            _decide(prompt, cancel=["stuck"])
+        else:
+            _finish_when_ready(prompt)
+
+    workflow = _workflow(
+        tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=_Workers(stuck=stuck))
+    )
+
+    async def broken_reclaim(node):
+        raise IsolationError("git branch -D failed")
+
+    workflow.isolation.reclaim = broken_reclaim
+    with pytest.raises(IsolationError):
+        workflow.run()
+    assert "node/stuck" in _git(tmp_git_repo, "branch", "--list", "node/*")
+
+    workflow = _workflow(tmp_path, tmp_git_repo, FakeFactory(planner=planner, worker=_Workers()))
+    assert workflow.run() == RunOutcome.SUCCEEDED
+    assert _git(tmp_git_repo, "branch", "--list", "node/*") == ""
 
 
 def test_a_running_task_cannot_be_rewritten_without_cancelling_it(tmp_path, tmp_git_repo):

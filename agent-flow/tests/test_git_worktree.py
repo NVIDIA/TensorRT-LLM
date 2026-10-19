@@ -425,6 +425,19 @@ def test_commit_signs_off_the_node_output(tmp_git_repo, tmp_path):
     anyio.run(iso.release, node)
 
 
+def test_release_removes_a_directory_git_no_longer_counts_as_a_worktree(tmp_git_repo, tmp_path):
+    iso = GitWorktreeIsolation(repo_path=tmp_git_repo, worktrees_root=tmp_path / "wt")
+    node = Node(id="c1", type="impl")
+    cwd = anyio.run(iso.acquire, node)
+    (cwd / ".git").unlink()
+    (cwd / "left.txt").write_text("x")
+
+    anyio.run(iso.release, node)
+
+    assert not cwd.exists()
+    assert str(cwd) not in _git(tmp_git_repo, "worktree", "list")
+
+
 def test_commit_is_noop_when_worktree_has_no_changes(tmp_git_repo, tmp_path):
     """``commit`` returns ``None`` and creates no commit when nothing changed."""
     iso = GitWorktreeIsolation(repo_path=tmp_git_repo, worktrees_root=tmp_path / "wt")

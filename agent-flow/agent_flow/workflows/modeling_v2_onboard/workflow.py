@@ -139,6 +139,9 @@ class _State:
     # The checkout's HEAD when each landing task started, to restore it when
     # the task is reset.
     landing_base: dict[str, str] = field(default_factory=dict)
+    # Tasks the planner reset whose workers, jobs, notes and branches are not
+    # yet all dropped; a resumed run drops them first.
+    resetting: list[str] = field(default_factory=list)
 
     def save(self, path: Path) -> None:
         data = {"version": _STATE_VERSION, **asdict(self)}
@@ -165,6 +168,7 @@ class _State:
             tasks={tid: NodeState(s) for tid, s in data["tasks"].items()},
             finished=[tuple(item) for item in data.get("finished", [])],
             landing_base=data.get("landing_base", {}),
+            resetting=data.get("resetting", []),
         )
 
 
@@ -788,6 +792,7 @@ class ModelingV2OnboardWorkflow:
             task.cancel()
             cancelled.append(task)
         self._resetting |= change.reset
+        self._state.resetting = sorted(self._resetting)
         self._adopt(change.plan)
         tasks = self._state.tasks
         for tid in sorted(change.reset):
@@ -820,16 +825,32 @@ class ModelingV2OnboardWorkflow:
         await asyncio.gather(*cancelled, return_exceptions=True)
         for tid in sorted(change.reset):
             node = change.plan.graph.by_id.get(tid) or change.old_plan.graph.by_id[tid]
-            self._cancel_jobs(tid)
-            result = self.layout.result_path(tid)
-            if result.is_file():
-                attempt = len(self.layout.previous_attempts(tid)) + 1
-                result.replace(self.layout.attempt_path(tid, attempt))
-            shutil.rmtree(self.layout.node_dir(tid), ignore_errors=True)
-            await self._discard(node)
-            if node.isolation == "shared":
-                self._restore_checkout(tid)
-            self._resetting.discard(tid)
+            await self._drop(node)
+
+    async def _drop(self, node: Node) -> None:
+        """Drop one reset task's jobs, notes, branch and checkout changes."""
+        tid = node.id
+        self._cancel_jobs(tid)
+        result = self.layout.result_path(tid)
+        if result.is_file():
+            attempt = len(self.layout.previous_attempts(tid)) + 1
+            result.replace(self.layout.attempt_path(tid, attempt))
+        shutil.rmtree(self.layout.node_dir(tid), ignore_errors=True)
+        await self._discard(node)
+        self._restore_checkout(tid)
+        self._resetting.discard(tid)
+        self._state.resetting = sorted(self._resetting)
+        self._save()
+
+    async def _finish_resets(self) -> None:
+        """Finish the resets a stopped run left half done."""
+        for tid in list(self._state.resetting):
+            node = self._plan.graph.by_id.get(tid)
+            if node is None:
+                # Removed from the plan: what is left of it is a worktree task's.
+                node = Node(id=tid, type="removed")
+            self._resetting.add(tid)
+            await self._drop(node)
 
     def _describe(self, node: Node) -> str:
         tasks = self._state.tasks
@@ -1081,6 +1102,7 @@ class ModelingV2OnboardWorkflow:
             if resumed:
                 text = self.layout.running_plan_path.read_text(encoding="utf-8")
                 self._adopt(parse_plan(text))
+                await self._finish_resets()
             else:
                 await self._initial_plan()
             print_rule(f"[bold cyan]Run (up to {self.max_parallel} workers)[/bold cyan]", self._log)
