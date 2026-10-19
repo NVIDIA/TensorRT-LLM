@@ -6,6 +6,8 @@ Exercises real PNG round-trips, ``video_to_bytes``, and the path-based
 ``resolve_video_format`` contract.
 """
 
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from unittest import mock
@@ -14,6 +16,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tensorrt_llm.media import encoding as media_encoding
 from tensorrt_llm.media.encoding import (
     image_to_bytes,
     resolve_video_format,
@@ -129,6 +132,54 @@ def test_save_video_avi_writes_riff_container(tmp_path):
         head = f.read(12)
     assert head[:4] == b"RIFF"
     assert head[8:12] == b"AVI "
+
+
+def test_ffmpeg_encoder_feeds_frames_without_holding_the_gil(tmp_path):
+    """The ffmpeg encoder pipes the frames' C-order bytes without a GIL-held copy.
+
+    Pipelines hand over non-contiguous videos; copying one while holding the GIL stalls
+    the serving event loop that runs alongside the encode thread.
+    """
+    video = torch.randint(0, 256, (3, 48, 544, 960), dtype=torch.uint8).permute(1, 2, 3, 0)
+    fed = []
+
+    class _FakeFfmpeg:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, input):
+            fed.append(input)
+            return b"", b""
+
+    stop = threading.Event()
+    worst_gap = [0.0]
+
+    def heartbeat():
+        last = time.perf_counter()
+        while not stop.is_set():
+            time.sleep(0.001)
+            now = time.perf_counter()
+            worst_gap[0] = max(worst_gap[0], now - last)
+            last = now
+
+    thread = threading.Thread(target=heartbeat)
+    thread.start()
+    try:
+        with (
+            mock.patch.object(media_encoding, "_get_ffmpeg_path", return_value="ffmpeg"),
+            mock.patch.object(media_encoding.subprocess, "Popen", _FakeFfmpeg),
+        ):
+            media_encoding._FfmpegCliEncoder().encode_video(
+                video, str(tmp_path / "out.mp4"), frame_rate=24.0
+            )
+    finally:
+        stop.set()
+        thread.join()
+
+    assert len(fed) == 1 and bytes(fed[0]) == video.numpy().tobytes()
+    assert worst_gap[0] < 0.1
 
 
 # ---------------------------------------------------------------------------
