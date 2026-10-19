@@ -412,6 +412,7 @@ class ParallelConfig(StrictBaseModel):
     def token_sharded_tp(self) -> bool:
         """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
         return self.tp_layout == "token_sharded"
+
     text_encoder_tp_size: int = Field(
         1,
         ge=1,
