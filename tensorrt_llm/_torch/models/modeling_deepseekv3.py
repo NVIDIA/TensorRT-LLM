@@ -1476,8 +1476,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:
         """
-        For DeepSeek‑R1, MLP TP size is limited by intermediate_size // block_size
-        and must also be multiples of gpus_per_node to avoid expensive inter‑node allreduce.
+        For DeepSeek‑R1, MLP TP size is limited by intermediate_size // block_size.
+        Without the fused post-MLP all-reduce it is also capped at gpus_per_node to
+        avoid an expensive inter‑node allreduce.
 
         Args:
             intermediate_size (int): MLP intermediate size.
@@ -1499,12 +1500,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.mapping.tp_size,
             )
 
-            if tp > self.mapping.gpus_per_node:
+            if tp > self.mapping.gpus_per_node and not self.enable_fusion:
+                # Without the fused post-MLP all-reduce the MLP reduces within
+                # its own group, so a node-local MLP TP stays correct.
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
                 )  # Avoid costly inter-node TP
             else:
+                # The fused post-MLP all-reduce sums over every rank of the TP
+                # group, so the MLP keeps the full TP: a smaller MLP TP would
+                # count each partial sum tp_size / mlp_tp_size times.
                 mlp_tp_size = tp
         return mlp_tp_size
 

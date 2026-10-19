@@ -74,7 +74,9 @@ add_th_common_family(
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  trtllmGenQKVProcessOp.cpp
+  glmMlaKvHalfAppendOp.cpp
+  glmSparseMlaFlashDecodeOp.cpp)
 
 add_th_common_family(
   th_common_gemm_quant
@@ -98,6 +100,8 @@ add_th_common_family(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  glmDenseMlpSmallMOp.cpp
+  glmFusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
@@ -108,6 +112,7 @@ add_th_common_family(
   mxfp8Gemm.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
+  glmFusedEmbeddingOp.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
@@ -116,8 +121,15 @@ add_th_common_family(
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
 # because moe/utils/moeUtilOp.cpp depends on OSS-specific MoE utility types and
 # function signatures.
-add_th_common_family(th_common_moe fusedTopkSoftmax.cpp llama4MinLatency.cpp
-                     noAuxTcOp.cpp dsv3RouterGemmOp.cpp)
+add_th_common_family(
+  th_common_moe
+  fusedTopkSoftmax.cpp
+  llama4MinLatency.cpp
+  noAuxTcOp.cpp
+  dsv3RouterGemmOp.cpp
+  glmRouterGemmOp.cpp
+  glmLowMBf16MoeOp.cpp
+  glmRoutedExpertsOp.cpp)
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
 # th_common_moe with target_sources() so the list stays next to the files.
@@ -128,7 +140,10 @@ add_th_common_family(
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
+  glmDsaHistTopKOp.cpp
   asyncUlyssesOp.cpp
+  glmMnnvlAllgatherOp.cpp
+  glmMnnvlHopOp.cpp
   ulyssesPostUnscatterOp.cpp
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
@@ -139,7 +154,8 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  glmDraftSampleGlueOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
@@ -160,7 +176,8 @@ add_th_common_family(
   loraOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
-  compressorOp.cpp)
+  compressorOp.cpp
+  glmVerifyHeadAcceptOp.cpp)
 
 add_library(
   th_common SHARED
