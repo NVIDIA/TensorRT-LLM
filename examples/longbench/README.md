@@ -1,6 +1,11 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # LongBench Evaluation with TensorRT-LLM and Sparse Attention
 
-This directory contains evaluation scripts for LongBench v1 datasets using TensorRT-LLM backend.
+This directory contains evaluation scripts for LongBench v1 datasets using TensorRT-LLM's PyTorch backend.
 
 > **Note**:  
 LongBench v2 evaluation has been integrated into `trtllm-eval`. Please refer to `tensorrt_llm/evaluate/longbench_v2.py` for details.

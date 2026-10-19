@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <span>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -376,7 +377,7 @@ void testBufferType()
     static_assert(std::is_same_v<T,
         typename DataTypeTraits<dataType.getDataType(), dataType.isUnsigned(), dataType.isPointer()>::type>);
     IBuffer::SharedPtr buffer{std::make_shared<HostBuffer>(size, dataType, allocator)};
-    auto bufferPtr = bufferCast<T>(*buffer);
+    auto bufferPtr = buffer->getBufferPtr<T>();
     auto constexpr max = limits::max();
     bufferPtr[0] = max;
     EXPECT_EQ(bufferPtr[0], max);
@@ -610,7 +611,7 @@ TEST_F(TllmBuffersTest, PinnedPoolStressTest)
     std::shuffle(allocations.begin(), allocations.end(), rnd);
     auto const deallocIdx = allocations.size() / 2;
     auto const deallocSize = allocations.size() - deallocIdx;
-    for (auto const& [ptr, size] : BufferRange{allocations.data() + deallocIdx, deallocSize})
+    for (auto const& [ptr, size] : std::span{allocations.data() + deallocIdx, deallocSize})
     {
         allocator.deallocate(ptr, size);
         totalUsedSize -= size;

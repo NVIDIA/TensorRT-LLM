@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
+import shlex
 import subprocess  # nosec B404
 import sys
 import threading
@@ -67,6 +69,58 @@ def test_mpi_pool_session_forwards_current_rendezvous(monkeypatch):
             ]
         finally:
             session.shutdown()
+
+
+_STALE_SPAWN_ENV = "TLLM_TEST_STALE_SPAWN_ENV"
+_STALE_SPAWN_SCRIPT = f"""
+import json
+import os
+import sys
+from pathlib import Path
+
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+
+def spawn_and_read():
+    session = MpiPoolSession(n_workers=1)
+    try:
+        return session.submit_sync(os.getenv, {_STALE_SPAWN_ENV!r})[0]
+    finally:
+        session.shutdown()
+
+
+os.environ[{_STALE_SPAWN_ENV!r}] = "1"
+while_set = spawn_and_read()
+del os.environ[{_STALE_SPAWN_ENV!r}]
+Path(sys.argv[1]).write_text(json.dumps([while_set, spawn_and_read()]))
+"""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_does_not_resurrect_unset_forwarded_env(
+        tmp_path: Path) -> None:
+    # A singleton's MPI runtime is forked at the process's first spawn and
+    # launches every later worker with that environment, so a fresh process
+    # is needed to make the first spawn happen while the variable is set.
+    env, _ = split_mpi_env()
+    env.pop(_STALE_SPAWN_ENV, None)
+    # Keep PMIX_HOSTNAME, which split_mpi_env() drops with the other PMIX_*
+    # variables: it only overrides the hostname PMIx uses, and CI sets it on
+    # pods whose names are too long for a singleton's MPI_Comm_spawn.
+    if "PMIX_HOSTNAME" in os.environ:
+        env["PMIX_HOSTNAME"] = os.environ["PMIX_HOSTNAME"]
+    worker_env = tmp_path / "worker_env.json"
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "-c", _STALE_SPAWN_SCRIPT,
+         str(worker_env)],
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(worker_env.read_text()) == ["1", None]
 
 
 def flashinfer_environment_probe():
@@ -312,14 +366,16 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     """Environment for a rank-0 launcher-managed run of ``trtllm-llmapi-launch``.
 
     ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
-    address and an HMAC key without importing tensorrt_llm; the stubbed
-    ``python3 -S`` used for the workspace lock exits 0, so the persistent slot
-    is treated as acquired.
+    address and an HMAC key without importing tensorrt_llm. Stdlib-only
+    ``python3 -S`` calls use the test interpreter.
     """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir(exist_ok=True)
     python_stub = stub_bin / "python3"
     python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-S\" ]; then\n"
+                           f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
+                           "fi\n"
                            "if [ \"$1\" = \"-c\" ]; then\n"
                            "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
                            "fi\n")
@@ -405,6 +461,77 @@ def test_llmapi_launch_temporary_fallback_leaves_cubin_dir_unset(
     assert "temporary FlashInfer JIT workspace" in result.stderr
     # The fallback workspace, artifacts included, is removed at exit.
     assert list(tmpdir.iterdir()) == []
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    python_stub = stub_bin / "python3"
+    python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-S\" ]; then\n"
+                           f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
+                           "fi\n"
+                           "if [ \"$1\" = \"-c\" ]; then\n"
+                           "    echo ipc:///tmp/trtllm-unified-cache-test\n"
+                           "fi\n")
+    python_stub.chmod(0o755)
+    openssl_stub = stub_bin / "openssl"
+    openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
+    openssl_stub.chmod(0o755)
+
+    env = os.environ.copy()
+    for name in (
+            "SLURM_NTASKS",
+            "SLURM_PROCID",
+            "OMPI_COMM_WORLD_SIZE",
+            "OMPI_COMM_WORLD_RANK",
+            "PMI_ID",
+            "FLASHINFER_WORKSPACE_BASE",
+            "FLASHINFER_CUBIN_DIR",
+            "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+    ):
+        env.pop(name, None)
+    cache_root = tmp_path / "home" / "unified"
+    env["PMI_RANK"] = "0"
+    env["HOME"] = str(tmp_path / "home")
+    env["TRTLLM_CACHE_DIR"] = "~/unified"
+    env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
+    env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
+
+    launcher = Path(__file__).parents[
+        3] / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch"
+    result = subprocess.run(  # nosec B603
+        ["bash", str(launcher), "/usr/bin/env"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    workspace = cache_root / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    assert "better cache reuse" in result.stderr
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_matches_bootstrap_expansion_with_trailing_home(
+        tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    cache_root = home / "unified"
+    env = _launcher_env(tmp_path, f"{home}{os.sep}")
+    env["TRTLLM_CACHE_DIR"] = "~/unified"
+    env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
+
+    result = _run_launcher_env(env)
+
+    workspace = cache_root / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
 
 
 @pytest.mark.cpu_only

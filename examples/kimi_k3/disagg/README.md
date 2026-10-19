@@ -38,8 +38,9 @@ for constraints.
 - `disable_overlap_scheduler: true` on the ctx server (disagg
   requirement) and on the gen server (SA runs eager; also keeps the
   SA-off smoke maximally comparable).
-- `enable_block_reuse: false`, `tokens_per_block: 64`, no chunked
-  prefill, beam width 1 (model requirements).
+- `enable_block_reuse: false`, no chunked prefill, beam width 1 (model
+  requirements); `tokens_per_block: 64` is kept for historical reasons
+  (older TRTLLM-Gen MLA kernels required it).
 - `max_tokens_in_buffer: 8448` covers the target max ISL of 8192; raise
   it together with `max_num_tokens`/`max_seq_len` for longer ISL.
 - **`kv_cache_bounce_size_mb: 1024` on both sides**: the V2 transceiver's default

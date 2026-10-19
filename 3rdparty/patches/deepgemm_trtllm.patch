@@ -398,7 +398,7 @@ index 0e637da..92e4ce7 100644
                                            const torch::Tensor& b, const torch::Tensor& sfb,
                                            const std::optional<torch::Tensor>& c,
 diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
-index f703a0c..e2cb532 100644
+index 8f93050..4ad1196 100644
 --- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
 +++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
 @@ -13,6 +13,62 @@
@@ -520,7 +520,7 @@ index f703a0c..e2cb532 100644
  
      // Launch
      jit->launch(
-@@ -241,4 +258,29 @@ static void __instantiate_kernel() {{
+@@ -242,4 +259,29 @@ static void __instantiate_kernel() {{
          tensor_map_shared_l2_weights_sf);
  }
  
@@ -883,10 +883,10 @@ index e9b68a2..a018c99 100644
      // Launch
      jit->launch(
 diff --git a/csrc/runtime/jit.hpp b/csrc/runtime/jit.hpp
-index 7ee09da..f167fe8 100644
+index f95922f..9719953 100644
 --- a/csrc/runtime/jit.hpp
 +++ b/csrc/runtime/jit.hpp
-@@ -34,4 +34,19 @@ inline void init_jit(const std::string& library_root_path) {
+@@ -41,4 +41,19 @@ inline void init_jit(const std::string& library_root_path) {
      });
  }
  
@@ -907,18 +907,18 @@ index 7ee09da..f167fe8 100644
 +
  }  // namespace deep_gemm
 diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
-index 1c18563..0b664ff 100644
+index 4d6887d..31b59bc 100644
 --- a/deep_gemm/__init__.py
 +++ b/deep_gemm/__init__.py
-@@ -23,6 +23,7 @@ from ._C import (
-     set_pdl,
-     get_pdl,
+@@ -25,6 +25,7 @@ from ._C import (
+     set_barrier_timeout_seconds,
+     get_barrier_timeout_seconds,
      use_deterministic_algorithms,
 +    take_compiled_kernel_names,
  )
  
  # cuBLASLt Kernels
-@@ -36,6 +37,8 @@ from ._C import (
+@@ -38,6 +39,8 @@ from ._C import (
  # DeepGEMM Kernels
  from ._C import (
      # FP8-FP4 GEMMs (accept any FP8/FP4 operand combination)
@@ -927,7 +927,7 @@ index 1c18563..0b664ff 100644
      fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
      fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
      m_grouped_fp8_fp4_gemm_nt_contiguous,
-@@ -67,6 +70,9 @@ from ._C import (
+@@ -69,6 +72,9 @@ from ._C import (
      einsum,
      fp8_einsum,
      # Attention kernels
@@ -937,7 +937,7 @@ index 1c18563..0b664ff 100644
      fp8_fp4_mqa_logits,
      get_mqa_logits_metadata,
      get_paged_mqa_logits_metadata,
-@@ -85,6 +91,7 @@ from ._C import (
+@@ -87,6 +93,7 @@ from ._C import (
      transform_sf_into_required_layout,
      # MegaMoE
      get_block_m_for_mega_moe,

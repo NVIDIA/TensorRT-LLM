@@ -100,6 +100,9 @@ class _MnnvlWorkspace(TypedDict):
     # An MPI communicator under MPI, the TP ProcessGroup under a non-MPI orchestrator (Ray).
     # None between checkpoint_prepare() and a successful checkpoint_restore().
     comm: Optional[Union[_MpiCommProtocol, "torch.distributed.ProcessGroup"]]
+    # Set once the workspace is handed out during CUDA graph capture: the captured graphs launch on its buffers and
+    # flags, so a larger workspace that replaces it must keep it alive.
+    captured: bool
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -257,12 +260,20 @@ def get_or_scale_allreduce_mnnvl_workspace(
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
-            return workspace
+            return _mark_if_capturing(workspace)
 
     workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(mapping)
     with workspace_lock:
-        return _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
-                                                       buffer_size_bytes)
+        return _mark_if_capturing(
+            _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
+                                                    buffer_size_bytes))
+
+
+def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
+    """Record that a CUDA graph being captured launches on this workspace."""
+    if not workspace["captured"] and torch.cuda.is_current_stream_capturing():
+        workspace["captured"] = True
+    return workspace
 
 
 def _get_or_scale_allreduce_mnnvl_workspace(
@@ -288,6 +299,10 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MNNVL all-reduce workspace creation or growth during CUDA graph capture: run each shape once "
+                "outside capture first")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
@@ -348,6 +363,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 "buffer_flags": buffer_flags,
                 "buffer_size_bytes": buffer_size_bytes,
                 "comm": comm,
+                "captured": False,
             }
         except Exception as error:
             candidate_error = error
@@ -364,6 +380,13 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         _initialize_allreduce_mnnvl_protocol(candidate_workspace)
         # Hand ownership of the communicator to the workspace.
         pending_comms.pop(mapping, None)
+        previous_workspace = allreduce_mnnvl_workspaces.get(mapping)
+        if previous_workspace is not None and previous_workspace["captured"]:
+            # CUDA graphs captured on the previous workspace keep launching on its buffers and flags. One that no
+            # capture used is released by the replacement below: every rank had synchronized its device before the
+            # protocol reset above returned, so no kernel still uses it.
+            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.setdefault(
+                mapping, []).append(previous_workspace)
         allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
@@ -755,6 +778,11 @@ class MNNVLAllReduce(nn.Module):
     allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
                                                      _MnnvlWorkspace]] = {}
 
+    # Workspaces a larger one replaced after a CUDA graph capture used them. Those graphs still launch on their buffers
+    # and flags, so they stay alive with the process. The checkpoint hooks cover only the current workspace.
+    allreduce_mnnvl_retired_workspaces: typing.ClassVar[dict[
+        Mapping, list[_MnnvlWorkspace]]] = {}
+
     # Communicators split for a mapping whose workspace construction has not
     # succeeded yet. Ownership moves to the workspace once it is published, so
     # an entry here is never reachable from allreduce_mnnvl_workspaces.
@@ -769,6 +797,7 @@ class MNNVLAllReduce(nn.Module):
         threading.Lock] = threading.Lock()
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
+        AllReduceFusionOp.RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -968,7 +997,11 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params.scale,  # scale
             int(fusion_op),
         )
-        return tuple(outputs) if is_fusion else outputs[0]
+        # RMS_NORM returns norm_out alone; match AllReduce.forward's
+        # "unwrap a single-element result" contract so callers see a tensor.
+        if is_fusion and len(outputs) > 1:
+            return tuple(outputs)
+        return outputs[0]
 
 
 class AllReduce(nn.Module):

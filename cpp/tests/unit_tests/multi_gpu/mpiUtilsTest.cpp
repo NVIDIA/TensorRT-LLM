@@ -129,7 +129,7 @@ void testBroadcastBuffer()
     auto const value = rank == root ? expectedValue : BufferType{};
     auto constexpr bufferSize = 1024;
     auto buffer = tr::BufferManager::cpu(bufferSize, tr::TRTDataType<BufferType>::value);
-    auto* data = tr::bufferCast<BufferType>(*buffer);
+    auto* data = buffer->template getBufferPtr<BufferType>();
     std::fill(data, data + bufferSize, value);
     comm.bcast(*buffer, root);
     EXPECT_TRUE(std::all_of(data, data + bufferSize, [&](auto x) { return x == expectedValue; }));
