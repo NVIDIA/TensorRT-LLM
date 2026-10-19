@@ -4389,12 +4389,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     } else if (stageName.contains("-Generic-")) {
         // Generic stages select tests by marker expression rather than backend ownership.
         makoArgs += ["backend=generic"]
-    } else if (stageName.contains("-Verl-")) {
-        // If stageName contains "-Verl-", add "backend=verl" to makoArgs
-        // At this point, only tests with backend=verl or unspecified backend will be run
-        makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -6603,12 +6599,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
         "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
-        // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
-        // numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under
-        // the interpreter. Importing tensorrt_llm then fails and every test in the stage goes
-        // with it, which makes the whole stage noise rather than signal.
-        // "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
