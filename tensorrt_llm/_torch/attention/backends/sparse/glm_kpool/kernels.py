@@ -172,6 +172,10 @@ def kpool_update(
     ``i`` -- the packed rows of several context requests. In-place; no host sync,
     fixed shapes: CUDA-graph safe.
     """
+    if request_ids is not None and positions.dim() != 1:
+        # The same-pool skip compares POS[b] with POS[b + 1], which is only valid
+        # when consecutive rows belong to one table.
+        raise ValueError("kpool_update: request_ids requires 1-D positions")
     rows_per_table = positions.shape[1] if positions.dim() == 2 else 1
     positions = positions.reshape(-1)
     n = positions.shape[0]
@@ -258,6 +262,10 @@ def append_paged_state_rows(
     columns of each indexer row. Pools are slot-major ``[slots, tokens_per_block,
     dim]`` views with arbitrary slot/row strides. CUDA-graph safe.
     """
+    for name, width in (("latent", latent.shape[-1]), ("packed", packed.shape[-1])):
+        # The kernel spans each row with tl.arange, which needs a power-of-two width.
+        if width <= 0 or width & (width - 1):
+            raise ValueError(f"append_paged_state_rows: {name} width {width} is not a power of two")
     rows_per_table = positions.shape[1]
     latent = latent.reshape(-1, latent.shape[-1])
     packed = packed.reshape(-1, packed.shape[-1])

@@ -466,6 +466,7 @@ def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
         (8, 2052, 16, torch.bfloat16),
         (8, 2052, 16, torch.float8_e4m3fn),
         (256, 128, 16, torch.float8_e4m3fn),
+        (8, 2052, 32, torch.float8_e4m3fn),
         (64, 256, 64, torch.float8_e4m3fn),
     ],
 )
@@ -796,3 +797,34 @@ def test_compact_sparse_rows_tail_and_empty_rows(width):
         assert torch.equal(packed[row], expected)
         assert int(lengths[row]) == max(values.numel(), 1)
         assert bool(nonempty[row]) == (values.numel() > 0)
+
+
+def test_cache_update_kernels_reject_unsupported_layouts():
+    """Layouts the kernels cannot address fail before launch instead of misbehaving."""
+    table = torch.zeros(2, 1, dtype=torch.int64, device="cuda")
+    pool = torch.zeros(1, TPB, 3 * HD, dtype=torch.bfloat16, device="cuda")
+    ape = torch.zeros(KPOOL, HD, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="request_ids requires 1-D positions"):
+        kpool_update(
+            pool,
+            table,
+            torch.zeros(2, 2, dtype=torch.int64, device="cuda"),
+            ape,
+            TPB,
+            head_dim=HD,
+            kpool=KPOOL,
+            request_ids=torch.zeros(4, dtype=torch.int32, device="cuda"),
+        )
+    latent = torch.zeros(1, 1, 512, dtype=torch.bfloat16, device="cuda")
+    packed = torch.zeros(1, 1, 3 * HD, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="packed width 384 is not a power of two"):
+        append_paged_state_rows(
+            latent,
+            packed,
+            torch.zeros(1, 1, dtype=torch.int64, device="cuda"),
+            table[:1],
+            torch.zeros(1, TPB, 512, dtype=torch.bfloat16, device="cuda"),
+            pool,
+            TPB,
+            None,
+        )

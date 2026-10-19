@@ -631,7 +631,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         kv_rows, _, _ = latent_pool_rows(state.latent_pool)
         num_query_tokens, num_query_heads, head_dim = q.shape
         num_cache_rows = kv_rows.shape[0]
-        native_fp8 = kv_rows.dtype == torch.float8_e4m3fn and num_query_heads in (16, 64)
+        native_fp8 = kv_rows.dtype == torch.float8_e4m3fn and num_query_heads in (16, 32, 64)
         native_supported = (
             q.is_cuda
             and q.dtype == torch.bfloat16

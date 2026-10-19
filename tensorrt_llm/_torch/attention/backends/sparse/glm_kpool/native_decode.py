@@ -24,7 +24,10 @@ class GlmKpoolNativeDecode:
 
     def __init__(self) -> None:
         self._counter: torch.Tensor | None = None
-        self._workspace_size: int | None = None
+        self._workspace_size = 0
+        self._counter_size = 0
+        # (query dtype, max query rows, query heads) the sizes were computed for.
+        self._sized_for: tuple[torch.dtype, int, int] | None = None
 
     def prepare_workspace(
         self,
@@ -39,11 +42,21 @@ class GlmKpoolNativeDecode:
         from ...fmha.flashinfer_trtllm_gen import _get_generation_workspace_layout
 
         capturing = torch.cuda.is_current_stream_capturing()
-        if self._workspace_size is None:
+        sized_for = (query_dtype or q.dtype, max_query_rows, q.shape[1])
+        if sized_for != self._sized_for:
+            # Host-side queries; recomputed only when the shape they depend on changes.
             layout = _get_generation_workspace_layout(
-                query_dtype or q.dtype, max_query_rows, max_query_rows, q.shape[1], 512, 1, 0
+                sized_for[0], max_query_rows, max_query_rows, q.shape[1], 512, 1, 0
             )
-            self._workspace_size = int(layout["trtllm_gen_workspace_size"])
+            sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+            self._workspace_size = max(
+                self._workspace_size, int(layout["trtllm_gen_workspace_size"])
+            )
+            self._counter_size = max(
+                self._counter_size,
+                get_trtllm_gen_multi_ctas_kv_counter_bytes(max_query_rows, q.shape[1], sm_count),
+            )
+            self._sized_for = sized_for
         workspace = metadata.effective_workspace
         if workspace is None:
             raise RuntimeError("glm_kpool native decode requires prepared attention workspace")
@@ -53,15 +66,13 @@ class GlmKpoolNativeDecode:
             workspace.resize_(
                 (self._workspace_size + workspace.element_size() - 1) // workspace.element_size()
             )
-        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-        size = get_trtllm_gen_multi_ctas_kv_counter_bytes(max_query_rows, q.shape[1], sm_count)
-        if self._counter is None or self._counter.numel() < size:
+        if self._counter is None or self._counter.numel() < self._counter_size:
             if capturing:
                 raise RuntimeError(
                     "glm_kpool native decode counters must be allocated before capture"
                 )
             # TRTLLM-GEN resets its counters after each invocation.
-            self._counter = torch.zeros(size, dtype=torch.uint8, device=q.device)
+            self._counter = torch.zeros(self._counter_size, dtype=torch.uint8, device=q.device)
 
     def __call__(
         self,
