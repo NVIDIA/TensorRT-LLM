@@ -48,7 +48,7 @@ def test_runner_llm_args_follow_mapping_and_model_defaults(monkeypatch):
             raise _StopBeforeLoad
 
     monkeypatch.setattr(runner_module, "ModelLoader", _RecordingModelLoader)
-    monkeypatch.setattr(runner_module, "_construct_checkpoint_loader", lambda *args: object())
+    monkeypatch.setattr(runner_module, "construct_checkpoint_loader", lambda *args: object())
 
     mapping = Mapping(
         world_size=4,
