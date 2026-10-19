@@ -158,7 +158,8 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
 SPEC_DEC_CTX_COALESCE_ITERS = 2
 SPEC_DEC_CTX_COALESCE_MAX_TOKENS_RATIO = 0.5
 _BATCH_WAIT_FIELDS = frozenset(
-    ("batch_wait_timeout_iters", "batch_wait_max_tokens_ratio"))
+    ("batch_wait_timeout_ms", "batch_wait_timeout_iters",
+     "batch_wait_max_tokens_ratio"))
 
 
 def resolve_spec_dec_batch_wait_defaults(
@@ -197,7 +198,8 @@ def resolve_spec_dec_batch_wait_defaults(
         return None
     if fields_set & _BATCH_WAIT_FIELDS:
         return None
-    if (llm_args.batch_wait_timeout_iters != 0
+    if (llm_args.batch_wait_timeout_ms != 0
+            or llm_args.batch_wait_timeout_iters != 0
             or llm_args.batch_wait_max_tokens_ratio != 0):
         return None
     if enable_attention_dp or is_disaggregated:
@@ -711,26 +713,8 @@ class PyExecutor:
                     "TLLM_ADP_BALANCE_LOW_OCCUPANCY_TIMEOUT_ITERS must be "
                     "between 0 and attention_dp_config.timeout_iters "
                     f"({self.attention_dp_time_out_iters})")
-        self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
-        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
-        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
-        spec_dec_batch_wait = resolve_spec_dec_batch_wait_defaults(
-            self.llm_args,
-            self.model_engine,
-            self.enable_attention_dp,
+        self._init_batch_waiting(
             is_disaggregated=kv_cache_transceiver is not None)
-        if spec_dec_batch_wait is not None:
-            (self.batch_wait_timeout_iters,
-             self.batch_wait_max_tokens_ratio) = spec_dec_batch_wait
-            logger.info(
-                "One-model EAGLE3 with decode CUDA graphs: coalescing new "
-                "context requests for up to "
-                f"{self.batch_wait_timeout_iters} iterations while generation "
-                "is in flight (batch_wait_timeout_iters="
-                f"{self.batch_wait_timeout_iters}, batch_wait_max_tokens_ratio="
-                f"{self.batch_wait_max_tokens_ratio}). Set "
-                "batch_wait_timeout_iters=0 to disable.")
-        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -7222,6 +7206,30 @@ class PyExecutor:
                              for req in scheduled_requests.generation_requests
                              if getattr(req, "is_attention_dp_dummy", False))
         return num_ctx_tokens, num_gen_tokens
+
+    def _init_batch_waiting(self, is_disaggregated: bool) -> None:
+        """Resolve the batch-waiting knobs, including the one-model EAGLE3
+        default from resolve_spec_dec_batch_wait_defaults."""
+        self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
+        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
+        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
+        spec_dec_batch_wait = resolve_spec_dec_batch_wait_defaults(
+            self.llm_args,
+            self.model_engine,
+            self.enable_attention_dp,
+            is_disaggregated=is_disaggregated)
+        if spec_dec_batch_wait is not None:
+            (self.batch_wait_timeout_iters,
+             self.batch_wait_max_tokens_ratio) = spec_dec_batch_wait
+            logger.info(
+                "One-model EAGLE3 with decode CUDA graphs: coalescing new "
+                "context requests for up to "
+                f"{self.batch_wait_timeout_iters} iterations while generation "
+                "is in flight (batch_wait_timeout_iters="
+                f"{self.batch_wait_timeout_iters}, batch_wait_max_tokens_ratio="
+                f"{self.batch_wait_max_tokens_ratio}). Set "
+                "batch_wait_timeout_iters=0 to disable.")
+        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
