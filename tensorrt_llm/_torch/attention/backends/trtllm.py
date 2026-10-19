@@ -373,8 +373,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         self.mixed_precision_kv_views = None
         if callable(
-                getattr(self.kv_cache_manager, "get_mixed_precision_buffers",
-                        None)):
+                getattr(self.kv_cache_manager,
+                        "get_mixed_precision_page_tables", None)):
             self.mixed_precision_kv_views = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}

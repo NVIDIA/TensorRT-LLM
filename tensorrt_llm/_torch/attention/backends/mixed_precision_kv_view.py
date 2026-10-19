@@ -50,8 +50,9 @@ class MixedPrecisionKVView:
         # Native BF16 paged-context FMHA uses 32-token pages.
         self.tokens_per_block = min(self.block_size, 32) if trtllm else self.block_size
         self.history = manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
-        (self.high, _), (self.scales, _) = manager.get_mixed_precision_buffers(
-            layer_idx, metadata.request_ids, metadata.kv_layout
+        self.high = manager.get_buffers(layer_idx, metadata.kv_layout, mixed_precision_pool="high")
+        self.scales = manager.get_buffers(
+            layer_idx, metadata.kv_layout, mixed_precision_pool="scales"
         )
         if self.layout != metadata.kv_layout:
             # Reinterpret pool strides without moving stored KV.
@@ -77,10 +78,7 @@ class MixedPrecisionKVView:
 
     def update(self, metadata: AttentionMetadata, layer_idx: int) -> None:
         manager = metadata.kv_cache_manager
-        (_, high_ids), (_, scale_ids) = manager.get_mixed_precision_buffers(
-            layer_idx, metadata.request_ids, metadata.kv_layout
-        )
-        history_ids = manager.get_batch_cache_indices(metadata.request_ids, layer_idx)
+        page_tables = manager.get_mixed_precision_page_tables(metadata.request_ids, layer_idx)
         cached_lengths = metadata.kv_cache_params.num_cached_tokens_per_seq
         seq_lens = metadata.seq_lens.tolist()
         lengths = [a + b for a, b in zip(cached_lengths, seq_lens)]
@@ -93,7 +91,7 @@ class MixedPrecisionKVView:
         tables = torch.full(
             (3, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        for role, rows in enumerate((history_ids, scale_ids, high_ids)):
+        for role, rows in enumerate(page_tables):
             for row, pages in enumerate(rows):
                 count = (lengths[row] + self.block_size - 1) // self.block_size
                 if role < 2 and (len(pages) < count or any(page < 0 for page in pages[:count])):
@@ -111,7 +109,7 @@ class MixedPrecisionKVView:
             (2, manager.max_batch_size), torch.int32, "mixed_lengths", metadata.is_cuda_graph
         )[:, :batch]
         self.lengths.copy_(
-            maybe_pin_memory(torch.tensor([cached_lengths, lengths], dtype=torch.int32)),
+            torch.tensor([cached_lengths, lengths], dtype=torch.int32, pin_memory=prefer_pinned()),
             non_blocking=True,
         )
         self.max_new_tokens_per_request = max(seq_lens, default=0)
@@ -136,14 +134,22 @@ class MixedPrecisionKVView:
             self.metadata.kv_cache_manager = self
             self.metadata.kv_layout = self.layout
             self.metadata.use_paged_context_fmha = True
-            offsets = self.block_offsets()
+            ordinals = torch.arange(self.max_blocks_per_seq, dtype=torch.int32)
+            pages = torch.tensor(self.page_starts[:-1], dtype=torch.int32)[:, None] + ordinals
+            offsets = torch.stack(
+                (self.kv_factor * pages, self.kv_factor * pages + self.kv_factor - 1), dim=1
+            )
+            valid = ordinals < torch.tensor(self.page_counts, dtype=torch.int32)[:, None]
             block_offsets = buffers.get_buffer(
                 (1, manager.max_batch_size, 2, self.max_blocks_per_seq),
                 torch.int32,
                 f"mixed_block_offsets_{layer_idx}",
                 metadata.is_cuda_graph,
             )[:, : len(lengths)]
-            block_offsets.copy_(offsets, non_blocking=True)
+            block_offsets.copy_(
+                maybe_pin_memory(offsets.masked_fill(~valid[:, None], -1).unsqueeze(0)),
+                non_blocking=True,
+            )
             self.metadata.kv_cache_block_offsets = block_offsets
         self.metadata.mixed_precision_kv_views = None
 
@@ -189,14 +195,6 @@ class MixedPrecisionKVView:
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-
-    def block_offsets(self) -> torch.Tensor:
-        ordinals = torch.arange(self.max_blocks_per_seq, dtype=torch.int32)
-        pages = torch.tensor(self.page_starts[:-1], dtype=torch.int32)[:, None] + ordinals
-        kv_factor = self.pool.shape[1]
-        offsets = torch.stack((kv_factor * pages, kv_factor * pages + kv_factor - 1), dim=1)
-        valid = ordinals < torch.tensor(self.page_counts, dtype=torch.int32)[:, None]
-        return maybe_pin_memory(offsets.masked_fill(~valid[:, None], -1).unsqueeze(0))
 
     def writeback(self) -> None:
         """Write every new token to the primary pool and its retained high page."""

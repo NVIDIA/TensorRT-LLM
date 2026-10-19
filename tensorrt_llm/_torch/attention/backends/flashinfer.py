@@ -1085,8 +1085,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         super().__post_init__()
         self.mixed_precision_kv_views = None
         if callable(
-                getattr(self.kv_cache_manager, "get_mixed_precision_buffers",
-                        None)):
+                getattr(self.kv_cache_manager,
+                        "get_mixed_precision_page_tables", None)):
             self.mixed_precision_kv_views = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 

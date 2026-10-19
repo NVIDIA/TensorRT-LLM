@@ -155,7 +155,13 @@ def test_mixed_precision_preserves_native_and_shared_kv_storage(dtype):
 )
 def test_native_state_layout_is_unchanged(manager, state):
     config = manager.kv_cache_manager_py_config
-    with patch.object(manager, "high_layers", {}), patch.object(manager, "high_low_pool_ratio", 1):
+    with (
+        patch.object(manager, "high_layers", {}),
+        patch.object(manager, "high_low_pool_ratio", 1),
+        patch.object(manager, "pp_layers", [0, 1]),
+        patch.object(manager, "num_kv_heads_per_layer", [2, 2]),
+        patch.object(manager, "max_attention_window_vec", [None, 513]),
+    ):
         configured = manager._build_cache_config(
             replace(config, layers=[config.layers[0], state], initial_pool_ratio=[0.5, 0.5])
         )

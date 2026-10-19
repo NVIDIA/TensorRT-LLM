@@ -244,7 +244,7 @@ def test_optimized_two_pool_prefill_and_decode(
         arena = manager.get_staging_buffer((1,), torch.uint8).data_ptr()
         history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
         scales_before = token_major(
-            manager.get_mixed_precision_buffers(0, request_ids, kv_layout)[1][0]
+            manager.get_buffers(0, kv_layout, mixed_precision_pool="scales")
         ).clone()
         assert_native_config()
         if backend is TrtllmAttention:
@@ -272,10 +272,11 @@ def test_optimized_two_pool_prefill_and_decode(
         assert manager.get_staging_buffer((1,), torch.uint8).data_ptr() == arena
         assert_native_config()
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
-        all_history_ids = manager.get_batch_cache_indices(request_ids, 0)
-        (high, all_high_ids), (scales, all_scale_ids) = manager.get_mixed_precision_buffers(
-            0, request_ids, kv_layout
+        all_history_ids, all_scale_ids, all_high_ids = manager.get_mixed_precision_page_tables(
+            request_ids, 0
         )
+        high = manager.get_buffers(0, kv_layout, mixed_precision_pool="high")
+        scales = manager.get_buffers(0, kv_layout, mixed_precision_pool="scales")
         scales = token_major(scales)
         high = token_major(high)
         for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
@@ -552,7 +553,8 @@ def test_mla_preserves_native_rope_and_attention(backend):
             )
             assert torch.isfinite(output).all()
             assert metadata.kv_cache_manager is manager
-        (high, ids), _ = manager.get_mixed_precision_buffers(0, [0], "NHD")
+        high = manager.get_buffers(0, mixed_precision_pool="high")
+        _, _, ids = manager.get_mixed_precision_page_tables([0], 0)
         assert high.shape[1] == 1
         assert ids[0][0] >= 0 and ids[0][1] == kv.BAD_PAGE_INDEX and ids[0][-1] >= 0
     finally:
