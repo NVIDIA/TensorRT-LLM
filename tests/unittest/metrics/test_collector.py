@@ -778,6 +778,16 @@ class TestLogIterationStatsKvCacheIteration:
             == 10
         )
 
+    def test_connector_load_latencies_observed(self):
+        collector = _make_kv_iter_collector()
+        collector.log_iteration_stats({"iterConnectorLoadLatenciesSec": [0.5, 1.25]})
+        collector.log_iteration_stats({"iterConnectorLoadLatenciesSec": []})
+        collector.log_iteration_stats({})
+        assert _get_histogram_count(collector, "histogram_kv_connector_load_latency") == 2
+        assert _get_histogram_sum(
+            collector, "histogram_kv_connector_load_latency"
+        ) == pytest.approx(1.75)
+
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""
         collector = _make_kv_iter_collector()

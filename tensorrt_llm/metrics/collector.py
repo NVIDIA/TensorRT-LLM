@@ -73,6 +73,7 @@ class MetricsCollector:
             trtllm_kv_cache_iter_partial_reused_blocks_total
             trtllm_kv_cache_iter_missed_blocks_total
             trtllm_kv_cache_iter_connector_reused_blocks_total
+            trtllm_kv_connector_load_latency_seconds
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
@@ -299,6 +300,16 @@ class MetricsCollector:
             "from an external store (a subset of the reused blocks). Counted "
             "when the load is accepted, before an asynchronous transfer "
             "completes.",
+            labelnames=self.labels.keys())
+        self.histogram_kv_connector_load_latency = Histogram(
+            name=self.metric_prefix + "kv_connector_load_latency_seconds",
+            documentation=
+            "Histogram of the time from a KV cache connector's asynchronous "
+            "load being accepted to it completing on every rank, in seconds.",
+            buckets=[
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                10.0, 30.0, 60.0
+            ],
             labelnames=self.labels.keys())
         self.kv_cache_gen_alloc_blocks_total = Counter(
             name=self.metric_prefix + "kv_cache_gen_alloc_blocks_total",
@@ -919,6 +930,9 @@ class MetricsCollector:
             iteration_stats.get("kvCacheLevelTiers"))
         self._log_connector_cached_tokens(
             iteration_stats.get("iterConnectorCachedTokens"))
+        for latency in iteration_stats.get("iterConnectorLoadLatenciesSec", []):
+            self._log_histogram(self.histogram_kv_connector_load_latency,
+                                latency)
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(

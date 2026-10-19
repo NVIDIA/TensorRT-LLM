@@ -34,8 +34,9 @@ The Connector API is split into two parts:
 To implement a custom KV connector, you need to implement both the scheduler and worker-side interfaces.
 """
 
+import time
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -758,6 +759,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._prefix_completion_tracker: PrefixLoadCompletionTracker | None = None
         self._deferred_load_terminations: Dict[int, LlmRequest] = {}
         self._finished_load_terminations: List[LlmRequest] = []
+        # Monotonic acceptance time of each request's outstanding asynchronous load.
+        self._async_load_start_times: Dict[int, float] = {}
+        # Drained only when iteration stats are collected, so it is bounded for when they are not.
+        self._async_load_latencies: deque[float] = deque(maxlen=4096)
 
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
@@ -935,6 +940,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if not load.is_async:
             self.commit_new_matched_tokens(request, end - start, False)
         else:
+            self._async_load_start_times[request.request_id] = time.monotonic()
             request.py_num_connector_matched_tokens = end - start
 
     def mark_prefix_loads_dispatched(self) -> None:
@@ -973,6 +979,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             del self._prefix_loads[reservation_id]
             self._prefix_completion_tracker.forget(reservation_id)
             self._prefix_load_requests.pop(request.request_id)
+            self._async_load_start_times.pop(request.request_id, None)
             self._bound_prefix_load_ids.discard(reservation_id)
             self.scheduler_output_manager.external_loads.pop(request.request_id, None)
             for output in (self._scheduler_output, self._bound_scheduler_output):
@@ -1082,6 +1089,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # (see `take_scheduled_requests_pending_load`).
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
+            self._async_load_start_times[request.request_id] = time.monotonic()
 
         self.scheduler_output_manager.record_new_matched_tokens(request, num_tokens)
 
@@ -1198,6 +1206,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.scheduler_output_manager.reset_request(request.request_id)
         self.finished_async_loading_requests.pop(request.request_id, None)
         self._deferred_load_terminations.pop(request.request_id, None)
+        self._async_load_start_times.pop(request.request_id, None)
         # The connector's own per-request state is keyed to the allocation too.
         if self.scheduler is not None:
             self.scheduler.request_reset(request)
@@ -1457,7 +1466,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             if self._prefix_completion_tracker is not None:
                 self._prefix_completion_tracker.close()
 
+    def take_async_load_latencies(self) -> List[float]:
+        """Return and clear the latencies of asynchronous loads finished since the last call.
+
+        Each is the time in seconds from the connector's load being accepted to every rank
+        reporting it complete.
+        """
+        latencies = list(self._async_load_latencies)
+        self._async_load_latencies.clear()
+        return latencies
+
     def _finish_load(self, request: LlmRequest, is_async: bool) -> None:
+        start_time = self._async_load_start_times.pop(request.request_id, None)
+        if start_time is not None:
+            self._async_load_latencies.append(time.monotonic() - start_time)
         if request.request_id in self._deferred_load_terminations:
             request = self._deferred_load_terminations.pop(request.request_id)
             self._finished_load_terminations.append(request)

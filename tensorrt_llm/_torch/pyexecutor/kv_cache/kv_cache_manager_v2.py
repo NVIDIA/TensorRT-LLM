@@ -5417,6 +5417,11 @@ class KVCacheManagerV2(BaseResourceManager):
             connector_cached_tokens=(
                 connector_cached_tokens if self._connector_reports_cached_tokens() else None
             ),
+            connector_load_latencies_s=(
+                self.kv_connector_manager.take_async_load_latencies()
+                if self._connector_reports_cached_tokens()
+                else None
+            ),
         )
 
     def _connector_reports_cached_tokens(self) -> bool:

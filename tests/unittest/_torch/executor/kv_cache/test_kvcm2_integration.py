@@ -2373,12 +2373,19 @@ def test_live_storage_stats_use_the_manager_api() -> None:
 
 
 @pytest.mark.parametrize(
-    "kv_connector_manager, expected_connector_cached_tokens",
-    [(None, None), (SimpleNamespace(capacity_only=False), 9)],
+    "kv_connector_manager, expected_connector_cached_tokens, expected_load_latencies",
+    [
+        (None, None, None),
+        (
+            SimpleNamespace(capacity_only=False, take_async_load_latencies=lambda: [0.5]),
+            9,
+            [0.5],
+        ),
+    ],
     ids=["no_connector", "serving_connector"],
 )
 def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
-    kv_connector_manager, expected_connector_cached_tokens
+    kv_connector_manager, expected_connector_cached_tokens, expected_load_latencies
 ) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.enable_stats = True
@@ -2423,6 +2430,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
     assert stats.disk_prefetch_blocks == 7
     assert stats.cached_tokens_by_level == [5, 2, 1]
     assert stats.connector_cached_tokens == expected_connector_cached_tokens
+    assert stats.connector_load_latencies_s == expected_load_latencies
 
 
 def _make_admission_manager(

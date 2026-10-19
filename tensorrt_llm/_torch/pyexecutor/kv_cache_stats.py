@@ -142,6 +142,9 @@ class KVCacheV2IterationStatsReport:
     # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
+    # Latencies in seconds of the asynchronous KV connector loads finished during this iteration.
+    # None when no connector can serve tokens.
+    connector_load_latencies_s: list[float] | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -239,6 +242,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
     if kv_iter_stats.connector_cached_tokens is not None:
         stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
+    if kv_iter_stats.connector_load_latencies_s is not None:
+        stats_dict["iterConnectorLoadLatenciesSec"] = list(kv_iter_stats.connector_load_latencies_s)
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {
