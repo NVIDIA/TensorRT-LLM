@@ -834,9 +834,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return rid in self._send_sessions or rid in self._recv_sessions
 
     def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
-        # A send cannot write anything until every peer rank's REQUEST_DATA
-        # has arrived.
-        return not self._transfer_worker.has_all_peer_req_infos_for_send(get_unique_rid(req))
+        # A send cannot write anything until every peer rank's REQUEST_DATA has
+        # arrived; until then its session stays INIT (READY once they all have).
+        # A retired, cancelled, failed or finished send is not waiting and must
+        # time out normally.
+        session = self._send_sessions.get(get_unique_rid(req))
+        return session is not None and session.status == SessionStatus.INIT
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""

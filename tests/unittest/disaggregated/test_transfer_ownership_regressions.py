@@ -1727,32 +1727,133 @@ def test_request_data_for_a_session_not_yet_created_is_still_parked() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("peer_asked", [False, True])
-def test_context_send_waits_for_peer_until_every_peer_rank_asked(peer_asked: bool) -> None:
-    rid = 111
-    asked = Mock(return_value=peer_asked)
+@pytest.mark.parametrize("retried", [False, True])
+def test_cleared_session_failure_reaches_the_waiting_receive(
+    retried: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The FAILED reply for a cleared session resolves the peer's receive end to end.
+
+    Real Sender reply, real Receiver dispatch and real RxSession: the published
+    receive turns terminal without waiting for its own timeout or a forward
+    pass, holds no destination access, and the transceiver retires it exactly
+    once. A retried generation request is answered under its own fresh id.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    ctx_rid = 112
+    gen_rid = ctx_rid + 1000 if retried else ctx_rid
+
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = False
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = {}
+    receiver._shutdown = False
+    receiver._bounce = _BounceProbe()
+    session = _make_rx_session(receiver, gen_rid)
+
+    def publish(task: KVRecvTask) -> None:
+        task.expected_transfers = 1
+        session.mark_transferring(task.slice_id)
+
+    receiver.dispatch_task = publish
+    session.receive(_sole_piece())
+    assert session.has_transferring_tasks()
+
+    sender = _make_sender_with_cleared_session(ctx_rid)
+    del sender._send_failed_result_to_receiver  # use the real reply path
+    sender._instance_rank = 3
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="gen"))
+    )
+    dealer = Mock()
+    sender._get_or_connect_dealer = Mock(return_value=dealer)
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=ctx_rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=gen_rid,
+        slice_id=0,
+    )
+
+    sender._respond_with_kv(b"gen", [MessageType.REQUEST_DATA, info.to_bytes()])
+    (reply,) = [call.args[0] for call in dealer.send.call_args_list]
+    receiver._process_kv_agent_result(b"ctx", reply)
+
+    assert session.status == SessionStatus.ERROR
+    assert not session.has_transferring_tasks()
+
+    request = SimpleNamespace(request_id=gen_rid)
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._transfer_worker = SimpleNamespace(has_all_peer_req_infos_for_send=asked)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._mapping = SimpleNamespace(pp_size=1, enable_attention_dp=False, world_size=1)
+    transceiver._dist = SimpleNamespace(rank=0)
+    transceiver._gen_allgather = Mock()
+    transceiver._recv_sessions = {gen_rid: session}
+    transceiver._recv_reqs = {gen_rid: request}
+
+    assert transceiver.check_gen_transfer_status(None) == ([], [gen_rid], [])
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert gen_rid not in receiver._sessions
+    assert transceiver.check_gen_transfer_status(None) == ([], [], [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("status", "waiting"),
+    [
+        (SessionStatus.INIT, True),
+        (SessionStatus.READY, False),
+        (SessionStatus.TRANSFERRING, False),
+        (SessionStatus.TRANSFERRED, False),
+        (SessionStatus.CANCELLED, False),
+        (SessionStatus.ERROR, False),
+        (None, False),
+    ],
+)
+def test_context_send_waits_for_peer_only_while_live_and_unasked(status, waiting) -> None:
+    """Only a live send whose peer ranks have not all asked yet is waiting.
+
+    A send that was retired (e.g. by a peer's CANCEL_SESSION) has no peer
+    request info left either, but it must time out normally rather than be
+    held for the whole peer-wait ceiling.
+    """
+    rid = 111
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {} if status is None else {rid: SimpleNamespace(status=status)}
     request = SimpleNamespace(
         py_request_id=rid,
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
     )
 
-    assert transceiver.context_transfer_is_waiting_for_peer(request) is not peer_asked
-    asked.assert_called_once_with(rid)
+    assert transceiver.context_transfer_is_waiting_for_peer(request) is waiting
 
 
 @pytest.mark.cpu_only
-def test_cleared_session_marker_expires(monkeypatch) -> None:
+def test_cleared_session_markers_expire_oldest_first(monkeypatch) -> None:
+    """Expired markers are dropped from the front; younger ones are kept."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: clock["t"])
     sender = _make_sender_with_cleared_session(109)
-    assert set(sender._retired_rids) == {109}
-    now = transfer_mod.time.monotonic()
-    monkeypatch.setattr(
-        transfer_mod.time, "monotonic", lambda: now + transfer_mod.Sender._RETIRED_SESSION_TTL_S + 1
-    )
+    clock["t"] += 10.0
+    sender._sessions[110] = object()
+    sender.clear_session(110)
+    clock["t"] += 10.0
+    sender._sessions[109] = object()  # 109 is set up and cleared again: it moves to the back
+    sender.clear_session(109)
+    assert list(sender._retired_rids) == [110, 109]
 
+    clock["t"] += transfer_mod.Sender._RETIRED_SESSION_TTL_S - 15.0  # 110 is 5 s short of the TTL
     sender.sweep_stale_req_infos()
+    assert list(sender._retired_rids) == [110, 109]
 
+    clock["t"] += 7.0  # 110 is now past the TTL, 109 is not
+    sender.sweep_stale_req_infos()
+    assert list(sender._retired_rids) == [109]
+
+    clock["t"] += 10.0
+    sender.sweep_stale_req_infos()
     assert sender._retired_rids == {}
 
 

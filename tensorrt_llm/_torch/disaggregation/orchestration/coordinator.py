@@ -235,8 +235,6 @@ class DisaggTransferCoordinator:
             return
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
-        if not self.inflight_cancel_active():
-            self._cancel_stalled_gen_receives()
         # Gen-transfer status performs cross-rank consensus internally. Enter
         # it symmetrically; ranks with no ready local future contribute an
         # empty ready set.
@@ -809,40 +807,6 @@ class DisaggTransferCoordinator:
                     f"{request.py_request_id}; waiting for C++ transfer status "
                     "to report final cleanup"
                 )
-
-    @nvtx_range("cancel_stalled_gen_receives")
-    def _cancel_stalled_gen_receives(self) -> None:
-        """Act on generation receive timeouts without waiting for a forward pass.
-
-        Without in-flight cancellation, the executor's response pass is what
-        cancels a timed-out receive, and it runs only after a forward step. A
-        generation worker whose every slot holds a stalled receive schedules
-        nothing, never reaches that pass, and so stops admitting requests for
-        good. Cancel such receives here instead: the reap below fails one once
-        its session reports the cancel, and one the cancel already released is
-        failed directly, as the response pass would.
-        """
-        timed_out = [
-            req
-            for req in self._registry.active_requests()
-            if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_timed_out
-        ]
-        if not timed_out:
-            return
-        # A user cancellation is settled by the cancel path. Under multi-rank
-        # ADP a released request stays active until the synced drain; do not
-        # fail it twice.
-        user_canceled_ids = set(self._registry.canceled_request_ids())
-        pending_ids = {id(req) for req in self._pending_timed_out_requests}
-        released = [
-            req
-            for req in timed_out
-            if self._vote_id(req) not in user_canceled_ids
-            and id(req) not in pending_ids
-            and self.request_cancellation(req)
-        ]
-        if released:
-            self.fail_timed_out(released)
 
     @nvtx_range("check_gen_transfer_errors_consensus")
     def _check_gen_transfer_errors_consensus(self) -> None:

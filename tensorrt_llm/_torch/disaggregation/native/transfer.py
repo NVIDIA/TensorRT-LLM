@@ -720,9 +720,9 @@ class Sender(SenderBase):
         # transfer error, our own side's is an ordinary end.
         self._pre_cancelled_rids: dict[int, bool] = {}
         # unique_rid -> clear time, for sessions already cleared (completed, failed, cancelled or
-        # timed out). A REQUEST_DATA for one of them must be answered FAILED: parking it as an
-        # early generation-first request would leave the peer's receive unresolved for good.
-        # Protected by _sessions_lock.
+        # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
+        # parking it as an early generation-first request would leave the peer's receive
+        # unresolved for good. Protected by _sessions_lock.
         self._retired_rids: dict[int, float] = {}
         self._shutdown = False
         self._shutdown_requested = False
@@ -792,11 +792,11 @@ class Sender(SenderBase):
         """
         now = time.monotonic()
         with self._sessions_lock:
-            for rid in [
-                rid
-                for rid, ts in self._retired_rids.items()
-                if now - ts > self._RETIRED_SESSION_TTL_S
-            ]:
+            # Oldest first (see clear_session), so only expired entries are visited.
+            while self._retired_rids:
+                rid, ts = next(iter(self._retired_rids.items()))
+                if now - ts <= self._RETIRED_SESSION_TTL_S:
+                    break
                 del self._retired_rids[rid]
         with self._peer_requests_lock:
             stale_rids = [
@@ -1857,6 +1857,8 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if unique_rid in self._sessions:
                 del self._sessions[unique_rid]
+                # Re-insert so the dict stays ordered by clear time.
+                self._retired_rids.pop(unique_rid, None)
                 self._retired_rids[unique_rid] = time.monotonic()
         self._remove_req_info(unique_rid)
 
