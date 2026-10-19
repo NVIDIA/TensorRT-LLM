@@ -15,6 +15,7 @@
 """Tests for the perf-sanity AgentX client's prefill-only (ctx_only) path."""
 
 import importlib.util
+import re
 from pathlib import Path
 from types import ModuleType
 
@@ -156,3 +157,12 @@ def test_other_request_errors_always_fail(client: ModuleType):
     errors = [_empty_content(1), {"error_details": {"type": "HTTPError"}, "count": 1}]
     with pytest.raises(RuntimeError, match="aiperf reported request errors"):
         client.check_request_errors(errors, requests=100000)
+
+
+def test_aiperf_keepalive_stays_below_trtllm_serve_keepalive(client: ModuleType):
+    # An aiperf pooled connection that outlives the server's keep-alive can be
+    # reused just as trtllm-serve closes it ("Connection reset by peer").
+    server_path = REPO_ROOT / "tensorrt_llm" / "serve" / "openai_server.py"
+    match = re.search(r"^TIMEOUT_KEEP_ALIVE = (\d+)", server_path.read_text(), re.MULTILINE)
+    assert match, "TIMEOUT_KEEP_ALIVE not found in openai_server.py"
+    assert 0 < client.AIPERF_HTTP_KEEPALIVE_TIMEOUT_S < int(match.group(1))
