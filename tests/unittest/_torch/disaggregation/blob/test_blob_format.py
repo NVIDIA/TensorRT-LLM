@@ -5,17 +5,26 @@
 from __future__ import annotations
 
 import pytest
-from driver_conformance import NAMES, SCOPE
-from object_trailer import TRAILER_BYTES, TRAILER_VERSION, Checksum, check_trailer, encode_trailer
 
 from tensorrt_llm._torch.disaggregation.blob.keys import FORMAT_VERSION, encode_key
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
+    DriverRejected,
+    RegionLayout,
     RowIO,
     RowResult,
     RowStatus,
     Span,
+    StoreError,
     faulted,
+)
+from tensorrt_llm._torch.disaggregation.testing.driver_conformance import NAMES, SCOPE
+from tensorrt_llm._torch.disaggregation.testing.object_trailer import (
+    TRAILER_BYTES,
+    TRAILER_VERSION,
+    Checksum,
+    check_trailer,
+    encode_trailer,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -47,6 +56,12 @@ def test_key_prefix_is_a_store_partition_with_a_narrow_charset() -> None:
 # Value types.
 
 
+def test_a_rejection_is_not_a_store_error() -> None:
+    """Code written for store trouble must never swallow a rejection."""
+    assert not issubclass(DriverRejected, StoreError)
+    assert not issubclass(StoreError, DriverRejected)
+
+
 def test_row_result_pairs_fault_text_with_fault() -> None:
     assert faulted("timeout").fault == "timeout"
     assert RowResult(RowStatus.READY).concluded and not RowResult(RowStatus.PENDING).concluded
@@ -56,18 +71,33 @@ def test_row_result_pairs_fault_text_with_fault() -> None:
         RowResult(RowStatus.READY, "text")
 
 
-def test_span_layout_and_row_validate_their_numbers() -> None:
+def test_span_and_layout_validate_their_numbers() -> None:
     with pytest.raises(ValueError):
         Span(-1, 8)
     with pytest.raises(ValueError):
         Span(0, 0)
     assert Span(0x1000, 64).overlaps(Span(0x1020, 64))
     assert Span(0x1010, 16).within(Span(0x1000, 64))
+    for slot_bytes, slot_count in ((0, 1), (8, 0), (-8, 1)):
+        with pytest.raises(ValueError):
+            RegionLayout(slot_bytes, slot_count)
+    assert RegionLayout(8, 4).nbytes == 32
+
+
+def test_a_row_is_a_key_and_disjoint_spans_in_the_order_given() -> None:
+    spans = [Span(0x2000, 8), Span(0x1000, 8)]
+    row = RowIO("k", spans)  # type: ignore[arg-type]
+    assert row.spans == (Span(0x2000, 8), Span(0x1000, 8))  # kept in order, not sorted
+    assert row.nbytes == 16
     with pytest.raises(ValueError):
-        RowIO("", Span(0x1000, 8))
+        RowIO("", (Span(0x1000, 8),))
+    with pytest.raises(ValueError):
+        RowIO("k", ())
+    with pytest.raises(ValueError):
+        RowIO("k", (Span(0x1000, 64), Span(0x1020, 64)))
 
 
-def test_capabilities_are_declared_in_full() -> None:
+def test_capabilities_that_grant_are_declared_and_later_ones_default_off() -> None:
     with pytest.raises(TypeError):
         DriverCapabilities(get=True, put=True, cancel=False, probe=False)  # type: ignore[call-arg]
     with pytest.raises(ValueError):
@@ -75,7 +105,12 @@ def test_capabilities_are_declared_in_full() -> None:
     with pytest.raises(ValueError):
         DriverCapabilities(get=True, put=True, cancel=False, probe=False, max_rows_per_op=0)
     caps = DriverCapabilities(get=True, put=False, cancel=False, probe=False, max_rows_per_op=4)
-    assert caps.hints is False  # a capability added later defaults to not supported
+    assert (caps.hints, caps.absent_is_miss, caps.device_memory, caps.multi_span) == (
+        False,
+        False,
+        False,
+        False,
+    )
     with pytest.raises(AttributeError):
         caps.put = True  # type: ignore[misc]
 

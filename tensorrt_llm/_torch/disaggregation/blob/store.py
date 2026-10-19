@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The private boundary between the blob backend and a byte store.
 
-A driver moves whole rows between registered host memory and one store. It answers two questions
+A driver moves whole rows between registered memory and one store. It answers two questions
 separately: what each row's logical result is (:meth:`StoreDriver.poll`), and whether an operation
 can still touch the caller's memory (:meth:`StoreDriver.access_ended`). Neither answer implies the
 other. Nothing here belongs to the public backend contract in ``base/``; the backend translates
@@ -17,22 +17,25 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 Hint = Any
-"""The caller's hint for where a get or probe should look, handed to the driver unchanged. The
-backend passes a hint only to a driver that declares ``hints`` and rejects it before dispatch for
-any other, which therefore keeps its hint-free calls as they were."""
+"""The caller's hint for where a get or probe should look, handed to the driver unchanged. A hint
+is an immutable snapshot: the driver may keep a reference to it for as long as it needs and never
+modifies it. The backend passes a hint only to a driver that declares ``hints``; for any other
+driver it rejects the submission that carries one, before dispatch, so such a driver keeps its
+hint-free calls as they were."""
+
+
+class DriverRejected(Exception):
+    """Raised by a driver on purpose, before it touched the store or the caller's memory.
+
+    The only exception that certifies nothing escaped: the caller may forget the call. It is not a
+    :class:`StoreError`, so code that handles store trouble never swallows a rejection. Any other
+    raise from ``register``, ``put`` or ``get`` may have escaped, and the caller keeps the memory
+    protected until the driver proves otherwise, at the latest through a ``drain`` returning True.
+    """
 
 
 class StoreError(Exception):
     """A store-side failure the driver could not express as a row result."""
-
-
-class DriverRejected(StoreError):
-    """Raised by a driver on purpose, before it touched the store or the caller's memory.
-
-    The only exception that certifies nothing escaped: the caller may forget the call. Any other
-    raise from ``register``, ``put`` or ``get`` may have escaped, and the caller keeps the memory
-    protected until the driver proves otherwise, at the latest through a ``drain`` returning True.
-    """
 
 
 class RegistrationError(StoreError):
@@ -52,9 +55,9 @@ class RegistrationError(StoreError):
 class RowStatus(enum.Enum):
     """The logical state of one row within an operation.
 
-    READY and FAULT are the only two that carry a verdict; MISS, NOT_READY and DECLINED say that
-    nothing moved and nothing went wrong, so the backend reports the row as not delivered without
-    a fault and they never count toward isolation.
+    READY and FAULT are the only two that carry a verdict. MISS, NOT_READY, DECLINED and CANCELLED
+    say that nothing was delivered and nothing went wrong: the backend reports such a row as not
+    delivered without a fault, and none of them counts toward isolation.
     """
 
     PENDING = "pending"
@@ -66,7 +69,8 @@ class RowStatus(enum.Enum):
     store's "already exists" counts only once that object is committed."""
 
     MISS = "miss"
-    """For a get: the store holds no object under the key."""
+    """For a get: the store holds no object under the key. Only a driver that declares
+    ``absent_is_miss`` can tell this apart from a failure; another reports FAULT for such a key."""
 
     NOT_READY = "not_ready"
     """The key is held by a write that has not finished: a get delivered nothing, a put published
@@ -77,10 +81,12 @@ class RowStatus(enum.Enum):
     the other rows of the operation go on."""
 
     CANCELLED = "cancelled"
-    """Never started, because of a cancel or a drain; the row's memory was not touched."""
+    """Never started, because of a cancel or a drain; no byte moved and the row's memory was not
+    touched. A row that had started never concludes CANCELLED."""
 
     FAULT = "fault"
-    """Anything else: timeout, size or integrity mismatch, transport or store error."""
+    """Anything else: timeout, size or integrity mismatch, transport or store error. Says nothing
+    about the destination's contents."""
 
 
 @dataclass(frozen=True)
@@ -99,14 +105,6 @@ class RowResult:
         return self.status is not RowStatus.PENDING
 
 
-PENDING = RowResult(RowStatus.PENDING)
-READY = RowResult(RowStatus.READY)
-MISS = RowResult(RowStatus.MISS)
-NOT_READY = RowResult(RowStatus.NOT_READY)
-DECLINED = RowResult(RowStatus.DECLINED)
-CANCELLED = RowResult(RowStatus.CANCELLED)
-
-
 def faulted(reason: str) -> RowResult:
     """A FAULT result carrying ``reason``."""
     return RowResult(RowStatus.FAULT, reason)
@@ -119,7 +117,11 @@ def concluded(results: Sequence[RowResult]) -> bool:
 
 @dataclass(frozen=True)
 class Span:
-    """Host memory ``[address, address + nbytes)``."""
+    """A non-empty range ``[address, address + nbytes)`` inside a registered region.
+
+    Whether that region is host or device memory is the region's business, not the span's. A span
+    need not be a whole slot.
+    """
 
     address: int
     nbytes: int
@@ -163,21 +165,34 @@ class RegionLayout:
 
 @dataclass(frozen=True)
 class RowIO:
-    """One row to move: its store key and where its payload sits.
+    """One row to move: its store key and the spans its payload occupies.
 
-    The payload is the KV bytes of one staging slot in a registered region; the object a driver
-    stores is that payload, in whatever format and with whatever integrity data the driver keeps.
-    ``position`` is ``(group, row)`` within the submission, kept so the backend can map results
-    back; drivers treat it as opaque.
+    The stored object is the spans' bytes back to back, in the order given; the key does not
+    depend on how a row is split. A row staged on the host has one span. A row lent in place has
+    one span per pool of its pool group, in pool order, and may cover only part of a slot when the
+    two sides of a transfer are sharded differently. Spans of one row never overlap. A row of more
+    than one span reaches only a driver that declares ``multi_span``.
     """
 
     key: str
-    payload: Span
-    position: tuple[int, int] | None = None
+    spans: tuple[Span, ...]
 
     def __post_init__(self) -> None:
         if not self.key:
             raise ValueError("a row needs a store key")
+        spans = tuple(self.spans)
+        object.__setattr__(self, "spans", spans)
+        if not spans:
+            raise ValueError(f"row {self.key} has no spans")
+        for i, first in enumerate(spans):
+            for second in spans[i + 1 :]:
+                if first.overlaps(second):
+                    raise ValueError(f"row {self.key} has overlapping spans {first} and {second}")
+
+    @property
+    def nbytes(self) -> int:
+        """The object's size: the spans' bytes added up."""
+        return sum(span.nbytes for span in self.spans)
 
 
 class RegionHandle(Protocol):
@@ -211,8 +226,15 @@ class DriverCapabilities:
         cancel: ``cancel`` does something; without it the backend only suppresses unstarted work.
         probe: ``probe`` answers; without it the backend fetches blindly.
         max_rows_per_op: Rows one ``put``/``get`` accepts, or ``None`` for no limit.
-        hints: ``get`` and ``probe`` read a caller's hint; without it the backend rejects a hint
-            before dispatch and the driver is called without one.
+        hints: ``get`` and ``probe`` read a caller's hint; without it the backend rejects a
+            submission carrying a hint before dispatch and the driver is called without one.
+        absent_is_miss: A get of a key the store does not hold concludes MISS. Without it the
+            store cannot tell absence from failure, such a get may conclude FAULT, and the
+            backend's fault accounting counts misses too.
+        device_memory: The driver can register regions of device memory; without it every region
+            handed to it is host memory.
+        multi_span: ``put`` and ``get`` take rows of more than one span; without it every row
+            handed to it has exactly one.
     """
 
     get: bool
@@ -221,6 +243,9 @@ class DriverCapabilities:
     probe: bool
     max_rows_per_op: int | None
     hints: bool = False
+    absent_is_miss: bool = False
+    device_memory: bool = False
+    multi_span: bool = False
 
     def __post_init__(self) -> None:
         if not (self.get or self.put):
@@ -245,14 +270,19 @@ class StoreDriver(Protocol):
     rows' memory until ``access_ended`` is true. Neither a failure result nor a successful
     ``unregister`` is access-end evidence.
 
+    Memory: the caller keeps the spans of a put unchanged, and lets nothing but the operation itself
+    write the spans of a get, until ``access_ended`` is true; a logical result does not lift that. The
+    driver never reads or writes outside the spans of the rows it was given.
+
     Integrity: a READY get row is the whole object, intact, under the right key; a READY put row
     is a complete object any reader can get. How a driver assures this is its own: a store's
     native size checks, hidden unfinished objects and checksums, or data the driver keeps beside
     the object. A failed, declined or cancelled put never damages an existing complete object.
 
-    Queries (``poll``, ``access_ended``, ``access_unprovable``, ``cancel``) read recorded state:
-    they never block, never ask the store and never raise for a handle this driver issued. A handle
-    from elsewhere, or any call after ``close``, is a programming error and raises.
+    Non-blocking calls (``poll``, ``access_ended``, ``access_unprovable``, ``cancel``) read or
+    update recorded state: they never block, never ask the store and never raise for a handle this
+    driver issued. A handle from elsewhere, or any call after ``close``, is a programming error
+    and raises.
     """
 
     @property
@@ -261,7 +291,10 @@ class StoreDriver(Protocol):
         ...
 
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> RegionHandle:
-        """Register one host region the driver may read and write.
+        """Register one region the driver may read and write.
+
+        The region is host memory unless the driver declares ``device_memory``, in which case the
+        caller may also hand it device regions.
 
         Raises:
             DriverRejected: Bad geometry or overlap with a live registration; nothing escaped.
@@ -282,19 +315,27 @@ class StoreDriver(Protocol):
     def put(self, rows: Sequence[RowIO]) -> OpHandle:
         """Publish ``rows``; may return before any byte moved.
 
+        The caller guarantees that the rows' spans hold the payload and stay unchanged until
+        ``access_ended`` is true.
+
         Raises:
             DriverRejected: ``put`` is not declared, the driver is draining or closed, a key
-                appears twice in ``rows``, ``rows`` exceed ``max_rows_per_op``, or a payload lies
-                outside a live registration; nothing escaped.
+                appears twice in ``rows``, ``rows`` exceed ``max_rows_per_op``, a row has more
+                than one span without ``multi_span``, or a span lies outside a live registration;
+                nothing escaped.
         """
         ...
 
     def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
         """Fetch ``rows``, from where ``hint`` says when given; may return before any byte moved.
 
-        Raises as ``put``. ``hint`` is passed only to a driver that declares ``hints``; the
-        backend rejects it before dispatch otherwise, and a driver may treat an unexpected hint
-        as a programming error.
+        The caller guarantees that no two spans of one call overlap, within a row or across rows,
+        so a driver may write the rows concurrently without checking, and that nothing but this
+        operation writes those spans until ``access_ended`` is true. ``hint`` is passed only to a
+        driver that declares ``hints``; the backend rejects the submission otherwise, and a driver
+        may treat an unexpected hint as a programming error.
+
+        Raises as ``put``.
         """
         ...
 

@@ -3,9 +3,11 @@
 """An in-process store and a driver over it, for tests.
 
 ``MemoryStore`` is a dictionary of complete objects that endpoints in one process can share. It
-can be given a capacity, and a test can mark a key as held by an unfinished write. ``MemoryDriver``
-really copies bytes between registered host memory and that store, keeping a trailer beside each
-object that it verifies on every get, the way a real store checks sizes and checksums natively.
+can be given a capacity, and a test can mark a key as held by an unfinished write, corrupt an
+object or make a presence query fail. ``MemoryDriver`` really copies bytes between registered
+host memory and that store, gathering a row's spans into one object and scattering them back,
+and keeps a trailer beside each object that it verifies on every get, the way a real store checks
+sizes and checksums natively.
 
 In automatic mode an operation completes inside ``put``/``get``, like a blocking SDK. In controlled
 mode the test releases three things separately per operation: the transfer, the logical results
@@ -26,15 +28,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from object_trailer import Checksum, check_trailer, encode_trailer
-
 from tensorrt_llm._torch.disaggregation.blob.store import (
-    CANCELLED,
-    DECLINED,
-    MISS,
-    NOT_READY,
-    PENDING,
-    READY,
     DriverCapabilities,
     DriverRejected,
     Hint,
@@ -51,12 +45,27 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     faulted,
 )
 
+from .object_trailer import Checksum, check_trailer, encode_trailer
+
 DEFAULT_CAPABILITIES = DriverCapabilities(
-    get=True, put=True, cancel=True, probe=True, max_rows_per_op=None
+    get=True,
+    put=True,
+    cancel=True,
+    probe=True,
+    max_rows_per_op=None,
+    absent_is_miss=True,
+    multi_span=True,
 )
 MAX_PROBES_IN_FLIGHT = 4
 
 Kind = Literal["put", "get"]
+
+_PENDING = RowResult(RowStatus.PENDING)
+_READY = RowResult(RowStatus.READY)
+_MISS = RowResult(RowStatus.MISS)
+_NOT_READY = RowResult(RowStatus.NOT_READY)
+_DECLINED = RowResult(RowStatus.DECLINED)
+_CANCELLED = RowResult(RowStatus.CANCELLED)
 
 
 class ObjectNotReady(StoreError):
@@ -84,14 +93,16 @@ class StoredObject:
 class MemoryStore:
     """Objects by key. Each object is a private copy, committed whole or not at all.
 
-    Subclass and override ``commit`` or ``get`` to make a test's store block or fail; both may
-    raise ``StoreError``, which the driver turns into a row fault.
+    Subclass and override ``commit``, ``get`` or ``presence`` to make a test's store block or
+    fail; they may raise ``StoreError``, which the driver turns into a row fault or re-raises from
+    ``probe``.
     """
 
     def __init__(self, capacity: int | None = None) -> None:
         self._lock = threading.Lock()
         self._objects: dict[str, StoredObject] = {}
         self._writing: set[str] = set()
+        self._presence_failure: str | None = None
         self.capacity = capacity
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
@@ -115,6 +126,9 @@ class MemoryStore:
 
     def presence(self, key: str) -> ProbeStatus:
         with self._lock:
+            if self._presence_failure is not None:
+                reason, self._presence_failure = self._presence_failure, None
+                raise StoreError(reason)
             if key in self._writing:
                 return ProbeStatus.NOT_READY
             return ProbeStatus.HIT if key in self._objects else ProbeStatus.MISS
@@ -147,6 +161,11 @@ class MemoryStore:
         with self._lock:
             self._writing.discard(key)
 
+    def fail_next_presence(self, reason: str) -> None:
+        """Make the next presence query raise ``StoreError(reason)``."""
+        with self._lock:
+            self._presence_failure = reason
+
     def corrupt(self, key: str, index: int) -> None:
         """Flip one payload byte of the committed object, as a damaged store would."""
         with self._lock:
@@ -171,7 +190,7 @@ class _Registration:
 @dataclass(eq=False)
 class _Row:
     io: RowIO
-    published: RowResult = PENDING
+    published: RowResult = _PENDING
     staged: RowResult | None = None  # decided but not yet visible through poll
     started: bool = False  # a transfer took the row; cancel and fail leave it alone
     transferred: bool = False
@@ -194,6 +213,17 @@ class _Probe:
     finished: threading.Event
 
 
+def _gather(spans: Sequence[Span]) -> bytes:
+    return b"".join(ctypes.string_at(span.address, span.nbytes) for span in spans)
+
+
+def _scatter(spans: Sequence[Span], payload: bytes) -> None:
+    offset = 0
+    for span in spans:
+        ctypes.memmove(span.address, payload[offset : offset + span.nbytes], span.nbytes)
+        offset += span.nbytes
+
+
 class MemoryDriver:
     """A ``StoreDriver`` over a ``MemoryStore``; see the module docstring for the two modes."""
 
@@ -211,6 +241,7 @@ class MemoryDriver:
         self._registrations: list[_Registration] = []
         self._ops: list[MemoryOp] = []
         self._probes: list[_Probe] = []
+        self._probe_workers: list[threading.Thread] = []  # every worker ever started
         self._draining = False
         self._closed = False
         self._cancel_effective = True
@@ -310,10 +341,11 @@ class MemoryDriver:
         # start happen under the lock, so close and drain see every worker.
         with self._lock:
             self._probes = [probe for probe in self._probes if not probe.finished.is_set()]
-            if self._draining or self._probe_unknown or len(self._probes) >= MAX_PROBES_IN_FLIGHT:
+            if self._draining or self._probe_unknown or not self._probe_slot_free():
                 return tuple(ProbeStatus.UNKNOWN for _ in keys)
             worker = threading.Thread(target=ask, name="memory-driver-probe", daemon=True)
             self._probes.append(_Probe(worker, finished))
+            self._probe_workers.append(worker)
             worker.start()
         if finished.wait(budget_s):
             worker.join()  # it is exiting; leave no thread behind a call that got its answer
@@ -390,7 +422,7 @@ class MemoryDriver:
                 row.published = faulted(reason)
 
     def write_late(self, op: MemoryOp, index: int, data: bytes) -> None:
-        """Write into a faulted get row's payload after its result, as a transfer that kept going
+        """Write into a faulted get row's spans after its result, as a transfer that kept going
         would. Refused once access has ended, and for rows that are not FAULT: those must stay
         as reported."""
         with self._lock:
@@ -400,12 +432,9 @@ class MemoryDriver:
             row = op.rows[index]
             if row.published.status is not RowStatus.FAULT:
                 raise RuntimeError(f"row {index} is {row.published.status.value}, not faulted")
-            payload = row.io.payload
-            if len(data) != payload.nbytes:
-                raise ValueError(
-                    f"late write of {len(data)} bytes into a {payload.nbytes}-byte row"
-                )
-            ctypes.memmove(payload.address, data, len(data))
+            if len(data) != row.io.nbytes:
+                raise ValueError(f"late write of {len(data)} bytes into a {row.io.nbytes}-byte row")
+            _scatter(row.io.spans, data)
 
     def end_access(self, op: MemoryOp) -> None:
         """Declare that the operation will never touch its rows' memory again."""
@@ -450,11 +479,12 @@ class MemoryDriver:
             return sum(1 for probe in self._probes if not probe.finished.is_set())
 
     def join_probes(self, timeout: float) -> None:
-        """Wait for every probe worker to exit, for tests that opened a gate they had closed."""
+        """Wait for every probe worker ever started to exit, for tests that opened a gate they
+        had closed."""
         with self._lock:
-            probes = list(self._probes)
-        for probe in probes:
-            probe.worker.join(timeout)
+            workers = list(self._probe_workers)
+        for worker in workers:
+            worker.join(timeout)
 
     # Submission checks, one rule each.
 
@@ -465,6 +495,10 @@ class MemoryDriver:
     def _check_not_draining(self) -> None:
         if self._draining:
             raise DriverRejected("the driver is draining")
+
+    def _check_hint(self, hint: Hint) -> None:
+        if hint is not None and not self._capabilities.hints:
+            raise DriverRejected("this driver reads no hints")
 
     def _check_row_limit(self, rows: Sequence[RowIO]) -> None:
         if not rows:
@@ -478,21 +512,33 @@ class MemoryDriver:
         if len(set(keys)) != len(keys):
             raise DriverRejected("a key appears more than once in the operation")
 
-    def _check_hint(self, hint: Hint) -> None:
-        if hint is not None and not self._capabilities.hints:
-            raise DriverRejected("this driver reads no hints")
+    def _check_span_count(self, rows: Sequence[RowIO]) -> None:
+        if not self._capabilities.multi_span and any(len(io.spans) > 1 for io in rows):
+            raise DriverRejected("this driver takes rows of one span")
+
+    def _check_disjoint(self, kind: Kind, rows: Sequence[RowIO]) -> None:
+        """The spans of a get never overlap across rows; the caller guarantees it, this driver checks
+        it anyway to catch a backend mistake in tests."""
+        if kind != "get":
+            return
+        spans = [span for io in rows for span in io.spans]
+        for i, first in enumerate(spans):
+            for second in spans[i + 1 :]:
+                if first.overlaps(second):
+                    raise DriverRejected(f"spans {first} and {second} overlap within one get")
 
     def _check_registered(self, rows: Sequence[RowIO]) -> None:
         for io in rows:
-            if not self._registered(io.payload):
-                raise DriverRejected(f"{io.payload} is outside every live registration")
+            for span in io.spans:
+                if not self._registered(span):
+                    raise DriverRejected(f"{span} is outside every live registration")
 
     def _check_region_idle(self, registration: _Registration) -> None:
         busy = sum(
             1
             for op in self._ops
             if not op.access_ended
-            and any(row.io.payload.within(registration.span) for row in op.rows)
+            and any(span.within(registration.span) for row in op.rows for span in row.io.spans)
         )
         if busy:
             raise DriverRejected(f"{busy} operation(s) may still access the region")
@@ -502,6 +548,9 @@ class MemoryDriver:
             raise DriverRejected("close needs a drain that returned True")
         if any(r.live for r in self._registrations):
             raise DriverRejected("close needs every registration unregistered")
+
+    def _probe_slot_free(self) -> bool:
+        return len(self._probes) < MAX_PROBES_IN_FLIGHT
 
     def _start_draining(self) -> None:
         self._draining = True
@@ -525,6 +574,8 @@ class MemoryDriver:
             self._check_hint(hint)
             self._check_row_limit(rows)
             self._check_unique_keys(rows)
+            self._check_span_count(rows)
+            self._check_disjoint(kind, rows)
             self._check_registered(rows)
             op = MemoryOp(kind, [_Row(io) for io in rows], hint)
             self._ops.append(op)
@@ -565,15 +616,15 @@ class MemoryDriver:
             return faulted(f"{type(error).__name__}: {error}")
 
     def _put_row(self, io: RowIO) -> RowResult:
-        payload = ctypes.string_at(io.payload.address, io.payload.nbytes)
+        payload = _gather(io.spans)
         trailer = self._trailer_for(io, payload)
         outcome = self.store.commit(io.key, payload, trailer)
         if outcome in (Commit.STORED, Commit.SAME):
-            return READY
+            return _READY
         if outcome is Commit.DECLINED:
-            return DECLINED
+            return _DECLINED
         if outcome is Commit.NOT_READY:
-            return NOT_READY
+            return _NOT_READY
         # A diagnostic this store can afford; the contract asks no driver to compare bytes.
         return faulted("key exists with different content")
 
@@ -581,30 +632,28 @@ class MemoryDriver:
         try:
             stored = self.store.get(io.key)
         except ObjectNotReady:
-            return NOT_READY
+            return _NOT_READY
         if stored is None:
-            return MISS
-        if len(stored.payload) != io.payload.nbytes:
-            return faulted(f"object is {len(stored.payload)} bytes, expected {io.payload.nbytes}")
+            return _MISS
+        if len(stored.payload) != io.nbytes:
+            return faulted(f"object is {len(stored.payload)} bytes, expected {io.nbytes}")
         problem = self._verify(io, stored)
         if problem is not None:
             return faulted(problem)
-        ctypes.memmove(io.payload.address, stored.payload, len(stored.payload))
-        return READY
+        _scatter(io.spans, stored.payload)
+        return _READY
 
     def _trailer_for(self, io: RowIO, payload: bytes) -> bytes:
-        return encode_trailer(
-            io.key.encode(), io.payload.nbytes, checksum=Checksum.CRC32, payload=payload
-        )
+        return encode_trailer(io.key.encode(), io.nbytes, checksum=Checksum.CRC32, payload=payload)
 
     def _verify(self, io: RowIO, stored: StoredObject) -> str | None:
         """Why the stored object may not be delivered as ``io``, or ``None``."""
-        return check_trailer(stored.trailer, io.key.encode(), io.payload.nbytes, stored.payload)
+        return check_trailer(stored.trailer, io.key.encode(), io.nbytes, stored.payload)
 
     def _cancel_unstarted(self, op: MemoryOp) -> None:
         for row in op.rows:
             if not row.started and not row.published.concluded:
-                row.published = CANCELLED
+                row.published = _CANCELLED
         self._settle_untouched(op)
 
     def _settle_untouched(self, op: MemoryOp) -> None:
