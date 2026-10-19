@@ -184,11 +184,11 @@ TEST_P(TransferAgentTest, CheckRemoteDescriptorsAcrossVmmChunks)
         xferAgent1.get());
     // Advertise a chunked region over two real registrations without requiring a VMM allocator.
     auto const metadata = xferAgent1->getLocalAgentDesc();
-    AgentDesc const chunked{metadata.getBackendAgentDesc(),
-        {{reinterpret_cast<uintptr_t>(destination), kTotalSize, kChunkSize}}};
+    AgentDesc const chunked{
+        metadata.getBackendAgentDesc(), {{reinterpret_cast<uintptr_t>(destination), kTotalSize, kChunkSize}}};
     xferAgent0->loadRemoteAgent(agent1, chunked);
-    EXPECT_TRUE(xferAgent0->checkRemoteDescs(
-        agent1, MemoryDescs{MemoryType::kVRAM, {MemoryDesc{destination, kTotalSize, 0}}}));
+    EXPECT_TRUE(
+        xferAgent0->checkRemoteDescs(agent1, MemoryDescs{MemoryType::kVRAM, {MemoryDesc{destination, kTotalSize, 0}}}));
     EXPECT_FALSE(xferAgent0->checkRemoteDescs(
         agent1, MemoryDescs{MemoryType::kVRAM, {MemoryDesc{destination, kTotalSize + 1, 0}}}));
     xferAgent0->invalidateRemoteAgent(agent1);
