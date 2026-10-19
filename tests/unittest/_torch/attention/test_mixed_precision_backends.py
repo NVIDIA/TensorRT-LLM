@@ -483,6 +483,85 @@ def test_mixed_precision_public_options():
     KvCacheConfig(first_n=0, last_n=0)
 
 
+@pytest.mark.parametrize("backend", ("TRTLLM", "FLASHINFER"))
+@pytest.mark.parametrize("mixed_precision,use_v2", ((None, False), (None, True), ("nvfp4", True)))
+def test_mixed_precision_manager_routing(backend, mixed_precision, use_v2):
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(), sparse_attention_config=None, attn_backend=backend
+    )
+    config = KvCacheConfig(enable_mix_precision=mixed_precision, use_kv_cache_manager_v2=use_v2)
+    expected = (
+        MixedPrecisionKVCacheManager
+        if mixed_precision is not None
+        else _util.KVCacheManagerV2
+        if use_v2
+        else _util.KVCacheManager
+    )
+    with patch.object(
+        _util, "_non_hybrid_kv_cache_manager_cls", wraps=_util._non_hybrid_kv_cache_manager_cls
+    ) as select_manager:
+        assert _util.get_kv_cache_manager_cls(model_config, config) is expected
+    select_manager.assert_called_once_with(model_config.pretrained_config, config)
+
+
+@pytest.mark.parametrize(
+    "model_overrides,use_v2,error,match",
+    [
+        ({}, False, ValueError, "requires use_kv_cache_manager_v2=True"),
+        (
+            {"pretrained_config": SimpleNamespace(architectures=["Qwen3NextForCausalLM"])},
+            True,
+            NotImplementedError,
+            "sparse and recurrent",
+        ),
+        (
+            {"sparse_attention_config": SimpleNamespace(algorithm="dsa")},
+            True,
+            NotImplementedError,
+            "sparse and recurrent",
+        ),
+        ({"attn_backend": "FLASH_ATTN"}, True, NotImplementedError, "TRTLLM or FlashInfer"),
+    ],
+    ids=("v1", "mamba", "sparse", "backend"),
+)
+def test_mixed_precision_manager_rejects_unsupported_routes(model_overrides, use_v2, error, match):
+    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+
+    model_config = SimpleNamespace(
+        **{
+            "pretrained_config": SimpleNamespace(),
+            "sparse_attention_config": None,
+            "attn_backend": "TRTLLM",
+            **model_overrides,
+        }
+    )
+    config = KvCacheConfig(enable_mix_precision="nvfp4", use_kv_cache_manager_v2=use_v2)
+    with pytest.raises(error, match=match):
+        get_kv_cache_manager_cls(model_config, config)
+
+
+def test_mixed_precision_does_not_override_fp4_mla_routing():
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        sparse_attention_config=None,
+        attn_backend="TRTLLM",
+        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+    )
+    assert (
+        get_kv_cache_manager_cls(model_config, KvCacheConfig(use_kv_cache_manager_v2=True))
+        is Fp4MlaKVCacheManagerV2
+    )
+    with pytest.raises(ValueError, match="requires FP16/BF16/FP8 high KV"):
+        get_kv_cache_manager_cls(
+            model_config, KvCacheConfig(enable_mix_precision="nvfp4", use_kv_cache_manager_v2=True)
+        )
+
+
 @pytest.mark.parametrize(
     "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
 )

@@ -6810,14 +6810,9 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             * (self.kv_factor if data_role == Role.ALL else 1)
         )
 
-    def get_cache_bytes_per_token(self) -> int:
-        return sum(
-            self.get_layer_bytes_per_token(layer, Role.ALL)
-            for layer in range(self.num_local_layers)
-        )
-
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         # Compact native layers before assigning extra pool IDs.
+        config = super()._build_cache_config(config)
         config = super()._remove_zero_size_buffers(config)
         if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
             raise NotImplementedError(

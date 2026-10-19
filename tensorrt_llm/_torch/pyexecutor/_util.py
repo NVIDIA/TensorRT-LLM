@@ -107,6 +107,8 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # require KVCacheManagerV2 for per-layer buffer sizes.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config))
+    if kv_cache_config.enable_mix_precision is not None:
+        return MixedPrecisionKVCacheManager
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -208,7 +210,9 @@ def get_kv_cache_manager_cls(
                 "Mixed-precision KV currently supports dense Attention/MLA with "
                 "TRTLLM or FlashInfer; sparse and recurrent models are not wired yet."
             )
-        return MixedPrecisionKVCacheManager
+        if (quant_config is not None
+                and quant_config.quant_mode.has_fp4_kv_cache()):
+            raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
     if (sparse_attn_config is None and is_mla(config)
             and quant_config is not None
             and quant_config.quant_mode.has_fp4_kv_cache()):
