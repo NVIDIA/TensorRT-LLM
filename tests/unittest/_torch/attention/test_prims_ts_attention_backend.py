@@ -571,6 +571,68 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
     check_output()
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("log2_jump", [7.0, 9.0], ids=["freeze-row-max", "rescale-row-max"])
+@torch.no_grad()
+def test_prims_ts_context_lazy_rescale_with_late_key_block(
+    dtype: torch.dtype, log2_jump: float
+) -> None:
+    from tensorrt_llm._torch.attention.backends.prims_ts import BatchPrefillPagedTSWrapper
+
+    device = torch.device("cuda")
+    q_len, kv_len, page_size, head_dim = 64, 512, 64, 128
+    sm_scale = head_dim**-0.5
+    query = torch.zeros((q_len, 1, head_dim), device=device, dtype=dtype)
+    query[..., 0] = 1
+    k_cache = torch.zeros((kv_len // page_size, 1, page_size, head_dim), device=device, dtype=dtype)
+    v_cache = torch.ones_like(k_cache)
+    # Only the last page raises the row maximum, after earlier KV tiles have
+    # contributed to the accumulator. The skip threshold is 8 in log2 logits.
+    k_cache[-1, :, :, 0] = log2_jump / (sm_scale * math.log2(math.e))
+    v_cache[-1] = -1
+    qo_indptr = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    block_tables = torch.arange(kv_len // page_size, device=device, dtype=torch.int32)[None]
+    seq_lens = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    output = torch.empty_like(query)
+
+    logical_k = k_cache[:, 0].flatten(0, 1).float()
+    logical_v = v_cache[:, 0].flatten(0, 1).float()
+    scores = (query[:, 0].float() @ logical_k.T) * sm_scale
+    actual_log2_jump = (scores[0, -1] - scores[0, 0]).item() * math.log2(math.e)
+    assert (actual_log2_jump > 8.0) == (log2_jump > 8.0)
+    expected = (torch.softmax(scores, dim=-1) @ logical_v).to(dtype)[:, None]
+
+    wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
+    wrapper.plan(
+        device=device,
+        batch_size=1,
+        max_seq_len_q=q_len,
+        max_kv_len=kv_len,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        q_dtype=dtype,
+        k_dtype=dtype,
+        v_dtype=dtype,
+        out_dtype=dtype,
+        page_size=page_size,
+        mask_type="dense",
+        sm_scale=sm_scale,
+    )
+    wrapper.run(query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output)
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(
+            query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output, validate=False
+        )
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+
 def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

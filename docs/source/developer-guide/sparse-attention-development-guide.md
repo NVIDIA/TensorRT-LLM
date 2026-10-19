@@ -358,6 +358,10 @@ three prediction methods. A `VanillaAttention` implementation instead overrides
   (BSR `block_indptr`/`block_indices` or a packed `exact_block_bits`
   bitmask), optional K/V summaries for proxy routes, and optional
   `kv_valid_bits` masking ragged KV tails.
+- **Summary contract**: both `k_summary` and `v_summary` are arithmetic means
+  over the tokens present in each KV block, excluding padding in a partial
+  final block. The kernel applies the represented token count to each proxy;
+  do not pass V sums or pre-weight the summaries.
 - **Default**: hands through `SparseBackendForwardArgs.block_sparse_inputs`,
   so modules that predict before the core forward do not override it.
   Override it to predict inside the backend from the flattened Q/K/V,
