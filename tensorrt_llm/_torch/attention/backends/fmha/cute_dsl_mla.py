@@ -26,7 +26,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     CustomAttentionMask,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    get_cute_dsl_mla_max_split_kv,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
@@ -45,8 +48,9 @@ if TYPE_CHECKING:
 # request uses this step from the batch's KV lengths (the kernel clamps it to
 # the grid and the slots beyond exit before their mainloop).
 _SPLIT_PLAN_MAX_REQUESTS = 1024
-# CuteDSLNVMlaDecodeBlackwellRunner._MAX_SPLIT_KV: the largest grid any tactic uses.
-_SPLIT_PLAN_MAX_SPLIT = 32
+# CuteDSLNVMlaDecodeBlackwellRunner._MAX_SPLIT_KV: the largest grid any tactic
+# uses (TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV, default 32).
+_SPLIT_PLAN_MAX_SPLIT = get_cute_dsl_mla_max_split_kv()
 # mma_qk_tiler N of every tactic: the KV tile a split is made of.
 _SPLIT_PLAN_KV_TILE = 128
 # Shortest piece worth its partial-output write and reduction read.
@@ -811,7 +815,16 @@ class CuteDslMlaFmha(PhasedFmha):
         runner = CuteDSLNVMlaDecodeBlackwellRunner
         rows_per_request = runner.get_num_q_tiles(num_heads, seq_len_q)
         wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
-        key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
+        # A request cannot use more splits than this step's tactic grid has.
+        grid_split = runner.get_grid_split_kv(batch_size, rows_per_request)
+        key = (
+            batch_size,
+            rows_per_request,
+            wave_clusters,
+            grid_split,
+            cache_seqs.data_ptr(),
+            plan.data_ptr(),
+        )
         if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
             launch_mla_split_kv_plan(
                 cache_seqs,
@@ -819,6 +832,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 num_requests=batch_size,
                 rows_per_request=rows_per_request,
                 wave_clusters=wave_clusters,
+                max_split=grid_split,
             )
             meta._cute_dsl_mla_split_plan_key = key
         return plan[:batch_size]

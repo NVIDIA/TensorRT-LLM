@@ -116,6 +116,45 @@ def test_plan_2d_kernel_matches_loop_kernel(batch: int) -> None:
         assert plans[0] == plans[1], (rows, batch)
 
 
+@pytest.mark.parametrize("batch", [1, 16, 128, 129])
+def test_plan_kernels_match_host_mirror_under_raised_split_cap(monkeypatch, batch: int) -> None:
+    """TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV=128: 128 candidates fit the 2D kernel up
+    to 128 requests, larger batches take the loop kernel."""
+    mod = _plan_mod()
+    monkeypatch.setattr(mod, "_SPLIT_PLAN_MAX_SPLIT", 128)
+    generator = torch.Generator().manual_seed(7)
+    for rows in (1, 6):
+        for max_split in (8, 128):
+            kv = torch.randint(1, 1_100_000, (batch,), generator=generator)
+            kv[0] = 1_048_576
+            kv_lens = kv.tolist()
+            expected = mod.plan_mla_split_kv(
+                kv_lens, rows_per_request=rows, wave_clusters=WAVE, max_split=max_split
+            )
+            cache_seqs = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+            plan = torch.full((batch,), -5, dtype=torch.int32, device="cuda")
+            mod.launch_mla_split_kv_plan(
+                cache_seqs,
+                plan,
+                num_requests=batch,
+                rows_per_request=rows,
+                wave_clusters=WAVE,
+                max_split=max_split,
+            )
+            torch.cuda.synchronize()
+            assert plan.tolist() == expected, (rows, max_split, kv_lens[:4])
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("", 32), ("32", 32), ("128", 128), ("1000", 256), ("0", 1)]
+)
+def test_max_split_kv_env(monkeypatch, value: str, expected: int) -> None:
+    from tensorrt_llm._torch.cute_dsl_utils import get_cute_dsl_mla_max_split_kv
+
+    monkeypatch.setenv("TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV", value)
+    assert get_cute_dsl_mla_max_split_kv() == expected
+
+
 def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     mod = _plan_mod()
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
@@ -132,7 +171,8 @@ def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     first = mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 8, 8, 96)
     assert first.numel() == 8 and meta._cute_dsl_mla_split_plan.numel() == 16
     # 8 tokens x 96 heads pack into six 128-row query tiles per request.
-    assert launches == [dict(num_requests=8, rows_per_request=6, wave_clusters=106)]
+    # The default tactic's grid for B8 has 16 split slots: the plan's cap.
+    assert launches == [dict(num_requests=8, rows_per_request=6, wave_clusters=106, max_split=16)]
     # The other layers of the step reuse the plan.
     second = mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 8, 8, 96)
     assert second.data_ptr() == first.data_ptr() and len(launches) == 1
@@ -144,21 +184,27 @@ def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     assert mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 2000, 8, 96) is None
 
 
+@pytest.mark.parametrize("max_split_kv", [32, 128])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("empty_request", [False, True])
 def test_runner_variable_split_matches_uniform_split(
-    input_dtype: torch.dtype, empty_request: bool
+    monkeypatch, request, input_dtype: torch.dtype, empty_request: bool, max_split_kv: int
 ) -> None:
     """Per-request splits under a 16-slot grid reproduce the uniform-split output and Helix stats.
 
     Covers requests planned onto one split (stored directly by the split
     kernel), onto several, onto more splits than KV tiles, and a request
-    without local KV (the reduction's canonical empty result).
+    without local KV (the reduction's canonical empty result). With a raised
+    split cap, also a 64-slot grid, uniform and per request.
     """
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_MAX_SPLIT_KV", max_split_kv)
+    # The workspace rows are cached per geometry, not per split cap.
+    CuteDSLNVMlaDecodeBlackwellRunner._max_split_kv_rows.cache_clear()
+    request.addfinalizer(CuteDSLNVMlaDecodeBlackwellRunner._max_split_kv_rows.cache_clear)
     torch.manual_seed(5)
     device = torch.device("cuda")
     batch_size, seq_len_q, num_heads = 4, 2, 96
@@ -235,12 +281,15 @@ def test_runner_variable_split_matches_uniform_split(
         return output_storage.float(), stats
 
     ref_out, ref_stats = run(None, 1)
-    for plan, split_kv in (
+    cases = [
         ([3, 1, 7, 2], 16),
         ([16, 16, 16, 16], 16),
         ([40, 1, 2, 1], 8),
         ([1, 1, 1, 1], 16),
-    ):
+    ]
+    if max_split_kv > 32:
+        cases += [(None, 64), ([3, 1, 64, 40], 64)]
+    for plan, split_kv in cases:
         out, stats = run(plan, split_kv)
         tol = 2e-2 if input_dtype == torch.float8_e4m3fn else 1e-2
         torch.testing.assert_close(out, ref_out, rtol=tol, atol=tol)

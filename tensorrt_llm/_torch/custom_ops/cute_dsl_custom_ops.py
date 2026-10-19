@@ -20,7 +20,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
-                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                              get_cute_dsl_mla_max_split_kv)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import (get_current_locality_domain,
@@ -11965,7 +11966,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _LSE_DTYPE_BYTES = 4  # float32
 
         _MMA_TILE_M = 128
-        _MAX_SPLIT_KV = 32
+        # TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV, default 32 (see
+        # get_cute_dsl_mla_max_split_kv).
+        _MAX_SPLIT_KV = min(get_cute_dsl_mla_max_split_kv(),
+                            MLA_DECODE_MAX_SPLITS)
         # CTA waves the split targets: with one wave, the longest request of a
         # skewed decode batch sets the kernel time.
         _SPLIT_KV_WAVES = 8
@@ -12042,6 +12046,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             two; ``S`` is the number of packed query tiles per request."""
             target = cls._SPLIT_KV_WAVES * max_active_blocks / (2 * B * S)
             return min(cls._MAX_SPLIT_KV, 1 << max(0, round(math.log2(target))))
+
+        @classmethod
+        def get_grid_split_kv(cls, B: int, S: int) -> int:
+            """split_kv of the default tactic for ``B`` requests of ``S``
+            packed query tiles (``default_tactic``'s bucketed batch): the
+            grid's split slots, so the most splits a request plan can use."""
+            return cls.get_default_split_kv(last_positive_power_of_2(B), S,
+                                            cls._get_max_active_blocks())
 
         @staticmethod
         def get_split_kv_candidates(B: int, S: int,
@@ -12607,9 +12619,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     is_var_split_kv,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
-                    # The variable split-KV reducer needs the generic capacity.
-                    reducer_max_splits=(MLA_DECODE_MAX_SPLITS
-                                        if is_var_split_kv else 32),
+                    # The variable split-KV reducer, and grids of more than
+                    # 32 splits, need the generic capacity.
+                    reducer_max_splits=(MLA_DECODE_MAX_SPLITS if is_var_split_kv
+                                        or self._MAX_SPLIT_KV > 32 else 32),
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
