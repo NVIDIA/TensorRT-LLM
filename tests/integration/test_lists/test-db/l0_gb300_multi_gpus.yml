@@ -17,9 +17,7 @@ l0_gb300_multi_gpus:
   tests:
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
-  # MuseSparkOpen TEP fused post-attention all-reduce hop: its collective test as one
-  # 4-rank job, bitwise against the built-in MNNVL all-reduce + cluster boundary.
-  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/allreduce/test_modeling_v2_post_attn_hop_rank_job.py
+  - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]

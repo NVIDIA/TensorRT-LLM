@@ -153,3 +153,10 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
   # reading (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg) when one is
   # measured, and tighten min_al then.
   min_al: 1.5
+# Read by TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance.
+# Keyed by target and variant, like the modeling_v2 entries above. Measured on
+# GB300 over the full GSM8K run of that test (seven drafts, so acceptance length
+# lives in [1.0, 8.0]); min_al is 95% of it.
+ModelingV2MuseSparkOpenNvfp4Tep4::dflash2:
+  ref_al: 4.892
+  min_al: 4.647
