@@ -21,6 +21,7 @@ machinery in every subprocess of an instrumented stage: this file's directory
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional
@@ -57,6 +58,18 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     import configparser
     import threading
 
+    # Resolved at module load, where an ImportError surfaces normally: some callers of
+    # these names run from inside a monkey-patched mpi4py handshake function, where it
+    # must not be mistaken for a failure of their own guarded logic -- see _log_taint.
+    from cbts.coverage.collection.channel import (
+        TAINT_ATTRIBUTION,
+        TAINT_INCOMPLETE,
+        TAINT_NOT_SUBSCRIBED,
+        TAINT_PY_START_UNAVAILABLE,
+        ContextSubscriber,
+        safe_print,
+    )
+
     _CONFIG = os.getenv("CBTS_COVERAGE_CONFIG")
 
     # Source roots bound collection; include patterns match repository-relative Python paths.
@@ -64,16 +77,13 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         try:
             cp = read_source_config(path)
         except (OSError, configparser.Error) as exc:
-            print(
-                f"[cbts] CBTS_COVERAGE_CONFIG={path!r} could not be read: {exc}; coverage disabled",
-                file=sys.stderr,
+            safe_print(
+                f"[cbts] CBTS_COVERAGE_CONFIG={path!r} could not be read: {exc}; coverage disabled"
             )
             return [], ".", None, []
         src = [ln.strip() for ln in cp.get("run", "source", fallback="").splitlines() if ln.strip()]
         if not src:
-            print(
-                f"[cbts] {path!r} has no [run] source entries; coverage disabled", file=sys.stderr
-            )
+            safe_print(f"[cbts] {path!r} has no [run] source entries; coverage disabled")
         data_file = cp.get("run", "data_file", fallback="")
         data_dir = os.path.dirname(data_file) or "."
         repository_root = cp.get("run", "repository_root", fallback="").strip() or None
@@ -108,13 +118,19 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         outer pytest process, before it ever calls into this process's hooks -- calling
         this helper there too would print every one of them twice. This is only for
         taints a process raises about its own state, which have no other log line.
+
+        Never raises: reporting a problem must not itself become a new one that
+        disturbs the product, so a failure here (e.g. a broken stderr) is swallowed
+        rather than surfaced -- best-effort is all a diagnostic owes. The print and the
+        taint are guarded separately: a broken stderr must not also cost the taint,
+        which needs no stderr at all to land in the leaf database.
         """
-        print(
+        safe_print(
             f"[cbts] tainted coverage ({kind}): {reason} for {nodeid or '<whole stage>'} "
-            "in <this process>",
-            file=sys.stderr,
+            "in <this process>"
         )
-        _tracker.note_taint(None, nodeid, kind, reason)
+        with contextlib.suppress(Exception):
+            _tracker.note_taint(None, nodeid, kind, reason)
 
     class _ActiveHooks(hooks.Hooks):
         """Real implementations, installed as ``hooks.active`` for the rest of this process.
@@ -138,7 +154,15 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         def flush_coverage(self) -> Optional[str]:
             if _stop_event.is_set():
                 return None
-            return _tracker.save()
+            try:
+                return _tracker.save()
+            except Exception as e:
+                # Same guard as _save_active: this is called from cbts_plugin's
+                # pytest_sessionfinish, after every test has already run and reported,
+                # so a save failure here must not turn a passing session into a
+                # reported error.
+                safe_print(f"[cbts] flush save failed in pid {os.getpid()}: {e!r}")
+                return None
 
         def record_channel_taints(
             self, taints: Iterable[tuple[Optional[str], str, str, str]]
@@ -154,11 +178,6 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             for process_uid, facts in diagnostics.items():
                 _tracker.note_process_diagnostic(process_uid, facts)
 
-        def note_expected_workers(self, nodeid: Optional[str], n: int) -> None:
-            if _stop_event.is_set():
-                return
-            _tracker.note_expected_workers(nodeid or "", n)
-
     # Installed so peers (the pool patch, the pytest plugin) can call back without importing
     # this guest-injected module by name; see cbts.coverage.collection.hooks.
     _active_hooks = _ActiveHooks()
@@ -170,7 +189,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         try:
             _tracker.save()
         except Exception as e:
-            print(f"[cbts] periodic save failed in pid {os.getpid()}: {e!r}", file=sys.stderr)
+            safe_print(f"[cbts] periodic save failed in pid {os.getpid()}: {e!r}")
 
     def _final_save() -> None:
         """Last save for this process; idempotent, so STOP, atexit, and on_stop can all call it.
@@ -188,7 +207,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             _tracker.save()
             _tracker.stop()
         except Exception as e:
-            print(f"[cbts] final save failed in pid {os.getpid()}: {e!r}", file=sys.stderr)
+            safe_print(f"[cbts] final save failed in pid {os.getpid()}: {e!r}")
         if _subscriber is not None:
             _subscriber.close()
 
@@ -205,8 +224,6 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         # phase belongs to that entry.
         _tracker.start()
     else:
-        _framework_ready = threading.Event()
-        _activation_lock = threading.Lock()
 
         def _subscriber_diagnostics() -> dict[str, str]:
             """Facts about this process worth knowing if it is later dropped and asked about.
@@ -228,20 +245,24 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         def _subscribe_to_context_channel() -> None:
             """Join the outer pytest's channel, landing this process on the current test.
 
+            Called exactly once per process: immediately for anything whose address is
+            already in its environment, or from `_install_worker_sync_hook` for an MPI
+            pool worker, once mpi4py has supplied it -- see README.md's "What happens
+            to PY_START" section. A no-op, not an error, if no address is available
+            even then (e.g. no channel at all this session; the coordinator's own
+            `TAINT_NO_CHANNEL` already covers that).
+
             ``on_stop=_final_save`` can fire synchronously inside ``subscribe()`` if the
             channel had already sent its final STOP, or the producer had already exited,
             by the time this process joined: ``ContextSubscriber.subscribe`` reads the
             first frame inline, and either case delivers one immediately. Callers must
             re-check ``_stop_event`` after this returns before doing anything that assumes
             the tracker is still live.
-            """
-            from cbts.coverage.collection.channel import (
-                TAINT_ATTRIBUTION,
-                TAINT_INCOMPLETE,
-                TAINT_NOT_SUBSCRIBED,
-                ContextSubscriber,
-            )
 
+            Never raises: coverage must never decide whether the product can start, and
+            this can run inside a monkey-patched mpi4py handshake function -- any failure,
+            anticipated or not, is reported and self-tainted rather than propagated.
+            """
             global _subscriber
             try:
                 _subscriber = ContextSubscriber.subscribe(
@@ -252,119 +273,124 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                     diagnostics=_subscriber_diagnostics(),
                 )
             except Exception as exc:
-                # Reported rather than raised: this runs inside the framework's import,
-                # and coverage must not decide whether the product can start.
-                print(
+                # This runs at module level for most roles (see the call site below) --
+                # nothing above catches a failure here, so even the report itself must
+                # not be able to raise.
+                safe_print(
                     f"[cbts] context subscribe failed in pid {os.getpid()}: {exc}: "
-                    f"{exc.__cause__!r}",
-                    file=sys.stderr,
+                    f"{exc.__cause__!r}"
                 )
                 # Nothing else can flag this: never having joined, this process is
                 # unknown to the producer. Two separate doubts follow. Everything it
                 # records lands on the context it was spawned with, so those rows may
                 # belong to later tests it silently served. And every other test in the
                 # stage is missing its coverage -- which tests, it cannot say, having
-                # heard no announcement, so that half is stage-scoped.
+                # heard no announcement, so that half is stage-scoped. A reachable
+                # address that failed to connect is not retried: that is a real
+                # failure, not a not-yet-announced one.
                 _log_taint(_tracker._ctx, TAINT_ATTRIBUTION, TAINT_NOT_SUBSCRIBED)
                 _log_taint("", TAINT_INCOMPLETE, TAINT_NOT_SUBSCRIBED)
 
-        def _activate_tracker(timed_out: bool = False) -> None:
-            """Enable PY_START, reachable from either the import watcher or the backstop below.
+        def _activate_tracker() -> None:
+            """Subscribe to the context channel if possible, then enable PY_START.
 
-            ``timed_out`` is set only by the backstop, meaning the framework import watcher
-            never fired within the deadline. That taints the process: nothing was recorded yet
-            (PY_START isn't on until this call), so there is no attribution risk, only an
-            incomplete one for whatever ran during the delay.
+            Called once activation is worth attempting: immediately for a process whose
+            address is already in its environment, or from `_install_worker_sync_hook`
+            for an MPI pool worker, once mpi4py has supplied it. ``_tracker.start()``
+            is guarded the same way `_subscribe_to_context_channel` guards itself: a
+            failure here must become a taint, never an exception the real mpi4py
+            handshake this can run inside of would have to deal with.
             """
-            with _activation_lock:
-                if _framework_ready.is_set() or _stop_event.is_set():
-                    return
-                _framework_ready.set()
-                # Subscribe first: recording must not start on a stale context.
-                _subscribe_to_context_channel()
-                if _stop_event.is_set():
-                    # subscribe() already ran _final_save synchronously (see its
-                    # docstring): this process's coverage is saved and done. Starting
-                    # PY_START now would only re-enable it for the rest of the process's
-                    # lifetime with every future save silently no-op'd on _stop_event --
-                    # pure overhead, none of it ever written.
-                    return
-                if timed_out:
-                    from cbts.coverage.collection.channel import (
-                        TAINT_ACTIVATION_TIMEOUT,
-                        TAINT_INCOMPLETE,
-                    )
-
-                    _log_taint("", TAINT_INCOMPLETE, TAINT_ACTIVATION_TIMEOUT)
-                _tracker.start()
+            _subscribe_to_context_channel()
+            if _stop_event.is_set():
+                # subscribe() already ran _final_save synchronously (see its
+                # docstring): this process's coverage is saved and done. Starting
+                # PY_START now would only re-enable it for the rest of the process's
+                # lifetime with every future save silently no-op'd on _stop_event --
+                # pure overhead, none of it ever written.
+                return
+            try:
+                started = _tracker.start()
+            except Exception:
+                started = False
+            if not started:
+                # sys.monitoring's PY_START tool could not be enabled (see
+                # PyStartTracker.start): this process will record zero touches for its
+                # entire life. Nothing else can see that to flag it -- it must report
+                # on itself, stage-scoped, since it may go on to serve many tests, all
+                # silently blank.
+                _log_taint("", TAINT_INCOMPLETE, TAINT_PY_START_UNAVAILABLE)
 
         def _install_pool_patch() -> None:
-            from cbts.coverage.collection.pool import install_expected_workers_patch
+            from cbts.coverage.collection.pool import install_pool_env_patch
 
-            install_expected_workers_patch()
+            install_pool_env_patch()
 
-        # The pool accounting patch goes on as mpi4py.futures lands, before any MPIPoolExecutor
-        # can be constructed. Both pytest roles are covered already -- the outer one by the
-        # plugin's pytest_configure, the inner one above -- and a process that never builds a
-        # pool just leaves the patch unused. Every product process needs this watcher, whether
-        # or not it defers its own activation below: it's usually the *coordinator* (not a
-        # worker) that constructs the pool.
+        def _install_worker_sync_hook() -> None:
+            """Patch mpi4py so an MPI pool worker activates once its coordinator's env lands.
+
+            ``_lib._sync_set_data`` is what a spawned ``MPIPoolExecutor`` worker calls
+            during its MPI sync handshake to apply the coordinator's env payload
+            (``os.environ.update(data.pop('env'))``) -- the one point this process is
+            guaranteed to have the channel address. It also runs before ``server_exec``
+            (the task loop, the only place product code runs), so activating here loses
+            nothing compared to activating at interpreter startup. See README.md's "What
+            happens to PY_START" section for the full story.
+            """
+            from mpi4py.futures import _lib
+
+            marker = "_cbts_patched_sync_data"
+            if getattr(_lib._sync_set_data, marker, False):
+                return
+            original = _lib._sync_set_data
+
+            def _patched(data):
+                result = original(data)
+                try:
+                    _activate_tracker()
+                except Exception:
+                    # Last-resort net: _activate_tracker already guards its own steps,
+                    # so this should never fire, but this function stands in for a real
+                    # mpi4py handshake step, and coverage must never be able to corrupt
+                    # or abort that for a failure nothing anticipated.
+                    _log_taint("", TAINT_INCOMPLETE, TAINT_PY_START_UNAVAILABLE)
+                return result
+
+            setattr(_patched, marker, True)
+            _lib._sync_set_data = _patched
+
+        # The pool env patch goes on as mpi4py.futures lands, before any MPIPoolExecutor can be
+        # constructed. Both pytest roles are covered already -- the outer one by the plugin's
+        # pytest_configure, the inner one above -- and a process that never builds a pool just
+        # leaves the patch unused. It's usually the *coordinator* (not a worker) that constructs
+        # the pool.
         _watched_imports = {"mpi4py.futures": _install_pool_patch}
-
         if process_roles.is_mpi_pool_worker():
-            # Only an actual MPI pool worker risks tripping MpiPoolSession's wait_shutdown
-            # identity barrier (tensorrt_llm/llmapi/mpi_session.py): that barrier's deadline
-            # is shared with process spawn + this process's first framework import, so an
-            # instrumented cold import can eat into (or blow) it. Defer PY_START until that
-            # import finishes (or CBTS_WORKER_ACTIVATE_MAX_SECONDS elapses) so the barrier
-            # sees a normal-speed worker; module and class bodies executed before activation
-            # go unrecorded here, but functions a test exercises are re-entered afterwards.
-            try:
-                _activate_max = max(
-                    1.0, float(os.environ.get("CBTS_WORKER_ACTIVATE_MAX_SECONDS", "120"))
-                )
-            except ValueError:
-                _activate_max = 120.0
-            # Product top-level import names taken from the coverage source roots (e.g. "tensorrt_llm").
-            _product_tops = {
-                os.path.basename(p.rstrip("/"))
-                for p in _src
-                if p and os.path.realpath(p) != _tracker.repository_root
-            }
-            _watched_imports.update(dict.fromkeys(_product_tops, _activate_tracker))
+            # This process's channel address arrives only through mpi4py's own sync
+            # handshake, not at exec like an ordinary child's -- see
+            # process_roles.is_mpi_pool_worker and _install_worker_sync_hook. Defer
+            # activation to that hook instead of attempting it now, when it is
+            # guaranteed to find no address yet.
+            _watched_imports["mpi4py.futures._lib"] = _install_worker_sync_hook
             sys.meta_path.insert(0, ImportCompletionWatcher(_watched_imports))
-
-            def _deferred_activate() -> None:
-                # Backstop for a worker that never imports the framework, or whose import is
-                # abnormally slow. No-ops (via _activate_tracker's own guard) if the watcher
-                # above already activated before the deadline.
-                if not _framework_ready.wait(_activate_max):
-                    _activate_tracker(timed_out=True)
-
-            threading.Thread(
-                target=_deferred_activate,
-                daemon=True,
-                name="cbts-deferred-activate",
-            ).start()
         else:
-            # No barrier to protect for any other product process (trtllm-serve, disagg
-            # helpers, ...): activate immediately, same as a pytest process, so its import
-            # phase gets recorded too.
             sys.meta_path.insert(0, ImportCompletionWatcher(_watched_imports))
+            # No barrier to protect for any other product process (trtllm-serve, disagg
+            # helpers, an mpirun-launched MPICommExecutor sibling, ...): activate
+            # immediately, same as a pytest process, so its import phase gets recorded too.
             _activate_tracker()
 
     if _ROLE == _INNER_PYTEST:
         # The inner pytest runs without -p cbts_plugin, so nothing else will install the pool
-        # accounting patch for it; do it here rather than through the watcher thread below.
+        # env patch for it; do it here rather than through the watcher thread below.
         try:
-            from cbts.coverage.collection.pool import install_expected_workers_patch
+            from cbts.coverage.collection.pool import install_pool_env_patch
 
-            install_expected_workers_patch()
+            install_pool_env_patch()
         except Exception as _exc:
-            print(
-                f"[cbts] inner-pytest mpi patch skipped in pid {os.getpid()}: {_exc!r}",
-                file=sys.stderr,
-            )
+            # Module-level, like the block above: a report failure here must not
+            # raise either, or it takes this whole sitecustomize import down with it.
+            safe_print(f"[cbts] inner-pytest mpi patch skipped in pid {os.getpid()}: {_exc!r}")
 
     # Every instrumented process saves periodically so its coverage survives a non-clean exit;
     # pool workers in particular lose their atexit save when the pool is torn down at test end.

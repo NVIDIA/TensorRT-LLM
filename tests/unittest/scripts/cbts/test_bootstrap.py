@@ -84,7 +84,7 @@ def test_note_taint_none_means_self_but_empty_string_is_preserved(tmp_path):
     """
     tracker = PyStartTracker([], str(tmp_path))
 
-    tracker.note_taint(None, "test_a", "incomplete", "worker_activation_timeout")
+    tracker.note_taint(None, "test_a", "incomplete", "did_not_finish_before_deadline")
     tracker.note_taint("", "test_b", "incomplete", "context_channel_unreachable")
     tracker.note_taint("some-other-pid", "test_c", "attribution", "context_not_acknowledged")
 
@@ -292,11 +292,7 @@ _RECORD_PROBE = textwrap.dedent("""
 
 
 def test_a_generic_product_process_activates_immediately(cbts_env):
-    """Only an actual MPI pool worker defers activation.
-
-    Any other product process (trtllm-serve, disagg helpers, ...) has no wait_shutdown
-    barrier to protect and activates right away.
-    """
+    """Any product process other than an MPI pool worker activates PY_START right away."""
     env, workdir = cbts_env
     _write_fakeprod(workdir)
     env["PYTHONPATH"] = os.pathsep.join([_BOOTSTRAP_PYTHONPATH, str(workdir / "product")])
@@ -316,6 +312,132 @@ def test_a_generic_product_process_activates_immediately(cbts_env):
     assert "after True" in result.stdout, result.stdout
     # Nothing is deferred, so the class body's import-time execution is recorded too.
     assert "recorded ['<module>', 'AtImportTime', 'work']" in result.stdout, result.stdout
+
+
+def test_py_start_unavailable_is_tainted(cbts_env):
+    """Regression: PyStartTracker.start() returning False must not go unflagged.
+
+    sys.monitoring's PY_START tool can fail to register (another tool already holds
+    the id, or the callback registration itself raises); when it does, this process
+    will record zero touches for its entire life, and nothing else can see that to
+    flag it -- it must taint itself.
+    """
+    env, workdir = cbts_env
+    env["CBTS_TEST_ID"] = "suite.py::test_x"
+    env.pop("CBTS_PROCESS_ROLE", None)
+
+    # `-S` skips automatic sitecustomize import at startup, so this script can patch
+    # PyStartTracker.start *before* triggering site processing itself via site.main()
+    # -- otherwise sitecustomize would already have run the real start() by the time
+    # any -c code got control.
+    script = textwrap.dedent("""
+        from cbts.coverage.collection.pystart import PyStartTracker
+        PyStartTracker.start = lambda self: False
+        import site
+        site.main()
+        import sitecustomize
+        print('active', sitecustomize._tracker._active)
+        print('taints', sorted((k, r) for _p, _n, k, r in sitecustomize._tracker._taints))
+        """)
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "active False" in result.stdout, result.stdout
+    assert "taints [('incomplete', 'py_start_unavailable')]" in result.stdout, result.stdout
+
+
+def test_py_start_raising_does_not_abort_the_product_process(cbts_env):
+    """Regression: an *exception* from start(), not just a False return, must not escape.
+
+    Coverage must never decide whether the product can start -- an unanticipated
+    failure inside PyStartTracker.start() (not just the documented False-return
+    case) must still be swallowed and tainted, not propagated into whatever called
+    activation.
+    """
+    env, workdir = cbts_env
+    env["CBTS_TEST_ID"] = "suite.py::test_x"
+    env.pop("CBTS_PROCESS_ROLE", None)
+
+    script = textwrap.dedent("""
+        from cbts.coverage.collection.pystart import PyStartTracker
+        def _raise(self):
+            raise RuntimeError('boom')
+        PyStartTracker.start = _raise
+        import site
+        site.main()
+        import sitecustomize
+        print('active', sitecustomize._tracker._active)
+        print('taints', sorted((k, r) for _p, _n, k, r in sitecustomize._tracker._taints))
+        """)
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "active False" in result.stdout, result.stdout
+    assert "taints [('incomplete', 'py_start_unavailable')]" in result.stdout, result.stdout
+
+
+def test_mpi_worker_activation_failure_does_not_abort_the_sync_handshake(cbts_env):
+    """Regression: an activation failure inside the MPI sync-handshake hook must not escape.
+
+    `_install_worker_sync_hook` wraps mpi4py's own `_sync_set_data`, called from deep
+    inside a real MPI handshake. If `_activate_tracker()` raised there, it would
+    propagate into mpi4py's own code and could abort or corrupt the worker's startup
+    -- exactly the behavior-altering failure CBTS must never cause.
+    """
+    pytest.importorskip("mpi4py.futures")
+    env, workdir = cbts_env
+    address = str(workdir / "server.sock")
+    env.pop("CBTS_CONTEXT_SOCKET", None)
+    env["CBTS_TEST_ID"] = "suite.py::test_x"
+    env.pop("CBTS_PROCESS_ROLE", None)
+
+    from cbts.coverage.collection.channel import ContextServer
+
+    server = ContextServer.start(address)
+    server.announce("suite.py::test_x", ack_timeout=0)
+    try:
+        script = textwrap.dedent(f"""
+            from cbts.coverage.collection.pystart import PyStartTracker
+            def _raise(self):
+                raise RuntimeError('boom')
+            PyStartTracker.start = _raise
+            import sys
+            sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']
+            import site
+            site.main()
+            import sitecustomize
+            from mpi4py.futures import _lib
+            result = _lib._sync_set_data({{'env': {{'CBTS_CONTEXT_SOCKET': {address!r}}}}})
+            print('sync-returned', result is not None)
+            print('active', sitecustomize._tracker._active)
+            print('taints', sorted((k, r) for _p, _n, k, r in sitecustomize._tracker._taints))
+            """)
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script],
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        server.close(drain_timeout=0.5)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "sync-returned True" in result.stdout, result.stdout
+    assert "active False" in result.stdout, result.stdout
+    assert "taints [('incomplete', 'py_start_unavailable')]" in result.stdout, result.stdout
 
 
 def test_a_process_that_exits_normally_does_not_taint_the_channel(cbts_env):
@@ -358,88 +480,74 @@ def test_a_process_that_exits_normally_does_not_taint_the_channel(cbts_env):
         server.close(drain_timeout=0.5)
 
 
-def test_an_mpi_pool_worker_activates_when_the_framework_import_finishes(cbts_env):
-    """The one process type with a wait_shutdown barrier to protect.
+def test_an_mpi_pool_worker_defers_activation_to_the_sync_handshake(cbts_env):
+    """An MPI pool worker is the one process type with deferred activation.
 
-    Defer PY_START until the framework import completes, then record on that thread.
+    Its channel address arrives only through mpi4py's own sync handshake
+    (`_lib._sync_set_data`), not at exec like an ordinary child's, so activation
+    (subscribe + PY_START together) is deferred to that hook instead of being
+    attempted at interpreter startup, when it is guaranteed to find no address. The
+    handshake still runs before any product import, so deferring to it loses nothing.
     """
+    pytest.importorskip("mpi4py.futures")
     env, workdir = cbts_env
     _write_fakeprod(workdir)
+    address = str(workdir / "server.sock")
     env["PYTHONPATH"] = os.pathsep.join([_BOOTSTRAP_PYTHONPATH, str(workdir / "product")])
+    env.pop("CBTS_CONTEXT_SOCKET", None)  # not yet known at interpreter startup
     env["CBTS_TEST_ID"] = "suite.py::test_x"
     env.pop("CBTS_PROCESS_ROLE", None)
 
-    # `-S` skips automatic sitecustomize import at startup (PYTHONPATH entries still land on
-    # sys.path regardless), so this script can fake sys.orig_argv to the mpi4py.futures pool
-    # worker spawn signature *before* triggering site processing itself via site.main() --
-    # otherwise sitecustomize would already have inspected the real argv by the time any -c
-    # code got control.
-    script = (
-        textwrap.dedent("""
-            import sys
-            sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']
-            import site
-            site.main()
-            import sitecustomize
-            """)
-        + _RECORD_PROBE
-    )
-    result = subprocess.run(
-        [sys.executable, "-S", "-c", script],
-        cwd=workdir,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    from cbts.coverage.collection.channel import ContextServer
+
+    server = ContextServer.start(address)
+    # Announced before the subscriber joins, so it lands on this context immediately
+    # (the first frame is read inline by subscribe()) instead of the server's default
+    # "" -- matching the real producer, which always has a current test by the time any
+    # subscriber connects.
+    server.announce("suite.py::test_x", ack_timeout=0)
+    try:
+        # `-S` skips automatic sitecustomize import at startup (PYTHONPATH entries still
+        # land on sys.path regardless), so this script can fake sys.orig_argv to the
+        # mpi4py.futures pool worker spawn signature *before* triggering site processing
+        # itself via site.main() -- otherwise sitecustomize would already have inspected
+        # the real argv by the time any -c code got control.
+        script = (
+            textwrap.dedent(f"""
+                import sys
+                sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']
+                import site
+                site.main()
+                import sitecustomize
+                print('active-before-sync', sitecustomize._tracker._active)
+                print('subscribed-before-sync', sitecustomize._subscriber is not None)
+                from mpi4py.futures import _lib
+                # Simulate mpi4py applying the coordinator's env payload during the
+                # worker's sync handshake, before any product import.
+                _lib._sync_set_data({{'env': {{'CBTS_CONTEXT_SOCKET': {address!r}}}}})
+                print('subscribed-after-sync', sitecustomize._subscriber is not None)
+                """)
+            + _RECORD_PROBE
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script],
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        server.close(drain_timeout=0.5)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "before False" in result.stdout, result.stdout
-    # Activation happens inline on the importing thread, so nothing runs unrecorded after it.
-    assert "after True" in result.stdout, result.stdout
-    # work() is entered after activation; AtImportTime's body ran during the deferred import.
-    assert "recorded ['work']" in result.stdout, result.stdout
-
-
-def test_an_mpi_pool_worker_that_hits_the_activation_timeout_is_tainted(cbts_env):
-    """A backstop-triggered activation is an anomaly, not the routine unrecorded-import gap.
-
-    The default budget is already past the documented worst-case cold import, so hitting it
-    at all signals an abnormally slow run and gets an INCOMPLETE taint.
-    """
-    env, workdir = cbts_env
-    # Nothing ever imports the watched "fakeprod" name, so only the backstop can activate.
-    # CBTS_WORKER_ACTIVATE_MAX_SECONDS is floored at 1.0s in sitecustomize.py, so this is the
-    # fastest the backstop can fire.
-    env["CBTS_WORKER_ACTIVATE_MAX_SECONDS"] = "0.05"
-    env["CBTS_TEST_ID"] = "suite.py::test_x"
-    env.pop("CBTS_PROCESS_ROLE", None)
-
-    # Poll rather than a fixed sleep: the backstop is floored at 1.0s, but a loaded CI
-    # host can push its actual fire time well past that margin.
-    script = textwrap.dedent("""
-        import sys
-        sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']
-        import site
-        site.main()
-        import sitecustomize
-        import time
-        deadline = time.monotonic() + 10
-        while not sitecustomize._tracker._active and time.monotonic() < deadline:
-            time.sleep(0.05)
-        print('active', sitecustomize._tracker._active)
-        print('taints', sorted((k, r) for _p, _n, k, r in sitecustomize._tracker._taints))
-        """)
-    result = subprocess.run(
-        [sys.executable, "-S", "-c", script],
-        cwd=workdir,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "active True" in result.stdout, result.stdout
-    assert "taints [('incomplete', 'worker_activation_timeout')]" in result.stdout, result.stdout
+    assert "active-before-sync False" in result.stdout, result.stdout
+    assert "subscribed-before-sync False" in result.stdout, result.stdout
+    assert "subscribed-after-sync True" in result.stdout, result.stdout
+    # PY_START is already active by the time _RECORD_PROBE's own check runs (right
+    # after the sync handshake), and nothing was lost: the class body's import-time
+    # execution is recorded, same as if activation had never been deferred at all.
+    assert "before True" in result.stdout, result.stdout
+    assert "recorded ['<module>', 'AtImportTime', 'work']" in result.stdout, result.stdout
 
 
 def test_a_worker_that_joins_after_stop_does_not_leave_py_start_enabled(cbts_env):
@@ -474,18 +582,10 @@ def test_a_worker_that_joins_after_stop_does_not_leave_py_start_enabled(cbts_env
     env["CBTS_TEST_ID"] = "suite.py::test_x"
     env.pop("CBTS_PROCESS_ROLE", None)
 
-    script = textwrap.dedent("""
-        import sys
-        sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']
-        import site
-        site.main()
-        import sitecustomize
-        import fakeprod
-        print('active', sitecustomize._tracker._active)
-        """)
+    script = "import sitecustomize\nprint('active', sitecustomize._tracker._active)\n"
     try:
         result = subprocess.run(
-            [sys.executable, "-S", "-c", script],
+            [sys.executable, "-c", script],
             cwd=workdir,
             env=env,
             capture_output=True,
@@ -519,6 +619,100 @@ def test_pool_patch_is_installed_as_mpi4py_futures_is_imported(cbts_env):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "patched True" in result.stdout, result.stdout
+
+
+def test_pool_env_patch_failure_is_recorded_as_a_taint():
+    """Regression: a pool-env-merge failure must be recorded, not just printed.
+
+    `_report_pool_env_unavailable` is `pool.py`'s own escape hatch for the
+    `_patched_init` try/except: a worker that never gets the channel address has no
+    later retry to find it, unlike one whose address merely arrives late, so this
+    must land in the report via `hooks.active`, not just stderr.
+    """
+    from cbts.coverage.collection import hooks, pool
+
+    recorded = []
+
+    class _FakeHooks(hooks.Hooks):
+        def record_channel_taints(self, taints):
+            recorded.extend(taints)
+
+    original = hooks.active
+    hooks.active = _FakeHooks()
+    try:
+        pool._report_pool_env_unavailable(RuntimeError("boom"))
+    finally:
+        hooks.active = original
+
+    assert sorted((kind, reason) for _uid, _nodeid, kind, reason in recorded) == [
+        ("attribution", "pool_env_unavailable"),
+        ("incomplete", "pool_env_unavailable"),
+    ]
+
+
+def test_install_pool_env_patch_never_raises(monkeypatch):
+    """Regression: install_pool_env_patch() must swallow and taint any internal failure.
+
+    It stands in for the product's own pool construction setup; an unexpected
+    failure inside it (not just the documented ImportError) must not propagate.
+    """
+    from cbts.coverage.collection import hooks, pool
+
+    def _boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pool, "_install_pool_env_patch", _boom)
+
+    recorded = []
+
+    class _FakeHooks(hooks.Hooks):
+        def record_channel_taints(self, taints):
+            recorded.extend(taints)
+
+    monkeypatch.setattr(hooks, "active", _FakeHooks())
+
+    assert pool.install_pool_env_patch() is False
+    assert recorded
+
+
+def test_patched_pool_init_calls_the_real_init_despite_a_merge_failure(monkeypatch):
+    """Regression: a merge failure inside the patched __init__ must not block pool construction.
+
+    `_patched_init` stands in for the product's own `MPIPoolExecutor` construction --
+    on the critical path of every dynamically-spawned pool, including every
+    multi-GPU deployment that uses one. Even an unanticipated failure merging the
+    channel address in must not prevent the real constructor from running.
+    """
+    pytest.importorskip("mpi4py.futures")
+    from cbts.coverage.collection import hooks, pool
+    from mpi4py.futures import MPIPoolExecutor
+
+    calls = []
+
+    def _stub_init(self, *args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(MPIPoolExecutor, "__init__", _stub_init, raising=False)
+    assert pool._install_pool_env_patch() is True
+
+    recorded = []
+
+    class _FakeHooks(hooks.Hooks):
+        def record_channel_taints(self, taints):
+            recorded.extend(taints)
+
+    monkeypatch.setattr(hooks, "active", _FakeHooks())
+    monkeypatch.setenv("CBTS_CONTEXT_SOCKET", "/some/address")
+
+    # A truthy, non-mapping 'env' makes dict(kwargs.get('env') or {}) raise TypeError.
+    instance = object.__new__(MPIPoolExecutor)
+    MPIPoolExecutor.__init__(instance, max_workers=1, env=42)
+
+    assert calls == [{"max_workers": 1, "env": 42}]
+    assert sorted((kind, reason) for _uid, _nodeid, kind, reason in recorded) == [
+        ("attribution", "pool_env_unavailable"),
+        ("incomplete", "pool_env_unavailable"),
+    ]
 
 
 def test_program_arguments_are_not_read_as_interpreter_options(cbts_env):
@@ -581,6 +775,62 @@ def test_a_session_without_a_channel_taints_every_test(cbts_env):
     assert sorted(rows) == [
         ("", "attribution", "no_context_channel"),
         ("", "incomplete", "no_context_channel"),
+    ], f"{rows}\n{result.stdout}{result.stderr}"
+
+
+def test_runtest_protocol_failure_does_not_prevent_the_test_from_running(cbts_env):
+    """Regression: a context-switch failure must not stop the real test from running.
+
+    Everything cbts_plugin's pytest_runtest_protocol does runs before the actual test
+    body (it's a hookwrapper around the whole protocol); coverage must never be able
+    to prevent that test from executing at all, even when something in its own
+    bookkeeping breaks unexpectedly -- but a stderr line alone does not make the
+    report itself reflect that its coverage cannot be trusted.
+    """
+    import sqlite3
+
+    env, workdir = cbts_env
+    env["CBTS_PROCESS_ROLE"] = "outer_pytest"
+    (workdir / "conftest.py").write_text(
+        textwrap.dedent("""
+            from cbts.coverage.collection.pystart import PyStartTracker
+
+            def _raise(self, nodeid):
+                raise RuntimeError('boom')
+
+            PyStartTracker.switch_test_context = _raise
+            """)
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "cbts_plugin",
+            "test_dummy.py",
+        ],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, result.stdout
+    # The reason reaches the operator, not just the fact.
+    assert "context switch to" in result.stderr, result.stderr
+
+    rows = []
+    for leaf in workdir.glob(".cbtscov.*.sqlite"):
+        with sqlite3.connect(f"file://{leaf}?mode=ro", uri=True) as db:
+            rows += db.execute("SELECT test, kind, reason FROM taint_rows").fetchall()
+    assert sorted(rows) == [
+        ("", "incomplete", "context_switch_failed"),
+        ("unit/test_dummy.py::test_a", "attribution", "context_switch_failed"),
     ], f"{rows}\n{result.stdout}{result.stderr}"
 
 
