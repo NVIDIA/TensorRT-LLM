@@ -28,6 +28,10 @@
 # H100_PCIe-*
 # DGX_H100-*
 
-Reason: aws-pdx-slurm-1 complete outage, with no backup cluster 2026-10-20 00:00-05:00 Beijing time. Slack: https://nvidia.slack.com/archives/C0ANDGK93DZ/p1792098411747449 Maintenance Link: https://aihub.nvidia.com/allocations/maintenances/6ad13fc03cf25574bf03db7c
+Reason: aws-pdx-slurm-1 complete outage with no backup cluster, 2026-10-20 00:00-05:00 Beijing time.
+# Planned start
+# Shanghai: 2026-10-20, 00:00 GMT+8 | PT: 2026-10-19, 09:00 PDT | UTC: 2026-10-19, 16:00 UTC
+# Planned end
+# Shanghai: 2026-10-20, 05:00 GMT+8 | PT: 2026-10-19, 14:00 PDT | UTC: 2026-10-19, 21:00 UTC
 B300-*
 DGX_B300-*
