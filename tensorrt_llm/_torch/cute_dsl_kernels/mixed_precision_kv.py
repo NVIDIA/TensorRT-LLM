@@ -98,12 +98,12 @@ class _PagedMixedPrecisionKV:
         groups = (
             self.capacity * pool.shape[1] * pool.shape[3] * (pool.shape[4] // self.codec.group_size)
         )
-        self.kernel(pool, history, scales, high, tables, lengths).launch(
+        self.convert_paged_kv(pool, history, scales, high, tables, lengths).launch(
             grid=((groups + 127) // 128, lengths.shape[1], 1), block=(128, 1, 1), stream=stream
         )
 
     @cute.kernel
-    def kernel(
+    def convert_paged_kv(
         self,
         pool: cute.Tensor,
         history: cute.Tensor,
