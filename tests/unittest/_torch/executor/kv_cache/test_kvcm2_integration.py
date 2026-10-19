@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -401,7 +401,6 @@ def _make_manager_for_cache_tier_test(
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
-        patch(f"{module}.CuError", _CacheTierInitError),
         patch(f"{module}.IndexMapper"),
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
@@ -482,42 +481,41 @@ def test_buffered_events_receive_vocab_size(
     assert impl_constructor.call_args.kwargs["event_manager"] is manager.event_manager
 
 
-def _multi_rank_host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
-    """Exercise the real world collective from an MPI worker."""
+def _multi_rank_host_failure_consensus_worker() -> tuple[int, int, bool, int]:
+    """Exercise the real world collective from an MPI worker.
+
+    Only rank 1 fails to build the host tier. Every rank must still raise: a
+    rank that returned a working manager while another aborted would leave the
+    job half-initialized and hang on the next collective.
+    """
     from tensorrt_llm._utils import mpi_rank, mpi_world_size
 
     rank = mpi_rank()
     world_size = mpi_world_size()
-    initial_impl = Mock()
-    fallback_impl = Mock()
+    local_impl = Mock()
     impl_side_effect: list[object] = (
-        [initial_impl, fallback_impl]
-        if rank == 0
-        else [_CacheTierInitError("rank-local host tier failure"), fallback_impl]
+        [local_impl] if rank == 0 else [_CacheTierInitError("rank-local host tier failure")]
     )
 
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-        ),
-        impl_side_effect,
-        mapping=Mapping(
-            world_size=world_size,
-            rank=rank,
-            tp_size=world_size,
-        ),
-    )
+    raised = False
+    try:
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            impl_side_effect,
+            mapping=Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=world_size,
+            ),
+        )
+    except Exception:
+        raised = True
 
-    return (
-        rank,
-        impl_constructor.call_count,
-        initial_impl.shutdown.call_count,
-        any(
-            isinstance(tier, HostCacheTierConfig)
-            for tier in manager.kv_cache_manager_py_config.cache_tiers
-        ),
-    )
+    # The rank that succeeded must also release what it built.
+    return (rank, world_size, raised, local_impl.shutdown.call_count)
 
 
 def test_base_config_uses_local_attention_window_order() -> None:
@@ -1121,73 +1119,40 @@ def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
 def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
     mapping = SimpleNamespace(world_size=2)
     dist = Mock()
-    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.USE_NO_HOST)
+    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.ABORT)
 
     with patch.object(Distributed, "get", return_value=dist):
-        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.KEEP_HOST, mapping)
+        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.OK, mapping)
 
-    assert status == _KVCacheManagerInitStatus.USE_NO_HOST
-    dist.allreduce.assert_called_once_with(
-        int(_KVCacheManagerInitStatus.KEEP_HOST), op=ReduceOp.MAX
-    )
+    assert status == _KVCacheManagerInitStatus.ABORT
+    dist.allreduce.assert_called_once_with(int(_KVCacheManagerInitStatus.OK), op=ReduceOp.MAX)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
-def test_world_ranks_converge_on_hostless_fallback() -> None:
+def test_world_ranks_converge_on_host_failure() -> None:
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     session = MpiPoolSession(n_workers=2)
     try:
-        results = session.submit_sync(_multi_rank_host_fallback_consensus_worker)
+        results = session.submit_sync(_multi_rank_host_failure_consensus_worker)
     finally:
         session.shutdown()
 
-    assert sorted(results) == [(0, 2, 1, False), (1, 2, 0, False)]
+    # Rank 1 failed locally; rank 0 succeeded and must abort with it, after
+    # shutting down the manager it had already built.
+    assert sorted(results) == [(0, 2, True, 1), (1, 2, True, 0)]
 
 
-def test_local_fallback_failure_is_shared_before_raising() -> None:
+def test_peer_init_failure_discards_local_candidate() -> None:
+    """A rank whose own init succeeded still aborts, and releases what it built."""
+    local_impl = Mock()
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
 
     with (
         patch(
             f"{module}._sync_kv_cache_manager_init_status",
-            side_effect=[
-                _KVCacheManagerInitStatus.USE_NO_HOST,
-                _KVCacheManagerInitStatus.ABORT,
-            ],
-        ) as sync_status,
-        pytest.raises(RuntimeError, match="fallback init failed"),
-    ):
-        _make_manager_for_cache_tier_test(
-            KvCacheConfig(
-                max_gpu_total_bytes=16 << 20,
-                host_cache_size=16 << 20,
-            ),
-            [
-                _CacheTierInitError("host tier init failed"),
-                RuntimeError("fallback init failed"),
-            ],
-        )
-
-    assert [call.args[0] for call in sync_status.call_args_list] == [
-        _KVCacheManagerInitStatus.USE_NO_HOST,
-        _KVCacheManagerInitStatus.ABORT,
-    ]
-
-
-def test_peer_fallback_failure_discards_local_candidate() -> None:
-    initial_impl = Mock()
-    fallback_impl = Mock()
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
-
-    with (
-        patch(
-            f"{module}._sync_kv_cache_manager_init_status",
-            side_effect=[
-                _KVCacheManagerInitStatus.USE_NO_HOST,
-                _KVCacheManagerInitStatus.ABORT,
-            ],
+            return_value=_KVCacheManagerInitStatus.ABORT,
         ),
         pytest.raises(RuntimeError, match="failed on another rank"),
     ):
@@ -1196,94 +1161,45 @@ def test_peer_fallback_failure_discards_local_candidate() -> None:
                 max_gpu_total_bytes=16 << 20,
                 host_cache_size=16 << 20,
             ),
-            [initial_impl, fallback_impl],
+            [local_impl],
         )
 
-    initial_impl.shutdown.assert_called_once_with()
-    fallback_impl.shutdown.assert_called_once_with()
+    local_impl.shutdown.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    ("add_secondary_gpu_tier", "expected_can_evict"),
-    [(False, False), (True, True)],
-)
-def test_host_init_fallback_recomputes_eviction_capability(
-    add_secondary_gpu_tier: bool,
-    expected_can_evict: bool,
-) -> None:
-    impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-        ),
-        [_CacheTierInitError("host tier init failed"), impl],
-        add_secondary_gpu_tier=add_secondary_gpu_tier,
-    )
+@pytest.mark.parametrize("add_secondary_gpu_tier", [False, True])
+def test_host_init_failure_propagates_without_rebuilding(add_secondary_gpu_tier: bool) -> None:
+    """A configured host tier is honoured or the manager does not come up.
 
-    assert manager.can_evict is expected_can_evict
-    assert impl_constructor.call_count == 2
-    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
-    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
-    assert any(isinstance(tier, HostCacheTierConfig) for tier in initial_tiers)
-    assert all(isinstance(tier, GpuCacheTierConfig) for tier in fallback_tiers)
-    assert len(fallback_tiers) == 1 + int(add_secondary_gpu_tier)
+    Dropping the tier and rebuilding would run the job on a cache other than the
+    one asked for. The construction is attempted exactly once.
+    """
+    # A second impl is offered: if the host tier were dropped and construction
+    # retried, that retry would succeed and nothing would be raised. The error
+    # escaping is what shows the retry did not happen.
+    with pytest.raises(_CacheTierInitError, match="host tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [_CacheTierInitError("host tier init failed"), Mock()],
+            add_secondary_gpu_tier=add_secondary_gpu_tier,
+        )
 
 
-def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
-    impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-            disk_cache_size=16 << 20,
-            disk_cache_path=str(tmp_path),
-        ),
-        [_CacheTierInitError("host tier init failed"), impl],
-    )
-
-    assert manager.can_evict
-    assert impl_constructor.call_count == 2
-    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
-    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
-    assert [type(tier) for tier in initial_tiers] == [
-        GpuCacheTierConfig,
-        HostCacheTierConfig,
-        DiskCacheTierConfig,
-    ]
-    assert [type(tier) for tier in fallback_tiers] == [
-        GpuCacheTierConfig,
-        DiskCacheTierConfig,
-    ]
-
-
-@pytest.mark.cpu_only
-def test_host_init_fallback_recreates_cold_codec_and_keeps_disk(tmp_path) -> None:
-    impl = Mock()
-    codecs = [object(), object()]
-    codec_provider = Mock()
-    codec_provider.create_cold_page_codec.side_effect = codecs
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-            disk_cache_size=16 << 20,
-            disk_cache_path=str(tmp_path),
-        ),
-        [_CacheTierInitError("host tier init failed"), impl],
-        cold_page_codec_provider=codec_provider,
-    )
-
-    assert manager.can_evict
-    assert codec_provider.create_cold_page_codec.call_count == 2
-    assert impl_constructor.call_count == 2
-    assert impl_constructor.call_args_list[0].kwargs["cold_page_codec"] is codecs[0]
-    assert impl_constructor.call_args_list[1].kwargs["cold_page_codec"] is codecs[1]
-    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
-    assert [type(tier) for tier in fallback_tiers] == [
-        GpuCacheTierConfig,
-        DiskCacheTierConfig,
-    ]
+def test_host_init_failure_propagates_with_disk_tier(tmp_path) -> None:
+    """The disk tier is no reason to retry without the host tier either."""
+    with pytest.raises(_CacheTierInitError, match="host tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+                disk_cache_size=16 << 20,
+                disk_cache_path=str(tmp_path),
+            ),
+            [_CacheTierInitError("host tier init failed"), Mock()],
+        )
 
 
 @pytest.mark.cpu_only
@@ -1365,6 +1281,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._kv_reserve_draft_tokens = 4
     manager._effective_draft_len = Mock(return_value=2)
     manager.kv_compression_manages_history = False
@@ -1374,6 +1291,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
     assert manager._allocated_draft_lens[request.py_request_id] == 4
+    assert manager._inflight_draft_lens[request.py_request_id] == [4]
 
     batch = ScheduledRequests()
     batch.generation_requests.append(request)
@@ -1385,6 +1303,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     assert kv_cache.resize.call_args_list[1].args == (103, 102)
     assert request.py_request_id not in manager._allocated_draft_lens
+    assert request.py_request_id not in manager._inflight_draft_lens
 
 
 def _revert_context_request(request_id: int) -> SimpleNamespace:
@@ -1493,6 +1412,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     """A manager wired just far enough to run the publish/history bookkeeping."""
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
     manager.enable_block_reuse = True
     manager.is_draft = False
     manager._can_publish_block_reuse = True
@@ -1611,7 +1531,7 @@ class _ContextRequest:
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
-    py_connector_served_position: int = 0
+    py_served_prefix_end: int = 0
     py_num_connector_matched_tokens: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
@@ -1749,23 +1669,24 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         spec_config=spec_config,
     )
     try:
-        runner = object.__new__(DecoderRunner)
-        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        runner._config = SimpleNamespace(
-            spec_config=spec_config,
-            max_draft_len=draft_len,
-            max_draft_loop_tokens=draft_len,
-            max_seq_len=manager.max_seq_len,
-            max_beam_width=1,
-            use_mrope=False,
-        )
-        runner.get_runtime_tokens_per_gen_step = lambda length: length + 1
-        runner._get_draft_kv_cache_manager = lambda _: None
-        runner.model = SimpleNamespace(
-            model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+        requests = DummyRequestFactory(
+            config=SimpleNamespace(
+                spec_config=spec_config,
+                max_draft_len=draft_len,
+                max_draft_loop_tokens=draft_len,
+                max_seq_len=manager.max_seq_len,
+                max_beam_width=1,
+                use_mrope=False,
+            ),
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+            ),
+            get_runtime_tokens_per_gen_step=lambda length: length + 1,
+            release_request_state=None,
         )
         resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-        batch = runner._create_cuda_graph_warmup_request(
+        batch = requests.create_cuda_graph_warmup_request(
             resources, batch_size=2, draft_len=draft_len
         )
         assert batch is not None
@@ -1780,6 +1701,41 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
             manager.free_resources(request)
         assert not manager.kv_cache_map
     finally:
+        manager.shutdown()
+
+
+def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=True, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=2,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+    )
+    tokens = [1] * 32
+    seed = manager.impl.create_kv_cache(ReuseScope(), tokens)
+    dummy = None
+    try:
+        assert seed.resume(manager._stream.cuda_stream)
+        assert seed.resize(len(tokens))
+        seed.commit(tokens, is_end=True)
+        seed.close()
+
+        dummy = manager.add_dummy_requests([1000], token_nums=[33], is_gen=True)
+        assert dummy is not None
+        assert manager.kv_cache_map[dummy[0].py_request_id].num_committed_tokens == 0
+    finally:
+        if dummy is not None:
+            manager.free_resources(dummy[0])
         manager.shutdown()
 
 
@@ -2902,10 +2858,13 @@ def _make_fresh_fill_manager(
     monkeypatch: pytest.MonkeyPatch,
     fill_value: float | None = _FRESH_FILL,
 ) -> KVCacheManagerV2:
-    # The production path synchronises so the fill lands before the forward
-    # pass; these tests run on CPU tensors.
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    # These tests use CPU tensors and an explicit stream double; a device-wide wait is forbidden.
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", Mock(side_effect=AssertionError("device-wide fill sync"))
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock(return_value=Mock()))
     manager = object.__new__(KVCacheManagerV2)
+    manager._stream = SimpleNamespace(device=torch.device("cuda:0"))
     manager._fresh_page_fill = fill_value
     manager._fresh_pages_filled = {}
     manager._fresh_fill_announced = True
@@ -2926,11 +2885,29 @@ def test_fresh_fill_covers_pages_on_allocation(monkeypatch: pytest.MonkeyPatch) 
     buffer = torch.zeros(8, 2)
     kv_cache = _FreshFillKVCache([2, 5])
     manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+    other_buffer = torch.zeros_like(buffer)
+    manager.pp_layers = [0, 1]
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager.layer_to_pool_mapping_dict = {0: 0, 1: 0}
+    manager.get_buffers = lambda layer_idx: (buffer, other_buffer)[layer_idx]
+    order = Mock()
+    order.attach_mock(torch.cuda.current_stream.return_value, "stream")
+    fill = Mock(wraps=kv_cache_v2_module._fill_kv_pages)
+    monkeypatch.setattr(kv_cache_v2_module, "_fill_kv_pages", fill)
+    order.attach_mock(fill, "fill")
 
     manager._fill_fresh_kv_pages(1)
+    torch.cuda.current_stream.assert_called_once_with(device=manager._stream.device)
+    assert order.mock_calls == [
+        call.stream.wait_stream(manager._stream),
+        call.fill(buffer, [2, 5], _FRESH_FILL),
+        call.fill(other_buffer, [2, 5], _FRESH_FILL),
+        call.stream.synchronize(),
+    ]
     assert torch.equal(buffer[2], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[0], torch.zeros(2))
+    assert torch.equal(other_buffer, buffer)
 
     # The owner writes its KV into page 2; growing by one page must fill only
     # the new page, not rewrite what the owner already stored.
@@ -2939,6 +2916,12 @@ def test_fresh_fill_covers_pages_on_allocation(monkeypatch: pytest.MonkeyPatch) 
     manager._fill_fresh_kv_pages(1)
     assert torch.equal(buffer[6], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[2], torch.full((2,), 1.5))
+    assert order.mock_calls[-4:] == [
+        call.stream.wait_stream(manager._stream),
+        call.fill(buffer, [6], _FRESH_FILL),
+        call.fill(other_buffer, [6], _FRESH_FILL),
+        call.stream.synchronize(),
+    ]
 
 
 def test_fresh_fill_skips_committed_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2966,6 +2949,7 @@ def test_fresh_fill_disabled_or_unknown_request_is_a_noop(
     manager._fresh_page_fill = _FRESH_FILL
     manager._fill_fresh_kv_pages(99)
     assert torch.equal(buffer, torch.zeros(4, 2))
+    torch.cuda.current_stream.assert_not_called()
 
 
 def test_fresh_fill_refills_page_reassigned_after_release(

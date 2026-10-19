@@ -103,6 +103,34 @@ def test_fp8_quantize_blackwell(dtype, m, k):
                                rtol=1e-1)
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 100 and getSMVersion() != 90,
+    reason="Only test on Blackwell and Hopper",
+)
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_fp8_quantize_1x128_vectorized_matches_elementwise(use_ue8m0):
+    # A 16-byte aligned input takes the vectorized kernel, one 4 bytes past the
+    # boundary the element-wise kernel; both give the same bytes and scales.
+    # K = 576 ends in a partial group, M = 37 pads the scale rows.
+    m, k = 37, 576
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    a_offset = torch.empty(m * k + 2, device='cuda',
+                           dtype=torch.bfloat16)[2:].view(m, k)
+    a_offset.copy_(a)
+    fp8_a, scale_a = torch.ops.trtllm.fp8_quantize_1x128(a, use_ue8m0)
+    fp8_b, scale_b = torch.ops.trtllm.fp8_quantize_1x128(a_offset, use_ue8m0)
+    assert torch.equal(fp8_a.view(torch.uint8), fp8_b.view(torch.uint8))
+    # Hopper returns the scale buffer with unwritten padding rows.
+    num_blocks, m_padded = (k + 127) // 128, (m + 3) // 4 * 4
+    rows = m if scale_a.numel() == num_blocks * m else m_padded
+
+    def written(scale):
+        return scale.flatten()[:num_blocks * rows].view(num_blocks, rows)[:, :m]
+
+    assert torch.equal(written(scale_a), written(scale_b))
+
+
 def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
     if torch.any(torch.isnan(a)):
         raise Exception("NaN in a")
@@ -200,6 +228,31 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
 
     mxfp8_quantize_check_accuracy(a_pt[:, :k].cpu().to(torch.float32),
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
+
+
+@pytest.mark.parametrize("is_sf_swizzled_layout, alignment", [(False, 512),
+                                                              (True, 32)])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_zero_rows(is_sf_swizzled_layout, alignment):
+    """No rows: empty outputs, and no launch error left for the next call."""
+    k = 2880
+    torch.random.manual_seed(0)
+    a = torch.randn([4, k], dtype=torch.bfloat16, device="cuda")
+    ref_fp8, ref_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout,
+                                                      alignment)
+
+    empty = torch.empty([0, k], dtype=torch.bfloat16, device="cuda")
+    empty_fp8, empty_sf = torch.ops.trtllm.mxfp8_quantize(
+        empty, is_sf_swizzled_layout, alignment)
+    assert empty_fp8.shape == (0, ref_fp8.shape[1])
+    assert empty_sf.numel() == 0
+
+    # A launch error left pending by the empty call is raised by the next
+    # kernel launch, here torch.equal's.
+    a_fp8, a_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout,
+                                                  alignment)
+    assert torch.equal(a_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert torch.equal(a_sf, ref_sf)
 
 
 def _run_megamoe_prepare(hidden_states, token_selected_experts,

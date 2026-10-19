@@ -98,6 +98,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
+    # (local q_begin, local q_end, per-rank sizes) when indexer_prefill_chunks
+    # cover only this TP rank's share of the context query tokens; the top-k
+    # results are then all-gathered once after the chunks.
+    indexer_prefill_q_split: Optional[Tuple[int, int, List[int]]] = None
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
@@ -573,8 +577,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         msl_c = int(self.get_indexer_max_seq_len())
         # Prefill leg first: the decode-stride guard below may return early for
         # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
+        # forwarded only when enabled (keeps the default warmup calls unchanged)
+        det_kw = (
+            {"deterministic": True}
+            if getattr(self.sparse_metadata_params, "gvr_deterministic_topk", False)
+            else {}
+        )
         try:
-            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
+            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768), **det_kw)
         except torch.cuda.OutOfMemoryError:
             logger.warning(
                 "self-sampling GVR prefill warmup ran out of memory; prefill "
@@ -602,6 +612,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
+                **det_kw,
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines
@@ -613,17 +624,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
-        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        # Especially for the changes in DecoderInputPreparer.preprocess_inputs().
         #
         # NOTE:
         # In overlap scheduler + speculative decoding, kv_lens_cuda can be corrected at runtime
-        # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
+        # (inside preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
 
         super().on_update_kv_lens()
 
-        # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
+        # preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.

@@ -84,13 +84,31 @@ def get_ucx_tls():
     return "^ib,gdr_copy"
 
 
-def cleanup_output_files():
-    """Clean up output files from previous runs."""
-    for file in ['output.json', 'output_streaming.json']:
-        try:
-            os.remove(file)
-        except FileNotFoundError:
-            pass
+def get_ucx_net_devices():
+    """Get UCX_NET_DEVICES for these single-node disaggregated tests.
+
+    Every worker runs on this host, so loopback is the only TCP device UCX
+    needs. With every netdev enabled, UCX protocol selection re-queries each
+    TCP interface (ethtool ioctls, slow on bonded NICs) for every new endpoint,
+    which pushed cold NIXL peer setup past kv_transfer_timeout_ms on B200
+    nodes (https://nvbugs/6836097).
+    """
+    return "lo"
+
+
+def apply_pre_hopper_nccl_workaround(env: dict) -> None:
+    """Keep NCCL off PCIe peer-to-peer on pre-Hopper CI nodes.
+
+    The 8xL40S CI nodes run with the AMD IOMMU in DMA translation mode, so
+    PCIe P2P writes across the host bridge fault (``AMD-Vi IO_PAGE_FAULT``)
+    and never land. NCCL still picks its P2P/CUMEM transport there, and the
+    first PP send/recv or TP collective in the warmup forward hangs the
+    worker before it can register with the disagg server
+    (https://nvbugs/6728119). Restricting P2P to PCIe-switch peers makes NCCL
+    fall back to SHM on those nodes; NVLink platforms are unaffected.
+    """
+    if get_sm_version() < 90:
+        env.setdefault("NCCL_P2P_LEVEL", "PXB")
 
 
 # Fatal patterns whose presence in worker/server logs after a stress run
@@ -349,8 +367,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml",
         "ctxpp4_gentp4":
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
-        "deepseek_v3_lite_fp8_mpi":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
         "deepseek_v3_lite_fp8_tp1":
@@ -505,11 +521,19 @@ def run_client_tests(example_dir,
                      server_url,
                      workers_proc,
                      server_proc,
+                     client_output_dir,
                      use_ray=False,
                      client_test_set=None):
-    """Run client tests against the disaggregated server."""
+    """Run client tests against the disaggregated server.
+
+    Client outputs go to client_output_dir, not to the cwd: concurrent QA jobs
+    run from one shared checkout and can overwrite each other's files there.
+    """
     if client_test_set is None:
         client_test_set = get_client_test_set(test_desc)
+
+    def output_path(file_name):
+        return os.path.join(client_output_dir, file_name)
 
     client_dir = f"{example_dir}/clients"
     for _ in range(num_iters):
@@ -539,25 +563,30 @@ def run_client_tests(example_dir,
 
         # Run completion test (non-streaming)
         if client_test_set.completion:
-            check_call(client_cmd, env=env, poll_procs=poll_procs)
+            completion_output = output_path('output.json')
+            completion_client_cmd = client_cmd + ['-o', completion_output]
+            check_call(completion_client_cmd, env=env, poll_procs=poll_procs)
 
         # Streaming client run
         if client_test_set.completion_streaming:
+            streaming_output = output_path('output_streaming.json')
             streaming_client_cmd = client_cmd + [
-                '--streaming', '-o', 'output_streaming.json'
+                '--streaming', '-o', streaming_output
             ]
             check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run chat completion test
         if client_test_set.chat:
-            chat_output = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_file_name = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_output = output_path(chat_file_name)
             chat_client_cmd = client_cmd + ['-e', 'chat', '-o', chat_output]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run streaming chat completion test
         if client_test_set.chat_streaming:
+            streaming_chat_output = output_path('output_streaming_chat.json')
             streaming_chat_client_cmd = client_cmd + [
-                '-e', 'chat', '--streaming', '-o', 'output_streaming_chat.json'
+                '-e', 'chat', '--streaming', '-o', streaming_chat_output
             ]
             check_call(streaming_chat_client_cmd,
                        env=env,
@@ -589,7 +618,7 @@ def run_client_tests(example_dir,
             continue
 
         for output_file in output_files:
-            with open(output_file, 'r') as f:
+            with open(output_path(output_file), 'r') as f:
                 content = f.read()
                 if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
                     # Different models (and endpoints) phrase the continuation
@@ -1061,6 +1090,8 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
+    apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
@@ -1113,6 +1144,7 @@ def run_disaggregated_test(example_dir,
             server_url,
             all_worker_procs,
             disagg_server.process,
+            client_output_dir=work_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
@@ -1305,6 +1337,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
@@ -1481,6 +1514,7 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
@@ -1504,6 +1538,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
@@ -1524,6 +1559,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
     run_disaggregated_test(
         disaggregated_example_root,
@@ -1556,6 +1592,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         "TRTLLM_USE_NIXL_KVCACHE": "0",
         "TRTLLM_USE_UCX_KVCACHE": "1",
         "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
     }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -1599,6 +1636,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -1827,28 +1865,6 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
 
 
 @skip_no_hopper
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip(
-    reason="MPI cache transceiver requires shared MPI process group, "
-    "incompatible with service discovery which launches separate subprocesses")
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_mpi",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
@@ -1953,6 +1969,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["UCX_MM_ERROR_HANDLING"] = "y"
 
     # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
@@ -2257,6 +2274,7 @@ def run_disaggregated_benchmark(example_dir,
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2523,9 +2541,9 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -3116,6 +3134,7 @@ def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
                                                                "transfers")
     env = baseline_env(llm_venv._new_env) | {
         "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
         "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
         "TRTLLM_NIXL_NUM_THREADS": "1",
         "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": transfer_dir,
@@ -3961,9 +3980,9 @@ def run_disaggregated_mixed_stress(example_dir: str,
     if profiles is None:
         profiles = _DEFAULT_MIXED_STRESS_PROFILES
 
-    cleanup_output_files()
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     setup_start = time.monotonic()
@@ -4117,9 +4136,9 @@ def run_disaggregated_cancel_test(example_dir,
                                   model_path=None,
                                   cwd=None):
     """Run disaggregated test with request cancellation stress test."""
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -4270,6 +4289,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -4310,14 +4330,19 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                         **base
                     }
 
-                # 1) Streaming vs non-streaming consistency check
-                async with session.post(url,
-                                        json=make_payload(prompt, False),
-                                        timeout=timeout) as resp:
-                    assert resp.status == 200, \
-                        f"[{api_type}] non-streaming: {await resp.text()}"
-                    ns_tokens, ns_logprobs = extract_logprobs(
-                        await resp.json(), api_type)
+                # 1) Streaming vs non-streaming consistency check.
+                # Block reuse is on, and a cold prefill is not bit-identical
+                # to a reused prefix. Issue the non-streaming request twice
+                # and keep the second result so both sides of the comparison
+                # hit the reuse path.
+                for _ in range(2):
+                    async with session.post(url,
+                                            json=make_payload(prompt, False),
+                                            timeout=timeout) as resp:
+                        assert resp.status == 200, \
+                            f"[{api_type}] non-streaming: {await resp.text()}"
+                        ns_tokens, ns_logprobs = extract_logprobs(
+                            await resp.json(), api_type)
 
                 async with session.post(url,
                                         json=make_payload(prompt, True),
@@ -4332,13 +4357,10 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 assert len(ns_logprobs) == len(st_logprobs), (
                     f"[{api_type}] logprobs length: "
                     f"{len(ns_logprobs)} vs {len(st_logprobs)}")
-                # Skip position 0: the first token logprob can diverge
-                # between streaming and non-streaming in disaggregated mode
-                # due to the context/generation handoff boundary.
                 comparable = 0
                 for i, (n, s) in enumerate(
                         zip(ns_logprobs, st_logprobs, strict=True)):
-                    if i == 0 or n is None or s is None:
+                    if n is None or s is None:
                         continue
                     comparable += 1
                     rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
@@ -4346,7 +4368,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     assert np.isclose(n, s, rtol=rtol, atol=atol), \
                         f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
                 assert comparable > 0, (
-                    f"[{api_type}] no comparable post-handoff logprobs found")
+                    f"[{api_type}] no comparable logprobs found")
 
                 # 2) Chat API with top_logprobs (requires gather_generation_logits)
                 if api_type == "chat":
@@ -4411,6 +4433,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,

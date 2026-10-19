@@ -1031,7 +1031,8 @@ public:
                 fmhaData.mScales.dsv4OScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
                 fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
                 fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
-                fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mScales.sageAttnSfsQPtrD,
+                fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mMetaData.variableWindowTokenStartsD,
+                fmhaData.mMetaData.variableWindowTokenEndsD, fmhaData.mScales.sageAttnSfsQPtrD,
                 fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD, fmhaData.mScales.sageAttnSfsVPtrD,
                 fmhaData.mInputBuffers.attentionSinksPtrD, fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD,
                 fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
@@ -1427,6 +1428,8 @@ private:
         fmhaData.mMetaData.seqLensKvD = params.seqLensKvPtr;
         fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD = params.firstSparseMaskOffsetsKvPtr;
         fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
+        fmhaData.mMetaData.variableWindowTokenStartsD = params.variableWindowTokenStartsPtr;
+        fmhaData.mMetaData.variableWindowTokenEndsD = params.variableWindowTokenEndsPtr;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
         fmhaData.mMetaData.skipCorrThreshold = params.mSkipCorrThreshold;
@@ -1552,7 +1555,8 @@ private:
 
         // Attention features
         options.mUseBlockSparseAttention = params.mUseBlockSparseAttention;
-        options.mAttentionWindowSize = params.mAttentionWindowSize;
+        options.mLeftSlidingWindow = params.mLeftSlidingWindow;
+        options.mRightSlidingWindow = params.mRightSlidingWindow;
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
 
         // Sparse attention (MLA / MQA / GQA)
