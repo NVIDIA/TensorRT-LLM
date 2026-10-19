@@ -91,8 +91,8 @@ if TYPE_CHECKING:
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
-# Number of worker threads for KV transfer queues (default: 1)
-KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+# Number of Sender worker threads; each (request, peer) stream stays on one of them.
+KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "4"))
 
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
@@ -702,14 +702,19 @@ class SendTaskBase(_LogicalTask):
 
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
-        self._exception = exc
-        self.status = TaskStatus.ERROR
-        self._event.set()
+        with self.lock:
+            self._exception = exc
+            self.status = TaskStatus.ERROR
+            self._event.set()
 
     def complete(self) -> None:
+        """Mark the task delivered, unless a failure already ended it."""
         self._logical_outcomes.complete(self._logical_index)
-        self.status = TaskStatus.TRANSFERRED
-        self._event.set()
+        with self.lock:
+            if self.status == TaskStatus.ERROR:
+                return
+            self.status = TaskStatus.TRANSFERRED
+            self._event.set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
@@ -926,6 +931,10 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ) -> None:
+        if KV_TRANSFER_NUM_THREADS < 1:
+            raise ValueError(
+                f"TRTLLM_KV_TRANSFER_NUM_THREADS must be at least 1, got {KV_TRANSFER_NUM_THREADS}"
+            )
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent

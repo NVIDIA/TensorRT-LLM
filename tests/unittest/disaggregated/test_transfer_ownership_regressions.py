@@ -1483,6 +1483,32 @@ def test_cancel_to_receivers_is_queued_behind_each_stream_earlier_reports() -> N
 
 
 @pytest.mark.cpu_only
+def test_send_task_complete_does_not_overwrite_a_failure() -> None:
+    task = transfer_mod.KVSendTask(
+        _sole_piece(),
+        DisaggregatedParams(disagg_request_id=100),
+        slice_id=0,
+    )
+    failure = RuntimeError("another peer's write failed")
+
+    task.fail(failure)
+    task.complete()
+
+    assert task.is_done
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert task._exception is failure
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_threads", [0, -1])
+def test_sender_rejects_fewer_than_one_worker_thread(monkeypatch, num_threads: int) -> None:
+    monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", num_threads)
+
+    with pytest.raises(ValueError, match="TRTLLM_KV_TRANSFER_NUM_THREADS must be at least 1"):
+        transfer_mod.Sender(Mock(), Mock())
+
+
+@pytest.mark.cpu_only
 def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
