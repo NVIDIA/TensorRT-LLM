@@ -456,7 +456,7 @@ def get_rank_model_storage(model):
 def _resolve_checkpoint_io_policy(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: CheckpointFormat | str | None,
-    load_format: LoadFormat | str,
+    load_format: LoadFormat,
     requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
 ) -> tuple[CheckpointIOPolicy, Optional[str]]:
@@ -470,13 +470,11 @@ def _resolve_checkpoint_io_policy(
     elif checkpoint_format != CheckpointFormat.HF:
         reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
                   f"(received '{checkpoint_format}')")
-    else:
-        normalized_load_format = getattr(load_format, "name", load_format)
-        if str(normalized_load_format).lower() != "auto":
-            reason = ("rank-striped read-ahead requires load_format='auto' "
-                      f"(received {normalized_load_format!r})")
-        elif partial_model_loading:
-            reason = "partial model loading was requested"
+    elif load_format != LoadFormat.AUTO:
+        reason = ("rank-striped read-ahead requires load_format='auto' "
+                  f"(received {load_format.name!r})")
+    elif partial_model_loading:
+        reason = "partial model loading was requested"
 
     if reason is None:
         from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
@@ -514,7 +512,7 @@ def _construct_checkpoint_loader(
     *,
     mx_config: Optional[ModelExpressConfig] = None,
     checkpoint_io_policy: CheckpointIOPolicy = CheckpointIOPolicy.NATIVE,
-    load_format: LoadFormat | str = LoadFormat.AUTO,
+    load_format: LoadFormat = LoadFormat.AUTO,
     partial_model_loading: bool = False,
 ) -> BaseCheckpointLoader:
     # Just in case someone wrongly passes a str instead of a CheckpointIOPolicy.
@@ -730,12 +728,11 @@ class ModelLoaderMetricNames(Enum):
 
 def _checkpoint_startup_metadata(
     checkpoint_loader: BaseCheckpointLoader,
-    load_format: LoadFormat | str,
+    load_format: LoadFormat,
 ) -> dict[str, str]:
     """Describe the concrete checkpoint source selected for this load."""
     weight_loader = getattr(checkpoint_loader, "weight_loader", None)
     source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
-    load_format_name = getattr(load_format, "name", load_format)
     return {
         "checkpoint_loader_kind":
         type(checkpoint_loader).__name__,
@@ -745,7 +742,7 @@ def _checkpoint_startup_metadata(
         "checkpoint_source_kind":
         str(source_kind or "unknown"),
         "load_format":
-        str(load_format_name).lower(),
+        load_format.name.lower(),
     }
 
 
