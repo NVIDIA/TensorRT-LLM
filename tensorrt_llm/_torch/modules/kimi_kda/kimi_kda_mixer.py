@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import os
 import weakref
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from fla.modules import ShortConvolution
@@ -48,6 +48,18 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 # projection kernels. Verify intentionally counts B * num_steps because those
 # flattened token rows form the projection GEMMs' M dimension.
 _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
+
+
+class _KdaPrequantizedCore(NamedTuple):
+    """MXFP8 KDA core emitted by the fused verify epilogue.
+
+    ``activation`` is the ``[tokens, H * V]`` E4M3 post-o_norm core and
+    ``scale`` its UE8M0 1x128 scales in the flat uint8 R128c4 layout that
+    ``o_proj.forward_prequantized`` consumes.
+    """
+
+    activation: torch.Tensor
+    scale: torch.Tensor
 
 
 def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
@@ -442,12 +454,14 @@ class KimiKDALinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Run metadata-dependent KDA prefill/decode/verify dispatch.
 
         ``output`` is the BCG post-o_norm, pre-o_proj core buffer. When it
         is supplied, subpaths fill and return its corresponding slices;
-        otherwise this method returns an allocated core tensor.
+        otherwise this method returns an allocated core tensor. A
+        verify-only batch without ``output`` may instead return the fused
+        verify epilogue's MXFP8 core (see ``forward_verify_fused``).
         """
         mamba_metadata = attn_metadata.mamba_metadata
         num_prefills = attn_metadata.num_contexts
@@ -515,6 +529,9 @@ class KimiKDALinearAttention(nn.Module):
                     ssm_pool,
                     generation_state_indices,
                     output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
+                    # The MXFP8 core cannot be concatenated with a prefill
+                    # core or stored into the BCG buffer.
+                    allow_prequantized_output=output is None and num_prefills == 0,
                 )
                 if output is None:
                     cores.append(verify_core)
@@ -522,9 +539,12 @@ class KimiKDALinearAttention(nn.Module):
             return output
         return cores[0] if len(cores) == 1 else torch.cat(cores, dim=0)
 
-    def _project_output(self, core: torch.Tensor) -> torch.Tensor:
+    def _project_output(self, core: Union[torch.Tensor, _KdaPrequantizedCore]) -> torch.Tensor:
         """Project the post-o_norm KDA core and reduce TP partials."""
-        out = self.o_proj(core.reshape(-1, self.proj_size))
+        if isinstance(core, _KdaPrequantizedCore):
+            out = self.o_proj.forward_prequantized(core.activation, core.scale)
+        else:
+            out = self.o_proj(core.reshape(-1, self.proj_size))
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
@@ -574,14 +594,25 @@ class KimiKDALinearAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Project the block input into the ``[3D, T]`` the convolution needs.
 
+        The result is channel-major when the transposed GEMM can write it
+        directly, and otherwise a transposed view of token-major rows, which
+        the convolution and ``fused_kda_post_conv`` read through strides.
+
         Returns ``(packed_conv, onorm_g)``; ``onorm_g`` is None for
         configurations without a full-rank gate.
         """
         d = self.proj_size
         if self._qkvg_proj_weight is not None:
-            # Transposing the GEMM skips the repack the paths below still need.
             weight = self._qkvg_proj_weight
-            packed_conv = torch.mm(weight[: 3 * d], x2d.t())
+            # The transposed GEMM writes rows of T elements; cuBLAS's fast
+            # kernels need each row to start on a 16-byte boundary and fall
+            # back to a several-times-slower one otherwise. When aligned, the
+            # channel-major result is still preferred: its in-place convolution
+            # is faster than the channel-last one for single long sequences.
+            if x2d.shape[0] * x2d.element_size() % 16 == 0:
+                packed_conv = torch.mm(weight[: 3 * d], x2d.t())
+            else:
+                packed_conv = torch.nn.functional.linear(x2d, weight[: 3 * d]).t()
             onorm_g = (
                 torch.nn.functional.linear(x, weight[3 * d : 4 * d])
                 if self.use_full_rank_gate
@@ -623,6 +654,14 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run KDA prefill for ``num_prefills`` packed context sequences.
+
+        ``x2d`` is ``[T, hidden]`` with sequence boundaries in ``cu_seqlens``.
+        Convolution windows in ``conv_pool`` and recurrent states in
+        ``ssm_pool`` are read and updated in place at ``slot_indices``.
+        Returns the gated core output before ``o_proj``, written into
+        ``output`` when one is given.
+        """
         chunk_indices = getattr(mamba_metadata, "kda_chunk_indices", None)
         varlen_is_aligned = getattr(mamba_metadata, "kda_varlen_is_aligned", None)
         single_sequence_length = getattr(mamba_metadata, "kda_single_sequence_length", None)
@@ -674,9 +713,11 @@ class KimiKDALinearAttention(nn.Module):
 
         # Reuse GDN's packed variable-length causal convolution. It reads
         # and writes the live [slots, 3D, W - 1] pool directly and honors
-        # has_initial_state for fresh versus continuation requests.
+        # has_initial_state for fresh versus continuation requests. It works in
+        # place on channel-major input and returns a new token-major tensor
+        # for a transposed view.
         assert self._packed_conv_weight is not None
-        causal_conv1d_fn(
+        packed_conv = causal_conv1d_fn(
             packed_conv,
             self._packed_conv_weight,
             query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
@@ -1049,7 +1090,10 @@ class KimiKDALinearAttention(nn.Module):
         # so drafted batches always take the verify path.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
-        return out.squeeze(1)
+        # FLA's gated norm is [tokens * heads, head_dim]; the optimized
+        # fallback kernel is [B, 1, H, V]. Prefill returns [tokens, H, V],
+        # so a mixed batch can cat the two cores only after this reshape.
+        return self._store_core(out, output)
 
     def forward_verify(
         self,
@@ -1060,7 +1104,8 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        allow_prequantized_output: bool = False,
+    ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
 
@@ -1085,7 +1130,13 @@ class KimiKDALinearAttention(nn.Module):
                 "were not allocated so there is no fallback"
             )
             return self.forward_verify_fused(
-                x2d, num_steps, layer_cache, ssm_pool, slot_indices, output=output
+                x2d,
+                num_steps,
+                layer_cache,
+                ssm_pool,
+                slot_indices,
+                output=output,
+                allow_prequantized_output=allow_prequantized_output,
             )
         return self.forward_verify_sequential(
             x2d,
@@ -1098,7 +1149,7 @@ class KimiKDALinearAttention(nn.Module):
         )
 
     def _project_verify_inputs(
-        self, x: torch.Tensor, num_rows: int
+        self, x: torch.Tensor, num_rows: int, preserve_section_strides: bool = False
     ) -> Optional[
         tuple[
             torch.Tensor,
@@ -1109,7 +1160,13 @@ class KimiKDALinearAttention(nn.Module):
             Optional[torch.Tensor],
         ]
     ]:
-        """Project fused QKVG and [f_a | b] inputs for target verification."""
+        """Project fused QKVG and [f_a | b] inputs for target verification.
+
+        With ``preserve_section_strides`` the q/k/v/gate sections stay
+        strided views of the fused QKVG output (and beta of the fused
+        ``[f_a | b]`` output); the packed fused verify kernel reads them in
+        place instead of paying one copy per section.
+        """
         qkvg_weight = self._qkvg_proj_weight
         fused_qkvg = self.qkvg_proj
         if qkvg_weight is None and fused_qkvg is None:
@@ -1141,17 +1198,21 @@ class KimiKDALinearAttention(nn.Module):
             forget_gate = self.f_b_proj(self.f_a_proj(x))
 
         d = self.proj_size
-        q_proj, k_proj, v_proj = (part.contiguous() for part in qkvg[..., : 3 * d].split(d, dim=-1))
+        q_proj, k_proj, v_proj = qkvg[..., : 3 * d].split(d, dim=-1)
         qkvg_split_sizes = self.qkvg_split_sizes
         has_onorm_gate = self.use_full_rank_gate and (
             qkvg_weight is not None or (qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4)
         )
         if has_onorm_gate:
-            onorm_g = qkvg[..., 3 * d : 4 * d].contiguous()
+            onorm_g = qkvg[..., 3 * d : 4 * d]
         elif onorm_lowrank is not None:
-            onorm_g = onorm_lowrank.contiguous()
+            onorm_g = onorm_lowrank
         else:
             onorm_g = None
+        if not preserve_section_strides:
+            q_proj, k_proj, v_proj = q_proj.contiguous(), k_proj.contiguous(), v_proj.contiguous()
+            if onorm_g is not None:
+                onorm_g = onorm_g.contiguous()
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
     def forward_verify_fused(
@@ -1162,15 +1223,27 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        allow_prequantized_output: bool = False,
+    ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
-        Token layout: the kernel indexes each request's new tokens at
-        ``cu_seqlens[n] + num_accepted[n] + i``. The runtime packs the
-        ``num_steps`` new tokens per request contiguously, so we pass
-        ``cu_seqlens[n] = n * num_steps - num_accepted[n]`` — the shift
-        lands the kernel's reads/writes exactly on the packed rows. A
-        negative entry for request 0 is fine: ``bos`` is only ever used
+        Fused epilogue path (the output gate is available and the output-norm
+        weights are finalized): the runtime packs ``num_steps`` new rows
+        contiguously per request, so the kernel derives the row offsets from
+        the request index and reads each request's pending accepted count
+        from the slot-indexed replay pool (``packed_token_layout``). It also
+        applies the gated RMSNorm in its epilogue (``fuse_output_norm``), so
+        it returns the post-o_norm core directly. When
+        ``allow_prequantized_output`` is set and ``o_proj`` accepts a
+        prequantized activation (Rubin CuTe MXFP8 GEMM), the epilogue also
+        quantizes the core to MXFP8 and ``_project_output`` hands it to
+        ``o_proj.forward_prequantized``.
+
+        Fallback path: the kernel indexes each request's new tokens at
+        ``cu_seqlens[n] + num_accepted[n] + i``, so we pass
+        ``cu_seqlens[n] = n * num_steps - num_accepted[n]``, which lands the
+        kernel's reads and writes on the packed rows; the output gate runs in
+        Python. A negative entry for request 0 is fine: ``bos`` is only used
         additively with a token offset ``>= num_accepted``.
         """
         num_generations = x2d.shape[0] // num_steps
@@ -1180,7 +1253,10 @@ class KimiKDALinearAttention(nn.Module):
         x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
         T_total = num_generations * num_steps
 
-        projections = self._project_verify_inputs(x, T_total)
+        can_fuse_output_norm = self._onorm_w_f32 is not None
+        projections = self._project_verify_inputs(
+            x, T_total, preserve_section_strides=can_fuse_output_norm
+        )
         if projections is None:
             q_proj = self.q_proj(x)
             k_proj = self.k_proj(x)
@@ -1190,26 +1266,21 @@ class KimiKDALinearAttention(nn.Module):
             onorm_g = None
         else:
             q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections
+        fuse_output_norm = can_fuse_output_norm and onorm_g is not None
+        if not fuse_output_norm:
+            # The legacy layout has only ever seen dense projections.
+            q_proj, k_proj, v_proj = q_proj.contiguous(), k_proj.contiguous(), v_proj.contiguous()
+            beta_proj = beta_proj.contiguous()
         x_q = q_proj.view(1, T_total, H, K)
         x_k = k_proj.view(1, T_total, H, K)
         x_v = v_proj.view(1, T_total, H, self.head_dim)
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
         g = forget_gate.view(1, T_total, H, K)
-        beta = beta_proj.contiguous().view(1, T_total, H)
+        beta = beta_proj.view(1, T_total, H)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
-        lower_bound = self.gate_lower_bound
-
-        pending = layer_cache.prev_num_accepted_tokens[
-            slot_indices
-        ]  # accepted drafts of the previous round, per req
-        cu_seqlens = torch.arange(
-            0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
-        )
-        cu_seqlens[:num_generations].sub_(pending)
-
-        out = self._dispatch.mtp_verify(
+        verify_kwargs = dict(
             x_q=x_q,
             x_k=x_k,
             x_v=x_v,
@@ -1226,15 +1297,51 @@ class KimiKDALinearAttention(nn.Module):
             A_log=self.A_log.detach(),
             dt_bias=self.dt_bias.detach(),
             recurrent_state=ssm_pool,
-            qkg_cache=layer_cache.kda_qkg_cache,
+            k_cache=layer_cache.kda_k_cache,
+            g_cache=layer_cache.kda_g_cache,
             v_cache=layer_cache.kda_v_cache,
             beta_cache=layer_cache.kda_beta_cache,
             ssm_state_indices=slot_indices,
-            cu_seqlens=cu_seqlens,
             num_spec=num_spec,
-            num_accepted_tokens=pending,
-            lower_bound=lower_bound,
+            lower_bound=self.gate_lower_bound,
             scale=self.head_k_dim**-0.5,
+        )
+
+        if fuse_output_norm:
+            mxfp8_output = (
+                allow_prequantized_output
+                and output is None
+                and bool(getattr(self.o_proj, "supports_prequantized_input", False))
+                and callable(getattr(self.o_proj, "forward_prequantized", None))
+            )
+            out = self._dispatch.mtp_verify(
+                **verify_kwargs,
+                cu_seqlens=None,
+                num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
+                packed_token_layout=True,
+                onorm_g=onorm_g.view(1, T_total, H, self.head_dim),
+                onorm_weight=self._onorm_w_f32,
+                onorm_eps=self.o_norm.eps,
+                fuse_output_norm=True,
+                mxfp8_output=mxfp8_output,
+            )
+            if mxfp8_output:
+                return _KdaPrequantizedCore(*out)
+            # Can be removed once the op writes the core in place.
+            return self._store_core(out, output)
+
+        pending = layer_cache.prev_num_accepted_tokens[
+            slot_indices
+        ]  # accepted drafts of the previous round, per req
+        cu_seqlens = torch.arange(
+            0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
+        )
+        cu_seqlens[:num_generations].sub_(pending)
+
+        out = self._dispatch.mtp_verify(
+            **verify_kwargs,
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=pending,
         )
         o = out.view(num_generations, num_steps, H, self.head_dim)
         core = self._output_gate(x, o, onorm_g)

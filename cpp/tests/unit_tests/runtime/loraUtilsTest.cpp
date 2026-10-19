@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -98,7 +98,7 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
 
     std::vector<int32_t> config{1, 0, 4, 1, 1, 4};
 
-    auto configPtr = bufferCast<int32_t>(*optReqLoraConfig.value());
+    auto configPtr = optReqLoraConfig.value()->getBufferPtr<int32_t>();
     std::copy_n(config.data(), config.size(), configPtr);
 
     EXPECT_THAT([&]()

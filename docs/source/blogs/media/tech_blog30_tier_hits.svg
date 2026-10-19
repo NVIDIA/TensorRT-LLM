@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 794 375" width="794" height="375">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="794" height="375" fill="#f5f5f5"/>
+<rect x="50" y="28" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
+<text x="66.0" y="37.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">served from GPU</text>
+<rect x="281" y="28" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
+<text x="297.0" y="37.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">served from host memory</text>
+<rect x="512" y="28" width="11" height="11" fill="#e4e5e7" stroke="#4f5d75"/>
+<text x="528.0" y="37.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">served from disk</text>
+<text x="215.0" y="64.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2</text>
+<text x="215.0" y="77.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">4 GB300 · concurrency 48</text>
+<text x="215.0" y="90.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">host cache 24 GiB per GPU · disk tier 512 GiB · AgentX replay, 30 min</text>
+<line x1="50" y1="270" x2="380" y2="270" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="145.0" y="208.6" width="60" height="61.4" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="175.0" y="242.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">36%</text>
+<rect x="145.0" y="153.4" width="60" height="55.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="175.0" y="184.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">32%</text>
+<rect x="145.0" y="100.0" width="60" height="53.4" fill="#e4e5e7" stroke="#4f5d75" stroke-width="1"/>
+<text x="175.0" y="129.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">31%</text>
+<text x="175.0" y="283.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">uncompressed</text>
+<rect x="225.0" y="207.4" width="60" height="62.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="255.0" y="241.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">37%</text>
+<rect x="225.0" y="132.7" width="60" height="74.7" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="255.0" y="173.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">44%</text>
+<rect x="225.0" y="100.0" width="60" height="32.7" fill="#e4e5e7" stroke="#4f5d75" stroke-width="1"/>
+<text x="255.0" y="119.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">19%</text>
+<text x="255.0" y="283.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">NVFP4 cold pages</text>
+<text x="215.0" y="302.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">disk share 31% → 19%</text>
+<text x="215.0" y="316.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">block hit rate 86.7% → 88.4%</text>
+<text x="215.0" y="329.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">TTFT p90 39.8 s → 23.4 s</text>
+<text x="215.0" y="342.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">requests completed in the window 1,133 → 1,581</text>
+<text x="579.0" y="64.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">Qwen3.5-397B-A17B</text>
+<text x="579.0" y="77.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">4 GB300 · concurrency 128</text>
+<text x="579.0" y="90.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">host cache 16 GiB per GPU · disk tier 512 GiB · AgentX replay, 30 min</text>
+<line x1="414" y1="270" x2="744" y2="270" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="509.0" y="168.4" width="60" height="101.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="539.0" y="222.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">60%</text>
+<rect x="509.0" y="124.0" width="60" height="44.4" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="539.0" y="149.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">26%</text>
+<rect x="509.0" y="100.0" width="60" height="24.0" fill="#e4e5e7" stroke="#4f5d75" stroke-width="1"/>
+<text x="539.0" y="115.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">14%</text>
+<text x="539.0" y="283.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">uncompressed</text>
+<rect x="589.0" y="142.2" width="60" height="127.8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="619.0" y="209.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">75%</text>
+<rect x="589.0" y="100.0" width="60" height="42.2" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="619.0" y="124.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">25%</text>
+<rect x="589.0" y="100.0" width="60" height="0.0" fill="#e4e5e7" stroke="#4f5d75" stroke-width="1"/>
+<text x="619.0" y="283.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">NVFP4 cold pages</text>
+<text x="579.0" y="302.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">disk share 14% → 0%</text>
+<text x="579.0" y="316.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">block hit rate 81.0% → 85.2%</text>
+<text x="579.0" y="329.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">TTFT p90 33.8 s → 20.7 s</text>
+<text x="579.0" y="342.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">requests completed in the window 3,070 → 4,621</text>
+</svg>

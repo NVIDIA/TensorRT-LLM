@@ -41,6 +41,7 @@ l0_h100:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   - unittest/_torch/modules/test_w4a16_nvfp4_linear.py
+  - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
@@ -64,7 +65,11 @@ l0_h100:
   # function's leaves on Hopper, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_fused_sampling_op.py
+  - unittest/_torch/speculative/test_chain_speculative_sampling_op.py
+  - unittest/_torch/speculative/test_dynamic_tree_rejection_op.py
+  - unittest/_torch/speculative/test_dynamic_tree_sampling_dispatch.py
   - unittest/_torch/speculative/test_rejection_buffers_guard.py
   - unittest/_torch/speculative/test_sa_hybrid_state_promotion.py
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
@@ -210,6 +215,7 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-overlap-t5-small]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_block_reuse_requested
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v2-decoder-graphs-on-beam2]
   - test_e2e.py::test_openai_chat_harmony
@@ -260,6 +266,7 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-Qwen3-0.6B]
     - unittest/_torch/executor/test_overlap_scheduler.py
     - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp1" TIMEOUT (90)
+    - unittest/executor/test_ray_sleep_state.py
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_postproc_workers.py
