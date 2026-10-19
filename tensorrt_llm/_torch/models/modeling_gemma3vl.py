@@ -24,6 +24,7 @@ from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
                                         fuse_input_embeds)
@@ -179,6 +180,8 @@ class Gemma3MultiModalProjector(torch.nn.Module):
         content_format=ContentFormat.STRING,
     ))
 class Gemma3VLM(PreTrainedModel):
+
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,

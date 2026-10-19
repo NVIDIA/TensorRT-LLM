@@ -72,6 +72,7 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
@@ -3096,6 +3097,8 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     ``multi_modal_projector.*`` and ``patch_merge_mlp.*`` checkpoint
     blobs under that namespace.
     """
+
+    lora_owner = DecoderLoraOwner(module_path="model")
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """LoRA parameter construction for the PyTorch model engine."""
 
+from inspect import getattr_static
+
 import torch
 from torch import nn
 
@@ -9,13 +11,68 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
+from tensorrt_llm.inputs.registry import InputProcessor
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 
 from ..resource_manager import PeftCacheManager
 from ..scheduler import ScheduledRequests
+from .multimodal import is_multimodal
+
+
+def resolve_lora_owner(
+    model: nn.Module, input_processor: InputProcessor
+) -> tuple[DecoderLoraOwner, nn.Module]:
+    """Bind the declared decoder owner before loading any adapters.
+
+    Multimodal models must select a decoder submodule. Undeclared text-only
+    models own adapters at the model root.
+    """
+    multimodal = is_multimodal(model, input_processor)
+    model_description = f"{'Multimodal model' if multimodal else 'Model'} {type(model).__name__}"
+    try:
+        owner = model.lora_owner
+    except (AttributeError, NotImplementedError) as exc:
+        undeclared = object()
+        # A descriptor that raises AttributeError is still an explicit declaration.
+        if (
+            not multimodal
+            and isinstance(exc, AttributeError)
+            and getattr_static(model, "lora_owner", undeclared) is undeclared
+        ):
+            return DecoderLoraOwner(), model
+        raise ValueError(
+            f"{model_description} must declare a supported decoder LoRA owner: {exc}"
+        ) from exc
+    if not isinstance(owner, DecoderLoraOwner):
+        raise ValueError(
+            f"{model_description} has invalid decoder LoRA owner {owner!r}; "
+            "expected DecoderLoraOwner"
+        )
+    if (
+        not isinstance(owner.module_path, str)
+        or (multimodal and not owner.module_path)
+        or (owner.module_path and any(not part for part in owner.module_path.split(".")))
+    ):
+        raise ValueError(
+            f"{model_description} has invalid decoder LoRA owner path {owner.module_path!r}"
+        )
+
+    try:
+        decoder = model.get_submodule(owner.module_path)
+    except (AttributeError, NotImplementedError) as exc:
+        raise ValueError(
+            f"{model_description} cannot resolve decoder LoRA owner {owner.module_path!r}: {exc}"
+        ) from exc
+    if not isinstance(decoder, nn.Module) or (multimodal and decoder is model):
+        raise ValueError(
+            f"{model_description} decoder LoRA owner {owner.module_path!r} "
+            "must select a decoder submodule"
+        )
+    return owner, decoder
 
 
 def make_lora_model_config(
@@ -23,6 +80,8 @@ def make_lora_model_config(
     lora_target_modules: list[str],
     trtllm_modules_to_hf_modules: dict[str, str],
     swap_gate_up_proj_lora_b_weight: bool = True,
+    *,
+    owner: DecoderLoraOwner,
 ) -> LoraModelConfig:
     """Describe the model to the LoRA stack, for the engine to record."""
     return LoraModelConfig(
@@ -31,6 +90,7 @@ def make_lora_model_config(
         hidden_size=model.config.hidden_size,
         dtype=torch_dtype_to_str(model.config.torch_dtype),
         swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight,
+        owner=owner,
     )
 
 
@@ -42,9 +102,7 @@ def make_cuda_graph_lora_manager(
     max_tokens_per_seq: int,
     max_num_tokens: int,
 ) -> CudaGraphLoraManager:
-    """Build the CUDA-graph LoRA manager. Only call this when graphs are enabled."""
-    # Multimodal encoders have separate layer indices and do not receive decoder adapters.
-    model = getattr(model, "language_model", model)
+    """Build a graph manager from the decoder module selected during initialization."""
     max_lora_size = lora_config.max_loras or 8  # Default fallback
     manager = CudaGraphLoraManager(
         max_lora_size=max_lora_size,

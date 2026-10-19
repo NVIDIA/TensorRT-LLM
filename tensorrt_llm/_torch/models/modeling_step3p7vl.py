@@ -55,6 +55,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.mlp import MLP
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
@@ -1216,6 +1217,8 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     multimodal payload this class is a thin passthrough so plain text
     benchmarks continue to use the original Step3p7 text path.
     """
+
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__()

@@ -44,6 +44,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
+from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
                                         fuse_input_embeds,
@@ -955,6 +956,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
     _supports_flash_attn = True
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig):
         if _is_mm_disagg():

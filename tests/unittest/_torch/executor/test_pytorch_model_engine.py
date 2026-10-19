@@ -609,6 +609,7 @@ def _install_graph_runner_stub(runner: DecoderRunner,
     return stub
 
 
+@pytest.mark.cpu_only
 def test_cleanup_releases_runner_model_before_release_gc() -> None:
 
     class Model:
@@ -622,6 +623,8 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
     engine._runner = SimpleNamespace(_model=model)
     engine._model_caller = ModelCaller(model)
     engine._mm_item_scheduler = None
+    engine._lora_model = model
+    engine._lora_owner = None
     engine.model = model
     engine._release_cuda_graphs = Mock()
     engine.input_processor = None
