@@ -291,7 +291,28 @@ def sonarScan()
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**,security_scanning/**,triton_kernels/**,cpp/tensorrt_llm/kernels/trtllmGenKernels/**,cpp/tensorrt_llm/kernels/internal_cutlass_kernels/**,**/*.a,**/*.so,**/*.o,**/*.xz,**/*.txz,**/*.tar,**/*.gz,**/*.svg,ATTRIBUTIONS-*.md,**/*.zip"
+          // Keep the analysis report under the SonarQube server upload limit (HTTP 413).
+          def sonarExclusions = [
+            "cpp/build/**", "**/*.lock", "**/*.cubin", "**/*.zst", "**/*.tar.zst", "**/cubin/**",
+            "3rdparty/**", "docs/**", "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.ico",
+            "**/*.pdf", "**/*.whl", "**/*.egg-info/**", "security_scanning/**", "triton_kernels/**",
+            "cpp/tensorrt_llm/kernels/trtllmGenKernels/**", "cpp/tensorrt_llm/kernels/internal_cutlass_kernels/**",
+            "**/*.a", "**/*.so", "**/*.o", "**/*.xz", "**/*.txz", "**/*.tar", "**/*.gz", "**/*.svg",
+            "ATTRIBUTIONS-*.md", "**/*.zip",
+            // Binary/media files
+            "**/*.mp4", "**/*.avi", "**/*.xlsx", "**/*.npy", "**/*.pt", "**/*.safetensors", "**/*.bin",
+            // Tests and benchmarks
+            "tests/**", "cpp/tests/**", "cpp/micro_benchmarks/**", "cpp/kernels/**/test/**", "triton_backend/**/tests/**",
+            // Examples and tooling
+            "examples/**", "agent-flow/**", ".claude/**",
+            // Generated or vendored kernel code
+            "tensorrt_llm/_torch/cute_dsl_kernels/**", "tensorrt_llm/_torch/_experimental/modeling_v2/**",
+            "tensorrt_llm/grpc/openengine/_generated/**", "**/*_pb2*.py",
+            "cpp/kernels/fmha_v2/**", "cpp/kernels/xqa/**", "cpp/tensorrt_llm/deep_gemm/**",
+            "cpp/tensorrt_llm/cutlass_extensions/**", "cpp/tensorrt_llm/kernels/cutlass_kernels/**",
+            "cpp/tensorrt_llm/kernels/flashMLA/**", "cpp/tensorrt_llm/kernels/moe/cutlass/**",
+          ].join(",")
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref} -Dsonar.sourceEncoding=UTF-8 -Dsonar.cfamily.symbolicExecution.automaticShallowModeThreshold=70 -Dsonar.exclusions=${sonarExclusions}"
         }
     }
 }
