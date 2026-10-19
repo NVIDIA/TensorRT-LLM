@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +18,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
+from tensorrt_llm._torch.pyexecutor.engine import multimodal as multimodal_module
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
     resolve_mm_encoder_output_budget,
@@ -312,6 +314,67 @@ def test_duplicate_request_hits_cache_and_skips_encoding(monkeypatch: pytest.Mon
     first_published = first.py_multimodal_data["multimodal_embedding"]
     assert torch.equal(published, first_published)
     assert published.untyped_storage().data_ptr() != first_published.untyped_storage().data_ptr()
+
+
+def test_item_encode_runs_inside_nccl_window_tensor_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope_inputs = []
+    in_scope = []
+
+    @contextlib.contextmanager
+    def discard(inputs: Any) -> Iterator[None]:
+        scope_inputs.append(inputs)
+        in_scope.append(True)
+        try:
+            yield
+        finally:
+            in_scope.pop()
+
+    cache = TensorLRUCache(1 << 20, name="test")
+    put = cache.put
+    put_in_scope = []
+
+    def scoped_put(key: Any, value: torch.Tensor) -> bool:
+        put_in_scope.append(bool(in_scope))
+        return put(key, value)
+
+    monkeypatch.setattr(multimodal_module, "discard_nccl_window_tensor_outputs", discard)
+    monkeypatch.setattr(cache, "put", scoped_put)
+    mm_item_scheduler = _cache_mm_item_scheduler(cache, monkeypatch)
+    model = mm_item_scheduler.model
+    forward = model.forward_multimodal_encoder_items
+    forward_in_scope = []
+
+    def scoped_forward(encoder_inputs: Any) -> list[torch.Tensor]:
+        forward_in_scope.append(bool(in_scope))
+        return forward(encoder_inputs)
+
+    monkeypatch.setattr(model, "forward_multimodal_encoder_items", scoped_forward)
+    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+    state = request.py_mm_encoder_state
+    record = state.record
+    record_in_scope = []
+
+    def scoped_record(item_idx: int, output: torch.Tensor) -> None:
+        record_in_scope.append(bool(in_scope))
+        record(item_idx, output)
+
+    monkeypatch.setattr(state, "record", scoped_record)
+    mm_item_scheduler.forward_items([request], {1: [0, 1]})
+
+    # Window tensors from the encoder are released at the scope boundary, so
+    # the encode and every copy retained past it must happen inside the scope.
+    assert len(scope_inputs) == 1
+    assert forward_in_scope == [True]
+    assert put_in_scope == [True, True]
+    assert record_in_scope == [True, True]
+    assert is_multimodal_encoder_ready(request)
+
+    # A full cache hit runs no encoder and opens no scope.
+    second = _cache_request(2, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+    mm_item_scheduler.forward_items([second], {2: [0, 1]})
+    assert len(scope_inputs) == 1
 
 
 def test_cache_hit_at_encode_skips_only_hit_items(monkeypatch: pytest.MonkeyPatch) -> None:
