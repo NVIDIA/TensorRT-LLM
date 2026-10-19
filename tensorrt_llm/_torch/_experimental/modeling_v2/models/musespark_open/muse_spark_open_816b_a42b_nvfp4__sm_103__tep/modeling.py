@@ -85,6 +85,16 @@ Target attention (installed by the shell's constructor, ``layers.adopt_model``):
   launched; ``ops/attention/full_attention_prep_fold`` normalizes Q and appends
   the step's K/V inside the attention kernel, launched from ``_attn_impl``
   without the built-in call chain.
+* With any of the attention paths above other than ``preattn_prep``
+  (``attention.TRTLLM_GEN_DECODE_PATHS``), every layer's attention selects
+  flashinfer's trtllm-gen FMHA for its decode steps
+  (``attention.select_decode_fmha``): those paths read its KV-pool page bound,
+  and the full-attention ones intercept its decode call. On sm_103 the public
+  FMHA library list already holds it. On sm_107 the public list leaves it out,
+  so a ``DecodeTrtllmGenFmha`` goes in front of each layer's FMHA libraries:
+  decode steps run it, while prefill and mixed steps keep the built-in
+  selection (the ``thop`` attention). The drafter's attention is not a target
+  layer and keeps the built-in selection.
 
 Dense projections and prefetch:
 
@@ -285,12 +295,16 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
 
     @classmethod
     def adopt(
-        cls, model: MuseSparkOpenModel, plan: "_dispatch.Plan" = _dispatch.NO_PATHS
+        cls,
+        model: MuseSparkOpenModel,
+        plan: "_dispatch.Plan" = _dispatch.NO_PATHS,
+        compute_capability: Optional[Tuple[int, int]] = None,
     ) -> "MuseSparkOpenTepModelingV2":
         """Re-class the built-in text model as this core and build its two targets.
 
         ``plan`` is the model's composition (``dispatch.compose``); with
-        ``NO_PATHS`` the core runs the built-in modules only.
+        ``NO_PATHS`` the core runs the built-in modules only. ``compute_capability``
+        is the architecture the plan was composed for (``layers.adopt_model``).
 
         Raises:
             TypeError: if ``model`` is not exactly the built-in ``MuseSparkOpenModel``.
@@ -300,7 +314,7 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
             raise TypeError(
                 f"{cls.__name__} adopts the built-in MuseSparkOpenModel, got {type(model).__name__}"
             )
-        adopted = _layers.adopt_model(model, plan)
+        adopted = _layers.adopt_model(model, plan, compute_capability)
         model.__class__ = cls
         model._plan = plan
         model._finalize_transport = adopted.finalize_transport
@@ -652,7 +666,7 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
             self._runtime_hooks = _runtime.make_runtime_hooks(self)
         # The built-in constructor returns early when it is re-entered; adopt once.
         if not isinstance(self.llm.model, MuseSparkOpenTepModelingV2):
-            MuseSparkOpenTepModelingV2.adopt(self.llm.model, plan)
+            MuseSparkOpenTepModelingV2.adopt(self.llm.model, plan, capability)
 
     def load_weights(self, weights, weight_mapper=None):
         """The built-in load, then the plan's weight-dependent fast paths (the expert

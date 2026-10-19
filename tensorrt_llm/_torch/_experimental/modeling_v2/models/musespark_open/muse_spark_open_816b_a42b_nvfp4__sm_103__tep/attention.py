@@ -11,6 +11,8 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch import flashinfer_utils as _flashinfer_utils
+from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as _fi_gen
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     PredefinedAttentionMask,
@@ -20,7 +22,7 @@ from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenAtte
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.logger import logger
 
-from .dispatch import LAUNCH_PDL
+from .dispatch import LAUNCH_PDL, sm_of
 from .ops.attention.paged_decode_attention import HEAD_DIM as _DECODE_HEAD_DIM
 from .ops.attention.paged_decode_attention import MAX_ROWS as _DECODE_MAX_ROWS
 from .ops.attention.paged_decode_attention import Q_PER_KV as _DECODE_Q_PER_KV
@@ -455,11 +457,8 @@ class MuseSparkOpenTepDecodeAttention(MuseSparkOpenAttention):
         return None
 
     def _total_num_blocks_fmha(self):
-        """The FMHA library whose pool bound the cache view takes (the trtllm-gen one)."""
-        for lib in getattr(getattr(self.attn, "_fmha_manager", None), "fmha_libs", ()):
-            if type(lib).__name__ == "FlashInferTrtllmGenFmha":
-                return lib
-        return None
+        """The FMHA library whose pool bound the cache view takes (the trtllm-gen one), or None."""
+        return trtllm_gen_fmha(self.attn)
 
     def _paged_decode(
         self,
@@ -563,3 +562,123 @@ def _attention_class(
     from .kernels.boundary_early_release import triggers as pdl_triggers
 
     return pdl_triggers.NORM_GATE_CLASSES[base]
+
+
+#: The fast paths whose decode steps need flashinfer's trtllm-gen FMHA library in each target
+#: layer's FMHA manager: the sliding-window ones take its KV-pool page bound, and the
+#: full-attention ones also intercept its ``run_generation``, so it must be the library the
+#: manager selects for those layers' decode steps.
+TRTLLM_GEN_DECODE_PATHS = (
+    "swa_paged_decode",
+    "swa_block",
+    "full_attention_prep_append",
+    "full_attention_split_kv",
+    "full_attention_prep_fold",
+)
+
+
+def trtllm_gen_fmha(attn) -> Optional[_fi_gen.FlashInferTrtllmGenFmha]:
+    """The flashinfer trtllm-gen FMHA library in ``attn``'s FMHA manager, or None."""
+    for lib in getattr(getattr(attn, "_fmha_manager", None), "fmha_libs", ()):
+        if isinstance(lib, _fi_gen.FlashInferTrtllmGenFmha):
+            return lib
+    return None
+
+
+class DecodeTrtllmGenFmha(_fi_gen.FlashInferTrtllmGenFmha):
+    """flashinfer's trtllm-gen FMHA, offered for the generation phase only.
+
+    ``select_decode_fmha`` puts one in front of a target layer's FMHA libraries on
+    an architecture whose public library list leaves flashinfer's trtllm-gen FMHA
+    out. The manager then selects it for a generation-only step that the
+    library's own checks accept (``FlashInferTrtllmGenFmha._is_supported`` for the
+    generation phase). A step with a context phase -- a prefill, or a batch that
+    mixes both phases -- finds no context support here and is served by the public
+    libraries, as without this class.
+    """
+
+    def _is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: AttentionMetadata,
+        forward_args,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        if phase != FmhaPhase.GENERATION:
+            return False
+        return super()._is_supported(q, k, v, metadata, forward_args, phase=phase)
+
+
+def _decode_fmha_refusal(attn) -> Optional[str]:
+    """Why flashinfer's trtllm-gen FMHA cannot serve ``attn``'s decode steps, or None.
+
+    The static checks of ``FlashInferTrtllmGenFmha.is_available`` other than its
+    SM list; the request checks run per step (``is_supported``).
+    """
+    if not _flashinfer_utils.IS_FLASHINFER_AVAILABLE:
+        return "flashinfer is not installed"
+    missing = _fi_gen.FlashInferTrtllmGenFmha._missing_fused_nanobind_ops()
+    if missing:
+        return f"the binding lacks {', '.join(missing)}"
+    num_heads, num_kv_heads = attn.num_heads, attn.num_kv_heads
+    checks = (
+        (getattr(attn, "skip_correction_threshold", 0.0) > 0.0, "skip-correction"),
+        (getattr(attn, "is_mla_enable", False), "MLA"),
+        (getattr(attn, "sparse_params", None) is not None, "sparse attention"),
+        (
+            num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads,
+            f"{num_heads} query heads over {num_kv_heads} KV heads",
+        ),
+    )
+    for failed, reason in checks:
+        if failed:
+            return reason
+    return None
+
+
+def select_decode_fmha(layers, compute_capability) -> int:
+    """Make flashinfer's trtllm-gen FMHA the library each layer's attention selects for decode.
+
+    Per architecture, read once from ``compute_capability``:
+
+    * sm_103: the public library list already holds it
+      (``FlashInferTrtllmGenFmha.is_available``) and the manager selects it;
+      nothing changes.
+    * sm_107: the public list leaves it out, so every layer's manager gets a
+      ``DecodeTrtllmGenFmha`` in front of its libraries. Decode steps then run
+      flashinfer's trtllm-gen FMHA where it supports them; prefill and mixed steps
+      keep the public selection.
+    * no device (None): nothing changes.
+
+    Returns:
+        The number of layers whose manager changed.
+
+    Raises:
+        ValueError: on sm_107, for a layer whose attention the library cannot
+            serve (nothing changes); for any other architecture.
+    """
+    sm = sm_of(compute_capability)
+    if sm is None or sm == 103:
+        return 0
+    if sm != 107:
+        raise ValueError(f"[musespark_open] no decode FMHA selection is written for sm{sm}")
+    refusals = []
+    for layer in layers:
+        reason = _decode_fmha_refusal(layer.self_attn.attn)
+        if reason is not None:
+            refusals.append(f"layer {layer.self_attn.layer_idx}: {reason}")
+    if refusals:
+        raise ValueError(
+            "[musespark_open] flashinfer's trtllm-gen FMHA cannot serve the decode steps: "
+            + "; ".join(refusals)
+        )
+    changed = 0
+    for layer in layers:
+        attn = layer.self_attn.attn
+        if trtllm_gen_fmha(attn) is None:
+            attn._fmha_manager.fmha_libs.insert(0, DecodeTrtllmGenFmha(attn))
+            changed += 1
+    return changed

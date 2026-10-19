@@ -144,7 +144,11 @@ def build(monkeypatch):
     monkeypatch.setattr(
         modeling.MuseSparkOpenTepModelingV2,
         "adopt",
-        classmethod(lambda cls, model, plan=dispatch.NO_PATHS: events.append("adopt")),
+        classmethod(
+            lambda cls, model, plan=dispatch.NO_PATHS, compute_capability=None: events.append(
+                "adopt"
+            )
+        ),
     )
     runtime = types.SimpleNamespace(make_runtime_hooks=make_runtime_hooks)
     monkeypatch.setitem(sys.modules, f"{_PKG}.runtime", runtime)

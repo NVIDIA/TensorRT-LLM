@@ -136,7 +136,7 @@ def build(monkeypatch):
     monkeypatch.setattr(
         modeling.MuseSparkOpenTepModelingV2,
         "adopt",
-        classmethod(lambda cls, model, plan=dispatch.NO_PATHS: None),
+        classmethod(lambda cls, model, plan=dispatch.NO_PATHS, compute_capability=None: None),
     )
     monkeypatch.setattr(draft, "install", lambda *a: events.append("drafter_blocks"))
     monkeypatch.setattr(draft_head, "install", lambda *a: events.append("draft_head"))

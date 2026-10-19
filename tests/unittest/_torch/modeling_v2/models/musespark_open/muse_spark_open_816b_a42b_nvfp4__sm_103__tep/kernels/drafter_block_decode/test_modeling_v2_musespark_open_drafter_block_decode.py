@@ -87,7 +87,11 @@ def build(monkeypatch):
     monkeypatch.setattr(
         modeling.MuseSparkOpenTepModelingV2,
         "adopt",
-        classmethod(lambda cls, model, plan=dispatch.NO_PATHS: events.append("adopt")),
+        classmethod(
+            lambda cls, model, plan=dispatch.NO_PATHS, compute_capability=None: events.append(
+                "adopt"
+            )
+        ),
     )
 
     def _build(*paths):

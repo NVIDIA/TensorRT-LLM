@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -676,8 +676,17 @@ class AdoptedLayers:
     qkv_prefetch: Optional[object]
 
 
-def adopt_model(model: MuseSparkOpenModel, plan: "_dispatch.Plan") -> AdoptedLayers:
+def adopt_model(
+    model: MuseSparkOpenModel,
+    plan: "_dispatch.Plan",
+    compute_capability: Optional[Tuple[int, int]] = None,
+) -> AdoptedLayers:
     """Install ``plan``'s layer-level fast paths on the built-in text model, in install order.
+
+    ``compute_capability`` is the GPU architecture the composition was decided for; with
+    a fast path of ``_attention.TRTLLM_GEN_DECODE_PATHS`` planned it selects the decode
+    FMHA library of every layer (``_attention.select_decode_fmha``). None changes no
+    FMHA selection.
 
     Raises:
         ValueError: if a fast path of the plan cannot run on this model.
@@ -729,6 +738,17 @@ def adopt_model(model: MuseSparkOpenModel, plan: "_dispatch.Plan") -> AdoptedLay
             attention_class.check(layer.self_attn)
         for layer in model.layers:
             attention_class.adopt(layer.self_attn)
+    if any(plan.enabled(path) for path in _attention.TRTLLM_GEN_DECODE_PATHS):
+        # The full-attention paths below intercept the trtllm-gen FMHA's decode call, and
+        # every attention path reads its KV-pool page bound.
+        selected = _attention.select_decode_fmha(model.layers, compute_capability)
+        if selected:
+            logger.info(
+                f"[musespark_open] decode FMHA: flashinfer trtllm-gen FMHA selected for the decode "
+                f"steps of {selected} of {len(model.layers)} layers on "
+                f"sm{_dispatch.sm_of(compute_capability)}; prefill and mixed steps keep the "
+                "built-in selection"
+            )
     if plan.enabled("full_attention_prep_append"):
         # After every attention re-class: the prep append puts its mixin in front of
         # whatever class the full-attention layers carry by now.

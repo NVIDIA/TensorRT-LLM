@@ -933,7 +933,11 @@ def shell_parts(monkeypatch):
     monkeypatch.setattr(
         modeling.MuseSparkOpenTepModelingV2,
         "adopt",
-        classmethod(lambda cls, model, plan=dispatch.NO_PATHS: events.append(("adopt", plan))),
+        classmethod(
+            lambda cls, model, plan=dispatch.NO_PATHS, compute_capability=None: events.append(
+                ("adopt", plan, compute_capability)
+            )
+        ),
     )
     return events
 
@@ -952,7 +956,7 @@ def test_an_unserved_shell_under_auto_adopts_with_no_paths(monkeypatch, shell_pa
     monkeypatch.setattr(modeling, "resolved_mode", lambda target: _AUTO)
     shell = _SHELL(_config(2, _dflash(7)))
     assert shell._plan == dispatch.NO_PATHS
-    assert shell_parts == ["built-in model", ("adopt", dispatch.NO_PATHS)]
+    assert shell_parts == ["built-in model", ("adopt", dispatch.NO_PATHS, _SM103)]
 
 
 def test_a_served_shell_adopts_with_the_plan_compose_made(monkeypatch, shell_parts):
@@ -970,7 +974,7 @@ def test_a_served_shell_adopts_with_the_plan_compose_made(monkeypatch, shell_par
     shell = _SHELL(_SERVED)
     assert shell._plan is plan
     assert composed == [(shell.llm.model, _SERVED, _REQUIRE, modeling.TARGET_PATHS, _SM103, None)]
-    assert shell_parts == ["built-in model", ("adopt", plan)]
+    assert shell_parts == ["built-in model", ("adopt", plan, _SM103)]
 
 
 def test_the_shell_composes_with_the_built_in_dflash_worker(monkeypatch, shell_parts, quiet):
@@ -1008,6 +1012,8 @@ def test_the_shell_composes_for_the_device_it_reads_once(monkeypatch, shell_part
     shell = _SHELL(_SERVED)
     assert reads == [_SM107]
     assert shell._plan.paths == modeling.TARGET_PATHS[107, 8].served
+    # The core adopts for the capability read here (the decode FMHA selection).
+    assert shell_parts[-1] == ("adopt", shell._plan, _SM107)
     assert "attention_output_into_hop" in shell._plan.paths
 
 

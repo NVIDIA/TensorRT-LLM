@@ -69,7 +69,11 @@ def build(monkeypatch):
     monkeypatch.setattr(
         modeling.MuseSparkOpenTepModelingV2,
         "adopt",
-        classmethod(lambda cls, model, plan=dispatch.NO_PATHS: events.append("adopt")),
+        classmethod(
+            lambda cls, model, plan=dispatch.NO_PATHS, compute_capability=None: events.append(
+                "adopt"
+            )
+        ),
     )
     monkeypatch.setattr(
         drafter_worker, "install", lambda *args: events.append(("drafter worker install", args))

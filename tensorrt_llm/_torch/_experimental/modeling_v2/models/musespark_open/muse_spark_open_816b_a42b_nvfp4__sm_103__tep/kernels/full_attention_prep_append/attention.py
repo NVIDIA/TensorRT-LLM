@@ -80,6 +80,7 @@ from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from ... import attention as _target_attention
 from ...attention_forward import PREPROCESS_ARGS, eliding, preprocess_reachable
 from ...dispatch import LAUNCH_PDL
 from ...ops.attention.preattn_prep_append import MAX_ROWS, preattn_prep_append
@@ -467,10 +468,8 @@ class FullAppendAttention:
         return result
 
     def _prep_append_fmha_lib(self):
-        for lib in getattr(getattr(self.attn, "_fmha_manager", None), "fmha_libs", ()):
-            if type(lib).__name__ == "FlashInferTrtllmGenFmha":
-                return lib
-        return None
+        """The flashinfer trtllm-gen FMHA library of this layer's FMHA manager, or None."""
+        return _target_attention.trtllm_gen_fmha(self.attn)
 
     def _prep_append_decline(self, qkv: torch.Tensor, md) -> Optional[str]:
         """Why this call cannot run the folded prep, or ``None``. Host-side reads only."""
