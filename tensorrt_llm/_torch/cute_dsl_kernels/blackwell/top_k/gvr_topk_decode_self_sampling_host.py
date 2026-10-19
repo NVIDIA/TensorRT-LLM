@@ -46,12 +46,14 @@ CUDA-graph capture.
 
 import math
 import operator
+import os
 import threading
 from collections.abc import Sequence
 
 import torch
 
 _dev_mod = None
+_GVR_SPLIT4 = os.environ.get("TRTLLM_GVR_SPLIT4", "0") == "1"
 
 
 def _device():
@@ -621,15 +623,16 @@ def route_split(
 
 
 def route_streaming(
-    b: int, n: int, npad: int, k: int, force_main: bool = False
+    b: int, n: int, npad: int, k: int, force_main: bool = False, split4: bool | None = None
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
     correct for ANY row length, so the register-resident specialists are
     skipped even when the envelope n would normally land on them.  Where
     route() itself lands on main/clus this is IDENTICAL to route().
-    force_main additionally skips the clus rounding, so the raw
-    min(r1, r2) R matches the CUDA else-branch exactly."""
+    force_main skips the clus rounding. TRTLLM_GVR_SPLIT4 additionally uses
+    four CTAs per row when the exact split workspace fits; ``split4`` overrides
+    that default (the prefill plan needs R == 1 and passes False)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     R = 1
@@ -639,6 +642,10 @@ def route_streaming(
         R = max(min(r1, r2), 1)
     elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:
         R = 2
+    use_split4 = _GVR_SPLIT4 if split4 is None else split4
+    split_rows = use_split4 and force_main and b <= _MAXC and 1 <= k <= 2048
+    if split_rows:
+        R = 4
     useclus = False
     if not force_main and 2 <= R <= 8 and k <= 1024:
         p2 = 1
@@ -648,7 +655,7 @@ def route_streaming(
             p2 = 4
         R = p2
         useclus = True
-    big = b * R <= 148
+    big = split_rows or b * R <= 148
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -804,7 +811,7 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, det: bool = False) -> tu
         return hit
     b_route = _PREFILL_TIER_ROWS[tier]
     n_route = max(n_bucket, k + 1)
-    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+    plan = route_streaming(b_route, n_route, n_route, k, force_main=True, split4=False)
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -827,6 +834,14 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, det: bool = False) -> tu
     lc = ("main", fn, (rt["SCAP_"], rt["CMP_"]), tail)
     _PREFILL_CACHE[key] = lc
     return lc
+
+
+def _varlen_plan(b: int, n: int, npad: int, k: int, num_sms: int, sm_version: int) -> dict[str, object]:
+    """TRTLLM_GVR_SPLIT4: four CTAs per row through the streaming main kernel when the
+    exact split workspace fits; otherwise the regular route."""
+    if _GVR_SPLIT4 and b <= _MAXC and 1 <= k <= 2048:
+        return route_streaming(b, n, npad, k, force_main=True)
+    return route(b, n, npad, k, num_sms, sm_version)
 
 
 def _varlen_launcher(
@@ -862,7 +877,7 @@ def _varlen_launcher(
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version)
+    plan_free = _varlen_plan(num_rows, n_route, npad, k, num_sms, sm_version)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -935,7 +950,7 @@ def _varlen_launcher(
     fn = dev.get_compiled(
         tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True, det=det, fused_k=k
     )
-    big = num_rows * r_const <= 148
+    big = tpl[0] >= 1024
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
         if big
@@ -1867,7 +1882,7 @@ def warmup_varlen(
     r = nn
     r_max = req_rows[-1]
     while r <= r_max:
-        plan_free = route(
+        plan_free = _varlen_plan(
             r,
             max(min(n_env_c, npad_c), int(top_k) + 1),
             npad_c,
@@ -1919,6 +1934,8 @@ def warmup_varlen(
     # row counts, which the band key does not see, so it always runs: a later
     # call with a new row count inside an already-warmed band must still
     # create that row count's entry, or capture at it raises not-compiled.
+    if _GVR_SPLIT4:
+        key += (tuple(req_rows),)
     with _VARLEN_WARMUP_LOCK:
         bands_done = key in _VARLEN_WARMUP_DONE
     if not bands_done:
