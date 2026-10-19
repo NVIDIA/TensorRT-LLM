@@ -17,8 +17,7 @@
 [run]
 source =
     @TRTLLM_WHEEL_PATH@/tensorrt_llm/
-    @TRTLLM_SOURCE_ROOT@/
-repository_root = @TRTLLM_SOURCE_ROOT@
+    %(repository_root)s/
 # fnmatch patterns on repository-relative paths; * also matches directory separators.
 include =
     tensorrt_llm/*.py

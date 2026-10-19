@@ -15,12 +15,14 @@
 
 from __future__ import annotations
 
+import configparser
 import os
 import secrets
 import socket
 import sys
 import threading
 from fnmatch import fnmatchcase
+from pathlib import Path
 from types import CodeType
 from typing import Iterable, Mapping, Optional
 
@@ -28,9 +30,18 @@ from cbts.coverage.collection.compact_db import canonicalize_path, write_leaf_da
 
 _MON = getattr(sys, "monitoring", None)
 _DEFAULT_TOOL_ID = int(os.environ.get("CBTS_PYSTART_TOOL_ID", "4"))
+REPOSITORY_ROOT = str(Path(__file__).resolve().parents[6])
 
 # (process_uid, context, kind, reason) nobody can vouch for.
 Taint = tuple[str, str, str, str]
+
+
+def read_source_config(path: str | os.PathLike[str] | None = None) -> configparser.ConfigParser:
+    """Read collection settings with the checkout path resolved in this process."""
+    config = configparser.ConfigParser(defaults={"repository_root": REPOSITORY_ROOT})
+    with open(path or Path(__file__).with_name("coveragerc.template"), encoding="utf-8") as stream:
+        config.read_file(stream)
+    return config
 
 
 class PyStartTracker:

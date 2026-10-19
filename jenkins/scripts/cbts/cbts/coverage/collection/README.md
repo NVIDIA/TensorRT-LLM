@@ -32,13 +32,12 @@ machinery / pytest actually load by bare name live outside the `cbts` package, i
 | `import_watch.py` | The generic meta-path import-completion watcher (run a callback once a named module finishes executing), used by the bootstrap to detect the framework's import finishing. |
 | `process_roles.py` | Generic launch-target detection: opts pip/cmake/ninja/Ray-infra subtrees out of instrumentation, and identifies an `mpi4py.futures` pool worker so only that process type defers `PY_START` activation. |
 | `../../command/coverage/collection/pystart_report.py` | The CLI (`cbts.command coverage collection pystart-report`): unions compact databases and emits `--out-sqlite` (the selector artifact), `--out-dir` (a split HTML report) and `--out-json` (the full `test -> [file::qualname]` map). |
-| `coveragerc.template`, `make_coveragerc.sh` | The runtime rcfile: `[run] source`, `repository_root`, `include` and `data_file`, with `@...@` placeholders substituted into `$JOB_WORKSPACE/.coveragerc`. |
+| `coveragerc.template`, `make_coveragerc.sh` | The runtime rcfile: `[run] source`, `include` and `data_file`, with `@...@` placeholders substituted into `$JOB_WORKSPACE/.coveragerc`. |
 
 The default scope covers library Python from both the installed wheel and checkout, all Python
 under `examples/`, `scripts/` and `tests/test_common/`, and the root and `tests/` conftest files.
-`TRTLLM_SOURCE_ROOT` identifies the
-checkout; `make_coveragerc.sh` defaults it to the checkout containing the script. K8s and SLURM
-render the checkout path visible to their test process. Include patterns match repository-relative
+The Python bootstrap resolves `%(repository_root)s` from its own location in the checkout, so K8s
+and SLURM use the checkout visible to their test process. Include patterns match repository-relative
 paths with `fnmatch` semantics (`*` also matches `/`). Extending collection does not extend the
 coverage selector's core-Python eligibility rules.
 
@@ -254,9 +253,9 @@ Coverage stage merges every stage's files through `pystart_report.py` and upload
 `meta` table carrying the coverage rate) and `cbts_report/` (the split HTML report; open
 `cbts_report/index.html` after extracting).
 
-For a coverage-rate report, pass `--repository-root` and `--source-root`, with `--include` patterns
-matching the runtime config. CI computes the denominator over the same library, examples, scripts,
-test_common and conftest scope as the collector.
+For a coverage-rate report, pass the checkout as `--source-root`. The report reads include patterns
+from the same template as the collector, so its denominator covers the same library, examples,
+scripts, test_common and conftest scope.
 
 Every database uses schema version 4. `case_stage` stores a bare test ID beside its stage ID, and
 logical views reconstruct the selector's `<stage>/<test>` key. Integer IDs are local to a database,
@@ -301,7 +300,6 @@ c.execute("SELECT process, test, stage, kind, reason FROM taint_rows").fetchall(
 CBTS_DIR="$(pwd)/jenkins/scripts/cbts"
 COV_DIR="${CBTS_DIR}/cbts/coverage/collection"
 export TRTLLM_WHEEL_PATH=/usr/local/lib/python3.12/dist-packages
-export TRTLLM_SOURCE_ROOT="$(pwd)"
 export JOB_WORKSPACE=/tmp/cbts_smoke STAGE_NAME=smoke
 "${COV_DIR}/make_coveragerc.sh"
 export PYTHONPATH="${CBTS_DIR}/cbts_injectors:${CBTS_DIR}:${PYTHONPATH:-}"

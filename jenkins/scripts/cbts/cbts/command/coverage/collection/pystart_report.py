@@ -26,14 +26,14 @@ import tempfile
 from collections import defaultdict
 from fnmatch import fnmatchcase
 from html import escape
-from typing import Iterable, Optional
 
 import click
 
 from cbts.coverage.collection.compact_db import SCHEMA_VERSION, canonicalize_path, merge_databases
+from cbts.coverage.collection.pystart import read_source_config
 
 
-def canon(path: str, repository_root: Optional[str] = None) -> str:
+def canon(path: str, repository_root: str | None = None) -> str:
     """Collapse an absolute install/src path to the repository-relative form."""
     return canonicalize_path(path, repository_root)
 
@@ -57,15 +57,13 @@ def _collect_defs(node: ast.AST, prefix: str, rel: str, funcs: set[tuple[str, st
             _collect_defs(child, prefix, rel, funcs)
 
 
-def enumerate_defs(
-    source_root: str,
-    *,
-    repository_root: Optional[str] = None,
-    include: Iterable[str] = (),
-) -> tuple[set[str], set[tuple[str, str]]]:
+def enumerate_defs(source_root: str) -> tuple[set[str], set[tuple[str, str]]]:
     """Return (coverable_files, funcs) for the coverage-rate denominator, matching what the tracker records."""
     funcs: set[tuple[str, str]] = set()
-    patterns = tuple(include)
+    patterns = read_source_config().get("run", "include", fallback="").split()
+    repository_root = os.path.abspath(source_root)
+    if os.path.basename(repository_root) == "tensorrt_llm":
+        repository_root = os.path.dirname(repository_root)
     for dirpath, _dirs, names in os.walk(source_root):
         for nm in names:
             if not nm.endswith(".py"):
@@ -227,13 +225,7 @@ def write_json(con: sqlite3.Connection, out_path: str) -> None:
     default=None,
     help="source tree; when given, compute file/function coverage rate",
 )
-@click.option("--repository-root", default=None, help="checkout root for repository-relative paths")
-@click.option(
-    "--include",
-    multiple=True,
-    help="repository-relative fnmatch pattern for the coverage-rate denominator; repeat to union",
-)
-def main(glob_pattern, out_sqlite, out_dir, out_json, source_root, repository_root, include):
+def main(glob_pattern, out_sqlite, out_dir, out_json, source_root):
     """Merge compact CBTS coverage databases into a compact touch DB and reports."""
     # Merge into a SQLite DB (bounded memory): --out-sqlite directly, else a unique per-invocation temp file.
     keep = out_sqlite is not None
@@ -278,9 +270,7 @@ def main(glob_pattern, out_sqlite, out_dir, out_json, source_root, repository_ro
     }
     rate_line = ""
     if source_root:
-        coverable_files, all_funcs = enumerate_defs(
-            source_root, repository_root=repository_root, include=include
-        )
+        coverable_files, all_funcs = enumerate_defs(source_root)
         touched_files = {
             r[0] for r in con.execute("SELECT DISTINCT file FROM touch_rows WHERE test != ''")
         } & coverable_files

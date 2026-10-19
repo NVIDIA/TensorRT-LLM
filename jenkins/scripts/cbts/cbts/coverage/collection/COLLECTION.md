@@ -24,7 +24,8 @@ No line numbers, no call counts, no call graph.
 The default runtime config collects `tensorrt_llm/**/*.py` (from the checkout and the installed
 wheel), `examples/**/*.py`, `scripts/**/*.py`, `tests/test_common/**/*.py`, the checkout's root
 `conftest.py`, and every `tests/**/conftest.py`.
-`[run] source` bounds the physical source trees; `repository_root` maps checkout paths to stable
+`[run] source` bounds the physical source trees; the bootstrap resolves `%(repository_root)s` from
+its own checkout location. That root maps checkout paths to stable
 repository-relative names; `include` selects those names using `fnmatch` patterns (`*` also matches
 directory separators). Installed wheel paths still map to `tensorrt_llm/...`, so wheel and checkout
 copies merge into the same file identity. Other Python files under `tests/` are excluded.

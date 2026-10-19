@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Iterable, Mapping, Optional
 
 from cbts.coverage.collection import hooks, process_roles
 from cbts.coverage.collection.import_watch import ImportCompletionWatcher
-from cbts.coverage.collection.pystart import PyStartTracker
+from cbts.coverage.collection.pystart import PyStartTracker, read_source_config
 
 if TYPE_CHECKING:
     from cbts.coverage.collection.channel import ContextSubscriber
@@ -61,17 +61,11 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
 
     # Source roots bound collection; include patterns match repository-relative Python paths.
     def _read_config(path: str) -> tuple[list[str], str, Optional[str], list[str]]:
-        cp = configparser.ConfigParser()
         try:
-            if not cp.read(path):
-                print(
-                    f"[cbts] CBTS_COVERAGE_CONFIG={path!r} could not be read; coverage disabled",
-                    file=sys.stderr,
-                )
-                return [], ".", None, []
-        except configparser.Error as exc:
+            cp = read_source_config(path)
+        except (OSError, configparser.Error) as exc:
             print(
-                f"[cbts] CBTS_COVERAGE_CONFIG={path!r} is malformed: {exc}; coverage disabled",
+                f"[cbts] CBTS_COVERAGE_CONFIG={path!r} could not be read: {exc}; coverage disabled",
                 file=sys.stderr,
             )
             return [], ".", None, []

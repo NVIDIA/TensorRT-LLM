@@ -22,7 +22,6 @@ set -euo pipefail
 : "${STAGE_NAME:?STAGE_NAME is required}"
 
 TEMPLATE_DIR="$(cd "$(dirname "$0")" && pwd)"
-TRTLLM_SOURCE_ROOT="${TRTLLM_SOURCE_ROOT:-$(cd "${TEMPLATE_DIR}/../../../../../.." && pwd)}"
 TEMPLATE_FILE="${TEMPLATE_DIR}/coveragerc.template"
 OUTPUT_FILE="${JOB_WORKSPACE}/.coveragerc"
 
@@ -35,7 +34,6 @@ mkdir -p "${JOB_WORKSPACE}"
 
 sed \
     -e "s|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHEEL_PATH}|g" \
-    -e "s|@TRTLLM_SOURCE_ROOT@|${TRTLLM_SOURCE_ROOT}|g" \
     -e "s|@JOB_WORKSPACE@|${JOB_WORKSPACE}|g" \
     -e "s|@STAGE_NAME@|${STAGE_NAME}|g" \
     "${TEMPLATE_FILE}" > "${OUTPUT_FILE}"
