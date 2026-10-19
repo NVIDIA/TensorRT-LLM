@@ -223,9 +223,45 @@ def test_cute_dsl_paged_mqa_logits_gate(requested, cute_dsl_available, sm_100f, 
         indexer_decision = resolve_cute_dsl_paged_mqa_logits(
             sparse_config.to_sparse_params().use_cute_dsl_paged_mqa_logits
         )
-
-    assert metadata.use_cute_dsl_paged_mqa_logits is expected
+        assert metadata.use_cute_dsl_paged_mqa_logits is expected
     assert indexer_decision is expected
+
+
+@pytest.mark.parametrize(
+    "next_n,kernel_atoms,batch_size,max_ctx,expected",
+    [
+        (4, (1, 2, 3, 4), 32, 65536, (1, 4, 1)),  # exact atom: caller-side, unchanged
+        (6, (1, 2, 3), 32, 65536, (2, 3, 1)),  # exact divisor 3: caller-side
+        (7, (1, 2, 3, 4), 128, 65536, (1, 4, 2)),  # in-kernel 4 + 3: fewer waves
+        (7, (1, 2, 3), 128, 65536, (1, 3, 3)),  # FP4: 3 + 2 + 2
+        (5, (1, 2, 3, 4), 128, 65536, (1, 3, 2)),  # tile = widest atom (3 + 2)
+        (7, (1, 2, 3, 4), 1, 4096, (7, 1, 1)),  # wave tie: keep atom 1
+        (7, (1, 2, 3), 1, 65536, (7, 1, 1)),  # B=1: too few waves for the split to pay
+        (7, (1, 2, 3), 32, 4096, (1, 3, 3)),  # 24 atom-1 waves: split
+        (7, (1, 2, 3, 4), 0, 0, (1, 4, 2)),  # workload unknown: fewer KV passes
+    ],
+)
+def test_pick_dsl_split(next_n, kernel_atoms, batch_size, max_ctx, expected):
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _pick_dsl_split
+
+    got = _pick_dsl_split(
+        next_n, num_sms=148, batch_size=batch_size, max_ctx=max_ctx, kernel_atoms=kernel_atoms
+    )
+    assert got == expected
+
+
+@pytest.mark.parametrize("next_n,num_atoms", [(4, 2), (5, 2), (7, 2), (7, 3), (8, 3)])
+def test_atom_ctx_offsets_match_kernel(next_n, num_atoms):
+    """The indexer's stagger must equal the kernel's _atom_ctx_len stagger."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _atom_ctx_offsets
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits.mqa_logits_util import (
+        atom_tokens_after,
+    )
+
+    base, rem = divmod(next_n, num_atoms)
+    assert _atom_ctx_offsets(next_n, num_atoms) == [
+        atom_tokens_after(i, num_atoms, base, rem, next_n) for i in range(num_atoms)
+    ]
 
 
 def test_cute_dsl_paged_mqa_logits_default_is_aligned():
@@ -367,6 +403,7 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         _indexer_compress_ratio=4,
         kv_cache_manager=SimpleNamespace(),
         get_indexer_max_seq_len=Mock(return_value=msl_c),
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
         use_cute_dsl_paged_mqa_logits=True,
         num_sms=148,
     )
