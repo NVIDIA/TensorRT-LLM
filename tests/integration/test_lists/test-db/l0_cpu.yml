@@ -89,6 +89,18 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py::test_text_request_needs_no_hf_processor
   - unittest/_torch/models/test_minimax_m3_vl.py::test_tokenizer_from_auto_processor_is_not_image_support
   - unittest/_torch/models/test_minimax_m3_vl.py::test_image_request_uses_a_valid_processor
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_serve_rendered_image_prompt_is_used_verbatim
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_serve_rendered_mixed_image_and_video_prompt
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_framed_marker_is_reduced_to_the_bare_marker
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_marker_and_media_count_mismatch_is_rejected
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_raw_prompt_marker_text_is_rejected
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_openai_chat_marks_the_rendered_prompt_for_the_input_processor
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_image_token_count_accepts_every_media_io_format
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_preferred_media_io_format_is_uint8_numpy
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_token_count_is_one_bracket_per_temporal_patch
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_fast_path_expand_video_one_bracket_per_temporal_patch
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_request_lets_the_processor_resize_frames
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_float_tensor_media_reach_the_processor_as_uint8_hwc
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe

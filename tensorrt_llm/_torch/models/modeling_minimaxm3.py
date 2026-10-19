@@ -3007,8 +3007,10 @@ def _build_minimax_m3_vl_input_processor_registration():
         model_type="minimax_m3_vl",
         placeholder_metadata=MultimodalPlaceholderMetadata(
             placeholder_map={
-                "image": "]<]start of image[>[]<]image[>[]<]end of image[>[",
-                "video": "]<]start of image[>[]<]video[>[]<]end of image[>[",
+                # The bare per-item markers the M3 chat template renders; the
+                # HF processor adds the start/end-of-image framing.
+                "image": "]<]image[>[",
+                "video": "]<]video[>[",
             },
             placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
             content_format=ContentFormat.STRING,

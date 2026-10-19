@@ -2270,6 +2270,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
+                if request.prompt_token_ids is None:
+                    # `prompt` is the rendered chat template with the
+                    # placeholders in place; the input processor must not
+                    # render it again.
+                    prompt["chat_template_applied"] = True
             if mm_embeddings:
                 prompt["multi_modal_embeddings"] = mm_embeddings
             if mm_data and mm_embeddings:
@@ -2785,6 +2790,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
+                if request.prompt_token_ids is None:
+                    prompt["chat_template_applied"] = True
                 if mm_item_order:
                     prompt["mm_item_order"] = mm_item_order
 
