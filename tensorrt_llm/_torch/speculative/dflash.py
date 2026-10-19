@@ -607,19 +607,29 @@ class DFlashSpecMetadata(SpecMetadata):
             # prefilling, so _store_prefill_context -- the only other assigner --
             # never runs and every request would land on the dummy slot.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            for rid in self.request_ids[num_contexts:]:
+            assigned = {}
+            for request_idx, rid in enumerate(self.request_ids[num_contexts:], num_contexts):
                 if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    if worker._assign_slot(rid) is None:
+                    slot = worker._assign_slot(rid, updates=assigned)
+                    if slot is None:
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
+                    elif worker._ctx_unified_cache:
+                        # New requests have no in-flight predecessor. Subsequent
+                        # accepted tokens advance the device length during replay.
+                        token_offset = sum(self.seq_lens[:request_idx])
+                        assigned[slot] = min(
+                            int(self.host_position_ids[token_offset]), worker._max_ctx
+                        )
+            worker._write_ctx_len(assigned)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -1705,10 +1715,18 @@ class DFlashWorker(SpecWorkerBase):
 
         # Lazy init buffers and attach worker reference for prepare()
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        previous_ctx_len = self._ctx_len
         self._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
         spec_metadata._dflash_worker = self
+        if (
+            self._ctx_unified_cache
+            and self._ctx_len is not previous_ctx_len
+            and spec_metadata.request_ids
+        ):
+            # New buffers clear request slots; seed them before generation.
+            spec_metadata.prepare()
         # Before any store: prefill and decode both address pages through it.
         # Returning False here means an empty batch -- the missing-offsets case
         # raises inside, with the metadata type in the message.
@@ -2169,18 +2187,7 @@ class DFlashWorker(SpecWorkerBase):
             bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
-            if self._ctx_unified_cache:
-                gen_start = attn_metadata.num_ctx_tokens
-                # Device positions include overlap-scheduler corrections and
-                # define the shared request's prefix before this verification.
-                ctx_len_gen = (
-                    position_ids[gen_start : gen_start + num_gens * total_tokens_per_req]
-                    .reshape(num_gens, total_tokens_per_req)[:, 0]
-                    .long()
-                )
-                self._ctx_len[slots] = ctx_len_gen
-            else:
-                ctx_len_gen = self._ctx_len[slots]
+            ctx_len_gen = self._ctx_len[slots]
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
