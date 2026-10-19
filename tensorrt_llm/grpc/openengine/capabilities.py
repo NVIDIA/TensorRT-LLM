@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Collection, Mapping
 
+from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
@@ -63,18 +64,7 @@ def supported_guides(backend: str | None) -> frozenset[str]:
 
 def _loaded_model_type(llm: Any) -> str:
     """Return the top-level model type for the loaded input processor."""
-    input_processor = getattr(llm, "input_processor", None)
-    config = (
-        input_processor.config
-        if isinstance(input_processor, BaseMultimodalInputProcessor)
-        else getattr(llm, "_hf_model_config", None)
-    )
-    if config is None:
-        return ""
-
-    # The class attribute preserves the top-level type for composite configs.
-    model_type = getattr(type(config), "model_type", None) or getattr(config, "model_type", "")
-    return model_type if isinstance(model_type, str) else ""
+    return resolve_top_level_model_type(llm.input_processor.config)
 
 
 def resolve_media_capabilities(

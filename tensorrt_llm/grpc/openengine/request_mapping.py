@@ -429,16 +429,16 @@ async def _input_from_request(
     if not request.media:
         return inputs
 
+    capabilities = media_capabilities or media_capabilities_for_model(llm)
+    modalities = capabilities.modalities
+    if not modalities:
+        raise UnsupportedFeatureError("media input is not supported by the loaded model")
+
     if len(request.media) > _MAX_MEDIA_ITEMS:
         raise ValueError(
             f"at most {_MAX_MEDIA_ITEMS} media items are supported per request, "
             f"got {len(request.media)}"
         )
-
-    capabilities = media_capabilities or media_capabilities_for_model(llm)
-    modalities = capabilities.modalities
-    if not modalities:
-        raise UnsupportedFeatureError("media input is not supported by the loaded model")
 
     resolved_handlers: list[_MediaHandler] = []
     for index, item in enumerate(request.media):

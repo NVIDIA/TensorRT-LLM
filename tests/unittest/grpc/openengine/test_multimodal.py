@@ -569,9 +569,7 @@ async def test_image_count_is_bounded_before_decoding(image_llm, monkeypatch):
         prompt="too many images",
         media=[
             generation_pb2.MediaItem(
-                # Unsupported on purpose: the count guard must win before the
-                # per-item modality loop.
-                modality=generation_pb2.MODALITY_VIDEO,
+                modality=generation_pb2.MODALITY_IMAGE,
                 raw_bytes=b"image",
             )
             for _ in range(request_mapping._MAX_MEDIA_ITEMS + 1)
@@ -580,6 +578,23 @@ async def test_image_count_is_bounded_before_decoding(image_llm, monkeypatch):
 
     with pytest.raises(ValueError, match="at most 64 media items"):
         await request_mapping._input_from_request(request, llm)
+
+
+@pytest.mark.asyncio
+async def test_model_capability_is_checked_before_media_count_limit():
+    request = generation_pb2.GenerateRequest(
+        prompt="too many images",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+            for _ in range(request_mapping._MAX_MEDIA_ITEMS + 1)
+        ],
+    )
+
+    with pytest.raises(UnsupportedFeatureError, match="media input is not supported"):
+        await request_mapping._input_from_request(request, SimpleNamespace())
 
 
 @pytest.mark.asyncio

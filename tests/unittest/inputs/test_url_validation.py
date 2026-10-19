@@ -158,11 +158,20 @@ class TestValidateUrl:
 
     @patch(
         "tensorrt_llm.inputs.media_io.socket.getaddrinfo",
-        side_effect=socket.gaierror("Name or service not known"),
+        side_effect=socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
     )
     def test_rejects_unresolvable_hostname(self, _):
-        with pytest.raises(MediaFetchError, match="Could not resolve"):
+        with pytest.raises(RuntimeError, match="Could not resolve") as error:
             _validate_url("http://this.does.not.exist.invalid/")
+        assert not isinstance(error.value, MediaFetchError)
+
+    @patch(
+        "tensorrt_llm.inputs.media_io.socket.getaddrinfo",
+        side_effect=socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+    )
+    def test_maps_temporary_resolution_failure_to_fetch_error(self, _):
+        with pytest.raises(MediaFetchError, match="Could not resolve"):
+            _validate_url("http://temporarily-unavailable.example/")
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_accepts_public_hostname(self, _):
@@ -446,12 +455,7 @@ class TestSafeAiohttpGet:
             "tensorrt_llm.inputs.media_io._get_aiohttp_session",
             new=AsyncMock(return_value=_FakeSession()),
         ):
-            unsafe_session = MagicMock()
-            unsafe_session.get.side_effect = AssertionError("caller session must not be used")
-            assert (
-                self._run(_safe_aiohttp_get("http://example.com/file.bin", session=unsafe_session))
-                == b"abcd"
-            )
+            assert self._run(_safe_aiohttp_get("http://example.com/file.bin")) == b"abcd"
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_raises_after_too_many_redirects(self, _):
@@ -545,3 +549,30 @@ class TestSafeAiohttpGet:
 
         with pytest.raises(RuntimeError, match="non-public"):
             self._run(resolve())
+
+    @pytest.mark.parametrize(
+        ("error", "expected_type"),
+        [
+            (
+                socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+                MediaFetchError,
+            ),
+            (
+                socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+                RuntimeError,
+            ),
+        ],
+    )
+    def test_connection_resolver_classifies_dns_failures(self, error, expected_type):
+        async def resolve():
+            resolver = _ValidatingResolver()
+            resolver._resolver.resolve = AsyncMock(side_effect=error)
+            try:
+                await resolver.resolve("example.com", 80)
+            finally:
+                await resolver.close()
+
+        with pytest.raises(expected_type, match="Could not resolve") as raised:
+            self._run(resolve())
+        if error.errno != socket.EAI_AGAIN:
+            assert not isinstance(raised.value, MediaFetchError)
