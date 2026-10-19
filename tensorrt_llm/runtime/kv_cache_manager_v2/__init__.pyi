@@ -458,6 +458,7 @@ class _Status(enum.Enum):
     ACTIVE = enum.auto()
     SUSPENDED = enum.auto()
     CLOSED = enum.auto()
+    UNMATERIALIZED = enum.auto()
 
 KvCacheStatus: TypeAlias = _Status
 
@@ -793,6 +794,8 @@ class KVCacheManager:
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
+    def release_gpu_memory(self, discard: bool = False) -> None: ...
+    def materialize_gpu_memory(self, zero: bool = False) -> None: ...
     def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
         """Whether the named buffer uses sparse attention. Rejects unknown buffers."""
     def get_mem_pool_base_address(

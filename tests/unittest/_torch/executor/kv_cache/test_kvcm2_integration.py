@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
@@ -3127,6 +3128,31 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
     assert torch.equal(buffer[22], torch.full((2,), 5.0))
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "host_tiers,mode,error",
+    [
+        ([], RestoreMode.NONE, None),
+        ([], RestoreMode.CPU, "shortfall: 33554432 bytes"),
+        ([16 << 20], RestoreMode.CPU, "shortfall: 16777216 bytes"),
+        ([32 << 20], RestoreMode.PINNED, None),
+    ],
+)
+def test_sleep_requires_host_capacity_covering_gpu(
+    host_tiers: list[int], mode: RestoreMode, error: str | None
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    # Hot and cold GPU levels both need backup capacity.
+    tiers = [GpuCacheTierConfig(quota=16 << 20), GpuCacheTierConfig(quota=16 << 20)]
+    tiers.extend(HostCacheTierConfig(quota=quota) for quota in host_tiers)
+    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
+    if error is None:
+        manager.validate_sleep_config(mode)
+    else:
+        with pytest.raises(ValueError, match=error):
+            manager.validate_sleep_config(mode)
+
+
 class _GuardKVCache:
     """Scriptable stand-in for the guard sequence's KV cache."""
 
@@ -3135,9 +3161,12 @@ class _GuardKVCache:
         self.resize_ok = resize_ok
         self.closed = False
         self.committing_stopped = False
+        self.is_active = True
+        self.num_committed_tokens = 0
 
     def resume(self, stream: object) -> bool:
         del stream
+        self.is_active = self.resume_ok
         return self.resume_ok
 
     def stop_committing(self) -> None:
@@ -3149,6 +3178,9 @@ class _GuardKVCache:
 
     def close(self) -> None:
         self.closed = True
+
+    def suspend(self) -> None:
+        self.is_active = False
 
 
 def _make_guard_manager(
@@ -3162,12 +3194,21 @@ def _make_guard_manager(
     manager._guard_page_fill = "nan"
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
+    manager._sleep_restore_mode = None
+    manager._sleeping_active_caches = set()
+    manager._fresh_pages_filled = {}
+    manager.conversation_manager = None
+    manager.sparse_metadata_batch = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_page_index_bufs = Mock()
     manager.num_extra_kv_tokens = 0
     manager.pp_layers = [0]
-    manager._stream = SimpleNamespace(cuda_stream=None)
+    manager._stream = SimpleNamespace(cuda_stream=None, synchronize=lambda: None)
     manager.kv_cache_map = {}
     manager.index_mapper = Mock()
     manager.impl = Mock()
+    if kv_cache is not None:
+        manager.impl.release_gpu_memory.side_effect = lambda **kwargs: kv_cache.suspend()
 
     def create_kv_cache(request_id: int, *args: object, **kwargs: object) -> object | None:
         del args, kwargs
@@ -3197,6 +3238,16 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     # Never committed: the reuse tree must never hand this page to a request.
     assert kv_cache.committing_stopped
     assert not kv_cache.closed
+
+    manager.release_memory(RestoreMode.NONE)
+    manager.impl.release_gpu_memory.assert_called_once_with(discard=True)
+    buffer.fill_(1)
+    manager.materialize_memory()
+    assert torch.isnan(buffer[3]).all()
+    assert torch.equal(buffer[2], torch.ones(2))
+    assert manager.guard_page_indices() == frozenset({3})
+    assert not kv_cache.closed
+    manager.impl.create_kv_cache.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["create", "resume", "resize", "no_layer"])

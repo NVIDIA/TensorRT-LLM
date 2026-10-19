@@ -88,6 +88,7 @@ def _make_executor(
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
+    exe._sleeping_memory_tags = set()
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
