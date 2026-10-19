@@ -24,7 +24,9 @@
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
+#include <mpi.h>
 #include <nccl.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/extension.h>
 #endif
 
@@ -45,6 +47,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE
@@ -72,6 +75,17 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace common::nccl_util
 {
+
+// Record a non-owning association with the matching host group. Explicit ranks select
+// members of an existing host communicator; no new host communicator is created.
+// An empty process-group rank list selects the entire process group.
+void registerHostCommunicator(ncclComm_t comm, MPI_Comm hostComm, std::vector<int> const& ranks);
+void registerHostCommunicator(
+    ncclComm_t comm, c10::intrusive_ptr<c10d::ProcessGroup> const& hostComm, std::vector<int> ranks = {});
+
+// Blocking CPU consensus; throws if the matching host group is missing or expired.
+// Votes on overlapping groups sharing a host communicator must run in matching order across ranks.
+bool hostAllTrue(ncclComm_t comm, bool localOk);
 
 //==============================================================================
 // NCCL Resource Management
@@ -113,6 +127,27 @@ public:
 private:
     NcclCommResourceManager() = default;
     ~NcclCommResourceManager();
+
+    friend void registerHostCommunicator(ncclComm_t, MPI_Comm, std::vector<int> const&);
+    friend void registerHostCommunicator(ncclComm_t, c10::intrusive_ptr<c10d::ProcessGroup> const&, std::vector<int>);
+    friend bool hostAllTrue(ncclComm_t, bool);
+
+    struct MpiHostGroup
+    {
+        MPI_Comm comm;
+        std::vector<int> ranks;
+    };
+
+    struct PgHostGroup
+    {
+        c10::weak_intrusive_ptr<c10d::ProcessGroup> comm;
+        std::vector<int> ranks;
+    };
+
+    using HostCommunicator = std::variant<MpiHostGroup, PgHostGroup>;
+    void registerHostCommunicator(ncclComm_t comm, HostCommunicator hostComm, int size, int rank);
+    HostCommunicator lookupHostCommunicator(ncclComm_t comm) const;
+    std::unordered_map<ncclComm_t, HostCommunicator> mHostCommunicators;
 
     using ResourceEntry = std::pair<ResourceCleanupFunc, std::string>;
 
@@ -235,8 +270,8 @@ public:
     // reuses buffers owned by that PyTorch graph memory pool, then may claim an unowned buffer for it.
     // Uses best-fit strategy: selects the smallest eligible buffer that meets the size requirement.
     // New allocation/registration is prohibited during capture.
-    // Uses the supplied stream for capture detection, stream-scoped reuse eligibility, and allocation
-    // synchronization. Callers using a non-default stream must pass it explicitly.
+    // Uses the supplied stream for capture detection and stream-scoped reuse eligibility.
+    // Callers using a non-default stream must pass it explicitly.
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream = nullptr);
 
     // Select the allocation domain on this host thread. owner == -1 explicitly selects eager;
@@ -348,7 +383,7 @@ private:
 
     // Drain the sticky CUDA error left by a failed symmetric allocation.
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
-        int localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
+        bool localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
 
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
