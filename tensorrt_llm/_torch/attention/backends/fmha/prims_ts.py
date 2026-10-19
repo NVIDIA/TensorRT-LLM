@@ -875,6 +875,7 @@ class PrimsTSFmha(PhasedFmha):
         output_scale = None
         vc_params = None
         vc_repair_tiles = 0
+        vc_demean = True
         if forward_args.vc_attention:
             # VC-Attention carries its V scale and tile means (and under QK8 the E4M3 Q/K
             # with their block scales) in the run operands instead of per-tensor scales.
@@ -904,6 +905,7 @@ class PrimsTSFmha(PhasedFmha):
                     k_bshd, v_bshd, q=vc_q, denoise_step=get_denoise_step()
                 )
             k_bshd, v_bshd, vc_params = vc_operands.k, vc_operands.v, vc_operands.params
+            vc_demean = vc_operands.demean
             if vc_operands.q is not None:
                 q_bshd = vc_operands.q
         elif forward_args.v_fp8_per_tensor:
@@ -911,7 +913,18 @@ class PrimsTSFmha(PhasedFmha):
             output_scale = v_dequant_scale.float().reshape(1)
         out = output.view(batch_size, seq_len, num_heads, head_dim)
         mask_type = self._get_prims_mask_type(forward_args)
-        key = (batch_size, seq_len, q_bshd.dtype, v_bshd.dtype, out.dtype, mask_type)
+        # A VC plan is compiled per demean phase and repair tile count, so the
+        # operands of either V-Smooth phase meet a matching plan.
+        key = (
+            batch_size,
+            seq_len,
+            q_bshd.dtype,
+            v_bshd.dtype,
+            out.dtype,
+            mask_type,
+            vc_demean,
+            vc_repair_tiles,
+        )
         wrapper = self._contiguous_context_wrappers.get(key)
         if wrapper is None:
             if torch.cuda.is_current_stream_capturing():
@@ -943,7 +956,7 @@ class PrimsTSFmha(PhasedFmha):
                 out_dtype=out.dtype,
                 mask_type=mask_type,
                 sm_scale=sm_scale,
-                vc_config=VCAttentionConfig(repair_tiles=vc_repair_tiles)
+                vc_config=VCAttentionConfig(demean=vc_demean, repair_tiles=vc_repair_tiles)
                 if vc_params is not None
                 else None,
             )
