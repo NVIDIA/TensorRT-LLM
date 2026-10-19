@@ -774,12 +774,22 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     PoolGroupIndex const hotPoolGroup = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
     size_t const hotPageBytes = storage.slotSize(hotPoolGroup).at(PoolIndex{0});
     std::array<uint8_t, 2> const pagePatterns{0x3C, 0xA7};
+    // The offload below runs on a stream of its own, created cudaStreamNonBlocking, and the
+    // freshly allocated slots carry a null readyEvent for it to wait on -- so nothing orders these
+    // fills against it. They are issued on a stream this test owns and waited for here; the offload
+    // would otherwise be free to read the pages before they are filled, and the restore further
+    // down would compare against stale bytes.
+    cudaStream_t fillStream{};
+    ASSERT_EQ(cudaStreamCreate(&fillStream), cudaSuccess);
     for (size_t index = 0; index < firstPages.size(); ++index)
     {
         MemAddress const address = std::get<MemAddress>(
             storage.slotAddress(kHotLevel, hotPoolGroup, firstPages[index]->slotId(), PoolIndex{0}));
-        ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(address), pagePatterns[index], hotPageBytes), cudaSuccess);
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), pagePatterns[index], hotPageBytes, fillStream),
+            cudaSuccess);
     }
+    ASSERT_EQ(cudaStreamSynchronize(fillStream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(fillStream), cudaSuccess);
 
     auto temporarySlots = storage.newGpuSlots(twoSlots, migrationRecorder, dropRecorder);
     EXPECT_EQ(offloaded, 2);
