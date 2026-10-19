@@ -1798,7 +1798,9 @@ class DecoderRunner(ScheduledModelRunner):
             ran_flashinfer_forward = run_autotuner_pass(
                 flashinfer_mxfp8_autotune(), synchronize_trtllm_cache=False
             )
-        if self.runtime_hooks.merge_tuned_tactics_across_ranks:
+        # The model's declared hooks (the all-off default when it declares none): the warmup passes also run on
+        # engines built without the runner's constructor.
+        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks:
             # Rank-local profiling noise must not leave tensor-parallel peers
             # serving different tactics for one shape: keep the fastest everywhere.
             # Collective; before the native MXFP8 cache below registers the tactics.
@@ -2199,7 +2201,10 @@ class DecoderRunner(ScheduledModelRunner):
                     )
                     with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
                         self._capture_generation_cuda_graphs(resource_manager)
-                    if is_warmup_only and self.runtime_hooks.merge_tuned_tactics_across_ranks:
+                    if (
+                        is_warmup_only
+                        and runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks
+                    ):
                         # Tactics tuned while warming the decode graphs agree across
                         # ranks before the capture pass reads them.
                         AutoTuner.get().post_tune_merge_tactics()
