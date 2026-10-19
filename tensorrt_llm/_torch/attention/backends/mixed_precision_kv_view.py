@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Convert mixed-precision KV pools to and from native Attention views."""
 
-import copy
-from dataclasses import replace
+from contextlib import contextmanager
+from typing import Iterator
 
 import torch
 
@@ -25,7 +25,7 @@ class MixedPrecisionKVView:
 
     @classmethod
     def prepare_batch(cls, metadata: AttentionMetadata) -> None:
-        """Update addresses and native Attention plans before capture or replay."""
+        """Update mixed-precision addresses before capture or replay."""
         if not metadata.kv_cache_manager.high_layers:
             return
         view = next(iter(metadata.mixed_precision_kv_views.values()), None)
@@ -75,7 +75,6 @@ class MixedPrecisionKVView:
         self.low_dtype = manager.low_dtype
         self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
-        self.metadata = None
 
     def update(self, metadata: AttentionMetadata) -> None:
         manager = metadata.kv_cache_manager
@@ -114,26 +113,9 @@ class MixedPrecisionKVView:
         )
         self.max_new_tokens_per_request = max(seq_lens, default=0)
 
-        from .flashinfer import FlashInferAttentionMetadata
+        from .trtllm import TrtllmAttentionMetadata
 
-        if isinstance(metadata, FlashInferAttentionMetadata):
-            if self.metadata is None:
-                self.metadata = replace(metadata, kv_cache_manager=self, cuda_graph_buffers=None)
-            else:
-                self.metadata.seq_lens = metadata.seq_lens
-                self.metadata.seq_lens_kv = metadata.seq_lens_kv
-                self.metadata.num_contexts = metadata.num_contexts
-                self.metadata.kv_cache_params = metadata.kv_cache_params
-                self.metadata.request_ids = metadata.request_ids
-                self.metadata.prompt_lens = metadata.prompt_lens
-                self.metadata.position_ids = metadata.position_ids
-                self.metadata.padded_num_tokens = metadata.padded_num_tokens
-            self.metadata.prepare()
-        else:
-            self.metadata = copy.copy(metadata)
-            self.metadata.kv_cache_manager = self
-            self.metadata.kv_layout = self.layout
-            self.metadata.use_paged_context_fmha = True
+        if isinstance(metadata, TrtllmAttentionMetadata):
             ordinals = torch.arange(self.max_blocks_per_seq, dtype=torch.int32)
             pages = torch.tensor(self.page_starts[:-1], dtype=torch.int32)[:, None] + ordinals
             offsets = torch.stack(
@@ -150,8 +132,38 @@ class MixedPrecisionKVView:
                 maybe_pin_memory(offsets.masked_fill(~valid[:, None], -1).unsqueeze(0)),
                 non_blocking=True,
             )
-            self.metadata.kv_cache_block_offsets = block_offsets
-        self.metadata.mixed_precision_kv_views = None
+            self.kv_cache_block_offsets = block_offsets
+
+    @contextmanager
+    def use_staging(self, metadata: AttentionMetadata, layer_idx: int) -> Iterator[None]:
+        """Read and write this layer's KV through the native staging buffer."""
+        from .trtllm import TrtllmAttentionMetadata
+
+        self.convert(layer_idx)
+        if not isinstance(metadata, TrtllmAttentionMetadata):
+            yield
+            self.convert(layer_idx, writeback=True)
+            return
+        saved = (
+            metadata.kv_cache_manager,
+            metadata.kv_layout,
+            metadata.use_paged_context_fmha,
+            metadata.kv_cache_block_offsets,
+        )
+        try:
+            metadata.kv_cache_manager = self
+            metadata.kv_layout = self.layout
+            metadata.use_paged_context_fmha = True
+            metadata.kv_cache_block_offsets = self.kv_cache_block_offsets
+            yield
+        finally:
+            (
+                metadata.kv_cache_manager,
+                metadata.kv_layout,
+                metadata.use_paged_context_fmha,
+                metadata.kv_cache_block_offsets,
+            ) = saved
+        self.convert(layer_idx, writeback=True)
 
     def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
         from ...cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv
@@ -183,10 +195,6 @@ class MixedPrecisionKVView:
             list(range(start, start + count))
             for start, count in zip(self.page_starts, self.page_counts)
         ]
-
-    @property
-    def blocks_in_primary_pool(self) -> int:
-        return self.page_starts[-1]
 
     def get_batch_cache_indices_flat(self, request_ids, num_blocks, layer_idx=None):
         return torch.tensor(

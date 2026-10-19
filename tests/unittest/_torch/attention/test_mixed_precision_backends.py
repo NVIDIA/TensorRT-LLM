@@ -30,15 +30,16 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 
 @pytest.mark.parametrize("scratch_reuse", [False, True])
 @pytest.mark.parametrize(
-    "backend,high_dtype,compute_dtype,width,query_heads,heads,kv_layout,fp8_input",
+    "backend,high_dtype,compute_dtype,width,query_heads,heads,kv_layout,fp8_input,block",
     [
-        (TrtllmAttention, DataType.HALF, torch.float16, 64, 2, 2, "HND", False),
-        (TrtllmAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD", False),
-        (TrtllmAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", False),
-        (FlashInferAttention, DataType.HALF, torch.float16, 64, 2, 2, "HND", False),
-        (FlashInferAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD", False),
-        (FlashInferAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", False),
-        (FlashInferAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", True),
+        (TrtllmAttention, DataType.HALF, torch.float16, 64, 2, 2, "HND", False, 128),
+        (TrtllmAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD", False, 128),
+        (TrtllmAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", False, 128),
+        (FlashInferAttention, DataType.HALF, torch.float16, 64, 2, 2, "HND", False, 128),
+        (FlashInferAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "NHD", False, 128),
+        (FlashInferAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", False, 128),
+        (FlashInferAttention, DataType.FP8, torch.bfloat16, 64, 4, 1, "NHD", True, 128),
+        (TrtllmAttention, DataType.BF16, torch.bfloat16, 128, 4, 2, "HND", False, 32),
     ],
     ids=[
         "mha_fp16-trtllm",
@@ -48,6 +49,7 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
         "gqa_bf16_nhd-flashinfer",
         "mqa_fp8_nhd-flashinfer",
         "mqa_fp8_nhd-flashinfer-fused_fp8",
+        "gqa_bf16_native_p32-trtllm",
     ],
 )
 def test_optimized_two_pool_prefill_and_decode(
@@ -59,11 +61,13 @@ def test_optimized_two_pool_prefill_and_decode(
     heads,
     kv_layout,
     fp8_input,
+    block,
     scratch_reuse,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
-    block, length, batch = 128, 640, 2
+    length, batch = 640, 2
+    native_interleave = backend is FlashInferAttention or block == 32
     request_ids = list(range(batch))
     high_torch_dtype = binding_to_torch_dtype(high_dtype)
     manager = MixedPrecisionKVCacheManager(
@@ -71,7 +75,7 @@ def test_optimized_two_pool_prefill_and_decode(
             max_tokens=65536, enable_block_reuse=True, enable_swa_scratch_reuse=scratch_reuse
         ),
         CacheType.SELF,
-        num_layers=2,
+        num_layers=4 if native_interleave else 2,
         num_kv_heads=heads,
         head_dim=width,
         tokens_per_block=block,
@@ -81,8 +85,15 @@ def test_optimized_two_pool_prefill_and_decode(
         dtype=high_dtype,
         low_dtype=DataType.NVFP4,
         high_low_pool_ratio=1 / 3,
-        first_n=128,
-        last_n=128,
+        first_n=block,
+        last_n=block,
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=4,
+            num_kv_shared_layers=1,
+            layer_types=["full_attention"] * 4,
+        )
+        if native_interleave
+        else None,
     )
     generator = torch.Generator(device="cuda").manual_seed(123)
     query, key, value = [
@@ -108,7 +119,7 @@ def test_optimized_two_pool_prefill_and_decode(
             quant_config=quant_config,
             **({"flashinfer_backend": "trtllm-gen"} if fp8_input else {}),
         )
-        for layer_idx in range(2)
+        for layer_idx in ((0, 2, 1) if native_interleave else (0, 1))
     ]
     attention = attentions[0]
     selection_cache = attention._fmha_manager if backend is TrtllmAttention else None
@@ -126,9 +137,10 @@ def test_optimized_two_pool_prefill_and_decode(
     module._attn_impl = partial(Attention._attn_impl, module)
     decode_graph = None
     staging_address = None
+    native_output = None
 
     def forward(begin, end, context):
-        nonlocal decode_graph, staging_address
+        nonlocal decode_graph, staging_address, native_output
         metadata = backend.Metadata(
             seq_lens=torch.tensor([end - begin] * batch, dtype=torch.int32),
             num_contexts=batch if context else 0,
@@ -147,11 +159,15 @@ def test_optimized_two_pool_prefill_and_decode(
         metadata.prepare()
         view = metadata.mixed_precision_kv_views[0]
         assert metadata.mixed_precision_kv_views[1] is view
+        assert 2 not in metadata.mixed_precision_kv_views
+        if backend is FlashInferAttention:
+            assert metadata._vswa_layer_to_pool[0] == metadata._vswa_layer_to_pool[1]
+            assert metadata._vswa_layer_to_pool[0] != metadata._vswa_layer_to_pool[2]
         assert view.get_buffers(0).dtype == high_torch_dtype
         if staging_address is None:
             staging_address = view.get_buffers(0).data_ptr()
         assert view.get_buffers(0).data_ptr() == staging_address
-        assert view.metadata.mixed_precision_kv_views is None
+        assert not hasattr(view, "metadata")
         q, k, v = [
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
         ]
@@ -171,26 +187,59 @@ def test_optimized_two_pool_prefill_and_decode(
         def run():
             nonlocal layer_outputs
             layer_outputs = []
+            seq_lens_cuda = metadata.seq_lens_cuda
+            kv_cache_params = metadata.kv_cache_params
+            layer_inputs_list = (
+                (inputs, inputs, other_inputs) if native_interleave else (inputs, other_inputs)
+            )
             try:
-                for layer_attention, layer_inputs in zip(attentions, (inputs, other_inputs)):
+                for layer_attention, layer_inputs in zip(attentions, layer_inputs_list):
                     module.attn = layer_attention
-                    layer_outputs.append(
-                        Attention.forward_impl(
-                            module,
-                            *layer_inputs,
-                            metadata,
-                            PredefinedAttentionMask.CAUSAL,
-                            None,
-                            None,
-                            None,
+                    with patch.object(
+                        layer_attention, "forward", wraps=layer_attention.forward
+                    ) as backend_forward:
+                        layer_outputs.append(
+                            Attention.forward_impl(
+                                module,
+                                *layer_inputs,
+                                metadata,
+                                PredefinedAttentionMask.CAUSAL,
+                                None,
+                                None,
+                                None,
+                            )
                         )
-                    )
+                    assert backend_forward.call_args.args[3] is metadata
+                    assert metadata.seq_lens_cuda is seq_lens_cuda
+                    assert metadata.kv_cache_params is kv_cache_params
+                    assert metadata.kv_cache_manager is manager
+                    assert metadata.kv_layout == kv_layout
+                    if backend is FlashInferAttention:
+                        assert (
+                            metadata._vswa_active_pool_id
+                            == (metadata._vswa_layer_to_pool[layer_attention.layer_idx])
+                        )
             finally:
                 module.attn = attention
             return layer_outputs[0]
 
         output = run()
-        torch.testing.assert_close(layer_outputs[1], -output, atol=0.01, rtol=0.02)
+        native_output = layer_outputs[1].clone() if native_interleave else None
+        torch.testing.assert_close(layer_outputs[-1], -output, atol=0.01, rtol=0.02)
+        if context and backend is TrtllmAttention:
+            native_offsets = metadata.kv_cache_block_offsets
+            paged_context = metadata.use_paged_context_fmha
+            with (
+                patch.object(attention, "forward", side_effect=RuntimeError("backend failure")),
+                pytest.raises(RuntimeError, match="backend failure"),
+            ):
+                Attention.forward_impl(
+                    module, *inputs, metadata, PredefinedAttentionMask.CAUSAL, None, None, None
+                )
+            assert metadata.kv_cache_manager is manager
+            assert metadata.kv_layout == kv_layout
+            assert metadata.kv_cache_block_offsets is native_offsets
+            assert metadata.use_paged_context_fmha == paged_context
         if not context and high_dtype == DataType.BF16:
             reference = output.clone()
             eager_metadata = metadata
@@ -223,8 +272,12 @@ def test_optimized_two_pool_prefill_and_decode(
             metadata.prepare()
             graph.replay()
             torch.testing.assert_close(output, reference.flip(0), atol=0.01, rtol=0.02)
-            torch.testing.assert_close(layer_outputs[1], -output, atol=0.01, rtol=0.02)
-            decode_graph = (metadata, graph, output, layer_outputs[1], run)
+            if native_interleave:
+                torch.testing.assert_close(
+                    layer_outputs[1], native_output.flip(0), atol=0.01, rtol=0.02
+                )
+            torch.testing.assert_close(layer_outputs[-1], -output, atol=0.01, rtol=0.02)
+            decode_graph = (metadata, graph, output, layer_outputs[-1], run)
             output = output.flip(0)
         assert metadata.kv_cache_manager is manager and metadata.kv_layout == kv_layout
         return output
@@ -269,6 +322,13 @@ def test_optimized_two_pool_prefill_and_decode(
             atol=0.05 if high_dtype == DataType.FP8 else 0.02,
             rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
         )
+        if native_interleave:
+            torch.testing.assert_close(
+                native_output,
+                reference.transpose(1, 2).reshape_as(native_output),
+                atol=0.05 if high_dtype == DataType.FP8 else 0.02,
+                rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
+            )
         history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
         assert_native_config()
         if backend is TrtllmAttention:
@@ -294,6 +354,20 @@ def test_optimized_two_pool_prefill_and_decode(
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
         assert_native_config()
+        if native_interleave:
+            native_reference = torch.nn.functional.scaled_dot_product_attention(
+                query[:, -1].reshape(batch, 1, query_heads, width).transpose(1, 2),
+                key.to(high_torch_dtype)
+                .to(compute_dtype)
+                .reshape(batch, -1, heads, width)
+                .transpose(1, 2),
+                value.to(high_torch_dtype)
+                .to(compute_dtype)
+                .reshape(batch, -1, heads, width)
+                .transpose(1, 2),
+                enable_gqa=True,
+            ).reshape_as(native_output)
+            torch.testing.assert_close(native_output, native_reference, atol=0.01, rtol=0.02)
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
         all_history_ids, all_high_ids = manager.get_mixed_precision_page_tables(request_ids, 0)
         high = manager.get_buffers(0, kv_layout, mixed_precision_pool="high")
@@ -734,9 +808,13 @@ def test_mla_preserves_native_rope_and_attention(backend):
             metadata.prepare()
             assert metadata.mixed_precision_kv_views[1].get_buffers(1).dtype == torch.bfloat16
             output = hidden.new_empty((end - begin, 16 * 128))
-            model.forward_impl(
-                torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
-            )
+            seq_lens_cuda = metadata.seq_lens_cuda
+            with patch.object(model, "_forward_impl", wraps=model._forward_impl) as model_forward:
+                model.forward_impl(
+                    torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
+                )
+            assert model_forward.call_args.args[2] is metadata
+            assert metadata.seq_lens_cuda is seq_lens_cuda
             assert torch.isfinite(output).all()
             assert metadata.kv_cache_manager is manager
         high = manager.get_buffers(1, mixed_precision_pool="high")
