@@ -212,6 +212,9 @@ async def test_metrics_route_does_not_poll_iteration_stats_queue(
     )
     server.app = FastAPI()
     server.use_harmony = False
+    # The optional control routes are off by default, as in OpenAIServer.__init__.
+    server._enable_runtime_control_endpoints = False
+    server._enable_rl_control_endpoints = False
     server.register_routes()
 
     transport = httpx.ASGITransport(app=server.app)
