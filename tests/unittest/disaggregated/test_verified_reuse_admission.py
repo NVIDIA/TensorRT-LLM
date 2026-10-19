@@ -352,7 +352,7 @@ def _deliver_kv(monkeypatch, submit_result):
     rid = 99
     sender = _make_sender()
     dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     task = transfer_mod.KVSendTask(
         _make_chunk(),
         DisaggregatedParams(disagg_request_id=rid),
