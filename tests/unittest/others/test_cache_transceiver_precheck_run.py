@@ -187,6 +187,15 @@ def test_wait_for_addr_times_out_on_missing_file(tmp_path):
         rp.wait_for_addr(rp.addr_path(str(tmp_path), 0, 0), timeout_s=0)
 
 
+def test_wait_for_addr_stops_once_the_abort_flag_is_up(tmp_path, monkeypatch):
+    """A ctx that failed before publishing raises the flag; gen stops waiting, with its reason."""
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    work = str(tmp_path)
+    rp.raise_abort_flag(work, "ctx_0 UNHANDLED_ERROR: FileExistsError")
+    with pytest.raises(rp._PeerAbort, match="abandoned: ctx_0 UNHANDLED_ERROR: FileExistsError"):
+        rp.wait_for_addr(rp.addr_path(work, 0, 0), timeout_s=5, work_dir=work)
+
+
 def test_abort_flag_roundtrip_and_write_once(tmp_path, monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "1")
     work = str(tmp_path)

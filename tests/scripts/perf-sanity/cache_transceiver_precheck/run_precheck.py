@@ -655,11 +655,12 @@ def write_addr(path, payload):
     atomic_write_shared_file(path, json.dumps(payload), mode=0o600, fsync=True)
 
 
-def wait_for_addr(path, timeout_s):
+def wait_for_addr(path, timeout_s, work_dir=None):
     """Wait for THIS run's addr file.
 
     Files stamped with another run's job id are treated as stale and skipped
-    (keep polling).
+    (keep polling). With `work_dir`, stop waiting once its abort flag is up:
+    the instance that should publish may have failed and never will.
     """
     expect_job = run_token()
     deadline = time.monotonic() + timeout_s
@@ -675,6 +676,10 @@ def wait_for_addr(path, timeout_s):
                 if not expect_job or not stamped or stamped == expect_job:
                     return payload
                 # Stale addr from a previous run in a reused work dir.
+        if work_dir is not None:
+            reason = abort_flag_reason(work_dir)
+            if reason is not None:
+                raise _PeerAbort(f"rendezvous file {path} abandoned: {reason}")
         time.sleep(1.0)
     raise _Timeout(f"rendezvous file {path} not published within {timeout_s}s")
 
@@ -1633,6 +1638,7 @@ def _gen_open_session(runner, peer_idx, arm):
             addr = wait_for_addr(
                 addr_path(runner.work_dir, peer_idx, runner.server_idx),
                 plan["rendezvous_timeout_s"],
+                runner.work_dir,
             )
             # Session HMAC key: shared only through the work-dir addr file,
             # never over the network.
@@ -1929,7 +1935,11 @@ def _hard_abort_unhandled(runner, exc):
             time.sleep(ABORT_COORDINATION_TIMEOUT_S)
     except Exception:  # noqa: BLE001 - abort must still happen
         pass
-    _hard_abort_process(runner.comm)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        _hard_abort_process(runner.comm)
 
 
 def _hard_abort_unquiesced(runner, current_cell, exc):
