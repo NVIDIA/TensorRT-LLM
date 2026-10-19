@@ -15,6 +15,11 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.mapping import Mapping
 
 
@@ -49,6 +54,37 @@ from tensorrt_llm.mapping import Mapping
 def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
     """Getter reads top-level lengths and ignores layout metadata."""
     assert get_multimodal_embedding_lengths(req) == expected
+
+
+@pytest.mark.parametrize("legacy_lengths", [None, [2]])
+@pytest.mark.cpu_only
+def test_multimodal_embedding_lengths_uses_item_metadata(legacy_lengths):
+    """Encoder output export uses the same rows as model input assembly."""
+    metadata = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[2])
+    data = {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
+    if legacy_lengths is not None:
+        data["multimodal_embedding_lengths"] = legacy_lengths
+    params = MultimodalParams(multimodal_data=data)
+    req = SimpleNamespace(multimodal_lengths=[4], py_multimodal_data=params.multimodal_data)
+
+    assert get_multimodal_embedding_lengths(req) is params.get_item_layout()[1]
+
+
+@pytest.mark.cpu_only
+def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
+    """A direct Params caller cannot export a different item layout."""
+    params = MultimodalParams(
+        multimodal_data={
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0)], output_embedding_lengths=[2]
+            ),
+            "multimodal_embedding_lengths": [3],
+        }
+    )
+    req = SimpleNamespace(multimodal_lengths=[4], py_multimodal_data=params.multimodal_data)
+
+    with pytest.raises(ValueError, match="item output lengths must match"):
+        get_multimodal_embedding_lengths(req)
 
 
 @pytest.mark.parametrize(
