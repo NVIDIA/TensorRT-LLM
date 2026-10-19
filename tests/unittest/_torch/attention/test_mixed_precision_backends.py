@@ -143,7 +143,7 @@ def test_optimized_two_pool_prefill_and_decode(
             max_num_tokens=batch * (length + 1),
             kv_cache_manager=manager,
             request_ids=request_ids,
-            prompt_lens=[end] * batch,
+            prompt_lens=[end - begin if context else length] * batch,
             kv_layout=kv_layout,
             runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
         )
