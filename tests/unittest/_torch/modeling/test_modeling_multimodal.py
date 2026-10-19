@@ -525,7 +525,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             # Prepare metadata before capture
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0, False)
+            key = (1, 0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),
