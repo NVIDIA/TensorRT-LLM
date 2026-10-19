@@ -35,6 +35,7 @@ from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
+from tensorrt_llm._torch.models.modeling_gemma3 import build_gemma_attention_mask
 from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4AssistantForCausalLM,
     Gemma4AssistantMaskedEmbedder,
@@ -46,7 +47,6 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
-from tensorrt_llm._torch.modules.gemma_attention_mask import build_gemma_attention_mask
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping

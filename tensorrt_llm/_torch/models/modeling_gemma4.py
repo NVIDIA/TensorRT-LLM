@@ -61,11 +61,11 @@ from ..modules.fused_ops.rmsnorm_residual_add import (
 )
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
-from ..modules.gemma_attention_mask import build_gemma_attention_mask
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
+from .modeling_gemma3 import build_gemma_attention_mask
 from .modeling_speculative import (
     _SPECULATIVE_POSITION_HEADROOM,
     SpecDecOneEngineForCausalLM,
