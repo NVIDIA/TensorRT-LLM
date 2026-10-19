@@ -1173,6 +1173,7 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     executor.enable_attention_dp = False
+    executor.adp_router = Mock(exclude_retiring_requests=False)
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
@@ -2723,6 +2724,125 @@ def test_pad_still_warns_on_a_genuine_routable_surplus():
 
     assert mock_logger.warning.call_count == 1
     assert "exceeds expected_num_active_requests" in mock_logger.warning.call_args[0][0]
+
+
+def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_active_requests=4):
+    """Drive the non-attention-DP branch of ``_fetch_new_requests``.
+
+    Returns the ``total_num_live_requests`` handed to the queue wait and the
+    ``total_num_active_requests`` that admission subtracts from its capacity.
+    """
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=max_num_active_requests,
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
+        _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
+    )
+    seen = {}
+    stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
+
+    def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
+        seen["active"] = total_num_active_requests
+        seen["all_ranks"] = all_ranks_num_active_requests
+        return []
+
+    stub._pop_from_waiting_queue = _pop
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]
+    ) as merge:
+        assert PyExecutor._fetch_new_requests(stub, Mock(), active_requests) == []
+    merge.assert_called_once()
+    return seen
+
+
+def test_non_adp_admission_excludes_retiring_requests_with_headroom():
+    """A context server under overlap: every request retires one iteration late.
+
+    With ``max_batch_size`` 4 and the previous batch's 4 requests all retiring,
+    admission must see an empty pool so it can seat a full replacement batch in
+    the headroom (nvbug 6919819); counting the retirees capped every refill at
+    the seats the previous iteration had left unused. The retirees still count
+    as live, so the idle wait does not block while they are resident.
+    """
+    retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
+
+    seen = _run_non_adp_fetch(retiring, exclude_retiring_requests=True)
+
+    assert seen == {"live": 4, "active": 0, "all_ranks": None}
+
+
+def test_non_adp_admission_counts_retiring_requests_without_headroom():
+    """Without the headroom a retiring request still holds one of the B seats."""
+    active = [
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+    ]
+
+    seen = _run_non_adp_fetch(active, exclude_retiring_requests=False)
+
+    assert seen == {"live": 2, "active": 2, "all_ranks": None}
+
+
+def test_non_adp_admission_keeps_counting_requests_that_are_not_retiring():
+    active = [
+        _make_adp_request(LlmRequestState.CONTEXT_INIT, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=3),
+    ]
+
+    seen = _run_non_adp_fetch(active, exclude_retiring_requests=True)
+
+    assert seen == {"live": 3, "active": 2, "all_ranks": None}
+
+
+@pytest.mark.parametrize(
+    ("exclude_retiring_requests", "expected_admitted_ids"),
+    [(True, [10, 11, 12, 13]), (False, [])],
+)
+def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
+    exclude_retiring_requests, expected_admitted_ids
+):
+    """Run the real waiting-queue pop: 4 retiring, 4 waiting, capacity 4.
+
+    With the overlap headroom the whole waiting batch is admitted beside the
+    retiring requests; without it the retiring requests fill every seat. Either
+    way the retiring requests still count as live for the idle wait.
+    """
+    retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests(RequestQueueItem(10 + i) for i in range(4))
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=4,
+        is_benchmark_disagg=False,
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
+        _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
+    )
+    for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
+        setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
+    live = []
+    stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        side_effect=lambda new_requests, **_: list(new_requests),
+    ):
+        admitted = PyExecutor._fetch_new_requests(stub, waiting_queue, retiring)
+
+    assert [item.id for item in admitted] == expected_admitted_ids
+    assert [item.id for item in waiting_queue] == [10, 11, 12, 13][len(expected_admitted_ids) :]
+    assert live == [4]
+    assert stub.num_fetch_requests == len(expected_admitted_ids)
 
 
 def test_generic_disagg_adp_mixed_rank_states_stay_queueable():

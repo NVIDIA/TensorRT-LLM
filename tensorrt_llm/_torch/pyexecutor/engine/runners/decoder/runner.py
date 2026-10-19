@@ -836,9 +836,19 @@ class DecoderRunner(ScheduledModelRunner):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # Helix CP is decode-only and runs into issues with the
-        # autotuner warmup's context requests.
-        if self._context_warmups_supported and not self.mapping.has_cp_helix():
+        # Helix CP is decode-only, so it tunes on generation requests.
+        if self._context_warmups_supported and self.mapping.has_cp_helix():
+            with (
+                self._warmup_timer.phase(
+                    "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
+            ):
+                self._run_autotuner_warmup(resource_manager, generation_only=True)
+            log_mem_snapshot("warmup/after_autotuner")
+            gc.collect()
+            torch.cuda.empty_cache()
+        elif self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
                     "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
@@ -1511,8 +1521,14 @@ class DecoderRunner(ScheduledModelRunner):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
-        """Runs forward passes to populate the autotuner cache."""
+    def _run_autotuner_warmup(
+        self, resource_manager: ResourceManager, generation_only: bool = False
+    ) -> None:
+        """Runs forward passes to populate the autotuner cache.
+
+        ``generation_only`` tunes on one batch of ``max_batch_size`` generation
+        requests instead of a context batch, for Helix CP generation workers.
+        """
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
             MXFP8GemmRunner,
@@ -1606,14 +1622,22 @@ class DecoderRunner(ScheduledModelRunner):
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        token_num_upper_bound = min(
-            self._config.max_num_tokens,
-            self._config.max_batch_size * (self._config.max_seq_len - 1),
-        )
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self._config.original_max_draft_len,
-        )
+        if generation_only:
+            tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
+            num_gen_requests = min(
+                self._config.max_batch_size,
+                self._config.max_num_tokens // tokens_per_gen_request,
+            )
+            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        else:
+            token_num_upper_bound = min(
+                self._config.max_num_tokens,
+                self._config.max_batch_size * (self._config.max_seq_len - 1),
+            )
+            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num_upper_bound,
+                max_num_draft_tokens=self._config.original_max_draft_len,
+            )
 
         # The warmup runs again after the KV cache is rebuilt; when the token
         # shape is unchanged and no MXFP8 tuning is pending, the profiling
@@ -1643,10 +1667,13 @@ class DecoderRunner(ScheduledModelRunner):
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})..."
         )
 
-        warmup_configs = [(curr_max_num_tokens, 0)]
-        if self.guided_decoder is None and not self.mapping.has_pp():
-            # Add generation request to warmup the autotuner cache.
-            warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
+        if generation_only:
+            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
+        else:
+            warmup_configs = [(curr_max_num_tokens, 0)]
+            if self.guided_decoder is None and not self.mapping.has_pp():
+                # Add generation request to warmup the autotuner cache.
+                warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
