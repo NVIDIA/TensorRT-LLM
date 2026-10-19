@@ -25,6 +25,7 @@ import torch
 from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_one_shot_trace_dispatch,
+    prims_ts_decode_mla_wrapper_trace_dispatch,
 )
 
 from .decode import (
@@ -1576,7 +1577,7 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=int(dict(policy)["split_kv"]),
         )
 
-    @flashinfer_experimental_api
+    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
     def run(
         self,
         query: torch.Tensor,
