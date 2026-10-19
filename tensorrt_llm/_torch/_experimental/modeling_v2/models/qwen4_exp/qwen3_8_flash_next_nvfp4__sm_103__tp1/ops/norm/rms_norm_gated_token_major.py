@@ -8,17 +8,49 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import triton
 
 # Registration is lazy: the op is defined beside the mamba/GDN mixer, and
 # `import tensorrt_llm._torch.custom_ops` alone does not make
 # torch.ops.trtllm.rms_norm_gated_token_major resolve.
-import tensorrt_llm._torch.modules.mamba.layernorm_gated  # noqa: F401
+import tensorrt_llm._torch.modules.mamba.layernorm_gated as _layernorm_gated
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: The checkpoint's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`.
 _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activation="sigmoid")
 #: The same geometry under the op's default silu gate.
 _SILU = dict(_CKPT, gate_activation="silu")
+#: Prefill-sized launches (at least this many rows, i.e. 683 tokens of 48 heads) run
+#: the multi-row kernel at `_PREFILL_ROWS` rows a program: at 16384 tokens 94 vs 143
+#: us on GB300 (traffic roofline ~81 us), where 4 rows a program leave 196608 small
+#: programs.
+_PREFILL_MIN_ROWS = 32768  # capacity: fixed: a dispatch threshold, not a buffer size
+_PREFILL_ROWS = 8
+
+
+def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) -> bool:
+    n = x.shape[-1]
+    return (
+        x.shape[0] >= _PREFILL_MIN_ROWS
+        and x.stride(-1) == 1
+        and z.stride(2) == 1
+        and z.stride(1) == n
+        and n <= 256
+        and n & (n - 1) == 0
+        and gate_activation in ("silu", "sigmoid")
+    )
+
+
+def _prefill_launch(x, z, weight, eps, gate_activation):
+    """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every SM)."""
+    rows, n = x.shape
+    out = torch.empty_like(x)
+    _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(rows, _PREFILL_ROWS),)](
+        x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
+        N=n, ROWS=_PREFILL_ROWS, HEADS_PER_TOK=z.shape[1], GATE_SIGMOID=gate_activation == "sigmoid",
+        WEIGHT_IS_DELTA=False, LAUNCH_WITH_PDL=False, num_warps=4,
+    )  # fmt: skip
+    return out
 
 
 class RmsNormGatedTokenMajor(OpWrapper):
@@ -34,6 +66,9 @@ class RmsNormGatedTokenMajor(OpWrapper):
     scale) the output is `float8_e4m3fn`: the gated value is rounded to
     `x.dtype`, multiplied by `1 / fp8_scale[0]` and saturated at +-448 --
     byte-identical to the unfused norm -> static-quantize pair.
+
+    Call site: `z` is the `[T, 6144]` column view of the GDN layer's one
+    `[T, 16480]` input-projection output, reshaped `[T, 48, 128]`.
 
     Fusion boundary: norm, weight, gate and the optional quantize. The caller
     owns both projections producing `x` and `z`, and every reshape.
@@ -56,6 +91,21 @@ class RmsNormGatedTokenMajor(OpWrapper):
         Cell(
             why="z a column slice: token stride 16384, 512 tokens",
             spec=dict(tokens=512, z="column_slice", **_CKPT),
+        ),
+        *(
+            Cell(
+                why=f"z the in_proj column view: token stride 16480, {t} tokens",
+                spec=dict(tokens=t, z="in_proj", **_CKPT),
+            )
+            for t in (1, 128, 8192, 16384)
+        ),
+        Cell(
+            why="683 tokens: the first launch at 8 rows a program",
+            spec=dict(tokens=683, z="in_proj", **_CKPT),
+        ),
+        Cell(
+            why="1001 tokens x 48 heads at 8 rows a program, silu",
+            spec=dict(tokens=1001, z="in_proj", **_SILU),
         ),
         Cell(
             why="x row stride 2N: only stride(-1) must be 1",
@@ -90,11 +140,13 @@ class RmsNormGatedTokenMajor(OpWrapper):
 
     note = """
     Metadata consumed: none. Two Triton kernels: a multi-row kernel (4 rows per
-    program) when `x.stride(-1) == 1`, `z.stride(2) == 1`, `z.stride(1) == N`
-    and N is a power of two <= 256 -- the checkpoint's N = 128 -- else the
-    generic single-row kernel on a packed copy of `z`. PDL on the multi-row
-    path only when the grid is smaller than the SM count and
-    `TRTLLM_ENABLE_PDL != 0`; results are bitwise identical with it off.
+    program; 8 from 32768 rows, without fp8 output) when `x.stride(-1) == 1`,
+    `z.stride(2) == 1`, `z.stride(1) == N` and N is a power of two <= 256 --
+    the checkpoint's N = 128 -- else the generic single-row kernel on a packed
+    copy of `z`. PDL on the 4-row path only when the grid is smaller than the
+    SM count and `TRTLLM_ENABLE_PDL != 0`; results are bitwise identical with
+    it off. The 8-row programs reduce a row's mean square in another order
+    than the 4-row ones (one-ulp differences on some outputs).
 
     Loud, so not guarded: 3-D `x` (ValueError), a `z` not covering `x`
     (AssertionError "does not match x shape"; 2-D `z` ValueError), an unknown
@@ -126,6 +178,8 @@ class RmsNormGatedTokenMajor(OpWrapper):
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
     ) -> torch.Tensor:
+        if fp8_scale is None and z.dim() == 3 and _prefill_multirow(x, z, gate_activation):
+            return _prefill_launch(x, z, weight, eps, gate_activation)
         return torch.ops.trtllm.rms_norm_gated_token_major(
             x, z, weight, eps, fp8_scale, gate_activation
         )

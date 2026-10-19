@@ -65,8 +65,9 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     # arange), pool_dtype (fp32), l2norm (True), normalize_qk (caller-normalized
     # q/k when l2norm is off), output ("none" | "prefix": a length-prefix slice
     # of a longer buffer, as the stock mixer passes), ab ("packed": column
-    # halves of a [T, 96] projection | "separate": two contiguous [T, 48], as
-    # the target's two matmuls make them), layout ("varlen" | "layer_view":
+    # halves of a [T, 96] projection | "separate": two contiguous [T, 48] |
+    # "in_proj": q/k/v/a/b all column views of one [T, 16480] projection, as the
+    # target's one input GEMM makes them), layout ("varlen" | "layer_view":
     # pool[1] of a [3, slots, ...] cache | "batched": cu_seqlens None,
     # contiguous copies | "rows": cu_seqlens None, one token per row, q/k/v
     # [N, 1, heads, 128] views of the packed [N, 10240] block whose token
@@ -80,6 +81,17 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
                 ),
             )
             for n in (1, 4, 16, 32)
+        )
+        + tuple(
+            Cell(
+                why=f"target decode call, in_proj column views, N={n}",
+                spec=dict(seq_lens=(1,) * n, slots=slots, indices=indices, ab="in_proj"),
+            )
+            for n, slots, indices in (
+                (1, ENGINE_SLOTS, _scattered(1)),
+                (32, ENGINE_SLOTS, _scattered(32)),
+                (128, 128, None),
+            )
         )
         + (
             Cell(
@@ -215,9 +227,10 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     layer's whole pool `[slots, 48, 128, 128]` at `mamba_ssm_cache_dtype`:
     - fp32 pool: `(a_log, a, dt_bias, 1.0, 20.0, q, k, v, b, ssm_states,
       si_all, None, True, qsl_long, None)` -- q/k/v `[1, T, heads, 128]`
-      reshaped column views of the conv output `[T, 10240]` (read through
-      `stride(1)`, no repack), `a`/`b` two contiguous `[T, 48]` projections,
-      int64 `cu_seqlens`;
+      reshaped column views of the conv output (read through `stride(1)`, no
+      repack), and `a`/`b`, all column views of the layer's one `[T, 16480]`
+      input-projection output (row stride 16480; the conv wrote q|k|v in
+      place), int64 `cu_seqlens`;
     - bf16 pool: the rows form, `cu_seqlens` None -- q/k/v `[T, 1, heads,
       128]` split from the whole `[T, 10240]` block reshaped to `[T, 1, 80,
       128]`, so the token stride is the row stride (`is_valid` refuses other

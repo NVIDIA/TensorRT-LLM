@@ -31,6 +31,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 #: The GDN in_proj row the old column-slice measurement used: [q k v | z] = 10240 | 6144.
 _PROJ_WIDTH, _Z_OFFSET = 16384, 10240
+#: The target's concatenated GDN input projection: [q k v | z | a | b] = 10240 | 6144 | 48 | 48.
+_IN_PROJ_WIDTH = 16480
 
 
 def _seed(text: str) -> int:
@@ -55,6 +57,8 @@ def _build(spec, seed):
     layout = spec.get("z", "packed")
     if layout == "column_slice":
         z = randn(t, _PROJ_WIDTH)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
+    elif layout == "in_proj":
+        z = randn(t, _IN_PROJ_WIDTH)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
     elif layout == "head_strided":
         z = randn(t, heads, 2 * n)[:, :, :n]
     else:
@@ -76,6 +80,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         assert z.stride()[1:] == (cell.spec["width"], 1)
         if cell.spec["tokens"] > 1:
             assert z.stride(0) == _PROJ_WIDTH and not z.is_contiguous()
+    if cell.spec.get("z") == "in_proj" and cell.spec["tokens"] > 1:
+        assert z.stride() == (_IN_PROJ_WIDTH, cell.spec["width"], 1) and not z.is_contiguous()
     if cell.spec.get("x") == "strided_rows":
         assert x.stride(0) == 2 * cell.spec["width"] and not x.is_contiguous()
     before = [x.clone(), z.clone(), weight.clone()]
