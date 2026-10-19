@@ -32,11 +32,12 @@ from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, reg
 
 # Largest draft batch whose non-causal, unwindowed TRTLLM block attention runs
 # as B * block_size single-query decode rows instead of one context-FMHA call.
-# Every row reads its request's whole KV, so the row form trades block_size
-# times the KV traffic for split-KV parallelism. The context kernel launches
-# few CTAs at small batch, so the rows stay ahead up to at least B = 32 (the
-# largest batch measured); the cap also bounds the workspace and counter
-# buffers, which are sized for B * block_size requests below it.
+# Every row reads its request's whole KV, so the row form reads block_size
+# times the KV in exchange for split-KV parallelism, which pays off while the
+# context kernel launches few CTAs, i.e. at small batch. The value is not tuned
+# per architecture: every SM100-family GPU that runs the TRTLLM path takes this
+# same gate. It also bounds the workspace and multi-CTA counter buffers, which
+# are sized for up to this many times block_size requests.
 _NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE = 32
 
 
