@@ -120,7 +120,7 @@ attention_config:
 - On H100/H200/H800/H20, only one recipe with fixed `qk_dtype: "int8"` is supported.
 - On B200/GB200, it is recommended to use the `qk_dtype: "int8"` recipes.
 - On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200.
-- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once.
+- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. PrimTS runs on B200/GB200 and B300/GB300 only, so H100/H200/H800/H20 reject `smooth_v`.
 
 **Configuration.**
 

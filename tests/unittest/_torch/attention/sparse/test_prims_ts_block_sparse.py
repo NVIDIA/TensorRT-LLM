@@ -420,8 +420,10 @@ def _set_sage_recipe(args: AttentionForwardArgs) -> None:
 
 
 def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> None:
-    attention, fmha, q, k, v, metadata, args = _contiguous_case()
-    attention._fmha_manager = SimpleNamespace(fmha_libs=[fmha])
+    attention, _fmha, q, k, v, metadata, args = _contiguous_case()
+    # The core quantizes whichever libraries the layer has; each library decides whether it
+    # takes the quantized inputs.
+    attention._fmha_manager = SimpleNamespace(fmha_libs=[])
     quantized = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
     sage_quantize = Mock(return_value=quantized)
     monkeypatch.setattr(trtllm_backend, "sage_quantize", sage_quantize)
@@ -475,13 +477,9 @@ def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> 
     assert quantize() is quantized
     assert sage_quantize.call_args.kwargs["smooth_v"]
 
-    # Calls with a KV cache, and layers without a library that takes quantized inputs,
-    # quantize nothing.
+    # Calls with a KV cache quantize nothing.
     sage_quantize.reset_mock()
     _set_block_sparse_inputs(args, proxy)
-    attention._fmha_manager.fmha_libs = []
-    assert quantize() is None
-    attention._fmha_manager.fmha_libs = [fmha]
     metadata.kv_cache_manager = Mock()
     assert quantize() is None
     sage_quantize.assert_not_called()

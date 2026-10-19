@@ -233,7 +233,6 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     PLAN_CACHE_KEY = "prims_ts_block_sparse"
 
     supports_block_sparse_inputs = True
-    supports_sage_quantized_inputs = True
 
     def _is_supported(
         self,

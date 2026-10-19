@@ -190,6 +190,30 @@ class TestAttentionConfigQuantValidation:
                     ),
                 )
 
+    @pytest.mark.parametrize(
+        ("sm_ver", "qk_dtype", "q_block_size", "accepted"),
+        [(90, "int8", 2, False), (100, "int8", 1, True), (103, "fp8", 1, True)],
+    )
+    def test_smooth_v_requires_primts_architecture(self, sm_ver, qk_dtype, q_block_size, accepted):
+        def build():
+            return AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    q_block_size=q_block_size,
+                    k_block_size=16,
+                    v_block_size=1,
+                    smooth_v=True,
+                ),
+            )
+
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            if accepted:
+                assert build().quant_attention_config.smooth_v
+            else:
+                with pytest.raises(ValidationError, match="smooth_v needs the PrimTS kernels"):
+                    build()
+
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
             backend="CUTEDSL",

@@ -234,9 +234,8 @@ only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
 The contiguous block-sparse path also consumes the SageAttention recipe in
-`AttentionForwardArgs`. Prediction sees the original Q/K/V. When a library of
-the layer declares `supports_sage_quantized_inputs`, the attention core then
-quantizes the Q/K/V of a block-sparse call before FMHA selection, with
+`AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
+then quantizes the Q/K/V of a block-sparse call before FMHA selection, with
 TensorRT-LLM's Sage quantization kernel (`attention/kernels/sage_quant.py`),
 and passes the result in `AttentionForwardArgs.sage_quantized`. Q/K get
 per-block scales and V per-sequence channel scales; the summaries of proxy

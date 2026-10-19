@@ -2027,14 +2027,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         The attention op quantizes dense SageAttention inside its kernels and
         cannot add a V mean back, so only block-sparse calls and calls with V
-        smoothing are quantized here, for the FMHA libraries that take
-        quantized inputs: separate Q, K, and V without a KV cache.
+        smoothing are quantized here, given separate Q, K, and V without a KV
+        cache. Each FMHA library decides whether it takes the quantized inputs;
+        the attention op ignores them.
         """
         qk_quant_dtype = forward_args.sage_attn_qk_dtype
         if (qk_quant_dtype is None or k is None or v is None
-                or metadata.kv_cache_manager is not None
-                or not any(fmha.supports_sage_quantized_inputs
-                           for fmha in self._fmha_manager.fmha_libs)):
+                or metadata.kv_cache_manager is not None):
             return None
         inputs = forward_args.sparse_runtime_params.block_sparse_inputs
         if inputs is None and not forward_args.sage_attn_smooth_v:

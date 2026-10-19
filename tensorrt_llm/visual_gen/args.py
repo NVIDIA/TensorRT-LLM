@@ -221,6 +221,11 @@ class AttentionConfig(StrictBaseModel):
                     "smooth_k and smooth_v are SageAttention options and do not apply to the "
                     f"per-tensor recipe {recipe!r}."
                 )
+            if q_config.smooth_v and sm_version not in (100, 103):
+                raise ValueError(
+                    "smooth_v needs the PrimTS kernels, which add the V mean back to the "
+                    f"attention output and run on SM100 and SM103 only; got SM{sm_version}."
+                )
         elif q_config.smooth_k or q_config.smooth_v:
             raise ValueError(
                 f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
