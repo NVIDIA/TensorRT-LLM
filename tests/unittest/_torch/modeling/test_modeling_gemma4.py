@@ -46,6 +46,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
+from tensorrt_llm._torch.modules.gemma_attention_mask import build_gemma_attention_mask
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -4371,6 +4372,22 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
             "the caller no longer loops per-image, so the metadata must allow "
             "cross-image batching.",
         )
+
+
+def test_gemma_attention_mask_peak() -> None:
+    # A second quadratic tensor exceeds the allowance by tens of MiB.
+    length = 4096
+    types = torch.zeros(2 * length, dtype=torch.int64, device="cuda")
+    types[64:128] = 1
+    warm = build_gemma_attention_mask(types, [length, length], [0, 1024], 512)
+    del warm
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = build_gemma_attention_mask(types, [length, length], [0, 1024], 512)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - before
+    assert peak <= result.numel() + 2 * 1024**2
 
 
 if __name__ == "__main__":
