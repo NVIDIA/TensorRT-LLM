@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The pool's column gather and the pre-expert RMSNorm + NVFP4 quantization, in one launch.
 
-Built-in decode at TP8 with sharded projections prepares the experts' input on
+Built-in decode at TP8 (TP4) with sharded projections prepares the experts' input on
 the MoE preparation stream with three launches: the pool GEMM writes this
-rank's 512 of the 4096 pooled columns, ``_gather_columns`` exchanges the eight
+rank's 512 (1024) of the 4096 pooled columns, ``_gather_columns`` exchanges the
 slices and writes the gathered ``[M, 4096]`` BF16, and flashinfer's CuTe-DSL
 ``rmsnorm_fp4quant`` (``RMSNormFP4QuantKernel``) reads it back for the Gemma
 RMSNorm and the NVFP4 quantization (E2M1 payload, E4M3 block scales of 16,
@@ -17,9 +17,10 @@ of 128 threads per two rows, 64 threads per row, each thread owning eight
 8-element vectors spaced 512 columns apart) and keeps its arithmetic -- the
 sum of squares through flashinfer's own ``row_reduce``, the scale and
 quantization helpers -- statement for statement. Only where the row comes
-from changes: a thread's eight vectors are exactly the same four payload words
-of each of the eight ranks' slices, so the thread sends its own four words to
-the seven peers, polls the seven peers' four words (all loads in flight
+from changes: a thread's eight vectors are, at TP8, the same four payload
+words of each of the eight ranks' slices, and at TP4 two vectors (256 words
+apart) of each of the four ranks' slices. The thread sends the vectors of its
+own slice to every peer, polls the peers' vectors (all loads in flight
 together), and writes all eight vectors to the shared-memory tile where the
 built-in ``cp.async`` copy would have put them. The quantization phase reads
 the row from that tile instead of from global memory -- the same bits.
@@ -28,10 +29,10 @@ With ``return_gathered`` (the default) the gathered BF16 row is also written
 out, as the built-in gather would have; without it the kernel skips that
 store.
 
-With ``stale_poll`` (the stale-only schedule) the first polling round reads all seven
-peers' words and each later round reads only the peers whose tags were still
+With ``stale_poll`` (the stale-only schedule) the first polling round reads every
+peer vector and each later round reads only the vectors whose tags were still
 stale, all of those reads in flight together; by default every round reads all
-seven again. The same words either way: in one call a peer's four words have
+of them again. The same words either way: in one call a peer's four words have
 one writer and are not rewritten before this rank clears them, so the read that
 first sees all four tags current returns what any later read would.
 The quantization phases copy flashinfer's ``RMSNormFP4QuantKernel``
@@ -48,16 +49,22 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLD, ProjectionInbox
+from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLDS, ProjectionInbox
 
 #: Width of the pooled (expert) activation.
 HIDDEN = 4096
-#: Columns of the pool output one rank computes.
-LOCAL_COLUMNS = HIDDEN // WORLD
-#: 32-bit payload words of one row of one rank's slice.
-_ROW_WORDS = LOCAL_COLUMNS // 2
 #: NVFP4 block size (elements per E4M3 scale).
 BLOCK = 16
+#: 8-column vectors per thread in flashinfer's H=4096 geometry, 512 columns apart.
+_VECTORS = 8
+#: Payload words between a thread's consecutive vectors (512 columns).
+_VECTOR_SPAN_WORDS = 256
+
+
+def local_columns(world: int) -> int:
+    """Columns of the pool output one of ``world`` ranks computes (512 at TP8, 1024 at TP4)."""
+    return HIDDEN // world
+
 
 try:
     from flashinfer.cute_dsl import fp4_common as _fp4
@@ -133,7 +140,7 @@ if _AVAILABLE:
     class _PoolGatherRmsnormFp4QuantKernel(_FlashinferKernel):
         """flashinfer's RMSNorm + FP4 quantization, reading its row from the pool inbox."""
 
-        def __init__(self, peer_rank: int, stale_poll: bool = False):
+        def __init__(self, peer_rank: int, world: int, stale_poll: bool = False):
             major, minor = torch.cuda.get_device_capability()
             super().__init__(
                 dtype=cutlass.BFloat16,
@@ -152,8 +159,9 @@ if _AVAILABLE:
                 and self.threads_per_row == 64
                 and self.rows_per_block == 2
                 and self.vec_size == 8
-                and self.num_vec_blocks == WORLD
+                and self.num_vec_blocks == _VECTORS
                 and self.num_vec_blocks * self.vec_size * self.threads_per_row == HIDDEN
+                and world in WORLDS
             ):
                 raise ValueError(
                     "flashinfer's RMSNormFP4QuantKernel geometry changed: "
@@ -162,7 +170,18 @@ if _AVAILABLE:
                     f"{self.vec_size}"
                 )
             self.peer_rank = peer_rank
+            self.world = world
+            self.row_words = local_columns(world) // 2
+            # Vector v of a thread lies in rank owner(v)'s slice, at word
+            # offset(v) + 4 * lane of its row: at TP8 one vector per rank, at TP4 two.
+            self.per_rank = _VECTORS // world
             self.stale_poll = stale_poll
+
+        def owner(self, v: int) -> int:
+            return v // self.per_rank
+
+        def offset(self, v: int) -> int:
+            return (v % self.per_rank) * _VECTOR_SPAN_WORDS
 
         @cute.jit
         def __call__(
@@ -275,103 +294,117 @@ if _AVAILABLE:
 
             # ==============================================================
             # Phase 1: gather this thread's eight vectors into sX, where the
-            # built-in cp.async copy puts them: columns
-            # lane * 8 + 512 * b (+0..7) of the row -- payload words
-            # [4 * lane, 4 * lane + 4) of rank b's slice.
+            # built-in cp.async copy puts them: columns lane * 8 + 512 * v
+            # (+0..7) of the row -- payload words
+            # [offset(v) + 4 * lane, offset(v) + 4 * lane + 4) of rank owner(v)'s slice.
             # ==============================================================
             actual_row_idx = bidx * rows_per_block + row_in_block
             state = counters + Int64(actual_row_idx) * 8
             tag = Uint32(0)
             slot = Uint32(0)
+            row_words = self.row_words
+            world = self.world
             if actual_row_idx < M:
                 last_tag, last_slot = load_state(state)
                 tag = next_tag(last_tag)
                 slot = (last_slot ^ Uint32(1)) & Uint32(1)
                 word = Int64(lane_in_row * 4)
                 row64 = Int64(actual_row_idx)
-                l0, l1, l2, l3 = load_words(local + (row64 * _ROW_WORDS + word) * 4)
-                sent = (
-                    (Int64(slot) * WORLD + self.peer_rank) * MAX_ROWS + row64
-                ) * _ROW_WORDS + word
-                for b in cutlass.range_constexpr(WORLD):
-                    if cutlass.const_expr(b != self.peer_rank):
-                        publish_words(inbox + Int64(b) * stride + sent * 8, l0, l1, l2, l3, tag)
+                received = cute.make_rmem_tensor(cute.make_layout((4 * _VECTORS,)), Uint32)
+                # This rank's own vectors: loaded, then sent to every peer.
+                for v in cutlass.range_constexpr(_VECTORS):
+                    if cutlass.const_expr(self.owner(v) == self.peer_rank):
+                        at = row64 * row_words + word + self.offset(v)
+                        l0, l1, l2, l3 = load_words(local + at * 4)
+                        received[4 * v] = l0
+                        received[4 * v + 1] = l1
+                        received[4 * v + 2] = l2
+                        received[4 * v + 3] = l3
+                        sent = (
+                            (Int64(slot) * world + self.peer_rank) * MAX_ROWS + row64
+                        ) * row_words + (word + self.offset(v))
+                        for b in cutlass.range_constexpr(world):
+                            if cutlass.const_expr(b != self.peer_rank):
+                                publish_words(
+                                    inbox + Int64(b) * stride + sent * 8, l0, l1, l2, l3, tag
+                                )
                 own = inbox + Int64(self.peer_rank) * stride
-                received = cute.make_rmem_tensor(cute.make_layout((4 * WORLD,)), Uint32)
                 if cutlass.const_expr(self.stale_poll):
-                    # Bit b of `stale` is set while peer b's words carry an old tag;
-                    # only those peers are read again, the others keep their words.
-                    tags = cute.make_rmem_tensor(cute.make_layout((4 * WORLD,)), Uint32)
+                    # Bit v of `stale` is set while vector v's words carry an old tag;
+                    # only those vectors are read again, the others keep their words.
+                    tags = cute.make_rmem_tensor(cute.make_layout((4 * _VECTORS,)), Uint32)
                     stale = Uint32(0)
-                    for b in cutlass.range_constexpr(WORLD):
-                        if cutlass.const_expr(b != self.peer_rank):
-                            box = ((Int64(slot) * WORLD + b) * MAX_ROWS + row64) * _ROW_WORDS + word
+                    for v in cutlass.range_constexpr(_VECTORS):
+                        if cutlass.const_expr(self.owner(v) != self.peer_rank):
+                            box = (
+                                (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                            ) * row_words + (word + self.offset(v))
                             p0, t0, p1, t1, p2, t2, p3, t3 = poll_words(own + box * 8)
-                            received[4 * b] = p0
-                            received[4 * b + 1] = p1
-                            received[4 * b + 2] = p2
-                            received[4 * b + 3] = p3
-                            tags[4 * b] = t0
-                            tags[4 * b + 1] = t1
-                            tags[4 * b + 2] = t2
-                            tags[4 * b + 3] = t3
-                            stale = stale | stale_bit(t0, t1, t2, t3, tag, Uint32(1 << b))
+                            received[4 * v] = p0
+                            received[4 * v + 1] = p1
+                            received[4 * v + 2] = p2
+                            received[4 * v + 3] = p3
+                            tags[4 * v] = t0
+                            tags[4 * v + 1] = t1
+                            tags[4 * v + 2] = t2
+                            tags[4 * v + 3] = t3
+                            stale = stale | stale_bit(t0, t1, t2, t3, tag, Uint32(1 << v))
                     while stale != Uint32(0):
                         polled = stale
                         stale = Uint32(0)
-                        for b in cutlass.range_constexpr(WORLD):
-                            if cutlass.const_expr(b != self.peer_rank):
+                        for v in cutlass.range_constexpr(_VECTORS):
+                            if cutlass.const_expr(self.owner(v) != self.peer_rank):
                                 box = (
-                                    (Int64(slot) * WORLD + b) * MAX_ROWS + row64
-                                ) * _ROW_WORDS + word
+                                    (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                ) * row_words + (word + self.offset(v))
                                 p0, t0, p1, t1, p2, t2, p3, t3 = poll_words_if(
                                     own + box * 8,
-                                    (polled >> Uint32(b)) & Uint32(1),
-                                    received[4 * b],
-                                    tags[4 * b],
-                                    received[4 * b + 1],
-                                    tags[4 * b + 1],
-                                    received[4 * b + 2],
-                                    tags[4 * b + 2],
-                                    received[4 * b + 3],
-                                    tags[4 * b + 3],
+                                    (polled >> Uint32(v)) & Uint32(1),
+                                    received[4 * v],
+                                    tags[4 * v],
+                                    received[4 * v + 1],
+                                    tags[4 * v + 1],
+                                    received[4 * v + 2],
+                                    tags[4 * v + 2],
+                                    received[4 * v + 3],
+                                    tags[4 * v + 3],
                                 )
-                                received[4 * b] = p0
-                                received[4 * b + 1] = p1
-                                received[4 * b + 2] = p2
-                                received[4 * b + 3] = p3
-                                tags[4 * b] = t0
-                                tags[4 * b + 1] = t1
-                                tags[4 * b + 2] = t2
-                                tags[4 * b + 3] = t3
-                                stale = stale | stale_bit(t0, t1, t2, t3, tag, Uint32(1 << b))
+                                received[4 * v] = p0
+                                received[4 * v + 1] = p1
+                                received[4 * v + 2] = p2
+                                received[4 * v + 3] = p3
+                                tags[4 * v] = t0
+                                tags[4 * v + 1] = t1
+                                tags[4 * v + 2] = t2
+                                tags[4 * v + 3] = t3
+                                stale = stale | stale_bit(t0, t1, t2, t3, tag, Uint32(1 << v))
                 else:
                     stale = Uint32(1)
                     while stale != Uint32(0):
                         stale = Uint32(0)
-                        for b in cutlass.range_constexpr(WORLD):
-                            if cutlass.const_expr(b != self.peer_rank):
+                        for v in cutlass.range_constexpr(_VECTORS):
+                            if cutlass.const_expr(self.owner(v) != self.peer_rank):
                                 box = (
-                                    (Int64(slot) * WORLD + b) * MAX_ROWS + row64
-                                ) * _ROW_WORDS + word
+                                    (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                ) * row_words + (word + self.offset(v))
                                 p0, t0, p1, t1, p2, t2, p3, t3 = poll_words(own + box * 8)
-                                received[4 * b] = p0
-                                received[4 * b + 1] = p1
-                                received[4 * b + 2] = p2
-                                received[4 * b + 3] = p3
+                                received[4 * v] = p0
+                                received[4 * v + 1] = p1
+                                received[4 * v + 2] = p2
+                                received[4 * v + 3] = p3
                                 stale = stale | any_stale(t0, t1, t2, t3, tag)
                 gathered_row = mX.iterator.toint() + row64 * (H * 2)
-                for b in cutlass.range_constexpr(WORLD):
-                    if cutlass.const_expr(b != self.peer_rank):
-                        box = ((Int64(slot) * WORLD + b) * MAX_ROWS + row64) * _ROW_WORDS + word
+                for v in cutlass.range_constexpr(_VECTORS):
+                    if cutlass.const_expr(self.owner(v) != self.peer_rank):
+                        box = (
+                            (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                        ) * row_words + (word + self.offset(v))
                         clear_words(own + box * 8)
-                        w0 = received[4 * b]
-                        w1 = received[4 * b + 1]
-                        w2 = received[4 * b + 2]
-                        w3 = received[4 * b + 3]
-                    else:
-                        w0, w1, w2, w3 = l0, l1, l2, l3
-                    column = b * LOCAL_COLUMNS + lane_in_row * 8
+                    w0 = received[4 * v]
+                    w1 = received[4 * v + 1]
+                    w2 = received[4 * v + 2]
+                    w3 = received[4 * v + 3]
+                    column = v * (2 * _VECTOR_SPAN_WORDS) + lane_in_row * 8
                     _store_shared_words(sX.iterator + row_in_block * H + column, w0, w1, w2, w3)
                     if cutlass.const_expr(store_gathered):
                         _store_global_words(gathered_row + Int64(column) * 2, w0, w1, w2, w3)
@@ -456,8 +489,9 @@ if _AVAILABLE:
         enable_pdl: bool,
         store_gathered: bool,
         stale_poll: bool = False,
+        world: int = 8,
     ):
-        kernel = _PoolGatherRmsnormFp4QuantKernel(peer_rank, stale_poll)
+        kernel = _PoolGatherRmsnormFp4QuantKernel(peer_rank, world, stale_poll)
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
         with torch.cuda.device(device_index):
@@ -498,10 +532,10 @@ def decode_nvfp4(
 
 
 class PoolGatherRmsnormFp4Quant(OpWrapper):
-    """Gather the eight pool slices and quantize their Gemma RMSNorm to NVFP4.
+    """Gather the TP group's pool slices and quantize their Gemma RMSNorm to NVFP4.
 
-    ``local`` is this rank's ``[M, 512]`` BF16 pool output (columns
-    ``rank * 512 ...``), ``gain`` the pre-expert norm's ``1 + w`` (BF16, as the
+    ``local`` is this rank's ``[M, 4096 / world]`` BF16 pool output (columns
+    ``rank * 4096 / world ...``: 512 at TP8, 1024 at TP4), ``gain`` the pre-expert norm's ``1 + w`` (BF16, as the
     built-in MoE caches it), ``global_scale`` the experts' static FP32 input
     scale (shape ``[1]``). Returns the packed E2M1 payload ``[M, 2048]`` and the
     row-major E4M3 block scales ``[M, 256]`` (both ``uint8``, the built-in
@@ -512,8 +546,9 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
     the peers whose words have not all arrived (the stale-only schedule); the same
     outputs.
 
-    A collective over the TP8 group: every rank calls it with the same row
-    count, in the same order relative to its other calls on ``inbox``.
+    A collective over the TP group (TP4 or TP8, ``inbox.world``): every rank
+    calls it with the same row count, in the same order relative to its other
+    calls on ``inbox``.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -552,7 +587,12 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
         fp4 = torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device)
         scale = torch.empty((rows, HIDDEN // BLOCK), dtype=torch.uint8, device=device)
         _compile(
-            device.index, inbox.rank, bool(enable_pdl), bool(return_gathered), bool(stale_poll)
+            device.index,
+            inbox.rank,
+            bool(enable_pdl),
+            bool(return_gathered),
+            bool(stale_poll),
+            inbox.world,
         )(
             gathered,
             gain,
@@ -629,12 +669,11 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
         """Raw vector accesses at fixed strides: a strided or misaligned input is
         read as if packed; a row count outside 1..8 addresses outside the inbox."""
         rows = local.shape[0] if local.dim() == 2 else -1
-        if not 1 <= rows <= MAX_ROWS or tuple(local.shape) != (rows, LOCAL_COLUMNS):
-            raise ValueError(
-                f"local must be [1..{MAX_ROWS}, {LOCAL_COLUMNS}], got {tuple(local.shape)}"
-            )
+        columns = local_columns(inbox.world)
+        if not 1 <= rows <= MAX_ROWS or tuple(local.shape) != (rows, columns):
+            raise ValueError(f"local must be [1..{MAX_ROWS}, {columns}], got {tuple(local.shape)}")
         for tensor, shape, dtype in (
-            (local, (rows, LOCAL_COLUMNS), torch.bfloat16),
+            (local, (rows, columns), torch.bfloat16),
             (gain, (HIDDEN,), torch.bfloat16),
             (global_scale, (1,), torch.float32),
         ):
@@ -649,8 +688,8 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
                     f"expected a contiguous 16-byte aligned {dtype} {shape} tensor on "
                     f"{local.device}, got {tensor.dtype} {tuple(tensor.shape)}"
                 )
-        if inbox.row_words != _ROW_WORDS:
-            raise ValueError(f"inbox carries {inbox.row_words}-word rows, this op {_ROW_WORDS}")
+        if inbox.row_words != columns // 2:
+            raise ValueError(f"inbox carries {inbox.row_words}-word rows, this op {columns // 2}")
 
 
 pool_gather_rmsnorm_fp4quant = PoolGatherRmsnormFp4Quant()

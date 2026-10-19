@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fast path ``moe_prologue``: the decode MoE prologue as one chain on one stream.
 
-Built-in decode at TP8 prepares a MoE layer's input on two streams that join
+Built-in decode at TP8 (TP4) prepares a MoE layer's input on two streams that join
 before the experts: on the main stream the replicated FP32 router reads its whole
 8 MiB weight on every rank (256 logits per row), the routing kernel selects the
 top-8, and with ``replicated_experts`` its placement kernel places the selection; on
 the preparation stream the rank's pool slice GEMM and the pool gather +
 pre-expert NVFP4 quantization (the ``projection_gathers`` fused kernel) run. Each rank
-only ever runs 32 of the 256 experts, and the logits of the other 224 are
+only ever runs 32 (64) of the 256 experts, and the logits of the others are
 computed by the ranks that own them as well.
 
 With this fast path a decode step of at most 8 rows runs, on the current stream:
 
-1. ``ops/moe/router_shard``: this rank's 32 logit columns (1 MiB of weight),
+1. ``ops/moe/router_shard``: this rank's 32 (64) logit columns (1 (2) MiB of weight),
    bit for bit the built-in router's columns;
 2. the pool slice GEMM, as on the built-in path (the ``dense_gemms`` dispatcher when selected);
 3. ``ops/comm/pool_gather_route``: the fused pool gather + quantization,
@@ -96,18 +96,24 @@ from ..projection_gathers.gathers import MuseSparkOpenTepGatherMoE, _require_ali
 #: finalize read (``MuseSparkOpenRoutingMethod.apply``); its ``reference`` runs them.
 
 
-def _placement(moe):
-    """``(kind, static_from, state)`` of the replicated experts' placement on this layer, if installed and active."""
+def _placement(moe, world: Optional[int] = None):
+    """``(kind, static_from, state)`` of the replicated experts' placement on this layer, if installed and active.
+
+    ``world`` is the TP size; by default the prologue inbox's (TP8 without one).
+    """
+    if world is None:
+        world = getattr(getattr(moe, "_prologue_inbox", None), "world", 8)
+    local = _route.local_experts(world)
     state = getattr(moe, "_replicated_experts", None)
     if state is None or not state.active:
-        return _route.PLACE_NONE, _route.LOCAL_EXPERTS, None
+        return _route.PLACE_NONE, local, None
     if state.balance and getattr(state, "windows", 2) == 3:
-        return _route.PLACE_BALANCE3, _route.LOCAL_EXPERTS, state
+        return _route.PLACE_BALANCE3, local, state
     if state.balance:
-        return _route.PLACE_BALANCE, _route.LOCAL_EXPERTS, state
-    if state.static_from < _route.LOCAL_EXPERTS:
+        return _route.PLACE_BALANCE, local, state
+    if state.static_from < local:
         return _route.PLACE_STATIC, int(state.static_from), state
-    return _route.PLACE_OWNER, _route.LOCAL_EXPERTS, state
+    return _route.PLACE_OWNER, local, state
 
 
 class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
@@ -128,11 +134,12 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
             self._pool_direct_refuse_declined(hidden_states)
             return super().prepare_moe_inputs(hidden_states)
         rows = hidden_states.shape[0]
+        inbox = self._prologue_inbox
+        world = inbox.world
         # The pool quantization's arguments, checked as the projection gathers check them on the
-        # slice the GEMM will produce (a contiguous [rows, 512] BF16 view).
-        probe = hidden_states.view(-1)[: rows * _route.LOCAL_COLUMNS].view(
-            rows, _route.LOCAL_COLUMNS
-        )
+        # slice the GEMM will produce (a contiguous [rows, 4096 / TP] BF16 view).
+        columns = _route.local_columns(world)
+        probe = hidden_states.view(-1)[: rows * columns].view(rows, columns)
         args = self._pool_quant_args(probe)
         if args is None:
             self._pool_direct_refuse_declined(hidden_states)
@@ -141,7 +148,6 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
         if self._pool_direct_armed is not None:
             return self._pool_direct_armed.prepare(self, hidden_states, warps, gain, global_scale)
         routing = self.experts.routing_method
-        inbox = self._prologue_inbox
         side = self._router_stream
         with self.nvtx("router"):
             if side is None:
@@ -152,13 +158,16 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
                     self.metap_multiplier,
                     warps,
                     self._prologue_enable_pdl,
+                    ranks=world,
                 )
             else:
                 # router_fork: allocated on the current stream, which reads it after the join;
                 # written on the side stream, which starts after the hop completed.
                 main = torch.cuda.current_stream()
                 logits_local = torch.empty(
-                    (rows, _shard.LOCAL_EXPERTS), device=hidden_states.device, dtype=torch.float32
+                    (rows, _shard.local_experts(world)),
+                    device=hidden_states.device,
+                    dtype=torch.float32,
                 )
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
@@ -169,6 +178,7 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
                         self.metap_multiplier,
                         warps,
                         logits_local,
+                        ranks=world,
                     )
         with self.nvtx("pool"):
             projected = self._replicated_projection(
@@ -176,7 +186,7 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
             )
             if side is not None:
                 main.wait_stream(side)
-            place, static_from, state = _placement(self)
+            place, static_from, state = _placement(self, world)
             bias = routing.e_score_correction_bias
             _require_aligned(pooled=projected, gain=gain, bias=bias, logits=logits_local)
             # early_expert_ids: the expert ids published to the persistent expert
@@ -197,10 +207,10 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
                 return_gathered=True,
                 **({} if early is None else {"early": early}),
             )
-        self._prologue_record_routing(out, place, state)
+        self._prologue_record_routing(out, place, state, world)
         return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
 
-    def _prologue_record_routing(self, out, place: int, state) -> None:
+    def _prologue_record_routing(self, out, place: int, state, world: int = 8) -> None:
         """What the experts and the finalize read, keyed on the logits object: the
         routing memo, and the replicated experts' placement."""
         routing = self.experts.routing_method
@@ -209,7 +219,7 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
         if state is not None:
             state.placement = (out.logits, version, out.local_ids, out.weights_bf16, out.stats)
             if place == _route.PLACE_BALANCE3:
-                state.placement += (3 * _route.LOCAL_EXPERTS,)
+                state.placement += (3 * _route.local_experts(world),)
             state.last_stats = out.stats
 
     def _pool_direct_refuse_declined(self, hidden_states: torch.Tensor) -> None:
@@ -281,7 +291,10 @@ def agreed_build(mapping) -> bool:
 
 
 def install(model: MuseSparkOpenModel) -> int:
-    """Re-class every layer's projection-gather MoE as the prologue MoE; build the 512-word inbox.
+    """Re-class every layer's projection-gather MoE as the prologue MoE; build its inbox.
+
+    The inbox rows carry the pool slice and the logit block: 512 words at TP8,
+    1024 at TP4 (``pool_gather_route.row_words``).
 
     Returns the number of layers installed: 0, on every rank alike, when the
     pool site is not fused (``projection_gathers.fusable_sites`` agrees on that
@@ -310,7 +323,8 @@ def install(model: MuseSparkOpenModel) -> int:
         raise ValueError(
             "[musespark_open] moe_prologue needs CuTe DSL and flashinfer's RMSNormFP4QuantKernel on every TP rank"
         )
-    inbox = ProjectionInbox(mapping, row_words=_route.ROW_WORDS)
+    world = mapping.tp_size
+    inbox = ProjectionInbox(mapping, row_words=_route.row_words(world))
     enable_pdl = LAUNCH_PDL
     for layer in layers:
         moe = layer.feed_forward
@@ -319,7 +333,8 @@ def install(model: MuseSparkOpenModel) -> int:
         moe._prologue_enable_pdl = bool(enable_pdl)
     logger.info(
         f"[musespark_open] moe_prologue: one-chain MoE prologue on the decode path of all {len(layers)} layers "
-        f"(router shard of {_shard.LOCAL_EXPERTS} experts, routing and any replicated-expert placement "
+        f"(TP{world} router shard of {_shard.local_experts(world)} experts, routing and any "
+        "replicated-expert placement "
         f"in the pool kernel; steps of at most {MAX_ROWS} rows; PDL {'on' if enable_pdl else 'off'})"
     )
     return len(layers)

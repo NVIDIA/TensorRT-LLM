@@ -38,7 +38,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   129..512 tokens with the fused finalize + all-reduce, as consecutive calls of
   at most 128 tokens.
 - ``MUSESPARK_OPEN_SHARDED_PROJECTIONS`` (default off, experimental): column-shard
-  TP8 pool/unpool projections for batches of at most eight tokens.
+  pool/unpool projections for batches of at most eight tokens, at TP8/EP8 over
+  two four-GPU GB300 nodes or TP4/EP4 on one.
 - ``MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT`` (default on): fused pre-expert
   RMSNorm + NVFP4 quantization.
 - ``MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT`` (default off): BF16 TP4/TP8 QKV
@@ -2661,8 +2662,15 @@ class MuseSparkOpenModel(DecoderModel):
                 for layer in self.layers:
                     layer.feed_forward._finalize_ar_workspace = self._finalize_ar_workspace
         if os.getenv("MUSESPARK_OPEN_SHARDED_PROJECTIONS", "0") == "1":
+            tp_nodes = len({rank // mapping.gpus_per_node for rank in mapping.tp_group})
+            if mapping.tp_size == 8:
+                sharded_topology = mapping.moe_ep_size == 8
+            elif mapping.tp_size == 4:
+                sharded_topology = mapping.moe_ep_size == 4 and tp_nodes == 1
+            else:
+                sharded_topology = False
             if not (
-                mapping.tp_size == mapping.moe_ep_size == 8
+                sharded_topology
                 and mapping.gpus_per_node == 4
                 and mapping.cp_size == mapping.pp_size == 1
                 and not mapping.enable_attention_dp
@@ -2676,8 +2684,9 @@ class MuseSparkOpenModel(DecoderModel):
             ):
                 raise ValueError(
                     "Sharded projections require SM103 (or SM107 with "
-                    "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1) BF16 TP8/EP8, four GPUs per node, "
-                    "CP1/PP1, expert width 4096, and no attention DP or external MoE communication"
+                    "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1) BF16 TP8/EP8 or single-node TP4/EP4, "
+                    "four GPUs per node, CP1/PP1, expert width 4096, and no attention DP or "
+                    "external MoE communication"
                 )
             from .musespark_open_projection_gather import ProjectionGatherWorkspace
 
@@ -2689,7 +2698,9 @@ class MuseSparkOpenModel(DecoderModel):
             for layer in self.layers:
                 layer.feed_forward._pool_gather_workspace = pool_workspace
                 layer.feed_forward._unpool_gather_workspace = unpool_workspace
-            logger.info("MuseSparkOpen experimental TP8 sharded projections enabled for M<=8")
+            logger.info(
+                f"MuseSparkOpen experimental TP{mapping.tp_size} sharded projections enabled for M<=8"
+            )
         # Final norm keeps the raw stored weight (gain center 0).
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype

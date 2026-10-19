@@ -18,6 +18,8 @@ runs them on real weights).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -81,7 +83,7 @@ def _builtin(cls):
 def _builtin_layer(index: int) -> MuseSparkOpenDecoderLayer:
     layer = _builtin(MuseSparkOpenDecoderLayer)
     layer.layer_idx = index
-    layer.mapping = object()
+    layer.mapping = SimpleNamespace(tp_size=8)
     moe = _builtin(MuseSparkOpenMoE)
     moe.layer_idx = index
     moe.num_experts = 256

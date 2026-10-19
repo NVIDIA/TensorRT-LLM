@@ -77,6 +77,7 @@ class _Workspace:
     """A stand-in for ``UnpoolDirectWorkspace``: distinct slot tensors per (buffer, rows)."""
 
     def __init__(self):
+        self.world = 8
         self.slots = torch.zeros(direct_op.BUFFERS, 8, LOCAL, dtype=torch.bfloat16)
         self.built = []
         self.watches = 0

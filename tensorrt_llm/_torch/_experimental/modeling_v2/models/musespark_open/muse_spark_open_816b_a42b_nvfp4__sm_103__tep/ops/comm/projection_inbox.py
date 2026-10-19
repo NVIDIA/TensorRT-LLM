@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fabric inbox for the column-sharded pool/unpool projections at TP8, and its PTX.
+"""Fabric inbox for the column-sharded pool/unpool projections at TP4 or TP8, and its PTX.
 
-The sharded projections compute ``N/8`` output columns per rank and need every
+The sharded projections compute ``N/world`` output columns per rank and need every
 rank's slice before the next op. The built-in path gathers them with a
 separate kernel (``musespark_open_projection_gather._gather_columns``) whose
 output the consumer then reads back. The fused ops in this directory instead
@@ -44,8 +44,12 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.mapping import Mapping
 
-#: Ranks the inbox connects: the attention TP group of the tep8 target.
-WORLD = 8
+#: Rank counts the inbox connects: the attention TP group of tep4 (one tray) or tep8
+#: (two trays). An inbox's own count is ``ProjectionInbox.world``.
+WORLDS = (4, 8)
+#: Widths of the two sharded projections' outputs: the pool (8192 -> 4096) and
+#: the unpool (4096 -> 8192).
+PROJECTION_WIDTHS = (4096, 8192)
 #: Rows (tokens) per call the inbox has room for: a decode step of one request with
 #: up to seven DFlash drafts. The built-in sharded projections stop at the same bound.
 MAX_ROWS = 8
@@ -74,34 +78,44 @@ class _InboxFabricMemory(MnnvlMemory):
         return mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
 
 
+def row_words_of(width: int, world: int) -> int:
+    """32-bit payload words one of ``world`` ranks contributes per row of a ``width``-wide output."""
+    return width // world // 2
+
+
 class ProjectionInbox:
-    """The receive slots of one sharded-projection site on every TP8 rank.
+    """The receive slots of one sharded-projection site on every rank of a TP4 or TP8 group.
 
     ``row_words`` is the number of 32-bit payload words one rank contributes per
-    row: half its local column count (512 for the unpool's 1024 local columns,
-    256 for the pool's 512). Construction is collective over the TP group.
+    row: half its local column count (``row_words_of``: at TP8 512 for the
+    unpool's 1024 local columns and 256 for the pool's 512, at TP4 1024 and 512).
+    Construction is collective over the TP group.
 
     Attributes read by the fused ops: ``base`` (address of rank 0's segment
     through the fabric mapping), ``stride`` (bytes between ranks' segments),
-    ``counters`` (``int32 [MAX_ROWS, 2]``, the per-row tag and slot) and ``rank``.
+    ``counters`` (``int32 [MAX_ROWS, 2]``, the per-row tag and slot), ``rank`` and
+    ``world`` (the TP size, which the fused ops compile in).
     ``segment()`` is this rank's receive memory as ``int64`` words (all zero
     whenever no call is in flight).
     """
 
     def __init__(self, mapping: Mapping, row_words: int) -> None:
-        if mapping.tp_size != WORLD or mapping.enable_attention_dp or mapping.cp_size != 1:
-            raise ValueError("ProjectionInbox needs TP8 without attention DP or CP")
-        if row_words not in (256, 512):
-            raise ValueError(f"row_words must be 256 or 512, got {row_words}")
+        if mapping.tp_size not in WORLDS or mapping.enable_attention_dp or mapping.cp_size != 1:
+            raise ValueError("ProjectionInbox needs TP4 or TP8 without attention DP or CP")
+        world = mapping.tp_size
+        allowed = tuple(row_words_of(width, world) for width in PROJECTION_WIDTHS)
+        if row_words not in allowed:
+            raise ValueError(f"row_words must be one of {allowed} at TP{world}, got {row_words}")
         if not all(Distributed.get(mapping).tp_allgather(MnnvlMemory.supports_mnnvl())):
             raise ValueError("ProjectionInbox needs NVLink fabric memory on every TP rank")
         MnnvlMemory.initialize()
         self.rank = mapping.tp_rank
+        self.world = world
         self.row_words = row_words
-        self.slot_bytes = WORLD * MAX_ROWS * row_words * _TAGGED_BYTES
+        self.slot_bytes = world * MAX_ROWS * row_words * _TAGGED_BYTES
         self._owner = _InboxFabricMemory(mapping, 2 * self.slot_bytes)
         record = type(self._owner).allocated_map[self._owner.ptr]
-        if record.comm_size != WORLD or record.comm_rank != mapping.tp_rank:
+        if record.comm_size != world or record.comm_rank != mapping.tp_rank:
             raise RuntimeError("ProjectionInbox allocation does not match the TP group")
         self.base = int(self._owner.ptr)
         self.stride = int(self._owner.rank_stride)
@@ -115,7 +129,7 @@ class ProjectionInbox:
         Distributed.get(mapping).tp_allgather(True)
 
     def segment(self) -> torch.Tensor:
-        """This rank's receive slots, ``int64 [2 * WORLD * MAX_ROWS * row_words]``."""
+        """This rank's receive slots, ``int64 [2 * world * MAX_ROWS * row_words]``."""
         return self._segments[self.rank]
 
 

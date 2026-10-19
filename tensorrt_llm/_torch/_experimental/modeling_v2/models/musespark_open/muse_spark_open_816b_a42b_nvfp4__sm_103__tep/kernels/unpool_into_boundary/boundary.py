@@ -103,7 +103,7 @@ class MuseSparkOpenTepDirectGatedResidual(MuseSparkOpenTepGatedResidual):
         alpha, beta = self.coefficients()
         if not (
             branch.dim() == 2
-            and branch.shape[1] == _unpool.LOCAL_COLUMNS
+            and branch.shape[1] == _unpool.local_columns(workspace.world)
             and residual.shape[-1] == _unpool.HIDDEN
             and self._fits_fused(residual, branch, next_norm, gain, alpha, beta)
         ):

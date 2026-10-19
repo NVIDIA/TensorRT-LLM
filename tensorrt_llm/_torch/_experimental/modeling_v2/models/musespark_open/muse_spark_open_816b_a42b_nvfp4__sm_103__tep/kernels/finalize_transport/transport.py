@@ -5,8 +5,9 @@
 Where the op is called: the built-in MoE's forward hands its unfinalized
 expert rows to ``self._finalize_ar_workspace.finalize(gemm2_output, indices,
 routing_weights, norm_weight, eps, num_tokens)``, the ``FinalizeIpcWorkspace``
-the built-in text model builds when ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1``
-at TP8 over two nodes, and gives every layer. Every path that reaches the
+the built-in text model builds -- at TP8 over two nodes when
+``MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1`` (fabric), at TP4 on one node
+always (IPC) -- and gives every layer. Every path that reaches the
 finalize -- decode and prefill, the built-in expert call and the replicated experts'
 stacked one -- goes through that attribute.
 
@@ -42,7 +43,8 @@ def refusal(model: MuseSparkOpenModel) -> Optional[str]:
     if legacy is None:
         return (
             "the model runs no fused finalize all-reduce (it needs "
-            "MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1 at TP8 over two four-GPU nodes)"
+            "MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1 at TP8 over two four-GPU nodes, or "
+            "TP4 on one four-GPU node)"
         )
     others = [
         layer.layer_idx

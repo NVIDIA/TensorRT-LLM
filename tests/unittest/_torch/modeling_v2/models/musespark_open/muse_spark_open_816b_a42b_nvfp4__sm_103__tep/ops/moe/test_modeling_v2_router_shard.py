@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the musespark_open router_shard entry.
 
-The entry claims the built-in router projection's bits for its rank's 32
-columns: for every rank, the concatenation of the eight ranks' outputs is
-``MuseSparkOpenMoE.router_logits`` bit for bit, at every row count 1..8 and at
+The entry claims the built-in router projection's bits for its rank's 32 (EP8)
+or 64 (EP4) columns: for every rank, the concatenation of the ranks' outputs is
+``MuseSparkOpenMoE.router_logits`` bit for bit, at EP8 and EP4, at every row count 1..8 and at
 the warp count the built-in launch uses for that row count (with and without
 the MoE prepare stream), with or without programmatic dependent launch and the
 early trigger. The cells are also gated against the entry's float64 reference.
@@ -32,10 +32,10 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.moe.router_shard import (  # noqa: E501
     EXPERTS,
     HIDDEN,
-    LOCAL_EXPERTS,
     MAX_ROWS,
-    RANKS,
+    RANK_COUNTS,
     builtin_warps,
+    local_experts,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.moe.router_shard import (  # noqa: E501
     router_shard as op,
@@ -54,6 +54,9 @@ from _validating import (  # noqa: E402,F401 — path above; fixture by name
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="router_shard needs a GPU")
 
 DEV = "cuda"
+#: The tep8 layout, which the tests without a ``ranks`` parameter use.
+RANKS = 8
+LOCAL_EXPERTS = local_experts(RANKS)
 #: The checkpoint's metap multiplier: (hidden / base_width) ** -0.5 with base_width 256.
 CKPT_SCALE = (HIDDEN / 256.0) ** -0.5
 #: (enable_pdl, early_trigger) launch modes; none changes a bit.
@@ -91,11 +94,11 @@ def _inputs(rows: int, seed: int):
     return x, weight
 
 
-def _all_ranks(x, weight, num_warps, enable_pdl=False, early_trigger=False):
+def _all_ranks(x, weight, num_warps, enable_pdl=False, early_trigger=False, ranks=RANKS):
     return torch.cat(
         [
-            op(x, weight, rank, CKPT_SCALE, num_warps, enable_pdl, early_trigger)
-            for rank in range(RANKS)
+            op(x, weight, rank, CKPT_SCALE, num_warps, enable_pdl, early_trigger, ranks=ranks)
+            for rank in range(ranks)
         ],
         dim=1,
     )
@@ -118,42 +121,45 @@ def _assert_bits_equal(got: torch.Tensor, want: torch.Tensor, what: str) -> None
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     rows, num_warps = cell.spec["rows"], cell.spec["num_warps"]
+    ranks = cell.spec.get("ranks", RANKS)
+    local = local_experts(ranks)
     x, weight = _inputs(rows, zlib.crc32(cell.why.encode()))
     before = (x.clone(), weight.clone())
     prepare_stream = num_warps == 16
     assert builtin_warps(rows, prepare_stream) == num_warps, "a cell the built-in never launches"
     want = MuseSparkOpenMoE.router_logits(_builtin_moe(prepare_stream, weight), x)
-    for rank in range(RANKS):
-        out = op(x, weight, rank, CKPT_SCALE, num_warps)
-        assert out.is_contiguous() and out.shape == (rows, LOCAL_EXPERTS)
+    for rank in range(ranks):
+        out = op(x, weight, rank, CKPT_SCALE, num_warps, ranks=ranks)
+        assert out.is_contiguous() and out.shape == (rows, local)
         # Within 16 FP32 ulps of the row's largest logit, 2 ulps RMS (router_gemv's band:
         # the same 8192-term sums in the same order).
         assert_within_ulp(
             out,
-            op.reference(x, weight, rank, CKPT_SCALE, num_warps).to(out.dtype),
+            op.reference(x, weight, rank, CKPT_SCALE, num_warps, ranks=ranks).to(out.dtype),
             element_ulp=16.0,
             rms_ulp=2.0,
         )
-        first = rank * LOCAL_EXPERTS
+        first = rank * local
         _assert_bits_equal(
-            out, want[:, first : first + LOCAL_EXPERTS], f"rank {rank} rows={rows} w={num_warps}"
+            out, want[:, first : first + local], f"rank {rank}/{ranks} rows={rows} w={num_warps}"
         )
     assert torch.equal(x, before[0]) and torch.equal(weight, before[1]), "inputs are read-only"
 
 
+@pytest.mark.parametrize("ranks", RANK_COUNTS, ids=lambda r: f"ep{r}")
 @pytest.mark.parametrize("prepare_stream", (True, False), ids=("prepare_stream", "no_prepare"))
 @pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
-def test_bit_identity_with_the_builtin_projection(rows, prepare_stream) -> None:
-    """Every row count, both launch layouts, every launch mode, 16 draws each."""
+def test_bit_identity_with_the_builtin_projection(rows, prepare_stream, ranks) -> None:
+    """Every row count, both launch layouts, every launch mode, 16 draws each, EP8 and EP4."""
     num_warps = builtin_warps(rows, prepare_stream)
     for seed in range(16):
         x, weight = _inputs(rows, seed=1000 * rows + seed + 7 * prepare_stream)
         want = MuseSparkOpenMoE.router_logits(_builtin_moe(prepare_stream, weight), x)
         for enable_pdl, early in LAUNCHES:
             _assert_bits_equal(
-                _all_ranks(x, weight, num_warps, enable_pdl, early),
+                _all_ranks(x, weight, num_warps, enable_pdl, early, ranks=ranks),
                 want,
-                f"rows={rows} seed={seed} pdl={enable_pdl} early={early}",
+                f"ep{ranks} rows={rows} seed={seed} pdl={enable_pdl} early={early}",
             )
 
 
@@ -182,10 +188,11 @@ def test_cuda_graph_capture_and_replay_with_pdl() -> None:
         _assert_bits_equal(torch.cat(outs, dim=1), want, f"graph replay {seed}")
 
 
-def _side_all_ranks(x, weight, num_warps):
-    outs = [torch.full((x.shape[0], LOCAL_EXPERTS), float("nan"), device=DEV) for _ in range(RANKS)]
+def _side_all_ranks(x, weight, num_warps, ranks=RANKS):
+    local = local_experts(ranks)
+    outs = [torch.full((x.shape[0], local), float("nan"), device=DEV) for _ in range(ranks)]
     for rank, out in enumerate(outs):
-        assert side_op(x, weight, rank, CKPT_SCALE, num_warps, out) is out
+        assert side_op(x, weight, rank, CKPT_SCALE, num_warps, out, ranks=ranks) is out
     return torch.cat(outs, dim=1)
 
 
@@ -214,20 +221,21 @@ def test_side_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixtu
     assert torch.equal(x, before[0]) and torch.equal(weight, before[1]), "inputs are read-only"
 
 
+@pytest.mark.parametrize("ranks", RANK_COUNTS, ids=lambda r: f"ep{r}")
 @pytest.mark.parametrize("prepare_stream", (True, False), ids=("prepare_stream", "no_prepare"))
 @pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
-def test_side_bit_identity_with_the_shard_and_the_builtin(rows, prepare_stream) -> None:
+def test_side_bit_identity_with_the_shard_and_the_builtin(rows, prepare_stream, ranks) -> None:
     """The plain launch gives router_shard's bits (every launch mode) and the built-in's."""
     num_warps = builtin_warps(rows, prepare_stream)
     for seed in range(16):
         x, weight = _inputs(rows, seed=3000 * rows + seed + 7 * prepare_stream)
         want = MuseSparkOpenMoE.router_logits(_builtin_moe(prepare_stream, weight), x)
-        got = _side_all_ranks(x, weight, num_warps)
-        _assert_bits_equal(got, want, f"side rows={rows} seed={seed}")
+        got = _side_all_ranks(x, weight, num_warps, ranks=ranks)
+        _assert_bits_equal(got, want, f"side ep{ranks} rows={rows} seed={seed}")
         for enable_pdl, early in LAUNCHES:
             _assert_bits_equal(
                 got,
-                _all_ranks(x, weight, num_warps, enable_pdl, early),
+                _all_ranks(x, weight, num_warps, enable_pdl, early, ranks=ranks),
                 f"side vs shard rows={rows} seed={seed} pdl={enable_pdl} early={early}",
             )
 
@@ -385,10 +393,11 @@ def test_is_valid_admits_the_served_inputs_and_refuses_others(rows):
 
 
 @pytest.mark.skipif(os.environ.get("MODELING_V2_TIMING") != "1", reason="set MODELING_V2_TIMING=1")
-def test_microbenchmark() -> None:
+@pytest.mark.parametrize("ranks", RANK_COUNTS, ids=lambda r: f"ep{r}")
+def test_microbenchmark(ranks) -> None:
     """µs per call in a CUDA graph of 62 calls over 62 distinct weights (every call
-    reads its weight from HBM), the built-in full projection vs one rank's shard.
-    Printed, never gated."""
+    reads its weight from HBM), the built-in full projection vs one rank's shard
+    (32 columns at EP8, 64 at EP4). Printed, never gated."""
     layers = 62
     weights = [_inputs(1, seed=100 + i)[1] for i in range(layers)]
     builtin = [_builtin_moe(True, w) for w in weights]
@@ -417,9 +426,9 @@ def test_microbenchmark() -> None:
     for rows in (1, 8):
         x = _inputs(rows, seed=rows)[0]
         old = timed(lambda: [MuseSparkOpenMoE.router_logits(m, x) for m in builtin])
-        new = timed(lambda: [op(x, w, 3, CKPT_SCALE, 16) for w in weights])
-        new_pdl = timed(lambda: [op(x, w, 3, CKPT_SCALE, 16, True) for w in weights])
+        new = timed(lambda: [op(x, w, 3, CKPT_SCALE, 16, ranks=ranks) for w in weights])
+        new_pdl = timed(lambda: [op(x, w, 3, CKPT_SCALE, 16, True, ranks=ranks) for w in weights])
         print(
-            f"  rows={rows}: built-in {old:.2f} us/call, router_shard {new:.2f} us/call, "
+            f"  ep{ranks} rows={rows}: built-in {old:.2f} us/call, router_shard {new:.2f} us/call, "
             f"with PDL {new_pdl:.2f} us/call"
         )

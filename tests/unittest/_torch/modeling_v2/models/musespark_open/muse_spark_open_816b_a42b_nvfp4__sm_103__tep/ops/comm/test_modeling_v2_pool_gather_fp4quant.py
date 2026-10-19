@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the musespark_open pool_gather_fp4quant entry (TP8 over two GB300 nodes).
 
-Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes, e.g.
+Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes (TP8), or
+four on one node (TP4), e.g.
 ``srun -N2 --ntasks-per-node=4 --mpi=pmix python -m pytest <this file>``;
 anywhere else every test skips.
 
@@ -34,9 +35,9 @@ except ImportError:  # pragma: no cover - the test needs MPI ranks
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.comm.pool_gather_fp4quant import (  # noqa: E501
     HIDDEN,
-    LOCAL_COLUMNS,
     PoolGatherRmsnormFp4Quant,
     decode_nvfp4,
+    local_columns,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.comm.pool_gather_fp4quant import (  # noqa: E501
     pool_gather_rmsnorm_fp4quant as op,
@@ -48,14 +49,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 __extra_import_path__ = ["../../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
-WORLD = 8
+#: The TP size under test: the MPI world when it is 4 (one node) or 8 (two nodes).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
+LOCAL_COLUMNS = local_columns(WORLD)
 #: The checkpoint's pre-expert norm epsilon (rms_norm_eps).
 EPS = 1e-5
 
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)

@@ -703,7 +703,8 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
         ("drafter_hops",),
     ),
     Precondition(
-        "the fabric fused finalize all-reduce (MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1)",
+        "the fused finalize all-reduce workspace (MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1 at "
+        "TP8; built in on one tray at TP4)",
         _fabric_finalize,
         ("finalize_transport",),
     ),

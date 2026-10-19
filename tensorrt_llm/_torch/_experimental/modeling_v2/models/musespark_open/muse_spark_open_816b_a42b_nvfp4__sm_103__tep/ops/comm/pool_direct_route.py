@@ -87,8 +87,13 @@ from tensorrt_llm.mapping import Mapping
 
 from . import pool_gather_route as _route
 from . import unpool_direct_boundary as _direct
-from .pool_gather_fp4quant import BLOCK, HIDDEN, LOCAL_COLUMNS
-from .projection_inbox import MAX_ROWS, WORLD
+from .pool_gather_fp4quant import BLOCK, HIDDEN, local_columns
+from .projection_inbox import MAX_ROWS
+
+#: The TP size this transport is laid out for: TP8 over two trays. TP4 keeps the
+#: inbox path of ``pool_gather_route`` (``moe_prologue``).
+WORLD = 8
+LOCAL_COLUMNS = local_columns(WORLD)
 
 EXPERTS = _route.EXPERTS
 LOCAL_EXPERTS = _route.LOCAL_EXPERTS

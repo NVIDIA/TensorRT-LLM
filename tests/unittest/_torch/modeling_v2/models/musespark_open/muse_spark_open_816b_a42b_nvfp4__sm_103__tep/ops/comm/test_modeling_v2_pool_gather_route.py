@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the musespark_open pool_gather_route entry (TP8 over two GB300 nodes).
+"""GPU test for the musespark_open pool_gather_route entry (TP8 over two GB300 nodes, TP4 on one).
 
 Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes, e.g.
-``srun -N2 --ntasks-per-node=4 --mpi=pmix python -m pytest <this file>``;
-anywhere else every test skips.
+``srun -N2 --ntasks-per-node=4 --mpi=pmix python -m pytest <this file>``, or four
+on one node (TP4: 64 experts per rank; the placement is checked against
+``pool_gather_route.ring_reference``, the ring flow over four 64-expert blocks,
+since ``ring_buddy_assign`` is a TP8 kernel); anywhere else every test skips.
 
 The entry claims the built-in chain's bits on every rank: the full router
 logits (the eight ranks' 32-column slices), ``MuseSparkOpenRoutingMethod.apply``'s
@@ -44,16 +46,20 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.comm.pool_gather_route import (  # noqa: E501
     EXPERTS,
     HIDDEN,
-    LOCAL_COLUMNS,
-    LOCAL_EXPERTS,
     PLACE_BALANCE,
     PLACE_BALANCE3,
     PLACE_NONE,
     PLACE_OWNER,
     PLACE_STATIC,
-    ROW_WORDS,
     TOP_K,
     PoolGatherRoute,
+    local_columns,
+    local_experts,
+    ring_reference,
+    row_words,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.comm.pool_gather_route import (  # noqa: E501
+    PLACES as SERVED_PLACES,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.comm.pool_gather_route import (  # noqa: E501
     pool_gather_route as op,
@@ -68,7 +74,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 __extra_import_path__ = ["../../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
-WORLD = 8
+#: The TP size under test: the MPI world when it is 4 (one node) or 8 (two nodes).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
+LOCAL_COLUMNS = local_columns(WORLD)
+LOCAL_EXPERTS = local_experts(WORLD)
+ROW_WORDS = row_words(WORLD)
 #: The checkpoint's pre-expert norm epsilon (rms_norm_eps) and routing
 #: renormalization epsilon (router_score_division_eps).
 EPS = 1e-5
@@ -86,7 +96,7 @@ PLACES = {
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
@@ -194,7 +204,7 @@ def _builtin(workspace, routing, local, logits, gain, global_scale, place, rank)
         selected=selected,
         weights=weights,
     )
-    if place not in (PLACE_NONE, PLACE_BALANCE3):
+    if place not in (PLACE_NONE, PLACE_BALANCE3) and WORLD == 8:
         ids, weights_bf16, stats = ring_buddy_assign(
             selected, weights, rank, place == PLACE_BALANCE, _static_from(place)
         )
@@ -203,11 +213,21 @@ def _builtin(workspace, routing, local, logits, gain, global_scale, place, rank)
 
 
 def _with_place3(want: dict, place: int, rank: int) -> dict:
-    """``want`` plus the three-window placement of its selection (``PLACE_BALANCE3`` only).
+    """``want`` plus the placements no built-in kernel computes (host, after the chain ran).
 
-    No built-in kernel places over three windows; the rule is
-    ``ring_windows.place`` (host, after the chain ran).
+    The three-window placement (``PLACE_BALANCE3``): ``ring_windows.place``. At TP4 every
+    placement: ``ring_reference``, the ring flow over four 64-expert blocks.
     """
+    if WORLD != 8 and place not in (PLACE_NONE, PLACE_BALANCE3):
+        ids, weights_bf16, stats = ring_reference(
+            want["selected"],
+            want["weights"],
+            rank,
+            WORLD,
+            place == PLACE_BALANCE,
+            _static_from(place),
+        )
+        return dict(want, local_ids=ids, weights_bf16=weights_bf16, stats=stats)
     if place != PLACE_BALANCE3:
         return want
     from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.replicated_experts import (  # noqa: E501
@@ -346,6 +366,8 @@ def _reference(slices, logits, gain, global_scale, bias, place, rank):
 @pytest.mark.parametrize("cell", PoolGatherRoute.CELLS, ids=lambda c: c.why[:40])
 @torch.inference_mode()
 def test_cells_match_builtin_bits_and_reference(group, cell, certifying):  # noqa: F811
+    if cell.spec.get("world", WORLD) != WORLD or cell.spec["place"] not in SERVED_PLACES[WORLD]:
+        pytest.skip(f"a cell of another TP size than TP{WORLD}")
     comm, rank, builtin, inbox, _ = group
     certifying(op)
     rows, place = cell.spec["rows"], cell.spec["place"]
@@ -412,6 +434,8 @@ def test_near_ties_match_builtin_bits(group, kind, place):
     """Constructed near-ties: the selection key's order and its tie-break by expert id."""
     comm, rank, builtin, inbox, _ = group
     place = PLACES[place]
+    if place not in SERVED_PLACES[WORLD]:
+        pytest.skip(f"placement {place} is not served at TP{WORLD}")
     gain = torch.empty(HIDDEN, device="cuda", dtype=torch.bfloat16).normal_(1, 0.1)
     global_scale = torch.tensor([224.0], device="cuda", dtype=torch.float32)
     problems = []
@@ -444,6 +468,8 @@ def test_builtin_router_logits_match(group):
     for step in range(30):
         rows = (8, 1, 3, 8, 6, 8, 2, 7)[step % 8]
         place = (PLACE_BALANCE, PLACE_NONE, PLACE_OWNER, PLACE_STATIC, PLACE_BALANCE3)[step % 5]
+        if place not in SERVED_PLACES[WORLD]:
+            place = PLACE_OWNER
         x = (torch.randn(rows, 8192, generator=gen, device="cuda") * (1 + step)).to(torch.bfloat16)
         logits = torch.empty(rows, EXPERTS, device="cuda")
         tile_rows = 1 if rows in (1, 2, 3, 5) else 2
@@ -479,6 +505,8 @@ def test_row_count_changes_and_tag_wrap(group):
     problems = []
     for step, rows in enumerate((1, 8, 3, 8, 1, 2, 8, 1, 8, 5, 8, 8, 3)):
         place = (PLACE_BALANCE, PLACE_NONE, PLACE_BALANCE3)[step % 3]
+        if place not in SERVED_PLACES[WORLD]:
+            place = PLACE_OWNER
         logits = _logits(800 + step, rows).cuda()
         local = _local(700 + step, rank, rows).cuda()
         logits_local = logits[:, LOCAL_EXPERTS * rank : LOCAL_EXPERTS * (rank + 1)].contiguous()
@@ -521,6 +549,7 @@ def _time_graphs(comm, graphs: dict, calls: int, rounds: int = 16):
 
 
 @pytest.mark.skipif(os.environ.get("MODELING_V2_TIMING") != "1", reason="MODELING_V2_TIMING=1")
+@pytest.mark.skipif(WORLD != 8, reason="the dense_gemms pool kernel table is the TP8 one")
 @pytest.mark.parametrize("rows", [8, 1])
 @torch.inference_mode()
 def test_microbenchmark(group, rows):

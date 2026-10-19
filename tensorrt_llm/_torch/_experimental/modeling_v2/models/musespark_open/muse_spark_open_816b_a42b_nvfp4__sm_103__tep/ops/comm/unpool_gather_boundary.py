@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The unpool's column gather and the post-FFN residual boundary, in one launch.
 
-Built-in decode at TP8 with sharded projections ends each layer's MoE with
+Built-in decode at TP8 (TP4) with sharded projections ends each layer's MoE with
 three launches on the critical path: the unpool GEMM writes this rank's 1024
-of the 8192 output columns, ``_gather_columns`` exchanges the eight slices
+(2048) of the 8192 output columns, ``_gather_columns`` exchanges the slices
 through fabric memory and writes the gathered ``[M, 8192]`` branch, and the
 cluster boundary (``musespark_open_boundary._ClusterBoundaryKernel``) reads it
 back for the weight-first post-FFN RMSNorm, the gated FP32 residual and the
@@ -14,7 +14,8 @@ This entry is that boundary kernel with the gather folded into its load. The
 boundary already splits each row over a cluster of ``C`` CTAs, CTA ``c``
 owning columns ``[c * 8192/C, (c+1) * 8192/C)`` -- for every row count this
 entry takes (1..8, so ``C`` is 16 or 8) that range lies inside one rank's
-1024-column slice. So each thread publishes its 16 bytes of this rank's slice
+1024-column (TP8) or 2048-column (TP4) slice. So each thread publishes its 16
+bytes of this rank's slice
 to one peer and polls exactly the 16 bytes of one peer's slice it is about to
 normalize; no CTA waits on more than one peer, nothing waits for the whole
 gather, and the gathered branch never touches global memory.
@@ -54,18 +55,18 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLD, ProjectionInbox
+from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLDS, ProjectionInbox
 
 #: Width of the residual stream the boundary normalizes.
 HIDDEN = 8192
-#: Columns of the unpool output one rank computes.
-LOCAL_COLUMNS = HIDDEN // WORLD
 #: Where the kernel triggers its dependents' launch (see the module docstring).
 TRIGGERS = {"exit": 0, "after_wait": 1, "entry": 2}
-#: 32-bit payload words of one row of one rank's slice.
-_ROW_WORDS = LOCAL_COLUMNS // 2
-#: Threads that cover one peer's row slice at four payload words each.
-_PER_PEER = _ROW_WORDS // 4
+
+
+def local_columns(world: int) -> int:
+    """Columns of the unpool output one of ``world`` ranks computes (1024 at TP8, 2048 at TP4)."""
+    return HIDDEN // world
+
 
 try:
     from tensorrt_llm._torch.models import musespark_open_boundary as _boundary
@@ -113,15 +114,21 @@ if _AVAILABLE:
             norm_fp32: bool,
             peer_rank: int,
             trigger: int = 0,
+            world: int = 8,
         ):
             cluster, threads = boundary_geometry(m)
             super().__init__(m, cluster, threads, gain, post_eps, pre_eps, norm_fp32)
             # One 8-column vector per thread and one peer per CTA: the layout this
             # kernel's inbox addressing is written for.
-            if self.iters != 1 or (self.threads * 8) > LOCAL_COLUMNS:
+            if world not in WORLDS or self.iters != 1 or (self.threads * 8) > local_columns(world):
                 raise ValueError(f"rows={m} gives a boundary geometry this gather cannot feed")
             self.peer_rank = peer_rank
             self.trigger = trigger
+            self.world = world
+            # 32-bit payload words of one row of one rank's slice, and the threads
+            # that cover it at four words each.
+            self.row_words = local_columns(world) // 2
+            self.per_peer = self.row_words // 4
 
         @cute.jit
         def __call__(
@@ -244,13 +251,15 @@ if _AVAILABLE:
             # four words of this rank's slice to that peer, which covers every
             # (peer, word) pair once.
             flat = rank * self.threads + tid
-            peer = flat // _PER_PEER
-            word = (flat % _PER_PEER) * 4
-            w0, w1, w2, w3 = load_words(local.toint() + (Int64(row) * _ROW_WORDS + Int64(word)) * 4)
+            peer = flat // self.per_peer
+            word = (flat % self.per_peer) * 4
+            w0, w1, w2, w3 = load_words(
+                local.toint() + (Int64(row) * self.row_words + Int64(word)) * 4
+            )
             if peer != self.peer_rank:
                 sent = (
-                    (Int64(slot) * WORLD + self.peer_rank) * MAX_ROWS + Int64(row)
-                ) * _ROW_WORDS + Int64(word)
+                    (Int64(slot) * self.world + self.peer_rank) * MAX_ROWS + Int64(row)
+                ) * self.row_words + Int64(word)
                 publish_words(inbox.toint() + Int64(peer) * stride + sent * 8, w0, w1, w2, w3, tag)
 
             a = self.load(alpha + offset, Float32)
@@ -264,7 +273,8 @@ if _AVAILABLE:
                     inbox.toint()
                     + Int64(self.peer_rank) * stride
                     + (
-                        ((Int64(slot) * WORLD + Int64(peer)) * MAX_ROWS + Int64(row)) * _ROW_WORDS
+                        ((Int64(slot) * self.world + Int64(peer)) * MAX_ROWS + Int64(row))
+                        * self.row_words
                         + Int64(word)
                     )
                     * 8
@@ -460,9 +470,10 @@ if _AVAILABLE:
         trigger: int = 0,
         *,
         capture: bool = False,
+        world: int = 8,
     ):
         kind = _UnpoolGatherBoundaryCaptureKernel if capture else _UnpoolGatherBoundaryKernel
-        kernel = kind(rows, has_gain, post_eps, pre_eps, norm_fp32, peer_rank, trigger)
+        kernel = kind(rows, has_gain, post_eps, pre_eps, norm_fp32, peer_rank, trigger, world)
         pointers = [
             make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
             for dtype in _POINTER_TYPES
@@ -514,18 +525,18 @@ def _reference_boundary(
 
 
 class UnpoolGatherBoundary(OpWrapper):
-    """Gather the eight unpool slices and run the post-FFN boundary on the result.
+    """Gather the TP group's unpool slices and run the post-FFN boundary on the result.
 
-    ``local`` is this rank's ``[M, 1024]`` BF16 unpool output (columns
-    ``rank * 1024 ...``), ``residual`` the ``[M, 8192]`` FP32 residual stream,
+    ``local`` is this rank's ``[M, 8192 / world]`` BF16 unpool output (columns
+    ``rank * 8192 / world ...``: 1024 at TP8, 2048 at TP4), ``residual`` the ``[M, 8192]`` FP32 residual stream,
     ``gain`` the post-FFN norm's ``1 + w`` (BF16) or ``None`` for a weightless
     norm, ``alpha``/``beta`` the FP32 gated-residual coefficients, ``weight`` the
     next layer's pre-QKV Gemma norm weight (BF16). Returns the updated FP32
     residual and the next layer's BF16 attention input, both ``[M, 8192]``.
 
-    A collective over the TP8 group: every rank calls it with the same row
-    count, in the same order relative to its other calls on ``inbox``. Launched
-    with programmatic dependent launch.
+    A collective over the TP group (TP4 or TP8, ``inbox.world``): every rank
+    calls it with the same row count, in the same order relative to its other
+    calls on ``inbox``. Launched with programmatic dependent launch.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -631,6 +642,7 @@ class UnpoolGatherBoundary(OpWrapper):
                 norm_fp32_residual,
                 inbox.rank,
                 TRIGGERS[trigger],
+                world=inbox.world,
             )
             compiled(*operands, stream)
         else:
@@ -644,6 +656,7 @@ class UnpoolGatherBoundary(OpWrapper):
                 inbox.rank,
                 TRIGGERS[trigger],
                 capture=True,
+                world=inbox.world,
             )
             compiled(*operands, capture.data_ptr(), capture.stride(0), stream)
         return updated, normalized
@@ -703,12 +716,11 @@ class UnpoolGatherBoundary(OpWrapper):
         keeps every row 16-byte aligned, and a 16-byte aligned start.
         """
         rows = local.shape[0] if local.dim() == 2 else -1
+        columns = local_columns(inbox.world)
         if not 1 <= rows <= MAX_ROWS:
-            raise ValueError(
-                f"local must be [1..{MAX_ROWS}, {LOCAL_COLUMNS}], got {tuple(local.shape)}"
-            )
+            raise ValueError(f"local must be [1..{MAX_ROWS}, {columns}], got {tuple(local.shape)}")
         expected = (
-            (local, (rows, LOCAL_COLUMNS), torch.bfloat16),
+            (local, (rows, columns), torch.bfloat16),
             (residual, (rows, HIDDEN), torch.float32),
             (alpha, (HIDDEN,), torch.float32),
             (beta, (HIDDEN,), torch.float32),
@@ -726,8 +738,8 @@ class UnpoolGatherBoundary(OpWrapper):
                     f"expected a contiguous 16-byte aligned {dtype} {shape} tensor on "
                     f"{residual.device}, got {tensor.dtype} {tuple(tensor.shape)}"
                 )
-        if inbox.row_words != _ROW_WORDS:
-            raise ValueError(f"inbox carries {inbox.row_words}-word rows, this op {_ROW_WORDS}")
+        if inbox.row_words != columns // 2:
+            raise ValueError(f"inbox carries {inbox.row_words}-word rows, this op {columns // 2}")
         if trigger not in TRIGGERS:
             raise ValueError(f"trigger must be one of {sorted(TRIGGERS)}, got {trigger!r}")
         if capture is not None and not capture_fits(capture, rows, residual.device):

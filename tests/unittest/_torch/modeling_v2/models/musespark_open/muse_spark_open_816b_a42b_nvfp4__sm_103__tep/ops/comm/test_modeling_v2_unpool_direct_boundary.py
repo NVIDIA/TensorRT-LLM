@@ -75,8 +75,9 @@ PLAN = importlib.import_module(_TARGET + ".kernels.dense_gemms.dispatcher")
 op = D.unpool_direct_boundary
 f1 = GATHER_BOUNDARY.unpool_gather_boundary
 
-WORLD = 8
-HIDDEN, LOCAL_COLUMNS, MAX_ROWS = D.HIDDEN, D.LOCAL_COLUMNS, D.MAX_ROWS
+#: The TP size under test: the MPI world when it is 4 (one node) or 8 (two nodes).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
+HIDDEN, LOCAL_COLUMNS, MAX_ROWS = D.HIDDEN, D.local_columns(WORLD), D.MAX_ROWS
 #: The checkpoint's norm epsilons: rms_post_norm_eps for the post-FFN norm, rms_norm_eps next.
 POST_EPS, PRE_EPS = 1e-6, 1e-5
 #: The unpool projection's K (the expert hidden width) and the QKV projection's N per rank.
@@ -97,7 +98,7 @@ POLLER_CALLS = int(os.environ.get("MODELING_V2_UNPOOL_DIRECT_CALLS", "10240"))
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)

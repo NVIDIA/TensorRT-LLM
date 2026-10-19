@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test of the direct unpool transport's buffer discipline (``unpool_into_boundary``; TP8, two GB300 nodes).
+"""GPU test of the direct unpool transport's buffer discipline (``unpool_into_boundary``; TP8 or TP4).
 
 Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes, e.g.
 ``srun -N2 --ntasks-per-node=4 --mpi=pmix python -m pytest <this file>``;
@@ -22,7 +22,8 @@ next replay starts while the late consumer still reads.
 * **negative control**: an odd count on ``layer mod 2`` (the last call of a replay and
   the first of the next on buffer 0, no collective in between) -- a fast rank's next
   GEMM overwrites the late consumer's unread slot: must be detected (differing bits, or
-  the 20 ms breaking guard);
+  the 20 ms breaking guard); on one tray (TP4) with the late consumer alone
+  (``_late_consumer_only``), since the rotating spins there mask it;
 * the same odd count on ``buffer_sequence`` (the last call on buffer 2): exact;
 * the model's cycle, 61 fused layers on ``buffer_sequence(61)``: exact.
 """
@@ -55,8 +56,9 @@ try:
 except ImportError:  # pragma: no cover - the test needs CuTe DSL
     cute = None
 
-WORLD = 8
-HIDDEN, LOCAL_COLUMNS = D.HIDDEN, D.LOCAL_COLUMNS
+#: The TP size under test: the MPI world when it is 4 (one node) or 8 (two nodes).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
+HIDDEN, LOCAL_COLUMNS = D.HIDDEN, D.local_columns(WORLD)
 POST_EPS, PRE_EPS = 1e-6, 1e-5
 UNPOOL_K = 4096
 SPLITK = "splitk:64,8,4,12"
@@ -67,7 +69,7 @@ BACK_TO_BACK, CHECKS = 5, 6
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     if cute is None or not D.available():
         pytest.skip("needs CuTe DSL")
     comm = MPI.COMM_WORLD
@@ -238,16 +240,32 @@ def _consumer_spins(layers: int, rank: int) -> dict:
     return spins
 
 
-def _run(comm, rank, inbox, ws, buffers):
+def _late_consumer_only(layers: int, rank: int) -> tuple:
+    """The one-tray negative control's schedule: no producer spins, and a single 100 us
+    consumer spin on rank 1 at the last layer.
+
+    On one tray of four the rotating spins of ``_producer_spins`` and ``_consumer_spins``
+    hold every fast rank behind a late peer at the end of each replay as well, so the
+    next replay's first GEMM no longer overtakes the late consumer; with the late
+    consumer alone it does."""
+    return {}, ({layers - 1: 100_000} if rank == 1 else {})
+
+
+def _run(comm, rank, inbox, ws, buffers, schedule=None):
     """Graph of ``len(buffers)`` layers on ``buffers``; ``CHECKS`` x ``BACK_TO_BACK`` replays.
-    Returns this rank's differing bits per check and whether its guard fired."""
+    ``schedule(layers, rank)`` gives ``(producer spins, consumer spins)``; by default the
+    rotating ones. Returns this rank's differing bits per check and whether its guard fired."""
     layers = len(buffers)
     join = _Join(seed=7)
     ws.build_variants([D.variant(ROWS, True, POST_EPS, PRE_EPS, False, "entry", False)])
     hop = _launcher(_Hop())
     spin = {ns: _launcher(_Hop(ns)) for ns in (20_000, 50_000, 100_000)}
-    producers = {layer: spin[ns] for layer, ns in _producer_spins(layers, rank).items()}
-    consumers = {layer: spin[ns] for layer, ns in _consumer_spins(layers, rank).items()}
+    if schedule is None:
+        producer_ns, consumer_ns = _producer_spins(layers, rank), _consumer_spins(layers, rank)
+    else:
+        producer_ns, consumer_ns = schedule(layers, rank)
+    producers = {layer: spin[ns] for layer, ns in producer_ns.items()}
+    consumers = {layer: spin[ns] for layer, ns in consumer_ns.items()}
     lay = _Layers(layers, rank)
     lay.fill(1)
     _settle(comm)
@@ -315,7 +333,10 @@ def test_negative_control_two_consecutive_calls_on_one_buffer_are_detected(group
     buffers = tuple(layer % 2 for layer in range(15))
     with pytest.raises(ValueError):
         D.check_buffer_sequence(buffers)
-    total, guards = _totals(comm, rank, "15 on layer mod 2", *_run(comm, rank, inbox, ws, buffers))
+    schedule = None if WORLD == 8 else _late_consumer_only
+    total, guards = _totals(
+        comm, rank, "15 on layer mod 2", *_run(comm, rank, inbox, ws, buffers, schedule)
+    )
     assert total > 0 or guards > 0, "two consecutive calls on one buffer went undetected"
 
 

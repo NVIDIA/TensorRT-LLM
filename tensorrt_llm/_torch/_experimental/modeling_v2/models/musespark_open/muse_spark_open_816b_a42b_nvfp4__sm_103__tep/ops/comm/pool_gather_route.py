@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """The pool gather + pre-expert NVFP4 quantization, with the router logits and the routing.
 
-``pool_gather_fp4quant`` (the fused pool gather of ``projection_gathers``) gathers the eight ranks' pool slices
+``pool_gather_fp4quant`` (the fused pool gather of ``projection_gathers``) gathers the TP ranks' pool slices
 inside the pre-expert RMSNorm + NVFP4 quantization kernel. This entry is that
-kernel with the MoE routing folded in, for a decode step of at most 8 rows:
+kernel with the MoE routing folded in, for a decode step of at most 8 rows, at
+TP8 (two trays) or TP4 (one tray); ``L = 256 / TP`` experts per rank (32 or 64):
 
-* each rank brings only its own 32 router logits per row
-  (``ops/moe/router_shard``), ``[M, 32]`` FP32;
+* each rank brings only its own ``L`` router logits per row
+  (``ops/moe/router_shard``), ``[M, L]`` FP32;
 * a CTA has two warp groups. Warps 0-3 are ``pool_gather_fp4quant``'s kernel
-  (flashinfer's 128-thread geometry): the pool gather from words 0-255 of the
-  512-word inbox rows, the RMSNorm and the quantization. Warps 4-7 send the
-  rank's whole ``[M, 32]`` logit block in words 256-511 of the box of the
-  CTA's first row (same tag and slot as that row's pool words) and receive
-  the seven others, so every CTA holds all ``M x 256`` logits;
+  (flashinfer's 128-thread geometry): the pool gather from the first
+  ``row_words(TP) / 2`` words of the inbox rows (256 of 512 at TP8, 512 of 1024
+  at TP4), the RMSNorm and the quantization. Warps 4-7 send the rank's whole
+  ``[M, L]`` logit block in the second half of the box of the CTA's first row
+  (same tag and slot as that row's pool words) and receive the others, so
+  every CTA holds all ``M x 256`` logits;
 * warps 4-7 then compute, redundantly in every CTA, the routing of all M rows
   exactly as the built-in ``_full_routing_kernel`` does (sigmoid, + expert
   bias for the selection, top-8 by a unique 64-bit key, the unbiased scores
@@ -84,18 +86,49 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from .pool_gather_fp4quant import _AVAILABLE as _POOL_AVAILABLE
-from .pool_gather_fp4quant import BLOCK, HIDDEN, LOCAL_COLUMNS
+from .pool_gather_fp4quant import _VECTOR_SPAN_WORDS, _VECTORS, BLOCK, HIDDEN, local_columns
 from .pool_gather_fp4quant import pool_gather_rmsnorm_fp4quant as _pool_op
-from .projection_inbox import MAX_ROWS, WORLD, ProjectionInbox
+from .projection_inbox import MAX_ROWS, WORLDS, ProjectionInbox
 
-#: The router's experts, the 32 each expert-parallel rank owns, and the top-k.
+#: The router's experts and the top-k.
 EXPERTS = 256
-LOCAL_EXPERTS = EXPERTS // WORLD
 TOP_K = 8
-#: Payload words per inbox row: the pool slice, then the logit block.
-POOL_WORDS = LOCAL_COLUMNS // 2
-LOGIT_WORDS = MAX_ROWS * LOCAL_EXPERTS
-ROW_WORDS = POOL_WORDS + LOGIT_WORDS
+#: The routing warps hold the 256 logits of a row as eight chunks of 32 experts (lane
+#: ``l`` of chunk ``k`` is expert ``32 k + l``); the placement's census keeps one 32-bit
+#: presence word per chunk. An expert-parallel rank's block of ``local_experts(TP)``
+#: experts is one chunk at TP8 and two (low, high) at TP4.
+CHUNKS = 8
+CHUNK = 32
+
+
+def local_experts(world: int) -> int:
+    """The experts each of ``world`` expert-parallel ranks owns: 32 at TP8, 64 at TP4."""
+    return EXPERTS // world
+
+
+def pool_words(world: int) -> int:
+    """Payload words of the pool slice at the head of an inbox row."""
+    return local_columns(world) // 2
+
+
+def logit_words(world: int) -> int:
+    """Payload words of the logit block after the pool slice: ``[MAX_ROWS, L]`` FP32."""
+    return MAX_ROWS * local_experts(world)
+
+
+def row_words(world: int) -> int:
+    """Payload words per inbox row: the pool slice, then the logit block (512 at TP8, 1024 at TP4)."""
+    return pool_words(world) + logit_words(world)
+
+
+#: The TP8 layout's values (two trays), which TP8-only callers read; ``row_words(world)``
+#: and its siblings give every layout.
+WORLD = 8
+LOCAL_COLUMNS = local_columns(WORLD)
+LOCAL_EXPERTS = local_experts(WORLD)
+POOL_WORDS = pool_words(WORLD)
+LOGIT_WORDS = logit_words(WORLD)
+ROW_WORDS = row_words(WORLD)
 
 #: Placement kinds (the replicated experts' modes): none (routing only), every expert on
 #: its owner, the balanced ring-buddy flow, a fixed routing-independent move; and
@@ -110,6 +143,12 @@ PLACE_BALANCE3 = 4
 #: computes. A placement added later is refused with ``early=`` until the
 #: publication and the ``local_ids`` store compute it through that one helper.
 EARLY_PLACES = (PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_BALANCE3)
+#: The placements served at each TP size: three ring windows only at TP8 (at TP4 the
+#: 192-expert stack does not fit beside the KV cache).
+PLACES = {
+    8: (PLACE_NONE, PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_BALANCE3),
+    4: (PLACE_NONE, PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC),
+}
 
 #: The CTA: warps 0-3 run the pool gather + quantization (flashinfer's 128-thread
 #: geometry), warps 4-7 the logit exchange, the routing and the placement. Named
@@ -587,17 +626,25 @@ if _AVAILABLE:
                 winners[r].append(top_lo)
         return picks, winners
 
-    def _placed_expert(g, words, xs, peer_rank: int, x2s=None):
+    def _block_select(blk, values, world: int):
+        """``values[blk]`` (warp-uniform select over the ``world`` blocks)."""
+        chosen = values[0]
+        for b in range(1, world):
+            chosen = _sel(_eq(blk, Uint32(b)), values[b], chosen)
+        return chosen
+
+    def _placed_expert(g, words, xs, peer_rank: int, x2s=None, world: int = 8):
         """The placement of selected expert ``g`` on rank ``peer_rank`` (two or three ring windows).
 
         The local id of the copy this rank runs: ``g``'s index in its own block
-        (own experts, 0..31), in the ring predecessor's block (32..63) when the
-        expert moves one rank on, else ``g``'s id past the 64-expert window (the
-        expert runs on another rank). ``words`` are the census bits per block
-        (which experts any row selected), ``xs`` per block how many of its
-        highest selected experts move one rank on (the placement mode's
+        (own experts, ``0..L-1``), in the ring predecessor's block (``L..2L-1``) when the
+        expert moves one rank on, else ``g``'s id past the ``2L``-expert window (the
+        expert runs on another rank); ``L = local_experts(world)``. ``words`` are the
+        census bits per 32-expert chunk (which experts any row selected; a block is
+        one chunk at TP8 and the chunk pair (low, high) at TP4), ``xs`` per block how
+        many of its highest selected experts move one rank on (the placement mode's
         result: 0 for owner-only, the balanced flow, or the static move).
-        With ``x2s`` (three windows, ``PLACE_BALANCE3``),
+        With ``x2s`` (three windows, ``PLACE_BALANCE3``, TP8 only),
         ``xs`` counts the experts that leave the block and ``x2s`` (<= ``xs``)
         those of them that go on two ranks: the ``x2s`` highest present ones run
         two ranks on (local ids 64..95, the second predecessor's block), the next
@@ -607,37 +654,56 @@ if _AVAILABLE:
         One expression for the ``local_ids`` store and the early-id
         publication, so both carry the same id.
         """
-        blk = g >> 5
-        idx = g & Uint32(31)
+        local = local_experts(world)
         if x2s is not None:
+            blk = g >> 5
+            idx = g & Uint32(31)
             word_blk = words[0]
             m_blk = xs[0]
             x2_blk = x2s[0]
-            for b in range(1, WORLD):
+            for b in range(1, world):
                 at = _eq(blk, Uint32(b))
                 word_blk = _sel(at, words[b], word_blk)
                 m_blk = _sel(at, xs[b], m_blk)
                 x2_blk = _sel(at, x2s[b], x2_blk)
             above = _popc((word_blk >> idx) >> 1)
             hops = _lt_u(above, m_blk) + _lt_u(above, x2_blk)
-            runs_on = (blk + hops) & Uint32(WORLD - 1)
+            runs_on = (blk + hops) & Uint32(world - 1)
             rank_u = Uint32(peer_rank)
-            here = idx + hops * Uint32(LOCAL_EXPERTS)
-            wrap = Uint32(EXPERTS - 3 * LOCAL_EXPERTS)
-            elsewhere = _sel(_ge_u(g, wrap), g - wrap, g) + Uint32(3 * LOCAL_EXPERTS)
+            here = idx + hops * Uint32(local)
+            wrap = Uint32(EXPERTS - 3 * local)
+            elsewhere = _sel(_ge_u(g, wrap), g - wrap, g) + Uint32(3 * local)
             return _sel(_eq(runs_on, rank_u), here, elsewhere)
-        word_blk = words[0]
-        x_blk = xs[0]
-        for b in range(1, WORLD):
-            at = _eq(blk, Uint32(b))
-            word_blk = _sel(at, words[b], word_blk)
-            x_blk = _sel(at, xs[b], x_blk)
-        above = _popc((word_blk >> idx) >> 1)
-        runs_on = (blk + _lt_u(above, x_blk)) & Uint32(WORLD - 1)
+        if world == 8:
+            blk = g >> 5
+            idx = g & Uint32(31)
+            word_blk = words[0]
+            x_blk = xs[0]
+            for b in range(1, world):
+                at = _eq(blk, Uint32(b))
+                word_blk = _sel(at, words[b], word_blk)
+                x_blk = _sel(at, xs[b], x_blk)
+            above = _popc((word_blk >> idx) >> 1)
+        else:
+            # A 64-expert block is the chunk pair (2 blk, 2 blk + 1): the experts above
+            # g in its block are those above it in its chunk, plus the whole high chunk
+            # when g is in the low one.
+            blk = g >> 6
+            idx = g & Uint32(63)
+            chunk = g >> 5
+            inner = g & Uint32(31)
+            chunk_word = words[0]
+            for c in range(1, CHUNKS):
+                chunk_word = _sel(_eq(chunk, Uint32(c)), words[c], chunk_word)
+            high = _block_select(blk, [_popc(words[2 * b + 1]) for b in range(world)], world)
+            in_low = _eq(chunk & Uint32(1), Uint32(0))
+            above = _popc((chunk_word >> inner) >> 1) + _sel(in_low, high, Uint32(0))
+            x_blk = _block_select(blk, xs, world)
+        runs_on = (blk + _lt_u(above, x_blk)) & Uint32(world - 1)
         rank_u = Uint32(peer_rank)
-        here = _sel(_eq(blk, rank_u), idx, idx + Uint32(LOCAL_EXPERTS))
-        wrap = Uint32(EXPERTS - 2 * LOCAL_EXPERTS)
-        elsewhere = _sel(_ge_u(g, wrap), g - wrap, g) + Uint32(2 * LOCAL_EXPERTS)
+        here = _sel(_eq(blk, rank_u), idx, idx + Uint32(local))
+        wrap = Uint32(EXPERTS - 2 * local)
+        elsewhere = _sel(_ge_u(g, wrap), g - wrap, g) + Uint32(2 * local)
         return _sel(_eq(runs_on, rank_u), here, elsewhere)
 
     # ---- the CTA's two warp groups --------------------------------------------
@@ -682,6 +748,7 @@ if _AVAILABLE:
             epoch_word: int = 0,
             trigger: int = 0,
             stamps: int = 0,
+            world: int = 8,
         ):
             major, minor = torch.cuda.get_device_capability()
             super().__init__(
@@ -698,7 +765,7 @@ if _AVAILABLE:
                 and self.threads_per_row == 64
                 and self.rows_per_block == 2
                 and self.vec_size == 8
-                and self.num_vec_blocks == WORLD
+                and self.num_vec_blocks == _VECTORS
                 and self.num_threads == 128
                 and self.num_vec_blocks * self.vec_size * self.threads_per_row == HIDDEN
             ):
@@ -708,7 +775,16 @@ if _AVAILABLE:
                     f"{self.rows_per_block} rows per CTA, {self.num_vec_blocks} vectors of "
                     f"{self.vec_size}, {self.num_threads} threads"
                 )
+            if world not in WORLDS or (route and place not in PLACES[world]):
+                raise ValueError(f"placement kind {place} is not served at TP{world}")
             self.peer_rank = peer_rank
+            self.world = world
+            # The inbox row: the pool slice (vector v of a thread lies in rank
+            # owner(v)'s slice at word offset(v) + 4 * lane), then the logit block.
+            self.per_rank = _VECTORS // world
+            self.local_experts = local_experts(world)
+            self.pool_words = pool_words(world)
+            self.row_words = row_words(world)
             self.place = place if route else PLACE_NONE
             self.static_from = static_from
             # False only in the phase microbenchmark: exchange the logits, skip
@@ -735,10 +811,16 @@ if _AVAILABLE:
             self.trigger = trigger if publish else 0
             self.stamps = stamps
 
+        def owner(self, v: int) -> int:
+            return v // self.per_rank
+
+        def offset(self, v: int) -> int:
+            return (v % self.per_rank) * _VECTOR_SPAN_WORDS
+
         def _route_smem_bytes(self) -> int:
             # logits [8, 256] FP32, selected ids [64] and weights [64], the placement's
-            # census [8], with alignment slack.
-            return MAX_ROWS * EXPERTS * 4 + 2 * MAX_ROWS * TOP_K * 4 + WORLD * 4 + 128
+            # census [8 chunks], with alignment slack.
+            return MAX_ROWS * EXPERTS * 4 + 2 * MAX_ROWS * TOP_K * 4 + CHUNKS * 4 + 128
 
         @cute.jit
         def __call__(
@@ -868,9 +950,13 @@ if _AVAILABLE:
             sWeights = smem.allocate_tensor(
                 Uint32, cute.make_layout((MAX_ROWS * TOP_K,)), byte_alignment=16
             )
-            # The placement's census: bit i of word b is set when local expert i of
-            # block b is selected by some row.
-            sCensus = smem.allocate_tensor(Uint32, cute.make_layout((WORLD,)), byte_alignment=16)
+            # The placement's census: bit i of word c is set when expert 32 c + i is
+            # selected by some row.
+            sCensus = smem.allocate_tensor(Uint32, cute.make_layout((CHUNKS,)), byte_alignment=16)
+            world = self.world
+            local_count = self.local_experts
+            row_words_ = self.row_words
+            pool_words_ = self.pool_words
             probe = mX.iterator.toint() + Int64(bidx * 64)
 
             if warp < QUANT_WARPS:
@@ -911,41 +997,51 @@ if _AVAILABLE:
                     slot = (last_slot ^ Uint32(1)) & Uint32(1)
                     word = Int64(lane_in_row * 4)
                     row64 = Int64(actual_row_idx)
-                    l0, l1, l2, l3 = load_words(local + (row64 * POOL_WORDS + word) * 4)
-                    sent = (
-                        (Int64(slot) * WORLD + self.peer_rank) * MAX_ROWS + row64
-                    ) * ROW_WORDS + word
-                    for b in cutlass.range_constexpr(WORLD):
-                        if cutlass.const_expr(b != self.peer_rank):
-                            publish_words(inbox + Int64(b) * stride + sent * 8, l0, l1, l2, l3, tag)
+                    received = cute.make_rmem_tensor(cute.make_layout((4 * _VECTORS,)), Uint32)
+                    for v in cutlass.range_constexpr(_VECTORS):
+                        if cutlass.const_expr(self.owner(v) == self.peer_rank):
+                            l0, l1, l2, l3 = load_words(
+                                local + (row64 * pool_words_ + word + self.offset(v)) * 4
+                            )
+                            received[4 * v] = l0
+                            received[4 * v + 1] = l1
+                            received[4 * v + 2] = l2
+                            received[4 * v + 3] = l3
+                            sent = (
+                                (Int64(slot) * world + self.peer_rank) * MAX_ROWS + row64
+                            ) * row_words_ + (word + self.offset(v))
+                            for b in cutlass.range_constexpr(world):
+                                if cutlass.const_expr(b != self.peer_rank):
+                                    publish_words(
+                                        inbox + Int64(b) * stride + sent * 8, l0, l1, l2, l3, tag
+                                    )
                     own = inbox + Int64(self.peer_rank) * stride
-                    received = cute.make_rmem_tensor(cute.make_layout((4 * WORLD,)), Uint32)
                     stale = Uint32(1)
                     while stale != Uint32(0):
                         stale = Uint32(0)
-                        for b in cutlass.range_constexpr(WORLD):
-                            if cutlass.const_expr(b != self.peer_rank):
+                        for v in cutlass.range_constexpr(_VECTORS):
+                            if cutlass.const_expr(self.owner(v) != self.peer_rank):
                                 box = (
-                                    (Int64(slot) * WORLD + b) * MAX_ROWS + row64
-                                ) * ROW_WORDS + word
+                                    (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                ) * row_words_ + (word + self.offset(v))
                                 p0, t0, p1, t1, p2, t2, p3, t3 = poll_words(own + box * 8)
-                                received[4 * b] = p0
-                                received[4 * b + 1] = p1
-                                received[4 * b + 2] = p2
-                                received[4 * b + 3] = p3
+                                received[4 * v] = p0
+                                received[4 * v + 1] = p1
+                                received[4 * v + 2] = p2
+                                received[4 * v + 3] = p3
                                 stale = stale | any_stale(t0, t1, t2, t3, tag)
                     gathered_row = mX.iterator.toint() + row64 * (H * 2)
-                    for b in cutlass.range_constexpr(WORLD):
-                        if cutlass.const_expr(b != self.peer_rank):
-                            box = ((Int64(slot) * WORLD + b) * MAX_ROWS + row64) * ROW_WORDS + word
+                    for v in cutlass.range_constexpr(_VECTORS):
+                        if cutlass.const_expr(self.owner(v) != self.peer_rank):
+                            box = (
+                                (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                            ) * row_words_ + (word + self.offset(v))
                             clear_words(own + box * 8)
-                            w0 = received[4 * b]
-                            w1 = received[4 * b + 1]
-                            w2 = received[4 * b + 2]
-                            w3 = received[4 * b + 3]
-                        else:
-                            w0, w1, w2, w3 = l0, l1, l2, l3
-                        column = b * LOCAL_COLUMNS + lane_in_row * 8
+                        w0 = received[4 * v]
+                        w1 = received[4 * v + 1]
+                        w2 = received[4 * v + 2]
+                        w3 = received[4 * v + 3]
+                        column = v * (2 * _VECTOR_SPAN_WORDS) + lane_in_row * 8
                         _store_shared_words(sX.iterator + row_in_block * H + column, w0, w1, w2, w3)
                         if cutlass.const_expr(store_gathered):
                             _store_global_words(gathered_row + Int64(column) * 2, w0, w1, w2, w3)
@@ -1032,14 +1128,14 @@ if _AVAILABLE:
             else:
                 # ==========================================================
                 # Warps 4-7: the logit blocks (in the box of the CTA's first row,
-                # words 256-511, under that row's tag and slot), the routing of
-                # all M rows (warp 4 + w takes rows w and w + 4; lane l holds
-                # expert 32k + l of block k) and the placement.
+                # after its pool words, under that row's tag and slot), the routing
+                # of all M rows (warp 4 + w takes rows w and w + 4; lane l holds
+                # expert 32k + l of chunk k) and the placement.
                 # ==========================================================
                 rt = tidx - QUANT_THREADS
                 rwarp = warp - QUANT_WARPS
                 # The expert bias is a parameter: read before the wait.
-                bias_k = [_ld_global_b32(bias + Int64((32 * k + lane) * 4)) for k in range(WORLD)]
+                bias_k = [_ld_global_b32(bias + Int64((32 * k + lane) * 4)) for k in range(CHUNKS)]
                 if enable_pdl:
                     cute.arch.griddepcontrol_wait()
                 if cutlass.const_expr(self.publish != 0):
@@ -1065,34 +1161,34 @@ if _AVAILABLE:
                     if rt == 0:
                         _stamp(probe + Int64(32))
                 if cutlass.const_expr(self.place != PLACE_NONE):
-                    if rt < WORLD:
+                    if rt < CHUNKS:
                         _st_shared_b32(sCensus.iterator + rt, Uint32(0))
                 first_row = Int64(bidx * rows_per_block)
                 last_tag, last_slot = load_state(counters + first_row * 8)
                 _bar_arrive(STATE_BARRIER, QUANT_THREADS + ROUTE_THREADS)
                 tag = next_tag(last_tag)
                 slot = (last_slot ^ Uint32(1)) & Uint32(1)
-                if rt * 4 < M * LOCAL_EXPERTS:
+                if rt * 4 < M * local_count:
                     word = Int64(rt * 4)
                     g0, g1, g2, g3 = load_words(logits_local + word * 4)
                     sent = (
-                        ((Int64(slot) * WORLD + self.peer_rank) * MAX_ROWS + first_row) * ROW_WORDS
-                        + POOL_WORDS
+                        ((Int64(slot) * world + self.peer_rank) * MAX_ROWS + first_row) * row_words_
+                        + pool_words_
                         + word
                     )
-                    for b in cutlass.range_constexpr(WORLD):
+                    for b in cutlass.range_constexpr(world):
                         if cutlass.const_expr(b != self.peer_rank):
                             publish_words(inbox + Int64(b) * stride + sent * 8, g0, g1, g2, g3, tag)
                     own = inbox + Int64(self.peer_rank) * stride
-                    received = cute.make_rmem_tensor(cute.make_layout((4 * WORLD,)), Uint32)
+                    received = cute.make_rmem_tensor(cute.make_layout((4 * world,)), Uint32)
                     stale = Uint32(1)
                     while stale != Uint32(0):
                         stale = Uint32(0)
-                        for b in cutlass.range_constexpr(WORLD):
+                        for b in cutlass.range_constexpr(world):
                             if cutlass.const_expr(b != self.peer_rank):
                                 box = (
-                                    ((Int64(slot) * WORLD + b) * MAX_ROWS + first_row) * ROW_WORDS
-                                    + POOL_WORDS
+                                    ((Int64(slot) * world + b) * MAX_ROWS + first_row) * row_words_
+                                    + pool_words_
                                     + word
                                 )
                                 q0, s0, q1, s1, q2, s2, q3, s3 = poll_words(own + box * 8)
@@ -1101,15 +1197,15 @@ if _AVAILABLE:
                                 received[4 * b + 2] = q2
                                 received[4 * b + 3] = q3
                                 stale = stale | any_stale(s0, s1, s2, s3, tag)
-                    # This thread's words: row (4 rt) // 32 of the block, experts
-                    # (4 rt) % 32 .. + 3 of each sender's 32.
-                    logit_row = (rt * 4) // LOCAL_EXPERTS
-                    logit_col = (rt * 4) % LOCAL_EXPERTS
-                    for b in cutlass.range_constexpr(WORLD):
+                    # This thread's words: row (4 rt) // L of the block, experts
+                    # (4 rt) % L .. + 3 of each sender's L.
+                    logit_row = (rt * 4) // local_count
+                    logit_col = (rt * 4) % local_count
+                    for b in cutlass.range_constexpr(world):
                         if cutlass.const_expr(b != self.peer_rank):
                             box = (
-                                ((Int64(slot) * WORLD + b) * MAX_ROWS + first_row) * ROW_WORDS
-                                + POOL_WORDS
+                                ((Int64(slot) * world + b) * MAX_ROWS + first_row) * row_words_
+                                + pool_words_
                                 + word
                             )
                             clear_words(own + box * 8)
@@ -1120,7 +1216,7 @@ if _AVAILABLE:
                         else:
                             v0, v1, v2, v3 = g0, g1, g2, g3
                         _store_shared_words(
-                            sLogits.iterator + logit_row * EXPERTS + b * LOCAL_EXPERTS + logit_col,
+                            sLogits.iterator + logit_row * EXPERTS + b * local_count + logit_col,
                             v0,
                             v1,
                             v2,
@@ -1151,7 +1247,7 @@ if _AVAILABLE:
                 for half in cutlass.range_constexpr(2 if self.route else 0):
                     row = rwarp + 4 * half
                     keys = []
-                    for k in cutlass.range_constexpr(WORLD):
+                    for k in cutlass.range_constexpr(CHUNKS):
                         expert = 32 * k + lane
                         logit = _ld_shared_b32(sLogits.iterator + row * EXPERTS + expert)
                         keys.append(
@@ -1201,73 +1297,90 @@ if _AVAILABLE:
                     w0, w1, w2, w3 = _load_shared_words(sCensus.iterator)
                     w4, w5, w6, w7 = _load_shared_words(sCensus.iterator + 4)
                     words = [w0, w1, w2, w3, w4, w5, w6, w7]
-                    loads = [_popc(w) for w in words]
-                    lane_r = Uint32(lane) & Uint32(WORLD - 1)
+                    # Per block: its chunk (TP8) or its chunk pair (TP4).
+                    per = CHUNKS // world
+                    loads = []
+                    for b in cutlass.range_constexpr(world):
+                        load_b = _popc(words[per * b])
+                        for c in cutlass.range_constexpr(1, per):
+                            load_b = load_b + _popc(words[per * b + c])
+                        loads.append(load_b)
+                    lane_r = Uint32(lane) & Uint32(world - 1)
                     # Per block, xs experts leave it (its highest present ones) and,
                     # with three windows, x2s of them go on two ranks.
                     x2s = None
                     if cutlass.const_expr(self.place == PLACE_BALANCE):
-                        # Lane r (mod 8) takes the arcs ending at rank r.
+                        # Lane r (mod world) takes the arcs ending at rank r.
                         held = loads[0]
-                        for b in cutlass.range_constexpr(1, WORLD):
+                        for b in cutlass.range_constexpr(1, world):
                             held = _sel(_eq(lane_r, Uint32(b)), loads[b], held)
                         arc = Uint32(0)
                         arcs = []
                         need = Uint32(0)
-                        for k in cutlass.range_constexpr(WORLD):
+                        for k in cutlass.range_constexpr(world):
                             span = k + 1
                             arc = arc + _shfl_idx_b32(
-                                held, (lane_r - Uint32(k)) & Uint32(WORLD - 1)
+                                held, (lane_r - Uint32(k)) & Uint32(world - 1)
                             )
                             arcs.append(arc)
-                            if cutlass.const_expr(span == WORLD):
-                                need = _max_s32(need, _div_u32(arc + Uint32(WORLD - 1), WORLD))
+                            if cutlass.const_expr(span == world):
+                                need = _max_s32(need, _div_u32(arc + Uint32(world - 1), world))
                             else:
                                 need = _max_s32(need, _div_u32(arc + Uint32(span), span + 1))
                         t = _redux_max_s32(need)
                         moved_r = Uint32(0)
-                        for k in cutlass.range_constexpr(WORLD):
+                        for k in cutlass.range_constexpr(world):
                             moved_r = _max_s32(moved_r, arcs[k] - Uint32(k + 1) * t)
-                        xs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(WORLD)]
+                        xs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(world)]
                     elif cutlass.const_expr(self.place == PLACE_BALANCE3):
-                        # Three windows (ring_windows.py): the smallest maximum
+                        # Three windows (ring_windows.py, TP8 only): the smallest maximum
                         # T over arcs that reach n + 2 ranks, the edge carries
                         # c[r] (moved_r, lane r), then per block the experts
                         # leaving it (xs: m = min(c, load)) and those going on
                         # two ranks (x2s).
                         held = loads[0]
-                        for b in cutlass.range_constexpr(1, WORLD):
+                        for b in cutlass.range_constexpr(1, world):
                             held = _sel(_eq(lane_r, Uint32(b)), loads[b], held)
                         arc = Uint32(0)
                         arcs = []
                         need = Uint32(0)
-                        for k in cutlass.range_constexpr(WORLD):
-                            reach = min(k + 3, WORLD)
+                        for k in cutlass.range_constexpr(world):
+                            reach = min(k + 3, world)
                             arc = arc + _shfl_idx_b32(
-                                held, (lane_r - Uint32(k)) & Uint32(WORLD - 1)
+                                held, (lane_r - Uint32(k)) & Uint32(world - 1)
                             )
                             arcs.append(arc)
                             need = _max_s32(need, _div_u32(arc + Uint32(reach - 1), reach))
                         t = _redux_max_s32(need)
                         moved_r = Uint32(0)
-                        for k in cutlass.range_constexpr(WORLD):
+                        for k in cutlass.range_constexpr(world):
                             moved_r = _max_s32(moved_r, arcs[k] - Uint32(k + 1) * t)
-                        cs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(WORLD)]
-                        xs = [_min_u32(cs[b], loads[b]) for b in range(WORLD)]
+                        cs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(world)]
+                        xs = [_min_u32(cs[b], loads[b]) for b in range(world)]
                         x2s = [
-                            _max_s32(Uint32(0), cs[(b + 1) % WORLD] - loads[(b + 1) % WORLD])
-                            for b in range(WORLD)
+                            _max_s32(Uint32(0), cs[(b + 1) % world] - loads[(b + 1) % world])
+                            for b in range(world)
                         ]
                     elif cutlass.const_expr(self.place == PLACE_STATIC):
-                        xs = [_popc(w >> self.static_from) for w in words]
+                        # Present experts at index static_from or above of each block.
+                        xs = []
+                        for b in cutlass.range_constexpr(world):
+                            count = Uint32(0)
+                            for c in cutlass.range_constexpr(per):
+                                shift = self.static_from - CHUNK * c
+                                if shift <= 0:
+                                    count = count + _popc(words[per * b + c])
+                                elif shift < CHUNK:
+                                    count = count + _popc(words[per * b + c] >> shift)
+                            xs.append(count)
                         moved_r = xs[0]
-                        for b in cutlass.range_constexpr(1, WORLD):
+                        for b in cutlass.range_constexpr(1, world):
                             moved_r = _sel(_eq(lane_r, Uint32(b)), xs[b], moved_r)
                     else:
-                        xs = [Uint32(0) for _ in range(WORLD)]
+                        xs = [Uint32(0) for _ in range(world)]
                         moved_r = Uint32(0)
                     from_prev = _shfl_idx_b32(
-                        moved_r, (lane_r + Uint32(WORLD - 1)) & Uint32(WORLD - 1)
+                        moved_r, (lane_r + Uint32(world - 1)) & Uint32(world - 1)
                     )
                     if cutlass.const_expr(self.publish != 0):
                         # Early ids: CTA 0 publishes every row's placed ids, before its own
@@ -1280,7 +1393,7 @@ if _AVAILABLE:
                             if pubs != Uint32(0):
                                 pslot = prow * TOP_K + lane
                                 pg = _ld_shared_b32(sSelected.iterator + pslot)
-                                pplaced = _placed_expert(pg, words, xs, self.peer_rank, x2s)
+                                pplaced = _placed_expert(pg, words, xs, self.peer_rank, x2s, world)
                                 pplaced = _sel(
                                     _lt_u(Uint32(prow), Uint32(M)), pplaced, Uint32(0xFFFFFFFF)
                                 )
@@ -1301,22 +1414,22 @@ if _AVAILABLE:
                     if writes != Uint32(0):
                         slot_index = own_row * TOP_K + lane
                         g = _ld_shared_b32(sSelected.iterator + slot_index)
-                        placed = _placed_expert(g, words, xs, self.peer_rank, x2s)
+                        placed = _placed_expert(g, words, xs, self.peer_rank, x2s, world)
                         _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
                         w_bits = _ld_shared_b32(sWeights.iterator + slot_index)
                         _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
                     held_load = loads[0]
-                    for b in cutlass.range_constexpr(1, WORLD):
+                    for b in cutlass.range_constexpr(1, world):
                         held_load = _sel(_eq(lane_r, Uint32(b)), loads[b], held_load)
                     reports = (
                         _eq(Uint32(bidx), Uint32(0))
                         & _eq(Uint32(rwarp), Uint32(2))
-                        & _lt_u(Uint32(lane), Uint32(WORLD))
+                        & _lt_u(Uint32(lane), Uint32(world))
                     )
                     if reports != Uint32(0):
                         _st_global_b32(stats + Int64(lane) * 4, held_load)
                         _st_global_b32(
-                            stats + Int64(lane + WORLD) * 4, held_load - moved_r + from_prev
+                            stats + Int64(lane + world) * 4, held_load - moved_r + from_prev
                         )
                 if cutlass.const_expr(self.probe):
                     if rt == 0:
@@ -1341,9 +1454,19 @@ if _AVAILABLE:
         epoch_word: int = 0,
         trigger: int = 0,
         stamps: int = 0,
+        world: int = 8,
     ):
         kernel = _PoolGatherRouteKernel(
-            peer_rank, place, static_from, route, probe, publish, epoch_word, trigger, stamps
+            peer_rank,
+            place,
+            static_from,
+            route,
+            probe,
+            publish,
+            epoch_word,
+            trigger,
+            stamps,
+            world,
         )
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
@@ -1387,7 +1510,7 @@ class RouteOutputs:
     ``logits`` ``[M, 256]`` FP32: the router logits; ``selected`` ``[M, 8]``
     int32 and ``weights`` ``[M, 8]`` FP32: the routing; and with a placement,
     ``local_ids`` ``[M, 8]`` int32, ``weights_bf16`` ``[M, 8]`` BF16 and
-    ``stats`` ``[16]`` int32 (``ring_buddy_assign``'s three outputs), else None.
+    ``stats`` ``[2 * TP]`` int32 (``ring_buddy_assign``'s three outputs), else None.
     """
 
     __slots__ = (
@@ -1413,9 +1536,10 @@ class RouteOutputs:
 class PoolGatherRoute(OpWrapper):
     """Gather the pool slices and the logit slices; quantize; route; place.
 
-    ``local`` is this rank's ``[M, 512]`` BF16 pool output, ``logits_local`` its
-    ``[M, 32]`` FP32 router logits (experts ``32 * rank ...``), ``inbox`` a
-    512-word-row ``ProjectionInbox``, ``gain`` / ``global_scale`` / ``eps`` the
+    At TP8 (TP4, ``inbox.world``): ``local`` is this rank's ``[M, 512]`` (``[M, 1024]``)
+    BF16 pool output, ``logits_local`` its ``[M, 32]`` (``[M, 64]``) FP32 router logits
+    (experts ``L * rank ...``), ``inbox`` a ``row_words(TP)``-word-row ``ProjectionInbox``,
+    ``gain`` / ``global_scale`` / ``eps`` the
     pre-expert norm's (as ``pool_gather_fp4quant``), ``bias`` the routing's
     ``[256]`` FP32 expert bias and ``renorm_eps`` its renormalization epsilon.
     ``place`` is one of ``PLACE_*``; ``static_from`` the ``PLACE_STATIC``
@@ -1425,6 +1549,14 @@ class PoolGatherRoute(OpWrapper):
     A collective over the TP group: every rank calls it with the same row count
     and placement kind, in the same order relative to its other calls on
     ``inbox``.
+
+    The TP4 placement interface (``early_expert_ids`` and the persistent experts
+    read it): expert-parallel rank ``r`` owns the 64-expert block ``[64 r, 64 r + 64)``;
+    the census holds one 32-bit presence word per 32-expert chunk, so block ``r``'s
+    word is the chunk pair ``(2 r, 2 r + 1)`` -- a little-endian 64-bit word whose bit
+    ``i`` is expert ``64 r + i``; ``local_ids`` are ``0..63`` for the own block,
+    ``64..127`` for the ring predecessor's block (a balanced or static move), and
+    ``>= 128`` for an expert another rank runs; ``stats`` is ``[2 * 4]``.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -1453,6 +1585,18 @@ class PoolGatherRoute(OpWrapper):
             why="1 row over three ring windows: at most 8 experts, the carry rarely moves",
             spec=dict(rows=1, place=PLACE_BALANCE3),
         ),
+        Cell(
+            why="tep4 K=7 verify: 8 rows, 64 experts per rank, owner-only placement (one tray)",
+            spec=dict(rows=8, place=PLACE_OWNER, world=4),
+        ),
+        Cell(
+            why="tep4: 8 rows, routing only (no placement)",
+            spec=dict(rows=8, place=PLACE_NONE, world=4),
+        ),
+        Cell(
+            why="tep4: 8 rows, the balanced flow over four 64-expert blocks",
+            spec=dict(rows=8, place=PLACE_BALANCE, world=4),
+        ),
     )
 
     note = """
@@ -1462,7 +1606,9 @@ class PoolGatherRoute(OpWrapper):
     has no built-in counterpart), and the built-in gather + flashinfer quantization's
     payload, scales and gathered row; with random and constructed near-tie
     logits, a delayed rank, row-count changes with tag wrap-around and CUDA-graph
-    replays. Rows 1..8 only.
+    replays. Rows 1..8 only. At TP4 the same claims hold against the built-in
+    chain at TP4 (the ring-buddy placement against ``reference``'s ring flow over
+    four 64-expert blocks).
     """
 
     def __call__(
@@ -1476,12 +1622,16 @@ class PoolGatherRoute(OpWrapper):
         bias: torch.Tensor,
         renorm_eps: float,
         place: int = PLACE_NONE,
-        static_from: int = LOCAL_EXPERTS,
+        static_from: Optional[int] = None,
         enable_pdl: bool = True,
         return_gathered: bool = True,
         early=None,
         stamps: Optional[torch.Tensor] = None,
     ) -> RouteOutputs:
+        """``static_from`` defaults to ``local_experts(inbox.world)`` (no static move)."""
+        world = inbox.world
+        if static_from is None:
+            static_from = local_experts(world)
         rows = local.shape[0]
         device = local.device
         gathered = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
@@ -1495,7 +1645,7 @@ class PoolGatherRoute(OpWrapper):
         weights_bf16 = (
             torch.empty((rows, TOP_K), dtype=torch.bfloat16, device=device) if placed else None
         )
-        stats = torch.empty((2 * WORLD,), dtype=torch.int32, device=device) if placed else None
+        stats = torch.empty((2 * world,), dtype=torch.int32, device=device) if placed else None
         # Early expert ids: publish the placed ids to the expert kernel that follows,
         # unless an earlier publication has not been consumed yet.
         publish = early is not None and placed and bool(enable_pdl) and early.may_publish()
@@ -1519,6 +1669,7 @@ class PoolGatherRoute(OpWrapper):
             int(static_from),
             bool(enable_pdl),
             bool(return_gathered),
+            world=world,
             **extra,
         )(
             gathered,
@@ -1567,7 +1718,7 @@ class PoolGatherRoute(OpWrapper):
         bias: torch.Tensor,
         renorm_eps: float,
         place: int = PLACE_NONE,
-        static_from: int = LOCAL_EXPERTS,
+        static_from: Optional[int] = None,
         enable_pdl: bool = True,
         return_gathered: bool = True,
         rank: int = 0,
@@ -1581,9 +1732,13 @@ class PoolGatherRoute(OpWrapper):
         ranks their FP32 rounding plus the bias in FP32 (the built-in's
         selection key), ties to the lower expert id; the weights are the
         float64 renormalization of the float64 scores. The placement is
-        ``ring_buddy_assign.reference`` on that selection (``ring_windows.place``
-        for ``PLACE_BALANCE3``).
+        ``ring_buddy_assign.reference`` on that selection at TP8
+        (``ring_windows.place`` for ``PLACE_BALANCE3``), and ``ring_reference``
+        at TP4 (the TP size is ``len(per_rank_logits)``).
         """
+        world = len(per_rank_logits)
+        if static_from is None:
+            static_from = local_experts(world)
         fp4, scale, gathered = _pool_op.reference(
             per_rank_locals, None, gain, global_scale, eps, return_gathered=return_gathered
         )
@@ -1604,6 +1759,15 @@ class PoolGatherRoute(OpWrapper):
             )
             weights_bf16 = weights.to(torch.bfloat16)
             stats = torch.tensor(placed_stats, dtype=torch.int32, device=selected.device)
+        elif place != PLACE_NONE and world != 8:
+            local_ids, weights_bf16, stats = ring_reference(
+                selected,
+                weights,
+                rank,
+                world,
+                balance=place == PLACE_BALANCE,
+                static_from=static_from if place == PLACE_STATIC else local_experts(world),
+            )
         elif place != PLACE_NONE:
             from ..moe.ring_buddy_assign import ring_buddy_assign
 
@@ -1637,7 +1801,7 @@ class PoolGatherRoute(OpWrapper):
         bias: torch.Tensor,
         renorm_eps: float,
         place: int = PLACE_NONE,
-        static_from: int = LOCAL_EXPERTS,
+        static_from: Optional[int] = None,
         enable_pdl: bool = True,
         return_gathered: bool = True,
         early=None,
@@ -1646,11 +1810,14 @@ class PoolGatherRoute(OpWrapper):
         """Raw vector accesses at fixed strides: a strided or misaligned operand is read
         as if packed; a row count outside 1..8 addresses outside the inbox. The early ids
         and the timeline stamps are written at raw addresses on the operands' device."""
+        world = inbox.world
+        columns = local_columns(world)
+        local_count = local_experts(world)
+        if static_from is None:
+            static_from = local_count
         rows = local.shape[0] if local.dim() == 2 else -1
-        if not 1 <= rows <= MAX_ROWS or tuple(local.shape) != (rows, LOCAL_COLUMNS):
-            raise ValueError(
-                f"local must be [1..{MAX_ROWS}, {LOCAL_COLUMNS}], got {tuple(local.shape)}"
-            )
+        if not 1 <= rows <= MAX_ROWS or tuple(local.shape) != (rows, columns):
+            raise ValueError(f"local must be [1..{MAX_ROWS}, {columns}], got {tuple(local.shape)}")
         if early is not None and early.device != local.device:
             raise ValueError(f"early ids on {early.device}, operands on {local.device}")
         if stamps is not None and (
@@ -1664,8 +1831,8 @@ class PoolGatherRoute(OpWrapper):
                 f"{local.device}, got {stamps.dtype} {tuple(stamps.shape)}"
             )
         for tensor, shape, dtype in (
-            (local, (rows, LOCAL_COLUMNS), torch.bfloat16),
-            (logits_local, (rows, LOCAL_EXPERTS), torch.float32),
+            (local, (rows, columns), torch.bfloat16),
+            (logits_local, (rows, local_count), torch.float32),
             (gain, (HIDDEN,), torch.bfloat16),
             (global_scale, (1,), torch.float32),
             (bias, (EXPERTS,), torch.float32),
@@ -1681,20 +1848,78 @@ class PoolGatherRoute(OpWrapper):
                     f"expected a contiguous 16-byte aligned {dtype} {shape} tensor on "
                     f"{local.device}, got {tensor.dtype} {tuple(tensor.shape)}"
                 )
-        if inbox.row_words != ROW_WORDS:
-            raise ValueError(f"inbox carries {inbox.row_words}-word rows, this op {ROW_WORDS}")
-        if place not in (PLACE_NONE, PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_BALANCE3):
-            raise ValueError(f"unknown placement kind {place}")
+        if inbox.row_words != row_words(world):
+            raise ValueError(
+                f"inbox carries {inbox.row_words}-word rows, this op {row_words(world)}"
+            )
+        if place not in PLACES[world]:
+            raise ValueError(f"placement kind {place} is not served at TP{world}")
         if early is not None and place not in (PLACE_NONE,) + EARLY_PLACES:
             raise ValueError(
                 f"early_expert_ids publishes only the placements _placed_expert computes {EARLY_PLACES}, "
                 f"got placement kind {place}"
             )
-        if not 0 <= static_from <= LOCAL_EXPERTS:
-            raise ValueError(f"static_from must be in [0, {LOCAL_EXPERTS}]")
+        if not 0 <= static_from <= local_count:
+            raise ValueError(f"static_from must be in [0, {local_count}]")
 
 
 pool_gather_route = PoolGatherRoute()
+
+
+def ring_reference(
+    selected: torch.Tensor,
+    weights: torch.Tensor,
+    rank: int,
+    ranks: int,
+    balance: bool = True,
+    static_from: Optional[int] = None,
+):
+    """``ring_buddy_assign.reference`` over ``ranks`` blocks of ``256 / ranks`` experts.
+
+    The placement in plain Python: the per-block loads, the moves (the balanced ring
+    flow of ``ring_buddy_assign.balance_ring``, or the experts at index
+    ``static_from`` and above), and every slot's local id (own block ``0..L-1``,
+    predecessor's ``L..2L-1``, elsewhere ``>= 2L``). Returns ``(local_ids,
+    weights_bf16, stats [2 * ranks])``.
+    """
+    from ..moe.ring_buddy_assign import balance_ring
+
+    block = EXPERTS // ranks
+    if static_from is None:
+        static_from = block
+    flat = [int(v) for v in selected.reshape(-1).tolist()]
+    present = sorted(set(flat))
+    load = [0] * ranks
+    for expert in present:
+        load[expert // block] += 1
+    if balance:
+        x = balance_ring(load)[1]
+    else:
+        x = [
+            sum(1 for e in present if e // block == b and e % block >= static_from)
+            for b in range(ranks)
+        ]
+    moved = set()
+    for b in range(ranks):
+        in_block = [e for e in present if e // block == b]
+        moved.update(sorted(in_block, reverse=True)[: x[b]])
+    local = []
+    for expert in flat:
+        owner, index = divmod(expert, block)
+        runs_on = (owner + (expert in moved)) % ranks
+        if runs_on != rank:
+            local.append(2 * block + expert % (EXPERTS - 2 * block))
+        elif owner == rank:
+            local.append(index)
+        else:
+            local.append(block + index)
+    after = [load[r] - x[r] + x[(r - 1) % ranks] for r in range(ranks)]
+    device = selected.device
+    return (
+        torch.tensor(local, dtype=torch.int32, device=device).reshape(selected.shape),
+        weights.to(torch.bfloat16),
+        torch.tensor(load + after, dtype=torch.int32, device=device),
+    )
 
 
 def available() -> bool:

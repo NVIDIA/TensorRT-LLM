@@ -57,7 +57,15 @@ PG = importlib.import_module(_TARGET + ".kernels.projection_gathers.gathers")
 RB = importlib.import_module(_TARGET + ".kernels.replicated_experts.ring_buddy")
 MP = importlib.import_module(_TARGET + ".kernels.moe_prologue.prologue")
 
-WORLD = 8
+#: The TP size under test: the MPI world when it is 4 (one node) or 8 (two nodes).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
+#: The layout of this TP size: pool slice columns, prologue inbox row words, router columns.
+P_LOCAL = P.local_columns(WORLD)
+R_ROW_WORDS = R.row_words(WORLD)
+S_LOCAL = S.local_experts(WORLD)
+#: The chain's placement: the balanced ring-buddy one against ``ring_buddy_assign`` at
+#: TP8; at TP4 (no built-in placement kernel) the routing alone.
+CHAIN_PLACE = R.PLACE_BALANCE if WORLD == 8 else R.PLACE_NONE
 LAYERS = 62
 EPS, RENORM_EPS = 1e-5, 1e-15
 SCALE = (8192 / 256.0) ** -0.5
@@ -68,7 +76,7 @@ WEIGHTS = 8
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
@@ -100,8 +108,8 @@ def env():
     e = types.SimpleNamespace(comm=comm, rank=rank)
     e.mapping = Mapping(world_size=WORLD, tp_size=WORLD, rank=rank, gpus_per_node=4)
     e.builtin_pool = ProjectionGatherWorkspace(e.mapping)
-    e.pool_inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=P.LOCAL_COLUMNS // 2)
-    e.inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=R.ROW_WORDS)
+    e.pool_inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=P_LOCAL // 2)
+    e.inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=R_ROW_WORDS)
     e.aux = torch.cuda.Stream()
     gen = torch.Generator(device="cuda").manual_seed(1234)  # the same weights on every rank
     e.router = [torch.randn(256, 8192, generator=gen, device="cuda") * 0.02 for _ in range(WEIGHTS)]
@@ -125,7 +133,16 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint8)
 
 
-_OUTPUTS = ("logits", "selected", "weights", "local_ids", "weights_bf16", "stats", "fp4", "scale")
+_OUTPUTS = (
+    ("logits", "selected", "weights", "local_ids", "weights_bf16", "stats", "fp4", "scale")
+    if CHAIN_PLACE != R.PLACE_NONE
+    else ("logits", "selected", "weights", "fp4", "scale")
+)
+
+
+def _pack(**outputs) -> tuple:
+    """One layer's outputs in ``_OUTPUTS`` order."""
+    return tuple(outputs[name] for name in _OUTPUTS)
 
 
 def _differing(got, want) -> dict:
@@ -147,7 +164,7 @@ class _Chain:
     def __init__(self, rows: int, rank: int):
         self.rows, self.rank = rows, rank
         self.hidden = torch.zeros(LAYERS, rows, 8192, device="cuda", dtype=torch.bfloat16)
-        self.pool = torch.zeros(LAYERS, rows, P.LOCAL_COLUMNS, device="cuda", dtype=torch.bfloat16)
+        self.pool = torch.zeros(LAYERS, rows, P_LOCAL, device="cuda", dtype=torch.bfloat16)
 
     def fill(self, seed: int):
         gen = torch.Generator().manual_seed(seed * 16 + 99)  # replicated on every rank
@@ -217,12 +234,14 @@ def _layers(
         if fused:
             warps = S.builtin_warps(chain.rows, True)
             if fork is None:
-                logits_local = S.router_shard(hidden, weight, e.rank, SCALE, warps, True, early)
+                logits_local = S.router_shard(
+                    hidden, weight, e.rank, SCALE, warps, True, early, ranks=WORLD
+                )
             else:
                 logits_local = (
-                    torch.empty(chain.rows, S.LOCAL_EXPERTS, device="cuda")
+                    torch.empty(chain.rows, S_LOCAL, device="cuda")
                     if join
-                    else torch.full((chain.rows, S.LOCAL_EXPERTS), 7.0, device="cuda")
+                    else torch.full((chain.rows, S_LOCAL), 7.0, device="cuda")
                 )
                 if not join:
                     e.held.append(logits_local)
@@ -230,7 +249,9 @@ def _layers(
                 with torch.cuda.stream(fork):
                     if layer in side_delays:
                         torch.cuda._sleep(side_delays[layer])
-                    S.router_shard_side(hidden, weight, e.rank, SCALE, warps, logits_local)
+                    S.router_shard_side(
+                        hidden, weight, e.rank, SCALE, warps, logits_local, ranks=WORLD
+                    )
             pooled = chain.pool[layer].clone()
             if fork is not None and join:
                 main.wait_stream(fork)
@@ -243,19 +264,19 @@ def _layers(
                 EPS,
                 e.bias,
                 RENORM_EPS,
-                R.PLACE_BALANCE,
-                R.LOCAL_EXPERTS,
+                CHAIN_PLACE,
+                R.local_experts(WORLD),
             )
             outputs.append(
-                (
-                    out.logits,
-                    out.selected,
-                    out.weights,
-                    out.local_ids,
-                    out.weights_bf16,
-                    out.stats,
-                    out.fp4,
-                    out.scale,
+                _pack(
+                    logits=out.logits,
+                    selected=out.selected,
+                    weights=out.weights,
+                    local_ids=out.local_ids,
+                    weights_bf16=out.weights_bf16,
+                    stats=out.stats,
+                    fp4=out.fp4,
+                    scale=out.scale,
                 )
             )
             continue
@@ -263,7 +284,9 @@ def _layers(
         logits = _builtin_router(hidden, weight)
         routing.clear_routing_memo()
         selected, weights = routing.apply(logits)
-        ids, weights_bf16, stats = A.ring_buddy_assign(selected, weights, e.rank, True)
+        ids = weights_bf16 = stats = None
+        if CHAIN_PLACE != R.PLACE_NONE:
+            ids, weights_bf16, stats = A.ring_buddy_assign(selected, weights, e.rank, True)
         with torch.cuda.stream(e.aux):
             gathered = e.builtin_pool.gather(chain.pool[layer].clone())
             fp4, scale = rmsnorm_fp4quant(
@@ -277,15 +300,15 @@ def _layers(
             )
         main.wait_stream(e.aux)
         outputs.append(
-            (
-                logits,
-                selected,
-                weights,
-                ids,
-                weights_bf16,
-                stats,
-                fp4.view(torch.uint8),
-                scale.view(torch.uint8),
+            _pack(
+                logits=logits,
+                selected=selected,
+                weights=weights,
+                local_ids=ids,
+                weights_bf16=weights_bf16,
+                stats=stats,
+                fp4=fp4.view(torch.uint8),
+                scale=scale.view(torch.uint8),
             )
         )
     return outputs
@@ -576,6 +599,8 @@ def test_reclassed_moe_prepares_the_builtin_moe_inputs(env, place, fork):
     the NVFP4 expert input, bit for bit; the experts' and the finalize's routing calls then hit the
     memo and the placement. With the router fork's side stream set the router shard runs there
     (``router_shard_side``), with the same bits."""
+    if WORLD != 8 and place != "none":
+        pytest.skip("the ring-buddy placement (replicated_experts) is a TP8 install")
     e = env
     moe, routing, state = _stub_moe(e, place)
     if fork:
@@ -643,7 +668,7 @@ def test_reclassed_moe_prepares_the_builtin_moe_inputs(env, place, fork):
 @torch.inference_mode()
 def test_more_than_eight_rows_take_the_builtin_path(env):
     e = env
-    moe, routing, state = _stub_moe(e, "balance")
+    moe, routing, state = _stub_moe(e, "balance" if WORLD == 8 else "none")
     hidden = torch.randn(9, 8192, device="cuda").bfloat16()
     assert moe._prologue_router_warps(hidden) is None
     assert moe._prologue_router_warps(hidden[:8].contiguous()) == 16

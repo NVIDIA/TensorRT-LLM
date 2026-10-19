@@ -2,17 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """The post-FFN boundary on a transport the unpool GEMM itself publishes into (``unpool_into_boundary``).
 
-``unpool_gather_boundary`` (the gather-transport boundary) loads this rank's ``[M, 1024]`` unpool
-slice from the GEMM's output, publishes it to the peers as tagged 64-bit words,
+``unpool_gather_boundary`` (the gather-transport boundary) loads this rank's ``[M, 8192 / TP]``
+unpool slice (1024 columns at TP8, 2048 at TP4) from the GEMM's output, publishes it to the
+peers as tagged 64-bit words,
 then polls one peer's words per thread. Here the unpool GEMM's output tensor
 *is* this rank's slot of a multicast transport: the GEMM's own epilogue stores
 reach every rank's copy, so the boundary kernel only polls, resets and
 computes. Off the critical path: the dependency-wait release followed by
 the reload of the local slice and the publication.
 
-Transport (Lamport, payload as flag). Every rank holds ``3 buffers x 8 source
-ranks x 8 rows x 1024`` BF16 -- rank-major, so rank ``r``'s slot of buffer
-``p`` is one contiguous ``[rows, 1024]`` block, a GEMM output as it is -- filled
+Transport (Lamport, payload as flag). Every rank holds ``3 buffers x TP source
+ranks x 8 rows x 8192 / TP`` BF16 -- rank-major, so rank ``r``'s slot of buffer
+``p`` is one contiguous ``[rows, 8192 / TP]`` block, a GEMM output as it is -- filled
 with the sentinel word ``0xFFFEFFFE``: two BF16 NaNs with payload ``0x7E``.
 Float-to-BF16 rounding (``cvt.rn.bf16{x2}.f32``, the GEMM epilogues') turns
 every NaN into the canonical ``0x7FFF``, so no GEMM output contains the
@@ -84,11 +85,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from . import unpool_gather_boundary as _f1
-from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLD
+from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLDS
 
-#: Width of the residual stream and of one rank's unpool slice.
+#: Width of the residual stream; one rank's unpool slice is ``local_columns(TP)`` of it.
 HIDDEN = _f1.HIDDEN
-LOCAL_COLUMNS = _f1.LOCAL_COLUMNS
+local_columns = _f1.local_columns
 TRIGGERS = _f1.TRIGGERS
 #: Buffers of the transport: two that alternate call by call, and a third for the last
 #: call of an odd count, so that no two consecutive calls share one (``buffer_sequence``).
@@ -97,9 +98,9 @@ BUFFERS = 3
 DIRECT_SENTINEL = 0xFFFEFFFE
 DIRECT_SENTINEL_HALF = 0xFFFE
 _SENTINEL_I32 = DIRECT_SENTINEL - (1 << 32)
-#: Bytes of one rank's slot (``MAX_ROWS`` rows) and of the whole transport.
-SLAB_BYTES = MAX_ROWS * LOCAL_COLUMNS * 2
-WORKSPACE_BYTES = BUFFERS * WORLD * SLAB_BYTES
+#: Bytes of the whole transport: ``BUFFERS`` x TP slots of ``MAX_ROWS`` rows of a rank's
+#: ``HIDDEN / TP`` columns, the same at every TP size.
+WORKSPACE_BYTES = BUFFERS * MAX_ROWS * HIDDEN * 2
 #: Per-rank control words, in pinned host memory the kernel stores to at system scope:
 #: ``GUARD_WORD`` is set by a poll that outlived the guard.
 CONTROL_WORDS = 4
@@ -108,9 +109,6 @@ GUARD_WORD = 0
 DIRECT_GUARD_NS = 1 << 33
 #: Seconds between two reads of the guard word by ``start_guard_watch``'s thread.
 GUARD_WATCH_S = 1.0
-#: 32-bit payload words of one row of one rank's slice, and threads per peer slice.
-_ROW_WORDS = LOCAL_COLUMNS // 2
-_PER_PEER = _ROW_WORDS // 4
 
 _AVAILABLE = HAS_CUTE_DSL and _f1.available()
 
@@ -213,8 +211,9 @@ if _AVAILABLE:
             capture: bool,
             guard_ns: int,
             guard_break: bool,
+            world: int = 8,
         ):
-            super().__init__(m, gain, post_eps, pre_eps, norm_fp32, 0, trigger)
+            super().__init__(m, gain, post_eps, pre_eps, norm_fp32, 0, trigger, world)
             self.capture = bool(capture)
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
@@ -310,8 +309,8 @@ if _AVAILABLE:
                 # Thread (rank, tid) covers columns [offset, offset + 8): words
                 # [word, word + 4) of peer ``peer``'s slice, as in the gather boundary.
                 flat = rank * self.threads + tid
-                peer = flat // _PER_PEER
-                word = (flat % _PER_PEER) * 4
+                peer = flat // self.per_peer
+                word = (flat % self.per_peer) * 4
 
                 a = self.load(alpha + offset, Float32)
                 b = self.load(beta + offset, Float32)
@@ -326,7 +325,8 @@ if _AVAILABLE:
                 box = (
                     receive.toint()
                     + (
-                        ((Int64(parity) * WORLD + Int64(peer)) * MAX_ROWS + Int64(row)) * _ROW_WORDS
+                        ((Int64(parity) * self.world + Int64(peer)) * MAX_ROWS + Int64(row))
+                        * self.row_words
                         + Int64(word)
                     )
                     * 4
@@ -458,9 +458,19 @@ if _AVAILABLE:
         capture: bool,
         guard_ns: int,
         guard_break: bool,
+        world: int = 8,
     ):
         kernel = _UnpoolDirectBoundaryKernel(
-            rows, has_gain, post_eps, pre_eps, norm_fp32, trigger, capture, guard_ns, guard_break
+            rows,
+            has_gain,
+            post_eps,
+            pre_eps,
+            norm_fp32,
+            trigger,
+            capture,
+            guard_ns,
+            guard_break,
+            world,
         )
         pointers = [
             make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -546,9 +556,9 @@ def buffer_sequence(calls: int) -> Tuple[int, ...]:
 
 
 class UnpoolDirectWorkspace:
-    """The direct transport of the post-FFN boundary (``unpool_into_boundary``) for one TP8 group.
+    """The direct transport of the post-FFN boundary (``unpool_into_boundary``) for one TP4 or TP8 group.
 
-    ``slot(buffer, rows)`` is this rank's ``[rows, 1024]`` BF16 slot of buffer
+    ``slot(buffer, rows)`` is this rank's ``[rows, 8192 / TP]`` BF16 slot of buffer
     ``buffer`` on the multicast address: a GEMM given it as its output publishes
     into every rank's copy. ``kernel(variant)`` is the compiled boundary for a
     call's settings. Construction is collective over the group (fabric
@@ -577,9 +587,12 @@ class UnpoolDirectWorkspace:
             _mnnvl_workspace_all_succeeded,
         )
 
-        if mapping.tp_size != WORLD or mapping.enable_attention_dp or mapping.cp_size != 1:
-            raise ValueError("the direct unpool transport needs TP8 without attention DP or CP")
+        if mapping.tp_size not in WORLDS or mapping.enable_attention_dp or mapping.cp_size != 1:
+            raise ValueError(
+                "the direct unpool transport needs TP4 or TP8 without attention DP or CP"
+            )
         self.rank = mapping.tp_rank
+        self.world = mapping.tp_size
         self.guard_ns = int(guard_ns)
         self.guard_break = bool(guard_break)
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
@@ -610,7 +623,7 @@ class UnpoolDirectWorkspace:
             self._receive = self._handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
             self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
             self._slots = self._mc.view(torch.bfloat16).view(
-                BUFFERS, WORLD, MAX_ROWS, LOCAL_COLUMNS
+                BUFFERS, self.world, MAX_ROWS, local_columns(self.world)
             )
             with torch.cuda.device(self.device):
                 self._receive.fill_(_SENTINEL_I32)
@@ -636,7 +649,7 @@ class UnpoolDirectWorkspace:
             ) from error
 
     def slot(self, buffer: int, rows: int) -> torch.Tensor:
-        """This rank's ``[rows, 1024]`` BF16 slot of ``buffer``, on the multicast address.
+        """This rank's ``[rows, 8192 / TP]`` BF16 slot of ``buffer``, on the multicast address.
 
         Write-only: a store through it reaches every rank's copy; nothing may read it.
         """
@@ -645,7 +658,7 @@ class UnpoolDirectWorkspace:
         return self._slots[buffer, self.rank, :rows]
 
     def receive(self) -> torch.Tensor:
-        """This rank's copy of the whole transport, ``int32 [3 * 8 * 8 * 512]`` (tests)."""
+        """This rank's copy of the whole transport, ``int32 [3 * 8 * 4096]`` (tests)."""
         return self._receive
 
     def control_ptr(self) -> int:
@@ -760,6 +773,7 @@ class UnpoolDirectWorkspace:
             capture,
             self.guard_ns,
             self.guard_break,
+            self.world,
         )
         # A dry launch loads the module now, not inside a capture.
         dummy = self._dry.data_ptr()
@@ -802,7 +816,7 @@ class UnpoolDirectBoundary(OpWrapper):
     epsilons, the norm ordering, ``trigger`` and ``capture`` are the gather boundary's.
     Returns its ``(updated, next_input)`` for the same slices.
 
-    A collective over the TP8 group: every rank calls it with the same row count
+    A collective over the TP group (TP4 or TP8): every rank calls it with the same row count
     and buffer, in the same order relative to its other calls on ``workspace``,
     and no two consecutive calls on one buffer (``buffer_sequence``). Launched
     with programmatic dependent launch.
@@ -971,9 +985,10 @@ class UnpoolDirectBoundary(OpWrapper):
         nobody published for this call (it would wait for them forever).
         """
         rows = published.shape[0] if published.dim() == 2 else -1
-        if not 1 <= rows <= MAX_ROWS or tuple(published.shape) != (rows, LOCAL_COLUMNS):
+        columns = local_columns(workspace.world)
+        if not 1 <= rows <= MAX_ROWS or tuple(published.shape) != (rows, columns):
             raise ValueError(
-                f"published must be [1..{MAX_ROWS}, {LOCAL_COLUMNS}], got {tuple(published.shape)}"
+                f"published must be [1..{MAX_ROWS}, {columns}], got {tuple(published.shape)}"
             )
         if (
             parity not in range(BUFFERS)

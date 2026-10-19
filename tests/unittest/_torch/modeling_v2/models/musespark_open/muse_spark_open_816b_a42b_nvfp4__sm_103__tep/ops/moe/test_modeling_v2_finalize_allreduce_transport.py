@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the musespark_open finalize_allreduce_transport entry (TP8 over two GB300 nodes).
+"""GPU test for the musespark_open finalize_allreduce_transport entry (TP8 or TP4 on GB300).
 
-Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes, e.g.
-``srun -N2 --ntasks-per-node=4 --mpi=pmix python -m pytest <this file>``;
-anywhere else every test skips.
+Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes (TP8), e.g.
+``srun -N2 --ntasks-per-node=4 --mpi=pmix python -m pytest <this file>``, or with
+four MPI ranks on one four-GPU GB300 node (TP4, against the built-in single-tray
+IPC workspace); anywhere else every test skips.
 
-The entry claims the built-in kernel's bits: a built-in fabric workspace and a
-``FinalizeTransportWorkspace`` per transport variant get the same inputs, and
+The entry claims the built-in kernel's bits: a built-in workspace (fabric at TP8,
+IPC at TP4) and a ``FinalizeTransportWorkspace`` per transport variant get the
+same inputs, and
 their outputs must be equal as raw bits on every rank. Covered: every cell
 (tokens 1, 8, 16; every slot of a token on one rank; a ring-buddy placement;
 exact zeros, negative zeros and BF16 subnormals whose partials round to ``-0``;
@@ -56,7 +58,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 __extra_import_path__ = ["../../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
-WORLD = 8
+#: The TP size under test: the MPI world when it is 4 or 8 (else every test skips).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
 HIDDEN = 4096
 TOP_K = 8
 EPS = 1e-8
@@ -74,11 +77,22 @@ VARIANTS = {
     "uc_red_warp": fin.Transport(publish="unicast"),
     "mc_atom_warp": fin.Transport(arrival="atom"),
 }
+if WORLD == 4:
+    # The built-in TP4 kernel adds its slot sums warp by warp in one CTA; only the
+    # warp reduction keeps that order (``flat_sum``), so only its variants claim its bits.
+    VARIANTS = {
+        name: transport for name, transport in VARIANTS.items() if transport.reduction == "warp"
+    }
+
+
+def _present(names):
+    """The variants of ``names`` this TP size certifies (``VARIANTS``)."""
+    return [name for name in names if name in VARIANTS]
 
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
@@ -93,13 +107,13 @@ def _agree(comm, ok: bool) -> bool:
 
 @pytest.fixture(scope="module")
 def group():
-    """A built-in fabric workspace and one transport workspace per variant, for the module."""
+    """A built-in workspace and one transport workspace per variant, for the module."""
     comm, rank = _world()
     from tensorrt_llm._torch.models.musespark_open_finalize_ar import FinalizeIpcWorkspace
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=WORLD, tp_size=WORLD, rank=rank, gpus_per_node=4)
-    builtin = FinalizeIpcWorkspace(mapping, use_mnnvl=True)
+    builtin = FinalizeIpcWorkspace(mapping, use_mnnvl=WORLD == 8)
     workspaces = {
         name: fin.FinalizeTransportWorkspace(builtin, mapping, transport)
         for name, transport in VARIANTS.items()
@@ -134,7 +148,7 @@ def _owners(tokens: int, seed: int, placement: str) -> torch.Tensor:
         return torch.arange(tokens)[:, None].expand(tokens, TOP_K) % WORLD
     gen = torch.Generator().manual_seed(10_000 + seed)
     experts = torch.stack([torch.randperm(256, generator=gen)[:TOP_K] for _ in range(tokens)])
-    owner = experts // 32
+    owner = experts // (256 // WORLD)
     if placement == "buddy":
         moved = torch.rand(tokens, TOP_K, generator=gen) < 0.4
         owner = torch.where(moved, (owner + 1) % WORLD, owner)
@@ -252,7 +266,8 @@ def test_cell_is_the_builtin_kernel_bit_for_bit(group, cell, variant, certifying
 
 
 @pytest.mark.parametrize(
-    "variant", ["finalize_transport", "finalize_transport_entry", "uc_atom_pull", "mc_red_push"]
+    "variant",
+    _present(["finalize_transport", "finalize_transport_entry", "uc_atom_pull", "mc_red_push"]),
 )
 @torch.inference_mode()
 def test_every_token_count(group, variant):
@@ -272,7 +287,7 @@ def test_every_token_count(group, variant):
 
 
 @pytest.mark.parametrize(
-    "variant", ["finalize_transport", "finalize_transport_entry", "mc_red_push_e"]
+    "variant", _present(["finalize_transport", "finalize_transport_entry", "mc_red_push_e"])
 )
 @torch.inference_mode()
 def test_a_delayed_rank_is_waited_for(group, variant):
@@ -293,7 +308,8 @@ def test_a_delayed_rank_is_waited_for(group, variant):
 
 
 @pytest.mark.parametrize(
-    "variant", ["finalize_transport", "finalize_transport_entry", "mc_atom_warp", "mc_red_push"]
+    "variant",
+    _present(["finalize_transport", "finalize_transport_entry", "mc_atom_warp", "mc_red_push"]),
 )
 @torch.inference_mode()
 def test_graph_replay_with_changing_inputs_and_token_counts(group, variant):
@@ -333,7 +349,9 @@ def test_graph_replay_with_changing_inputs_and_token_counts(group, variant):
     assert _agree(comm, bad == 0), f"rank {rank} {variant}: {bad} values differ across replays"
 
 
-@pytest.mark.parametrize("variant", ["finalize_transport_entry", "uc_red_warp", "mc_red_push_e"])
+@pytest.mark.parametrize(
+    "variant", _present(["finalize_transport_entry", "uc_red_warp", "mc_red_push_e"])
+)
 @torch.inference_mode()
 def test_a_long_burst_of_mixed_token_counts_stays_identical(group, variant):
     comm, rank, builtin, workspaces = group
@@ -514,7 +532,7 @@ def test_consecutive_calls_alternate_the_buffers_by_the_counter_parity(group, va
     slab_words = fin.SLAB_BYTES // 4
 
     def own(buffer):
-        start = (buffer * fin.RANKS + rank) * slab_words
+        start = (buffer * WORLD + rank) * slab_words
         return area[start : start + slab_words]
 
     shapes = (8, 8, 1, 16, 3, 8, 17, 8, 12, 8, 8, 2, 16, 8, 17, 17, 8, 5)
@@ -662,7 +680,7 @@ def _sharing(ws, transport):
     twin = object.__new__(fin.FinalizeTransportWorkspace)
     twin.__dict__.update(ws.__dict__)
     twin.transport = transport
-    twin._compiled = fin._compiled_kernel(ws.device.index, transport, ws.pdl)
+    twin._compiled = fin._compiled_kernel(ws.device.index, transport, ws.pdl, ws.ranks)
     return twin
 
 
@@ -744,12 +762,14 @@ def test_microbenchmark_with_the_real_neighbours(group):
     comm, rank, builtin, workspaces = group
     arms = [("builtin", builtin)] + [
         (name, workspaces[name])
-        for name in (
-            "uc_atom_pull",
-            "mc_red_push",
-            "mc_red_push_e",
-            "finalize_transport",
-            "finalize_transport_entry",
+        for name in _present(
+            (
+                "uc_atom_pull",
+                "mc_red_push",
+                "mc_red_push_e",
+                "finalize_transport",
+                "finalize_transport_entry",
+            )
         )
     ]
     _neighbour_chains(comm, rank, arms, tag="finalize_transport chain")
@@ -845,9 +865,10 @@ def test_microbenchmark_workspace_placement(group):
 
     comm, rank, builtin, workspaces = group
     mapping = Mapping(world_size=WORLD, tp_size=WORLD, rank=rank, gpus_per_node=4)
-    arms = [(f"{name}#fixture", workspaces[name]) for name in ("finalize_transport", "mc_red_push")]
+    names = [name for name in ("finalize_transport", "mc_red_push") if name in VARIANTS]
+    arms = [(f"{name}#fixture", workspaces[name]) for name in names]
     for copy in range(4):
-        for name in ("finalize_transport", "mc_red_push"):
+        for name in names:
             ws = fin.FinalizeTransportWorkspace(builtin, mapping, VARIANTS[name])
             _KEPT.append(ws)
             arms.append((f"{name}#{copy}", ws))

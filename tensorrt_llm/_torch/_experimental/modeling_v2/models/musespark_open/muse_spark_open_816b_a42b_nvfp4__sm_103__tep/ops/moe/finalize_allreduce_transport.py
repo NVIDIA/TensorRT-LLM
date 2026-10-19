@@ -1,16 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The fused expert finalize + all-reduce at TP8, on the fused hop's transport.
+"""The fused expert finalize + all-reduce at TP8 or TP4, on the fused hop's transport.
 
 The built-in ``FinalizeIpcWorkspace.finalize`` (``tensorrt_llm/_torch/models/
 musespark_open_finalize_ar.py``) normalizes each selected expert row on its own
 (weight-first RMSNorm with zero-centered gains), weights and adds a token's
 rows in FP32, rounds this rank's partial to BF16 with ``-0`` cleared, and sums
-the eight ranks' partials in FP32 in rank order before one more BF16 rounding.
+the ranks' partials in FP32 in rank order before one more BF16 rounding.
 This entry computes exactly that -- the same statements on the same thread map
 (a cluster of 8 CTAs per token, 64 threads, one 16-byte column vector of all 8
 slots per thread), so every rounding happens on the same operands in the same
-order -- and changes only how the partials travel and when dependents start:
+order -- and changes only how the partials travel and when dependents start.
+
+At TP8 the wrapped workspace is the fabric one over two trays, whose kernel runs
+a cluster of 8 at up to 16 tokens. At TP4 it is the single-tray IPC workspace,
+whose kernel runs one 512-thread CTA per token (cluster 1): this entry keeps
+its cluster of 8 there and adds the sixteen warp sums of a slot in the
+built-in's order, warp by warp from +0 with no per-CTA subtotal (``flat_sum``),
+so the TP4 result is the built-in TP4 kernel's bit for bit as well.
+
 
 * **Publication.** One store per thread to the slot's multicast address: the
   fabric writes it into slot ``rank`` of every rank's receive buffer (the
@@ -120,12 +128,20 @@ MAX_TOKENS = 16
 CLUSTER = 8
 VECTOR = 8
 THREADS = HIDDEN // (CLUSTER * VECTOR)
-#: The tensor-parallel group size the transport is laid out for.
-RANKS = 8
+#: The tensor-parallel group sizes the transport is laid out for: TP4 on one tray,
+#: TP8 over two. The kernel takes ``MAX_RANKS`` peer pointers whatever the size.
+RANK_COUNTS = (4, 8)
+MAX_RANKS = 8
 SENTINEL = 0x80000000
 BUFFERS = 2
 SLAB_BYTES = MAX_TOKENS * HIDDEN * 2
-WORKSPACE_BYTES = BUFFERS * RANKS * SLAB_BYTES
+
+
+def workspace_bytes(ranks: int) -> int:
+    """Bytes of one rank's receive area for a group of ``ranks``."""
+    return BUFFERS * ranks * SLAB_BYTES
+
+
 #: Control words: 0 the buffer index and 1 the counter of the built-in-style
 #: ``atom`` arrival, 2 the free-running counter of the ``red`` arrival.
 CONTROL_WORDS = 4
@@ -370,7 +386,7 @@ if HAS_CUTE_DSL:
 
         def slab_offset(self, buffer, source):
             """Byte offset of ``source``'s slab of ``buffer`` in a receive area."""
-            return (Int64(buffer) * RANKS + Int64(source)) * SLAB_BYTES
+            return (Int64(buffer) * self.ranks + Int64(source)) * SLAB_BYTES
 
         def publish(self, own, buffer, slot, rank, mcast, peers):
             """Store this rank's four words into slot ``rank`` of every rank's buffer."""
@@ -421,7 +437,7 @@ if HAS_CUTE_DSL:
             while stale != Uint32(0):
                 polled = stale
                 for p in cutlass.range_constexpr(self.ranks):
-                    address = receive + (Int64(buffer) * RANKS + p) * SLAB_BYTES + slot
+                    address = receive + (Int64(buffer) * self.ranks + p) * SLAB_BYTES + slot
                     v0, v1, v2, v3 = _poll_x4(
                         address,
                         (polled >> Uint32(p)) & Uint32(1),
@@ -443,7 +459,7 @@ if HAS_CUTE_DSL:
         def retire(self, buffer, slot, rank, receive):
             """Write the sentinel back into every peer slot this thread consumed."""
             for p in range(self.ranks):
-                address = receive + (Int64(buffer) * RANKS + p) * SLAB_BYTES + slot
+                address = receive + (Int64(buffer) * self.ranks + p) * SLAB_BYTES + slot
                 _reset_x4(address, Uint32(rank != p))
 
     class _FinalizeTransportKernel(LamportExchange):
@@ -451,11 +467,17 @@ if HAS_CUTE_DSL:
 
         CTA ``b`` handles token ``b // 8`` and the ``b % 8``-th 512-column slice;
         each thread owns one 16-byte column vector of that slice for all 8
-        slots -- the built-in kernel's map.
+        slots -- the built-in kernel's map. ``ranks`` is the TP size; at TP4 the
+        slot sums are added flat (``flat_sum``, the built-in cluster-1 order).
         """
 
-        def __init__(self, transport: Transport, pdl: bool):
-            self.ranks = RANKS
+        def __init__(self, transport: Transport, pdl: bool, ranks: int = 8):
+            if ranks not in RANK_COUNTS:
+                raise ValueError(f"the finalize transport serves {RANK_COUNTS} ranks, got {ranks}")
+            self.ranks = ranks
+            # The built-in TP4 kernel runs one CTA per token and adds its warps' sums
+            # from +0 in warp order; TP8's cluster of 8 adds per-CTA totals.
+            self.flat_sum = ranks == 4
             self.cluster = CLUSTER
             self.threads = THREADS
             self.warps = THREADS // 32
@@ -680,14 +702,20 @@ if HAS_CUTE_DSL:
                         )
                     cute.arch.mbarrier_wait(bar.iterator, 0)
                     if tid < TOP_K:
-                        # The built-in's per-CTA total (warps in order from +0),
-                        # then the cluster total (CTAs in order from +0).
                         total = Float32(0.0)
-                        for c in cutlass.range_constexpr(self.cluster):
-                            cta_total = Float32(0.0)
-                            for w in cutlass.range_constexpr(self.warps):
-                                cta_total = cta_total + recv[(c * self.warps + w) * TOP_K + tid]
-                            total = total + cta_total
+                        if cutlass.const_expr(self.flat_sum):
+                            # The built-in TP4 order: one CTA's warps in order from +0.
+                            for c in cutlass.range_constexpr(self.cluster):
+                                for w in cutlass.range_constexpr(self.warps):
+                                    total = total + recv[(c * self.warps + w) * TOP_K + tid]
+                        else:
+                            # The built-in TP8 order: per-CTA totals (warps in order
+                            # from +0), then the cluster total (CTAs in order from +0).
+                            for c in cutlass.range_constexpr(self.cluster):
+                                cta_total = Float32(0.0)
+                                for w in cutlass.range_constexpr(self.warps):
+                                    cta_total = cta_total + recv[(c * self.warps + w) * TOP_K + tid]
+                                total = total + cta_total
                         sums[tid] = total
                 else:
                     if lane == 0:
@@ -783,13 +811,13 @@ if HAS_CUTE_DSL:
         Uint32,  # control
         Uint32,  # receive
         Uint32,  # mcast
-    ) + (Uint32,) * RANKS
+    ) + (Uint32,) * MAX_RANKS
     #: The built-in's assumptions: 4 bytes for the row map and the routing weights.
     _POINTER_ALIGNMENTS = (16, 4, 4) + (16,) * (len(_POINTER_DTYPES) - 3)
 
     @functools.lru_cache(maxsize=32)
-    def _compiled_kernel(device_index: int, transport: Transport, pdl: bool):
-        kernel = _FinalizeTransportKernel(transport, pdl)
+    def _compiled_kernel(device_index: int, transport: Transport, pdl: bool, ranks: int = 8):
+        kernel = _FinalizeTransportKernel(transport, pdl, ranks)
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
@@ -814,7 +842,7 @@ def _pdl_enabled() -> bool:
 
 
 class FinalizeTransportWorkspace:
-    """This transport's memory and state for one TP8 group, in front of a built-in workspace.
+    """This transport's memory and state for one TP4 or TP8 group, in front of a built-in workspace.
 
     ``finalize`` has the built-in ``FinalizeIpcWorkspace.finalize`` signature and
     input contract: calls of 1..16 tokens run this module's kernel, every other
@@ -823,6 +851,10 @@ class FinalizeTransportWorkspace:
     choice depends on ``num_tokens`` only). Construction is collective over the
     group (multicast allocation, sentinel fill, kernel compilation and a dry
     launch) and either succeeds on every rank or raises on every rank.
+
+    The wrapped workspace is the TP8 fabric one (two trays) or the TP4 IPC one
+    (one tray); the multicast transport uses fabric handles only when the group
+    spans nodes, as the post-attention hop's does.
     """
 
     def __init__(self, legacy, mapping: Mapping, transport: Transport = DEFAULT):
@@ -833,10 +865,14 @@ class FinalizeTransportWorkspace:
             _mnnvl_workspace_all_succeeded,
         )
 
-        if mapping.tp_size != RANKS:
-            raise ValueError(f"the finalize transport serves TP{RANKS}, got TP{mapping.tp_size}")
+        if mapping.tp_size not in RANK_COUNTS:
+            raise ValueError(
+                f"the finalize transport serves TP{' or TP'.join(map(str, RANK_COUNTS))}, "
+                f"got TP{mapping.tp_size}"
+            )
         self.legacy = legacy
         self.transport = transport
+        self.ranks = mapping.tp_size
         self.rank = mapping.tp_rank
         self.pdl = _pdl_enabled()
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
@@ -847,14 +883,24 @@ class FinalizeTransportWorkspace:
                 raise RuntimeError("the CuTe DSL or the built-in finalize module is unavailable")
             if type(legacy) is not _legacy.FinalizeIpcWorkspace or legacy._closed:
                 raise RuntimeError(f"expected an open FinalizeIpcWorkspace, got {type(legacy)!r}")
-            if not legacy._use_mnnvl or legacy._ranks != RANKS:
-                raise RuntimeError("the wrapped workspace is not the TP8 fabric one")
+            if legacy._ranks != self.ranks:
+                raise RuntimeError(
+                    f"the wrapped workspace serves {legacy._ranks} ranks, the group {self.ranks}"
+                )
+            if self.ranks == 8 and not legacy._use_mnnvl:
+                raise RuntimeError("the wrapped TP8 workspace is not the fabric one")
+            if self.ranks == 4 and (legacy._use_mnnvl or mapping.is_multi_node()):
+                raise RuntimeError("the wrapped TP4 workspace is not the single-tray IPC one")
             if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
                 raise RuntimeError("the finalize transport runs on SM103 or SM107 only")
-            self._handle = _make_mnnvl_mcast_buffer(self._comm, WORKSPACE_BYTES, mapping, True)
-            words = WORKSPACE_BYTES // 4
+            size = workspace_bytes(self.ranks)
+            self._handle = _make_mnnvl_mcast_buffer(
+                self._comm, size, mapping, mapping.is_multi_node()
+            )
+            words = size // 4
             self._uc = [
-                self._handle.get_uc_buffer(peer, (words,), torch.int32, 0) for peer in range(RANKS)
+                self._handle.get_uc_buffer(peer, (words,), torch.int32, 0)
+                for peer in range(self.ranks)
             ]
             self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
             with torch.cuda.device(self.device):
@@ -869,15 +915,17 @@ class FinalizeTransportWorkspace:
                 f"{f' (this rank: {error!r})' if error is not None else ''}"
             ) from error
         receive = self._uc[self.rank].data_ptr()
+        peers = [t.data_ptr() for t in self._uc]
         self._fixed = (
             self.control.data_ptr(),
             receive,
             self._mc.data_ptr(),
-            *[t.data_ptr() for t in self._uc],
+            # Peer pointers past the group are never dereferenced.
+            *(peers + [receive] * (MAX_RANKS - self.ranks)),
         )
         error = None
         try:
-            self._compiled = _compiled_kernel(self.device.index, transport, self.pdl)
+            self._compiled = _compiled_kernel(self.device.index, transport, self.pdl, self.ranks)
             # A dry launch loads the module now, not inside a capture.
             dummy = self.control.data_ptr()
             self._launch(dummy, dummy, dummy, dummy, dummy, 0, HIDDEN, 1, 1.0, 1)
@@ -1000,8 +1048,9 @@ class FinalizeAllReduceTransport(OpWrapper):
     long burst, the arrival counter across its wrap, a producer that triggers
     its dependents before it writes their inputs) and against `reference`
     within a band; the alternation of the two receive buffers by the counter's
-    parity is checked white-box. Not certified: TP4, more than 16 tokens
-    (served by the built-in kernel).
+    parity is checked white-box; at TP4 (4 ranks on one tray) the same test
+    against the built-in TP4 IPC kernel (cluster 1). Not certified: more than
+    16 tokens (served by the built-in kernel).
     """
 
     def __call__(

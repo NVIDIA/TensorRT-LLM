@@ -586,8 +586,9 @@ _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: TEP4 on sm103 adds the attention paths validated at a tep4 rank's 32 query / 4 KV
 #: heads, the dense projections and drafter GEMMs on their tep4 kernel tables, the
 #: drafter hops and PDL chain on the tray's MNNVL one-shot, the LM-head inbox on the
-#: tray's multicast, and the expert paths on the owner-only 64-expert window (no
-#: replication).
+#: tray's multicast, the expert paths on the owner-only 64-expert window (no
+#: replication), and the sharded-projection gathers, the MoE prologue and the
+#: finalize transport on the tray.
 _SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
     {
         "swa_paged_decode",
@@ -602,6 +603,11 @@ _SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
         "lm_head_inbox",
         "persistent_experts",
         "bf16_routed_experts",
+        "projection_gathers",
+        "boundary_early_release",
+        "capture_fold",
+        "moe_prologue",
+        "finalize_transport",
     }
 )
 

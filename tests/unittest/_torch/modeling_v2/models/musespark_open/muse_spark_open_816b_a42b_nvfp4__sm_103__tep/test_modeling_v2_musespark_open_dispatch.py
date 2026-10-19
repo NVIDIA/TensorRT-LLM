@@ -237,8 +237,9 @@ _TEP4 = _TEP4_BITWISE | {"drafter_fc_shard"}
 #: sm103 TEP4's composition adds the attention paths validated at a tep4 rank's 32
 #: query / 4 KV heads, the dense projections and drafter GEMMs on their tep4 kernel
 #: tables, the drafter hops and PDL chain on the tray's MNNVL one-shot, the LM-head
-#: inbox on the tray's multicast, and the expert paths on the owner-only 64-expert
-#: window (no replication).
+#: inbox on the tray's multicast, the expert paths on the owner-only 64-expert
+#: window (no replication), and the sharded-projection gathers, the MoE prologue and
+#: the finalize transport on the tray.
 _SM103_TEP4 = _TEP4 | {
     "swa_paged_decode",
     "swa_block",
@@ -252,6 +253,11 @@ _SM103_TEP4 = _TEP4 | {
     "lm_head_inbox",
     "persistent_experts",
     "bf16_routed_experts",
+    "projection_gathers",
+    "boundary_early_release",
+    "capture_fold",
+    "moe_prologue",
+    "finalize_transport",
 }
 
 
@@ -270,22 +276,14 @@ def test_sm103_tensor_parallel_size_4_serves_its_composition_on_one_tray():
         assert dispatch.composition(_config(4, spec), modeling.TARGET_PATHS, _SM103) is None
 
 
-#: Requirements only the TP8 composition's paths have: a TP4 deployment cannot (the
-#: sharded projections raise in the built-in model at tp 4) or need not meet them.
+#: Requirements only the TP8 composition's paths have: a TP4 deployment need not meet them.
 _TP8_ONLY = (
-    "MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL",
-    "MUSESPARK_OPEN_SHARDED_PROJECTIONS",
-    "MUSESPARK_OPEN_ROUTING_MEMO",
-    "MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT",
-    "finalize transport",
-    "projection gathers",
-    "MoE prologue",
     "pool transport",
     "unpool transport",
 )
 
 
-def test_tensor_parallel_size_4_needs_no_tp8_only_setting():
+def test_tensor_parallel_size_4_needs_only_its_own_settings():
     tep4 = modeling.TARGET_PATHS[103, 4]
     required = [p.requirement for p in dispatch.preconditions(tep4.served, tep4)]
     for word in _TP8_ONLY:
@@ -304,6 +302,13 @@ def test_tensor_parallel_size_4_needs_no_tp8_only_setting():
         "head sampler",
         "drafter hops",
         "MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL",
+        "MUSESPARK_OPEN_SHARDED_PROJECTIONS",
+        "MUSESPARK_OPEN_ROUTING_MEMO",
+        "MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT",
+        "built in on one tray at TP4",
+        "finalize transport",
+        "projection gathers",
+        "MoE prologue",
     ):
         assert any(word in requirement for requirement in required), word
 

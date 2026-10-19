@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test of ``projection_gathers`` as a decode step runs it (TP8, two GB300 nodes).
+"""GPU test of ``projection_gathers`` as a decode step runs it (TP8 on two GB300 nodes, TP4 on one).
 
-Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes (four ranks
-per node, ``python -m pytest <this file>`` under the MPI launcher); anywhere else
-every test skips.
+Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes, or four on
+one (four ranks per node, ``python -m pytest <this file>`` under the MPI
+launcher); anywhere else every test skips.
 
 The op tests under ``comm/`` drive one fused call per CUDA-graph replay with a
 host barrier between replays. This file drives both fused ops the way the
@@ -54,7 +54,11 @@ U = importlib.import_module(_TARGET + ".ops.comm.unpool_gather_boundary")
 P = importlib.import_module(_TARGET + ".ops.comm.pool_gather_fp4quant")
 PG = importlib.import_module(_TARGET + ".kernels.projection_gathers.gathers")
 
-WORLD = 8
+#: The TP size under test: the MPI world when it is 4 (one node) or 8 (two nodes).
+WORLD = MPI.COMM_WORLD.Get_size() if MPI is not None and MPI.COMM_WORLD.Get_size() in (4, 8) else 8
+#: Local pool and unpool columns per rank.
+P_LOCAL = P.local_columns(WORLD)
+U_LOCAL = U.local_columns(WORLD)
 #: Pool sites per decode step (every layer); the unpool runs at 61 of them in
 #: the model, all 62 here.
 LAYERS = 62
@@ -66,7 +70,7 @@ _SPECIAL = (-32768, 1, 32639, 128, -129)
 
 def _world():
     if MPI is None or MPI.COMM_WORLD.Get_size() != WORLD or not torch.cuda.is_available():
-        pytest.skip("needs eight MPI ranks with CUDA (two four-GPU nodes)")
+        pytest.skip("needs eight MPI ranks (two four-GPU nodes) or four (one) with CUDA")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
@@ -90,8 +94,8 @@ def env():
     e.mapping = Mapping(world_size=WORLD, tp_size=WORLD, rank=rank, gpus_per_node=4)
     e.builtin_pool = ProjectionGatherWorkspace(e.mapping)
     e.builtin_unpool = ProjectionGatherWorkspace(e.mapping)
-    e.pool_inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=P.LOCAL_COLUMNS // 2)
-    e.unpool_inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=U.LOCAL_COLUMNS // 2)
+    e.pool_inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=P_LOCAL // 2)
+    e.unpool_inbox = inbox_mod.ProjectionInbox(e.mapping, row_words=U_LOCAL // 2)
     e.aux = torch.cuda.Stream()
     torch.manual_seed(1234)  # the same weights on every rank, as under TP
     with torch.no_grad():
@@ -148,10 +152,8 @@ class _Chain:
 
     def __init__(self, rows: int, rank: int):
         self.rows, self.rank = rows, rank
-        self.pool = torch.zeros(LAYERS, rows, P.LOCAL_COLUMNS, device="cuda", dtype=torch.bfloat16)
-        self.unpool = torch.zeros(
-            LAYERS, rows, U.LOCAL_COLUMNS, device="cuda", dtype=torch.bfloat16
-        )
+        self.pool = torch.zeros(LAYERS, rows, P_LOCAL, device="cuda", dtype=torch.bfloat16)
+        self.unpool = torch.zeros(LAYERS, rows, U_LOCAL, device="cuda", dtype=torch.bfloat16)
         self.residual = torch.zeros(LAYERS, rows, U.HIDDEN, device="cuda", dtype=torch.float32)
 
     def fill(self, seed: int, special: bool = False):
@@ -354,9 +356,7 @@ def test_reclassed_moe_prepares_the_builtin_expert_input(env):
     for declined in (False, True):
         backend.fc31_act_scale = torch.ones(1, device="cuda") if declined else None
         for rows in (1, 3, 8):
-            local = _bf16(
-                (rows, P.LOCAL_COLUMNS), 80000 + rows * 16 + e.rank + 1000 * declined, 2.0
-            )
+            local = _bf16((rows, P_LOCAL), 80000 + rows * 16 + e.rank + 1000 * declined, 2.0)
             local = local.cuda()
             want = MuseSparkOpenMoE.prepare_expert_input(moe, e.builtin_pool.gather(local))
             got = moe.prepare_expert_input(local)
@@ -409,11 +409,11 @@ def test_the_fused_choice_reads_no_pointer_value(env):
     gate._gather = e.builtin_unpool
     alpha, beta = gate.coefficients()
     aligned_residual = torch.randn(rows, U.HIDDEN, device="cuda")
-    aligned_local = _bf16((rows, U.LOCAL_COLUMNS), 5, 1.0).cuda()
+    aligned_local = _bf16((rows, U_LOCAL), 5, 1.0).cuda()
     unpool_counters = e.unpool_inbox.counters.clone()
     for residual, local in (
         (_misaligned(rows, U.HIDDEN, torch.float32), aligned_local),
-        (aligned_residual, _misaligned(rows, U.LOCAL_COLUMNS, torch.bfloat16)),
+        (aligned_residual, _misaligned(rows, U_LOCAL, torch.bfloat16)),
     ):
         assert gate._fits_fused(residual, local, e.norm, e.post_gain, alpha, beta)
         if residual is not aligned_residual:
@@ -426,7 +426,7 @@ def test_the_fused_choice_reads_no_pointer_value(env):
 
     moe, _ = _stub_moe(e)
     pool_counters = e.pool_inbox.counters.clone()
-    pooled = _misaligned(rows, P.LOCAL_COLUMNS, torch.bfloat16)
+    pooled = _misaligned(rows, P_LOCAL, torch.bfloat16)
     assert moe._pool_quant_args(pooled) is not None
     with pytest.raises(RuntimeError, match="16-byte"):
         moe.prepare_expert_input(pooled)
@@ -449,7 +449,7 @@ def test_the_sites_are_agreed_on_every_rank(env, monkeypatch):
     with pytest.raises(ValueError, match=r"projection_gathers \(unpool\) needs"):
         PG.fusable_sites(e.mapping, unpool=True, pool=True)
     monkeypatch.undo()
-    if e.rank == 5:
+    if e.rank == WORLD - 3:
         monkeypatch.setattr(PG._pool, "available", lambda: False)
     with pytest.raises(ValueError, match=r"projection_gathers \(pool\) needs"):
         PG.fusable_sites(e.mapping, unpool=True, pool=True)
@@ -509,7 +509,7 @@ def test_microbenchmark_jit_compile(env):
     for rows in range(1, 9):
         U._compile.cache_clear()
         start = time.perf_counter()
-        U._compile(rows, True, POST_EPS, PRE_EPS, device, False, e.rank)
+        U._compile(rows, True, POST_EPS, PRE_EPS, device, False, e.rank, world=WORLD)
         seconds[f"fused unpool boundary rows={rows}"] = time.perf_counter() - start
         builtin._compile_boundary.cache_clear()
         start = time.perf_counter()
@@ -517,7 +517,7 @@ def test_microbenchmark_jit_compile(env):
         seconds[f"built-in boundary rows={rows}"] = time.perf_counter() - start
     P._compile.cache_clear()
     start = time.perf_counter()
-    P._compile(device, e.rank, True, False)
+    P._compile(device, e.rank, True, False, world=WORLD)
     seconds["fused pool quant (all rows)"] = time.perf_counter() - start
     seconds["fused unpool boundary total (8 row counts)"] = sum(
         v for k, v in seconds.items() if k.startswith("fused unpool boundary rows=")

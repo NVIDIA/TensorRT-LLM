@@ -4,7 +4,8 @@
 
 With ``MUSESPARK_OPEN_SHARDED_PROJECTIONS=1`` the built-in MoE computes its
 pool (8192 -> 4096) and unpool (4096 -> 8192) projections as column slices per
-TP8 rank and gathers each slice with a separate fabric kernel. On decode steps
+rank of its TP8 (two trays) or TP4 (one tray) group and gathers each slice with
+a separate fabric kernel. On decode steps
 of at most 8 rows this fast path hands the slices straight to their consumers:
 
 * unpool: ``ops/comm/unpool_gather_boundary`` gathers the slice
@@ -123,7 +124,8 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
     def prepare_expert_input(self, pooled: torch.Tensor):
         if (
             pooled.dim() == 2
-            and pooled.shape[1] == _pool.LOCAL_COLUMNS
+            # The built-in workspace's TP size is the one the slices are cut for.
+            and pooled.shape[1] == _pool.local_columns(self._pool_gather_workspace.world)
             and self.expert_hidden_size == _pool.HIDDEN
         ):
             args = self._pool_quant_args(pooled)
@@ -220,7 +222,8 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
     ):
         if (
             branch.dim() == 2
-            and branch.shape[1] == _unpool.LOCAL_COLUMNS
+            # The built-in workspace's TP size is the one the slices are cut for.
+            and branch.shape[1] == _unpool.local_columns(self._gather.world)
             and residual.shape[-1] == _unpool.HIDDEN
         ):
             alpha, beta = self.coefficients()
@@ -405,8 +408,8 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
         if moe._pool_gather_workspace is None or moe._unpool_gather_workspace is None:
             raise ValueError(
                 "[musespark_open] projection_gathers fuses the sharded projections' gathers; it needs "
-                "MUSESPARK_OPEN_SHARDED_PROJECTIONS=1 (TP8/EP8; on sm107 with "
-                "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)"
+                "MUSESPARK_OPEN_SHARDED_PROJECTIONS=1 (TP8/EP8 or single-node TP4/EP4; on "
+                "sm107 with MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)"
             )
         for module, classes in (
             (layer, (MuseSparkOpenDecoderLayer,)),
@@ -419,6 +422,7 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
                     f"got {type(module).__name__} in layer {layer.layer_idx}"
                 )
     mapping = layers[0].mapping
+    world = mapping.tp_size
     unpool, pool = fusable_sites(mapping, unpool=unpool, pool=pool)
     if not (unpool or pool):
         logger.warning(
@@ -426,9 +430,11 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
         )
         return {}
     unpool_inbox = (
-        ProjectionInbox(mapping, row_words=_unpool.LOCAL_COLUMNS // 2) if unpool else None
+        ProjectionInbox(mapping, row_words=_unpool.local_columns(world) // 2) if unpool else None
     )
-    pool_inbox = ProjectionInbox(mapping, row_words=_pool.LOCAL_COLUMNS // 2) if pool else None
+    pool_inbox = (
+        ProjectionInbox(mapping, row_words=_pool.local_columns(world) // 2) if pool else None
+    )
     for layer in layers:
         layer.__class__ = MuseSparkOpenTepDecoderLayer
         moe = layer.feed_forward
@@ -448,8 +454,8 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
         if on
     ]
     logger.info(
-        f"[musespark_open] projection_gathers: sharded-projection gathers fused on the decode path "
-        f"({'; '.join(sites)}), steps of at most {MAX_ROWS} rows"
+        f"[musespark_open] projection_gathers: TP{world} sharded-projection gathers fused on the "
+        f"decode path ({'; '.join(sites)}), steps of at most {MAX_ROWS} rows"
     )
     layer_kwargs = {}
     if unpool:
