@@ -57,12 +57,14 @@ that config is planned; otherwise every candidate config is compiled, so the
 benchmark at first launch times cached cubins. The benchmark itself runs on
 the GPU, unchanged. Which config runs is always the autotuner's own choice.
 
-A provider may also tune ahead (``tune_batches``): at the end of each warmup
-the prefetcher compiles the candidate configs of every autotune key those
-batches reach that is still untuned, then runs the autotuner's own
-benchmark for that key on the GPU, through the kernel's real launcher on
-scratch tensors. The first batch to need the key then finds its config
-chosen. ``TLLM_JIT_PREFETCH_TUNE=0`` turns this off.
+Tune ahead (``TLLM_JIT_TUNE_AHEAD``, independent of prefetch) uses the
+providers that list ``tune_batches``: at the end of each warmup the candidate
+configs of every autotune key those batches reach that is still untuned are
+compiled, then the autotuner's own benchmark for that key runs on the GPU,
+through the kernel's real launcher on scratch tensors. The first batch to
+need the key then finds its config chosen. With prefetch on, the helpers
+compile the candidates; without it, a thread pool in this process does
+(``TLLM_JIT_TUNE_AHEAD_THREADS``), still inside warmup.
 
 Measurement hooks (always on when the module is enabled, or alone with
 ``TLLM_JIT_STATS=1``) log every compile and every autotune benchmark that
@@ -85,7 +87,8 @@ from tensorrt_llm.logger import logger
 _ENABLE_ENV = "TLLM_JIT_PREFETCH"
 _STATS_ENV = "TLLM_JIT_STATS"
 _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
-_TUNE_ENV = "TLLM_JIT_PREFETCH_TUNE"
+_TUNE_ENV = "TLLM_JIT_TUNE_AHEAD"
+_TUNE_THREADS_ENV = "TLLM_JIT_TUNE_AHEAD_THREADS"
 
 # Queue priorities, lowest first: the executor is blocked on it; the batch
 # being scheduled needs it; a provider can reach it (background enumeration).
@@ -120,10 +123,17 @@ def prefetch_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV, "0") == "1"
 
 
-def prefetch_tune_enabled() -> bool:
-    """Whether prefetch also runs the autotune benchmark of the untuned keys
-    the providers reach, at the end of warmup (see ``JitPrefetcher.tune``)."""
-    return prefetch_enabled() and os.environ.get(_TUNE_ENV, "1") == "1"
+def tune_ahead_enabled() -> bool:
+    """Whether the end of warmup runs the autotune benchmark of the untuned
+    keys the tune-ahead providers reach (see ``JitPrefetcher.tune``).
+
+    Independent of prefetch. ``TLLM_JIT_TUNE_AHEAD`` decides; unset, it
+    follows ``TLLM_JIT_PREFETCH``, so prefetch's default keeps tuning ahead.
+    """
+    v = os.environ.get(_TUNE_ENV)
+    if v is not None:
+        return v == "1"
+    return prefetch_enabled()
 
 
 def warmup_jit_coverage_enabled() -> bool:
@@ -142,6 +152,12 @@ def warmup_jit_coverage_enabled() -> bool:
 
 def stats_enabled() -> bool:
     return prefetch_enabled() or os.environ.get(_STATS_ENV, "0") == "1"
+
+
+def jit_engine_enabled() -> bool:
+    """Whether the engine creates a ``JitPrefetcher``: for prefetch, for
+    tune ahead or for the JIT stats, in any combination."""
+    return stats_enabled() or tune_ahead_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +694,23 @@ def _untuned(call: KernelCall) -> bool:
     return key not in autotuner.cache
 
 
+def _compile_spec(item: Tuple[Any, str]) -> bool:
+    """Compile one variant in this process from Triton's own specialization
+    JSON, with ``JITFunction.preload``: the same compile a launch would run,
+    into the same in-memory and on-disk caches, launching nothing. Returns
+    False if it failed (the launch that needs it then compiles it)."""
+    jit_fn, spec = item
+    try:
+        jit_fn.preload(spec)
+        return True
+    except Exception as e:  # noqa: BLE001 - compiled at first launch instead
+        logger.warning_once(
+            f"[JIT prefetch] tune-ahead compile failed for {jit_fn.fn.__name__}: {e}",
+            key=f"jitp_tune_compile_{jit_fn.fn.__name__}",
+        )
+        return False
+
+
 def _on_disk(jit_fn, signature, constexprs, attrs, options, backend) -> bool:
     """True if triton.compile would load this variant from the on-disk cache.
 
@@ -773,8 +806,10 @@ class _Stats:
     cd_executor_compiles: int = 0
     cd_executor_compile_s: float = 0.0
     # Tune ahead (JitPrefetcher.tune): batches run, autotune benchmarks run
-    # and their time, variants compiled in process meanwhile (none when the
-    # helpers delivered them), time waiting for the helpers, total time.
+    # and their time, variants the launches still compiled in process (none
+    # when the candidates were delivered beforehand), time spent getting the
+    # candidates compiled (waiting for the helpers, or the thread pool
+    # without prefetch), total time.
     ta_batches: int = 0
     ta_tunes: int = 0
     ta_tune_s: float = 0.0
@@ -782,6 +817,10 @@ class _Stats:
     ta_compile_s: float = 0.0
     ta_wait_s: float = 0.0
     ta_s: float = 0.0
+    # Tune ahead without prefetch: variants compiled by its thread pool
+    # before the benchmark, and how many of those failed.
+    ta_inproc_compiles: int = 0
+    ta_inproc_failed: int = 0
     # MSA fmha_sm100 kernels (FmhaSm100Builds): built by the helpers, failed
     # there, and built in process on the executor thread after warmup.
     fmha_helper_built: int = 0
@@ -799,6 +838,9 @@ class JitPrefetcher:
     def __init__(self, rank: int):
         self.rank = rank
         self.prefetch = prefetch_enabled()
+        # The executor-side JIT stats (on with prefetch or TLLM_JIT_STATS);
+        # tune ahead alone records only its own counters.
+        self.stats_on = stats_enabled()
         self.stats = _Stats()
         self._providers: List[Callable[[Any], List[KernelCall]]] = []
         self._provider_names: set = set()
@@ -848,7 +890,7 @@ class JitPrefetcher:
 
     @classmethod
     def init(cls, rank: int) -> Optional["JitPrefetcher"]:
-        if cls._instance is None and stats_enabled():
+        if cls._instance is None and jit_engine_enabled():
             cls._instance = JitPrefetcher(rank)
         return cls._instance
 
@@ -1492,11 +1534,14 @@ class JitPrefetcher:
         helper-built cubins instead of compiling them. A batch whose launches
         are all tuned is skipped before anything is allocated.
 
-        Compiles the helpers did not deliver run here, inside warmup, as
-        they would at that first forward. A batch that fails is logged and
-        skipped: its keys are then tuned at first use, as without prefetch.
+        Without prefetch there are no helpers: the batch's missing variants
+        are compiled by a thread pool in this process instead
+        (``_compile_in_process``), still before the benchmark. Compiles
+        neither delivered run here, inside warmup, as they would at that
+        first forward. A batch that fails is logged and skipped: its keys
+        are then tuned at first use, as without tune ahead.
         """
-        if not self.prefetch or not prefetch_tune_enabled():
+        if not tune_ahead_enabled():
             return
         jobs = [p for p in self._providers if getattr(p, "tune_batches", None) is not None]
         if not jobs:
@@ -1505,7 +1550,7 @@ class JitPrefetcher:
 
         timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
         t0 = time.perf_counter()
-        before = (self.stats.ta_tunes, self.stats.ta_compiles)
+        before = (self.stats.ta_tunes, self.stats.ta_compiles, self.stats.ta_inproc_compiles)
         n_batches = 0
         self._tune_thread = threading.get_ident()
         try:
@@ -1528,6 +1573,12 @@ class JitPrefetcher:
             f"{self.stats.ta_tunes - before[0]} autotune(s), "
             f"{self.stats.ta_compiles - before[1]} in-process compile(s), "
             f"{dt * 1e3:.0f} ms"
+            + (
+                ""
+                if self.prefetch
+                else f" ({self.stats.ta_inproc_compiles - before[2]} candidate(s) "
+                "compiled by its thread pool, no prefetch)"
+            )
         )
 
     def _tune_provider(self, provider: Any, timeout_s: float) -> int:
@@ -1541,11 +1592,14 @@ class JitPrefetcher:
             calls = provider(batch_ctx, seen=seen)
             if not any(_untuned(call) for call in calls):
                 continue
-            keys: List[str] = []
-            for call in calls:
-                self._plan_call(call, priority=_PRIO_BATCH, keys_out=keys)
             tw = time.perf_counter()
-            self._wait_for_helpers(keys, tw + timeout_s)
+            if self.prefetch:
+                keys: List[str] = []
+                for call in calls:
+                    self._plan_call(call, priority=_PRIO_BATCH, keys_out=keys)
+                self._wait_for_helpers(keys, tw + timeout_s)
+            else:
+                self._compile_in_process(calls)
             self.stats.ta_wait_s += time.perf_counter() - tw
             try:
                 provider.run_tune_batch(batch_ctx)
@@ -1558,6 +1612,52 @@ class JitPrefetcher:
                 continue
             n_batches += 1
         return n_batches
+
+    def _compile_in_process(self, calls: List[KernelCall]) -> None:
+        """Compile every variant of ``calls`` not compiled yet, all candidate
+        configs of an untuned key included, into the on-disk Triton cache,
+        with a pool of threads in this process (tune ahead without prefetch).
+
+        Each variant goes through ``triton.compile`` from Triton's own
+        specialization of the launch, as a helper compiles it, so the
+        benchmark that follows loads the cubins from disk. The thread count
+        is ``TLLM_JIT_TUNE_AHEAD_THREADS`` (default: as many as prefetch would
+        start helpers). A variant that fails to compile here is compiled by
+        the launch that needs it, as without tune ahead.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        work: Dict[str, Tuple[Any, str]] = {}
+        for call in calls:
+            jit_fn, _, _ = _unwrap_jit(call.fn)
+            try:
+                variants, _ = _expand(call)
+            except Exception:  # noqa: BLE001 - compiled at launch instead
+                continue
+            for kw in variants:
+                try:
+                    found = _lookup_or_serialize(jit_fn, call.args, kw)
+                except Exception:  # noqa: BLE001
+                    continue
+                if found is not None:
+                    work.setdefault(found[0], (jit_fn, found[1]))
+        if not work:
+            return
+        import torch
+
+        n = max(1, int(os.environ.get(_TUNE_THREADS_ENV, str(_default_workers()))))
+        # The CUDA current device is per thread: each compile thread takes this
+        # rank's, so the compiled kernels land in its in-memory caches.
+        with ThreadPoolExecutor(
+            max_workers=n,
+            thread_name_prefix="jit_tune_compile",
+            initializer=torch.cuda.set_device,
+            initargs=(torch.cuda.current_device(),),
+        ) as pool:
+            for ok in pool.map(_compile_spec, work.values()):
+                self.stats.ta_inproc_compiles += 1
+                if not ok:
+                    self.stats.ta_inproc_failed += 1
 
     def _wait_for_helpers(self, keys: List[str], deadline: float) -> None:
         """Wait until the Triton helpers have compiled every variant in
@@ -1857,6 +1957,7 @@ class JitPrefetcher:
             f" ta_batches={s.ta_batches} ta_tunes={s.ta_tunes} ta_tune_s={s.ta_tune_s:.3f}"
             f" ta_compiles={s.ta_compiles} ta_compile_s={s.ta_compile_s:.3f}"
             f" ta_wait_s={s.ta_wait_s:.3f} ta_s={s.ta_s:.3f}"
+            f" ta_inproc_compiles={s.ta_inproc_compiles} ta_inproc_failed={s.ta_inproc_failed}"
             f" fmha_helper_built={s.fmha_helper_built} fmha_helper_fail={s.fmha_helper_fail}"
             f" fmha_executor_compiles={s.fmha_executor_compiles}"
             f" fmha_executor_compile_s={s.fmha_executor_compile_s:.3f}"

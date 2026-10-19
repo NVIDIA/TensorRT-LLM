@@ -235,33 +235,52 @@ def test_tune_batches_respect_engine_limits(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.usefixtures("restore_triton_hooks")
-def test_tune_ahead_benchmarks_untuned_keys(monkeypatch):
+@pytest.mark.parametrize("prefetch", [True, False], ids=["with_prefetch", "tune_ahead_alone"])
+def test_tune_ahead_benchmarks_untuned_keys(prefetch, monkeypatch, tmp_path):
     """JitPrefetcher.tune runs the autotune benchmark of every untuned key of
     the provider's tune batches on the GPU, so later batches of other sizes,
     with and without cached prefixes, find each key tuned; a second call
-    runs no batch."""
+    runs no batch. Without prefetch, its own thread pool compiles the
+    candidates first, so no launch compiles one."""
     import queue
 
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
-    monkeypatch.delenv("TLLM_JIT_PREFETCH_TUNE", raising=False)
-    # No helpers here: the queued variants compile in process at launch.
-    monkeypatch.setenv("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "0")
-    monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
+    from triton import knobs
+
+    monkeypatch.setattr(knobs.cache, "dir", str(tmp_path))  # empty cache: candidates to compile
+    monkeypatch.setenv("TLLM_JIT_TUNE_AHEAD", "1")
+    if prefetch:
+        monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+        # No helpers here: the queued variants compile in process at launch.
+        monkeypatch.setenv("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "0")
+        monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
+    else:
+        monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+        monkeypatch.delenv("TLLM_JIT_STATS", raising=False)
     s, prov = _tune_provider(True, max_num_tokens=512, max_batch_size=8)
     batches = list(prov.tune_batches())
     tune_keys = set()
     for batch in batches:
         for call in prov(batch, seen=set()):
-            _, autotuner, _ = jp._unwrap_jit(call.fn)
+            jit_fn, autotuner, _ = jp._unwrap_jit(call.fn)
             if autotuner is not None:
                 autotuner.cache.clear()
+            # Forget kernels earlier tests compiled in this process: with the
+            # empty on-disk cache above, every candidate is then uncompiled.
+            for kernel_cache, *_ in jit_fn.device_caches.values():
+                kernel_cache.clear()
         tune_keys |= _tune_keys(prov(batch, seen=set()))
     p = jp.JitPrefetcher(rank=0)
-    p._queues["triton"] = queue.PriorityQueue()
+    assert p.prefetch == prefetch
+    if prefetch:
+        p._queues["triton"] = queue.PriorityQueue()
     p.register("mamba_ssd", prov)
     p.tune()
     assert p.stats.ta_batches == len(batches) == 2
     assert p.stats.ta_tunes == len(tune_keys) > 0
+    if not prefetch:
+        assert p.stats.ta_inproc_compiles > 0 and p.stats.ta_inproc_failed == 0
+        # The pool delivered every candidate: the benchmark compiled nothing.
+        assert p.stats.ta_compiles == 0
     for lens, cached in (([37, 120, 211], True), ([37, 120, 211], False), ([300], False)):
         later = _real_calls(s, lens, cached)
         assert not [c.label for c in later if jp._untuned(c)], (lens, cached)
@@ -270,11 +289,33 @@ def test_tune_ahead_benchmarks_untuned_keys(monkeypatch):
     assert p.stats.ta_tunes == len(tune_keys)
 
 
+@pytest.mark.parametrize(
+    "env,prefetch,tune,engine",
+    [
+        ({}, False, False, False),
+        ({"TLLM_JIT_PREFETCH": "1"}, True, True, True),
+        ({"TLLM_JIT_PREFETCH": "1", "TLLM_JIT_TUNE_AHEAD": "0"}, True, False, True),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, False, True, True),
+        ({"TLLM_JIT_STATS": "1"}, False, False, True),
+    ],
+)
+def test_prefetch_and_tune_ahead_are_independent(env, prefetch, tune, engine, monkeypatch):
+    """TLLM_JIT_PREFETCH and TLLM_JIT_TUNE_AHEAD switch independently; tune
+    ahead follows prefetch only while TLLM_JIT_TUNE_AHEAD is unset."""
+    for var in ("TLLM_JIT_PREFETCH", "TLLM_JIT_TUNE_AHEAD", "TLLM_JIT_STATS"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    assert jp.prefetch_enabled() == prefetch
+    assert jp.tune_ahead_enabled() == tune
+    assert jp.jit_engine_enabled() == engine
+
+
 @pytest.mark.usefixtures("restore_triton_hooks")
 def test_tune_ahead_off(monkeypatch):
-    """TLLM_JIT_PREFETCH_TUNE=0 runs no tune batch."""
+    """TLLM_JIT_TUNE_AHEAD=0 runs no tune batch, with prefetch on."""
     monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
-    monkeypatch.setenv("TLLM_JIT_PREFETCH_TUNE", "0")
+    monkeypatch.setenv("TLLM_JIT_TUNE_AHEAD", "0")
     monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
     ran = []
 

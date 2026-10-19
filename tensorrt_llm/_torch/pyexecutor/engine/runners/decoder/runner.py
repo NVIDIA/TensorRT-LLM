@@ -1640,9 +1640,10 @@ class DecoderRunner(ScheduledModelRunner):
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
-        With JIT prefetch on, its helpers compile both passes' variants, so
-        only (2) runs, to autotune them on the GPU; with prefetch also tuning
-        ahead (``TLLM_JIT_PREFETCH_TUNE``, on by default) only (1) runs.
+        With JIT tune ahead on (``TLLM_JIT_TUNE_AHEAD``), the autotune
+        benchmark of (2)'s keys runs at the end of warmup instead, so (2) is
+        skipped and (1) runs. Otherwise, with JIT prefetch on, its helpers
+        compile (1)'s variants, so only (2) runs, to autotune on the GPU.
 
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
@@ -1653,22 +1654,17 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
             return
-        from tensorrt_llm._torch.jit_prefetch import (
-            prefetch_tune_enabled,
-            warmup_jit_coverage_enabled,
-        )
+        from tensorrt_llm._torch.jit_prefetch import tune_ahead_enabled, warmup_jit_coverage_enabled
 
         jit_coverage = warmup_jit_coverage_enabled()
-        # With JIT prefetch tuning ahead, the autotune benchmark of the
-        # HAS_INITSTATES keys runs on the GPU at the end of warmup
+        # With tune ahead on, the autotune benchmark of the HAS_INITSTATES
+        # keys runs on the GPU at the end of warmup
         # (MambaSSDProvider.tune_batches), so the forced-initial-states pass
         # below has nothing left to do. A pipeline stage holds only its own
         # layers, so ranks can disagree; the gate itself only reads the
         # environment, so every rank enters this agreement or none does.
-        tuned_ahead = (
-            not jit_coverage
-            and prefetch_tune_enabled()
-            and self._agree_warmup_flag(self._mamba_prefill_tuned_ahead())
+        tuned_ahead = tune_ahead_enabled() and self._agree_warmup_flag(
+            self._mamba_prefill_tuned_ahead()
         )
 
         token_num_upper_bound = min(
@@ -1721,12 +1717,13 @@ class DecoderRunner(ScheduledModelRunner):
             (capped_num_tokens, 0, False, True, True),
         ]
         if tuned_ahead:
-            # Only the multi-sequence pass runs: it is the first multi-request
-            # context forward of the warmup, which loads the attention
-            # backend's kernels for such batches (_run_attention_warmup runs no
-            # context shape on Mamba hybrid models). Its SSD autotune keys are
-            # those of a batch without cached prefixes, tuned by the autotuner
-            # pass's forward, else here, as without prefetch.
+            # Only the multi-sequence pass runs, prefetch or not: it is the
+            # first multi-request context forward of the warmup, which loads
+            # the attention backend's kernels for such batches
+            # (_run_attention_warmup runs no context shape on Mamba hybrid
+            # models). Its SSD autotune keys are those of a batch without
+            # cached prefixes, tuned by the autotuner pass's forward, else
+            # here, as without tune ahead.
             mamba_warmup_shapes = mamba_warmup_shapes[:1]
         elif not jit_coverage:
             # JIT prefetch compiles the multi-sequence variants the first pass

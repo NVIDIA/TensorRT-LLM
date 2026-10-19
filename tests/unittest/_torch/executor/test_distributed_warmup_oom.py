@@ -529,13 +529,22 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
 @pytest.mark.parametrize(
     "env,covered,forwards,forced",
     [
-        # Tuned ahead: only the multi-sequence pass, no forced initial states.
+        # Tuned ahead: only the multi-sequence pass, no forced initial states,
+        # with prefetch or without it.
         ({"TLLM_JIT_PREFETCH": "1"}, True, 1, 0),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, True, 1, 0),
+        ({"TLLM_JIT_PREFETCH": "1", "TLLM_WARMUP_JIT_COVERAGE": "1"}, True, 1, 0),
         # Prefetch without tune ahead: only the forced-initial-states pass.
         ({"TLLM_JIT_PREFETCH": "1"}, False, 1, 1),
-        ({"TLLM_JIT_PREFETCH": "1", "TLLM_JIT_PREFETCH_TUNE": "0"}, True, 1, 1),
+        ({"TLLM_JIT_PREFETCH": "1", "TLLM_JIT_TUNE_AHEAD": "0"}, True, 1, 1),
         # Both passes.
-        ({"TLLM_JIT_PREFETCH": "1", "TLLM_WARMUP_JIT_COVERAGE": "1"}, True, 2, 1),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, False, 2, 1),
+        (
+            {"TLLM_JIT_PREFETCH": "1", "TLLM_JIT_TUNE_AHEAD": "0", "TLLM_WARMUP_JIT_COVERAGE": "1"},
+            True,
+            2,
+            1,
+        ),
         ({}, True, 2, 1),
     ],
 )
@@ -545,7 +554,7 @@ def test_mamba_warmup_passes_with_prefetch_tune_ahead(
     """With JIT prefetch tuning ahead, and every recurrent layer covered by it,
     the Mamba warmup skips its forced-initial-states pass; otherwise the
     passes are those of prefetch without tune ahead, or of no prefetch."""
-    for var in ("TLLM_JIT_PREFETCH", "TLLM_JIT_PREFETCH_TUNE", "TLLM_WARMUP_JIT_COVERAGE"):
+    for var in ("TLLM_JIT_PREFETCH", "TLLM_JIT_TUNE_AHEAD", "TLLM_WARMUP_JIT_COVERAGE"):
         monkeypatch.delenv(var, raising=False)
     for var, value in env.items():
         monkeypatch.setenv(var, value)

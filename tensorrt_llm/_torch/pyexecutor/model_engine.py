@@ -1113,14 +1113,22 @@ class PyTorchModelEngine(ModelEngine):
     def _init_jit_prefetch(self) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
         ``tensorrt_llm/_torch/jit_prefetch.py``)."""
-        from ..jit_prefetch import JitPrefetcher, prefetch_enabled
+        from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
+                                    tune_ahead_enabled)
         prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
         self._jit_prefetcher = prefetcher
         if prefetcher is not None and get_sm_version() in (100, 103):
             prefetcher.observe_deep_gemm()
             if self._uses_minimax_m3_msa():
                 prefetcher.install_fmha_sm100_counter()
-        if prefetcher is None or not prefetch_enabled():
+        if prefetcher is None:
+            return
+        if not prefetch_enabled():
+            # Tune ahead alone: no helpers, no planning; only the providers
+            # that tune ahead, whose candidates compile in this process.
+            if tune_ahead_enabled():
+                self._register_tune_ahead_providers(prefetcher)
+                prefetcher.tune()
             return
         from .. import jit_prefetch_deep_gemm as jdg
         if jdg.supported():
@@ -1210,14 +1218,7 @@ class PyTorchModelEngine(ModelEngine):
             msa_provider = MiniMaxM3MsaDecodeProvider(self.batch_size)
             if msa_provider:
                 prefetcher.register("minimax_m3_msa", msa_provider)
-        from ..modules.mamba.jit_prefetch import MambaSSDProvider
-        provider = MambaSSDProvider(self.model,
-                                    max_num_tokens=self.max_num_tokens,
-                                    max_batch_size=self.batch_size,
-                                    max_seq_len=self.max_seq_len)
-        if provider and prefetcher.register("mamba_ssd", provider):
-            logger.info(f"[JIT prefetch] Mamba SSD provider: "
-                        f"{len(provider.shapes)} distinct layer shape(s)")
+        self._register_tune_ahead_providers(prefetcher)
         from ..modules.mamba import jit_prefetch_decode
         decode_provider = jit_prefetch_decode.MambaDecodeProvider(
             self.batch_size)
@@ -1230,9 +1231,22 @@ class PyTorchModelEngine(ModelEngine):
         prefetcher.wait_ready()
         # Benchmark the untuned autotune keys the providers reach on the
         # GPU now (their candidates compiled by the helpers), before the
-        # background enumeration fills the helpers' queue.
+        # background enumeration fills the helpers' queue. A no-op unless
+        # tune ahead is on (TLLM_JIT_TUNE_AHEAD, default: on with prefetch).
         prefetcher.tune()
         prefetcher.start_background()
+
+    def _register_tune_ahead_providers(self, prefetcher) -> None:
+        """Register the providers that also tune ahead (``tune_batches``);
+        prefetch plans with them too."""
+        from ..modules.mamba.jit_prefetch import MambaSSDProvider
+        provider = MambaSSDProvider(self.model,
+                                    max_num_tokens=self.max_num_tokens,
+                                    max_batch_size=self.batch_size,
+                                    max_seq_len=self.max_seq_len)
+        if provider and prefetcher.register("mamba_ssd", provider):
+            logger.info(f"[JIT prefetch] Mamba SSD provider: "
+                        f"{len(provider.shapes)} distinct layer shape(s)")
 
     def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,
                            resource_manager: ResourceManager) -> None:
