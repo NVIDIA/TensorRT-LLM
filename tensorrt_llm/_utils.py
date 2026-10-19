@@ -1328,6 +1328,30 @@ def confidential_compute_enabled() -> bool:
     return cc_enabled
 
 
+_ENV_FLAG_TRUE_VALUES = frozenset(("1", "true", "yes", "on"))
+_ENV_FLAG_FALSE_VALUES = frozenset(("0", "false", "no", "off"))
+
+
+def get_env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    """Read a boolean switch from the environment.
+
+    Unset or blank returns ``default``. ``1``/``true``/``yes``/``on`` return
+    True and ``0``/``false``/``no``/``off`` return False (case-insensitive,
+    surrounding whitespace ignored). Any other value raises ``ValueError``, so
+    a typo cannot silently select the other arm of an A/B.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in _ENV_FLAG_TRUE_VALUES:
+        return True
+    if value in _ENV_FLAG_FALSE_VALUES:
+        return False
+    raise ValueError(f"{name}={raw!r} is not one of 1/true/yes/on or "
+                     "0/false/no/off")
+
+
 @lru_cache(maxsize=None)
 def prefer_pinned() -> bool:
     """
