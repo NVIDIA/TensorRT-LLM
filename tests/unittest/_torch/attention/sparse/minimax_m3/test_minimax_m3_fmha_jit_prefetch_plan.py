@@ -144,3 +144,166 @@ def test_provider_fp8_cache_plans_block_sparse_short_rows(monkeypatch):
 
 def test_provider_without_msa_layers_lists_nothing(monkeypatch):
     assert not _provider(monkeypatch, [], True)
+
+
+# FlashInfer modules: the MSA backend runs the dense layers' decode rows on
+# FlashInfer's TRTLLM-GEN launcher (fmha_gen), which every rank builds in
+# warmup's first forward with a generation request, context servers included.
+
+
+def _fi_model(monkeypatch, msa_layers: int, sm_100f=True, msa=True, flashinfer=True):
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import kernels, msa_backend
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import (
+        trtllm_gen_dense_decode as dense_decode,
+    )
+
+    class FakeMsa(msa_backend.MiniMaxM3MsaSparseAttention):
+        def __init__(self):  # noqa: D107 - no backend state needed
+            pass
+
+    class Layer:
+        def __init__(self):
+            self.attn = FakeMsa()
+
+    layers = [Layer() for _ in range(msa_layers)]
+    monkeypatch.setattr("tensorrt_llm._utils.is_sm_100f", lambda *a: sm_100f)
+    monkeypatch.setattr(kernels.msa_utils, "msa_package_available", lambda: msa)
+    monkeypatch.setattr(dense_decode, "flashinfer_available", lambda: flashinfer)
+    return SimpleNamespace(modules=lambda: iter([SimpleNamespace(), *layers]))
+
+
+def test_msa_model_builds_the_trtllm_gen_launcher(monkeypatch):
+    assert jpf.flashinfer_modules(_fi_model(monkeypatch, 60)) == ["fmha_gen"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(msa_layers=0),  # no MSA layer (Triton sparse backend, other models)
+        dict(msa_layers=60, sm_100f=False),
+        dict(msa_layers=60, msa=False),
+        dict(msa_layers=60, flashinfer=False),
+    ],
+    ids=["no-msa-layers", "not-sm100f", "no-fmha_sm100", "no-flashinfer"],
+)
+def test_other_engines_build_no_flashinfer_module(monkeypatch, kwargs):
+    assert jpf.flashinfer_modules(_fi_model(monkeypatch, **kwargs)) == []
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_start_model_builds_starts_fmha_gen_for_m3_only_with_prefetch(monkeypatch, prefetch):
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    model = _fi_model(monkeypatch, 60)
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1" if prefetch else "0")
+    with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
+        started = jp.start_model_builds(model)
+    assert started is prefetch
+    if prefetch:
+        start.assert_called_once_with(("fmha_gen",))
+    else:
+        start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "prefetch, tunes, sm_100f, started",
+    [
+        (True, True, True, True),
+        (True, False, True, False),  # the engine runs no FlashInfer MXFP8 pass
+        (True, True, False, False),  # SM120 has its own MXFP8 module
+        (False, True, True, False),
+    ],
+)
+def test_mxfp8_tune_modules_start_only_when_the_pass_runs(
+    monkeypatch, prefetch, tunes, sm_100f, started
+):
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1" if prefetch else "0")
+    monkeypatch.setattr("tensorrt_llm._utils.is_sm_100f", lambda *a: sm_100f)
+    with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
+        assert jp.start_mxfp8_tune_builds(tunes) is started
+    if started:
+        start.assert_called_once_with(("trtllm_utils", "mxfp8_gemm_cutlass"))
+    else:
+        start.assert_not_called()
+
+
+def _llm_args(algorithm="minimax_m3", implementation="msa", tokens_per_block=128, indexer="fp8"):
+    return SimpleNamespace(
+        sparse_attention_config=SimpleNamespace(
+            algorithm=algorithm, implementation=implementation, indexer_kv_dtype=indexer
+        ),
+        kv_cache_config=SimpleNamespace(tokens_per_block=tokens_per_block),
+    )
+
+
+def _quant_model(kv_quant):
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    return SimpleNamespace(
+        model_config=SimpleNamespace(quant_config=QuantConfig(kv_cache_quant_algo=kv_quant))
+    )
+
+
+@pytest.mark.parametrize("kv_quant, expected", [("NVFP4", "NVFP4"), ("FP8", "FP8"), (None, "BF16")])
+def test_kv_cache_geometry_follows_the_executor(kv_quant, expected):
+    """The page size, cache dtype and indexer dtype the KV cache manager will
+    have, as the fmha_sm100 planner reads them, from the engine's arguments."""
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    geometry = jpf.kv_cache_geometry(
+        _quant_model(QuantAlgo[kv_quant] if kv_quant else None), _llm_args()
+    )
+    assert geometry.tokens_per_block == 128
+    assert geometry.dtype == getattr(DataType, expected)
+    assert geometry.indexer_kv_dtype == "fp8"
+
+
+@pytest.mark.parametrize(
+    "llm_args",
+    [_llm_args(implementation="triton"), _llm_args(algorithm="dsa"), _llm_args(tokens_per_block=0)],
+    ids=["triton-backend", "other-algorithm", "no-page-size"],
+)
+def test_kv_cache_geometry_none_without_msa(llm_args):
+    assert jpf.kv_cache_geometry(_quant_model(None), llm_args) is None
+
+
+def test_load_time_plan_equals_the_warmup_plan(monkeypatch):
+    """Planned from the engine's arguments while the weights load, the
+    standard context server lists the same kernels as from its KV cache
+    manager at warmup."""
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    sites = [(32, 2, 2, False)] * 3 + [(32, 2, 2, True)] * 57
+    at_warmup = _provider(monkeypatch, sites, True)
+    model = SimpleNamespace(
+        modules=_provider_model(sites).modules,
+        model_config=_quant_model(QuantAlgo.NVFP4).model_config,
+    )
+    geometry = jpf.kv_cache_geometry(model, _llm_args())
+    at_load = jpf.MiniMaxM3FmhaProvider(model, geometry)
+    assert at_load.specs == at_warmup.specs
+
+
+def _provider_model(sites):
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    class FakeMsa(msa_backend.MiniMaxM3MsaSparseAttention):
+        def __init__(self, q, kv, idx):  # noqa: D107 - no backend state needed
+            self.m3_config = SimpleNamespace(
+                num_q_heads=q, num_kv_heads=kv, num_index_heads=idx, block_size=128
+            )
+
+    class Layer:
+        def __init__(self, q, kv, idx, sparse):
+            self.attn = FakeMsa(q, kv, idx)
+            self.is_sparse_attention_layer = sparse
+
+    layers = [Layer(*site) for site in sites]
+    return SimpleNamespace(modules=lambda: iter(layers))

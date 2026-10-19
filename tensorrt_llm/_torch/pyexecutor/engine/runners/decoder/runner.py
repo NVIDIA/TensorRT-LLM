@@ -761,14 +761,22 @@ class DecoderRunner(ScheduledModelRunner):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
-        from tensorrt_llm._torch.jit_prefetch import cancel_flashinfer_build, start_flashinfer_build
+        from tensorrt_llm._torch.jit_prefetch import (
+            cancel_flashinfer_build,
+            start_flashinfer_build,
+            start_mxfp8_tune_builds,
+        )
 
         # With JIT prefetch on, a CPU-only helper builds the sampling module
         # while the eager warmup forwards below run on the GPU; it is joined
         # (and the module loaded) before CUDA graph capture, the first phase
         # that can launch the sampling kernels, together with any helper the
-        # model loader started on a module of the model's layers.
+        # model loader started on a module of the model's layers. Another
+        # builds the FlashInfer modules the autotuner warmup's FlashInfer
+        # MXFP8 pass needs, if it runs; the pass waits on their file locks.
         sampling_in_helper = kv_cache_manager is not None and start_flashinfer_build()
+        if kv_cache_manager is not None:
+            start_mxfp8_tune_builds(self._tunes_flashinfer_mxfp8())
         try:
             with self._warmup_timer.phase(
                 "sampling_module_prewarm",
@@ -1498,6 +1506,56 @@ class DecoderRunner(ScheduledModelRunner):
         release_megamoe_scratch = getattr(_megamoe_op, "release_megamoe_profiling_scratch", None)
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
+
+    def _tunes_flashinfer_mxfp8(self) -> bool:
+        """Whether ``_run_autotuner_warmup`` will run its FlashInfer MXFP8 pass.
+
+        That pass builds FlashInfer's CUTLASS MXFP8 GEMM module the first time
+        it tunes ``mm_mxfp8``. This mirrors the pass's selection without
+        changing any layer's backend, so JIT prefetch can start that build at
+        the beginning of warmup; the autotuner warmup still decides.
+        """
+        from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+
+        # The autotuner warmup runs only with the autotuner on, for a runner
+        # with context warmups; context parallelism other than Helix skips
+        # warmup altogether.
+        if (
+            not self._config.enable_autotuner
+            or not self._context_warmups_supported
+            or (self.mapping.cp_size > 1 and not self.mapping.has_cp_helix())
+        ):
+            return False
+        methods = [
+            quant_method
+            for module in self.model.modules()
+            if isinstance(
+                (quant_method := getattr(module, "quant_method", None)), MXFP8LinearMethod
+            )
+        ]
+        # FlashInfer MXFP8 runs on the CUTLASS-layout operands through the
+        # trtllm::flashinfer_mm_mxfp8 op (MXFP8LinearMethod._load_flashinfer).
+        if not any(method.use_cutlass for method in methods):
+            return False
+        if getattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", None) is None:
+            return False
+        compile_all_batches = (
+            self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
+        )
+        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return any(
+                method.backend == "flashinfer"
+                or (method.backend == "auto" and not compile_all_batches)
+                for method in methods
+            )
+        return (
+            self.cuda_graph_runner.enabled
+            and not compile_all_batches
+            and any(
+                getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
+                for module in self.model.modules()
+            )
+        )
 
     def _run_autotuner_warmup(
         self, resource_manager: ResourceManager, generation_only: bool = False

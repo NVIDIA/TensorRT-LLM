@@ -20,7 +20,10 @@ process then loads the module from that workspace without rebuilding it, and
 it samples. The same holds for the TRTLLM-GEN attention launcher (``fmha_gen``)
 GLM-5.3-Flash's native decode builds, started before the sampling module as
 the model loader starts it: GLM's decode call then loads it without a
-rebuild. Without prefetch, or with the module already built, nothing is
+rebuild. So does FlashInfer's CUTLASS MXFP8 GEMM module, with the delay
+kernel its autotuner times with, which the autotuner warmup's FlashInfer
+MXFP8 pass builds (MiniMax-M3's decode graphs): FlashInfer's getters load the
+helper's builds. Without prefetch, or with the module already built, nothing is
 started. A build still running at the join's timeout is stopped together with
 its compilers, and the module is then built in place; so is one whose
 starting process exits. Each case runs in a subprocess: FlashInfer fixes its
@@ -214,6 +217,37 @@ _FMHA_GEN_CASE = textwrap.dedent(
 )
 
 
+# FlashInfer's CUTLASS MXFP8 GEMM and its autotuner's delay kernel, which the
+# autotuner warmup's FlashInfer MXFP8 pass builds the first time it tunes
+# mm_mxfp8 (MiniMax-M3's decode graphs): started at the beginning of warmup,
+# the modules FlashInfer's own getters then load are the helper's builds.
+_MXFP8_CASE = textwrap.dedent(
+    """
+    import json, os, time
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from flashinfer.jit import env as jit_env
+
+    sos = [jit_env.FLASHINFER_JIT_DIR / m / f"{m}.so" for m in jp.FLASHINFER_MXFP8_TUNE_MODULES]
+    started = jp.start_mxfp8_tune_builds(True)
+    waited = jp.wait_flashinfer_build()
+    mtimes = [os.stat(so).st_mtime_ns if so.exists() else None for so in sos]
+    from flashinfer.gemm.gemm_base import get_gemm_sm100_module_cutlass_mxfp8
+    from flashinfer.tllm_utils import get_trtllm_utils_module
+
+    t = time.time()
+    gemm = get_gemm_sm100_module_cutlass_mxfp8()
+    get_trtllm_utils_module().delay_kernel(1)
+    load_s = time.time() - t
+    print(json.dumps({"started": started, "waited": waited,
+                      "built_before_load": all(m is not None for m in mtimes),
+                      "rebuilt": [so.exists() and os.stat(so).st_mtime_ns != m
+                                  for so, m in zip(sos, mtimes)],
+                      "load_s": load_s, "runner": hasattr(gemm, "cutlass_mxfp8_gemm_runner"),
+                      "again": [jp.start_mxfp8_tune_builds(True), jp.flashinfer_builds_pending()]}))
+    """
+)
+
+
 def _env(tmp_path, prefetch: bool):
     env = dict(os.environ, FLASHINFER_WORKSPACE_BASE=str(tmp_path / "fi"), PYTHONNOUSERSITE="1")
     env.pop("TLLM_JIT_PREFETCH", None)
@@ -304,3 +338,16 @@ def test_timed_out_build_is_stopped_with_its_compilers(tmp_path):
     assert r["again"] is None
     # The module was then built in place, in the same build directory.
     assert r["sampled"] == [4]
+
+
+def test_mxfp8_tune_modules_built_by_helper_are_what_flashinfer_loads(tmp_path):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("FlashInfer's CUTLASS MXFP8 GEMM module here is the SM100-family one")
+    r = _run_json(tmp_path, prefetch=True, case=_MXFP8_CASE)
+    assert r["started"] is True and r["waited"] is not None, r
+    # Both modules built by the helper; FlashInfer's getters loaded them
+    # without a rebuild (the GEMM module is a minute of nvcc).
+    assert r["built_before_load"] and r["rebuilt"] == [False, False], r
+    assert r["load_s"] < 30 and r["runner"], r
+    # Built and joined: nothing is started again, nothing left to join.
+    assert r["again"] == [False, False], r

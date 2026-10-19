@@ -976,10 +976,12 @@ class ModelLoader:
 
             # With JIT prefetch on (TLLM_JIT_PREFETCH=1), JIT kernels the
             # model's layers build in warmup (FlashInfer modules, CuTe DSL
-            # FP8 GEMM tactics) are built in CPU-only helpers while the
-            # weights load.
+            # FP8 GEMM tactics, MiniMax-M3's MSA kernels) are built in
+            # CPU-only helpers while the weights load.
             from ..jit_prefetch import start_model_builds
-            start_model_builds(model, rank=self.mapping.rank)
+            start_model_builds(model,
+                               rank=self.mapping.rank,
+                               llm_args=self.llm_args)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

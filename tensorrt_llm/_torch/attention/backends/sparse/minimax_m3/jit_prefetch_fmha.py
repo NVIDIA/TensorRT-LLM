@@ -47,6 +47,7 @@ call runs is still chosen by ``fmha_sm100`` itself; it finds it built.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 KIND = "fmha_sm100"
@@ -208,3 +209,71 @@ def fmha_jit_module():
     from .kernels.msa_utils import require_msa_module
 
     return require_msa_module().jit
+
+
+def flashinfer_modules(model: Any) -> List[str]:
+    """FlashInfer JIT modules a MiniMax-M3 MSA engine builds in warmup:
+    ``["fmha_gen"]``, FlashInfer's TRTLLM-GEN attention launcher, for any
+    model with MSA attention layers on an SM100-family GPU, else none.
+
+    The MSA backend runs the decode rows of the dense layers (0-2) on
+    ``flashinfer.decode.trtllm_batch_decode_with_kv_cache``
+    (``kernels/trtllm_gen_dense_decode.py``; the backend refuses to start if
+    that path cannot run). Its launcher module is an nvcc build of about a
+    minute that each rank pays in warmup's first forward with a generation
+    request (``_run_attention_warmup``), on context-only servers as well.
+    Only the model's layers are needed to know this, so the prefetcher builds
+    it in a CPU-only helper while the weights load.
+    """
+    from tensorrt_llm._utils import is_sm_100f
+
+    from .kernels.msa_utils import msa_package_available
+    from .kernels.trtllm_gen_dense_decode import flashinfer_available
+    from .msa_backend import MiniMaxM3MsaSparseAttention
+
+    if model is None or not is_sm_100f() or not msa_package_available():
+        return []
+    if not flashinfer_available():
+        return []
+    for mod in model.modules():
+        if isinstance(mod.__dict__.get("attn"), MiniMaxM3MsaSparseAttention):
+            return ["fmha_gen"]
+    return []
+
+
+def kv_cache_geometry(model: Any, llm_args: Any) -> Optional[Any]:
+    """What :class:`MiniMaxM3FmhaProvider` reads from the KV cache manager
+    (page size, cache dtype, indexer dtype), derived from the engine's
+    arguments and the model's quantization the way the executor derives them
+    when it creates the manager, so the builds can start once the model is
+    constructed, while its weights load. None if the engine has no MSA
+    attention or a value is missing."""
+    from tensorrt_llm.bindings import DataType
+
+    sparse_cfg = getattr(llm_args, "sparse_attention_config", None)
+    if (
+        getattr(sparse_cfg, "algorithm", None) != "minimax_m3"
+        or getattr(sparse_cfg, "implementation", None) != "msa"
+    ):
+        return None
+    # The executor sets kv_cache_config.tokens_per_block to MSA's page size
+    # (128) before the model loads (py_executor_creator).
+    tokens_per_block = getattr(getattr(llm_args, "kv_cache_config", None), "tokens_per_block", None)
+    model_config = getattr(model, "model_config", None)
+    if not tokens_per_block or model_config is None:
+        return None
+    # As create_kv_cache_manager: an FP8 or NVFP4 KV cache from the
+    # (overridden) KV quantization, else an unquantized one, which the
+    # planner treats alike (BF16 q, as fmha_sm100 has no other).
+    quant_mode = model_config.quant_config.quant_mode
+    if quant_mode.has_fp8_kv_cache():
+        dtype = DataType.FP8
+    elif quant_mode.has_fp4_kv_cache():
+        dtype = DataType.NVFP4
+    else:
+        dtype = DataType.BF16
+    return SimpleNamespace(
+        tokens_per_block=int(tokens_per_block),
+        dtype=dtype,
+        indexer_kv_dtype=str(getattr(sparse_cfg, "indexer_kv_dtype", "bf16")),
+    )
