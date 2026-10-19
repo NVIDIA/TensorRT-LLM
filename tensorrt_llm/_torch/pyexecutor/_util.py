@@ -4576,6 +4576,7 @@ def create_torch_sampler_args(
                     index,
                     len(capture.beam_width_array) -
                     1)] for index in range(capture.max_capture_tokens)),
+                max_beam_width=max(capture.beam_width_array),
                 batch_sizes=batches,
                 early_stopping=capture.early_stopping,
             ) for capture in config.capture_configs)

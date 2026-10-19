@@ -190,6 +190,7 @@ def test_sampler_factory_preserves_capture_combinations_and_resource_limits() ->
         (2, 4, 4, 4),
         (2, 3),
     ]
+    assert [capture.max_beam_width for capture in captures] == [4, 4, 4, 4]
     assert [capture.early_stopping for capture in captures] == [1, 1, 0, 2]
     assert all(capture.batch_sizes == (1, 2) for capture in captures)
     assert all(not capture.return_probs for capture in captures)
@@ -232,3 +233,11 @@ def test_instantiation_resolves_capture_batches_without_changing_slot_capacity(m
     resolved = captured["beam_search_cuda_graph_config"]
     assert resolved.batch_sizes == [1, 2] and resolved.max_batch_size == 2
     assert config.batch_sizes is None and config.max_batch_size == 0
+
+
+@pytest.mark.parametrize("width", [0, 3])
+def test_internal_profile_rejects_insufficient_admission_width(width: int) -> None:
+    from tensorrt_llm._torch.pyexecutor.sampler.beam_search_graph import BeamSearchGraphProfile
+
+    with pytest.raises(ValueError, match="admission width"):
+        BeamSearchGraphProfile(beam_widths=(2, 4), max_beam_width=width, batch_sizes=(1,))

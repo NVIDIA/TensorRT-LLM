@@ -1597,8 +1597,7 @@ class PyExecutor:
                 self.execution_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.execution_stream):
                     self.sampler.prepare_cuda_graphs(
-                        vocab_size=self.model_engine.model.model_config.
-                        pretrained_config.vocab_size)
+                        vocab_size=self.model_engine.model.vocab_size_padded)
                 torch.cuda.current_stream().wait_stream(self.execution_stream)
 
     def start_worker(self):

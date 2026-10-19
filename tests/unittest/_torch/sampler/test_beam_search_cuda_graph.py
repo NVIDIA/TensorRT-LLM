@@ -558,12 +558,14 @@ def executor(sampler: TorchSampler) -> NS:
         kv_connector_manager=None,
         _beam_graph_capture_owner=Owner(),
         execution_stream=torch.cuda.Stream(),
-        model_engine=NS(model=NS(model_config=NS(pretrained_config=NS(vocab_size=32)))),
+        model_engine=NS(
+            model=NS(vocab_size_padded=32, model_config=NS(pretrained_config=NS(vocab_size=32)))
+        ),
     )
 
 
 def test_real_sampler_startup_restores_state_and_dispatches_handler(monkeypatch) -> None:
-    sampler = make_sampler((Profile(beam_widths=(2, 4), batch_sizes=(1, 2)),))
+    sampler = make_sampler((Profile(beam_widths=(2, 4), max_beam_width=4, batch_sizes=(1, 2)),))
     sampler.store.beam_search_store.ensure_cba()
     before = copy.deepcopy(sampler.store)
     finish = copy.deepcopy(sampler._finish_reasons_handler.store)
@@ -692,7 +694,9 @@ def test_async_sampler_declines_profiles() -> None:
             max_beam_width=4,
             max_total_draft_tokens=0,
             enable_async_worker=True,
-            beam_search_graph_profiles=(Profile(beam_widths=(2, 4), batch_sizes=(1,)),),
+            beam_search_graph_profiles=(
+                Profile(beam_widths=(2, 4), max_beam_width=4, batch_sizes=(1,)),
+            ),
         )
     )
     assert not sampler.needs_cuda_graph_warmup
@@ -775,7 +779,7 @@ def test_failed_replay_poisons_only_owner(monkeypatch) -> None:
 
 
 def test_capture_failure_restores_prepare_state(monkeypatch) -> None:
-    sampler = make_sampler((Profile(beam_widths=(2, 4), batch_sizes=(1,)),))
+    sampler = make_sampler((Profile(beam_widths=(2, 4), max_beam_width=4, batch_sizes=(1,)),))
     sampler.store.beam_search_store.ensure_cba()
     before = copy.deepcopy(sampler.store)
     finish = copy.deepcopy(sampler._finish_reasons_handler.store)
@@ -789,3 +793,92 @@ def test_capture_failure_restores_prepare_state(monkeypatch) -> None:
     equal(sampler._finish_reasons_handler.store, finish)
     assert sampler._beam_search._graph_runner.capture_failures == 2
     sampler.release_cuda_graphs()
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize(
+    "schedule,capture_tokens,capacity,vocab_size",
+    [
+        ([4], 3, 8, 32),
+        ([2, 4], 3, 8, 32),
+        ([2, 4, 8], 2, 16, 32),
+        ([2, 4, 8], 3, 8, 32),
+        ([4], 3, 4, 40),
+    ],
+)
+def test_startup_graphs_match_request_layout(
+    batch: int, schedule: list[int], capture_tokens: int, capacity: int, vocab_size: int
+) -> None:
+    from tensorrt_llm._torch.pyexecutor._util import create_torch_sampler_args
+    from tensorrt_llm.llmapi import BeamSearchCudaGraphConfig
+
+    config = BeamSearchCudaGraphConfig(
+        batch_sizes=[batch],
+        capture_configs=[dict(beam_width_array=schedule, max_capture_tokens=capture_tokens)],
+    )
+    sampler = TorchSampler(
+        create_torch_sampler_args(
+            max_seq_len=16,
+            speculative_config=None,
+            max_beam_width=capacity,
+            disable_overlap_scheduler=False,
+            enable_async_worker=False,
+            enable_speculative_beam_history_d2h=False,
+            max_num_sequences=4,
+            beam_search_cuda_graph_config=config,
+        )
+    )
+    ex = executor(sampler)
+    # The model interface also covers wrappers without a top-level lm_head.
+    ex.model_engine.model.vocab_size_padded = vocab_size
+    try:
+        executor_warmup()(ex)
+        runner = sampler._beam_search._graph_runner
+        assert runner is not None and runner.capture_count == capture_tokens
+        assert runner.capture_failures == 0
+        metadata = next(iter(runner._entries.values())).metadata
+        for tensor in graphs._state_tensors(metadata):
+            tensor.zero_()
+        metadata.seq_slots.copy_(torch.arange(batch - 1, -1, -1, device="cuda"))
+        metadata.beam_idx_arange.copy_(torch.arange(capacity, device="cuda", dtype=torch.int32))
+        metadata.cba.prompt_lens.fill_(1)
+        metadata.cba.end_ids.fill_(-1)
+        metadata.cba.cba_normed_scores.fill_(-float("inf"))
+        metadata.cba.cba_tokens.fill_(beam.BEAM_SEARCH_PAD_TOKEN)
+        metadata.cba.cba_caps.fill_(max(schedule))
+        width_in = 1
+        for index in range(capture_tokens + 1):
+            width_out = schedule[min(index, len(schedule) - 1)]
+            stride = 1 if index == 0 else max(schedule)
+            metadata.cba = dataclasses.replace(metadata.cba, max_gen_len=index + 2)
+            metadata.seq_lens.fill_(index + 1)
+            logits = torch.randn(batch * stride, vocab_size, device="cuda")
+            step = dict(
+                beam_width_in=width_in,
+                beam_width_out=width_out,
+                row_stride=stride,
+                temperature=None,
+                early_stopping=1,
+                return_probs=False,
+            )
+            reference = copy.deepcopy(metadata)
+            expected = NATIVE(logits.clone(), beam_search_args=reference, **step)
+            replays = runner.replay_count
+            actual = runner.sample(logits, beam_search_args=metadata, **step)
+            equal(actual, expected)
+            equal(metadata, reference)
+            assert runner.replay_count - replays == int(index < capture_tokens)
+            width_in = width_out
+        assert runner.capture_count == capture_tokens
+    finally:
+        ex._beam_graph_capture_owner.close()
+        sampler.release_cuda_graphs()
+
+
+def test_preparation_rejects_admission_width_above_sampler_capacity() -> None:
+    sampler = make_sampler((Profile(beam_widths=(2, 4), max_beam_width=8, batch_sizes=(1,)),))
+    try:
+        with pytest.raises(ValueError, match="sampler capacity"):
+            sampler.prepare_cuda_graphs(vocab_size=32)
+    finally:
+        sampler.release_cuda_graphs()

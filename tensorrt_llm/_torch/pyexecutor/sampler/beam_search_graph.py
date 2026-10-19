@@ -70,11 +70,14 @@ class BeamSearchGraphProfile:
     """Internal startup shapes; unknown request shapes execute eagerly.
 
     Widths describe successive output beam widths, starting with one input
-    beam. Batch sizes count requests, not beam rows. Temperature is applied by
-    BeamSearchStep before this region; tensor penalties use the eager path.
+    beam. max_beam_width retains the full request schedule maximum even when
+    beam_widths covers only its initial steps. Batch sizes count requests, not
+    beam rows. Temperature is applied by BeamSearchStep before this region;
+    tensor penalties use the eager path.
     """
 
     beam_widths: tuple[int, ...]
+    max_beam_width: int
     batch_sizes: tuple[int, ...]
     early_stopping: int = 1
     return_probs: bool = False
@@ -84,6 +87,8 @@ class BeamSearchGraphProfile:
             raise ValueError("Beam graph widths must be positive and nonempty")
         if not self.batch_sizes or min(self.batch_sizes) < 1:
             raise ValueError("Beam graph batch sizes must be positive and nonempty")
+        if self.max_beam_width < max(self.beam_widths):
+            raise ValueError("Beam graph admission width must cover all prepared widths")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -443,7 +448,7 @@ class BeamSearchGraphRunner:
         capacity, max_seq_len = store.cache_indirection.shape[1:]
         max_batch = store.cache_indirection.size(0)
         for profile in profiles:
-            if max(profile.beam_widths) > capacity or max(profile.batch_sizes) > max_batch:
+            if profile.max_beam_width > capacity or max(profile.batch_sizes) > max_batch:
                 raise ValueError("Beam graph profile exceeds sampler capacity")
         if not profiles:
             return
@@ -509,7 +514,7 @@ class BeamSearchGraphRunner:
                                 continue
                             args.cba = replace(cba, max_gen_len=index + 2)
                             args.seq_lens.fill_(index + 1)
-                            stride = 1 if index == 0 else capacity
+                            stride = 1 if index == 0 else profile.max_beam_width
                             logits = torch.zeros(
                                 (batch * stride, vocab_size), dtype=torch.float32, device=device
                             )
