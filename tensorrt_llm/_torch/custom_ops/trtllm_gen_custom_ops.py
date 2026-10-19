@@ -29,6 +29,109 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 
+# Pre-routing for trtllm::mxe4m3_mxe2m1_block_scale_moe_runner
+# (KIMI_K3_MOE_PRE_ROUTING=1). A model that computes the router logits on
+# another stream can launch the op's routing kernel there right after the
+# router GEMM (mxe2m1_pre_routing_prepare on the MoE stream before the fork,
+# mxe2m1_pre_routing_launch on the router stream). The next call of the op for
+# the same expert weights waits for the routing event after its input
+# quantization and skips its own routing (run_moe_routed).
+#
+# The routing workspace depends on the tile of the op's tactic, so every
+# non-tuning call records, per (gemm1 weights, num_tokens), the tile and the
+# routing inputs. Only recorded shapes are pre-routed (CUDA graph warmup runs
+# eager forwards before each capture), and the op uses the pre-routing only
+# when tile and routing inputs still match; otherwise it routes itself.
+_MXE2M1_PRE_ROUTING_ENV = "KIMI_K3_MOE_PRE_ROUTING"
+_MXE2M1_PRE_ROUTING_ENABLED = os.environ.get(_MXE2M1_PRE_ROUTING_ENV) == "1"
+# Above this many tokens per rank, the shared experts that now start later
+# overlap FC1 / FC2 and the contention costs more than the routing saves.
+# 0 = no limit.
+_MXE2M1_PRE_ROUTING_MAX_TOKENS = int(
+    os.environ.get("KIMI_K3_MOE_PRE_ROUTING_MAX_TOKENS", "8"))
+_MXE2M1_PRE_ROUTING_REC = {}
+_MXE2M1_PRE_ROUTING = {}
+MXE2M1_PRE_ROUTING_STATS = {"routed": 0, "fallback": 0, "recorded": 0}
+
+
+@dataclass(frozen=True)
+class _Mxe2m1RoutingRec:
+    tile: int
+    routing_bias: Optional[torch.Tensor]
+    num_experts: int
+    top_k: int
+    n_group: Optional[int]
+    topk_group: Optional[int]
+    local_expert_offset: int
+    local_num_experts: int
+    routed_scaling_factor: Optional[float]
+    routing_method_type: int
+
+    def same_inputs(self, other: "_Mxe2m1RoutingRec") -> bool:
+
+        def ptr(t):
+            return None if t is None else t.data_ptr()
+
+        return (
+            self.tile == other.tile
+            and ptr(self.routing_bias) == ptr(other.routing_bias)
+            and (self.num_experts, self.top_k, self.n_group, self.topk_group,
+                 self.local_expert_offset, self.local_num_experts,
+                 self.routed_scaling_factor, self.routing_method_type)
+            == (other.num_experts, other.top_k, other.n_group, other.topk_group,
+                other.local_expert_offset, other.local_num_experts,
+                other.routed_scaling_factor, other.routing_method_type))
+
+
+def mxe2m1_pre_routing_enabled() -> bool:
+    return _MXE2M1_PRE_ROUTING_ENABLED
+
+
+def mxe2m1_pre_routing_prepare(gemm1_weights: torch.Tensor, num_tokens: int):
+    """Allocate the routing workspace for ``gemm1_weights`` and ``num_tokens``.
+
+    Call on the MoE stream before the router stream forks. Returns None when
+    the op has not run this shape yet, above the token limit, or while
+    autotuning.
+    """
+    if not _MXE2M1_PRE_ROUTING_ENABLED or AutoTuner.get().is_tuning_mode:
+        return None
+    if 0 < _MXE2M1_PRE_ROUTING_MAX_TOKENS < num_tokens:
+        return None
+    rec = _MXE2M1_PRE_ROUTING_REC.get((gemm1_weights.data_ptr(), num_tokens))
+    if rec is None:
+        return None
+    ws = torch.ops.trtllm.mxe2m1_moe_routing_workspace(num_tokens,
+                                                       rec.num_experts,
+                                                       rec.top_k, rec.tile,
+                                                       gemm1_weights)
+    return rec, ws, torch.cuda.Event()
+
+
+def mxe2m1_pre_routing_launch(prepared, gemm1_weights: torch.Tensor,
+                              routing_logits: torch.Tensor) -> None:
+    """Run the routing kernel into the prepared workspace and record its event.
+
+    Call on the router stream after the router GEMM. The next
+    mxe4m3_mxe2m1_block_scale_moe_runner call for ``gemm1_weights`` waits for
+    the event, so the caller's MoE stream need not wait for the router stream
+    before that call.
+    """
+    rec, ws, event = prepared
+    torch.ops.trtllm.mxe2m1_moe_routing(routing_logits, rec.routing_bias, ws,
+                                        rec.num_experts, rec.top_k, rec.n_group,
+                                        rec.topk_group, rec.local_expert_offset,
+                                        rec.local_num_experts,
+                                        rec.routed_scaling_factor, rec.tile,
+                                        rec.routing_method_type)
+    event.record()
+    _MXE2M1_PRE_ROUTING[gemm1_weights.data_ptr()] = (rec, ws, event,
+                                                     routing_logits.data_ptr(),
+                                                     tuple(
+                                                         routing_logits.shape),
+                                                     routing_logits.dtype)
+
+
 _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
     "TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION")
 # Distribution names control the *shape* of the autotune dummy topk
@@ -1520,6 +1623,63 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         tuning_config_with_hook,
         input_tensors_for_tuner,
     )
+
+    pre = _MXE2M1_PRE_ROUTING.pop(gemm1_weights.data_ptr(),
+                                  None) if _MXE2M1_PRE_ROUTING else None
+    if pre is not None:
+        # Join the router stream before anything reads the routing workspace
+        # or the logits; the caller's MoE stream has not waited for it.
+        pre[2].wait()
+    if (_MXE2M1_PRE_ROUTING_ENABLED and routing_logits is not None
+            and topk_ids is None and topk_weights is None
+            and not tuner.is_tuning_mode):
+        tactic = [-1, -1] if best_tactic == -1 else best_tactic
+        num_tokens = hidden_states.shape[0]
+        rec = _Mxe2m1RoutingRec(
+            kernel_runner.get_runner().get_tile(tactic, num_tokens, top_k,
+                                                local_num_experts),
+            routing_bias, num_experts, top_k, n_group, topk_group,
+            local_expert_offset, local_num_experts, routed_scaling_factor,
+            routing_method_type)
+        key = (gemm1_weights.data_ptr(), num_tokens)
+        old = _MXE2M1_PRE_ROUTING_REC.get(key)
+        if old is None or not old.same_inputs(rec):
+            _MXE2M1_PRE_ROUTING_REC[key] = rec
+            MXE2M1_PRE_ROUTING_STATS["recorded"] += 1
+        if pre is not None:
+            pre_rec, pre_ws, _, logits_ptr, logits_shape, logits_dtype = pre
+            if (logits_ptr != routing_logits.data_ptr()
+                    or logits_shape != tuple(routing_logits.shape)
+                    or logits_dtype != routing_logits.dtype):
+                # The logits were replaced on the MoE stream before it joined
+                # the router stream; that read may have raced the router GEMM.
+                raise RuntimeError(
+                    f"{_MXE2M1_PRE_ROUTING_ENV}: the MoE op got other routing "
+                    "logits than the pre-routed ones")
+            if pre_rec.same_inputs(rec):
+                MXE2M1_PRE_ROUTING_STATS["routed"] += 1
+                result = kernel_runner.get_runner().run_moe_routed(
+                    routing_logits, routing_bias, hidden_states,
+                    hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+                    gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                    gemm2_weights, gemm2_weights_scale, gemm2_bias, None, None,
+                    None, kernel_runner.num_experts, kernel_runner.top_k,
+                    kernel_runner.n_group, kernel_runner.topk_group,
+                    kernel_runner.intermediate_size,
+                    kernel_runner.valid_hidden_size,
+                    kernel_runner.valid_intermediate_size,
+                    kernel_runner.local_expert_offset,
+                    kernel_runner.local_num_experts,
+                    kernel_runner.routed_scaling_factor,
+                    kernel_runner.routing_method_type, tactic, output, pre_ws,
+                    pre_rec.tile)
+                if output is not None:
+                    return torch.empty(0,
+                                       device=result.device,
+                                       dtype=result.dtype)
+                return result
+    if pre is not None:
+        MXE2M1_PRE_ROUTING_STATS["fallback"] += 1
 
     input_tensors = input_tensors_for_tuner
     input_tensors[
