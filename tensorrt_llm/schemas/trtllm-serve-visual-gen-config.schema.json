@@ -397,6 +397,24 @@
           "title": "Ring Size",
           "type": "integer"
         },
+        "tp_layout": {
+          "anyOf": [
+            {
+              "enum": [
+                "replicated",
+                "token_sharded"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Activation layout between TP projections: 'replicated' (all-reduce TP; the default when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires tp_size > 1 and no ulysses/ring/attn2d.",
+          "status": "prototype",
+          "title": "Tp Layout"
+        },
         "tp_size": {
           "default": 1,
           "description": "Tensor parallel group size. Heads are sharded across tp_size GPUs.",
