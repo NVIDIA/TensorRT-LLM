@@ -10,15 +10,17 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, FrozenSet, Iterable,
+                    Iterator, List, Literal, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
+from torch.utils.hooks import RemovableHandle
 
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 
@@ -46,6 +48,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType, PeftCacheConfig,
+                                          PrefillCudaGraphBackend,
                                           WaitingQueuePolicy)
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
@@ -411,6 +414,14 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # Early context-only completion (TLLM_EARLY_CTX_RESP_LAYER, see
+    # _register_early_ctx_resp_hook). Class-level defaults keep it off for
+    # executors assembled without __init__.
+    _early_ctx_resp_layer: Optional[int] = None
+    _early_ctx_resp_hook: Optional[RemovableHandle] = None
+    # Requests whose terminal response the hook published in this iteration.
+    _early_ctx_resp_sent_ids: FrozenSet[int] = frozenset()
 
     def __init__(
         self,
@@ -786,6 +797,9 @@ class PyExecutor:
         # queue-backed client delivery while retaining normal termination as
         # the single owner of resource and result-queue cleanup.
         self._pending_response_terminations: List[LlmRequest] = []
+        early_ctx_resp_layer = os.environ.get("TLLM_EARLY_CTX_RESP_LAYER")
+        if early_ctx_resp_layer:
+            self._early_ctx_resp_layer = int(early_ctx_resp_layer)
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _append_iter_stats is reached from per-rank-divergent gates,
         # so its tp_allgather collective is lifted to _flush_iter_stats_synced.
@@ -1984,6 +1998,9 @@ class PyExecutor:
             self._stop_mpi_progress_thread()
             return
         self.worker_thread.join()
+        if self._early_ctx_resp_hook is not None:
+            self._early_ctx_resp_hook.remove()
+            self._early_ctx_resp_hook = None
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1:
@@ -5714,10 +5731,182 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    def _register_early_ctx_resp_hook(self) -> None:
+        """Complete the previous batch's context-only requests inside forward.
+
+        The overlap loop updates batch k-1 and starts its KV sends only after
+        forward(k) returns on the host, roughly one step after k-1 finished on
+        the GPU, which delays the KV send and the terminal response of every
+        context-only request by that much. With TLLM_EARLY_CTX_RESP_LAYER=<L>,
+        a forward pre-hook on decoder layer L of forward(k) runs that work and
+        publishes those responses while the GPU still has layers < L queued.
+        """
+        layer_idx = self._early_ctx_resp_layer
+        if layer_idx is None or self._early_ctx_resp_hook is not None:
+            return
+        model = self.model_engine.model
+        llm_args = self.llm_args
+        if self.kv_cache_transceiver is None:
+            reason = "no KV cache transceiver"
+        elif self.dist.pp_size != 1 or self.dist.cp_size != 1:
+            reason = "pipeline or context parallelism"
+        elif self.kv_connector_manager is not None:
+            reason = "KV cache connector"
+        elif self._is_kv_manager_v2:
+            # Sends and terminations would release V2 index slots and rewrite
+            # host page indices while forward(k) is still being launched.
+            reason = "KV cache manager V2"
+        elif (llm_args.cuda_graph_config is not None
+              or llm_args.torch_compile_config is not None
+              or llm_args.prefill_cuda_graph_backend
+              != PrefillCudaGraphBackend.DISABLED):
+            # Graph replays skip module hooks; torch.compile would trace it.
+            reason = "CUDA graphs or torch.compile"
+        elif llm_args.enable_return_routed_experts:
+            reason = "routed expert capture"
+        elif not isinstance(model, DecoderModelForCausalLM):
+            reason = f"unsupported model {type(model).__name__}"
+        elif not (0 <= layer_idx <
+                  model.model_config.pretrained_config.num_hidden_layers):
+            reason = "layer index out of range"
+        else:
+            reason = None
+        if reason is not None:
+            logger.warning(
+                f"TLLM_EARLY_CTX_RESP_LAYER={layer_idx} ignored: {reason}")
+            self._early_ctx_resp_layer = None
+            return
+
+        # The model outlives this executor (the KV cache estimation executor
+        # shares it), so the hook must not keep the executor alive.
+        executor_ref = weakref.ref(self)
+
+        def pre_hook(module, args):
+            executor = executor_ref()
+            if executor is not None:
+                executor._early_ctx_resp_pre_hook()
+
+        self._early_ctx_resp_armed = False
+        self._early_ctx_resp_hook = model.model.layers[
+            layer_idx].register_forward_pre_hook(pre_hook)
+        logger.info(
+            f"Early context-only responses enabled on decoder layer {layer_idx}"
+        )
+
+    def _arm_early_ctx_resp_hook(self, scheduled_batch: ScheduledRequests,
+                                 process_previous_batch: bool) -> None:
+        # Armed for every forward of the overlap loop, not only when there is
+        # a previous batch: can_queue is TP-uniform, so every rank fires the
+        # hook's response gather exactly once per forward.
+        self._early_ctx_resp_armed = True
+        self._early_ctx_resp_fired = False
+        self._early_ctx_resp_batch = (scheduled_batch
+                                      if process_previous_batch else None)
+        self._early_ctx_resp_prev_done = False
+        self._early_ctx_resp_error = None
+        self._early_ctx_resp_sent_ids = frozenset()
+
+    def _disarm_early_ctx_resp_hook(self) -> bool:
+        """Return whether the hook processed the previous batch."""
+        self._early_ctx_resp_armed = False
+        self._early_ctx_resp_batch = None
+        if not self._early_ctx_resp_fired:
+            # forward(k) ended before layer L; pair the peers' hook gather.
+            self._enqueue_responses([])
+        if self._early_ctx_resp_error is not None:
+            # Raised here, where the loop's own previous-batch step would have.
+            raise self._early_ctx_resp_error
+        return self._early_ctx_resp_prev_done
+
+    @nvtx_range("_early_ctx_resp_pre_hook")
+    def _early_ctx_resp_pre_hook(self) -> None:
+        # Runs inside forward(k) on the execution stream; nothing below may
+        # wait on the device except for the previous batch's sampler event.
+        if not self._early_ctx_resp_armed:
+            return
+        self._early_ctx_resp_armed = False
+        self._early_ctx_resp_fired = True
+        responses = []
+        if self._early_ctx_resp_batch is not None:
+            try:
+                responses = self._complete_previous_ctx_requests(
+                    self._early_ctx_resp_batch)
+            except Exception as e:
+                # An exception here would be reported as a forward error.
+                self._early_ctx_resp_error = e
+        # Unconditional: a tp_gather under attention DP.
+        self._enqueue_responses(responses)
+        self._early_ctx_resp_sent_ids = frozenset(
+            request_id for request_id, _ in responses)
+
+    def _complete_previous_ctx_requests(
+            self, scheduled_batch: ScheduledRequests
+    ) -> List[Tuple[int, LlmResponse]]:
+        """Run the overlap loop's post-forward steps for the previous batch
+        and build the terminal responses of the context-only requests whose
+        KV send they started."""
+        previous_scheduled = self.previous_batch.scheduled_requests
+        sample_state = self.previous_batch.sample_state
+        sampled_requests = (previous_scheduled.context_requests_last_chunk +
+                            previous_scheduled.generation_requests)
+        if not any(request.is_context_only_request
+                   for request in sampled_requests):
+            return []
+        # The update must not change requests that forward(k) is using.
+        current = {id(request) for request in scheduled_batch.all_requests()}
+        if any(id(request) in current for request in sample_state.requests):
+            return []
+        if sample_state.sampler_event is not None:
+            # The previous batch's KV must be complete before its send starts.
+            sample_state.sampler_event.synchronize()
+
+        self._update_requests(sample_state)
+        if self.speculation_gate is not None:
+            self._update_batch_acceptance_rate(previous_scheduled,
+                                               sample_state,
+                                               iteration_id=self.iter_counter)
+        previous_requests = previous_scheduled.all_requests()
+        self._send_kv_async(previous_requests)
+        self._early_ctx_resp_prev_done = True
+
+        # Same as _handle_responses for a finished request. A send that
+        # already completed was released by the coordinator, which removed
+        # the request from active_requests and staged its response.
+        active_ids = {id(request) for request in self.active_requests}
+        batch_token_time = self.perf_manager.get_timestamp()
+        gpu_times_cache = {}
+        responses = []
+        for request in previous_requests:
+            if not (request.is_context_only_request and
+                    (request.is_context_finished
+                     or request.is_finished_due_to_length)
+                    and not request.is_finished_due_to_cancellation
+                    and request.state
+                    == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                    and id(request) in active_ids
+                    and not request.is_attention_dp_dummy
+                    and not request.py_kv_transfer_timed_out):
+                continue
+            request.draft_tokens = request.py_draft_tokens or []
+            request.decoding_iter = request.py_decoding_iter
+            self.perf_manager.append_step_metrics(
+                request, self.iter_counter, batch_token_time=batch_token_time)
+            if request.return_perf_metrics and request.py_decoding_iter >= 1:
+                request.update_perf_metrics(self.iter_counter)
+            if request.return_perf_metrics:
+                self.perf_manager.compute_batch_gpu_times(
+                    [request], gpu_times_cache=gpu_times_cache)
+            response = request.create_response(False, self.dist.rank)
+            if response:
+                self._set_final_response_fields(request, response)
+                responses.append((request.py_request_id, response))
+        return responses
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        self._register_early_ctx_resp_hook()
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
@@ -5774,6 +5963,7 @@ class PyExecutor:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
+                previous_batch_done = False
                 # Per-iteration scope labels for torch.profiler. The
                 # overlap loop runs ``_update_requests`` for the previous
                 # batch between the forward and the sampling region, so the
@@ -5901,15 +6091,23 @@ class PyExecutor:
                         self._submit_encoder_step(
                             scheduled_batch.encoder_requests)
 
+                    if self._early_ctx_resp_hook is not None:
+                        self._arm_early_ctx_resp_hook(
+                            scheduled_batch, self.previous_batch is not None
+                            and should_process_previous_batch)
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
+                    if self._early_ctx_resp_hook is not None:
+                        previous_batch_done = self._disarm_early_ctx_resp_hook()
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
-                if self.previous_batch is not None and should_process_previous_batch:
+                if (self.previous_batch is not None
+                        and should_process_previous_batch
+                        and not previous_batch_done):
                     self._update_requests(self.previous_batch.sample_state)
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
@@ -8785,6 +8983,26 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        # A request whose terminal response the early context-only response
+        # hook already published keeps its in-flight KV send: no error
+        # response and no state change. It only leaves active_requests, as in
+        # _handle_responses, and the transfer completion terminates it.
+        early_resp_terminations = []
+        if self._early_ctx_resp_sent_ids and not is_fatal:
+            in_transfer = self.async_transfer_manager.requests_in_transfer()
+            early_resp_requests = [
+                request for request in failed_requests
+                if request.py_request_id in self._early_ctx_resp_sent_ids
+                and request.py_request_id in in_transfer
+            ]
+            if early_resp_requests:
+                early_ids = {id(request) for request in early_resp_requests}
+                failed_requests = [
+                    request for request in failed_requests
+                    if id(request) not in early_ids
+                ]
+                if self.force_terminate_ctx_for_partial_reuse:
+                    early_resp_terminations = early_resp_requests
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -8828,7 +9046,8 @@ class PyExecutor:
             # responses instead; every rank flushes the buffer together at
             # _flush_pending_transfer_responses.
             self._pending_transfer_responses.extend(error_responses.items())
-            self._pending_response_terminations.extend(failed_requests)
+            self._pending_response_terminations.extend(failed_requests +
+                                                       early_resp_terminations)
             defer_termination = True
         else:
             # Without multi-rank ADP there is no rank-divergent collective, so
@@ -8848,7 +9067,7 @@ class PyExecutor:
                 self._terminate_request(request)
 
         if not defer_termination:
-            for request in failed_requests:
+            for request in failed_requests + early_resp_terminations:
                 self._terminate_request(request)
 
         if self._fatal_error is not None:
@@ -9147,6 +9366,19 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    def _set_final_response_fields(self, request: LlmRequest,
+                                   response: LlmResponse) -> None:
+        response.result.cached_tokens = request.cached_tokens
+        self._maybe_attach_ctx_usage(request, response)
+        response.result.per_pos_drafted = request.py_per_pos_drafted
+        response.result.per_pos_accepted = request.py_per_pos_accepted
+        if request.py_total_draft_tokens > 0:
+            # Backfill RequestPerfMetrics.speculative_decoding on the client
+            # side from the Python-owned counters.
+            response.result.spec_dec_totals = (
+                request.py_total_accepted_draft_tokens,
+                request.py_total_draft_tokens)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -9225,10 +9457,15 @@ class PyExecutor:
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
+            # The early context-only response hook already did the response
+            # part below for this request; only the bookkeeping remains.
+            early_resp_sent = req_id in self._early_ctx_resp_sent_ids
+
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
             # This is critical for E2E latency computation in tracing/Prometheus.
-            if request.return_perf_metrics and request.py_decoding_iter >= 1:
+            if (request.return_perf_metrics and request.py_decoding_iter >= 1
+                    and not early_resp_sent):
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
@@ -9247,6 +9484,9 @@ class PyExecutor:
             if (not emit_first_iter and request.py_decoding_iter == 1
                     and not request.is_finished):
                 should_emit = False
+            if early_resp_sent:
+                should_emit = False
+                request_done = request.is_finished
             if should_emit:
                 if request.return_perf_metrics:
                     # Response creation may finalize and copy scalar ctx GPU totals.
@@ -9255,16 +9495,7 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
-                    response.result.cached_tokens = request.cached_tokens
-                    self._maybe_attach_ctx_usage(request, response)
-                    response.result.per_pos_drafted = request.py_per_pos_drafted
-                    response.result.per_pos_accepted = request.py_per_pos_accepted
-                    if request.py_total_draft_tokens > 0:
-                        # Backfill RequestPerfMetrics.speculative_decoding on
-                        # the client side from the Python-owned counters.
-                        response.result.spec_dec_totals = (
-                            request.py_total_accepted_draft_tokens,
-                            request.py_total_draft_tokens)
+                    self._set_final_response_fields(request, response)
                     new_responses.append((req_id, response))
 
             if request_done:
