@@ -16,7 +16,7 @@
 import math
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -947,7 +947,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         )
     )
     context_postprocess = Mock()
-    wrapper = Mock()
+    wrapper = create_autospec(prims_context_module.BatchPrefillPagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -1034,7 +1034,8 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
         "q_dtype": torch.bfloat16,
-        "kv_dtype": torch.bfloat16,
+        "k_dtype": torch.bfloat16,
+        "v_dtype": torch.bfloat16,
         "out_dtype": torch.bfloat16,
         "page_size": 32,
         "mask_type": "causal",
@@ -1155,7 +1156,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
             False,
         )
     )
-    wrapper = Mock()
+    wrapper = create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
     wrapper._plan_state = SimpleNamespace(
         policy=(
             ("use_split_kv", use_split_kv),
@@ -1323,7 +1324,10 @@ def test_decode_layer_adapters_bind_the_same_shared_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_decode_module,
@@ -1409,7 +1413,10 @@ def test_decode_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_decode_module,
@@ -1509,7 +1516,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         dtype=torch.int32,
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -1703,7 +1710,10 @@ def test_mla_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
     fmha = PrimsTSFmha(attn)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_mla_module,
@@ -1769,7 +1779,7 @@ def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
         "is_current_stream_capturing",
         lambda: capturing,
     )
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_mla_module,
@@ -1815,7 +1825,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         dtype=torch.int32,
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,

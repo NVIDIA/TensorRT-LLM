@@ -18,6 +18,7 @@ import copy
 import fcntl
 import glob
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from test_common.perf_sanity_matching import get_test_case_match_keys
 
 from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info, print_warning
+from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
@@ -1550,6 +1552,24 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     return int(float(val)) if val is not None else 0
 
 
+def get_node_address() -> str:
+    """Return the address this node's servers bind and publish to the other roles.
+
+    An IP rather than the hostname, so neither binding it nor dialing a published
+    address needs DNS. get_local_ip() returns loopback when it finds no routable
+    interface, and its hostname-lookup fallback can return a link-local address;
+    other nodes cannot dial either, so the hostname is used instead.
+    """
+    hostname = socket.gethostname()
+    ip = get_local_ip()
+    address = ipaddress.ip_address(ip)
+    if address.is_loopback or address.is_link_local:
+        print_warning(f"No routable IP found on {hostname}; using the hostname instead")
+        return hostname
+    print_info(f"Using {ip} as the server address of {hostname}")
+    return ip
+
+
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     """Add host and port to command."""
     return cmd + ["--host", host, "--port", str(port)]
@@ -2624,11 +2644,8 @@ class DisaggTestCmds(NamedTuple):
     def _hostnames_dir(self, server_idx: int) -> str:
         """Directory the disagg tasks exchange bound addresses through.
 
-        Scoped by SLURM job id so a rerun never reads the previous run's files:
-        test_output_dir is derived from the test case name alone and is created
-        with exist_ok=True, so it is reused across runs. The step id is
-        deliberately excluded -- each role runs as a separate srun step within
-        one job, and they must all agree on this path.
+        Reused across runs; slurm_launch_draft.sh clears it before each attempt.
+        The step id is excluded so all roles (separate srun steps) agree on it.
         """
         run_id = os.environ.get("SLURM_JOB_ID", "local")
         return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
@@ -3091,11 +3108,7 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
-                # _hostnames_dir is scoped by job, so a new job never sees an
-                # older one's files, but a retry within the same job and the
-                # same server_idx would. Drop the previous attempt's address
-                # first, or the BENCHMARK task connects to a dead port. This
-                # task owns the file exclusively, so removing it here is safe.
+                # Drop a stale address from a retry so BENCHMARK never sees a dead port.
                 disagg_addr_path = self._disagg_server_addr_file(server_idx)
                 if os.path.exists(disagg_addr_path):
                     os.remove(disagg_addr_path)
@@ -4004,7 +4017,7 @@ class PerfSanityTestConfig:
             disagg_config = DisaggConfig(
                 name=f"{test_label}-{config_file_base_name}",
                 disagg_serving_type=disagg_serving_type,
-                hostname=socket.gethostname(),
+                hostname=get_node_address(),
                 numa_bind=numa_bind,
                 timeout=timeout,
                 benchmark_mode=benchmark_mode,

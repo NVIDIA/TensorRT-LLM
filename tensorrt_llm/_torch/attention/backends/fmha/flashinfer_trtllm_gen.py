@@ -479,6 +479,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
         tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
@@ -515,6 +516,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # FlashInfer's TRTLLM-Gen MLA decode does not support 64 < H < 128.
+        # Let selection fall through to the legacy TRTLLM-Gen backend.
+        if 64 < num_heads < 128:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                f"for num_heads={num_heads} (64 < num_heads < 128) "
+                "as it may select unsupported kernels.",
             )
 
         if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
@@ -753,6 +764,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
                     tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,

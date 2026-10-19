@@ -154,7 +154,8 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_thread.start()
 
     def _new_stream(self):
-        return CUASSERT(cudart.cudaStreamCreate())[0]
+        # Non-blocking, so gather/scatter never queue behind a forward on the legacy default stream.
+        return CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
 
     def _gather_blocking(self, src_addr: int, write_meta, total: int) -> None:
         """Gather the scattered fragments into the send region and block until done. The whole gather

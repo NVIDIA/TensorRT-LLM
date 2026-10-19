@@ -17,6 +17,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -506,19 +507,23 @@ class MultimodalItemScheduler:
                     target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
                 )
 
-            try:
-                outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            if len(outputs) != len(miss_owners):
-                raise MultimodalEncoderRequestError(
-                    "MM item encoder must return one output per item"
-                )
+            # This step runs outside the scoped LLM forward. Request state and
+            # the cache retain copies, so every window tensor the encoder
+            # produces is released when the scope exits.
+            with discard_nccl_window_tensor_outputs(encoder_inputs):
+                try:
+                    outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
+                except MultimodalEncoderContractError as error:
+                    raise MultimodalEncoderRequestError(str(error)) from error
+                if len(outputs) != len(miss_owners):
+                    raise MultimodalEncoderRequestError(
+                        "MM item encoder must return one output per item"
+                    )
 
-            for output, (request, item_idx, key) in zip(outputs, miss_owners, strict=True):
-                request.py_mm_encoder_state.record(item_idx, output)
-                if encoder_cache is not None and key is not None:
-                    encoder_cache.put(key, output)
+                for output, (request, item_idx, key) in zip(outputs, miss_owners, strict=True):
+                    request.py_mm_encoder_state.record(item_idx, output)
+                    if encoder_cache is not None and key is not None:
+                        encoder_cache.put(key, output)
 
         for request in touched_requests.values():
             request.py_mm_encoder_state.finalize(request.py_multimodal_data)
