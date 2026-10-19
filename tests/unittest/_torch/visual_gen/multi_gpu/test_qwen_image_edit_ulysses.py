@@ -39,7 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 
 try:
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
