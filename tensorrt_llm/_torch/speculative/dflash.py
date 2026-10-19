@@ -994,10 +994,16 @@ class DFlashWorker(SpecWorkerBase):
                     mgr.layer_to_pool_mapping_dict[local_id] != layer_group_id
                     or mgr.get_layer_page_index_scale(layer_id) != converter.scale
                 ):
-                    raise NotImplementedError(
-                        "DFlash's shared context block table requires draft layers "
-                        "with the same lifecycle and page-index scale"
+                    if self._ctx_unified_cache:
+                        raise NotImplementedError(
+                            "DFlash's shared context block table requires draft layers "
+                            "with the same lifecycle and page-index scale"
+                        )
+                    logger.warning(
+                        "DFlash: draft KV layers have different lifecycles or page-index "
+                        "scales; using the private ctx arena."
                     )
+                    return False
             if per_layer_tables:
                 # Attention tables address the physical pool origin, whereas
                 # get_buffers() starts at this layer's own K buffer.
