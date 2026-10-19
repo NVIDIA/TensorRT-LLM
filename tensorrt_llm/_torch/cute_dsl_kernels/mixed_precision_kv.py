@@ -170,13 +170,11 @@ def materialize_mixed_precision_kv(
     lengths: torch.Tensor,
     layout: str,
 ) -> None:
-    """Restore cached KV from native high pages or NVFP4 low pages.
+    """Restore cached KV from high pages or dequantized low pages.
 
-    Pools are 5D HND/NHD views; the native view may use a different page size.
-    CUDA int32 page_tables[3, B, P] contains independent low/scale/high page IDs
-    (missing high pages are -1); lengths[2, B] contains cached/total lengths.
-    The manager supplies valid page IDs and lengths within the view capacity.
-    NVFP4 global scale is 6 for FP8 native KV and 1 for FP16/BF16.
+    Pools use 5D HND/NHD layouts. CUDA int32 page_tables[3, B, P] holds
+    low/scale/high IDs (-1 for missing high pages); lengths[2, B] holds
+    cached/total lengths.
     """
     block_size = pool.shape[3 if layout == "HND" else 2]
     capacity = pool.shape[0] // lengths.shape[1] * block_size if lengths.shape[1] else 0
@@ -193,10 +191,9 @@ def writeback_mixed_precision_kv(
     max_new_tokens_per_request: int,
     layout: str,
 ) -> None:
-    """Write every new token to low/scales and any retained high page.
+    """Quantize new KV into low pools and copy retained high pages.
 
-    Tensor layouts and scales match materialize_mixed_precision_kv. The launch
-    bound max_new_tokens_per_request must cover each request throughout replay.
+    max_new_tokens_per_request bounds every replay; layouts match materialize.
     """
     _run(
         True, max_new_tokens_per_request, pool, history, scales, high, page_tables, lengths, layout

@@ -28,6 +28,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 
 
+@pytest.mark.parametrize("scratch_reuse", [False, True])
 @pytest.mark.parametrize(
     "backend,high_dtype,compute_dtype,width,query_heads,heads,kv_layout,fp8_input",
     [
@@ -50,7 +51,15 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
     ],
 )
 def test_optimized_two_pool_prefill_and_decode(
-    backend, high_dtype, compute_dtype, width, query_heads, heads, kv_layout, fp8_input
+    backend,
+    high_dtype,
+    compute_dtype,
+    width,
+    query_heads,
+    heads,
+    kv_layout,
+    fp8_input,
+    scratch_reuse,
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for native KVCM")
@@ -58,7 +67,9 @@ def test_optimized_two_pool_prefill_and_decode(
     request_ids = list(range(batch))
     high_torch_dtype = binding_to_torch_dtype(high_dtype)
     manager = MixedPrecisionKVCacheManager(
-        KvCacheConfig(max_tokens=65536, enable_block_reuse=True),
+        KvCacheConfig(
+            max_tokens=65536, enable_block_reuse=True, enable_swa_scratch_reuse=scratch_reuse
+        ),
         CacheType.SELF,
         num_layers=1,
         num_kv_heads=heads,
@@ -206,6 +217,7 @@ def test_optimized_two_pool_prefill_and_decode(
 
     try:
         manager.add_dummy_requests(request_ids, [length] * batch, is_gen=False)
+        assert all(manager.kv_cache_map[i].has_scratch_slots == scratch_reuse for i in request_ids)
         output = forward(0, length, True)
         reference = torch.nn.functional.scaled_dot_product_attention(
             query[:, :length].reshape(batch, length, query_heads, width).transpose(1, 2),
@@ -229,7 +241,7 @@ def test_optimized_two_pool_prefill_and_decode(
             atol=0.05 if high_dtype == DataType.FP8 else 0.02,
             rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
         )
-        arena = manager._staging_buffer.data_ptr()
+        arena = manager.get_staging_buffer((1,), torch.uint8).data_ptr()
         history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
         scales_before = token_major(
             manager.get_mixed_precision_buffers(0, request_ids, kv_layout)[1][0]
@@ -257,7 +269,7 @@ def test_optimized_two_pool_prefill_and_decode(
             assert cache.resize(length + 1)
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
-        assert manager._staging_buffer.data_ptr() == arena
+        assert manager.get_staging_buffer((1,), torch.uint8).data_ptr() == arena
         assert_native_config()
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
         all_history_ids = manager.get_batch_cache_indices(request_ids, 0)

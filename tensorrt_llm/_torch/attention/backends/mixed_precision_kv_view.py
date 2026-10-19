@@ -1,11 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare one ordinary paged cache for optimized mixed-precision Attention.
-
-The low pool stores every token and participates in native cache reuse. The
-high pool retains native KV for the configured prefix and tail. Attention reads
-and writes its usual KV dtype; paged conversion connects it to the two pools.
-"""
+"""Convert mixed-precision KV pools to and from native Attention views."""
 
 import copy
 from dataclasses import replace
@@ -26,7 +21,7 @@ def get_mixed_precision_kv_view(
 
 
 class MixedPrecisionKVView:
-    """Present temporary paged KV to Attention and return new writes to its pools."""
+    """Expose mixed-precision KV pools as a native Attention cache."""
 
     @classmethod
     def prepare_batch(cls, metadata: AttentionMetadata) -> None:
@@ -59,7 +54,7 @@ class MixedPrecisionKVView:
             layer_idx, metadata.request_ids, metadata.kv_layout
         )
         if self.layout != metadata.kv_layout:
-            # Keep the stored layout; only the Attention buffer is materialized in the new layout.
+            # Reinterpret pool strides without moving stored KV.
             self.history = self.history.transpose(2, 3)
             self.high = self.high.transpose(2, 3)
             self.scales = self.scales.transpose(2, 3)

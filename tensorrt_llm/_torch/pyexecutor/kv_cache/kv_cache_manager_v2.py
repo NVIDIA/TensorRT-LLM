@@ -6760,16 +6760,7 @@ class _MixedPrecisionLayerKind(IntEnum):
 
 
 class MixedPrecisionKVCacheManager(KVCacheManagerV2):
-    """Mixed-precision KV using native full-history and sliding-window lifecycles.
-
-    ``first_n`` is the sink length; ``last_n`` counts previously written tokens.
-    Both pools use native page granularity, allocation, migration, eviction and
-    REQUIRED reuse; the window does not change the Attention mask.
-    ``dtype`` keeps its usual meaning for native layers and the high copy;
-    ``low_dtype`` applies only to unshared, full-history dense K/V layers.
-    ``high_low_pool_ratio`` splits each original KV group's byte budget without
-    changing the shares assigned to other groups. None keeps native pool sizing.
-    """
+    """Manage low-precision KV history and high-precision prefix/tail pools."""
 
     def __init__(
         self,
@@ -6794,8 +6785,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         if getattr(config, "num_kv_shared_layers", 0):
             first_shared = config.num_hidden_layers - config.num_kv_shared_layers
             self._shared_kv_layers.update(range(first_shared, config.num_hidden_layers))
-            # Gemma4Attention reads the last non-shared layer of the same type.
-            # Leave both the readers and their source pools on the native path.
+            # Keep shared KV readers and their source layers on the native path.
             source_types = config.layer_types[:first_shared]
             for layer_type in set(config.layer_types[first_shared:]):
                 if layer_type in source_types:
@@ -6803,8 +6793,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                         first_shared - 1 - source_types[::-1].index(layer_type)
                     )
         self._staging_bytes = 0
-        self._staging_buffer: torch.Tensor | None = None
-        self._staging_stream: int | None = None
         from ...memory_buffer_utils import Buffers
 
         self.mixed_precision_buffers = Buffers()
@@ -6821,7 +6809,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                     raise ValueError("Mixed-precision KV requires adjacent K/V block-scale pages")
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        # Assign extra SWA IDs after the native removal of empty layers.
+        # Compact native layers before assigning extra pool IDs.
         config = super()._remove_zero_size_buffers(config)
         if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
             raise NotImplementedError(
@@ -6829,8 +6817,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             )
         if self.mapping.cp_size != 1:
             raise NotImplementedError("Mixed precision requires CP=1")
-        if config.enable_swa_scratch_reuse:
-            raise NotImplementedError("Mixed-precision staging requires ordinary SWA page tables")
         if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
             raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
         layers = list(config.layers)
@@ -6842,7 +6828,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             }
         largest_page = 0
         for layer in config.layers:
-            # Native SWA and recurrent-state pools keep their existing lifecycles.
+            # Preserve native SWA and recurrent-state pools.
             if (
                 not isinstance(layer, AttentionLayerConfig)
                 or layer.sliding_window_size is not None
@@ -6889,7 +6875,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         elements = pages * largest_page
         self._staging_bytes = get_size_in_bytes(elements, self.high_dtype)
         reserve = self._staging_bytes
-        # Page tables are per layer; lengths are shared by the batch. No token/head indices.
+        # Page tables are per layer; lengths are shared by the batch.
         reserve += len(self.high_layers) * 3 * pages * 4
         reserve += 2 * self.max_batch_size * 4
         # TRTLLM uses at most 32 tokens per staging page and two offsets even for MLA.
@@ -6902,7 +6888,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                     raise ValueError("KV budget cannot cover mixed-precision Attention staging")
                 tier = GpuCacheTierConfig(quota=tier.quota - reserve)
             tiers.append(tier)
-        ratio = self._split_mixed_precision_pool_ratio(config, layers)
+        ratio = self._split_mixed_precision_pool_ratio(config)
         return replace(config, layers=layers, cache_tiers=tiers, initial_pool_ratio=ratio)
 
     def _uses_mixed_precision(self, local_layer_idx: int) -> bool:
@@ -6942,52 +6928,47 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         return data_bytes + scale_bytes if data_role == Role.ALL else scale_bytes
 
     def _split_mixed_precision_pool_ratio(
-        self, config: KVCacheManagerConfigPy, layers: Sequence[object]
+        self, config: KVCacheManagerConfigPy
     ) -> list[float] | None:
-        """Split only the selected KV budgets, preserving the other layer-group weights."""
+        """Split selected KV budgets between high and low pools."""
         if self.high_low_pool_ratio is None:
             return config.initial_pool_ratio
 
-        # Use the native lifecycle key and its first-occurrence ordering, as
-        # LifeCycleRegistry does. Buffer shape/dtype does not define a group.
-        groups = {}
-        layer_groups = {}
-        for layer in layers:
-            if isinstance(layer, AttentionLayerConfig):
-                lifecycle = AttnLifeCycle.make(
+        low_layer = next(iter(self.high_layers))
+        groups = []
+        for layer in config.layers:
+            lifecycle = (
+                type(layer),
+                AttnLifeCycle.make(
                     layer.sliding_window_size,
                     layer.num_sink_tokens,
                     config.tokens_per_block,
                     bool(layer.buffers and layer.buffers[0].is_sparse),
                     layer.reuse_policy,
                 )
-                key = (
-                    lifecycle.window_size,
-                    lifecycle.num_sink_blocks,
-                    lifecycle.is_sparse,
-                    lifecycle.reuse_policy,
-                )
-            else:
-                key = ("ssm",)
-            layer_groups[int(layer.layer_id)] = groups.setdefault(key, len(groups))
-        num_original_groups = len({layer_groups[int(layer.layer_id)] for layer in config.layers})
-        original_ratio = config.initial_pool_ratio
-        if original_ratio is None:
-            if num_original_groups != 1:
-                raise ValueError(
-                    "Set kv_cache_config.pool_ratio for the original layer groups when "
-                    "splitting a hybrid cache with high_low_pool_ratio"
-                )
-            original_ratio = [1.0]
-        if len(original_ratio) != num_original_groups:
-            raise ValueError("pool_ratio must describe the original layer groups before splitting")
+                if isinstance(layer, AttentionLayerConfig)
+                else None,
+            )
+            if lifecycle not in groups:
+                groups.append(lifecycle)
+            if int(layer.layer_id) == low_layer:
+                low_group = groups.index(lifecycle)
 
-        ratio = list(original_ratio) + [0.0] * (len(groups) - num_original_groups)
-        # Selected full-history layers share one lifecycle, as do their high copies.
-        low, high = next(iter(self.high_layers.items()))
-        low_group, high_group = layer_groups[low], layer_groups[high]
-        high_fraction = self.high_low_pool_ratio / (1 + self.high_low_pool_ratio)
-        transferred = original_ratio[low_group] * high_fraction
+        ratio = list(config.initial_pool_ratio) if config.initial_pool_ratio is not None else [1.0]
+        if len(ratio) != len(groups):
+            raise ValueError(
+                "Set pool_ratio for the original layer groups before splitting mixed KV"
+            )
+
+        high = (
+            AttentionLayerConfig,
+            AttnLifeCycle.make(self.last_n + 1, self.first_n, config.tokens_per_block),
+        )
+        if high not in groups:
+            groups.append(high)
+            ratio.append(0.0)
+        high_group = groups.index(high)
+        transferred = ratio[low_group] * self.high_low_pool_ratio / (1 + self.high_low_pool_ratio)
         ratio[low_group] -= transferred
         ratio[high_group] += transferred
         return ratio
@@ -7003,7 +6984,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
     def get_mixed_precision_buffers(
         self, layer_idx: int, request_ids: list[int], kv_layout: str
     ) -> tuple[tuple[torch.Tensor, list[list[int]]], tuple[torch.Tensor, list[list[int]]]]:
-        """Return dense high KV and low block scales, each with its native page table."""
+        """Return high KV and low scales with their page tables."""
         local = self.layer_offsets[layer_idx]
         width = self.head_dim_per_layer[local]
         buffers = []
@@ -7042,20 +7023,12 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         return convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
 
     def get_staging_buffer(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
-        """Share a bounded Attention workspace between layers on one stream."""
-        size = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-        if size > self._staging_bytes:
-            raise ValueError("Mixed-precision Attention staging exceeds its reserved capacity")
-        stream = torch.cuda.current_stream()
-        if self._staging_buffer is None:
-            self._staging_buffer = torch.empty(
-                self._staging_bytes, dtype=torch.uint8, device=stream.device
-            )
-            self._staging_stream = stream.cuda_stream
-        elif stream.cuda_stream != self._staging_stream:
-            raise NotImplementedError("Mixed-precision staging requires one execution stream")
-        return self._staging_buffer[:size].view(dtype).view(shape)
+        """Return shared Attention staging storage."""
+        buffer = self.mixed_precision_buffers.get_buffer(
+            [self._staging_bytes], torch.uint8, "mixed_kv_staging", True
+        )
+        return self.mixed_precision_buffers._view_as(buffer, shape, dtype)
 
     def shutdown(self) -> None:
         super().shutdown()
-        self._staging_buffer = None
+        self.mixed_precision_buffers.buffers.clear()

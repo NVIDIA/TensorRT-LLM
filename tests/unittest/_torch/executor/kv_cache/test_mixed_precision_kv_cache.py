@@ -176,24 +176,28 @@ def test_native_state_layout_is_unchanged(manager, state):
 
 
 @pytest.mark.parametrize("manager", ["per_request"], indirect=True)
-def test_pool_ratio_splits_native_groups_not_individual_layers(manager):
+@pytest.mark.parametrize(
+    "window,sink,expected",
+    [(513, 0, [0.2, 0.4, 0.4]), (129, 128, [0.2, 0.8]), (129, 1, [0.2, 0.8])],
+)
+def test_pool_ratio_splits_native_groups_not_individual_layers(manager, window, sink, expected):
     config = manager.kv_cache_manager_py_config
     key = kv.BufferConfig(role=Role.KEY, size=1024)
     layers = [kv.AttentionLayerConfig(layer_id=i, buffers=[key]) for i in range(2)]
-    layers.append(kv.AttentionLayerConfig(layer_id=2, buffers=[key], sliding_window_size=513))
-    high = [
+    layers.append(
         kv.AttentionLayerConfig(
-            layer_id=i, buffers=[key], sliding_window_size=129, num_sink_tokens=128
+            layer_id=2, buffers=[key], sliding_window_size=window, num_sink_tokens=sink
         )
-        for i in (3, 4)
-    ]
+    )
     original = replace(config, layers=layers, initial_pool_ratio=[0.6, 0.4])
     with (
         patch.object(manager, "high_layers", {0: 3, 1: 4}),
         patch.object(manager, "high_low_pool_ratio", 2),
+        patch.object(manager, "first_n", 128),
+        patch.object(manager, "last_n", 128),
     ):
-        ratio = manager._split_mixed_precision_pool_ratio(original, [*layers, *high])
-    assert ratio == pytest.approx([0.2, 0.4, 0.4])
+        ratio = manager._split_mixed_precision_pool_ratio(original)
+    assert ratio == pytest.approx(expected)
 
 
 @pytest.mark.parametrize("manager", ["all_reusable", "per_request"], indirect=True)
