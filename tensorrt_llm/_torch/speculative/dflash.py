@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
@@ -37,6 +39,227 @@ from .dflash_attention import (
     validate_dflash_trtllm_gen_runtime,
 )
 from .interface import SpecMetadata, SpecWorkerBase
+
+
+# Two opt-in switches on the decode-step drafter prologue, read per call (a CUDA
+# graph keeps what was read at capture). Both are bit-exact with the code they
+# replace.
+#   TLLM_DFLASH_FUSED_PROLOGUE=1  the block-table refresh, the gen-request
+#       bookkeeping (bonus token / positions / embedding ids, noise block,
+#       context-KV mask and paged write, ctx_len advance, advertised context)
+#       and the single-latent context write each run as one Triton kernel
+#       instead of chains of small torch kernels. MLADSparkForCausalLM fuses
+#       its block fixup and block-latent writes under the same switch.
+#   TLLM_DFLASH_OVERLAP_CONTEXT_PROJECTION=1  the context projection of the
+#       gen tokens (fc + hidden_norm + latent GEMM + RMSNorm/RoPE), which reads
+#       only the captured target hidden states and the pre-step ctx_len, is
+#       forked onto an aux stream before sample/accept and joined before the
+#       accepted-mask write. Pure-generation steps only.
+def _fused_prologue_on() -> bool:
+    return os.environ.get("TLLM_DFLASH_FUSED_PROLOGUE", "0") == "1"
+
+
+def _overlap_ctx_projection_on() -> bool:
+    return os.environ.get("TLLM_DFLASH_OVERLAP_CONTEXT_PROJECTION", "0") == "1"
+
+
+def _fork_to(main: torch.cuda.Stream, aux: torch.cuda.Stream) -> None:
+    ev = torch.cuda.Event()
+    ev.record(main)
+    aux.wait_event(ev)
+
+
+def _join_on(main: torch.cuda.Stream, ev: torch.cuda.Event) -> None:
+    main.wait_event(ev)
+
+
+def _p2(n: int) -> int:
+    return triton.next_power_of_2(max(int(n), 1))
+
+
+@triton.jit
+def _refresh_ctx_block_tables_kernel(
+    src_ptr, s_row, s_col, tab_ptr, t_row, cnt_ptr, NCOL, DIV, BLOCK: tl.constexpr
+):
+    """counts[r] = #(src[r] >= 0); table[r] = int32(max(src[r], 0) // DIV)  (_refresh_ctx_block_tables)."""
+    r = tl.program_id(0)
+    cnt = tl.zeros((BLOCK,), dtype=tl.int64)
+    for c0 in range(0, NCOL, BLOCK):
+        c = c0 + tl.arange(0, BLOCK)
+        m = c < NCOL
+        e = tl.load(src_ptr + r * s_row + c * s_col, mask=m, other=-1).to(tl.int64)
+        cnt += (e >= 0).to(tl.int64)
+        tl.store(tab_ptr + r * t_row + c, (tl.maximum(e, 0) // DIV).to(tl.int32), mask=m)
+    tl.store(cnt_ptr + r, tl.sum(cnt, axis=0))
+
+
+@triton.jit
+def _gen_prologue_kernel(
+    na_ptr,
+    acc_ptr,
+    acc_row,
+    slots_ptr,
+    ctxlen_ptr,
+    ids_ptr,
+    qpos_ptr,
+    cpos_ptr,
+    NG,
+    MAX_CTX,
+    MASK_ID,
+    BLK: tl.constexpr,
+    KP1: tl.constexpr,
+    P2: tl.constexpr,
+):
+    """Per gen request i: embedding ids [bonus_i ..., mask], query positions, context-store positions."""
+    i = tl.program_id(0)
+    na = tl.load(na_ptr + i).to(tl.int64)
+    bonus = tl.load(acc_ptr + i * acc_row + tl.maximum(na - 1, 0)).to(tl.int64)
+    cl = tl.load(ctxlen_ptr + tl.load(slots_ptr + i))
+    now = tl.minimum(cl + na, MAX_CTX)
+    j = tl.arange(0, P2).to(tl.int64)
+    tl.store(qpos_ptr + i * BLK + j, now + j, mask=j < BLK)
+    tl.store(cpos_ptr + i * KP1 + j, cl + j, mask=j < KP1)
+    tl.store(ids_ptr + i, bonus)
+    if i == 0:
+        tl.store(ids_ptr + NG, MASK_ID)
+
+
+@triton.jit
+def _noise_block_kernel(emb_ptr, out_ptr, NG, H, BLK: tl.constexpr, BLOCK: tl.constexpr):
+    """noise[i, 0] = emb[i] (bonus), noise[i, j > 0] = emb[NG] (mask token)."""
+    t = tl.program_id(0)
+    i = t // BLK
+    j = t % BLK
+    src = tl.where(j == 0, i, NG).to(tl.int64)
+    for h0 in range(0, H, BLOCK):
+        h = h0 + tl.arange(0, BLOCK)
+        m = h < H
+        tl.store(out_ptr + t.to(tl.int64) * H + h, tl.load(emb_ptr + src * H + h, mask=m), mask=m)
+
+
+@triton.jit
+def _gen_ctx_store_kernel(
+    k_ptr,
+    k_srow,
+    k_slayer,
+    na_ptr,
+    slots_ptr,
+    rows_ptr,
+    ctxlen_ptr,
+    counts_ptr,
+    table_ptr,
+    t_row,
+    pool_ptr,
+    loff_ptr,
+    p_page,
+    p_off,
+    PS,
+    MAX_CTX,
+    USE_COUNTS: tl.constexpr,
+    KP1: tl.constexpr,
+    HD: tl.constexpr,
+    HDP2: tl.constexpr,
+):
+    """Context-KV store of the gen tokens.
+
+    Zero the rejected rows, clamp the column, page-table lookup, write every layer.
+    """
+    t = tl.program_id(0)
+    lyr = tl.program_id(1)
+    i = t // KP1
+    j = t % KP1
+    col = tl.load(ctxlen_ptr + tl.load(slots_ptr + i)) + j
+    valid = j < tl.load(na_ptr + i).to(tl.int64)
+    if USE_COUNTS:
+        row = tl.load(rows_ptr + i)
+        cap = tl.load(counts_ptr + row) * PS
+        col = tl.maximum(tl.minimum(col, cap - 1), 0)
+    else:
+        row = tl.load(slots_ptr + i)
+        col = tl.minimum(col, MAX_CTX - 1)
+    page = tl.load(table_ptr + row * t_row + col // PS).to(tl.int64)
+    off = col % PS
+    d = tl.arange(0, HDP2)
+    dm = d < HD
+    x = tl.load(k_ptr + t.to(tl.int64) * k_srow + lyr * k_slayer + d, mask=dm).to(tl.float32)
+    x = x * valid.to(tl.float32)
+    tl.store(
+        pool_ptr + tl.load(loff_ptr + lyr) + page * p_page + off * p_off + d,
+        x.to(pool_ptr.dtype.element_ty),
+        mask=dm,
+    )
+
+
+@triton.jit
+def _ctx_scatter_kernel(
+    k_ptr,
+    k_srow,
+    k_slayer,
+    rows_ptr,
+    pos_ptr,
+    table_ptr,
+    t_row,
+    pool_ptr,
+    loff_ptr,
+    p_page,
+    p_off,
+    PS,
+    HD: tl.constexpr,
+    HDP2: tl.constexpr,
+):
+    """_store_context_kv_paged (single-latent): pool[l][table[rows[t], pos[t] // PS], pos[t] % PS] = k[t, l]."""
+    t = tl.program_id(0)
+    lyr = tl.program_id(1)
+    pos = tl.load(pos_ptr + t)
+    page = tl.load(table_ptr + tl.load(rows_ptr + t) * t_row + pos // PS).to(tl.int64)
+    d = tl.arange(0, HDP2)
+    dm = d < HD
+    x = tl.load(k_ptr + t.to(tl.int64) * k_srow + lyr * k_slayer + d, mask=dm)
+    tl.store(
+        pool_ptr + tl.load(loff_ptr + lyr) + page * p_page + (pos % PS) * p_off + d, x, mask=dm
+    )
+
+
+@triton.jit
+def _gen_ctx_len_kernel(
+    na_ptr,
+    slots_ptr,
+    rows_ptr,
+    ctxlen_ptr,
+    counts_ptr,
+    out_ptr,
+    NG,
+    NSLOTS,
+    DUMMY,
+    MAX_CTX,
+    PS,
+    BS,
+    USE_COUNTS: tl.constexpr,
+    P2: tl.constexpr,
+    S2: tl.constexpr,
+):
+    """ctx_len[slots] += accepted, then the advertised context per gen request.
+
+    Clamps every slot to MAX_CTX and zeroes the dummy slot in between.
+    """
+    i = tl.arange(0, P2)
+    im = i < NG
+    s = tl.load(slots_ptr + i, mask=im, other=0)
+    na = tl.load(na_ptr + i, mask=im, other=0).to(tl.int64)
+    cl = tl.load(ctxlen_ptr + s, mask=im, other=0)
+    tl.store(ctxlen_ptr + s, cl + na, mask=im)
+    tl.debug_barrier()
+    a = tl.arange(0, S2)
+    am = a < NSLOTS
+    v = tl.minimum(tl.load(ctxlen_ptr + a, mask=am, other=0), MAX_CTX)
+    tl.store(ctxlen_ptr + a, tl.where(a == DUMMY, 0, v), mask=am)
+    tl.debug_barrier()
+    n = tl.load(ctxlen_ptr + s, mask=im, other=0)
+    if USE_COUNTS:
+        r = tl.load(rows_ptr + i, mask=im, other=0)
+        n = tl.minimum(n, tl.maximum(tl.load(counts_ptr + r, mask=im, other=0) * PS - BS, 0))
+    tl.store(out_ptr + i, n, mask=im)
+
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
@@ -1023,7 +1246,25 @@ class DFlashWorker(SpecWorkerBase):
         # pool, and the drafter addresses blocks, not planes.
         # clone(): .to() is a no-op for an int64 source, and the in-place ops
         # below would then edit attn_metadata's own tensor.
-        encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
+        view = src[self._ctx_pool_idx, :num_seqs, 0]
+        if (
+            _fused_prologue_on()
+            and view.shape[-1] == self._ctx_block_tables.shape[1]
+            and self._ctx_block_tables.stride(1) == 1
+        ):
+            _refresh_ctx_block_tables_kernel[(num_seqs,)](
+                view,
+                view.stride(0),
+                view.stride(1),
+                self._ctx_block_tables,
+                self._ctx_block_tables.stride(0),
+                self._ctx_block_counts,
+                view.shape[-1],
+                self._ctx_block_divisor,
+                BLOCK=1024,
+            )
+            return True
+        encoded = view.to(torch.int64).clone()
         # Before the clamp erases the placeholders. Informative only on the
         # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
         self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
@@ -1318,6 +1559,48 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_paged_append = get_dflash_paged_append()
         return self._ctx_paged_append
 
+    def _single_latent_pool_geometry(self):
+        """(layer-0 view, per-layer element offsets from it, page stride, in-page stride, head dim) of the single-latent
+        context pool, or None.
+
+        All layers must share one geometry; the offsets are built once, outside
+        graph capture.
+        """
+        bufs = self._ctx_kv_buf
+        if bufs is None or self._ctx_k_buf is not None:
+            return None
+        views = [bufs[i] for i in range(len(bufs))]
+        v0 = views[0]
+        key = tuple((v.data_ptr(), tuple(v.shape), tuple(v.stride()), v.dtype) for v in views)
+        cached = getattr(self, "_single_latent_pool_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        es = v0.element_size()
+        ok = all(
+            v.dim() == 5
+            and v.shape[1] == 1
+            and v.shape[2] == 1
+            and v.stride(4) == 1
+            and v.dtype == v0.dtype
+            and v.stride(0) == v0.stride(0)
+            and v.stride(3) == v0.stride(3)
+            and v.shape[3:] == v0.shape[3:]
+            and (v.data_ptr() - v0.data_ptr()) % es == 0
+            for v in views
+        )
+        geo = None
+        if ok:
+            loff = torch.tensor(
+                [(v.data_ptr() - v0.data_ptr()) // es for v in views],
+                dtype=torch.int64,
+                device=v0.device,
+            )
+            geo = (v0, loff, v0.stride(0), v0.stride(3), v0.shape[4])
+        self._single_latent_pool_cache = (key, geo)
+        return geo
+
     def _store_context_kv_paged(
         self,
         k: torch.Tensor,
@@ -1335,6 +1618,37 @@ class DFlashWorker(SpecWorkerBase):
                 else self._ctx_page_table
             )
             page_size = self._ctx_page_size
+            pool = self._single_latent_pool_geometry() if _fused_prologue_on() else None
+            if (
+                pool is not None
+                and k.dim() == 4
+                and k.size(2) == 1
+                and k.size(1) == len(self._ctx_kv_buf)
+                and k.stride(-1) == 1
+                and k.dtype == pool[0].dtype
+                and table.stride(1) == 1
+                and k.size(0) > 0
+            ):
+                base, loff, p_page, p_off, hd = pool
+                rows_c = rows.long().contiguous()
+                pos_c = positions.long().contiguous()
+                _ctx_scatter_kernel[(k.size(0), k.size(1))](
+                    k,
+                    k.stride(0),
+                    k.stride(1),
+                    rows_c,
+                    pos_c,
+                    table,
+                    table.stride(0),
+                    base,
+                    loff,
+                    p_page,
+                    p_off,
+                    page_size,
+                    HD=hd,
+                    HDP2=_p2(hd),
+                )
+                return
             pages = table[rows.long(), positions.long() // page_size].long()
             offsets = positions.long() % page_size
             for layer_idx in range(k.size(1)):
@@ -1659,6 +1973,12 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_ctx_len_host = list(self._ctx_len_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
+
+        self._pending_ctx_projection = None
+        if _overlap_ctx_projection_on() and num_contexts == 0 and num_gens > 0:
+            self._pending_ctx_projection = self._launch_gen_ctx_projection(
+                draft_model, spec_metadata, attn_metadata, input_ids.shape[0], num_gens, K
+            )
 
         self._execute_guided_decoder_if_present(logits)
 
@@ -2020,6 +2340,65 @@ class DFlashWorker(SpecWorkerBase):
         block_logits = gen_logits.new_full((*gen_logits.shape[:-1], full_vocab), float("-inf"))
         return candidate_ids, unary_logits, block_logits
 
+    def _gen_context_kv(self, draft_model, projected, positions, fused_store: bool):
+        """precompute_context_kv, or its per-layer-buffer twin when the fused store will consume it.
+        Returns (k [N, L, 1, hd] -- possibly a strided view --, v)."""
+        if fused_store and hasattr(draft_model, "precompute_context_kv_layers"):
+            buf = draft_model.precompute_context_kv_layers(projected, positions)
+            if buf is not None:
+                return buf.transpose(0, 1).unsqueeze(2), None
+        return draft_model.precompute_context_kv(projected, positions)
+
+    def _launch_gen_ctx_projection(
+        self, draft_model, spec_metadata, attn_metadata, total_target_tokens, num_gens, K
+    ):
+        """Fork the gen tokens' context projection onto an aux stream (joined in prepare_1st_drafter_inputs).
+
+        Reads only the captured target hidden states and _ctx_len[slots], which nothing between here and the join writes
+        (sample/accept, the Mamba/KDA state update and the kv_lens bookkeeping
+        touch neither); pure-generation steps only,
+        so _batch_to_slot is not rebuilt in between either."""
+        captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
+        if (
+            captured_hs is None
+            or not hasattr(draft_model, "fc")
+            or not hasattr(draft_model, "hidden_norm")
+            or not self._ctx_buf_inited
+        ):
+            return None
+        fused_store = (
+            _fused_prologue_on()
+            and self._ctx_paged
+            and self._ctx_block_tables is not None
+            and self._single_latent_pool_geometry() is not None
+        )
+        cache_dtype = self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
+        main = torch.cuda.current_stream()
+        aux = getattr(self, "_ctx_projection_stream", None)
+        if aux is None or aux.device != main.device:
+            aux = self._ctx_projection_stream = torch.cuda.Stream(device=main.device)
+        total_tokens_per_req = self._draft_tokens_per_req
+        _fork_to(main, aux)
+        with torch.cuda.stream(aux):
+            gen_start = attn_metadata.num_ctx_tokens
+            gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+            projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+            slots = self._batch_to_slot[:num_gens]
+            offsets_kp1 = torch.arange(K + 1, dtype=torch.long, device="cuda")
+            positions = (
+                (self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)).long().reshape(-1)
+            )
+            k_new, v_new = self._gen_context_kv(
+                draft_model, projected.to(cache_dtype), positions, fused_store
+            )
+            ev = torch.cuda.Event()
+            ev.record(aux)
+        if not torch.cuda.is_current_stream_capturing():
+            for t in (k_new, v_new):
+                if t is not None:
+                    t.record_stream(main)
+        return {"ev": ev, "k": k_new, "v": v_new}
+
     def prepare_1st_drafter_inputs(
         self,
         input_ids: torch.LongTensor,
@@ -2097,31 +2476,186 @@ class DFlashWorker(SpecWorkerBase):
 
             K_plus_1 = K + 1
 
-            bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
-            bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
-
-            ctx_len_gen = self._ctx_len[slots]
-            j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
-            offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
-
-            # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
-            # tokens are folded in (see the update below), so the running length
-            # used here has to be clamped on its own -- otherwise a request that
-            # already sits at the ceiling indexes num_accepted positions past
-            # any position the sequence can legitimately reach.
-            ctx_len_now = (ctx_len_gen + gen_num_accepted.long()).clamp_(max=self._max_ctx)
-            query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
-            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
-
+            pre = getattr(self, "_pending_ctx_projection", None)
+            self._pending_ctx_projection = None
             # The drafter's own trained mask row, if it kept one for the mask id in use.
             trained_mask_embedding = (
                 getattr(draft_model, "mask_token_embedding", None)
                 if mask_token_id == getattr(draft_model, "mask_token_id", None)
                 else None
             )
-            noise_embed_2d = dflash_noise_block_embedding(
-                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            fused = (
+                _fused_prologue_on()
+                and getattr(draft_model, "lilicorr", None) is None
+                and gen_num_accepted.dim() == 1
+                and gen_num_accepted.is_contiguous()
+                and gen_accepted_tokens.stride(1) == 1
+                and slots.is_contiguous()
+                and slots.dtype == torch.long
+                and self._ctx_len.is_contiguous()
             )
+            if pre is not None and not fused:
+                # Off the fused path the store recomputes the projection (and LiLiCorr reads it); drop the overlap one.
+                _join_on(torch.cuda.current_stream(), pre["ev"])
+                pre = None
+            if fused:
+                embed_ids = torch.empty(num_gens + 1, dtype=torch.long, device="cuda")
+                query_position_ids = torch.empty(
+                    (num_gens, query_tokens_per_req), dtype=torch.long, device="cuda"
+                )
+                ctx_position_ids = torch.empty(
+                    (num_gens, K_plus_1), dtype=torch.long, device="cuda"
+                )
+                _gen_prologue_kernel[(num_gens,)](
+                    gen_num_accepted,
+                    gen_accepted_tokens,
+                    gen_accepted_tokens.stride(0),
+                    slots,
+                    self._ctx_len,
+                    embed_ids,
+                    query_position_ids,
+                    ctx_position_ids,
+                    num_gens,
+                    self._max_ctx,
+                    int(mask_token_id),
+                    BLK=query_tokens_per_req,
+                    KP1=K_plus_1,
+                    P2=_p2(max(query_tokens_per_req, K_plus_1)),
+                )
+                bonus = embed_ids[:num_gens]
+                combined_embed = embed_tokens(embed_ids)
+                if (
+                    trained_mask_embedding is not None
+                    and trained_mask_embedding.dtype != combined_embed.dtype
+                ):
+                    noise_embed_2d = dflash_noise_block_embedding(
+                        embed_tokens,
+                        bonus,
+                        mask_token_id,
+                        query_tokens_per_req,
+                        trained_mask_embedding,
+                    )
+                else:
+                    if trained_mask_embedding is not None:
+                        # The drafter's trained mask row replaces the lookup's, as in dflash_noise_block_embedding.
+                        combined_embed[num_gens].copy_(trained_mask_embedding)
+                    if combined_embed.is_contiguous():
+                        hid = combined_embed.shape[-1]
+                        noise_embed_2d = torch.empty(
+                            (num_gens, query_tokens_per_req, hid),
+                            dtype=combined_embed.dtype,
+                            device=combined_embed.device,
+                        )
+                        _noise_block_kernel[(num_gens * query_tokens_per_req,)](
+                            combined_embed,
+                            noise_embed_2d,
+                            num_gens,
+                            hid,
+                            BLK=query_tokens_per_req,
+                            BLOCK=1024,
+                        )
+                    else:
+                        noise_embed_2d = (
+                            combined_embed[num_gens]
+                            .expand(num_gens, query_tokens_per_req, -1)
+                            .clone()
+                        )
+                        noise_embed_2d[:, 0, :] = combined_embed[:num_gens]
+            else:
+                bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
+                bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
+
+                ctx_len_gen = self._ctx_len[slots]
+                j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
+                offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
+
+                # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
+                # tokens are folded in (see the update below), so the running length
+                # used here has to be clamped on its own -- otherwise a request that
+                # already sits at the ceiling indexes num_accepted positions past
+                # any position the sequence can legitimately reach.
+                ctx_len_now = (ctx_len_gen + gen_num_accepted.long()).clamp_(max=self._max_ctx)
+                query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
+                ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+
+                noise_embed_2d = dflash_noise_block_embedding(
+                    embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+                )
+
+            fused_store_geometry = None
+            if (
+                has_target_features
+                and fused
+                and self._ctx_paged
+                and self._ctx_block_tables is not None
+            ):
+                fused_store_geometry = self._single_latent_pool_geometry()
+            if has_target_features and fused_store_geometry is not None:
+                cache_dtype = self._ctx_kv_buf[0].dtype
+                if pre is not None:
+                    _join_on(torch.cuda.current_stream(), pre["ev"])
+                    k_new = pre["k"]
+                else:
+                    gen_start = attn_metadata.num_ctx_tokens
+                    gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+                    projected_to_store = draft_model.project_target_hidden(
+                        gen_hs.reshape(-1, gen_hs.shape[-1])
+                    )
+                    k_new = self._gen_context_kv(
+                        draft_model,
+                        projected_to_store.to(cache_dtype),
+                        ctx_position_ids.long().reshape(-1),
+                        True,
+                    )[0]
+                base, loff, p_page, p_off, hd = fused_store_geometry
+                table = self._ctx_block_tables
+                _gen_ctx_store_kernel[(num_gens * K_plus_1, len(self._ctx_kv_buf))](
+                    k_new,
+                    k_new.stride(0),
+                    k_new.stride(1),
+                    gen_num_accepted,
+                    slots,
+                    gen_rows_out,
+                    self._ctx_len,
+                    self._ctx_block_counts,
+                    table,
+                    table.stride(0),
+                    base,
+                    loff,
+                    p_page,
+                    p_off,
+                    self._ctx_page_size,
+                    self._max_ctx,
+                    USE_COUNTS=True,
+                    KP1=K_plus_1,
+                    HD=hd,
+                    HDP2=_p2(hd),
+                )
+                num_ctx_per_req_t = torch.empty(num_gens, dtype=torch.long, device="cuda")
+                _gen_ctx_len_kernel[(1,)](
+                    gen_num_accepted,
+                    slots,
+                    gen_rows_out,
+                    self._ctx_len,
+                    self._ctx_block_counts,
+                    num_ctx_per_req_t,
+                    num_gens,
+                    self._ctx_len.numel(),
+                    self._dummy_slot,
+                    self._max_ctx,
+                    self._ctx_page_size,
+                    block_size,
+                    USE_COUNTS=True,
+                    P2=_p2(num_gens),
+                    S2=_p2(self._ctx_len.numel()),
+                )
+                has_target_features = False
+                fused_done = True
+            else:
+                fused_done = False
+                if fused:
+                    ctx_len_gen = self._ctx_len[slots]
+                    offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
@@ -2130,7 +2664,8 @@ class DFlashWorker(SpecWorkerBase):
                 # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
-                projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
+                if pre is None:
+                    projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 if getattr(draft_model, "lilicorr", None) is not None:
                     # The last accepted output is predicted by the corresponding input
                     # row; the newly committed token itself has no target row yet.
@@ -2154,7 +2689,6 @@ class DFlashWorker(SpecWorkerBase):
                 # _ctx_len range, so they're harmless.
                 slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                 col_flat = col_idx.reshape(-1)
-                proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
                 pos_flat = ctx_position_ids.long().reshape(-1)
                 mask_1d = write_mask.reshape(-1)
 
@@ -2163,9 +2697,14 @@ class DFlashWorker(SpecWorkerBase):
                 cache_dtype = (
                     self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
                 )
-                k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(cache_dtype), pos_flat
-                )
+                if pre is not None:
+                    _join_on(torch.cuda.current_stream(), pre["ev"])
+                    k_new, v_new = pre["k"], pre["v"]
+                else:
+                    proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
+                    k_new, v_new = draft_model.precompute_context_kv(
+                        proj_flat.to(cache_dtype), pos_flat
+                    )
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                 k_new.mul_(mask_bc)
                 if v_new is not None:
@@ -2187,16 +2726,17 @@ class DFlashWorker(SpecWorkerBase):
 
                 self._advance_ctx_len(slots, gen_num_accepted_long)
 
-            num_ctx_per_req_t = self._ctx_len[slots]
-            if self._ctx_block_tables is not None:
-                # The write above clamps columns to the request's allocation, so
-                # a context that outruns it has its tail written over the last
-                # valid slot. Truncate what is advertised to match, or the read
-                # attends that clobbered value -- or another request's page.
-                allocated = dflash_allocated_ctx_limit(
-                    self._ctx_block_counts, self._ctx_page_size, block_size
-                )
-                num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
+            if not fused_done:
+                num_ctx_per_req_t = self._ctx_len[slots]
+                if self._ctx_block_tables is not None:
+                    # The write above clamps columns to the request's allocation, so
+                    # a context that outruns it has its tail written over the last
+                    # valid slot. Truncate what is advertised to match, or the read
+                    # attends that clobbered value -- or another request's page.
+                    allocated = dflash_allocated_ctx_limit(
+                        self._ctx_block_counts, self._ctx_page_size, block_size
+                    )
+                    num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
