@@ -256,9 +256,9 @@ class TrtllmAttentionMetadata:
         return metadata
 
     def _drop_metadata_of_shut_down_caches(self) -> None:
-        """Forget metadata built over caches that were shut down. Each entry holds its
-        cache, so without this a model that builds a new cache per rollout would keep
-        every old one alive. A merely closed cache keeps its metadata: it may be
+        """Forget metadata built over caches that were shut down.
+
+        A merely closed cache keeps its metadata: it may be
         reopened, and graphs captured over it still read those buffers."""
         stale = [
             key
@@ -463,10 +463,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 tokens only: the fused kernel writes them at ``staging_offset`` and
                 attends over everything cached before them plus themselves.
                 ``batch_size`` must be 1. Sparse attention is not supported on this path.
-            causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
-                the new tokens into consecutive causal blocks: full attention within a
-                block, causal across blocks. Use it when the cache must hold each
-                block's K/V as if the blocks had been generated one at a time, so later
+            causal_block_size: Specifies how the real tokens will be cut into consecutive
+                causal blocks: full attention within a block, causal across blocks. Requires
+                ``kv_cache``; passing it without one raises. Use it when the cache must hold
+                each block's K/V as if the blocks had been generated one at a time, so later
                 blocks never leak into earlier ones. Absent: one causal block.
 
         Returns:
