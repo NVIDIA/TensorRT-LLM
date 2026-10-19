@@ -398,6 +398,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     )
     worker = SimpleNamespace(_results={7: generation_result})
     response_result = SimpleNamespace(
+        is_final=False,
         context_logits=torch.tensor([[0., 1., 2., 3.]] * 3),
         get_result=lambda: SimpleNamespace(output_token_ids=[[0]]),
     )
@@ -435,6 +436,7 @@ def test_generation_logprobs_need_no_worker_recomputation():
 
     worker = SimpleNamespace(
         _results={7: SimpleNamespace(_logprob_params=None)})
-    # No logits or result accessor is needed: generation logprobs come
-    # directly from the sampler's response tensors.
-    assert _get_logprobs(worker, SimpleNamespace(client_id=7)) is None
+    # Generation logprobs come directly from the sampler's response tensors.
+    response = SimpleNamespace(client_id=7,
+                               result=SimpleNamespace(is_final=False))
+    assert _get_logprobs(worker, response) is None

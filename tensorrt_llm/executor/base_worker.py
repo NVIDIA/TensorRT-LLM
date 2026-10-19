@@ -1598,7 +1598,7 @@ def _get_logprobs(worker, response: LlmResponse) -> Optional[LogProbsResult]:
             if logprob_params.drop_context_logits:
                 response.clear_context_logits()
 
-    if getattr(getattr(response, "result", None), "is_final", False):
+    if response.result.is_final:
         generation_result.clear_logprob_params()
     return logprobs_result
 
