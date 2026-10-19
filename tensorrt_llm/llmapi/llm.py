@@ -31,8 +31,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -978,40 +977,23 @@ class BaseLLM:
             # TODO(TRTLLM-12869): Pass encoder-side MM layout through
             # DisaggregatedParams so prefill does not rebuild prompt tokens,
             # positions, lengths, runs, special offsets, and cumsum here.
-            disagg_mm_inputs = (
+            prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs, mm_handles))
-            if not isinstance(disagg_mm_inputs, DisaggPrefillMultimodalInputs):
+                    inputs,
+                    mm_handles,
+                    mm_hashes=disaggregated_params.multimodal_hashes))
+            if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
-                    "DisaggPrefillMultimodalInputs")
-            prompt_token_ids = disagg_mm_inputs.prompt_token_ids
+                    "(prompt_token_ids, MultimodalParams)")
             prompt = inputs.get("prompt", None)
             if is_gen_only:
                 raise ValueError(
                     "Generation-only mode should not need multimodal parameters"
                 )
             else:
-                mm_hashes = disaggregated_params.multimodal_hashes
-                multimodal_input = disagg_mm_inputs.to_multimodal_input(
-                    mm_hashes)
-                # E/P handoff carries SharedTensorContainer dicts. Park them under the
-                # embedding key so BaseWorker's recursive to_tensor("multimodal_data")
-                # restores local tensor views before PyTorch forward. Until then this
-                # key holds handles, not tensors.
-                multimodal_data = {
-                    "multimodal_embedding":
-                    mm_handles,
-                    "multimodal_embedding_lengths":
-                    (disagg_mm_inputs.multimodal_embedding_lengths),
-                }
-                if disagg_mm_inputs.special_token_offsets is not None:
-                    multimodal_data["special_token_offsets"] = (
-                        disagg_mm_inputs.special_token_offsets)
-                if disagg_mm_inputs.item_types is not None:
-                    multimodal_data["layout_metadata"] = {
-                        "item_types": disagg_mm_inputs.item_types
-                    }
+                # BaseWorker resolves embedding handles to local tensor views.
+                multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
@@ -1026,10 +1008,6 @@ class BaseLLM:
                 maybe_compute_mm_embed_cumsum(
                     prompt_token_ids, {"multimodal_data": multimodal_data},
                     cast(BaseMultimodalInputProcessor, self.input_processor))
-                multimodal_params = MultimodalParams(
-                    multimodal_input=multimodal_input,
-                    multimodal_data=multimodal_data,
-                )
         # This condition is to ensure that this branch is not hit for models that expand
         # placeholder token IDs with MM data.
         elif ("prompt_token_ids" in inputs
