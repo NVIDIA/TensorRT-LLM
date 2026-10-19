@@ -6289,7 +6289,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "rounding of logits before logprob computation. Weights and inputs "
         "remain in the model dtype. Only supported for unquantized LM heads "
         "of decoder-only models.",
-        status="prototype")
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'float32']"})
 
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
