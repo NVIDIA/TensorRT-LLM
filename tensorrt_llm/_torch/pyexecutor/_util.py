@@ -939,6 +939,8 @@ class KvCacheCreator:
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
+        # Estimation can shrink _max_seq_len; cache ownership must stay fixed.
+        self._unification_max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
@@ -2194,6 +2196,17 @@ class KvCacheCreator:
                 "DFlash: a per-layer KV-head count is not supported in a shared "
                 "target and draft KV cache; keeping a separate draft KV cache.",
                 key="dflash_per_layer_kv_heads_fallback")
+            return False
+        draft_windows = _resolve_v2_max_attention_window_vec(
+            self._get_draft_max_attention_window(self._unification_max_seq_len,
+                                                 self._kv_cache_config),
+            self._unification_max_seq_len,
+            range(draft_model_config.pretrained_config.num_hidden_layers))
+        if len(set(draft_windows)) > 1:
+            logger.info_once(
+                "DFlash: draft layers have different effective attention "
+                "windows; keeping a separate draft KV cache.",
+                key="dflash_mixed_draft_windows_fallback")
             return False
         if self._is_disagg and os.environ.get(
                 "TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1":
