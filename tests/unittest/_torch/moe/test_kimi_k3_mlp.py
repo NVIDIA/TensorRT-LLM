@@ -599,6 +599,24 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
         assert "input_ready_event" not in received
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overlap,moe_backend,uses_aux_stream",
+    [(True, "CUTEDSL", True), (False, "CUTEDSL", False), (True, "TRTLLM", False)],
+)
+def test_kimi_k3_latent_down_stream(monkeypatch, overlap, moe_backend, uses_aux_stream):
+    """TRTLLM_K3_LATENT_OVERLAP=0 keeps the CuteDSL latent down-projection on the main stream."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_LATENT_OVERLAP", overlap)
+    aux_stream_dict = _make_aux_stream_dict()
+    stream = modeling_kimi_linear._k3_latent_down_stream(aux_stream_dict, moe_backend)
+    if uses_aux_stream:
+        assert stream is aux_stream_dict[AuxStreamType.MoeOutputMemset]
+    else:
+        assert stream is None
+
+
 def _make_kimi_k3_moe_weights(config):
     generator = torch.Generator().manual_seed(2026)
 
