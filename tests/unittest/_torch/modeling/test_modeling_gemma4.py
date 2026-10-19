@@ -2405,6 +2405,15 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertFalse(chunk_mask[-1, 0].item())
         self.assertTrue(chunk_mask[-1, 32].item())
 
+        # Vision runs override the two-token window; audio and text stay causal.
+        mixed_types = torch.tensor([1, 1, 1, 2, 2, 2, 3, 3, 3, 0], device="cuda")
+        mixed_mask = model.get_context_mask(mixed_types, effective_sliding_window=2)
+        expected = torch.eye(10, dtype=torch.bool)
+        expected[torch.arange(1, 10), torch.arange(9)] = True
+        expected[:3, :3] = True
+        expected[3:6, 3:6] = True
+        torch.testing.assert_close(mixed_mask.cpu(), expected, rtol=0, atol=0)
+
     @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
@@ -4387,6 +4396,8 @@ def test_gemma_attention_mask_peak() -> None:
     result = build_gemma_attention_mask(types, [length, length], [0, 1024], 512)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() - before
+    assert result.dtype == torch.bool
+    assert result.numel() == length * length + length * (1024 + length)
     assert peak <= result.numel() + 2 * 1024**2
 
 
