@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://raw.githubusercontent.com/sgl-project/sglang/d8fcbaa38da95201914a1277971044ee66837b26/python/sglang/srt/function_call/qwen3_coder_detector.py
 
 import json
@@ -129,7 +131,8 @@ def _coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     Types are tried in the order null, integer, number, boolean, object, array,
     string. A value that fits none of them is decoded as JSON when possible and
     otherwise kept as the original string, as is a non-finite number, which
-    JSON cannot represent.
+    JSON cannot represent. Python's ``None`` reads as null only where a string
+    is not accepted, since otherwise it may be the text "None".
     """
     if isinstance(schema_type, str):
         schema_type = [schema_type]
@@ -139,7 +142,7 @@ def _coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
         if candidate not in accepted:
             continue
         if candidate == "null":
-            if value.lower() == "null":
+            if value.lower() == "null" or (value == "None" and "string" not in accepted):
                 return None
         elif candidate == "string":
             return value

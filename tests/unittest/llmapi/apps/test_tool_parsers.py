@@ -1966,6 +1966,72 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert json.loads(whole.calls[0].parameters) == {"code": code, "n": 2}
         assert streamed == whole.calls[0].parameters
 
+    @pytest.mark.parametrize("streaming", [False, True],
+                             ids=["non_streaming", "streaming"])
+    def test_parse_preserves_string_and_null_types(self, parser, streaming):
+        """None stays text where a string is allowed and is null elsewhere."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_values",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "literal_none": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "literal_null": {
+                            "type": "string"
+                        },
+                        "nullable_null": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "nullable_integer": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+        chunks = [
+            "<tool_call>\n",
+            "<function=set_values>\n",
+            "<parameter=literal_none>None</parameter>\n",
+            "<parameter=literal_null>null</parameter>\n",
+            "<parameter=nullable_null>null</parameter>\n",
+            "<parameter=nullable_integer>None</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+        if streaming:
+            calls = []
+            for chunk in chunks:
+                calls.extend(
+                    parser.parse_streaming_increment(chunk, [tool_def]).calls)
+        else:
+            calls = parser.detect_and_parse("".join(chunks), [tool_def]).calls
+
+        assert [call.name for call in calls if call.name] == ["set_values"]
+        parameters = "".join(call.parameters for call in calls
+                             if call.parameters)
+        assert json.loads(parameters) == {
+            "literal_none": "None",
+            "literal_null": "null",
+            "nullable_null": None,
+            "nullable_integer": None,
+        }
+
 
 # ============================================================================
 # DeepSeek Parser Tests
