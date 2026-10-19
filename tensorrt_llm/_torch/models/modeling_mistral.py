@@ -914,7 +914,11 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
             raise NotImplementedError(
                 f"{type(self.llm).__name__} does not support decoder LoRA forwarding"
             )
-        return DecoderLoraOwner(module_path="language_model")
+        return DecoderLoraOwner(
+            module_path="language_model",
+            hf_prefixes=(*DecoderLoraOwner().hf_prefixes,
+                         "model.language_model.layers"),
+        )
 
     @property
     def multimodal_token_ids(self) -> torch.Tensor:

@@ -5,6 +5,7 @@ import io
 import json
 import tarfile
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -305,6 +306,66 @@ def test_duplicate_decoder_aliases_are_rejected_before_cache(
     assert any(key in str(exc.value) for key in flat)
     assert any(key in str(exc.value) for key in prefixed)
     _assert_not_cached(runtime)
+
+
+@pytest.fixture(
+    params=[
+        ("gemma3vl", "Gemma3VLM"),
+        ("mistral", "Mistral3VLM"),
+        ("step3p7vl", "Step3p7VLForConditionalGeneration"),
+        ("gemma4mm", "Gemma4ForConditionalGeneration"),
+    ],
+    ids=["gemma3", "mistral3-dense", "step3p7", "gemma4"],
+)
+def nested_language_model_owner(request: pytest.FixtureRequest) -> DecoderLoraOwner:
+    module_name, class_name = request.param
+    module = import_module(f"tensorrt_llm._torch.models.modeling_{module_name}")
+    model_type = getattr(module, class_name)
+    if module_name == "mistral":
+        model = model_type.__new__(model_type)
+        torch.nn.Module.__init__(model)
+        model.llm = module.MistralForCausalLM.__new__(module.MistralForCausalLM)
+        torch.nn.Module.__init__(model.llm)
+        return model.lora_owner
+    return model_type.lora_owner
+
+
+def test_model_declared_nested_language_model_alias_parses_decoder_weights(
+    nested_language_model_owner: DecoderLoraOwner,
+) -> None:
+    weights = _weights("hf", "base_model.model.model.language_model.layers")
+
+    parsed = get_all_hf_lora_weights(
+        weights,
+        {"o_proj"},
+        owner=nested_language_model_owner,
+        hf_modules_to_trtllm_modules={"o_proj": "attn_dense"},
+    )
+
+    assert set(parsed) == {0}
+    assert set(parsed[0]) == {"o_proj"}
+    assert set(parsed[0]["o_proj"]) == {"in", "out"}
+    assert torch.all(parsed[0]["o_proj"]["in"] == 1)
+    assert torch.all(parsed[0]["o_proj"]["out"] == 2)
+
+
+def test_model_declared_nested_language_model_alias_rejects_duplicate_flat_destination(
+    nested_language_model_owner: DecoderLoraOwner,
+) -> None:
+    nested = _weights("hf", "base_model.model.model.language_model.layers")
+    flat = _weights("hf", "base_model.model.model.layers")
+
+    with pytest.raises(ValueError, match="duplicate destination") as exc:
+        get_all_hf_lora_weights(
+            nested | flat,
+            {"o_proj"},
+            owner=nested_language_model_owner,
+            hf_modules_to_trtllm_modules={"o_proj": "attn_dense"},
+        )
+
+    assert next(iter(nested)) in str(exc.value)
+    assert next(iter(flat)) in str(exc.value)
+    assert "module path 'language_model'" in str(exc.value)
 
 
 @pytest.mark.parametrize("explicit_targets", [False, True])
