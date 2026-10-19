@@ -49,10 +49,10 @@ class _LayerCache:
     """Only what the plain-decode path reads; no fused-verify replay caches.
 
     ``has_kda_replay_caches`` mirrors the manager's property, which is
-    ``kda_qkg_cache is not None``; the mixer reads it unguarded.
+    ``kda_k_cache is not None``; the mixer reads it unguarded.
     """
 
-    kda_qkg_cache = None
+    kda_k_cache = None
     has_kda_replay_caches = False
 
 
