@@ -371,11 +371,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
-        self.mixed_precision_kv_views = None
-        if callable(
-                getattr(self.kv_cache_manager,
-                        "get_mixed_precision_page_tables", None)):
-            self.mixed_precision_kv_views = {}
+        self.mixed_precision_kv_views = ({} if getattr(
+            self.kv_cache_manager, "high_layers", None) else None)
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -2318,7 +2315,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 from .utils import append_mla_latent_cache
                 append_mla_latent_cache(
                     metadata.kv_cache_manager,
-                    self.layer_idx,
+                    self.get_local_layer_idx(metadata),
                     metadata.request_ids,
                     metadata.seq_lens.tolist(),
                     metadata.kv_cache_params.num_cached_tokens_per_seq,

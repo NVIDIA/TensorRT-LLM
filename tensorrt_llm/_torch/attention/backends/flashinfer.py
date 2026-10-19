@@ -1084,11 +1084,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.mixed_precision_kv_views = None
-        if callable(
-                getattr(self.kv_cache_manager,
-                        "get_mixed_precision_page_tables", None)):
-            self.mixed_precision_kv_views = {}
+        self.mixed_precision_kv_views = ({} if getattr(
+            self.kv_cache_manager, "high_layers", None) else None)
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
@@ -1204,8 +1201,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 layer_buffer = self.kv_cache_manager.get_buffers(layer_idx)
                 if layer_buffer is not None:
                     max_num_blocks = max(max_num_blocks, layer_buffer.shape[0])
-            if (self.mixed_precision_kv_views is not None
-                    and self.kv_cache_manager.high_layers):
+            if self.mixed_precision_kv_views is not None:
                 max_num_blocks = max(
                     max_num_blocks, self.max_num_requests *
                     self.kv_cache_manager.max_blocks_per_seq)
@@ -1231,12 +1227,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 space_ids = {}
                 for layer_idx in attention_layer_indices:
                     layer_offset = mgr.layer_offsets[layer_idx]
+                    key = (mgr.layer_to_pool_mapping_dict[layer_offset],
+                           get_scale(layer_idx))
                     if (self.mixed_precision_kv_views is not None
                             and layer_offset in mgr.high_layers):
                         key = ("mixed_precision_staging", )
-                    else:
-                        key = (mgr.layer_to_pool_mapping_dict[layer_offset],
-                               get_scale(layer_idx))
                     space_ids.setdefault(key, len(space_ids))
                     layer_space[layer_idx] = space_ids[key]
             if layer_space:
@@ -2417,9 +2412,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             [num_pages, page_size, qk_rope_head_dim].
         """
         # NHD layout: [num_pages, kv_factor=1, page_size, num_kv_heads=1, head_dim]
-        kv_cache_manager = (get_mixed_precision_kv_view(
-            metadata, self.layer_idx) or metadata.kv_cache_manager)
-        kv_buf = kv_cache_manager.get_buffers(self.layer_idx)
+        kv_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx)
         metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
         # [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
         combined = kv_buf.squeeze(1).squeeze(2)
@@ -2733,10 +2726,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             return
 
         # Key and Value
-        kv_cache_manager = (get_mixed_precision_kv_view(
-            metadata, self.layer_idx) or metadata.kv_cache_manager)
-        kv_cache = kv_cache_manager.get_buffers(self.layer_idx,
-                                                kv_layout=metadata.kv_layout)
+        kv_cache = metadata.kv_cache_manager.get_buffers(
+            self.layer_idx, kv_layout=metadata.kv_layout)
 
         # VSWA: swap in the correct pool's page indices for this layer
         # before both the KV cache append and the attention plan/run.

@@ -45,7 +45,6 @@ class MixedPrecisionKVView:
             self.max_seq_len + self.tokens_per_block - 1
         ) // self.tokens_per_block
         self.kv_factor = manager.kv_factor
-        self.max_attention_window_vec = (None,)
         # Fixed per-request spans keep addresses unchanged as sequences grow.
         self.page_starts = [row * self.max_blocks_per_seq for row in range(metadata.num_seqs + 1)]
         storage = manager.mixed_precision_buffers.get_buffer(
@@ -67,11 +66,12 @@ class MixedPrecisionKVView:
             shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
             staging = manager.mixed_precision_buffers._view_as(storage, shape, pools[-1].dtype)
             self.pools[layer_idx] = (staging, *pools)
-        self.layer_offsets = dict.fromkeys(self.pools, 0)
+        self.layer_offsets = {layer: layer for layer in self.pools}
+        self.max_attention_window_vec = (None,) * (max(self.pools) + 1)
         self.dtype = manager.dtype
         self.low_dtype = manager.low_dtype
         self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
-        self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
+        self.kv_cache_pool_mapping = torch.zeros((max(self.pools) + 1, 2), dtype=torch.int32)
         self.kv_cache_block_offsets = None
 
     def update(self, metadata: AttentionMetadata) -> None:
@@ -134,20 +134,19 @@ class MixedPrecisionKVView:
 
     def swap_staging(self, metadata: AttentionMetadata, kv=None):
         """Select staging KV or restore the supplied cache state."""
-        if self.kv_cache_block_offsets is None:
-            return None
-        saved = (
-            metadata.kv_cache_manager,
-            metadata.kv_layout,
-            metadata.use_paged_context_fmha,
-            metadata.kv_cache_block_offsets,
-        )
-        (
-            metadata.kv_cache_manager,
-            metadata.kv_layout,
-            metadata.use_paged_context_fmha,
-            metadata.kv_cache_block_offsets,
-        ) = kv if kv is not None else (self, self.layout, True, self.kv_cache_block_offsets)
+        saved = (metadata.kv_cache_manager,)
+        metadata.kv_cache_manager = self if kv is None else kv[0]
+        if self.kv_cache_block_offsets is not None:
+            saved += (
+                metadata.kv_layout,
+                metadata.use_paged_context_fmha,
+                metadata.kv_cache_block_offsets,
+            )
+            (
+                metadata.kv_layout,
+                metadata.use_paged_context_fmha,
+                metadata.kv_cache_block_offsets,
+            ) = (self.layout, True, self.kv_cache_block_offsets) if kv is None else kv[1:]
         return saved
 
     def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
