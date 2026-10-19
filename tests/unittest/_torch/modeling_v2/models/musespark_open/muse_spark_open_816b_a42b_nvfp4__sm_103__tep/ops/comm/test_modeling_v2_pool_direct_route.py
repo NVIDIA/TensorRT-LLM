@@ -225,7 +225,7 @@ def _layers(e, chain: _Chain, arm: str, place: int, delays=None, side_delays=Non
         )
         hidden = chain.live[layer]
         if arm == "router_fork":
-            logits_local = torch.empty(rows, S.LOCAL_EXPERTS, device="cuda")
+            logits_local = torch.empty(rows, D.LOCAL_EXPERTS, device="cuda")
             e.side.wait_stream(main)
             with torch.cuda.stream(e.side):
                 if layer in side_delays:
@@ -295,9 +295,9 @@ def test_the_publish_twin_fills_every_box_of_every_record(group, rows, warps):
     expected = torch.full_like(copy, SENTINEL_I32)
     copies = S.publish_copies(rows)
     for r in range(WORLD):
-        logits = torch.empty(rows, S.LOCAL_EXPERTS, device="cuda")
+        logits = torch.empty(rows, D.LOCAL_EXPERTS, device="cuda")
         S.router_shard_side(hidden, e.router[3], r, SCALE, warps, logits)
-        boxes = expected[buffer, r, D.POOL_SLOT_WORDS :].view(D.CTAS, D.MAX_ROWS, S.LOCAL_EXPERTS)
+        boxes = expected[buffer, r, D.POOL_SLOT_WORDS :].view(D.CTAS, D.MAX_ROWS, D.LOCAL_EXPERTS)
         for c in range(copies):
             boxes[c, :rows] = logits.view(torch.int32)
     bad = int((copy != expected).sum().item())
@@ -363,7 +363,7 @@ def _one_layer(e, hidden: torch.Tensor, arm: str, rows: int, place: int, static_
     """
     kernel = e.kernels[rows - 1]
     if arm == "tagged":
-        logits_local = torch.empty(rows, S.LOCAL_EXPERTS, device="cuda")
+        logits_local = torch.empty(rows, D.LOCAL_EXPERTS, device="cuda")
         S.router_shard_side(hidden, e.router[0], e.rank, SCALE, WARPS, logits_local)
         local = GEMM.dense_gemm(hidden, e.pool[0], kernel, True)
         out = R.pool_gather_route(
@@ -673,7 +673,7 @@ def test_a_concurrent_poller_never_sees_a_value_before_the_final_one(group, prod
         if is_router:
             words, start, halves = S.publish_copies(rows) * D.BOX_WORDS, D.POOL_SLOT_WORDS, False
             # Only the rows written: rows past M of each box stay the sentinel.
-            words = rows * S.LOCAL_EXPERTS
+            words = rows * D.LOCAL_EXPERTS
         else:
             words, start, halves = rows * D.POOL_ROW_WORDS, 0, True
         part = max(words // 4, 1)

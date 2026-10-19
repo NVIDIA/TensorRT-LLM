@@ -1957,7 +1957,8 @@ def _fork_edges(names: dict, raws: dict, edges: list) -> dict:
 
 #: Entry point -> (feature ids that run it, call sites per decode forward, widest width).
 ENTRIES = {
-    "preattn_prep": ({"preattn_prep"}, 6, 8),
+    # preattn_prep takes decode steps up to its own cap (wider than every other entry here).
+    "preattn_prep": ({"preattn_prep"}, 6, target_attention._PREATTN_PREP_MAX_ROWS),
     "post_attn_hop": ({"hop", "hop_early_trigger"}, 6, 8),
     "unpool_gather_boundary": ({"gathers"}, 5, 8),
     "pool_gather_fp4quant": ({"gathers"}, 4, 8),
