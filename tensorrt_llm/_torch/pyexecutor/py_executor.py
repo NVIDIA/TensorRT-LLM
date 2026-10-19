@@ -5744,7 +5744,7 @@ class PyExecutor:
                 # modifying any host memory copied to GPU. Scheduler V2
                 # modifies the host page table, so wait before scheduling.
                 # This wait is also needed for legacy scheduler, but it can
-                # be pushed later, e.g. before DecoderRunner._prepare_inputs().
+                # be pushed later, e.g. before DecoderInputPreparer.prepare_inputs().
                 self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
@@ -8015,7 +8015,7 @@ class PyExecutor:
                     resource_mgr_type].prepare_resources(
                         disagg_gen_init_to_prepare)
 
-        # These requests skip the context branch of _prepare_tp_inputs (their
+        # These requests skip DecoderInputPreparer._pack_context_requests (their
         # context phase ran on another worker); latch cached_tokens from the
         # prefix this worker just matched in its own cache.
         for req in requests:
