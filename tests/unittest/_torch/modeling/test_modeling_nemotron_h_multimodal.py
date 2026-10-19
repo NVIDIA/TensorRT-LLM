@@ -85,16 +85,17 @@ def test_nemotron_nano_registers_native_multimodal_epd_components():
     assert NemotronHMultimodalModel.support_mm_disagg is True
 
 
-def _assert_nano_video_handoff(handoff):
+def _assert_nano_video_handoff(prompt_token_ids, params):
     """Shared assertions for the EPD video handoff: split runs stay grouped under one MM item."""
-    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
-    assert handoff.multimodal_lengths == [8]
-    assert handoff.multimodal_positions == [1]
-    assert handoff.multimodal_embedding_lengths == [4]
-    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
-    assert handoff.multimodal_run_positions == [1, 6]
-    assert handoff.multimodal_run_lengths == [4, 4]
-    assert handoff.special_token_offsets == [0, 3, 4, 7]
+    assert prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert params.multimodal_input.multimodal_lengths == [8]
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.item_metadata.item_refs == [("video", 0)]
+    assert params.item_metadata.output_embedding_lengths == [4]
+    assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
+    assert params.multimodal_input.multimodal_run_positions == [1, 6]
+    assert params.multimodal_input.multimodal_run_lengths == [4, 4]
+    assert params.multimodal_data["special_token_offsets"] == [0, 3, 4, 7]
 
 
 @pytest.mark.parametrize(
@@ -137,19 +138,20 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     )
 
     video = VideoData(frames=[object()], metadata={}, audio=None)
-    handoff = processor.build_disagg_prefill_multimodal_inputs(
+    prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
         {
             input_field: input_value,
             "multi_modal_data": {"video": [video]},
         },
         [{"tensor_size": (4, 16)}],
+        mm_hashes=[[1] * 8],
     )
 
     if asserts_encode_not_called:
         processor._tokenizer.encode.assert_not_called()
         processor.expand_prompt_token_ids_for_mm.assert_called_once()
         assert processor.expand_prompt_token_ids_for_mm.call_args.args[0] == [101, 98, 102]
-    _assert_nano_video_handoff(handoff)
+    _assert_nano_video_handoff(prompt_token_ids, params)
 
 
 @pytest.mark.parametrize(

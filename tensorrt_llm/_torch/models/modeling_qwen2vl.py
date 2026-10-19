@@ -30,8 +30,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalEncoderItemMetadata,
+from tensorrt_llm.inputs.multimodal import (MultimodalEncoderItemMetadata,
                                             MultimodalItemMetadata,
                                             MultimodalItemPartition,
                                             MultimodalParams)
@@ -1261,8 +1260,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mm_handles = [{
             "tensor_size": tuple(image_embedding.shape)
         } for image_embedding in image_embeddings]
-        prompt_token_ids = build_disagg_prefill_multimodal_inputs(
-            inputs, mm_handles).prompt_token_ids
+        prompt_token_ids, multimodal_params = build_disagg_prefill_multimodal_inputs(
+            inputs, mm_handles)
 
         # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
         # ``image_token_id`` at mm positions (no legacy OOV remap), so
@@ -1282,10 +1281,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_config = self.get_mrope_config(mrope_input_ids, image_grid_thw,
                                              None, attention_mask, None)
 
-        multimodal_data = {
-            "multimodal_embedding": image_embeddings,
-            "mrope_config": mrope_config,
-        }
+        multimodal_data = multimodal_params.multimodal_data
+        multimodal_data["multimodal_embedding"] = image_embeddings
+        multimodal_data["mrope_config"] = mrope_config
         return prompt_token_ids, {"multimodal_data": multimodal_data}
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
@@ -2526,21 +2524,24 @@ class Qwen2VLModel(Qwen2VLModelBase):
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
     def build_disagg_prefill_multimodal_inputs(
-            self, inputs: TextPrompt,
-            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
+        self,
+        inputs: TextPrompt,
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
             mm_handles: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
@@ -2598,18 +2599,23 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
         assert mm_token_length[-1] + mm_token_offsets[
             -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
-            multimodal_lengths=mm_token_length,
-            multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[
-                mm_handle["tensor_size"][0] for mm_handle in mm_handles
-            ],
-            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
-                                                      1)),
-            multimodal_run_positions=mm_token_offsets,
-            multimodal_run_lengths=mm_token_length,
-        )
+        return expanded_ids.to(
+            torch.int32).tolist(), MultimodalParams.from_embeddings(
+                mm_handles,
+                MultimodalItemMetadata(
+                    [("image", i) for i in range(len(mm_handles))],
+                    output_embedding_lengths=[
+                        handle["tensor_size"][0] for handle in mm_handles
+                    ],
+                ),
+                multimodal_hashes=mm_hashes,
+                multimodal_lengths=mm_token_length,
+                multimodal_positions=mm_token_offsets,
+                multimodal_item_run_cu_offsets=list(
+                    range(len(mm_token_length) + 1)),
+                multimodal_run_positions=mm_token_offsets,
+                multimodal_run_lengths=mm_token_length,
+            )
 
 
 @support_multimodal_disaggregated

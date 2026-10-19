@@ -996,8 +996,13 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
 
     Apply this to a model class AFTER its input processor has been registered via
     @register_input_processor. The decorator will locate the processor class,
-    validate requirements, and set `supports_multimodal_disagg = True` on both
+    validate requirements, and set `support_mm_disagg = True` on both
     the processor class and the model class.
+
+    The processor implements ``build_disagg_prefill_multimodal_inputs(inputs,
+    mm_handles, *, mm_hashes=None)`` and returns ``(prompt_token_ids,
+    MultimodalParams)``. The params hold prompt layout, item metadata, and
+    embedding handles; the worker resolves the handles before model execution.
     """
     processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.get(
         model_cls)

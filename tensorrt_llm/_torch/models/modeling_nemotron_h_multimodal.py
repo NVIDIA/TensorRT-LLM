@@ -28,7 +28,6 @@ from PIL import Image
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
-    DisaggPrefillMultimodalInputs,
     MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
@@ -2510,8 +2509,12 @@ class NemotronHMultimodalInputProcessor(
         return input_ids[0].to(torch.int32).tolist(), {"multimodal_data": multimodal_data}
 
     def build_disagg_prefill_multimodal_inputs(
-        self, inputs: Union[TextPrompt, TokensPrompt], mm_handles: List[Dict[str, Any]]
-    ) -> DisaggPrefillMultimodalInputs:
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if prompt_token_ids is None and not text_prompt:
@@ -2627,11 +2630,15 @@ class NemotronHMultimodalInputProcessor(
             mm_mask, num_mm_tokens
         )
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids,
+        return expanded_ids, MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(
+                [(modalities[0], i) for i in range(len(mm_handles))],
+                output_embedding_lengths=multimodal_embedding_lengths,
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=num_mm_tokens,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=multimodal_embedding_lengths,
             multimodal_item_run_cu_offsets=item_run_cu_offsets,
             multimodal_run_positions=run_positions,
             multimodal_run_lengths=run_lengths,

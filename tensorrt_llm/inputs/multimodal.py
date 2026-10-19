@@ -832,68 +832,6 @@ class MultimodalInput:
 
 
 @dataclass
-class DisaggPrefillMultimodalInputs:
-    """Typed multimodal metadata returned by E/P disagg prefill processors."""
-
-    prompt_token_ids: List[int]
-    multimodal_lengths: List[int]
-    multimodal_positions: List[int]
-    multimodal_embedding_lengths: List[int]
-    multimodal_item_run_cu_offsets: Optional[List[int]] = None
-    multimodal_run_positions: Optional[List[int]] = None
-    multimodal_run_lengths: Optional[List[int]] = None
-    special_token_offsets: Optional[List[int]] = None
-    item_types: Optional[List[int]] = None
-
-    def __post_init__(self) -> None:
-        _validate_int_list(self.prompt_token_ids, "prompt_token_ids")
-        _validate_int_list(self.multimodal_embedding_lengths,
-                           "multimodal_embedding_lengths")
-        _validate_multimodal_positions_and_lengths(
-            self.multimodal_positions,
-            self.multimodal_lengths,
-            len(self.multimodal_embedding_lengths),
-            "multimodal_embedding_lengths",
-        )
-
-        if any(length <= 0 for length in self.multimodal_embedding_lengths):
-            raise ValueError("multimodal_embedding_lengths must be positive")
-
-        _validate_multimodal_runs(
-            len(self.multimodal_lengths),
-            self.multimodal_lengths,
-            self.multimodal_item_run_cu_offsets,
-            self.multimodal_run_positions,
-            self.multimodal_run_lengths,
-            "multimodal_lengths",
-        )
-        self._validate_optional_metadata()
-
-    def _validate_optional_metadata(self) -> None:
-        if self.special_token_offsets is not None:
-            _validate_int_list(self.special_token_offsets,
-                               "special_token_offsets")
-            if any(offset < 0 for offset in self.special_token_offsets):
-                raise ValueError("special_token_offsets must be non-negative")
-        if self.item_types is not None:
-            _validate_int_list(self.item_types, "item_types")
-            if len(self.item_types) != len(self.multimodal_lengths):
-                raise ValueError("item_types length must match "
-                                 "multimodal_lengths")
-
-    def to_multimodal_input(self,
-                            mm_hashes: List[List[int]]) -> MultimodalInput:
-        return MultimodalInput.from_components(
-            mm_hashes,
-            self.multimodal_positions,
-            self.multimodal_lengths,
-            mm_item_run_cu_offsets=self.multimodal_item_run_cu_offsets,
-            mm_run_positions=self.multimodal_run_positions,
-            mm_run_lengths=self.multimodal_run_lengths,
-        )
-
-
-@dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
 
@@ -1038,6 +976,70 @@ class MultimodalParams:
             self.multimodal_data = {}
         normalize_multimodal_item_metadata(self.multimodal_data,
                                            self.mm_item_order)
+
+    @classmethod
+    def from_embeddings(
+        cls,
+        embeddings: list[torch.Tensor] | list[dict[str, Any]],
+        item_metadata: MultimodalItemMetadata,
+        *,
+        multimodal_positions: list[int],
+        multimodal_lengths: list[int],
+        multimodal_hashes: list[list[int]] | None = None,
+        multimodal_item_run_cu_offsets: list[int] | None = None,
+        multimodal_run_positions: list[int] | None = None,
+        multimodal_run_lengths: list[int] | None = None,
+        special_token_offsets: list[int] | None = None,
+    ) -> "MultimodalParams":
+        """Attach prompt-ordered embeddings without copying their payloads.
+
+        Each entry is a tensor of shape ``[output_rows, feature_size]`` or its
+        shared-tensor handle. Item output lengths describe those rows; prompt
+        lengths also count model-specific MM framing tokens. Hashes enable
+        the C++ KV-cache representation. Without hashes, only the processed
+        data is retained, as for external embeddings without KV-cache reuse.
+        """
+        item_metadata.validate()
+        embedding_lengths = item_metadata.output_embedding_lengths
+        if embedding_lengths is None or len(embeddings) != len(
+                embedding_lengths):
+            raise ValueError("Embeddings and item output lengths must align")
+        if any(length <= 0 for length in embedding_lengths):
+            raise ValueError("Attached embedding lengths must be positive")
+        multimodal_input = None
+        if multimodal_hashes is not None:
+            if len(multimodal_hashes) != len(embedding_lengths):
+                raise ValueError(
+                    "Multimodal hashes and item output lengths must align")
+            multimodal_input = MultimodalInput.from_components(
+                multimodal_hashes,
+                multimodal_positions,
+                multimodal_lengths,
+                mm_item_run_cu_offsets=multimodal_item_run_cu_offsets,
+                mm_run_positions=multimodal_run_positions,
+                mm_run_lengths=multimodal_run_lengths,
+            )
+        else:
+            _validate_multimodal_positions_and_lengths(
+                multimodal_positions, multimodal_lengths,
+                len(embedding_lengths), "output_embedding_lengths")
+            _validate_multimodal_runs(len(embedding_lengths),
+                                      multimodal_lengths,
+                                      multimodal_item_run_cu_offsets,
+                                      multimodal_run_positions,
+                                      multimodal_run_lengths,
+                                      "output_embedding_lengths")
+        data = {
+            "multimodal_embedding": embeddings,
+            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: item_metadata,
+        }
+        if special_token_offsets is not None:
+            _validate_int_list(special_token_offsets, "special_token_offsets")
+            if any(offset < 0 for offset in special_token_offsets):
+                raise ValueError("special_token_offsets must be non-negative")
+            data["special_token_offsets"] = special_token_offsets
+        return cls(multimodal_input=multimodal_input, multimodal_data=data)
 
     @property
     def item_metadata(self) -> MultimodalItemMetadata | None:
