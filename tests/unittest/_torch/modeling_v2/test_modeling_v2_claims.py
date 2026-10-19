@@ -174,6 +174,19 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
     )
 
 
+def test_test_files_have_unique_names():
+    """None of these test directories is a package, so pytest imports each test file by its bare
+    name: two files of one name -- the same owned entry in two targets, say -- fail the collection
+    of the whole tree with an "import file mismatch", for every test in it, not just those two."""
+    seen: dict[str, Path] = {}
+    for path in sorted(Path(__file__).resolve().parent.rglob("test_*.py")):
+        assert path.name not in seen, (
+            f"{path.relative_to(Path(__file__).resolve().parent)} and "
+            f"{seen[path.name].relative_to(Path(__file__).resolve().parent)} share a file name"
+        )
+        seen[path.name] = path
+
+
 # The phase a step runs at is resolved once, at the dispatcher, and a target is
 # what runs after that resolution. These two gates are what keep that true:
 # without them a later edit can put `if md.num_contexts:` back inside a decode

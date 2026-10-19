@@ -127,11 +127,12 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tep8(LlmapiAccuracyTestHarness):
     @skip_not_sm100
     def test_gsm8k(self):
         # 1.1 TB of weights: 8 ranks, tensor-parallel attention and mamba, expert-parallel
-        # MoE (the replicated-attention layout does not fit). The state and the KV cache
-        # keep the checkpoint's own dtypes (fp32 SSM state, bf16 KV). Block reuse is off and
-        # the fraction is what is left after 140 GB of weights per 186 GB GPU. The target
-        # checks its step contract on the first forward; it travels as ``env_overrides``
-        # because the check runs where the metadata does.
+        # MoE (the replicated-attention layout leaves no room for the state and the cache).
+        # The state and the KV cache keep the checkpoint's own dtypes (fp32 SSM state, bf16
+        # KV). Block reuse is off and the fraction applies to what is left after about
+        # 128 GiB of weights on each 185 GiB GPU. The target checks its step contract on
+        # the first forward; it travels as ``env_overrides`` because the check runs where
+        # the metadata does.
         max_batch_size = 32
         with LLM(
             self.MODEL_PATH,

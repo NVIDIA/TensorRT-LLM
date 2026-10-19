@@ -23,7 +23,7 @@ inside a single job over every named device rather than independent cases: each 
 module-global rank state that only `_run_one_rank` binds. Neither this file's
 name nor its function names match pytest's collection patterns.
 
-The collected entry point is `test_modeling_v2_allreduce_op_matrix.py` beside
+The collected entry point is `test_modeling_v2_ultra_bf16_allreduce_op_matrix.py` beside
 this file: it starts this job and turns its exit code into an assertion. Both
 halves are started by file path: the launcher must not import `tensorrt_llm`
 (that calls MPI_Init, and an MPI-initialized process cannot start the
@@ -137,6 +137,8 @@ def _assert_within_summation_bound(
     err = (out.double() - exact).abs()
     over = (err > budget).sum().item()
     worst = (err / budget.clamp_min(1e-300)).max().item()
+    if os.environ.get("ALLREDUCE_MATRIX_VERBOSE") == "1" and RANK == 0:
+        print(f"  [bound] {where}: worst element at {worst:.3f} of the bound", flush=True)
     assert over == 0, (
         f"{where}: {over} elements outside the summation bound, worst at {worst:.3f} of it"
     )
@@ -155,7 +157,8 @@ def _assert_kernel_arithmetic(
 
     Discrimination, measured by mutating the run rather than this file: with
     ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 (the custom kernels add in bf16) the
-    first ONESHOT cell failed on every rank of the 4-rank sm_107 job with 33.2% of elements wrong;
+    first ONESHOT cell failed on every rank of the 4-rank sm_100 job (one GB200 node) with 33.2% of
+    elements wrong;
     with TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE=4096 (every custom call falls
     back to NCCL) it failed with 32.6% wrong -- against a gate of 0.
     """
@@ -166,6 +169,10 @@ def _assert_kernel_arithmetic(
     else:
         assert kernel == "nccl", kernel
         differs = (out != ref).float().mean().item()
+        if os.environ.get("ALLREDUCE_MATRIX_VERBOSE") == "1" and RANK == 0:
+            print(
+                f"  [nccl] {where}: {differs:.4f} of elements differ from `reference`", flush=True
+            )
         assert differs > 0.05, (
             f"{where}: only {differs:.4f} of elements differ from the fp32 sum rounded once; "
             "that is not NCCL's per-hop rounding -- a different kernel ran"

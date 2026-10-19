@@ -125,11 +125,14 @@ class Allreduce(OpWrapper):
     receives bit-identical results (which is what keeps TP-replicated
     activations replicated) and repeated calls are bitwise deterministic.
     ONESHOT / TWOSHOT equal `reference` bit for bit. NCCL differs from it in
-    about a third of the elements of a random payload -- its per-hop bf16
-    rounding -- and stays inside the sequential-summation bound
-    gamma_3 * sum|x_r| (bf16 unit roundoff 2^-8), the worst element at 0.95 of
-    it. On payloads whose partial sums are all exact, every strategy returns
-    the exact sum.
+    about a third of the elements of a random payload (0.329 to 0.330 on every
+    NCCL cell) -- its per-hop bf16 rounding -- and stays inside the
+    sequential-summation bound gamma_{n-1} * sum|x_r| (bf16 unit roundoff
+    2^-8), the worst element at 0.90 of it (the 8192-row cell; 0.61 at one
+    row). The custom kernels sit at 0.33 of it. All of this was measured at
+    4 ranks on one GB200 node (sm_100); the 8-rank, one-node case is not
+    covered by any run. On payloads whose partial sums are all exact, every
+    strategy returns the exact sum.
 
     The one-shot kernel treats a 32-bit word equal to fp32 -0.0 as its
     empty-slot marker and rewrites it to +0.0 on the way in, so a bf16 -0.0 at

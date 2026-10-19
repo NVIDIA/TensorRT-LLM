@@ -129,6 +129,7 @@ An entry's GPU test lives in the tests tree, mirroring the entry's path:
 tests/unittest/_torch/modeling_v2/
   test_modeling_v2_claims.py     source-level gates over the whole package (no GPU)
   test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
+  test_modeling_v2_*weight_table.py   what a target's weight table reads and slices (no GPU)
   _validating.py                 the fixtures that interpose is_valid and arm reference
   <category>/test_modeling_v2_<entry>.py                      shared entries
   models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
@@ -271,16 +272,18 @@ protocol of `TestNemotronV3Ultra`, `modeling_v2="require"`).
 
 `Arch.SM_100` is the third architecture. `models/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8`
 runs the BF16 release of Nemotron-3 Ultra -- no quantization at all, 1.1 TB of
-weights -- on 8 sm_100 ranks (one HGX B200 node, or two GB200 nodes), with
-tensor-parallel attention, mamba and shared expert and expert-parallel routed
-experts. It is the sm_107 NVFP4 tep4 target with the quantization taken out and
+weights -- on 8 sm_100 ranks, with tensor-parallel attention, mamba and shared
+expert and expert-parallel routed experts. It has run on two GB200 nodes; an
+8-GPU HGX B200 node, the single-node shape of the same routing, has not been
+tried. It is the sm_107 NVFP4 tep4 target with the quantization taken out and
 the rank count doubled. It has no dep8 sibling: attention data parallelism
-replicates every non-expert weight on every rank (about 68 GB: the mamba
+replicates every non-expert weight on every rank (about 63 GiB: the mamba
 projections, the shared experts, attention, the latent projections, the
-embeddings) beside 129 GB of experts, more than a 186 GB GPU holds. Routing
-claims it for the BF16 checkpoint (`quantization_config` absent), compute
-capability (10, 0), exactly 8 ranks tensor-parallel with expert-parallel MoE,
-attention DP off and no speculative decoding.
+embeddings) beside 120 GiB of experts, which is 183 of a 185 GiB GPU before the
+unsharded fp32 recurrent state (384 MiB per sequence), the KV cache or any
+activation. Routing claims it for the BF16 checkpoint (no quantization
+declared), compute capability (10, 0), exactly 8 ranks tensor-parallel with
+expert-parallel MoE, attention DP off and no speculative decoding.
 
 What differs from the NVFP4 target:
 
@@ -297,13 +300,25 @@ What differs from the NVFP4 target:
   The entry was deepseek's own (`fused_moe`, SwiGLU, bf16); it is promoted to the
   catalog with its test and gains Relu2 and the Ultra geometry as cells.
 * The KV cache is bf16 (`quant_mode` 0, no scales to pass) and the SSM state is fp32,
-  the checkpoint's `mamba_ssm_cache_dtype`; the NVFP4 gate runs fp16.
+  the checkpoint's `mamba_ssm_cache_dtype`; the NVFP4 gate runs fp16. The target
+  asserts both, and a bf16 conv state, when it takes the pools off the cache manager:
+  `kv_cache_config.dtype` or `mamba_ssm_cache_dtype` set to anything else would
+  otherwise be read and written in the wrong width without a shape error.
 * TP8 geometry per rank: 8 query heads over one kv head (each of the 2 kv heads is
   replicated on four ranks), 32 mamba heads in the rank's single group, a 1280-wide
   slice of the shared expert, 64 of the 512 experts.
 * The all-reduce is `AUTO` inside one node (the IPC one-shot / two-shot kernels for
-  decode-sized payloads, NCCL for large ones) and NCCL across nodes, where the IPC
-  workspace has no peers.
+  decode-sized payloads, NCCL for large ones). Across nodes the IPC workspace has no
+  peers, so on an NVL72-class system (aarch64, fabric handles) the target uses the MNNVL
+  kernels, which fold the residual add and the next block's RMSNorm into the all-reduce:
+  one kernel up to 1 MiB of payload (8 rows at 8 ranks), an all-reduce kernel and an
+  RMSNorm kernel above it. Anywhere else a multi-node group runs NCCL followed by the
+  fused add + RMSNorm. The user's `allreduce_strategy` decides, as it does for the
+  engine's own `AllReduce`: `AUTO` and `MNNVL` take MNNVL where it applies, `NCCL` opts
+  out. The log names the path a run took ("all-reduce over 8 ranks via ..."). Measured
+  at 8 ranks over two GB200 nodes (trtllm-bench, c=32, 1k/1k, 256 requests, one
+  allocation): 2473 tok/s with MNNVL, 2087 with `allreduce_strategy: NCCL`, 2398 for the
+  built-in implementation's default.
 
 Entries: `Arch.SM_100` is declared on every shared entry the target calls, each driven
 whole on sm_100: `thop_attention`, `cublas_mm`, `flashinfer_rmsnorm`,
@@ -315,11 +330,27 @@ pool, including rows 4 and 55 of a real `MambaHybridCacheManagerV2`'s 60-row map
 conv, scan and decode-step shapes at 32 heads in one group over an fp32 state pool; one
 group of 2048 for the gated norm; Relu2 over a window of 64 experts -- were driven on
 sm_100 only, so on an entry that also lists sm_103 or sm_107 they are not a claim about
-those. The target's own `allreduce` entry sits under its `ops/comm/` with a matrix that
-runs at 8 ranks where the node has 8 GPUs and at 4 where it has 4; it was driven at 4
-ranks (one GB200 node), so the one-shot / two-shot kernels at 8 ranks inside one node
--- an HGX B200 -- are not covered by any run yet. The accuracy gate ran on two GB200
-nodes, where the all-reduce is NCCL.
+those.
+
+The target owns two all-reduce entries under its `ops/comm/`, each with a multi-rank
+matrix beside its tests. `allreduce` (the IPC / NCCL sum, `ARCHS` sm_100) runs at 8 ranks
+where the node has 8 GPUs and at 4 where it has 4; it was driven at 4 ranks (one GB200
+node), so the one-shot / two-shot kernels at 8 ranks inside one node -- an HGX B200 --
+are not covered by any run yet. `mnnvl_fusion_allreduce` (the sum, the residual add and
+the next RMSNorm in one op over the multicast workspace; `ARCHS` sm_100, NVL72 only) was
+driven at 4 ranks on one GB200 node and at 8 ranks over two: both kernels, told apart by
+the stage count the workspace records rather than by the payload size; exact payloads
+bitwise on `residual_out` and inside a derived band on `norm_out`; a 108-call decode graph
+replayed three times at one row (one-shot) and at 32 rows (two-shot); and a graph captured
+on the engine's default workspace that keeps replaying after the workspace grew to the
+8192-row footprint. The accuracy gate ran on two GB200 nodes with the MNNVL path (94.807
+against the reference's 94.769) and, before that path existed, with NCCL across nodes
+(94.693 and 94.655).
+
+No CI stage runs the sm_100 pieces yet. `l0_b300.yml` lists the modeling_v2 directory for
+sm_103 (waived today), nothing lists it for sm_100, and the accuracy gate and the BF16
+`noaux_tc_op` cells read the 1.1 TB BF16 release from `LLM_MODELS_ROOT`, which has to be
+staged on the CI model share first.
 
 What the sm_100 runs surfaced, each written up in its entry or test:
 
@@ -333,7 +364,15 @@ What the sm_100 runs surfaced, each written up in its entry or test:
   measured worst cases).
 * **The IPC all-reduce has no peers across nodes**: `get_allreduce_workspace` allocates
   nothing to open there, so the target passes NCCL explicitly when the mapping spans
-  nodes rather than leaving `AUTO` to discover it.
+  nodes (and MNNVL is not taken) rather than leaving `AUTO` to discover it.
+* **The MNNVL kernels round the all-reduce sum to bf16 before the residual is added**,
+  one rounding more than NCCL followed by the fused add + RMSNorm, which adds in fp32.
+  The one-shot and two-shot kernels also associate the last fp32 product differently
+  (`(x * rcp) * gamma` against `(gamma * x) * rcp`). `residual_out` is gated bit for bit
+  on the exact payloads (and measured at zero difference on random ones); `norm_out`
+  differs from the entry's `reference` by a rare one-flip bf16 rounding of an element,
+  which is where the matrix's band comes from. Worst measured, element-wise / RMS in the
+  band's units: 0.93 / 0.007 at 4 ranks and 0.92 / 0.003 at 8, against gates of 2.0 / 0.02.
 
 The target is gated by
 `tests/integration/defs/accuracy/modeling_v2/test_nemotron_h.py::TestModelingV2Nemotron3UltraBf16Sm100Tep8`

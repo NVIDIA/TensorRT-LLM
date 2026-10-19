@@ -31,14 +31,19 @@ def _block_kinds(pretrained_config: Any) -> frozenset:
 
 
 def _quantization(pretrained_config: Any) -> Tuple[Optional[str], Optional[int]]:
-    """(quant_algo, kv-cache bits) as the checkpoint's config.json declares them."""
+    """(quantization algorithm, kv-cache bits) as the checkpoint's config.json declares them.
+
+    The algorithm is the engine's own `quant_algo` key (what the NVIDIA checkpoints' quantization
+    config carries) or, failing that, a Hugging Face native `quant_method`: any declared
+    quantization is something other than (None, None), so an unquantized target never claims it.
+    """
     qc = getattr(pretrained_config, "quantization_config", None)
     if qc is None:
         return None, None
     get = qc.get if isinstance(qc, dict) else lambda k, d=None: getattr(qc, k, d)
     kv = get("kv_cache_scheme", None) or {}
     kv_bits = kv.get("num_bits") if isinstance(kv, dict) else getattr(kv, "num_bits", None)
-    return get("quant_algo", None), kv_bits
+    return get("quant_algo", None) or get("quant_method", None), kv_bits
 
 
 def route(
@@ -84,8 +89,9 @@ def route(
     # everything but the routed experts whole on every rank. Both put the routed
     # experts expert-parallel over the same 4 ranks. The BF16 checkpoint is 1.1 TB
     # (the NVFP4 one 329 GB), so it takes 8 ranks, and only the tensor-parallel
-    # layout: replicating the non-expert weights (dep) would put about 68 GB of
-    # them on every rank beside 129 GB of experts, more than a 186 GB GPU holds.
+    # layout: replicating the non-expert weights (dep) would put about 63 GiB of
+    # them on every rank beside 120 GiB of experts: 183 of a 185 GiB GPU before the
+    # unsharded fp32 recurrent state (384 MiB per sequence), the KV cache or any activation.
     four_rank_ep = (
         mapping.world_size == 4
         and mapping.tp_size == 4

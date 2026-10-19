@@ -79,8 +79,9 @@ class CublasMm(OpWrapper):
         # nemotron_h's Ultra BF16 at tep8: every dense projection a rank runs that is
         # not already a cell above -- the mamba in_proj (z | x | B | C | dt rows of one
         # rank), the 8-q-head qkv and o_proj, and the two halves of the shared expert --
-        # at the same three row counts. fc1_latent, fc2_latent / the mamba out_proj and
-        # the router are the cells above: their shapes do not depend on the rank count.
+        # at the same three row counts. fc1_latent, fc2_latent and the router are the cells
+        # above: their shapes do not depend on the rank count. The mamba out_proj does
+        # (d_inner / 8 = 2048 -> 8192); at tep8 it happens to be fc2_latent's shape.
         *(
             Cell(
                 why=f"nemotron_h BF16 tep8 {what}, T={m}{tail}",

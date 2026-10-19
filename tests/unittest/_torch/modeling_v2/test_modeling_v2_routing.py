@@ -492,6 +492,9 @@ def test_ultra_bf16_depth_is_not_part_of_the_identity(_on_sm100):
             {},
             r"quantization \('MIXED_PRECISION', 8\)",
         ),
+        # a Hugging Face native quantization of the same model: any declared quantization is
+        # a different weight layout, even when the config carries no `quant_algo`
+        (dict(quantization_config=dict(quant_method="fp8")), {}, r"quantization \('fp8', None\)"),
         # the right checkpoint on 4 ranks: 1.1 TB of weights do not fit
         (dict(), _TEP4, "world_size=4"),
         # the right checkpoint with attention data parallel: the replicated non-expert

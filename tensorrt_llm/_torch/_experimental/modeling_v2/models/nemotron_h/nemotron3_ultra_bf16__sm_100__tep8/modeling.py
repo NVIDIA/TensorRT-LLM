@@ -64,13 +64,20 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.selective_state_u
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
+from tensorrt_llm._torch.distributed.ops import (
+    MNNVLAllReduce,
+    get_allreduce_workspace,
+    get_or_scale_allreduce_mnnvl_workspace,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 
 from . import weights as _weights
 from .ops.comm.allreduce import allreduce
+from .ops.comm.mnnvl_fusion_allreduce import FUSION_RESIDUAL_RMS_NORM, mnnvl_fusion_allreduce
 
 # The certification is per GPU architecture: this code was gated on sm_100 only.
 _SM = (10, 0)
@@ -79,10 +86,19 @@ _SM = (10, 0)
 _PAD_SLOT_ID = -1
 # Within one node AUTO picks the one-shot / two-shot IPC kernels for decode-sized payloads
 # and NCCL for large prefill payloads (it falls back to NCCL past the workspace). Between
-# nodes the IPC kernels have no peers to reach -- the workspace is never opened -- so the
-# group runs NCCL, which rides the NVLink domain where there is one.
+# nodes the IPC kernels have no peers to reach -- the workspace is never opened. On an NVL72
+# system (aarch64, fabric handles) the group uses the MNNVL kernels, which fuse the residual
+# add and the next block's RMSNorm into the all-reduce; anywhere else it runs NCCL. The user's
+# `allreduce_strategy` decides whether MNNVL is a candidate at all, as it does for the engine's
+# own AllReduce: AUTO and MNNVL take it where it applies, NCCL (or any other strategy) opts out.
 _ALLREDUCE_STRATEGY = AllReduceStrategy.AUTO
-_ALLREDUCE_STRATEGY_MULTI_NODE = AllReduceStrategy.NCCL
+# What a group runs where the IPC kernels have no peers (it spans nodes), or when asked for.
+_ALLREDUCE_STRATEGY_NCCL = AllReduceStrategy.NCCL
+_MNNVL_STRATEGIES = (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL)
+# The MNNVL kernels record a buffer's size in a uint32, and the engine grows the workspace in
+# 8 MiB steps: the largest call it can honour is the last multiple of 8 MiB below 2**32, and a
+# call needing more is not taken.
+_MNNVL_MAX_WORKSPACE_BYTES = 2**32 - 8 * 1024 * 1024
 # The checkpoint's time_step_limit (0, inf): softplus(dt + dt_bias) is not clamped.
 _DT_LIMIT = (0.0, float("inf"))
 
@@ -243,6 +259,11 @@ class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
         self.tp_group = list(mapping.tp_group)
         self._bound: "_Bound | None" = None
         self._binds = 0
+        # Set by post_load_weights, once the weights are real.
+        self.mnnvl = False
+        self.ar_strategy = _ALLREDUCE_STRATEGY
+        self.ar_workspace = None
+        self.side_stream: "torch.cuda.Stream | None" = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
 
@@ -255,17 +276,66 @@ class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
         """
         # The IPC workspace the custom allreduce kernels use, allocated once outside any
         # capture (the same tensor the engine's own AllReduce modules hold). A group that
-        # spans nodes uses NCCL, which needs no workspace.
+        # spans nodes has no IPC peers: it uses the MNNVL kernels where the system has them
+        # (below) and NCCL, which needs no workspace, for the calls MNNVL does not take.
         mapping = self.model_config.mapping
-        if mapping.is_multi_node():
-            self.ar_strategy, self.ar_workspace = _ALLREDUCE_STRATEGY_MULTI_NODE, None
+        dtype = self.model_config.torch_dtype
+        requested = self.model_config.allreduce_strategy
+        self.mnnvl = requested in _MNNVL_STRATEGIES and MNNVLAllReduce.is_mnnvl(
+            mapping, dtype, explicitly_requested=requested == AllReduceStrategy.MNNVL
+        )
+        if mapping.is_multi_node() or requested == AllReduceStrategy.NCCL:
+            self.ar_strategy, self.ar_workspace = _ALLREDUCE_STRATEGY_NCCL, None
         else:
             self.ar_strategy = _ALLREDUCE_STRATEGY
             self.ar_workspace = get_allreduce_workspace(mapping)
+        if self.mnnvl:
+            # Created here, on every rank at the same point and outside any graph capture:
+            # the setup is a collective, and a workspace cannot be created or grown while a
+            # capture is recording. Later calls only ever grow it, eagerly (see mnnvl_buffers).
+            try:
+                get_or_scale_allreduce_mnnvl_workspace(mapping, dtype)
+            except RuntimeError as exc:
+                # The setup ends in a fence that every rank leaves together, so a failure on
+                # one rank is a failure on all of them and they all fall back to NCCL.
+                logger.warning(f"MNNVL all-reduce workspace setup failed, using NCCL: {exc}")
+                self.mnnvl = False
+        if mapping.rank == 0:
+            logger.info(
+                f"nemotron3_ultra_bf16__sm_100__tep8: all-reduce over {mapping.tp_size} ranks via "
+                + (
+                    "MNNVL, fused with the residual add and RMSNorm"
+                    if self.mnnvl
+                    else self.ar_strategy.name
+                )
+            )
         # The shared expert runs on this stream beside the routed experts.
         self.side_stream = torch.cuda.Stream()
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
+
+    def mnnvl_buffers(self, num_tokens: int) -> "tuple[torch.Tensor, torch.Tensor] | None":
+        """The MNNVL workspace's `(comm_buffer, buffer_flags)` for a call over `num_tokens` rows,
+        or None when this group does not use MNNVL (or the call is past what the kernels size).
+
+        Called once per forward, outside the layer loop. The workspace grows here, eagerly, when
+        a call needs more than it holds. It never has to grow during a CUDA graph capture: the
+        engine runs every shape it captures once eagerly first (the runner's warmup step), so a
+        captured batch's growth has happened by the time the capture starts. A growth that fails
+        (an allocation on any rank) raises on every rank, as in the engine's own AllReduce: only
+        the first, load-time creation falls back to NCCL.
+        """
+        if not self.mnnvl:
+            return None
+        mapping = self.model_config.mapping
+        dtype = self.model_config.torch_dtype
+        need = MNNVLAllReduce.get_required_workspace_size(
+            num_tokens, self.dims.hidden, mapping.tp_size, dtype
+        )
+        if need > _MNNVL_MAX_WORKSPACE_BYTES:
+            return None
+        workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, dtype, buffer_size_bytes=need)
+        return workspace["uc_buffer"].view(dtype).view(3, -1), workspace["buffer_flags"]
 
     def _bind_cache_manager(self, md) -> None:
         """Take every pool view this model reads from one KV cache manager.
@@ -299,6 +369,15 @@ class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
         assert s0.shape[1:] == (d.heads_r, d.head_dim_ssm, d.ssm_state), (
             f"ssm state pool {tuple(s0.shape)}: expected "
             f"[slots, {d.heads_r}, {d.head_dim_ssm}, {d.ssm_state}]"
+        )
+        # The pools hold what the runtime was configured with, not what this target was gated on:
+        # `kv_cache_config.dtype` or `mamba_ssm_cache_dtype` can change them, and the kernels
+        # would read and write bf16 KV (no scales, quant_mode 0) and an fp32 SSM state regardless.
+        assert getattr(cm, "dtype", DataType.BF16) == DataType.BF16, (
+            f"KV cache dtype {cm.dtype}: this target reads and writes a bf16 KV cache"
+        )
+        assert c0.dtype == torch.bfloat16 and s0.dtype == torch.float32, (
+            f"conv state {c0.dtype} / ssm state {s0.dtype}: this target needs bf16 / fp32"
         )
         assert md.effective_beam_width == 1, "beam search is not implemented"
         assert md.cache_indirection is None, "beam search is not implemented"
@@ -432,6 +511,7 @@ class PrefillTarget:
             h = inputs_embeds
         num_tokens = h.shape[0]
         attn_out = torch.empty([num_tokens, d.q_width_r], dtype=h.dtype, device=h.device)
+        mnnvl = core.mnnvl_buffers(num_tokens)
 
         din, conv_c = d.d_inner_r, d.conv_r
         heads, hd, gn = d.heads_r, d.head_dim_ssm, d.gn_r
@@ -575,8 +655,23 @@ class PrefillTarget:
                 out = cublas_mm(routed, L.fc2_lat)
                 main.wait_stream(side)
                 out = out + shared
-            out = allreduce(out, group, core.ar_strategy, core.ar_workspace)
-            x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
+            if mnnvl is None:
+                out = allreduce(out, group, core.ar_strategy, core.ar_workspace)
+                x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
+            else:
+                # One op: the sum over the group, the residual add and the next block's
+                # RMSNorm (a single kernel up to 1 MiB of payload, two kernels above).
+                x, residual = mnnvl_fusion_allreduce(
+                    out,
+                    norm_next,
+                    residual,
+                    eps,
+                    mnnvl[0],
+                    mnnvl[1],
+                    True,
+                    None,
+                    FUSION_RESIDUAL_RMS_NORM,
+                )
         return x
 
 
@@ -677,6 +772,7 @@ class DecodeTarget:
             h = inputs_embeds
         num_tokens = h.shape[0]
         attn_out = torch.empty([num_tokens, d.q_width_r], dtype=h.dtype, device=h.device)
+        mnnvl = core.mnnvl_buffers(num_tokens)
 
         din, conv_c = d.d_inner_r, d.conv_r
         heads, hd, gn = d.heads_r, d.head_dim_ssm, d.gn_r
@@ -760,8 +856,23 @@ class DecodeTarget:
                 out = cublas_mm(routed, L.fc2_lat)
                 main.wait_stream(side)
                 out = out + shared
-            out = allreduce(out, group, core.ar_strategy, core.ar_workspace)
-            x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
+            if mnnvl is None:
+                out = allreduce(out, group, core.ar_strategy, core.ar_workspace)
+                x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
+            else:
+                # One op: the sum over the group, the residual add and the next block's
+                # RMSNorm (a single kernel up to 1 MiB of payload, two kernels above).
+                x, residual = mnnvl_fusion_allreduce(
+                    out,
+                    norm_next,
+                    residual,
+                    eps,
+                    mnnvl[0],
+                    mnnvl[1],
+                    True,
+                    None,
+                    FUSION_RESIDUAL_RMS_NORM,
+                )
         return x
 
 
