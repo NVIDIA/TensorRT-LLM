@@ -46,6 +46,18 @@ class FusedSigmoidMulInplace(OpWrapper):
             spec=dict(tokens=2048, **_CKPT),
         ),
         Cell(
+            why="decode 1 token: 2-D gate, the gate columns of the fused projection row",
+            spec=dict(tokens=1, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
+        ),
+        Cell(
+            why="decode 128 tokens: 2-D gate off the fused projection row (stride 14080)",
+            spec=dict(tokens=128, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
+        ),
+        Cell(
+            why="prefill 8192 tokens: 2-D gate off the fused projection row",
+            spec=dict(tokens=8192, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
+        ),
+        Cell(
             why="attention_output a [33, 6144] window of a [35, 8192] buffer",
             spec=dict(tokens=33, out="window", **_CKPT),
         ),

@@ -56,6 +56,7 @@ class RenormMoeRoutingOp(OpWrapper):
             spec=_ckpt(4096),
         ),
         Cell(why="8192 tokens: max_num_tokens", spec=_ckpt(8192)),
+        Cell(why="16384 rows: max_num_tokens of the tuned config", spec=_ckpt(16384)),
         Cell(
             why="the default fp32 output dtype at the checkpoint router",
             spec=_ckpt(512, torch.float32),
@@ -124,7 +125,7 @@ class RenormMoeRoutingOp(OpWrapper):
     Hard limits
       num_experts  <= 512 (raises past it)
       topk         <= 16 (raises past it); > num_experts silent, guarded
-      T            certified 0..8192 (16384 measured once)
+      T            certified 0..16384 (max_num_tokens of the tuned config)
     """
 
     def __call__(
