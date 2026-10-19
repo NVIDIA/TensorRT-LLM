@@ -38,7 +38,12 @@ from tensorrt_llm.inputs import (
     default_multimodal_input_loader,
     prompt_inputs,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import (
@@ -1047,7 +1052,9 @@ class TestChunkedPrefillCaching:
             multimodal_data={
                 "modality_type": modality,
                 modality: nested,
-                "multimodal_embedding_lengths": [num_tokens],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [(modality, 0)], output_embedding_lengths=[num_tokens]
+                ),
                 **extra,
             },
             multimodal_runtime=runtime,

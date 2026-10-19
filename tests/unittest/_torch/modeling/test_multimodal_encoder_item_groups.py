@@ -24,7 +24,6 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalEncoderItemMetadata,
     MultimodalEncoderRequestState,
     MultimodalInput,
     MultimodalItemMetadata,
@@ -83,6 +82,63 @@ def test_qwen_common_metadata_preserves_positive_output_requirement():
         processor.get_mm_item_metadata([12, 10, 13], data)
 
 
+@pytest.mark.parametrize("model", ["qwen2", "qwen2_5", "qwen3", "mistral"])
+@pytest.mark.parametrize("custom", [False, True])
+def test_processors_use_the_common_metadata_hook(model, custom):
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
+    from tensorrt_llm._torch.models.modeling_qwen2vl import (
+        Qwen2_5VLInputProcessorBase,
+        Qwen2VLInputProcessorBase,
+    )
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+
+    processor_cls = {
+        "qwen2": Qwen2VLInputProcessorBase,
+        "qwen2_5": Qwen2_5VLInputProcessorBase,
+        "qwen3": Qwen3VLInputProcessorBase,
+        "mistral": MistralHFInputProcessor,
+    }[model]
+    calls = []
+
+    class CustomProcessor(processor_cls):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
+            calls.append(prompt_token_ids)
+            metadata = super().get_mm_item_metadata(
+                prompt_token_ids, multimodal_data, mm_item_order
+            )
+            return replace(metadata, encoder_token_lengths=[80])
+
+    processor = object.__new__(CustomProcessor if custom else processor_cls)
+    processor._config = SimpleNamespace(
+        image_token_id=10,
+        video_token_id=11,
+        vision_start_token_id=12,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2, patch_size=2, image_size=8, num_channels=3
+        ),
+    )
+    processor._processor = SimpleNamespace()
+    prompt = [12, 10, 10, 13]
+    image = {"pixel_values": torch.zeros(8, 2), "image_grid_thw": torch.tensor([[1, 2, 4]])}
+    if model == "mistral":
+        image = {"pixel_values": torch.zeros(1, 3, 4, 8), "image_sizes": [[4, 8]]}
+    metadata = processor.get_mm_item_metadata(prompt, {"image": image})
+    assert calls == ([prompt] if custom else [])
+    assert metadata.item_refs == (("image", 0),)
+    assert metadata.output_embedding_lengths == (2,)
+    assert metadata.encoder_token_lengths == ((80,) if custom else (8,))
+    metadata.validate()
+    if model != "mistral":
+        partition = metadata.input_partitions["image"]["pixel_values"]
+        assert partition.item_lengths == (8,)
+        torch.testing.assert_close(
+            partition.select(image["pixel_values"], [0]), image["pixel_values"]
+        )
+
+
 def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
     from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
 
@@ -90,7 +146,9 @@ def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
     data = {
         "image": {"pixel_values": torch.zeros(1, 4, 6), "image_position_ids": torch.zeros(1, 4, 2)},
         "audio": {"audio_features": torch.zeros(1, 5, 8), "audio_features_mask": torch.ones(1, 5)},
-        "multimodal_embedding_lengths": [2, 4],
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("audio", 0), ("image", 0)], output_embedding_lengths=[2, 4]
+        ),
     }
     order = [{"modality": "audio", "index": 0}, {"modality": "image", "index": 0}]
     metadata = processor.get_mm_item_metadata([], data, order)
@@ -112,7 +170,12 @@ def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
         "feature_attention_mask": torch.ones(3, 5),
         "audio_num_clips": torch.tensor([2, 1]),
     }
-    data = {"audio": audio, "multimodal_embedding_lengths": [4, 2]}
+    data = {
+        "audio": audio,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("audio", 0), ("audio", 1)], output_embedding_lengths=[4, 2]
+        ),
+    }
     metadata = processor.get_mm_item_metadata([], data)
     metadata.validate()
     params = MultimodalParams(multimodal_data=data)
@@ -127,7 +190,12 @@ def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
     )
     assert selected.encoder_state is None
     video = {"audio": audio, "video_size": [[2, 1, 32, 32]]}
-    video_data = {"video": video, "multimodal_embedding_lengths": [6]}
+    video_data = {
+        "video": video,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("video", 0)], output_embedding_lengths=[6]
+        ),
+    }
     video_metadata = processor.get_mm_item_metadata([], video_data)
     assert video_metadata.item_refs == (("video", 0),)
     assert "audio" not in video_metadata.input_partitions
@@ -186,6 +254,28 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
 
 
+def test_common_metadata_shares_executor_and_encoder_layout():
+    from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
+
+    pixels = torch.arange(5 * HIDDEN).reshape(5, HIDDEN)
+    params = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": pixels},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 1), ("image", 0)], output_embedding_lengths=[3, 2]
+            ),
+        }
+    )
+    request = SimpleNamespace(py_multimodal_data=params.multimodal_data, multimodal_lengths=[3, 2])
+
+    assert get_multimodal_embedding_lengths(request) == (3, 2)
+    actual = _GroupedEncoderModel().encode_multimodal_inputs([params])
+
+    torch.testing.assert_close(actual, torch.cat((pixels[2:], pixels[:2])))
+    assert params.item_metadata.encoder_token_lengths is None
+    assert "multimodal_embedding_lengths" not in params.multimodal_data
+
+
 def _make_request(modalities: list[str], *, value_start: float = 1.0) -> MultimodalParams:
     """Build a request whose items carry unique, checkable patch values."""
     per_modality_rows: dict[str, list[int]] = {}
@@ -211,14 +301,13 @@ def _make_request(modalities: list[str], *, value_start: float = 1.0) -> Multimo
             pixel_key: torch.cat(blocks, dim=0),
             grid_key: torch.tensor([_grid_for_rows(r) for r in rows_per_item]),
         }
-    multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalEncoderItemMetadata(
+    multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
         item_refs=item_refs,
         encoder_token_lengths=list(lengths),
         output_embedding_lengths=list(lengths),
     )
     # Processors retain this field for legacy consumers. Encoder groups use
     # the typed item metadata when available.
-    multimodal_data["multimodal_embedding_lengths"] = list(lengths)
     return MultimodalParams(multimodal_data=multimodal_data)
 
 
@@ -283,7 +372,7 @@ def test_declared_audio_layout_selects_packed_frames_on_a_nonzero_axis():
                 "frame_counts": [2, 3, 1],
                 "shared_stats": shared,
             },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("audio", 0), ("audio", 1), ("audio", 2)], [2, 3, 1], [1, 2, 1]
             ),
         }
@@ -359,21 +448,9 @@ def test_mixed_modality_items_keep_scheduler_order():
 
 
 @pytest.mark.parametrize("modalities", [["video", "image", "image"], ["image", "video", "image"]])
-@pytest.mark.parametrize("legacy_order", [False, True])
-def test_full_and_item_encoder_paths_share_item_metadata(
-    modalities: list[str], legacy_order: bool
-) -> None:
+def test_full_and_item_encoder_paths_share_item_metadata(modalities: list[str]) -> None:
     model = _GroupedEncoderModel()
     request = _make_request(modalities)
-    metadata = request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    if legacy_order:
-        request.mm_item_order = [
-            {"modality": modality, "index": index} for modality, index in metadata.item_refs
-        ]
-    # Full-request encoding reads both order and lengths from the same
-    # metadata that drives the scheduler's item selection.
-    request.multimodal_data.pop("multimodal_embedding_lengths", None)
-
     full_output = model.encode_multimodal_inputs([request])
     item_outputs, _ = _run_items(model, [(request, i) for i in range(len(modalities))])
     expected = torch.cat([_expected_rows(request, i) for i in range(len(modalities))])
@@ -400,24 +477,15 @@ def test_metadata_is_rebased_for_partial_and_reordered_items() -> None:
     torch.testing.assert_close(outputs[1], _expected_rows(request, 0), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("use_metadata", [False, True])
-def test_full_and_item_order_can_differ_from_raw_payload_order(use_metadata: bool) -> None:
+def test_full_and_item_order_can_differ_from_raw_payload_order() -> None:
     model = _GroupedEncoderModel()
     request = _make_request(["image", "image"])
-    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalEncoderItemMetadata(
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
         [("image", 1), ("image", 0)], [3, 2], [3, 2]
     )
     expected = torch.cat([_expected_rows(request, 0), _expected_rows(request, 1)])
-    request.multimodal_data["multimodal_embedding_lengths"] = [3, 2]
-    if use_metadata:
-        item_outputs, _ = _run_items(model, [(request, 0), (request, 1)])
-        torch.testing.assert_close(torch.cat(item_outputs), expected, rtol=0, atol=0)
-    else:
-        request.multimodal_data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
-        request.mm_item_order = [
-            {"modality": "image", "index": 1},
-            {"modality": "image", "index": 0},
-        ]
+    item_outputs, _ = _run_items(model, [(request, 0), (request, 1)])
+    torch.testing.assert_close(torch.cat(item_outputs), expected, rtol=0, atol=0)
 
     torch.testing.assert_close(model.encode_multimodal_inputs([request]), expected, rtol=0, atol=0)
 
@@ -434,9 +502,8 @@ def _attach_cache_metadata(request, item_lengths):
     request.multimodal_data["mm_processor_kwargs_hash"] = "test"
 
 
-@pytest.mark.parametrize("metadata_format", ["typed", "typed_only", "legacy"])
 @pytest.mark.parametrize("reversed_order", [False, True])
-def test_partial_cache_uses_prompt_refs_and_lengths(metadata_format, reversed_order):
+def test_partial_cache_uses_prompt_refs_and_lengths(reversed_order):
     model = _GroupedEncoderModel()
     model._multimodal_encoder_cache = TensorLRUCache(4096)
     request = _make_request(["image", "image"])
@@ -445,14 +512,6 @@ def test_partial_cache_uses_prompt_refs_and_lengths(metadata_format, reversed_or
         metadata = MultimodalItemMetadata([("image", 1), ("image", 0)], [3, 2], [3, 2])
         request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
     lengths = metadata.output_embedding_lengths
-    request.multimodal_data["multimodal_embedding_lengths"] = list(lengths)
-    if metadata_format == "typed_only":
-        request.multimodal_data.pop("multimodal_embedding_lengths", None)
-    elif metadata_format == "legacy":
-        request.mm_item_order = [
-            {"modality": modality, "index": index} for modality, index in metadata.item_refs
-        ]
-        request.multimodal_data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
     _attach_cache_metadata(request, lengths)
     expected = model.encode_multimodal_inputs([request])
     keys = model._encoder_cache_keys(request)
@@ -465,8 +524,7 @@ def test_partial_cache_uses_prompt_refs_and_lengths(metadata_format, reversed_or
         model._multimodal_encoder_cache.get(keys[1]), expected[lengths[0] :], rtol=0, atol=0
     )
     assert model.encoder_calls[-1] == lengths[1]
-    if metadata_format != "legacy":
-        assert request.item_metadata is metadata
+    assert request.item_metadata is metadata
 
 
 def test_full_cache_write_uses_canonical_lengths_without_legacy_fields():
@@ -507,7 +565,7 @@ def test_partial_cache_batches_mixed_vision_and_audio_misses():
     request.multimodal_data["audio"] = {
         "input_features": torch.stack([torch.full((1, HIDDEN), value) for value in (10.0, 20.0)])
     }
-    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalEncoderItemMetadata(
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
         [("video", 0), ("audio", 0), ("image", 1), ("image", 0), ("audio", 1)],
         [4, 1, 3, 2, 1],
         [4, 1, 3, 2, 1],
@@ -579,7 +637,7 @@ def test_vision_and_audio_groups_share_full_and_item_ordering(shared_vision_enco
     request = _make_request(["video", "image"])
     audio = torch.stack([torch.full((2, HIDDEN), value) for value in (10.0, 20.0)])
     request.multimodal_data["audio"] = {"input_features": audio}
-    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalEncoderItemMetadata(
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
         [("video", 0), ("audio", 0), ("image", 0), ("audio", 1)], [4, 2, 2, 2], [4, 2, 2, 2]
     )
     request.multimodal_data.pop("multimodal_embedding_lengths", None)

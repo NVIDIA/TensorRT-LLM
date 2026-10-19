@@ -120,78 +120,6 @@ def select_multimodal_fields(
     return selected
 
 
-class MultimodalEncoderItemMetadata(NamedTuple):
-    """Prompt-ordered metadata shared by item scheduling and encoder assembly."""
-
-    item_refs: List[Tuple[str, int]]
-    """``(modality, local index)`` per atomic item, in prompt order.
-
-    The local index identifies the item within that modality's processed
-    payload. Legacy processors can supply `MultimodalParams.mm_item_order`
-    instead.
-    """
-
-    encoder_token_lengths: List[int]
-    """Physical attention-token cost charged to ``encoder_max_num_tokens``.
-
-    For Qwen ViTs this counts patch tokens before the spatial merger.
-    """
-
-    output_embedding_lengths: List[int]
-    """Output embedding rows per item, matching ``multimodal_embedding_lengths``.
-
-    These lengths split encoder outputs; they can differ from encoder cost
-    and from prompt token counts when only part of a placeholder is embedded.
-    """
-
-    def validate(self) -> None:
-        """Enforce the cross-field contract on producer-supplied metadata."""
-        if not all(isinstance(values, list) for values in self):
-            raise TypeError(
-                "Multimodal encoder item metadata fields must be lists")
-        lengths = self.encoder_token_lengths + self.output_embedding_lengths
-        if not all(isinstance(length, int) for length in lengths):
-            raise TypeError(
-                "Multimodal encoder item lengths must contain only integers")
-        if not (len(self.item_refs) == len(self.encoder_token_lengths) == len(
-                self.output_embedding_lengths)):
-            raise ValueError(
-                "Multimodal encoder item references and lengths must align")
-        if any(length <= 0 for length in self.encoder_token_lengths):
-            raise ValueError(
-                "Multimodal encoder token lengths must be positive")
-        if any(length <= 0 for length in self.output_embedding_lengths):
-            raise ValueError(
-                "Multimodal encoder output embedding lengths must be positive")
-
-    def select(self,
-               item_indices: Sequence[int]) -> "MultimodalEncoderItemMetadata":
-        """Select prompt-order items and rebase refs to their sliced payloads.
-
-        Each modality's payload must be sliced in the same selected-item order.
-        The source metadata remains owned by the original request.
-        """
-        if len(item_indices) == 1:
-            i = item_indices[0]
-            return MultimodalEncoderItemMetadata(
-                [(self.item_refs[i][0], 0)],
-                [self.encoder_token_lengths[i]],
-                [self.output_embedding_lengths[i]],
-            )
-        local_counts: dict[str, int] = {}
-        item_refs = []
-        for i in item_indices:
-            modality = self.item_refs[i][0]
-            local_index = local_counts.get(modality, 0)
-            item_refs.append((modality, local_index))
-            local_counts[modality] = local_index + 1
-        return MultimodalEncoderItemMetadata(
-            item_refs,
-            [self.encoder_token_lengths[i] for i in item_indices],
-            [self.output_embedding_lengths[i] for i in item_indices],
-        )
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class MultimodalItemMetadata:
     """Prompt-ordered items and their partitions in processed model inputs.
@@ -223,15 +151,6 @@ class MultimodalItemMetadata:
             is None else tuple(output_embedding_lengths))
         object.__setattr__(self, "input_partitions",
                            {} if input_partitions is None else input_partitions)
-
-    @classmethod
-    def from_encoder_metadata(
-            cls, metadata: MultimodalEncoderItemMetadata
-    ) -> "MultimodalItemMetadata":
-        """Adapt the legacy producer's lists to the shared immutable record."""
-        metadata.validate()
-        return cls(metadata.item_refs, metadata.encoder_token_lengths,
-                   metadata.output_embedding_lengths)
 
     def validate(self) -> None:
         """Validate producer data once before dispatch or executor admission."""
@@ -346,81 +265,11 @@ def get_multimodal_item_metadata(
     if not isinstance(multimodal_data, dict):
         raise TypeError("multimodal_data must be a dict")
     metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
-    if isinstance(metadata, MultimodalEncoderItemMetadata):
-        return MultimodalItemMetadata.from_encoder_metadata(metadata)
     if metadata is not None and not isinstance(metadata,
                                                MultimodalItemMetadata):
         raise TypeError(
             f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a MultimodalItemMetadata"
         )
-    return metadata
-
-
-def normalize_multimodal_item_metadata(
-    multimodal_data: dict[str, Any],
-    mm_item_order: list[dict[str, Any]] | None = None,
-) -> MultimodalItemMetadata | None:
-    """Adapt legacy order at the input boundary, without guessing mixed order."""
-    metadata = get_multimodal_item_metadata(multimodal_data)
-    if metadata is None:
-        lengths = multimodal_data.get("multimodal_embedding_lengths")
-        if lengths is None:
-            return None
-        if mm_item_order:
-            refs = [(entry["modality"], entry["index"])
-                    for entry in mm_item_order]
-        else:
-            present = [
-                m for m in MEDIA_MODALITIES
-                if multimodal_data.get(m) is not None
-            ]
-            if len(present) != 1:
-                return None
-            refs = [(present[0], i) for i in range(len(lengths))]
-        metadata = MultimodalItemMetadata(refs,
-                                          output_embedding_lengths=lengths)
-        metadata.validate()
-    if mm_item_order and metadata.item_refs != tuple(
-        (entry["modality"], entry["index"]) for entry in mm_item_order):
-        raise ValueError(
-            "Multimodal item references do not match the prompt item order")
-    legacy_lengths = multimodal_data.get("multimodal_embedding_lengths")
-    if metadata.output_embedding_lengths is not None and legacy_lengths is not None:
-        if not isinstance(legacy_lengths, (list, tuple)) or not all(
-                isinstance(n, int) for n in legacy_lengths):
-            raise TypeError(
-                "multimodal_embedding_lengths must be a sequence of integers")
-        if tuple(legacy_lengths) != metadata.output_embedding_lengths:
-            raise ValueError(
-                "Multimodal item output lengths do not match multimodal_embedding_lengths"
-            )
-        multimodal_data.pop("multimodal_embedding_lengths")
-    multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
-    return metadata
-
-
-def get_multimodal_encoder_item_metadata(
-    multimodal_data: Optional[Dict[str, Any]],
-) -> Optional[MultimodalEncoderItemMetadata]:
-    """Return typed atomic-item metadata from Python multimodal data."""
-    if multimodal_data is None:
-        return None
-    if not isinstance(multimodal_data, dict):
-        raise TypeError("multimodal_data must be a dict")
-    metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
-    if metadata is None:
-        return None
-    if isinstance(metadata, MultimodalItemMetadata):
-        if (metadata.encoder_token_lengths is None
-                or metadata.output_embedding_lengths is None):
-            return None
-        metadata = MultimodalEncoderItemMetadata(
-            list(metadata.item_refs), list(metadata.encoder_token_lengths),
-            list(metadata.output_embedding_lengths))
-    if not isinstance(metadata, MultimodalEncoderItemMetadata):
-        raise TypeError(f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a "
-                        "MultimodalEncoderItemMetadata")
-    metadata.validate()
     return metadata
 
 
@@ -936,7 +785,6 @@ class MultimodalRuntimeData:
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
-    "multimodal_embedding_lengths",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
 })
 
@@ -994,12 +842,6 @@ class MultimodalParams:
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
-    # Prompt-order manifest of data-backed items. Each entry is
-    # ``{"modality": m, "index": i, "placeholder": p}`` where ``i`` indexes
-    # ``multi_modal_data[m]``. Encoders that interleave items across modalities
-    # in prompt order read ``modality``/``index``; ``placeholder`` is carried
-    # for parity with the tracker manifest.
-    mm_item_order: Optional[List[Dict[str, Union[str, int]]]] = None
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
     # When set, the consume site in `get_multimodal_embeddings` issues a
     # `wait_event` and records attached embeddings on the current stream before
@@ -1018,9 +860,6 @@ class MultimodalParams:
     def __post_init__(self):
         if self.multimodal_data is None:
             self.multimodal_data = {}
-        if normalize_multimodal_item_metadata(self.multimodal_data,
-                                              self.mm_item_order) is not None:
-            self.mm_item_order = None
 
     @classmethod
     def from_embeddings(
@@ -1092,46 +931,15 @@ class MultimodalParams:
 
     def get_item_layout(
             self) -> tuple[Sequence[tuple[str, int]], Sequence[int]]:
-        """Resolve prompt-order item refs and output lengths for all modalities.
-
-        Typed metadata takes precedence. Legacy processors supply
-        ``mm_item_order`` and ``multimodal_embedding_lengths``; a request with
-        just one modality can omit the order.
-        """
-        # Input processors validate this record before dispatch; layout reads
-        # do not need to revalidate encoder costs on every forward.
-        metadata = cast(
-            Optional[MultimodalEncoderItemMetadata],
-            self.multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY),
-        )
-        if metadata is not None:
-            if metadata.output_embedding_lengths is None:
-                raise ValueError(
-                    "Encoder output assembly requires item output embedding lengths"
-                )
-            return metadata.item_refs, metadata.output_embedding_lengths
-
-        lengths = self.multimodal_data.get("multimodal_embedding_lengths") or []
-        if self.mm_item_order:
-            item_refs = cast(
-                list[tuple[str, int]],
-                [(entry["modality"], entry["index"])
-                 for entry in self.mm_item_order],
-            )
-            return item_refs, lengths
-
-        present = [
-            m for m in MEDIA_MODALITIES
-            if self.multimodal_data.get(m) is not None
-        ]
-        if len(present) > 1:
+        """Read prompt-order refs and output rows from the common item record."""
+        metadata = self.item_metadata
+        if metadata is None:
+            return (), ()
+        if metadata.output_embedding_lengths is None:
             raise ValueError(
-                "Request with multiple modalities present "
-                f"({present}) must carry item metadata or mm_item_order on MultimodalParams."
+                "Encoder output assembly requires item output embedding lengths"
             )
-        if present:
-            return [(present[0], i) for i in range(len(lengths))], lengths
-        return [], []
+        return metadata.item_refs, metadata.output_embedding_lengths
 
     def _is_shared_tensor_dict(self, obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
@@ -1681,7 +1489,6 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
-    "multimodal_embedding_lengths",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",

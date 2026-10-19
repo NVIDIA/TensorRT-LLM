@@ -26,7 +26,13 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     _assemble_multimodal_encoder_embeddings,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 
 
@@ -164,7 +170,10 @@ def make_keyed_multimodal_param(
             ),
             "image_sizes": [[2, 2]] * n_items,
         },
-        "multimodal_embedding_lengths": embedding_lengths,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", i) for i in range(len(embedding_lengths))],
+            output_embedding_lengths=embedding_lengths,
+        ),
         "mm_processor_kwargs_hash": kwargs_hash,
     }
     if local_embedding is not None:
@@ -274,7 +283,7 @@ def test_declared_qwen_fields_reuse_host_costs_for_device_grids():
     from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalEncoderItemMetadata,
+        MultimodalItemMetadata,
     )
 
     class QwenModel(DummyMultimodalModel):
@@ -285,7 +294,7 @@ def test_declared_qwen_fields_reuse_host_costs_for_device_grids():
     param = MultimodalParams(
         multimodal_data={
             "image": {"pixel_values": pixels, "image_grid_thw": grids},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("image", 1), ("image", 0)], [3, 2], [3, 2]
             ),
         }
@@ -710,7 +719,9 @@ def test_disabled_encoder_cache_preserves_current_behavior():
         MultimodalParams(
             multimodal_data={
                 "image": {"pixel_values": torch.empty(1)},
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
                 "mm_processor_kwargs_hash": "kwargs-a",
             },
             multimodal_runtime=make_runtime(2),
@@ -829,7 +840,9 @@ def test_build_multimodal_encoder_input_slices_packed_grid_thw():
                 "per_item_list": ["a", "b", "c"],
                 "per_request_scalar": torch.tensor(42.0),
             },
-            "multimodal_embedding_lengths": [2, 3, 1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1), ("image", 2)], output_embedding_lengths=[2, 3, 1]
+            ),
             "mm_processor_kwargs_hash": "kw",
         },
     )
@@ -866,7 +879,9 @@ def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size()
                 "pixel_values": pixels,
                 "image_sizes": [[3, 4], [5, 5]],
             },
-            "multimodal_embedding_lengths": [1, 1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1)], output_embedding_lengths=[1, 1]
+            ),
             "mm_processor_kwargs_hash": "kw",
         },
     )
@@ -899,7 +914,9 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
                 "input_features": features,
                 "input_features_mask": mask,
             },
-            "multimodal_embedding_lengths": [1, 1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("audio", 0), ("audio", 1)], output_embedding_lengths=[1, 1]
+            ),
             "mm_processor_kwargs_hash": "kw",
         },
     )
