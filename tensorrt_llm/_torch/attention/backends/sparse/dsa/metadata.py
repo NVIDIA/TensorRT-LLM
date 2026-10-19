@@ -98,6 +98,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
+    # (local q_begin, local q_end, per-rank sizes) when indexer_prefill_chunks
+    # cover only this TP rank's share of the context query tokens; the top-k
+    # results are then all-gathered once after the chunks.
+    indexer_prefill_q_split: Optional[Tuple[int, int, List[int]]] = None
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
