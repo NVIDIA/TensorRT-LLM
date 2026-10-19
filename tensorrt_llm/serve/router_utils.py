@@ -47,7 +47,6 @@ KV_CACHE_HASH_ALGOS = frozenset(
         KV_CACHE_HASH_ALGO_V2_SHA256_64,
     }
 )
-get_cache_salt_id = kv_cache_hash.get_cache_salt_id
 hash_v1_block_key = kv_cache_hash.hash_v1_block_key
 truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
@@ -60,7 +59,6 @@ __all__ = [
     "KV_CACHE_HASH_ALGO_V2",
     "KV_CACHE_HASH_ALGO_V2_SHA256_64",
     "KV_CACHE_HASH_ALGOS",
-    "get_cache_salt_id",
     "hash_v1_block_key",
     "truncate_sha256_hash_to_int64",
     "OpenAIRequest",

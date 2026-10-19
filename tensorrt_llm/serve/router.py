@@ -33,8 +33,8 @@ from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
-    BlockHashMixin, OpenAIRequest, block_key_hasher, get_cache_salt_id,
-    get_request_num_tokens, hash_v1_block_key, truncate_sha256_hash_to_int64)
+    BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
+    hash_v1_block_key, truncate_sha256_hash_to_int64)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_SELECT_MAX_ATTEMPTS = 2

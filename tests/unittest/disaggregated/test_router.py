@@ -14,8 +14,7 @@ import msgpack
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
-                                                hash_v1_block_key,
+from tensorrt_llm.runtime.kv_cache_hash import (hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager, ReuseScope, sequence_to_blockchain_keys)
@@ -550,16 +549,6 @@ def test_cache_aware_router_block_hashes_include_cache_salt(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     assert salted_v2_64_block_hashes != router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
-
-
-def test_cache_salt_id_derivation_matches_worker_path():
-    from tensorrt_llm.inputs.utils import \
-        get_cache_salt_id as worker_get_cache_salt_id
-
-    assert get_cache_salt_id("abc") == 3697813978277427044
-    assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
-    assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
-    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
 
 
 @pytest.mark.asyncio

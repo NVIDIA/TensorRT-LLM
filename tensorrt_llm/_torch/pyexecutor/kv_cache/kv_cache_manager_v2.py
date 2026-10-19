@@ -5504,8 +5504,8 @@ class KVCacheManagerV2(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 expected_prompt_length = token_num - 1 if is_gen else token_num
-                # Dummy/warmup request. Its reuse scope must be separate from
-                # real requests because a real prefix may already be cached.
+                # Dummy caches skip the prefix lookup and never commit, so they
+                # neither claim nor publish real prefixes (see _create_kv_cache).
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -5523,7 +5523,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 if not success:
                     release_resources(req)
                     return None
-                kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens
                 if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
@@ -5542,7 +5541,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         is_dummy=req.is_dummy,
                         expected_prompt_length=expected_prompt_length,
                     )
-                    # Dummy path: use the same isolated reuse scope.
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
@@ -5550,7 +5548,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
-                    draft_kv_cache.stop_committing()
                     success = draft_kv_cache.resize(dummy_capacity)
                     if not success:
                         release_resources(req, free_draft_resources=True)
