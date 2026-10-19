@@ -2549,12 +2549,14 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         for cfg in disagg_cfg.server_configs
         if cfg.other_args.get("speculative_config")
     }
-    tp_sizes = {
-        cfg.other_args.get("tensor_parallel_size", 1)
-        for cfg in disagg_cfg.server_configs
-    }
+    attention_parallel_configs = {(cfg.other_args.get("tensor_parallel_size",
+                                                      1),
+                                   cfg.other_args.get("enable_attention_dp",
+                                                      False))
+                                  for cfg in disagg_cfg.server_configs}
     os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
-        "1" if with_spec == {"ctx", "gen"} and len(tp_sizes) == 1 else "0")
+        "1" if with_spec == {"ctx", "gen"}
+        and len(attention_parallel_configs) == 1 else "0")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
