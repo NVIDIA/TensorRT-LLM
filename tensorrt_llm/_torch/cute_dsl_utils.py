@@ -97,6 +97,19 @@ def sm_reserve() -> int:
         return 0
 
 
+def reserved_max_active_clusters(full: int, cluster_size: int,
+                                 reserve: int) -> int:
+    """``full`` clusters less enough to free ``reserve`` SMs, never below one.
+
+    A non-positive ``full`` means the device cannot host the cluster shape and
+    is returned unchanged, so callers' "unsupported" checks still fire.
+    """
+    if reserve <= 0 or full <= 0:
+        return full
+    # One cluster occupies cluster_size SMs.
+    return max(1, full - math.ceil(reserve / max(1, cluster_size)))
+
+
 def _install_sm_reserve() -> None:
     if not IS_CUTLASS_DSL_AVAILABLE:
         return
@@ -120,9 +133,7 @@ def _install_sm_reserve() -> None:
             logger.info(
                 f"[cute_dsl_utils] {_SM_RESERVE_ENV}={reserve}: persistent grids "
                 f"launch with {reserve} SMs reserved")
-        # One cluster occupies cluster_size SMs; drop enough clusters to free
-        # ``reserve`` SMs, never below one cluster.
-        return max(1, full - math.ceil(reserve / max(1, cluster_size)))
+        return reserved_max_active_clusters(full, cluster_size, reserve)
 
     get_max_active_clusters._trtllm_sm_reserve_hook = True
     HardwareInfo.get_max_active_clusters = get_max_active_clusters

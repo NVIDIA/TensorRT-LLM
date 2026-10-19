@@ -98,3 +98,14 @@ def test_small_blocks_do_not_reserve_sms(monkeypatch):
     assert os.environ["TRTLLM_CUTEDSL_SM_RESERVE"] == "0"
     assert os.environ["TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"] == "clc_dynamic"
     assert os.environ["TLLM_ROUTING_DISABLE_COOP_LAUNCH"] == "1"
+
+
+@pytest.mark.parametrize(
+    "full, cluster_size, reserve, expected",
+    [(148, 1, 30, 118), (74, 2, 30, 59), (2, 2, 30, 1), (0, 2, 30, 0), (148, 1, 0, 148)],
+    ids=["one_sm", "pairs", "floor_one", "unsupported_stays_zero", "no_reserve"],
+)
+def test_sm_reserve_shrinks_supported_grids_only(full, cluster_size, reserve, expected):
+    from tensorrt_llm._torch.cute_dsl_utils import reserved_max_active_clusters
+
+    assert reserved_max_active_clusters(full, cluster_size, reserve) == expected
