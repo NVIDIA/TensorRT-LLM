@@ -35,6 +35,7 @@ from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
+from tensorrt_llm._torch.models.modeling_gemma3 import build_gemma_attention_mask
 from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4AssistantForCausalLM,
     Gemma4AssistantMaskedEmbedder,
@@ -2404,6 +2405,15 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertFalse(chunk_mask[-1, 0].item())
         self.assertTrue(chunk_mask[-1, 32].item())
 
+        # Vision runs override the two-token window; audio and text stay causal.
+        mixed_types = torch.tensor([1, 1, 1, 2, 2, 2, 3, 3, 3, 0], device="cuda")
+        mixed_mask = model.get_context_mask(mixed_types, effective_sliding_window=2)
+        expected = torch.eye(10, dtype=torch.bool)
+        expected[torch.arange(1, 10), torch.arange(9)] = True
+        expected[:3, :3] = True
+        expected[3:6, 3:6] = True
+        torch.testing.assert_close(mixed_mask.cpu(), expected, rtol=0, atol=0)
+
     @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
@@ -4371,6 +4381,24 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
             "the caller no longer loops per-image, so the metadata must allow "
             "cross-image batching.",
         )
+
+
+def test_gemma_attention_mask_peak() -> None:
+    # A second quadratic tensor exceeds the allowance by tens of MiB.
+    length = 4096
+    types = torch.zeros(2 * length, dtype=torch.int64, device="cuda")
+    types[64:128] = 1
+    warm = build_gemma_attention_mask(types, [length, length], [0, 1024], 512)
+    del warm
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = build_gemma_attention_mask(types, [length, length], [0, 1024], 512)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - before
+    assert result.dtype == torch.bool
+    assert result.numel() == length * length + length * (1024 + length)
+    assert peak <= result.numel() + 2 * 1024**2
 
 
 if __name__ == "__main__":

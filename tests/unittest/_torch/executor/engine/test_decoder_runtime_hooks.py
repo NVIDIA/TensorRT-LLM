@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DecoderRunner wiring of the step-loop hooks a model declares."""
+"""DecoderRunner and DecoderMetadata wiring of the step-loop hooks a model declares."""
 
 import pytest
 
@@ -12,6 +12,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     MsaRuntimePolicy,
@@ -31,11 +32,19 @@ _SHORT_IDENTITY = RuntimeHooks(msa=MsaRuntimePolicy(short_sequence_identity=True
 def _runner(
     sparse_attention_config: BaseSparseAttentionConfig | None, hooks: RuntimeHooks
 ) -> DecoderRunner:
-    # Only the two attributes the threshold and the MSA arming read.
+    # Only the two attributes the threshold reads.
     runner = object.__new__(DecoderRunner)
     runner.sparse_attention_config = sparse_attention_config
     runner.runtime_hooks = hooks
     return runner
+
+
+def _metadata(hooks: RuntimeHooks, attn_metadata: object) -> DecoderMetadata:
+    # Only the two attributes the MSA arming reads.
+    metadata = object.__new__(DecoderMetadata)
+    metadata.runtime_hooks = hooks
+    metadata.attn_metadata = attn_metadata
+    return metadata
 
 
 def test_no_threshold_without_a_split_or_a_short_identity_policy():
@@ -72,19 +81,20 @@ def test_short_identity_requires_the_minimax_m3_sparse_config(config):
 
 
 def test_a_default_msa_policy_arms_nothing():
-    runner = _runner(None, DEFAULT_RUNTIME_HOOKS)
     # A non-MSA metadata and no cache manager are fine when nothing is armed.
-    runner.attn_metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata = _metadata(DEFAULT_RUNTIME_HOOKS, object.__new__(TrtllmAttentionMetadata))
 
-    runner._arm_msa_policy(None)
+    metadata._arm_msa_policy(None)
 
 
 def test_an_msa_policy_requires_the_msa_backend_and_cache():
-    runner = _runner(None, RuntimeHooks(msa=MsaRuntimePolicy(reuse_pool_views=True)))
-    runner.attn_metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata = _metadata(
+        RuntimeHooks(msa=MsaRuntimePolicy(reuse_pool_views=True)),
+        object.__new__(TrtllmAttentionMetadata),
+    )
 
     with pytest.raises(ValueError, match="requires the MiniMax-M3 MSA sparse attention backend"):
-        runner._arm_msa_policy(object.__new__(MiniMaxM3KVCacheManagerV2))
+        metadata._arm_msa_policy(object.__new__(MiniMaxM3KVCacheManagerV2))
 
 
 def test_an_msa_policy_reaches_the_metadata_and_the_cache():
@@ -93,12 +103,13 @@ def test_an_msa_policy_reaches_the_metadata_and_the_cache():
         skip_unchanged_block_offsets=True,
         reuse_pool_views=False,
     )
-    runner = _runner(None, RuntimeHooks(msa=policy))
-    runner.attn_metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata = _metadata(
+        RuntimeHooks(msa=policy), object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    )
     manager = object.__new__(MiniMaxM3KVCacheManagerV2)
 
-    runner._arm_msa_policy(manager)
+    metadata._arm_msa_policy(manager)
 
-    assert runner.attn_metadata.msa_policy is policy
+    assert metadata.attn_metadata.msa_policy is policy
     assert manager.skip_unchanged_block_offsets is True
     assert manager.reuse_pool_views is False
