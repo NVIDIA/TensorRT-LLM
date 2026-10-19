@@ -393,14 +393,6 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
     return encoder_config
 
 
-@dataclass(frozen=True)
-class _EncoderDpInput:
-    """Locate one DP work item in the caller's multimodal params."""
-
-    param_index: int
-    item_index: Optional[int]
-
-
 def _build_request_multimodal_input(
     request: "LlmRequest", cache_enabled: bool
 ) -> Optional[MultimodalInput]:
@@ -790,52 +782,18 @@ class MultimodalModelMixin:
     def _allreduce_encoder_dp_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         return self._get_encoder_dp_allreduce()(tensor)
 
-    @staticmethod
-    def _supports_encoder_item_partition(param: MultimodalParams) -> bool:
-        """Return whether the common slicer understands this request layout."""
-        modality = MultimodalModelMixin._encoder_cache_modality(param)
-        if modality is None:
-            return False
-        modality_data = param.multimodal_data.get(modality)
-        if not isinstance(modality_data, dict):
-            return False
-        embedding_lengths = param.multimodal_data.get("multimodal_embedding_lengths")
-        if not isinstance(embedding_lengths, list):
-            return False
-        item_count = len(embedding_lengths)
-        if modality in ("image", "video"):
-            grid_key = f"{modality}_grid_thw"
-            packed_pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
-            pixel_values = modality_data.get("pixel_values")
-            grids = modality_data.get(grid_key)
-            return (
-                isinstance(grids, torch.Tensor)
-                and grids.shape[0] == item_count
-                and packed_pixel_key in modality_data
-            ) or (
-                isinstance(pixel_values, torch.Tensor)
-                and pixel_values.ndim >= 2
-                and pixel_values.shape[0] == item_count
-            )
-        if modality != "audio":
-            return False
-        feature_key = "input_features" if "input_features" in modality_data else "audio_features"
-        features = modality_data.get(feature_key)
-        return isinstance(features, torch.Tensor) and features.shape[0] == item_count
-
     def _build_encoder_dp_items(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> Optional[tuple[list[EncoderDpItem], dict[int, _EncoderDpInput]]]:
-        """Adapt upstream/main ``MultimodalParams`` to the DP-core contract.
+    ) -> tuple[list[EncoderDpItem], list[tuple[int, int | None]]] | None:
+        """Describe encoder work using the shared request item metadata.
 
-        Scheduler item metadata supplies physical encoder-token costs. Older
-        inputs without that metadata use output rows as a fallback cost. The
-        adapter falls back to one work descriptor per request when the common
-        raw-item slicer cannot safely partition that request.
+        Physical input tokens determine placement; output rows determine
+        reconstruction. Requests without item metadata stay atomic and use
+        their total output rows as an approximate placement cost.
         """
         items: list[EncoderDpItem] = []
-        item_inputs: dict[int, _EncoderDpInput] = {}
+        item_inputs: list[tuple[int, int | None]] = []
 
         for param_index, param in enumerate(multimodal_params):
             raw_lengths = param.multimodal_data.get("multimodal_embedding_lengths")
@@ -846,39 +804,24 @@ class MultimodalModelMixin:
                 raise ValueError("multimodal_embedding_lengths must contain positive values.")
             item_metadata = get_multimodal_encoder_item_metadata(param.multimodal_data)
             if item_metadata is None:
-                input_token_lengths = lengths
-            else:
-                if item_metadata.output_embedding_lengths != lengths:
-                    raise ValueError(
-                        "MM encoder item metadata output lengths must match "
-                        "multimodal_embedding_lengths."
-                    )
-                input_token_lengths = item_metadata.encoder_token_lengths
-
-            if self._supports_encoder_item_partition(param):
-                for item_index, row_count in enumerate(lengths):
-                    item = EncoderDpItem(
+                row_count = sum(lengths)
+                items.append(EncoderDpItem(len(items), row_count, row_count))
+                item_inputs.append((param_index, None))
+                continue
+            if item_metadata.output_embedding_lengths != lengths:
+                raise ValueError(
+                    "MM encoder item metadata output lengths must match "
+                    "multimodal_embedding_lengths."
+                )
+            for item_index, row_count in enumerate(lengths):
+                items.append(
+                    EncoderDpItem(
                         ordinal=len(items),
-                        input_token_count=input_token_lengths[item_index],
+                        input_token_count=item_metadata.encoder_token_lengths[item_index],
                         output_row_count=row_count,
                     )
-                    items.append(item)
-                    item_inputs[item.ordinal] = _EncoderDpInput(
-                        param_index=param_index,
-                        item_index=item_index,
-                    )
-            else:
-                row_count = sum(lengths)
-                item = EncoderDpItem(
-                    ordinal=len(items),
-                    input_token_count=sum(input_token_lengths),
-                    output_row_count=row_count,
                 )
-                items.append(item)
-                item_inputs[item.ordinal] = _EncoderDpInput(
-                    param_index=param_index,
-                    item_index=None,
-                )
+                item_inputs.append((param_index, item_index))
 
         return items, item_inputs
 
@@ -886,25 +829,25 @@ class MultimodalModelMixin:
         self,
         local_items: Sequence[EncoderDpItem],
         multimodal_params: Sequence[MultimodalParams],
-        item_inputs: dict[int, _EncoderDpInput],
+        item_inputs: Sequence[tuple[int, int | None]],
     ) -> list[MultimodalParams]:
-        """Slice raw inputs for DP work assigned to this rank."""
+        """Prepare assigned items through the model's shared item interface."""
         selected = [item_inputs[item.ordinal] for item in local_items]
         local_params: list[MultimodalParams] = []
         for param_index, grouped_items_iter in itertools.groupby(
-            selected, key=lambda item_input: item_input.param_index
+            selected, key=lambda item_input: item_input[0]
         ):
-            grouped_items = list(grouped_items_iter)
             param = multimodal_params[param_index]
-            if len(grouped_items) == 1 and grouped_items[0].item_index is None:
+            item_indices = [index for _, index in grouped_items_iter if index is not None]
+            if not item_indices:
                 local_params.append(param)
                 continue
-            if any(item.item_index is None for item in grouped_items):
-                raise ValueError("Encoder DP adapter cannot mix request-level and item-level work.")
-            item_indices = [int(item.item_index) for item in grouped_items]
-            local_param = self.build_multimodal_encoder_input(param, item_indices)
-            self._apply_metadata_slice(local_param, param, item_indices)
-            local_params.append(local_param)
+            local_params.extend(
+                local_param
+                for local_param, _, _ in self.prepare_multimodal_encoder_inputs(
+                    [(param, index) for index in item_indices]
+                )
+            )
         return local_params
 
     def _run_multimodal_encoder(
@@ -1216,8 +1159,7 @@ class MultimodalModelMixin:
         `second_per_grid_ts` (Qwen2.5-VL video) or `input_features_mask` /
         `feature_attention_mask` (audio) without model-specific code.
 
-        Models with a different layout (e.g. mixed-modality per param, custom packed
-        formats) should override this method. The parallel per-item metadata
+        Models with other packed layouts should override this method. The parallel per-item metadata
         (`multimodal_embedding_lengths`, `multimodal_hashes`) is model-agnostic and is
         re-sliced by the mixin after this returns, so overrides need only handle the
         modality-specific raw data.
@@ -1237,6 +1179,14 @@ class MultimodalModelMixin:
             )
 
         indices = list(item_indices)
+        item_metadata = get_multimodal_encoder_item_metadata(param.multimodal_data)
+        lengths = param.multimodal_data.get("multimodal_embedding_lengths")
+        if item_metadata is not None:
+            item_count = sum(
+                item_modality == modality for item_modality, _ in item_metadata.item_refs
+            )
+        else:
+            item_count = len(lengths) if isinstance(lengths, list) else None
         grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
         pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
 
@@ -1270,11 +1220,7 @@ class MultimodalModelMixin:
             modality in ("image", "video")
             and isinstance(modality_data.get("pixel_values"), torch.Tensor)
             and modality_data["pixel_values"].ndim >= 2
-            and (
-                not isinstance(param.multimodal_data.get("multimodal_embedding_lengths"), list)
-                or modality_data["pixel_values"].shape[0]
-                == len(param.multimodal_data["multimodal_embedding_lengths"])
-            )
+            and (item_count is None or modality_data["pixel_values"].shape[0] == item_count)
         ):
             # Stacked layout: dim-0 select from pixel values and parallel metadata.
             n_items = modality_data["pixel_values"].shape[0]
@@ -1769,9 +1715,16 @@ class MultimodalModelMixin:
         ]
         source_metadata = get_multimodal_encoder_item_metadata(source.multimodal_data)
         if source_metadata is not None:
+            item_refs: list[tuple[str, int]] = []
+            modality_counts: dict[str, int] = {}
+            for index in item_indices:
+                modality = source_metadata.item_refs[index][0]
+                local_index = modality_counts.get(modality, 0)
+                item_refs.append((modality, local_index))
+                modality_counts[modality] = local_index + 1
             residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
                 MultimodalEncoderItemMetadata(
-                    item_refs=[source_metadata.item_refs[i] for i in item_indices],
+                    item_refs=item_refs,
                     encoder_token_lengths=[
                         source_metadata.encoder_token_lengths[i] for i in item_indices
                     ],
@@ -2126,7 +2079,7 @@ def _dispatch_cross_iter_prefetch(
                 if partial_hits and encoder_cache is not None:
                     model._encode_with_partial_cache(partial_hits, encoder_cache)
                 if cache_misses:
-                    encoder_output = model._run_multimodal_encoder(cache_misses).clone()
+                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
                     if encoder_cache is not None:
                         for param in cache_misses:

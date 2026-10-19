@@ -14,6 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Sequence
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -158,8 +159,18 @@ class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         rows = []
         for param in multimodal_params:
-            item_ids = param.multimodal_data["image"]["pixel_values"][:, 0, 0, 0]
             lengths = param.multimodal_data["multimodal_embedding_lengths"]
+            metadata = param.multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+            refs = (
+                metadata.item_refs
+                if metadata is not None
+                else [("image", i) for i in range(len(lengths))]
+            )
+            item_ids = []
+            for modality, index in refs:
+                payload = param.multimodal_data[modality]
+                field = "input_features" if modality == "audio" else "pixel_values"
+                item_ids.append(float(payload[field][index].flatten()[0]))
             self.encoded_item_ids.extend(int(item_id) for item_id in item_ids)
             for item_id, length in zip(item_ids, lengths, strict=True):
                 rows.append(torch.full((length, 2), float(item_id)))
@@ -256,6 +267,7 @@ def make_encoder_dp_param_with_input_costs() -> MultimodalParams:
 
 
 @pytest.mark.parametrize("world_size,rank", [(2, 1), (4, 3)])
+@pytest.mark.cpu_only
 def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_size, rank):
     model_config = ModelConfig(
         mapping=Mapping(world_size=world_size, rank=rank, tp_size=world_size),
@@ -271,6 +283,7 @@ def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_s
     assert encoder_config.mapping.local_rank == model_config.mapping.local_rank
 
 
+@pytest.mark.cpu_only
 def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp():
     model_config = ModelConfig(
         mapping=Mapping(
@@ -311,6 +324,7 @@ def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp():
     ],
     ids=["attention_dp", "pipeline_parallel", "context_parallel", "partial_tp_group"],
 )
+@pytest.mark.cpu_only
 def test_encoder_data_parallel_rejects_unsupported_parallelism(mapping, error_match):
     model_config = ModelConfig(
         mapping=mapping,
@@ -321,6 +335,7 @@ def test_encoder_data_parallel_rejects_unsupported_parallelism(mapping, error_ma
         make_multimodal_encoder_model_config(model_config)
 
 
+@pytest.mark.cpu_only
 def test_encoder_data_parallel_partitions_items_and_restores_order():
     param = make_encoder_dp_param()
     rank_zero_model = DataParallelEncoderMultimodalModel(rank=0)
@@ -335,22 +350,96 @@ def test_encoder_data_parallel_partitions_items_and_restores_order():
     torch.testing.assert_close(output, expected)
 
 
+@pytest.mark.cpu_only
 def test_item_scheduled_encoder_uses_data_parallel_execution():
     param = make_encoder_dp_param()
     model = DataParallelEncoderMultimodalModel(rank=0)
-    model.peer_output = torch.tensor([0.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    model.peer_output = torch.tensor([20.0, 0.0, 0.0, 0.0]).unsqueeze(1).repeat(1, 2)
 
-    encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, 0), (param, 1), (param, 2)])
+    encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, 1), (param, 2)])
     outputs = model.forward_multimodal_encoder_items(encoder_inputs)
 
-    assert model.encoded_item_ids == [10]
+    assert model.encoded_item_ids == [30]
     item_metadata = encoder_inputs[0][0].multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    assert item_metadata.encoder_token_lengths == [4, 1, 3]
-    assert [output.shape[0] for output in outputs] == [4, 1, 3]
-    expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    assert item_metadata.item_refs == [("image", 0), ("image", 1)]
+    assert item_metadata.encoder_token_lengths == [1, 3]
+    assert [output.shape[0] for output in outputs] == [1, 3]
+    expected = torch.tensor([20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
     torch.testing.assert_close(torch.cat(outputs), expected)
 
 
+@pytest.mark.cpu_only
+def test_encoder_dp_uses_the_model_item_slicer() -> None:
+    param = make_encoder_dp_param_with_input_costs()
+    param.multimodal_data["image"]["custom_tiles"] = param.multimodal_data["image"].pop(
+        "pixel_values"
+    )
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    model.peer_output = torch.tensor([10.0] * 4 + [0.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+
+    def slice_tiles(
+        source: MultimodalParams,
+        indices: Sequence[int],
+        modality: str | None = None,
+    ) -> MultimodalParams:
+        assert modality == "image"
+        return MultimodalParams(
+            multimodal_data={
+                "image": {
+                    "pixel_values": source.multimodal_data["image"]["custom_tiles"][list(indices)]
+                },
+            }
+        )
+
+    with patch.object(model, "build_multimodal_encoder_input", side_effect=slice_tiles):
+        output = model._run_multimodal_encoder([param])
+
+    assert model.encoded_item_ids == [20]
+    expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
+    metadata = MultimodalEncoderItemMetadata(
+        item_refs=[("image", 1), ("audio", 0), ("image", 0)],
+        encoder_token_lengths=[1, 100, 1],
+        output_embedding_lengths=[4, 1, 3],
+    )
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": torch.tensor([30.0, 10.0]).reshape(2, 1, 1, 1)},
+            "audio": {"input_features": torch.tensor([20.0]).reshape(1, 1, 1)},
+            "multimodal_embedding_lengths": [4, 1, 3],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        }
+    )
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    model.peer_output = torch.tensor([10.0] * 4 + [0.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+
+    output = model._run_multimodal_encoder([param])
+
+    assert model.encoded_item_ids == [20]
+    assert param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] is metadata
+    expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_keeps_requests_atomic_without_item_metadata() -> None:
+    param = make_encoder_dp_param()
+    del param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    model.peer_output = torch.zeros(8, 2)
+
+    output = model._run_multimodal_encoder([param])
+
+    assert model.encoded_item_ids == [10, 20, 30]
+    expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu_only
 def test_encoder_data_parallel_uses_physical_input_token_costs():
     param = make_encoder_dp_param_with_input_costs()
     model = DataParallelEncoderMultimodalModel(rank=0)
@@ -363,6 +452,7 @@ def test_encoder_data_parallel_uses_physical_input_token_costs():
     torch.testing.assert_close(output, expected)
 
 
+@pytest.mark.cpu_only
 def test_attention_data_parallel_encodes_only_local_requests_without_collective():
     model = DataParallelEncoderMultimodalModel(rank=1, enable_attention_dp=True)
     param = make_encoder_dp_param()
@@ -373,6 +463,7 @@ def test_attention_data_parallel_encodes_only_local_requests_without_collective(
     assert output.shape == (8, 2)
 
 
+@pytest.mark.cpu_only
 def test_encoder_data_parallel_requires_model_opt_in():
     model = DummyMultimodalModel(make_embedding(), torch.tensor([7]))
     model.model_config = ModelConfig(

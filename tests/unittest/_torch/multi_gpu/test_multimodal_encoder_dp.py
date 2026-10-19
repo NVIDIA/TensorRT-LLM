@@ -25,6 +25,10 @@ import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalEncoderItemMetadata,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -106,6 +110,11 @@ def _make_param(item_ids: list[int], lengths: list[int]) -> MultimodalParams:
                 "image_sizes": [[1, 1] for _ in item_ids],
             },
             "multimodal_embedding_lengths": lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                item_refs=[("image", i) for i in range(len(item_ids))],
+                encoder_token_lengths=lengths,
+                output_embedding_lengths=lengths,
+            ),
         }
     )
 
