@@ -198,6 +198,9 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  # Nemotron-H family ops (Mamba2 conv / scan / state update, gated grouped norm, the BF16
+  # targets' MoE and low-M GEMM): certified on sm_100 only.
+  - unittest/_torch/modeling_v2/models/nemotron_h/ops TIMEOUT (60)
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
