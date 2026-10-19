@@ -55,6 +55,7 @@ class FakeConnectorManager:
 
     def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
         self.prefix_reservations_enabled = False
+        self.capacity_only = False
         self.reservations = {}
         self.reservation_requests = {}
         self.next_reservation_id = 1
@@ -466,7 +467,7 @@ def test_attention_sinks_are_never_masked(vswa_manager: KVCacheManagerV2) -> Non
 
     life_cycles = list(vswa_manager._life_cycle_by_layer_group())
     life_cycles[sliding] = AttnLifeCycle.make(VSWA_WINDOW, num_sink_tokens, tokens_per_block)
-    vswa_manager._connector_life_cycle_by_group = life_cycles
+    vswa_manager._layer_group_life_cycles = life_cycles
 
     request = make_request(prompt_len=VSWA_PROMPT_LEN)
     assert schedule(vswa_manager, request)
@@ -667,7 +668,7 @@ def test_a_sliding_single_group_reports_sentinels_in_the_flat_list():
 def test_a_served_prefix_survives_re_entry_under_a_sliding_window():
     """Here the rewind is not only wasted work.
 
-    ``_resize_for_connector_prefix`` sets the cache's ``history_length`` to the
+    ``_resize_for_served_prefix`` sets the cache's ``history_length`` to the
     served end, and raising history unlocks the blocks the window has passed. A
     cursor settled below that end points the forward pass at ordinals whose
     pages are gone.
@@ -723,7 +724,7 @@ def test_rejected_connector_candidate_releases_and_rewinds(
     assert request.context_current_position == 0
     assert request.prepopulated_prompt_len == 0
     assert request.context_chunk_size == PROMPT_LEN
-    assert request.py_connector_served_position == 0
+    assert request.py_served_prefix_end == 0
     assert schedule(manager, request)
     assert connector.get_prefix_reservation(request).reservation_id == 2
     assert connector.queries == [(request.request_id, 0), (request.request_id, 0)]

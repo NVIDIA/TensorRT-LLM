@@ -119,6 +119,72 @@ async def test_conditional_disagg_uses_selected_server_match_length():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_tail", "num_tokens", "expected_need_context"),
+    [
+        (False, 32, True),
+        (True, 32, False),
+        (True, 33, True),
+    ],
+)
+async def test_conditional_disagg_remote_tail_allows_cold_local_prefill(
+    remote_tail, num_tokens, expected_need_context
+):
+    service = _make_service("context_first")
+    service._config.bounded_replay_on_generation = remote_tail
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 0,
+                "num_tokens": num_tokens,
+            },
+        )
+    )
+    service._gen_router = router
+    request = CompletionRequest(model="model", prompt=[1] * num_tokens)
+
+    server, need_context = await service._check_conditional_disagg(request, 123)
+
+    assert server == "gen:8000"
+    assert need_context is expected_need_context
+
+
+@pytest.mark.asyncio
+async def test_remote_tail_cold_local_prefill_skips_context_worker(monkeypatch):
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._config.bounded_replay_on_generation = True
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 0,
+                "num_tokens": 32,
+            },
+        )
+    )
+    service._gen_router = router
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response("ok", finish_reason="stop")
+    )
+    request = CompletionRequest(model="model", prompt=[1] * 32)
+
+    await service._send_disagg_request_ctx_first(request)
+
+    service._ctx_client.send_request.assert_not_awaited()
+    gen_request = service._gen_client.send_request.call_args.args[0]
+    assert gen_request.disaggregated_params is None
+
+
+@pytest.mark.asyncio
 async def test_conditional_disagg_bypass_strips_client_disagg_params(monkeypatch):
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
     service = _make_service("context_first")
@@ -214,6 +280,15 @@ def _make_chat_response(
             )
         ],
     )
+
+
+def test_remote_tail_marker_requires_generation_after_context_stop():
+    service = _make_service("context_first")
+    response = _make_completion_response("", finish_reason="stop")
+    response.choices[0].disaggregated_params.first_gen_tokens = [17]
+    response.choices[0].disaggregated_params.remote_tail_start = 64
+
+    assert service._need_gen(response)
 
 
 async def _mock_streaming_response(chunks):
@@ -1184,3 +1259,111 @@ class TestFirstGenLogitsSerializeRoundtrip:
     def test_deserialize_missing_key_raises(self):
         with pytest.raises(ValueError, match="missing required key"):
             _deserialize_first_gen_logits([{"data": "abc", "shape": [1]}])
+
+
+@pytest.fixture
+def generation_first_stream_service():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_gen_first_context_failure_closes_unstarted_stream(
+    generation_first_stream_service, error_type
+):
+    service = generation_first_stream_service
+    gen_response = AsyncMock()
+    gen_response.__aiter__.side_effect = AssertionError("GEN consumer must not start")
+    service._gen_client.send_request.return_value = gen_response
+    service._ctx_client.send_request.side_effect = error_type("CTX interrupted")
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    with pytest.raises(error_type):
+        await service._send_disagg_request(request)
+
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_awaited_once_with()
+    # The HTTP clients own their router accounting; the service only closes GEN.
+    service._ctx_router.finish_request.assert_not_called()
+    service._gen_router.finish_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_close_before_read_stops_unstarted_consumer(
+    generation_first_stream_service,
+):
+    service = generation_first_stream_service
+    gen_response = AsyncMock()
+    gen_response.__aiter__.side_effect = AssertionError("GEN consumer must not start")
+    service._gen_client.send_request.return_value = gen_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    response = await service._send_disagg_request(request)
+    await response.aclose()
+    await response.aclose()
+
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_cancellation_closes_running_stream(generation_first_stream_service):
+    service = generation_first_stream_service
+    gen_started = asyncio.Event()
+    gen_closed = asyncio.Event()
+    ctx_started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def gen_chunks():
+        try:
+            gen_started.set()
+            await blocked.wait()
+            yield b"data: [DONE]\n\n"
+        finally:
+            gen_closed.set()
+
+    async def ctx_response(*args, **kwargs):
+        ctx_started.set()
+        await blocked.wait()
+
+    service._gen_client.send_request.return_value = gen_chunks()
+    service._ctx_client.send_request.side_effect = ctx_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    pending = asyncio.create_task(service._send_disagg_request(request))
+    try:
+        await asyncio.wait_for(gen_started.wait(), timeout=1)
+        await asyncio.wait_for(ctx_started.wait(), timeout=1)
+    finally:
+        pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert gen_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_close_after_chunk_closes_running_stream(generation_first_stream_service):
+    service = generation_first_stream_service
+    gen_closed = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def gen_chunks():
+        try:
+            yield b'data: "first"\n\n'
+            await blocked.wait()
+        finally:
+            gen_closed.set()
+
+    service._gen_client.send_request.return_value = gen_chunks()
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    response = await service._send_disagg_request(request)
+    assert await asyncio.wait_for(response.__anext__(), timeout=1) == b'data: "first"\n\n'
+    await response.aclose()
+
+    assert gen_closed.is_set()

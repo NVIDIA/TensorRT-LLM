@@ -41,7 +41,7 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from ..conftest import llm_models_root
 
-MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 SPEC_MODEL = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 EAGLE3_MODEL = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
 PROMPT_TOKEN_IDS = [1] + [42] * 63 + [43]
@@ -124,8 +124,10 @@ class _CudaGraphExecutionProbe:
         self,
         key: KeyType,
         current_inputs: dict[str, Any],
+        *,
+        position_id_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        output = self._replay(key, current_inputs)
+        output = self._replay(key, current_inputs, position_id_offsets=position_id_offsets)
         if self._pending_execution is not None and self._pending_execution.key == key:
             self._pending_execution.replayed = True
             self._pending_execution = None

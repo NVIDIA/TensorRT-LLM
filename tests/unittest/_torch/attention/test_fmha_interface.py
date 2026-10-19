@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from typing import cast
 from unittest.mock import Mock, patch
 
@@ -85,6 +86,8 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn._fmha_manager.select.return_value = fmha
 
     metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.token_major_gen_view.return_value = None
+    metadata.presented_token_major.return_value = nullcontext()
     metadata.is_cross = False
     metadata.enable_flash_mla = False
     metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
@@ -112,6 +115,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
 
     output = TrtllmAttention.forward(attn, q, k, v, metadata, forward_args)
 
+    metadata.presented_token_major.assert_called_once_with(None)
     attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
     fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
     assert not forward_args.is_fused_qkv
@@ -178,29 +182,39 @@ def test_inherited_availability_hook_uses_subclass_capabilities() -> None:
     assert _SkipCorrectionFmha.is_available(attn)
 
 
-@pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
+@pytest.mark.parametrize(
+    ("capability", "request_args"),
+    [
+        (
+            "supports_block_sparse_inputs",
+            {
+                "sparse_runtime_params": SparseRuntimeParams(
+                    block_sparse_inputs=BlockSparseForwardInputs(
+                        q_block_size=64,
+                        kv_block_size=64,
+                        exact_block_bits=torch.zeros((1, 1, 1, 1), dtype=torch.int32),
+                    )
+                )
+            },
+        ),
+        ("supports_per_tensor_fp8", {"qk_fp8_per_tensor": True}),
+        ("supports_per_tensor_fp8", {"v_fp8_per_tensor": True}),
+    ],
+)
+@pytest.mark.parametrize("requested", [False, True])
 @pytest.mark.parametrize("supported", [False, True])
-def test_support_checks_block_sparse_capability_before_implementation(
-    has_block_sparse_inputs: bool, supported: bool
+def test_support_checks_capabilities_before_implementation(
+    capability: str, request_args: dict, requested: bool, supported: bool
 ) -> None:
-    class _BlockSparseFmha(_MinimalFmha):
-        supports_block_sparse_inputs = True
+    _CapableFmha = type("_CapableFmha", (_MinimalFmha,), {capability: True})
 
     attn = cast(TrtllmAttention, FakeAttention())
     q, k, v = (torch.empty((2, 4)) for _ in range(3))
     metadata = Mock(spec=TrtllmAttentionMetadata)
-    forward_args = AttentionForwardArgs()
-    if has_block_sparse_inputs:
-        forward_args.sparse_runtime_params = SparseRuntimeParams(
-            block_sparse_inputs=BlockSparseForwardInputs(
-                q_block_size=64,
-                kv_block_size=64,
-                exact_block_bits=torch.zeros((1, 1, 1, 1), dtype=torch.int32),
-            )
-        )
+    forward_args = AttentionForwardArgs(**request_args) if requested else AttentionForwardArgs()
 
-    for fmha in (_MinimalFmha(attn), _BlockSparseFmha(attn)):
-        capability_supported = not has_block_sparse_inputs or fmha.supports_block_sparse_inputs
+    for fmha in (_MinimalFmha(attn), _CapableFmha(attn)):
+        capability_supported = not requested or getattr(fmha, capability)
         with patch.object(fmha, "_is_supported", return_value=supported) as hook:
             assert fmha.is_supported(q, k, v, metadata, forward_args) is (
                 capability_supported and supported

@@ -50,8 +50,10 @@ def _coordinator(manager: Mock, receive: Mock) -> DisaggTransferCoordinator:
 def _manager() -> Mock:
     """Run the real admission and resource hooks with mocked cache allocation."""
     manager = Mock(spec=KVCacheManagerV2)
+    manager._sharing = None  # no lender: free_resources closes and removes the cache itself
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
+    manager._pending_preemption = {}
     manager.is_draft = False
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False
@@ -224,6 +226,7 @@ def test_cancelled_admission_releases_event() -> None:
     manager._disagg_receive_ready[request.py_request_id] = ready
     manager.conversation_manager = None
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._early_freed_index_requests = set()

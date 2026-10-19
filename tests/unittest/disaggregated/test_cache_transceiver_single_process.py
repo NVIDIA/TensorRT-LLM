@@ -82,7 +82,12 @@ from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
+    CacheTransceiverConfig,
+    KvCacheConfig,
+    KvPoolRebalanceConfig,
+)
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
@@ -205,6 +210,10 @@ class KvCacheConfigV2:
     block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -2331,6 +2340,7 @@ def _offload_lifecycle_executor(
     executor.iter_counter = 0
     executor.stream_interval = 1
     executor.model_engine = SimpleNamespace(route_capture=None)
+    executor.draft_model_engine = None
     executor.perf_manager = SimpleNamespace(
         get_timestamp=time.monotonic, append_step_metrics=lambda *args, **kwargs: None
     )

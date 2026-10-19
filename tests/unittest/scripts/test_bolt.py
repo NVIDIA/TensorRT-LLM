@@ -25,8 +25,11 @@ Covers the pure logic most likely to regress silently:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import shutil
 import stat
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -107,6 +110,52 @@ def test_profile_for_ignores_empty_profile(apply_bolt, tmp_path):
     assert apply_bolt.profile_for("lib.so", tmp_path) is None
 
 
+# --------------------------- apply_bolt.is_bolt_applicable -----------------------
+def _compile_so(path: Path, emit_relocs: bool) -> bool:
+    """Build a trivial .so, optionally BOLT-compatible. False if no toolchain."""
+    if shutil.which("gcc") is None:
+        return False
+    src = path.with_suffix(".c")
+    src.write_text("int f(void){ return 1; }\n")
+    cmd = ["gcc", "-shared", "-fPIC", "-o", str(path), str(src)]
+    if emit_relocs:
+        cmd.insert(3, "-Wl,--emit-relocs")
+    return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
+
+
+needs_toolchain = pytest.mark.skipif(
+    shutil.which("gcc") is None or shutil.which("readelf") is None,
+    reason="needs gcc and readelf to produce/inspect a real ELF",
+)
+
+
+@needs_toolchain
+def test_is_bolt_applicable_requires_emit_relocs(apply_bolt, tmp_path):
+    # The distinction the guard exists for: both are valid ELFs that llvm-bolt
+    # will happily process, but only one carries the .rela.text it needs to do
+    # so correctly. A build that silently loses ENABLE_BOLT_COMPATIBLE=ON looks
+    # exactly like the first one.
+    plain = tmp_path / "plain.so"
+    assert _compile_so(plain, emit_relocs=False)
+    assert apply_bolt.is_bolt_applicable(plain) is False
+
+    compat = tmp_path / "compat.so"
+    assert _compile_so(compat, emit_relocs=True)
+    assert apply_bolt.is_bolt_applicable(compat) is True
+
+
+def test_is_bolt_applicable_without_readelf_does_not_block(apply_bolt, tmp_path, monkeypatch):
+    # No readelf means "cannot tell", and refusing to optimize on that would
+    # turn a missing utility into a build failure.
+    def _no_readelf(*_a, **_k):
+        raise OSError("readelf not found")
+
+    monkeypatch.setattr(apply_bolt.subprocess, "run", _no_readelf)
+    probe = tmp_path / "anything.so"
+    probe.write_bytes(b"\x7fELF")
+    assert apply_bolt.is_bolt_applicable(probe) is True
+
+
 # ------------------------------ apply_bolt.repack_wheel --------------------------
 def _mode_of(zip_path: Path, member: str) -> int:
     with zipfile.ZipFile(zip_path) as zf:
@@ -123,6 +172,34 @@ def _build_wheel(path: Path, members: dict) -> dict:
             zf.writestr(info, data)
     with zipfile.ZipFile(path) as zf:
         return {i.filename: i for i in zf.infolist()}
+
+
+def test_apply_discovers_manifest_beside_profiles(apply_bolt, tmp_path, monkeypatch):
+    """Every promoted bundle ships manifest.json, so the drift check needs no flag."""
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "libfoo.yaml").write_text("---\n")
+    manifest = profiles / "manifest.json"
+    manifest.write_text("{}")
+
+    seen = {}
+
+    def fake_standalone(wheel, output, pdir, strip, dry_run, passed_manifest, strict):
+        seen["manifest"] = passed_manifest
+        return 0
+
+    monkeypatch.setattr(apply_bolt, "bolt_standalone_wheel", fake_standalone)
+    args = argparse.Namespace(
+        profiles=profiles,
+        wheel=tmp_path / "in.whl",
+        output=tmp_path / "out.whl",
+        strip=False,
+        dry_run=False,
+        manifest=None,
+        strict=False,
+    )
+    assert apply_bolt._apply(args, tmp_path) == 0
+    assert seen["manifest"] == manifest
 
 
 def test_repack_wheel_preserves_member_modes(apply_bolt, tmp_path):
@@ -176,3 +253,147 @@ def test_repack_wheel_falls_back_for_new_members(apply_bolt, tmp_path):
     apply_bolt.repack_wheel(work, out, infos)
     with zipfile.ZipFile(out) as zf:
         assert sorted(zf.namelist()) == ["pkg/GENERATED", "pkg/lib.so"]
+
+
+# --------------------------- check_a53_veneers.find_veneers ----------------------
+# GNU ld's erratum-843419 workaround leaves a branch out to a stub that performs
+# a displaced load and branches straight back. BOLT mistakes that for a tail call
+# and clobbers x16 at the return site, so these have to be refused before BOLT
+# runs rather than detected afterwards.
+EM_AARCH64 = 183
+EM_X86_64 = 62
+
+
+@pytest.fixture(scope="module")
+def a53():
+    spec = importlib.util.spec_from_file_location(
+        "check_a53_veneers", BOLT_DIR / "internal" / "check_a53_veneers.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _b(src: int, dst: int) -> int:
+    """Encode an unconditional AArch64 `b` from src to dst."""
+    return 0x14000000 | (((dst - src) >> 2) & 0x03FFFFFF)
+
+
+def _elf(path: Path, words: list[int], base: int = 0x1000, machine: int = EM_AARCH64) -> Path:
+    """Minimal ELF64 carrying `words` in a single executable section."""
+    import struct
+
+    code = b"".join(struct.pack("<I", w) for w in words)
+    code_off = 64
+    shoff = code_off + len(code)
+
+    hdr = bytearray(64)
+    hdr[0:16] = b"\x7fELF\x02\x01\x01\x00" + bytes(8)
+    struct.pack_into("<HHI", hdr, 16, 3, machine, 1)  # type, machine, ver
+    struct.pack_into("<Q", hdr, 40, shoff)  # e_shoff
+    struct.pack_into("<HHHHHH", hdr, 52, 64, 0, 0, 64, 2, 0)
+
+    null_sh = bytes(64)
+    text_sh = bytearray(64)
+    # name, type=PROGBITS, flags=ALLOC|EXECINSTR, addr, offset, size
+    struct.pack_into("<IIQQQQ", text_sh, 0, 0, 1, 0x2 | 0x4, base, code_off, len(code))
+
+    path.write_bytes(bytes(hdr) + code + null_sh + bytes(text_sh))
+    return path
+
+
+def test_find_veneers_detects_erratum_round_trip(a53, tmp_path):
+    base = 0x1000
+    # b 0x1000 -> 0x1010; 0x1010 does the load; 0x1014 branches back to 0x1004.
+    words = [_b(base, base + 0x10)] + [0xD503201F] * 3 + [0xF9400001, _b(base + 0x14, base + 4)]
+    elf = _elf(tmp_path / "veneer.so", words, base)
+    assert a53.find_veneers(str(elf)) == [(base, base + 0x10)]
+
+
+def test_find_veneers_ignores_branch_that_does_not_return(a53, tmp_path):
+    base = 0x1000
+    words = [_b(base, base + 0x10)] + [0xD503201F] * 5
+    elf = _elf(tmp_path / "plain.so", words, base)
+    assert a53.find_veneers(str(elf)) == []
+
+
+def test_find_veneers_ignores_loop_latch(a53, tmp_path):
+    """A one-instruction latch branching back into its body is the same shape.
+
+    `S: b T` / `T+4: b S+4` on its own matches ordinary compiler output. Only a
+    real veneer holds the displaced load or store at T, and after
+    -mno-fix-cortex-a53-843419 a false positive is the only way this can fire.
+    """
+    base = 0x1000
+    words = [_b(base, base + 0x10)] + [0xD503201F] * 3
+    words += [_b(base + 0x10, base + 0x20), _b(base + 0x14, base + 4)]
+    elf = _elf(tmp_path / "latch.so", words, base)
+    assert a53.find_veneers(str(elf)) == []
+
+
+def test_find_veneers_ignores_non_aarch64(a53, tmp_path):
+    base = 0x1000
+    words = [_b(base, base + 0x10)] + [0xD503201F] * 3 + [0xF9400001, _b(base + 0x14, base + 4)]
+    elf = _elf(tmp_path / "x86.so", words, base, machine=EM_X86_64)
+    assert a53.find_veneers(str(elf)) == []
+
+
+def test_find_veneers_ignores_non_elf(a53, tmp_path):
+    junk = tmp_path / "notelf.so"
+    junk.write_bytes(b"this is not an ELF file")
+    assert a53.find_veneers(str(junk)) == []
+
+
+def test_bolt_elf_refuses_binary_with_a53_veneers(apply_bolt, tmp_path, monkeypatch):
+    """BOLT must never see these: it miscompiles them and still exits 0."""
+    base = 0x1000
+    words = [_b(base, base + 0x10)] + [0xD503201F] * 3 + [0xF9400001, _b(base + 0x14, base + 4)]
+    elf = _elf(tmp_path / "libwith.so", words, base)
+    profile = tmp_path / "libwith.yaml"
+    profile.write_text("---\n")
+
+    calls = []
+    monkeypatch.setattr(apply_bolt, "run", lambda cmd: calls.append(cmd) or (0, ""))
+
+    with pytest.raises(apply_bolt.BoltApplyError, match="cortex-a53-843419"):
+        apply_bolt.bolt_elf(elf, profile, [], strip=False, dry_run=False)
+    assert calls == [], "llvm-bolt must not run on a binary with these veneers"
+
+
+def test_is_bolt_applicable_treats_readelf_failure_as_no_verdict(apply_bolt, tmp_path, monkeypatch):
+    """A readelf that runs and fails says nothing about ENABLE_BOLT_COMPATIBLE."""
+
+    def _failing(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="readelf: Error: bad")
+
+    monkeypatch.setattr(apply_bolt.subprocess, "run", _failing)
+    probe = tmp_path / "lib.so"
+    probe.write_bytes(b"\x7fELF")
+    assert apply_bolt.is_bolt_applicable(probe) is True
+
+
+def test_find_veneers_tolerates_truncated_elf_header(a53, tmp_path):
+    """apply_bolt.is_elf only reads 4 bytes, so this reaches find_veneers."""
+    full = b"\x7fELF\x02\x01\x01\x00"
+    for size in range(4, 64):
+        stub = tmp_path / f"trunc{size}.so"
+        stub.write_bytes(full.ljust(size, b"\x00")[:size])
+        assert a53.find_veneers(str(stub)) == []
+
+
+def test_bolt_elf_does_not_crash_on_truncated_elf(apply_bolt, tmp_path, monkeypatch):
+    elf = tmp_path / "libtrunc.so"
+    elf.write_bytes(b"\x7fELF")
+    profile = tmp_path / "libtrunc.yaml"
+    profile.write_text("---\n")
+
+    def fake_llvm_bolt(cmd):
+        # Stand in for the real tool by producing the -o file, so the chmod and
+        # os.replace that follow run for real instead of being patched out.
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x7fELF")
+        return 0, ""
+
+    monkeypatch.setattr(apply_bolt, "run", fake_llvm_bolt)
+    # No veneers to find, so this must reach llvm-bolt rather than raise.
+    apply_bolt.bolt_elf(elf, profile, [], strip=False, dry_run=False)
+    assert elf.read_bytes() == b"\x7fELF"

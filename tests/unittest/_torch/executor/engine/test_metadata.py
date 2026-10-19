@@ -8,10 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.engine.metadata import (
-    build_attention_metadata,
-    update_spec_metadata,
-)
+from tensorrt_llm._torch.pyexecutor.engine.metadata import build_attention_metadata
 
 pytestmark = pytest.mark.cpu_only
 
@@ -98,56 +95,3 @@ def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
     assert metadata.draft_kv_cache_manager is draft_kv_cache_manager
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.num_heads_per_kv == 4
-
-
-def test_update_spec_metadata_handles_parallel_draft_and_dynamic_tree() -> None:
-    spec_mode = SimpleNamespace(
-        attention_need_spec_dec_mode=Mock(return_value=True),
-        is_parallel_draft=Mock(return_value=True),
-    )
-    spec_metadata = SimpleNamespace(
-        spec_dec_mode=spec_mode,
-        is_spec_dec_tree=True,
-        is_spec_dec_dynamic_tree=True,
-    )
-    scheduled_requests = SimpleNamespace(
-        batch_size=2,
-        num_context_requests=1,
-        context_requests=[object()],
-        generation_requests=[object()],
-    )
-    attn_metadata = SimpleNamespace(update_spec_dec_param=Mock())
-    spec_tree_manager = SimpleNamespace(
-        slot_storage=SimpleNamespace(fill_all_slot_ids=Mock()),
-    )
-
-    update_spec_metadata(
-        spec_metadata,
-        scheduled_requests,
-        attn_metadata,
-        spec_tree_manager,
-        runtime_draft_len=3,
-        runtime_tokens_per_gen_step=4,
-        attention_backend=_AttentionBackend,
-        original_max_draft_len=2,
-        original_max_total_draft_tokens=6,
-        spec_dec_max_total_draft_tokens=5,
-    )
-
-    assert spec_metadata.runtime_draft_len == 3
-    assert spec_metadata.runtime_tokens_per_gen_step == 4
-    spec_tree_manager.slot_storage.fill_all_slot_ids.assert_called_once_with(
-        scheduled_requests.context_requests,
-        scheduled_requests.generation_requests,
-    )
-    attn_metadata.update_spec_dec_param.assert_called_once_with(
-        batch_size=2,
-        is_spec_decoding_enabled=True,
-        is_spec_dec_tree=True,
-        is_spec_dec_dynamic_tree=True,
-        max_draft_len=6,
-        max_total_draft_tokens=6,
-        spec_metadata=spec_metadata,
-        spec_tree_manager=spec_tree_manager,
-        num_contexts=1,
-    )

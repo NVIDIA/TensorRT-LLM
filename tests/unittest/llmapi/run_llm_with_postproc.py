@@ -40,8 +40,7 @@ def main(model_dir: str, tp_size: int, n: int, best_of: Optional[int],
                                      n=n,
                                      best_of=best_of,
                                      top_k=top_k)
-    postproc_args = ChatPostprocArgs(role="assistant",
-                                     model="TinyLlama-1.1B-Chat-v1.0")
+    postproc_args = ChatPostprocArgs(role="assistant", model="Qwen3-0.6B")
     postproc_params = PostprocParams(
         post_processor=chat_stream_post_processor,
         postproc_args=postproc_args,
