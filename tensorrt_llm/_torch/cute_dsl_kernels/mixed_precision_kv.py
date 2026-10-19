@@ -29,7 +29,15 @@ class _NVFP4Codec:
     group_size = 16
     packed_group_size = 8
 
-    def __init__(self, dtype: torch.dtype) -> None:
+    @classmethod
+    def row_bytes(cls, head_dim: int) -> int:
+        """Pack one head's data and scales, aligned for vector stores."""
+        if head_dim % cls.group_size:
+            raise ValueError("NVFP4 mixed-precision KV requires head_dim divisible by 16")
+        size = head_dim // cls.group_size * (cls.packed_group_size + 1)
+        return (size + 7) // 8 * 8
+
+    def __init__(self, dtype: torch.dtype, head_dim: int) -> None:
         self.quantize = {
             torch.float16: process_nvfp4_block_half,
             torch.bfloat16: process_nvfp4_block_bfloat,
@@ -37,13 +45,13 @@ class _NVFP4Codec:
         }[dtype]
         self.fp8 = dtype == torch.float8_e4m3fn
         self.scale = 6.0 if self.fp8 else 1.0
+        self.scale_offset = head_dim // self.group_size * self.packed_group_size
 
     @cute.jit
     def encode(
         self,
         source: cute.Tensor,
         destination: cute.Tensor,
-        scales: cute.Tensor,
         group: cutlass.Int64,
     ) -> None:
         scale, packed = self.quantize(
@@ -52,13 +60,12 @@ class _NVFP4Codec:
         st_global_u64(
             get_ptr_as_int64(destination, cutlass.Int32(group * self.packed_group_size)), packed
         )
-        scales[group] = scale
+        destination[self.scale_offset + group] = scale
 
     @cute.jit
     def decode(
         self,
         source: cute.Tensor,
-        scales: cute.Tensor,
         group: cutlass.Int64,
         destination: cute.Tensor,
     ) -> None:
@@ -66,7 +73,7 @@ class _NVFP4Codec:
         cute.autovec_copy(cute.local_tile(source, (self.packed_group_size,), (group,)), packed)
         values = cute.recast_tensor(packed, cutlass.Float4E2M1FN).load().to(cutlass.Float32)
         scale_bits = cute.make_rmem_tensor((1,), cutlass.Uint8)
-        scale_bits[0] = scales[group]
+        scale_bits[0] = source[self.scale_offset + group]
         scale = cute.recast_tensor(scale_bits, cutlass.Float8E4M3FN)[0].to(cutlass.Float32)
         values = values * scale
         if cutlass.const_expr(self.fp8):
@@ -88,8 +95,7 @@ class _PagedMixedPrecisionKV:
     def __call__(
         self,
         pool: cute.Tensor,
-        history: cute.Tensor,
-        scales: cute.Tensor,
+        low: cute.Tensor,
         high: cute.Tensor,
         tables: cute.Tensor,
         lengths: cute.Tensor,
@@ -98,7 +104,7 @@ class _PagedMixedPrecisionKV:
         groups = (
             self.capacity * pool.shape[1] * pool.shape[3] * (pool.shape[4] // self.codec.group_size)
         )
-        self.convert_paged_kv(pool, history, scales, high, tables, lengths).launch(
+        self.convert_paged_kv(pool, low, high, tables, lengths).launch(
             grid=((groups + 127) // 128, lengths.shape[1], 1), block=(128, 1, 1), stream=stream
         )
 
@@ -106,8 +112,7 @@ class _PagedMixedPrecisionKV:
     def convert_paged_kv(
         self,
         pool: cute.Tensor,
-        history: cute.Tensor,
-        scales: cute.Tensor,
+        low: cute.Tensor,
         high: cute.Tensor,
         tables: cute.Tensor,
         lengths: cute.Tensor,
@@ -130,20 +135,18 @@ class _PagedMixedPrecisionKV:
             view_page = request * pages_per_request + position // pool.shape[2]
             view_row = pool[view_page, kv, position % pool.shape[2], head, None]
             view_tile = cute.local_tile(view_row, (self.codec.group_size,), (group,))
-            page = position // history.shape[2]
-            offset = position % history.shape[2]
+            page = position // low.shape[2]
+            offset = position % low.shape[2]
             valid = position < lengths[0, request]
             if cutlass.const_expr(self.write):
                 valid = position < lengths[1, request]
             if valid:
                 low_page = cutlass.Int64(tables[0, request, page])
-                scale_page = cutlass.Int64(tables[1, request, page])
-                high_page = cutlass.Int64(tables[2, request, page])
+                high_page = cutlass.Int64(tables[1, request, page])
                 if cutlass.const_expr(self.write):
                     self.codec.encode(
                         view_row,
-                        history[low_page, kv, offset, head, None],
-                        scales[scale_page, kv, offset, head, None],
+                        low[low_page, kv, offset, head, None],
                         group,
                     )
                     if high_page >= 0:
@@ -159,8 +162,7 @@ class _PagedMixedPrecisionKV:
                         )
                     else:
                         self.codec.decode(
-                            history[low_page, kv, offset, head, None],
-                            scales[scale_page, kv, offset, head, None],
+                            low[low_page, kv, offset, head, None],
                             group,
                             view_tile,
                         )
@@ -172,12 +174,16 @@ _LOW_PRECISION_CODECS = {DataType.NVFP4: _NVFP4Codec}
 _compiled_kernels = {}
 
 
+def get_mixed_precision_kv_row_bytes(low_dtype: DataType, head_dim: int) -> int:
+    """Return the complete encoded size of one token/head record."""
+    return _LOW_PRECISION_CODECS[low_dtype].row_bytes(head_dim)
+
+
 def convert_mixed_precision_kv(
     write: bool,
     capacity: int,
     pool: torch.Tensor,
-    history: torch.Tensor,
-    scales: torch.Tensor,
+    low: torch.Tensor,
     high: torch.Tensor,
     page_tables: torch.Tensor,
     lengths: torch.Tensor,
@@ -188,7 +194,7 @@ def convert_mixed_precision_kv(
     """Convert up to capacity tokens per request between native and mixed KV pools."""
     if capacity == 0 or lengths.shape[1] == 0:
         return
-    pools = (pool, history.view(torch.uint8), scales.view(torch.uint8), high)
+    pools = (pool, low.view(torch.uint8), high)
     if layout == "HND":
         pools = tuple(t.transpose(2, 3) for t in pools)
     tensors = (*pools, page_tables, lengths)
@@ -200,7 +206,7 @@ def convert_mixed_precision_kv(
     )
     if key not in _compiled_kernels:
         try:
-            codec = _LOW_PRECISION_CODECS[low_dtype](pool.dtype)
+            codec = _LOW_PRECISION_CODECS[low_dtype](pool.dtype, pool.shape[-1])
         except KeyError:
             raise NotImplementedError(
                 f"Mixed KV conversion between {low_dtype} and {pool.dtype} is not implemented"

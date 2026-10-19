@@ -6797,27 +6797,18 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         self.mixed_precision_buffers = Buffers()
         super().__init__(*args, **kwargs)
 
-    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> list[DataRole]:
-        roles = super()._get_buffer_roles_for_layer(local_layer_idx)
-        if self._uses_mixed_precision(local_layer_idx):
-            roles.append(Role.KEY_BLOCK_SCALE)
-            if Role.VALUE in roles:
-                roles.append(Role.VALUE_BLOCK_SCALE)
-        return roles
-
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         if not self._uses_mixed_precision(local_layer_idx):
             return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        elements = (
+        from ...cute_dsl_kernels.mixed_precision_kv import get_mixed_precision_kv_row_bytes
+
+        return (
             self.num_kv_heads_per_layer[local_layer_idx]
-            * self.head_dim_per_layer[local_layer_idx]
+            * get_mixed_precision_kv_row_bytes(
+                self.low_dtype, self.head_dim_per_layer[local_layer_idx]
+            )
             * (self.kv_factor if data_role == Role.ALL else 1)
         )
-        data_bytes = get_size_in_bytes(elements, self.low_dtype)
-        if data_role in (Role.KEY, Role.VALUE):
-            return data_bytes
-        scale_bytes = self.calculate_scaling_factor_size_bytes(elements, 16, DataType.FP8)
-        return data_bytes + scale_bytes if data_role == Role.ALL else scale_bytes
 
     def get_cache_bytes_per_token(self) -> int:
         return sum(
@@ -6849,8 +6840,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             ):
                 continue
             layer_id = int(layer.layer_id)
-            if self.low_dtype == DataType.NVFP4 and self.head_dim_per_layer[layer_id] % 16:
-                raise ValueError("NVFP4 mixed-precision KV requires head_dim divisible by 16")
             page_bytes = get_size_in_bytes(
                 self.tokens_per_block
                 * self.num_kv_heads_per_layer[layer_id]
@@ -6886,7 +6875,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         self._staging_bytes = pages * largest_page
         reserve = self._staging_bytes
         # Page tables are per layer; lengths are shared by the batch.
-        reserve += len(self.high_layers) * 3 * pages * 4
+        reserve += len(self.high_layers) * 2 * pages * 4
         reserve += 2 * self.max_batch_size * 4
         # TRTLLM uses at most 32 tokens per staging page and two offsets even for MLA.
         view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 32))
@@ -6903,21 +6892,24 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         layer_idx: int,
         kv_layout: str = "NHD",
         *,
-        mixed_precision_pool: Literal["low", "high", "scales"] = "low",
+        mixed_precision_pool: Literal["low", "high"] = "low",
     ) -> torch.Tensor | None:
         """Return a zero-copy view of the selected KV pool."""
         local = self.layer_offsets[layer_idx]
         if local not in self.high_layers:
             return super().get_buffers(layer_idx, kv_layout)
-        width = self.head_dim_per_layer[local]
-        layer, role, dtype, width = {
-            "low": (local, Role.KEY, torch.uint8, width // 2),
-            "high": (self.high_layers[local], Role.KEY, self.dtype, width),
-            "scales": (local, Role.KEY_BLOCK_SCALE, torch.uint8, width // 16),
+        layer, dtype, width = {
+            "low": (
+                local,
+                torch.uint8,
+                self.get_layer_bytes_per_token(local, Role.KEY)
+                // self.num_kv_heads_per_layer[local],
+            ),
+            "high": (self.high_layers[local], self.dtype, self.head_dim_per_layer[local]),
         }[mixed_precision_pool]
-        address = self.impl.get_mem_pool_base_address(layer, role, PageIndexMode.SHARED)
+        address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [
-            self.impl.get_page_index_upper_bound(layer, role) // self.kv_factor,
+            self.impl.get_page_index_upper_bound(layer, Role.KEY) // self.kv_factor,
             self.kv_factor,
             self.tokens_per_block,
             self.num_kv_heads_per_layer[local],
@@ -6934,19 +6926,15 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
     def get_mixed_precision_page_tables(
         self, request_ids: list[int], layer_idx: int
     ) -> tuple[list[list[int]], ...]:
-        """Return the low, scale and high page tables for this batch."""
+        """Return the low and high page tables for this batch."""
         local = self.layer_offsets[layer_idx]
         return tuple(
             self._get_batch_cache_indices_by_pool_id(
                 request_ids,
                 pool_id=int(self.impl.get_layer_group_id(layer)),
-                index_scale=int(self.impl.get_page_index_converter(layer, role).scale),
+                index_scale=int(self.impl.get_page_index_converter(layer, Role.KEY).scale),
             )
-            for layer, role in (
-                (local, Role.KEY),
-                (local, Role.KEY_BLOCK_SCALE),
-                (self.high_layers[local], Role.KEY),
-            )
+            for layer in (local, self.high_layers[local])
         )
 
     def _uses_mixed_precision(self, local_layer_idx: int) -> bool:

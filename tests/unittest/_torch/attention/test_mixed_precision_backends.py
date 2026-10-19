@@ -270,9 +270,6 @@ def test_optimized_two_pool_prefill_and_decode(
             rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
         )
         history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
-        scales_before = token_major(
-            manager.get_buffers(0, kv_layout, mixed_precision_pool="scales")
-        ).clone()
         assert_native_config()
         if backend is TrtllmAttention:
             assert selection_cache is not None
@@ -298,13 +295,12 @@ def test_optimized_two_pool_prefill_and_decode(
         output = forward(length, length + 1, False)
         assert_native_config()
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
-        all_history_ids, all_scale_ids, all_high_ids = manager.get_mixed_precision_page_tables(
-            request_ids, 0
-        )
+        all_history_ids, all_high_ids = manager.get_mixed_precision_page_tables(request_ids, 0)
         high = manager.get_buffers(0, kv_layout, mixed_precision_pool="high")
-        scales = manager.get_buffers(0, kv_layout, mixed_precision_pool="scales")
-        scales = token_major(scales)
         high = token_major(high)
+        packed_bytes, scale_bytes_per_head = width // 2, width // 16
+        payload_bytes = packed_bytes + scale_bytes_per_head
+        assert history.shape[1:] == (2, block, heads, (payload_bytes + 7) // 8 * 8)
         for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
             assert high_ids[0] >= 0 and high_ids[1:3] == [kv.BAD_PAGE_INDEX] * 2
             assert high_ids[-1] >= 0
@@ -327,13 +323,13 @@ def test_optimized_two_pool_prefill_and_decode(
                 for position in range(length + 1):
                     ordinal, offset = divmod(position, block)
                     torch.testing.assert_close(
-                        history[history_ids[ordinal], role, offset].view(torch.uint8),
+                        history[history_ids[ordinal], role, offset, :, :packed_bytes],
                         packed[position],
                         rtol=0,
                         atol=0,
                     )
                     torch.testing.assert_close(
-                        scales[all_scale_ids[row][ordinal], role, offset],
+                        history[history_ids[ordinal], role, offset, :, packed_bytes:payload_bytes],
                         scale_bytes[position],
                         rtol=0,
                         atol=0,
@@ -353,12 +349,6 @@ def test_optimized_two_pool_prefill_and_decode(
                 torch.testing.assert_close(
                     history[history_ids[ordinal]],
                     history_before[history_ids[ordinal]],
-                    rtol=0,
-                    atol=0,
-                )
-                torch.testing.assert_close(
-                    scales[all_scale_ids[row][ordinal]],
-                    scales_before[all_scale_ids[row][ordinal]],
                     rtol=0,
                     atol=0,
                 )
@@ -382,8 +372,7 @@ def test_optimized_two_pool_prefill_and_decode(
             for row, history_ids in enumerate(all_history_ids):
                 # The next replay appends the same K/V at the updated sequence length.
                 for pool, page_id in (
-                    (history, history_ids[ordinal]),
-                    (scales, all_scale_ids[row][ordinal]),
+                    (history[..., :payload_bytes], history_ids[ordinal]),
                     (high, all_high_ids[row][ordinal]),
                 ):
                     torch.testing.assert_close(
@@ -434,26 +423,29 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
 
     values = torch.linspace(-6, 6, 192 * 4 * width, device="cuda").view(192, 2, 2, width).to(dtype)
     pool = values.view(3, 64, 2, 2, width).transpose(1, 2).contiguous()
-    low = torch.full((3, 2, 128, 2, width // 2), 23, dtype=torch.uint8, device="cuda")
-    scales = torch.full((3, 2, 128, 2, width // 16), 17, dtype=torch.uint8, device="cuda")
+    packed_bytes, scale_bytes = width // 2, width // 16
+    payload_bytes = packed_bytes + scale_bytes
+    row_bytes = (payload_bytes + 7) // 8 * 8
+    low = torch.full((3, 2, 128, 2, row_bytes), 23, dtype=torch.uint8, device="cuda")
     high = torch.zeros((3, 2, 128, 2, width), dtype=dtype, device="cuda")
-    tables = torch.tensor([[[2, 0]], [[0, 2]], [[1, -1]]], dtype=torch.int32, device="cuda")
+    tables = torch.tensor([[[2, 0]], [[1, -1]]], dtype=torch.int32, device="cuda")
     lengths = torch.tensor([[0], [130]], dtype=torch.int32, device="cuda")
     factor = 1 / 6 if dtype == torch.float8_e4m3fn else 1.0
     quant_scale = torch.tensor([1 / factor], dtype=torch.float32, device="cuda")
     packed, block_scales = _reference_quant(values[:130], quant_scale)
-    expected_low, expected_scales, expected_high = low.clone(), scales.clone(), high.clone()
+    expected_low, expected_high = low.clone(), high.clone()
     for page, count in enumerate((128, 2)):
-        expected_low[(2, 0)[page], :, :count] = packed[128 * page : 128 * page + count].transpose(
-            0, 1
-        )
-        expected_scales[(0, 2)[page], :, :count] = block_scales[
+        expected_low[(2, 0)[page], :, :count, :, :packed_bytes] = packed[
+            128 * page : 128 * page + count
+        ].transpose(0, 1)
+        expected_low[(2, 0)[page], :, :count, :, packed_bytes:payload_bytes] = block_scales[
             128 * page : 128 * page + count
         ].transpose(0, 1)
     expected_high[1] = values[:128].transpose(0, 1)
-    pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, scales, high))
+    pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, high))
     convert_mixed_precision_kv(True, 130, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4)
-    for actual, expected in ((low, expected_low), (scales, expected_scales), (high, expected_high)):
+    # Compare complete records so padding and untouched pages must retain their sentinel.
+    for actual, expected in ((low, expected_low), (high, expected_high)):
         torch.testing.assert_close(
             actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
         )
@@ -580,7 +572,7 @@ def test_mla_preserves_native_rope_and_attention(backend):
             assert torch.isfinite(output).all()
             assert metadata.kv_cache_manager is manager
         high = manager.get_buffers(1, mixed_precision_pool="high")
-        _, _, ids = manager.get_mixed_precision_page_tables([0], 1)
+        _, ids = manager.get_mixed_precision_page_tables([0], 1)
         assert high.shape[1] == 1
         assert ids[0][0] >= 0 and ids[0][1] == kv.BAD_PAGE_INDEX and ids[0][-1] >= 0
     finally:

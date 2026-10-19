@@ -60,7 +60,7 @@ class MixedPrecisionKVView:
                 continue
             pools = (
                 manager.get_buffers(layer_idx, metadata.kv_layout, mixed_precision_pool=pool)
-                for pool in ("low", "scales", "high")
+                for pool in ("low", "high")
             )
             pools = tuple(
                 pool if self.layout == metadata.kv_layout else pool.transpose(2, 3)
@@ -92,14 +92,14 @@ class MixedPrecisionKVView:
         for layer_idx in self.pools:
             page_tables = manager.get_mixed_precision_page_tables(metadata.request_ids, layer_idx)
             tables = torch.full(
-                (3, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
+                (2, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
             for role, rows in enumerate(page_tables):
                 for row, pages in enumerate(rows):
                     count = min(len(pages), max_pages)
                     tables[role, row, :count] = torch.tensor(pages[:count], dtype=torch.int32)
             self.page_tables[layer_idx] = buffers.get_buffer(
-                (3, manager.max_batch_size, max_pages),
+                (2, manager.max_batch_size, max_pages),
                 torch.int32,
                 f"mixed_page_tables_{layer_idx}",
                 metadata.is_cuda_graph,

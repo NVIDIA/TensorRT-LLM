@@ -65,13 +65,23 @@ def manager(request):
     indirect=True,
 )
 def test_extra_pool_uses_existing_dtype_layout(manager):
-    """High pages use the configured native KV dtype without block scales."""
+    """High keeps the native dtype; low stores each packed record in one buffer."""
     high = manager.kv_cache_manager_py_config.layers[1]
     for buffer in high.buffers:
         expected = get_size_in_bytes(2 * 64 * 128, manager.dtype)
         assert buffer.size == expected
         assert manager.impl.get_page_stride(high.layer_id, buffer.role) >= expected
     assert all(buffer.role in (Role.KEY, Role.VALUE) for buffer in high.buffers)
+    low = manager.kv_cache_manager_py_config.layers[0]
+    assert [buffer.role for buffer in low.buffers] == [Role.KEY, Role.VALUE]
+    row_bytes = (64 // 2 + 64 // 16 + 7) // 8 * 8
+    assert all(buffer.size == 2 * 128 * row_bytes for buffer in low.buffers)
+    low_nhd = manager.get_buffers(0, "NHD")
+    low_hnd = manager.get_buffers(0, "HND")
+    assert low_nhd.data_ptr() == low_hnd.data_ptr()
+    assert low_nhd.dtype == low_hnd.dtype == torch.uint8
+    assert low_nhd.shape[1:] == (2, 128, 2, row_bytes)
+    assert low_hnd.shape[1:] == (2, 2, 128, row_bytes)
 
 
 @pytest.mark.parametrize("dtype", (DataType.HALF, DataType.BF16, DataType.FP8))
@@ -113,7 +123,7 @@ def test_mixed_precision_preserves_native_and_shared_kv_storage(dtype):
         assert mixed.dtype == native.dtype == dtype
         assert mixed.high_layers == {0: 4}
         assert mixed.get_buffers(0).dtype == torch.uint8
-        assert mixed.get_buffers(0).shape[-1] == 32
+        assert mixed.get_buffers(0).shape[-1] == 40
         assert mixed.get_cache_bytes_per_token() == sum(
             mixed.get_layer_bytes_per_token(layer, Role.ALL) for layer in range(4)
         )
@@ -289,7 +299,7 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(manager):
     high_group = manager.impl.get_layer_group_id(manager.high_layers[0])
     assert table.layer_groups[low_group].local_layers[0].global_layer_id == 0
     assert table.layer_groups[high_group].local_layers[0].global_layer_id == 1
-    assert len(table.layer_groups[low_group].pool_views) == 2  # NVFP4 data and scales.
+    assert len(table.layer_groups[low_group].pool_views) == 1  # Packed low records.
     assert len(table.layer_groups[high_group].pool_views) == 1
     registrar = PeerRegistrar(rank, KVRegionExtractorV1(table))
     peer = RankInfo.from_bytes(rank.to_bytes())
