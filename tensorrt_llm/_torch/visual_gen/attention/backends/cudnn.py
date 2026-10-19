@@ -610,7 +610,7 @@ class CuDNNAttention(AttentionBackend):
         """Write ``k``/``v`` at ``staging_offset``, then attend over the cache.
 
         ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The
-        first ``seq_len`` rows are real (``None``: all of them); rows past that are
+        first ``seq_len`` rows are real (``None``: all of them are real); rows past that are
         padding and are neither written nor attended. ``causal_block_size`` cuts the
         real tokens into consecutive causal blocks that are causal across each other
         (``None``: one causal block). Output is ``[1, S, H, D]`` with zero padding rows.
