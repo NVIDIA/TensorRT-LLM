@@ -45,7 +45,7 @@ encoder selection and LLM forwards create separate Params views.
 | `MultimodalItemPartition` | A small value describing one input field's item axis and optional packed lengths. It lives inside `item_metadata.input_partitions`. |
 | `MultimodalInput` | Processor-side hash, prompt-position, and exact-run data converted into the existing C++ request fields by the worker. |
 | `MultimodalRuntimeData` | Derived information for the current LLM forward or prefill chunk. |
-| `MultimodalEncoderRequestState` | Request-owned readiness and references to cached encoder outputs; the model still owns the `TensorLRUCache`. |
+| `MultimodalEncoderRequestState` | Request-owned readiness and cache references, plus a reference to the admitted item metadata; the model still owns the `TensorLRUCache`. |
 
 The process boundary is:
 
@@ -61,7 +61,11 @@ Executor / LlmRequest.py_multimodal_params
 ```
 
 After conversion, the worker clears the processor-side `multimodal_input`;
-the executor uses the C++ request fields for that information. Text-only requests
+the executor uses the C++ request fields for that information. When persistent
+encoder caching needs a Python `MultimodalInput`, it reconstructs it once and
+reuses it through the request Params. Selected inputs copy the wrapper before
+changing their hashes. Prefill/termination cleanup clears the retained wrapper.
+Text-only requests
 do not need an aggregate. Execution views leave `encoder_state` unset, and the
 request-wide Params do not carry the current chunk's runtime data. Existing
 prefetch events retain their stream synchronization role. Live cache references
@@ -80,10 +84,22 @@ Prompt multimodal token counts, physical encoder token costs, and output embeddi
 row counts serve different purposes. Unknown costs or row counts remain `None`;
 metadata alone does not enable item scheduling. Producers and admission boundaries
 validate the required contracts rather than revalidating all items per forward.
+The item refs, costs, and output rows are stored as immutable tuples; list inputs
+are accepted by the metadata constructor. Encoder state references this same
+record and reads its lengths without a second snapshot. Producers fill the
+partition declarations before admission.
 Legacy `mm_item_order`, `multimodal_embedding_lengths`, and the three-field
 `MultimodalEncoderItemMetadata` remain compatibility inputs. Migrated producers
-publish the shared metadata record; the executor's output-length helper reads its
-rows and rejects conflicting legacy lengths.
+publish the shared metadata record. Normalization checks and removes redundant
+legacy lengths, and Params clear the order manifest once metadata is available.
+Inputs without a known layout retain their compatibility path. The executor's
+output-length helper reads canonical rows and rejects conflicting legacy lengths.
+The encoder-result boundary still exports lengths as lists.
+
+Execution Params can receive model outputs. Inline encoding and prefetch retain
+their existing output write-back to the request, while item-scheduled LLM chunks
+keep their assembled embeddings local to the forward. CUDA event transfer remains
+with the execution paths that synchronize the streams.
 
 For encoder/prefill disaggregation (E/P), model processor hooks return
 `(prompt_token_ids, MultimodalParams)` and use `MultimodalParams.from_embeddings`

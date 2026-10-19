@@ -90,8 +90,8 @@ def _assert_nano_video_handoff(prompt_token_ids, params):
     assert prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
     assert params.multimodal_input.multimodal_lengths == [8]
     assert params.multimodal_input.multimodal_positions == [1]
-    assert params.item_metadata.item_refs == [("video", 0)]
-    assert params.item_metadata.output_embedding_lengths == [4]
+    assert params.item_metadata.item_refs == (("video", 0),)
+    assert params.item_metadata.output_embedding_lengths == (4,)
     assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
     assert params.multimodal_input.multimodal_run_positions == [1, 6]
     assert params.multimodal_input.multimodal_run_lengths == [4, 4]

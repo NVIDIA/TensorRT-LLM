@@ -86,7 +86,7 @@ def test_multimodal_payload_broadcast_and_children_keep_the_same_contract():
     assert child.item_metadata is not params.item_metadata
     assert params.encoder_state is child.encoder_state is None
     assert params.multimodal_runtime is child.multimodal_runtime is None
-    assert params.item_metadata.item_refs == [("audio", 0), ("image", 0)]
+    assert params.item_metadata.item_refs == (("audio", 0), ("image", 0))
     torch.testing.assert_close(
         child.multimodal_data["audio"]["features"], payload["audio"]["features"]
     )

@@ -92,15 +92,12 @@ class TestLengthsByModality:
 class TestMultimodalItemLayout:
     def test_image_only(self):
         mp = _mp(embedding_lengths=[10, 20, 30], buckets={"image": {}})
-        assert mp.get_item_layout() == (
-            [("image", 0), ("image", 1), ("image", 2)],
-            [10, 20, 30],
-        )
+        assert mp.get_item_layout() == ((("image", 0), ("image", 1), ("image", 2)), (10, 20, 30))
 
     def test_layout_includes_all_request_modalities(self):
         # Layout belongs to the request, independent of the encoder group.
         mp = _mp(embedding_lengths=[10], buckets={"audio": {}})
-        assert mp.get_item_layout() == ([("audio", 0)], [10])
+        assert mp.get_item_layout() == ((("audio", 0),), (10,))
 
     def test_item_metadata_owns_order_and_lengths(self) -> None:
         metadata = MultimodalEncoderItemMetadata(
@@ -115,8 +112,8 @@ class TestMultimodalItemLayout:
 
         item_refs, lengths = mp.get_item_layout()
 
-        assert item_refs is metadata.item_refs
-        assert lengths is metadata.output_embedding_lengths
+        assert item_refs == tuple(metadata.item_refs)
+        assert lengths == tuple(metadata.output_embedding_lengths)
         assert _lengths_by_modality([mp.get_item_layout()], ("image", "video")) == {
             "image": [4],
             "video": [6],

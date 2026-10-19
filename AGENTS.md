@@ -102,8 +102,13 @@ before changing multimodal preprocessing, item selection, or request ownership.
 - `item_metadata` reads one record in `multimodal_data`. Its `input_partitions` describe
   how processed fields are selected by item; model hooks retain batching and padding policy.
   Keep prompt token counts, encoder costs, and output embedding rows distinct.
+- Item refs, costs, and output rows are immutable tuples. Encoder state references the
+  admitted record instead of copying its lengths. Normalized Params consume legacy order
+  and length fields; keep compatibility inputs only where normalization is unavailable.
 - Only request Params own `encoder_state` cache references. Encoder selection and LLM chunk
   Params are separate views; cleanup remains in the executor and the cache remains model-owned.
+- Persistent encoder caching reuses one lazily reconstructed `MultimodalInput` per request.
+  Copy that wrapper before slicing its hashes; prefill/termination cleanup clears it.
 - E/P processor hooks return `(prompt_token_ids, MultimodalParams)`; use
   `MultimodalParams.from_embeddings` for embedding handoffs. `DisaggregatedParams` remains
   the transport envelope. Do not serialize live encoder state or CUDA events in a new wire format.

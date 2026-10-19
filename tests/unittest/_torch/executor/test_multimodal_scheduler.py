@@ -135,6 +135,7 @@ def test_cleanup_releases_duplicate_references_and_drops_state_and_event():
     state.set_item_cache_key(0, cache_key, ready=True)
     state.set_item_cache_key(1, cache_key, ready=True)
     request.py_mm_encoder_event = object()
+    request.py_multimodal_params.multimodal_input = object()
     cache = Mock()
     executor = SimpleNamespace(model_engine=SimpleNamespace(mm_encoder_cache=cache))
     PyExecutor._release_multimodal_resources(executor, request)
@@ -143,6 +144,7 @@ def test_cleanup_releases_duplicate_references_and_drops_state_and_event():
     assert state.item_cache_keys == [None, None]
     assert request.py_multimodal_params.encoder_state is None
     assert request.py_multimodal_params.encoder_event is None
+    assert request.py_multimodal_params.multimodal_input is None
 
 
 class _RejectMultimodalCapacityScheduler:
@@ -1071,7 +1073,7 @@ def test_prepare_multimodal_encoder_inputs_slices_before_device_transfer():
 
     item_param, embedding_lengths, modality = encoder_inputs[0]
     assert modality == "image"
-    assert embedding_lengths == [3]
+    assert embedding_lengths == (3,)
     assert item_param.multimodal_data["image"]["pixel_values"].squeeze(1).tolist() == [2, 3, 4]
     assert multimodal_param.multimodal_data["image"]["pixel_values"].shape[0] == 5
 
@@ -1172,18 +1174,24 @@ def test_weight_invalidation_rejects_live_references():
 def test_mm_encoder_state_enforces_lengths_slot_invariant():
     with pytest.raises(ValueError, match="one cache key per item slot"):
         MultimodalEncoderRequestState(
-            embedding_lengths=[2], encoder_token_lengths=[4], item_ready=[False, False]
+            item_metadata=MultimodalItemMetadata([("image", 0), ("image", 1)], [4, 7], [2, 3]),
+            item_ready=[False, False],
+            item_cache_keys=[None],
         )
 
 
-def test_mm_encoder_state_copies_validated_scheduler_costs_at_admission():
-    request = make_mm_request(1, [4, 7])
+def test_mm_encoder_state_uses_immutable_admitted_metadata():
+    costs = [4, 7]
+    request = make_mm_request(1, costs)
+    metadata = request.py_multimodal_params.item_metadata
+    costs[0] = 100
 
-    assert request.py_mm_encoder_state.encoder_token_lengths == [4, 7]
-
-    metadata = request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    metadata.encoder_token_lengths[0] = 100
-    assert request.py_mm_encoder_state.encoder_token_lengths == [4, 7]
+    assert metadata.encoder_token_lengths == (4, 7)
+    assert request.py_mm_encoder_state.item_metadata is metadata
+    assert "encoder_token_lengths" not in vars(request.py_mm_encoder_state)
+    assert "embedding_lengths" not in vars(request.py_mm_encoder_state)
+    with pytest.raises(TypeError):
+        metadata.encoder_token_lengths[0] = 100
 
     scheduler = _scheduler(max_batch_size=2, max_num_tokens=11)
     output = scheduler.schedule_request([request], set())
@@ -1191,7 +1199,10 @@ def test_mm_encoder_state_copies_validated_scheduler_costs_at_admission():
 
 
 def test_mm_encoder_state_tracks_prompt_ordered_cache_key_readiness():
-    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
+    state = MultimodalEncoderRequestState(
+        item_metadata=MultimodalItemMetadata([("audio", 0), ("audio", 1)], [4, 7], [2, 3]),
+        item_ready=[False, False],
+    )
     first_cache_key = ("cache", 0)
     second_cache_key = ("cache", 1)
 

@@ -67,8 +67,8 @@ def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
     ]
     assert params.multimodal_input.multimodal_lengths == [4]
     assert params.multimodal_input.multimodal_positions == [1]
-    assert params.item_metadata.item_refs == [("video", 0)]
-    assert params.item_metadata.output_embedding_lengths == [3]
+    assert params.item_metadata.item_refs == (("video", 0),)
+    assert params.item_metadata.output_embedding_lengths == (3,)
     assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 1]
     assert params.multimodal_input.multimodal_run_positions == [1]
     assert params.multimodal_input.multimodal_run_lengths == [4]
@@ -118,8 +118,8 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
     assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 1, 2]
     assert params.multimodal_input.multimodal_run_positions == [0, 5]
     assert params.multimodal_input.multimodal_run_lengths == [3, 4]
-    assert params.item_metadata.item_refs == [("image", 0), ("video", 0)]
-    assert params.item_metadata.output_embedding_lengths == [2, 3]
+    assert params.item_metadata.item_refs == (("image", 0), ("video", 0))
+    assert params.item_metadata.output_embedding_lengths == (2, 3)
     assert params.multimodal_data["special_token_offsets"] == [0, 3]
 
 
@@ -164,7 +164,7 @@ def test_disagg_image_processors_return_common_params(model):
     assert tokens == [11, _IMAGE_TOKEN_ID, _IMAGE_TOKEN_ID, 12, *([_IMAGE_TOKEN_ID] * 3), 13]
     assert isinstance(params, MultimodalParams)
     assert params.multimodal_data["multimodal_embedding"] is handles
-    assert params.get_item_layout() == ([("image", 0), ("image", 1)], [2, 3])
+    assert params.get_item_layout() == ((("image", 0), ("image", 1)), (2, 3))
     assert params.item_metadata.encoder_token_lengths is None
     assert params.multimodal_input.multimodal_hashes is hashes
     assert params.multimodal_input.multimodal_positions == [1, 4]
@@ -213,7 +213,7 @@ def test_disagg_preprocess_keeps_processor_params_and_mrope(monkeypatch, deepsta
     assert params is built[0]
     assert prompt == "video prompt"
     assert encoder_tokens is None
-    assert params.get_item_layout() == ([("video", 0)], [3])
+    assert params.get_item_layout() == ((("video", 0),), (3,))
     assert params.multimodal_data["multimodal_embedding"] is handles
     assert params.multimodal_data["mrope_config"]["mrope_position_ids"] is mrope_ids
     assert params.multimodal_data["mrope_config"]["mrope_position_deltas"] is mrope_deltas
@@ -268,7 +268,7 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     params = MultimodalParams(multimodal_data=extra["multimodal_data"])
 
     assert len(tokens) == 16
-    assert params.get_item_layout() == ([("image", 0), ("image", 1)], [4, 9])
+    assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] is embeddings
     assert params.multimodal_data["mrope_config"] is mrope_config
     assert params.multimodal_input is None

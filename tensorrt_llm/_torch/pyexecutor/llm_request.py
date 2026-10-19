@@ -4,7 +4,7 @@
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Union, cast
 
 import torch
 
@@ -1233,19 +1233,19 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.child_requests.append(py_request)
 
 
-def _validate_optional_int_list(values: Any,
-                                field_name: str) -> Optional[List[int]]:
+def _validate_optional_int_sequence(values: Any,
+                                    field_name: str) -> Optional[Sequence[int]]:
     if values is None:
         return None
-    if not isinstance(values, list):
-        raise TypeError(f"{field_name} must be a list")
+    if not isinstance(values, (list, tuple)):
+        raise TypeError(f"{field_name} must be a list or tuple")
     if not all(isinstance(value, int) for value in values):
         raise TypeError(f"{field_name} must contain only integers")
     return values
 
 
 def get_multimodal_embedding_lengths(
-        request: LlmRequest) -> Optional[List[int]]:
+        request: LlmRequest) -> Optional[Sequence[int]]:
     """Return canonical item output rows, falling back to legacy layout."""
     py_multimodal_data = request.py_multimodal_data
     if py_multimodal_data is not None and not isinstance(
@@ -1260,15 +1260,15 @@ def get_multimodal_embedding_lengths(
         item_lengths = item_metadata.output_embedding_lengths
         if (multimodal_embedding_lengths is not None
                 and multimodal_embedding_lengths is not item_lengths):
-            _validate_optional_int_list(multimodal_embedding_lengths,
-                                        "multimodal_embedding_lengths")
-            if multimodal_embedding_lengths != item_lengths:
+            _validate_optional_int_sequence(multimodal_embedding_lengths,
+                                            "multimodal_embedding_lengths")
+            if tuple(multimodal_embedding_lengths) != item_lengths:
                 raise ValueError(
                     "Multimodal encoder item output lengths must match "
                     "multimodal_embedding_lengths")
         multimodal_embedding_lengths = item_lengths
     # Output rows are Python-side metadata, not a nanobind request field.
-    multimodal_embedding_lengths = _validate_optional_int_list(
+    multimodal_embedding_lengths = _validate_optional_int_sequence(
         multimodal_embedding_lengths, "multimodal_embedding_lengths")
     if multimodal_embedding_lengths is None:
         return None
@@ -1291,7 +1291,7 @@ def get_multimodal_embedding_lengths(
 
 
 def get_multimodal_encoder_token_lengths(
-        request: LlmRequest) -> Optional[List[int]]:
+        request: LlmRequest) -> Optional[Sequence[int]]:
     """Return per-item physical encoder attention-token costs.
 
     Field-level validation happens inside
@@ -1308,7 +1308,7 @@ def get_multimodal_encoder_token_lengths(
     if embedding_lengths is None:
         raise ValueError("Multimodal encoder item scheduling requires "
                          "multimodal_embedding_lengths")
-    if item_metadata.output_embedding_lengths != embedding_lengths:
+    if item_metadata.output_embedding_lengths != tuple(embedding_lengths):
         raise ValueError("Multimodal encoder item output lengths must match "
                          "multimodal_embedding_lengths")
     return item_metadata.encoder_token_lengths
@@ -1450,9 +1450,9 @@ def initialize_multimodal_encoder_request(
                         whole_request_output_resident=(context_chunk_unit_size
                                                        is None),
                     ))
-        request.py_mm_encoder_state = (
-            MultimodalEncoderRequestState.from_embedding_lengths(
-                embedding_lengths, encoder_token_lengths=token_lengths))
+        request.py_mm_encoder_state = MultimodalEncoderRequestState(
+            item_metadata=get_multimodal_item_metadata(mm_data),
+            item_ready=[False] * len(embedding_lengths))
 
 
 def get_mm_context_chunk_start(request: LlmRequest) -> int:
