@@ -23,8 +23,10 @@ from unittest import mock
 import pytest
 
 from tensorrt_llm.serve.render import RenderResources, render_chat
+from tensorrt_llm.serve.router_utils import KV_CACHE_HASH_ALGO_DEFAULT
 
 from .render_helpers import (
+    KIMI_K3,
     LLAMA,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
@@ -120,13 +122,14 @@ class _Router:
         return router
 
     @staticmethod
-    def worker_fingerprint(tokenizer):
+    def worker_fingerprint(tokenizer, reasoning_parser=None):
         """A worker's fingerprint, built from a worker-shaped server and not from the router.
 
         Copying the router's own fingerprint would make the write-back tests agree by
         construction and hide any difference between how the two sides describe the
         same rendering configuration. A worker's ``processor`` is ``AutoProcessor``'s result,
-        which is the tokenizer itself for a text-only checkpoint, not ``None``.
+        which is the tokenizer itself for a text-only checkpoint, not ``None``. The worker's
+        reasoning parser is not part of the rendering configuration, but the router reads it.
         """
         from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
@@ -137,7 +140,7 @@ class _Router:
             chat_template=None,
             allow_request_chat_template=False,
             generator=SimpleNamespace(
-                args=SimpleNamespace(reasoning_parser=None),
+                args=SimpleNamespace(reasoning_parser=reasoning_parser),
                 input_processor=DefaultInputProcessor(None, None, tokenizer),
             ),
         )
@@ -200,8 +203,10 @@ class TestRouterWriteBack:
             router._tokenize(request)
 
         assert request.prompt_token_ids is None
-        # The warning names the worker that blocks forwarding.
-        assert "server2" in logger.warning.call_args.args[0]
+        # The warning names the worker that blocks forwarding, and why.
+        message = logger.warning.call_args.args[0]
+        assert "server2 (no rendering fingerprint reported)" in message
+        assert "server1" not in message
 
     def test_ids_are_not_forwarded_when_a_worker_renders_differently(
         self, router, tokenizer
@@ -214,9 +219,38 @@ class TestRouterWriteBack:
         }
         request = chat_request()
 
-        router._tokenize(request)
+        with mock.patch("tensorrt_llm.serve.router_utils.logger") as logger:
+            router._tokenize(request)
 
         assert request.prompt_token_ids is None
+        assert "server2 (renders differently" in logger.warning.call_args.args[0]
+
+    def test_the_fallback_is_reported_again_only_when_its_cause_changes(
+        self, router, tokenizer
+    ) -> None:
+        fingerprint = _Router.worker_fingerprint(tokenizer)
+        router._server_info = {"server1": {"render_fingerprint": fingerprint}, "server2": {}}
+
+        with mock.patch("tensorrt_llm.serve.router_utils.logger") as logger:
+
+            def reports():
+                return [c for c in logger.warning.call_args_list if "not forwarded" in c.args[0]]
+
+            router._tokenize(chat_request())
+            router._tokenize(chat_request())
+            assert len(reports()) == 1  # the same cause is not repeated
+
+            router._server_info["server2"] = {"render_fingerprint": {**fingerprint, "digest": "x"}}
+            router._tokenize(chat_request())
+            assert len(reports()) == 2  # a different cause is
+
+            self._trust(router, tokenizer)
+            forwarded = chat_request()
+            router._tokenize(forwarded)
+            assert forwarded.prompt_token_ids is not None
+            router._server_info["server2"] = {}
+            router._tokenize(chat_request())
+            assert len(reports()) == 3  # forwarding resumed, then broke again
 
     def test_ids_are_not_forwarded_when_no_worker_has_reported_yet(self, router) -> None:
         router._server_info = {}
@@ -226,23 +260,32 @@ class TestRouterWriteBack:
 
         assert request.prompt_token_ids is None
 
-    def test_ids_are_not_forwarded_when_the_worker_would_lose_decisions_from_the_prompt(
-        self,
+    THINKING_TEMPLATE = (
+        "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+        "{% if add_generation_prompt %}<assistant><think>{% endif %}"
+    )
+
+    def _thinking_router(self, reasoning_parser):
+        thinking_tokenizer = make_tokenizer(chat_template=self.THINKING_TEMPLATE)
+        built = _Router.build(thinking_tokenizer, ["server1"])
+        built._server_info = {
+            "server1": {
+                "render_fingerprint": _Router.worker_fingerprint(
+                    thinking_tokenizer, reasoning_parser=reasoning_parser
+                )
+            }
+        }
+        return built
+
+    @pytest.mark.parametrize("parser", ["poolside_v1", "laguna"])
+    def test_ids_are_not_forwarded_to_a_worker_whose_parser_reads_the_mode_off_the_prompt(
+        self, parser
     ) -> None:
         # A forwarded request is an ordinary chat request carrying prompt_token_ids: the
         # worker never sees the rendered text, so a reasoning mode read off the prompt (here a
         # template that prefills "<think>") would be lost. The worker must render it itself.
-        thinking_tokenizer = make_tokenizer(
-            chat_template=(
-                "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
-                "{% if add_generation_prompt %}<assistant><think>{% endif %}"
-            )
-        )
-        built = _Router.build(thinking_tokenizer, ["server1"])
+        built = self._thinking_router(parser)
         try:
-            built._server_info = {
-                "server1": {"render_fingerprint": _Router.worker_fingerprint(thinking_tokenizer)}
-            }
             request = chat_request()
 
             ids = built._tokenize(request)[0]
@@ -251,6 +294,87 @@ class TestRouterWriteBack:
             assert request.prompt_token_ids is None
         finally:
             built._test_patcher.stop()
+
+    @pytest.mark.parametrize("parser", [None, "qwen3", "deepseek-r1"])
+    def test_ids_are_forwarded_to_a_worker_whose_parser_ignores_the_prompt(self, parser) -> None:
+        built = self._thinking_router(parser)
+        try:
+            request = chat_request()
+
+            ids = built._tokenize(request)[0]
+
+            assert request.prompt_token_ids == ids
+        finally:
+            built._test_patcher.stop()
+
+    def test_a_worker_that_does_not_say_which_parser_it_runs_is_not_given_the_ids(self) -> None:
+        built = self._thinking_router(None)
+        try:
+            info = built._server_info["server1"]["render_fingerprint"]
+            del info["info"]["reasoning_parser"]
+            request = chat_request()
+
+            built._tokenize(request)
+
+            assert request.prompt_token_ids is None
+        finally:
+            built._test_patcher.stop()
+
+    def test_qwen3_without_thinking_is_forwarded_to_a_qwen3_parser_worker(
+        self, router, tokenizer
+    ) -> None:
+        # The real Qwen3 template prefills an empty think block for enable_thinking=false; the
+        # qwen3 parser does not read that off the prompt, so nothing is lost by forwarding.
+        fingerprint = _Router.worker_fingerprint(tokenizer, reasoning_parser="qwen3")
+        router._server_info = {
+            name: {"render_fingerprint": fingerprint} for name in router._servers
+        }
+        request = chat_request(chat_template_kwargs={"enable_thinking": False})
+
+        ids = router._tokenize(request)[0]
+
+        assert request.prompt_token_ids == ids
+        assert ids == self._expected_ids(
+            tokenizer, chat_request(chat_template_kwargs={"enable_thinking": False})
+        )
+
+    def test_a_request_a_serving_extension_rejects_is_routed_on_an_estimate(
+        self, monkeypatch
+    ) -> None:
+        # kimi_k3 refuses out-of-policy sampling parameters. The router has to leave that to
+        # the worker (which answers the request) rather than fail it itself.
+        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "1")
+        k3 = make_tokenizer(name=KIMI_K3)
+        built = _Router.build(k3, ["server1"])
+        try:
+            built._model_path = "/model"
+            built._model_types["/model"] = "kimi_k3"
+            request = chat_request(n=2)
+
+            ids = built._tokenize(request)[0]
+
+            assert ids
+            assert request.prompt_token_ids is None
+        finally:
+            built._test_patcher.stop()
+
+    def test_the_conversation_key_does_not_depend_on_whether_ids_were_forwarded(
+        self, router, tokenizer
+    ) -> None:
+        # The router keeps a conversation on one worker by the first messages and the first
+        # prompt tokens. Whether the ids are also sent to the workers must not move it.
+        router._routing_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
+        self._trust(router, tokenizer)
+        forwarded = chat_request()
+        key_forwarded = router._routing_key_sync(forwarded)["conv_key"]
+        assert forwarded.prompt_token_ids is not None
+
+        router._server_info = {}
+        held_back = chat_request()
+        key_held_back = router._routing_key_sync(held_back)["conv_key"]
+        assert held_back.prompt_token_ids is None
+
+        assert key_forwarded == key_held_back
 
     def test_ids_are_forwarded_when_the_prompt_carries_no_decisions(
         self, router, tokenizer

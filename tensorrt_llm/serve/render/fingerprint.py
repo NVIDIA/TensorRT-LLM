@@ -229,19 +229,32 @@ def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
     }
 
 
-def fingerprints_match(local: Optional[Dict[str, Any]], remote: Optional[Dict[str, Any]]) -> bool:
-    """Whether ids rendered under ``remote`` may be trusted under ``local``.
+def fingerprint_mismatch(
+    local: Optional[Dict[str, Any]], remote: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    """Why ids rendered under ``remote`` may not be trusted under ``local``; None if they may.
 
     A missing fingerprint on either side counts as a mismatch.
     """
-    if not local or not remote:
-        return False
-    if not (_identity_complete(local) and _identity_complete(remote)):
+    if not local:
+        return "this side has no rendering fingerprint"
+    if not remote:
+        return "no rendering fingerprint reported"
+    if not _identity_complete(local):
         # A tokenizer whose whole encoding configuration could not be identified is never
         # trusted, even when both sides happen to report the same digest.
-        return False
+        return "this side's tokenizer cannot be fully identified"
+    if not _identity_complete(remote):
+        return "the other side's tokenizer cannot be fully identified"
     digest = local.get("digest")
-    return digest is not None and digest == remote.get("digest")
+    if digest is None or digest != remote.get("digest"):
+        return "renders differently (different fingerprint)"
+    return None
+
+
+def fingerprints_match(local: Optional[Dict[str, Any]], remote: Optional[Dict[str, Any]]) -> bool:
+    """Whether ids rendered under ``remote`` may be trusted under ``local``."""
+    return fingerprint_mismatch(local, remote) is None
 
 
 def fingerprint_summary(fingerprint: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -259,7 +272,32 @@ def fingerprint_summary(fingerprint: Optional[Dict[str, Any]]) -> Optional[Dict[
             "use_harmony": bool(compared.get("use_harmony")),
             "tokenizer": {"complete": bool((compared.get("tokenizer") or {}).get("complete"))},
         },
+        # Not compared; read by a router deciding whether a prompt's reasoning mode is lost.
+        "reasoning_parser": (fingerprint.get("info") or {}).get("reasoning_parser"),
     }
+
+
+def worker_resolves_thinking(
+    fingerprint: Optional[Dict[str, Any]], resolved_thinking: Dict[str, bool]
+) -> bool:
+    """Whether the worker behind ``fingerprint`` reads a reasoning mode off the prompt.
+
+    ``resolved_thinking`` is what the prompt carries, per reasoning parser that takes its
+    mode from there. Only the parser the worker runs matters: a worker without a reasoning
+    parser, or with one that does not read the prompt, decides nothing from it and may be
+    given ids. A fingerprint that does not say which parser runs (an older worker) cannot
+    be judged, so it counts as one that does.
+    """
+    if not resolved_thinking:
+        return False
+    info = (fingerprint or {}).get("info")
+    if isinstance(info, dict) and "reasoning_parser" in info:
+        parser = info["reasoning_parser"]
+    elif "reasoning_parser" in (fingerprint or {}):
+        parser = fingerprint["reasoning_parser"]
+    else:
+        return True
+    return parser in resolved_thinking
 
 
 def _identity_complete(fingerprint: Dict[str, Any]) -> bool:

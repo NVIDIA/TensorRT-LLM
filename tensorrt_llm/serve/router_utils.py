@@ -40,9 +40,10 @@ from tensorrt_llm.serve.render import (
     PreparedContext,
     RenderResources,
     UnsupportedRenderError,
-    fingerprints_match,
+    fingerprint_mismatch,
     legacy_render_enabled,
     render_chat,
+    worker_resolves_thinking,
 )
 
 KV_CACHE_HASH_ALGO_DEFAULT = kv_cache_hash.KV_CACHE_HASH_ALGO_DEFAULT
@@ -334,13 +335,23 @@ class BlockHashMixin:
             cache[model] = resources
         return resources
 
-    def _may_write_back_token_ids(self, model: str) -> bool:
+    def _may_write_back_token_ids(
+        self, model: str, resolved_thinking: Optional[dict[str, bool]] = None
+    ) -> bool:
         """Whether prompt ids rendered here may replace the worker's own rendering.
 
         Only when every active worker reports the same rendering fingerprint as
         the router. A worker that reports none (an older version) or whose
-        ``/server_info`` could not be fetched counts as a mismatch. Hashing the vocabulary is slow, so the
-        router's own fingerprint is computed once per model.
+        ``/server_info`` could not be fetched counts as a mismatch. Hashing the vocabulary is
+        slow, so the router's own fingerprint is computed once per model.
+
+        ``resolved_thinking`` is the reasoning mode the prompt carries, per parser that reads it
+        off the prompt. A forwarded request has no prompt text for the worker to read it from,
+        so ids go only to workers whose own parser does not need it.
+
+        The workers whose rendering differs are left in ``_write_back_blockers``, by server with
+        the reason; the workers that need the prompt text for the reasoning mode, in
+        ``_thinking_blockers``.
         """
         published = self.__dict__.get("_published_render_fingerprints")
         servers = list(getattr(self, "_servers", None) or [])
@@ -354,20 +365,26 @@ class BlockHashMixin:
             # fetch leaves a worker active with no entry, and it must not be skipped.
             info = getattr(self, "_server_info", None) or {}
             remote = [(info.get(server) or {}).get("render_fingerprint") for server in servers]
-        self._write_back_blockers = []
+        self._write_back_blockers = {}
+        self._thinking_blockers = []
         if not remote:
             return False
         cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
         local = cache.get(model)
         if local is None:
             local = cache[model] = self._render_resources(model).fingerprint()
-        # Kept for the warning: which workers keep the ids from being forwarded.
-        self._write_back_blockers = [
+        for server, fingerprint in zip(servers, remote):
+            reason = fingerprint_mismatch(local, fingerprint)
+            if reason is not None:
+                self._write_back_blockers[server] = reason
+        if self._write_back_blockers:
+            return False
+        self._thinking_blockers = [
             server
             for server, fingerprint in zip(servers, remote)
-            if not fingerprints_match(local, fingerprint)
+            if worker_resolves_thinking(fingerprint, resolved_thinking or {})
         ]
-        return not self._write_back_blockers
+        return not self._thinking_blockers
 
     def set_published_render_fingerprints(self, fingerprints: dict[str, Optional[dict]]) -> None:
         """Worker fingerprints (summaries) a disagg coordinator published, by server."""
@@ -384,9 +401,10 @@ class BlockHashMixin:
                 tokenize=True,
                 encode_rendered=self._make_encode_rendered(request),
             )
-        except UnsupportedRenderError as error:
-            # Media, or a model the renderer does not support: route on an
-            # estimate and let the worker render the request itself.
+        except (UnsupportedRenderError, ValueError) as error:
+            # Media, a model the renderer does not support, or a request a serving extension
+            # rejects (kimi_k3 parameter policy, dynamic tools): route on an estimate and let
+            # the worker render the request itself, and answer it.
             logger.debug(f"Router could not render the request ({error}); routing on an estimate.")
             return self._tokenize_chat_legacy(request, set_prompt_token_ids=False)
         # A forwarded request is an ordinary chat request carrying prompt_token_ids, so the
@@ -394,29 +412,42 @@ class BlockHashMixin:
         # (kimi_k3) and reasoning modes read off the prompt are lost. Ids whose serving
         # semantics cannot be preserved that way are not forwarded; the worker renders them.
         context = PreparedContext.model_validate(rendered.context)
-        reason = None
+        request_reason = None
         if getattr(request.tool_choice, "function", None) is not None:
             # A named function makes the worker append a forced tool-call prefix to the prompt
             # it renders, and the worker rejects such a request together with prompt_token_ids.
-            reason = "a named tool_choice is rendered by the worker"
-        elif not context.is_trivial():
-            reason = "serving decisions derived from the rendered prompt cannot be forwarded"
-        if reason is None and self._may_write_back_token_ids(request.model):
+            request_reason = "a named tool_choice is rendered by the worker"
+        elif context.prompt_tokens_excluded_from_usage:
+            request_reason = "the worker adjusts the reported prompt usage from the prompt text"
+        if request_reason is None and self._may_write_back_token_ids(
+            request.model, context.resolved_thinking
+        ):
             request.prompt_token_ids = rendered.token_ids
+            self._last_fallback_reason = None
+            return rendered.token_ids
+        blockers = getattr(self, "_write_back_blockers", None) or {}
+        thinking_blockers = getattr(self, "_thinking_blockers", None) or []
+        if request_reason is not None:
+            logger.debug(f"Router rendered prompt ids are not forwarded: {request_reason}.")
+        elif not blockers and thinking_blockers:
+            logger.debug(
+                "Router rendered prompt ids are not forwarded: the reasoning parser of "
+                f"{', '.join(thinking_blockers)} reads the reasoning mode off the prompt text."
+            )
         else:
-            self._render_fallbacks = getattr(self, "_render_fallbacks", 0) + 1
-            if self._render_fallbacks == 1:
-                blockers = getattr(self, "_write_back_blockers", None)
-                if reason is None:
-                    reason = (
-                        "rendering fingerprint missing or different on " + ", ".join(blockers)
-                        if blockers
-                        else "no workers are known yet"
-                    )
+            reason = (
+                ", ".join(f"{server} ({why})" for server, why in blockers.items())
+                if blockers
+                else "no workers are known yet"
+            )
+            # The state of the workers, not of this request: reported again only when it changes.
+            if reason != getattr(self, "_last_fallback_reason", None):
+                self._last_fallback_reason = reason
                 logger.warning(
                     f"Router rendered prompt ids are not forwarded to workers: {reason}. "
                     "Workers render the prompt themselves; routing is based on the router's ids."
                 )
+        self._render_fallbacks = getattr(self, "_render_fallbacks", 0) + 1
         return rendered.token_ids
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:

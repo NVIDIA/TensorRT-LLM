@@ -30,7 +30,13 @@ from .chat import (
     render_conversation,
     tokenize_rendered,
 )
-from .fingerprint import compute_fingerprint, fingerprint_summary, fingerprints_match
+from .fingerprint import (
+    compute_fingerprint,
+    fingerprint_mismatch,
+    fingerprint_summary,
+    fingerprints_match,
+    worker_resolves_thinking,
+)
 from .prompt_types import (
     RENDERED_REQUEST_SCHEMA_VERSION,
     PreparedContext,
@@ -54,6 +60,7 @@ __all__ = [
     "arender_chat",
     "attach_render_routes",
     "compute_fingerprint",
+    "fingerprint_mismatch",
     "fingerprint_summary",
     "fingerprints_match",
     "harmony_enabled_for",
@@ -64,4 +71,5 @@ __all__ = [
     "render_conversation",
     "render_endpoints_enabled",
     "tokenize_rendered",
+    "worker_resolves_thinking",
 ]

@@ -325,6 +325,7 @@ def _parse_text_conversation(
             res.hf_config,
             res.multimodal_server_config,
             request_media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            model_type_override=res.model_type,
             resolve_media=False,
         )
     except ValidationError as error:
@@ -338,6 +339,7 @@ def _parse_text_conversation(
             res.hf_config,
             res.multimodal_server_config,
             request_media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            model_type_override=res.model_type,
             resolve_media=False,
         )
 
@@ -383,9 +385,12 @@ def render_chat(
             f"Model type {res.model_type!r} builds its prompt in its own input processor; "
             "rendering its prompts is not supported."
         )
-    conversation, _mm_coroutine, mm_placeholder_counts, _mm_item_order = _parse_text_conversation(
+    conversation, mm_coroutine, mm_placeholder_counts, _mm_item_order = _parse_text_conversation(
         request, res, raw_messages
     )
+    # Nothing here loads media; close the coroutine instead of leaving it to be reported
+    # as never awaited.
+    mm_coroutine.close()
     rendered = apply_chat_template(
         **_template_kwargs(
             res,

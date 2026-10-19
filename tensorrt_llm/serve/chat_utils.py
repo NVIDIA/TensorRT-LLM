@@ -469,6 +469,8 @@ def parse_chat_messages_coroutines(
             (e.g. `--media_io_kwargs`); defaults to empty.
         request_media_io_kwargs: Per-request override merged per
             modality with the server default via `BaseMediaIO.create`.
+        model_type_override: The model type to parse for, for a caller that
+            has no `model_config` (the KV-aware router) but knows the type.
         resolve_media: When False the returned coroutine closes the
             pending loads instead of running them and yields
             `(None, None)`.
@@ -481,7 +483,8 @@ def parse_chat_messages_coroutines(
     """
     conversation = []
     mm_placeholder_counts = []
-    model_type = resolve_top_level_model_type(model_config)
+    model_type = model_type_override or resolve_top_level_model_type(
+        model_config)
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,

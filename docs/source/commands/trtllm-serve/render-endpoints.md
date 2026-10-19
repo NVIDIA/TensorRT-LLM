@@ -118,3 +118,21 @@ appends a forced tool-call prefix when it renders, and rejects the request toget
 ## Limits
 
 Multimodal requests (images, video, audio) are not yet supported. The endpoints return `400` for them.
+
+## When the KV-aware router forwards its ids
+
+The `kv_cache_aware` router renders each chat request with the same code to choose a worker. It also sends the ids it
+rendered to the worker, so the worker does not render again, only when every active worker reports the same rendering
+fingerprint as the router in `/server_info`. Otherwise the worker renders the prompt itself and the router only uses
+its ids to route. The router logs a warning that names each worker that blocks forwarding and why, and logs again
+only when that changes. The causes:
+
+- A worker reports no fingerprint (an older version, or its `/server_info` could not be fetched).
+- A worker renders differently: another chat template (`--chat_template`), tokenizer, model type, or a model whose
+  processor builds the prompt (vision models).
+- A tokenizer that cannot be fully identified.
+- The router has no model path to resolve the model type from, so it renders as a generic text model.
+
+Some requests are never forwarded, whatever the workers report: a named `tool_choice`; a model whose usage count
+excludes tokens of the rendered prompt (Kimi-K3); and a prompt that carries a reasoning mode (`<think>` prefilled) when a
+worker runs a reasoning parser that reads the mode from the prompt text (`poolside_v1`, `laguna`, `minimax_m3`).

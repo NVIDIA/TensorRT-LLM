@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -32,10 +34,13 @@ from tensorrt_llm.serve.render import (
     RenderResources,
     UnsupportedRenderError,
     compute_fingerprint,
+    fingerprint_mismatch,
+    fingerprint_summary,
     fingerprints_match,
     legacy_render_enabled,
     render_chat,
     render_conversation,
+    worker_resolves_thinking,
 )
 from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
 
@@ -117,6 +122,45 @@ class TestRenderChat:
         # The loader a worker uses truncates on the left, keeping the end of the prompt.
         assert tokenizer.truncation_side == "left"
         assert render_chat(request, resources(tokenizer)).token_ids == full[-5:]
+
+    def test_rendering_leaves_no_unawaited_coroutine(self, tokenizer) -> None:
+        # The conversation parser hands back a coroutine for the media it would load. Nothing is
+        # loaded here, and Python reports one left alone as "never awaited" on every render.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            render_chat(chat_request(), resources(tokenizer))
+            gc.collect()
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+    def test_a_router_without_a_model_config_still_parses_for_the_model_type(self) -> None:
+        # kimi_k3 keeps a tool call's unparsable argument string verbatim, the way the worker
+        # (which has the model config) parses it. A caller that has only the model type must
+        # get the same prompt, not an error.
+        tokenizer = make_tokenizer(name=KIMI_K3)
+        request = chat_request(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{not json"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "x"},
+                {"role": "user", "content": "go"},
+            ]
+        )
+
+        rendered = render_chat(
+            request, RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
+        )
+
+        assert "{not json" in rendered.text
 
     def test_a_pre_tokenized_request_renders_to_its_own_ids(self, tokenizer) -> None:
         result = render_chat(chat_request(prompt_token_ids=[4, 5, 6]), resources(tokenizer))
@@ -447,6 +491,47 @@ class TestFingerprint:
             compute_fingerprint(harmony_resources(model_type=None)),
             compute_fingerprint(harmony_resources()),
         )
+
+    def test_a_mismatch_says_why(self, tokenizer) -> None:
+        fingerprint = compute_fingerprint(resources(tokenizer))
+        other = compute_fingerprint(resources(tokenizer, default_chat_template=SERVER_TEMPLATE))
+        incomplete = {
+            **fingerprint,
+            "compared": {**fingerprint["compared"], "tokenizer": {"complete": False}},
+        }
+
+        assert fingerprint_mismatch(fingerprint, fingerprint) is None
+        assert "no rendering fingerprint reported" in fingerprint_mismatch(fingerprint, None)
+        assert "renders differently" in fingerprint_mismatch(fingerprint, other)
+        assert "tokenizer cannot be fully identified" in fingerprint_mismatch(
+            fingerprint, incomplete
+        )
+        assert "tokenizer cannot be fully identified" in fingerprint_mismatch(
+            incomplete, fingerprint
+        )
+
+    @pytest.mark.parametrize(
+        "parser,resolved,expected",
+        [
+            ("poolside_v1", {"poolside_v1": True}, True),
+            ("poolside_v1", {"poolside_v1": False}, True),
+            ("qwen3", {"poolside_v1": True}, False),
+            (None, {"poolside_v1": True}, False),
+            ("poolside_v1", {}, False),
+        ],
+    )
+    def test_only_the_workers_own_reasoning_parser_decides_what_the_prompt_must_carry(
+        self, tokenizer, parser, resolved, expected
+    ) -> None:
+        fingerprint = compute_fingerprint(resources(tokenizer, reasoning_parser=parser))
+
+        assert worker_resolves_thinking(fingerprint, resolved) is expected
+        # A published summary says the same.
+        assert worker_resolves_thinking(fingerprint_summary(fingerprint), resolved) is expected
+
+    def test_a_fingerprint_that_does_not_name_the_parser_is_judged_to_need_the_prompt(self) -> None:
+        assert worker_resolves_thinking({"digest": "d"}, {"poolside_v1": True})
+        assert not worker_resolves_thinking({"digest": "d"}, {})
 
     def test_the_extension_and_harmony_switch_change_the_digest(self, tokenizer) -> None:
         plain = compute_fingerprint(resources(tokenizer))
