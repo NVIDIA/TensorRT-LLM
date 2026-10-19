@@ -276,10 +276,11 @@ class FullAttnSplitKvFoldAttention:
         """
         permuted = self._qkv_layout_inverse is not None
         mapping = getattr(self, "mapping", None)
+        kv_heads = self._split_kv_kv_heads
         checks = (
             (
                 qkv.dim() != 2
-                or qkv.shape[1] != _fold.RAW_WIDTH
+                or qkv.shape[1] != _fold.raw_width(kv_heads)
                 or qkv.stride(-1) != 1
                 or qkv.stride(0) % 8 != 0
                 or qkv.data_ptr() % 16 != 0,
@@ -324,7 +325,7 @@ class FullAttnSplitKvFoldAttention:
             (
                 kv_pool.dtype != torch.float8_e4m3fn
                 or kv_pool.dim() != 4
-                or tuple(kv_pool.shape[1:]) != (_v4.KV_HEADS, _v4.PAGE, _v4.HEAD_DIM)
+                or tuple(kv_pool.shape[1:]) != (kv_heads, _v4.PAGE, _v4.HEAD_DIM)
                 or not kv_pool.is_contiguous(),
                 "another cache view",
             ),
@@ -333,7 +334,8 @@ class FullAttnSplitKvFoldAttention:
                 "not one sequence's K/V page table",
             ),
             (
-                block_tables.dim() == 3 and -(-block_tables.shape[2] // splits) > _v4.MAX_CTA_PAGES,
+                block_tables.dim() == 3
+                and -(-block_tables.shape[2] // splits) > _v4.cta_pages(kv_heads),
                 "more pages per split than the kernel stages",
             ),
             (
@@ -346,6 +348,7 @@ class FullAttnSplitKvFoldAttention:
                     self.scale_query_by,
                     permuted,
                     self._split_kv_rescale_cols,
+                    kv_heads,
                 )
                 not in _v4._compiled_keys,
                 "full_attention_prep_fold was not compiled before this capture",
@@ -472,7 +475,9 @@ class FullAttnSplitKvFoldAttention:
         # The attention output the output gate is handed: never written (the gate merges the
         # partials instead, as with the split-KV attention).
         out = torch.empty(
-            (rows, _v4.Q_HEADS * _v4.HEAD_DIM), dtype=torch.bfloat16, device=call.qkv.device
+            (rows, _v4.q_heads(self._split_kv_kv_heads) * _v4.HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=call.qkv.device,
         )
         self._split_kv_pending = (part_o, part_lse, rows, out.data_ptr(), call.seq_lens)
         self._prep_fold_record(FOLD)

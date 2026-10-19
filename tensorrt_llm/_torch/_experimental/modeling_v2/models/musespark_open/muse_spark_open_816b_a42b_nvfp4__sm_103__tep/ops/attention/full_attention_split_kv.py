@@ -12,6 +12,9 @@ page through TMA tensor boxes (V in one 4 KB box, K in two 2 KB boxes, one per K
 16-stage ring, scores each 128-key tile with one N=128 MMA per Q term and K block, and writes
 one partial per row -- the normalized O in FP16 and its log2-sum-exp -- with no in-kernel
 combine. ``combine_norm_gate`` (the attention norm-gate that follows) merges the partials.
+That is the tep8 rank's shape (16 query / 2 KV heads). A tep4 rank's 4 KV heads are two such
+pairs: the grid is ``splits x 2`` CTAs with half as many splits, and every CTA computes what the
+tep8 build computes on its pair's slice of the operand, the pool and the partials.
 
 It writes no cache byte: the step's K/V and its query are written before it by the
 ``full_attention_prep_append`` folded prep (``preattn_prep_append``), whose BF16 fused operand ``[q' | k' | v]`` is this
@@ -121,11 +124,14 @@ Q_HEADS = KV_HEADS * Q_PER_KV
 QKV_WIDTH = (Q_HEADS + 2 * KV_HEADS) * HEAD_DIM
 #: Query rows the kernel's row map is written for: one accepted token and up to 7 drafts.
 MAX_ROWS = 8
-#: Output rows of a step: (token, query head) pairs.
+#: Output rows of a tep8 step: (token, query head) pairs.
 OUT_ROWS = MAX_ROWS * Q_HEADS
+#: KV heads of one rank per tensor-parallel size the kernel is built for (16 KV heads in the
+#: model): one pair at tep8, two at tep4. Any other rank shape has no build.
+RANK_KV_HEADS = {8: KV_HEADS, 4: 2 * KV_HEADS}
 #: Largest grid the combine reads partials for.
 MAX_SPLITS = 512
-#: Page ids one CTA stages in shared memory per table row.
+#: Page ids one CTA stages in shared memory per table row in the tep8 build (``cta_pages``).
 MAX_CTA_PAGES = 256
 #: Fewest pages per keyed split: a context of n pages has min(splits, ceil(n / MIN_PAGES)) keyed
 #: splits, the first ones; the rest are key-less.
@@ -136,6 +142,42 @@ RESCALE_COLS = (16, 32, HEAD_DIM)
 SPILL_FREE_RESCALE_COLS = 16
 
 
+def q_heads(kv_heads: int) -> int:
+    """Query heads of a rank with ``kv_heads`` KV heads."""
+    return kv_heads * Q_PER_KV
+
+
+def qkv_width(kv_heads: int) -> int:
+    """Width of the fused-QKV operand row of a rank with ``kv_heads`` KV heads."""
+    return (q_heads(kv_heads) + 2 * kv_heads) * HEAD_DIM
+
+
+def out_rows(kv_heads: int) -> int:
+    """Partial rows of a step of a rank with ``kv_heads`` KV heads: (token, query head) pairs."""
+    return MAX_ROWS * q_heads(kv_heads)
+
+
+def cta_pages(kv_heads: int) -> int:
+    """Page ids one CTA of the ``kv_heads`` build stages per table row: 256 at tep8, 512 at tep4
+    (whose pairs of KV heads split the SMs, so each CTA covers twice the pages of a tep8 CTA at
+    the same context)."""
+    if kv_heads == RANK_KV_HEADS[8]:
+        return MAX_CTA_PAGES
+    elif kv_heads == RANK_KV_HEADS[4]:
+        return 2 * MAX_CTA_PAGES
+    raise ValueError(f"full_attention_split_kv has no build for {kv_heads} KV heads per rank")
+
+
+def default_splits(kv_heads: int, sm_count: int) -> int:
+    """The splits of one pair of KV heads the target launches: one CTA per SM over the grid's
+    ``splits x pairs``: every SM at tep8 (one pair), half of them at tep4 (two pairs)."""
+    if kv_heads == RANK_KV_HEADS[8]:
+        return sm_count
+    elif kv_heads == RANK_KV_HEADS[4]:
+        return sm_count // 2
+    raise ValueError(f"full_attention_split_kv has no build for {kv_heads} KV heads per rank")
+
+
 def keyed_splits(seq_len: int, num_splits: int) -> int:
     """How many of ``num_splits`` splits hold keys at context ``seq_len`` (the kernel's
     ``eff``; splits ``>= keyed_splits`` are key-less)."""
@@ -143,11 +185,15 @@ def keyed_splits(seq_len: int, num_splits: int) -> int:
     return min(num_splits, (pages + MIN_PAGES - 1) // MIN_PAGES)
 
 
-def partial_buffers(num_splits: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Uninitialized partial buffers for ``num_splits`` CTAs: FP16 O ``[128, splits, 64]`` and
-    fp32 log2-sum-exp ``[128, splits]`` (row = token * 16 + query head)."""
-    part_o = torch.empty(OUT_ROWS, num_splits, HEAD_DIM, dtype=torch.float16, device=device)
-    part_lse = torch.empty(OUT_ROWS, num_splits, dtype=torch.float32, device=device)
+def partial_buffers(
+    num_splits: int, device, kv_heads: int = KV_HEADS
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Uninitialized partial buffers for ``num_splits`` splits: FP16 O ``[8 hq, splits, 64]``
+    and fp32 log2-sum-exp ``[8 hq, splits]`` (row = token * hq + query head; hq = 16 at tep8,
+    32 at tep4)."""
+    rows = out_rows(kv_heads)
+    part_o = torch.empty(rows, num_splits, HEAD_DIM, dtype=torch.float16, device=device)
+    part_lse = torch.empty(rows, num_splits, dtype=torch.float32, device=device)
     return part_o, part_lse
 
 
@@ -165,6 +211,7 @@ def _compiled_kernel(
     fold: Optional[Tuple[float, float, bool]] = None,
     app_wait: bool = True,
     min_pages: int = MIN_PAGES,
+    kv_heads: int = KV_HEADS,
 ):
     """The compiled kernel of one build. ``loader_wait=False`` (the loader never waits for the
     predecessor) exists for the PDL tests' negative control; ``k_tile=False`` and
@@ -180,7 +227,8 @@ def _compiled_kernel(
     prep's norm and the step's K/V append inside), without the pre-wait prefetch;
     ``app_wait=False`` (its loader does not wait for the append) is that op's tests' negative
     control. ``min_pages`` other than ``MIN_PAGES`` (fewer pages per split, so that the step's
-    two pages can sit in two CTAs) exists for that op's tests too; the ops build neither."""
+    two pages can sit in two CTAs) exists for that op's tests too; the ops build neither.
+    ``kv_heads`` is the rank's KV heads (``RANK_KV_HEADS``: 2 at tep8, 4 at tep4)."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -208,6 +256,8 @@ def _compiled_kernel(
             p_split=p_split,
             rescale_cols=rescale_cols,
             rescale_log2=rescale_log2,
+            kv_heads=kv_heads,
+            max_cta_pages=cta_pages(kv_heads),
         )
     else:
         assert not prefetch and k_tile and p_split, (prefetch, k_tile, p_split)
@@ -223,6 +273,8 @@ def _compiled_kernel(
             app_wait=app_wait,
             rescale_cols=rescale_cols,
             rescale_log2=rescale_log2,
+            kv_heads=kv_heads,
+            max_cta_pages=cta_pages(kv_heads),
         )
     dtypes = (
         cutlass.BFloat16,  # qkv
@@ -256,23 +308,35 @@ def compiled_key(
     prefetch: bool,
     evict_first: bool,
     rescale_cols: int = HEAD_DIM,
+    kv_heads: int = KV_HEADS,
 ) -> tuple:
     """The key ``_compiled_keys`` holds once that build is compiled: ``(device index, PDL,
     prefetch, evict_first)``, with ``("rescale_cols", n)`` appended for a chunked-rescale build
-    (``rescale_cols`` other than 64)."""
+    (``rescale_cols`` other than 64) and ``("kv_heads", n)`` for the tep4 build."""
     key = (device_index, bool(enable_pdl), bool(prefetch), bool(evict_first))
     if rescale_cols != HEAD_DIM:
         key += (("rescale_cols", int(rescale_cols)),)
+    if kv_heads != KV_HEADS:
+        key += (("kv_heads", int(kv_heads)),)
     return key
+
+
+def build_options(key: tuple) -> dict:
+    """The keyword options of ``_compiled_kernel`` a key's suffix (past its first four or, for
+    the fold, five entries) names."""
+    return {name: value for name, value in key if name in ("rescale_cols", "kv_heads")}
 
 
 class FullAttnSplitKv(OpWrapper):
     """Full-attention decode partials for one sequence and at most 8 rows.
 
-    Reads Q (BF16, the first 16 heads of the fused operand ``[rows, (16 + 2 + 2) * 64]``) and
-    the FP8 paged cache, which must already hold the step's K/V. Writes, into ``part_o``
-    ``[128, num_splits, 64]`` FP16 and ``part_lse`` ``[128, num_splits]`` fp32 (row = token
-    * 16 + query head; rows of tokens >= rows are not written), each split's normalized
+    The rank's shape is the pool's KV heads ``G`` (``kv_pool.shape[1]``): 2 at tep8, 4 at tep4
+    (``RANK_KV_HEADS``), with ``H = 8 G`` query heads. Reads Q (BF16, the first ``H`` heads of
+    the fused operand ``[rows, (H + 2 G) * 64]``) and the FP8 paged cache, which must already
+    hold the step's K/V. Writes, into ``part_o`` ``[8 H, num_splits, 64]`` FP16 and
+    ``part_lse`` ``[8 H, num_splits]`` fp32 (row = token * H + query head; rows of tokens >=
+    rows are not written; ``num_splits`` is per pair of KV heads, the grid
+    ``num_splits x G / 2``), each split's normalized
     attention output times the V dequant scale and its log2-sum-exp in units of the score
     scaled by ``log2(e) / 8``; a split with no keys writes ``-inf`` and no O. Returns
     ``(part_o, part_lse)``. ``seq_lens[0]`` is the context length including the step's rows;
@@ -282,9 +346,10 @@ class FullAttnSplitKv(OpWrapper):
     streams the pages below the step's first new position before the dependency wait;
     ``evict_first`` loads K/V with the L2 evict-first policy. Neither changes a value.
 
-    Loud preconditions (ValueError): BF16 qkv of 1..8 rows and width 1280 with a unit last
-    stride and 16-byte aligned rows; a contiguous FP8 E4M3 pool ``[blocks, 2, 32, 64]``; an
-    int32 ``[2, pages]`` block table with a unit last stride and at most 256 pages per split;
+    Loud preconditions (ValueError): BF16 qkv of 1..8 rows and width ``(H + 2 G) * 64`` (1280
+    at tep8, 2560 at tep4) with a unit last stride and 16-byte aligned rows; a contiguous FP8
+    E4M3 pool ``[blocks, G, 32, 64]`` with G 2 or 4; an int32 ``[2, pages]`` block table with
+    a unit last stride and at most ``cta_pages(G)`` (256 at tep8, 512 at tep4) pages per split;
     int32 ``seq_lens``; an fp32 scale; ``1 <= num_splits <= 512``; partial buffers of the
     shapes above; every tensor 16-byte aligned on one sm_103 or sm_107 device. The first call
     per device and build compiles the kernel, which must not happen inside a CUDA-graph capture.
@@ -294,6 +359,8 @@ class FullAttnSplitKv(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    # The tep4 cells (kv_heads=4) are certified by the tep4 op test.
 
     # spec: rows, ctx (= seq_lens[0], the step's rows included); optional splits (default: the
     # device's SM count), pdl, prefetch (default False).
@@ -368,20 +435,27 @@ class FullAttnSplitKv(OpWrapper):
         rescale_cols: int = HEAD_DIM,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows = qkv.shape[0] if qkv.dim() == 2 else 0
+        kv_heads = kv_pool.shape[1] if kv_pool.dim() == 4 else 0
+        if kv_heads not in RANK_KV_HEADS.values():
+            raise ValueError(
+                "full_attention_split_kv takes a pool [blocks, G, "
+                f"{PAGE}, {HEAD_DIM}] with G KV heads in {sorted(RANK_KV_HEADS.values())}; got "
+                f"{tuple(kv_pool.shape)}"
+            )
         if part_o is None or part_lse is None:
-            part_o, part_lse = partial_buffers(num_splits, qkv.device)
+            part_o, part_lse = partial_buffers(num_splits, qkv.device, kv_heads)
         tensors = (qkv, kv_pool, block_tables, seq_lens, kv_scale_orig_quant, part_o, part_lse)
         width = block_tables.shape[1] if block_tables.dim() == 2 else 0
         if (
             qkv.dtype != torch.bfloat16
             or qkv.dim() != 2
-            or qkv.shape[1] != QKV_WIDTH
+            or qkv.shape[1] != qkv_width(kv_heads)
             or qkv.stride(-1) != 1
             or qkv.stride(0) % 8 != 0
             or not 1 <= rows <= MAX_ROWS
             or kv_pool.dtype != torch.float8_e4m3fn
             or kv_pool.dim() != 4
-            or tuple(kv_pool.shape[1:]) != (KV_HEADS, PAGE, HEAD_DIM)
+            or tuple(kv_pool.shape[2:]) != (PAGE, HEAD_DIM)
             or not kv_pool.is_contiguous()
             or block_tables.dtype != torch.int32
             or block_tables.dim() != 2
@@ -390,29 +464,30 @@ class FullAttnSplitKv(OpWrapper):
             or block_tables.stride(-1) != 1
             or not 1 <= num_splits <= MAX_SPLITS
             or rescale_cols not in RESCALE_COLS
-            or -(-width // num_splits) > MAX_CTA_PAGES
+            or -(-width // num_splits) > cta_pages(kv_heads)
             or seq_lens.dtype != torch.int32
             or seq_lens.numel() < 1
             or kv_scale_orig_quant.dtype != torch.float32
             or kv_scale_orig_quant.numel() < 1
             or part_o.dtype != torch.float16
-            or tuple(part_o.shape) != (OUT_ROWS, num_splits, HEAD_DIM)
+            or tuple(part_o.shape) != (out_rows(kv_heads), num_splits, HEAD_DIM)
             or not part_o.is_contiguous()
             or part_lse.dtype != torch.float32
-            or tuple(part_lse.shape) != (OUT_ROWS, num_splits)
+            or tuple(part_lse.shape) != (out_rows(kv_heads), num_splits)
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
             or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
         ):
             raise ValueError(
-                "full_attention_split_kv takes, on one sm_103 or sm_107 device and 16-byte aligned: "
-                "BF16 qkv "
-                f"[1..{MAX_ROWS}, {QKV_WIDTH}] (unit last stride, rows a multiple of 8 elements "
-                f"apart), a contiguous FP8 E4M3 pool [blocks, {KV_HEADS}, {PAGE}, {HEAD_DIM}], an "
-                f"int32 [2, pages] block table (unit last stride, at most {MAX_CTA_PAGES} pages "
-                f"per split), int32 seq_lens, an fp32 scale, 1..{MAX_SPLITS} splits and contiguous "
-                f"partials FP16 [{OUT_ROWS}, splits, {HEAD_DIM}] / fp32 [{OUT_ROWS}, splits]; got "
+                "full_attention_split_kv takes, on one sm_103 or sm_107 device and 16-byte aligned: a "
+                "contiguous FP8 E4M3 pool [blocks, G, "
+                f"{PAGE}, {HEAD_DIM}] with G KV heads in {sorted(RANK_KV_HEADS.values())}, BF16 "
+                f"qkv [1..{MAX_ROWS}, (8 G + 2 G) * {HEAD_DIM}] (unit last stride, rows a multiple "
+                "of 8 elements apart), an int32 [2, pages] block table (unit last stride, at most "
+                f"{cta_pages(kv_heads)} pages per split), int32 seq_lens, an fp32 "
+                f"scale, 1..{MAX_SPLITS} splits and contiguous partials FP16 [64 G, splits, "
+                f"{HEAD_DIM}] / fp32 [64 G, splits]; got "
                 f"qkv {qkv.dtype} {tuple(qkv.shape)} strides {tuple(qkv.stride())}, pool "
                 f"{kv_pool.dtype} {tuple(kv_pool.shape)}, table {block_tables.dtype} "
                 f"{tuple(block_tables.shape)} strides {tuple(block_tables.stride())}, seq_lens "
@@ -422,14 +497,13 @@ class FullAttnSplitKv(OpWrapper):
                 f"devices {[str(t.device) for t in tensors]}"
             )
         device_index = qkv.device.index
-        key = compiled_key(device_index, enable_pdl, prefetch, evict_first, rescale_cols)
+        key = compiled_key(device_index, enable_pdl, prefetch, evict_first, rescale_cols, kv_heads)
         if torch.cuda.is_current_stream_capturing() and key not in _compiled_keys:
             raise RuntimeError(
                 "full_attention_split_kv compiles on its first call per device and build; make that call "
                 "before capturing a CUDA graph"
             )
-        build = {} if rescale_cols == HEAD_DIM else {"rescale_cols": int(rescale_cols)}
-        compiled = _compiled_kernel(*key[:4], **build)
+        compiled = _compiled_kernel(*key[:4], **build_options(key[4:]))
         _compiled_keys.add(key)
         import cuda.bindings.driver as cuda
 
@@ -473,19 +547,21 @@ class FullAttnSplitKv(OpWrapper):
         ``Q_hi + Q_lo``, formed here exactly as the kernel forms it (IEEE fp32 Veltkamp split,
         E4M3 round-to-nearest with saturation). Everything after that is fp32, with TF32 off for
         the two matmuls (``true_fp32_matmul``), and P stays fp32. Returns the fp32 attention
-        output ``[rows, 16 * 64]`` (times the V dequant scale), not the partials: how the op
+        output ``[rows, H * 64]`` (times the V dequant scale), not the partials: how the op
         cuts the keys (``num_splits``), launches (``enable_pdl``, ``prefetch``,
         ``evict_first``) and where it writes (``part_o``, ``part_lse``) change nothing it
         computes, and are ignored here.
         """
         rows = qkv.shape[0]
+        kv_heads = kv_pool.shape[1]
+        heads = q_heads(kv_heads)
         length = int(seq_lens[0])
         scale = kv_scale_orig_quant.float()[0]
 
         def e4m3(x: torch.Tensor) -> torch.Tensor:
             return x.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
-        q = qkv[:, : Q_HEADS * HEAD_DIM].float().reshape(rows, Q_HEADS, HEAD_DIM)
+        q = qkv[:, : heads * HEAD_DIM].float().reshape(rows, heads, HEAD_DIM)
         c = q * 1048577.0
         hi = c - (c - q)
         q_eff = e4m3(hi).float() + e4m3(q - hi).float()
@@ -495,15 +571,15 @@ class FullAttnSplitKv(OpWrapper):
 
         def gather(kv: int) -> torch.Tensor:
             raw = pool_bytes[block_tables[kv, keys // PAGE].long(), :, keys % PAGE]
-            return raw.view(torch.float8_e4m3fn).float() * dequant  # [keys, 2, 64]
+            return raw.view(torch.float8_e4m3fn).float() * dequant  # [keys, G, 64]
 
         k, v = gather(0), gather(1)
         past = length - rows
-        out = torch.empty((rows, Q_HEADS, HEAD_DIM), dtype=torch.float32, device=qkv.device)
+        out = torch.empty((rows, heads, HEAD_DIM), dtype=torch.float32, device=qkv.device)
         with true_fp32_matmul():
             for t in range(rows):
                 end = past + t + 1
-                for h in range(KV_HEADS):
+                for h in range(kv_heads):
                     qs = q_eff[t, h * Q_PER_KV : (h + 1) * Q_PER_KV]
                     s = qs @ k[:end, h].T / math.sqrt(HEAD_DIM)
                     out[t, h * Q_PER_KV : (h + 1) * Q_PER_KV] = (
@@ -551,12 +627,14 @@ class FullAttnSplitKv(OpWrapper):
 
 
 def merge_partials(part_o: torch.Tensor, part_lse: torch.Tensor, rows: int) -> torch.Tensor:
-    """The merged attention output ``[rows, 16 * 64]`` fp32 of the op's partials, in torch.
+    """The merged attention output ``[rows, H * 64]`` fp32 of the op's partials, in torch (H
+    query heads: ``part_o.shape[0] // 8``, 16 at tep8, 32 at tep4).
 
     A test helper and the definition of what ``combine_norm_gate`` merges: weights
     ``2^(lse_s - max lse)`` over the splits with a finite log2-sum-exp, O averaged with them.
     """
-    n = rows * Q_HEADS
+    heads = part_o.shape[0] // MAX_ROWS
+    n = rows * heads
     lse = part_lse[:n].double()
     o = part_o[:n].double()
     valid = torch.isfinite(lse)
@@ -564,7 +642,7 @@ def merge_partials(part_o: torch.Tensor, part_lse: torch.Tensor, rows: int) -> t
     w = torch.where(valid, torch.exp2(lse - m), torch.zeros_like(lse))
     o = torch.where(valid[..., None], o, torch.zeros_like(o))
     merged = (w[..., None] * o).sum(dim=1) / w.sum(dim=1, keepdim=True)
-    return merged.reshape(rows, Q_HEADS * HEAD_DIM).float()
+    return merged.reshape(rows, heads * HEAD_DIM).float()
 
 
 full_attention_split_kv = FullAttnSplitKv()

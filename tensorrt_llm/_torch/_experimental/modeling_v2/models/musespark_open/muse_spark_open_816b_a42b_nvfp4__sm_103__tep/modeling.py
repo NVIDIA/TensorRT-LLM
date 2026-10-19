@@ -557,13 +557,10 @@ class DecodeTarget:
 
 #: TEP8: every fast path.
 _TEP8_PATHS = _dispatch.FAST_PATH_NAMES
-#: TEP4: the fast paths written for any rank count whose output is bitwise the
-#: built-in model's, and ``drafter_fc_shard``, whose sharded drafter projection
-#: can move a draft token's bf16 last place (the target still verifies every
-#: draft; it shards every row count at TP4).
-_TEP4_PATHS = frozenset(
+#: The fast paths written for any rank count whose output is bitwise the built-in
+#: model's.
+_TEP4_BITWISE_PATHS = frozenset(
     {
-        "drafter_fc_shard",
         "preattn_prep",
         "full_attention_prep_append",
         "post_attention_hop",
@@ -579,6 +576,21 @@ _TEP4_PATHS = frozenset(
         "split_sampler",
     }
 )
+#: TEP4 on either architecture: the bitwise paths and ``drafter_fc_shard``, whose
+#: sharded drafter projection can move a draft token's bf16 last place (the target
+#: still verifies every draft; it shards every row count at TP4).
+_TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
+#: TEP4 on sm103 adds the attention paths validated at a tep4 rank's 32 query / 4 KV
+#: heads.
+_SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
+    {
+        "swa_paged_decode",
+        "swa_block",
+        "full_attention_split_kv",
+        "full_attention_prep_fold",
+        "drafter_block_decode",
+    }
+)
 
 #: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
 #: the fast paths served and the GPU topology they were validated on, with DFlash
@@ -592,7 +604,7 @@ TARGET_PATHS = {
         preconditions=(_dispatch.SM107_FUSED_KERNELS,),
     ),
     (103, 4): _dispatch.TargetPaths(
-        served=_TEP4_PATHS,
+        served=_SM103_TEP4_PATHS,
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL,),
     ),

@@ -257,8 +257,9 @@ def recorded(monkeypatch):
         )
         return "part_o", "part_lse"
 
-    def cng(part_o, part_lse, rows, gate, eps, trigger, seq_lens):
+    def cng(part_o, part_lse, rows, gate, eps, trigger, seq_lens, heads=16):
         taken.append(("combine_norm_gate", part_o, rows, gate, trigger, seq_lens is not None))
+        state.setdefault("cng_heads", []).append(heads)
         return "merged-gated"
 
     def builtin_prep(self, qkv, position_ids):
@@ -514,3 +515,112 @@ def test_a_spill_free_call_launches_the_spill_free_build(adoptable, recorded, mo
             position_ids=None, hidden_states="qkv", attn_metadata="md", preattn_prep=_entry
         )
     assert census.reports[-1][1:4] == (2, 2, "info")
+
+
+# --------------------------------------------------------------------------
+# A tep4 rank: 32 query / 4 KV heads
+# --------------------------------------------------------------------------
+def _tep4(model):
+    """The stand-in's full-attention layers at a tep4 rank's heads."""
+    for layer in model.layers:
+        layer.self_attn.num_heads = 32
+        layer.self_attn.num_key_value_heads = 4
+    return model
+
+
+def test_install_picks_the_tep4_build_on_a_tep4_rank(adoptable):
+    model = _tep4(_model(8))
+    assert split_kv_attention.install(model) == 2
+    for index in (3, 7):
+        attention = model.layers[index].self_attn
+        # Two pairs of KV heads share the SMs: half of them per pair.
+        assert attention._split_kv_splits == 76
+        assert attention._split_kv_kv_heads == 4
+    tep8 = _model(8)
+    split_kv_attention.install(tep8)
+    assert tep8.layers[3].self_attn._split_kv_splits == 152
+    assert tep8.layers[3].self_attn._split_kv_kv_heads == 2
+
+
+@pytest.mark.parametrize("heads, kv_heads", ((8, 1), (64, 8), (24, 3), (32, 2), (16, 4)), ids=str)
+def test_install_refuses_a_rank_shape_with_no_build(adoptable, heads, kv_heads):
+    model = _model()
+    for layer in model.layers:
+        layer.self_attn.num_heads = heads
+        layer.self_attn.num_key_value_heads = kv_heads
+    before = [type(layer.self_attn) for layer in model.layers]
+    with pytest.raises(ValueError, match="neither a tep8 rank's"):
+        split_kv_attention.install(model)
+    assert [type(layer.self_attn) for layer in model.layers] == before
+
+
+def test_install_refuses_layers_of_mixed_rank_shapes(adoptable):
+    model = _model(8)
+    model.layers[7].self_attn.num_heads = 32
+    model.layers[7].self_attn.num_key_value_heads = 4
+    with pytest.raises(ValueError, match="mix rank shapes"):
+        split_kv_attention.install(model)
+
+
+def test_a_tep4_folded_decode_call_launches_the_tep4_build(adoptable, recorded, monkeypatch):
+    """The decline reads the tep4 shapes (a [blocks, 4, 32, 64] pool, a 2560-wide operand, a
+    [rows, 32, 64] output, 512 pages per split) and the merge runs at 32 heads."""
+    model = _tep4(_model())
+    split_kv_attention.install(model)
+    full = model.layers[3].self_attn
+    real_prep = full_attention.FullAppendAttention._prep_append_prep
+
+    def tep4_prep(self, qkv, md):
+        q, gate, folded = real_prep(self, qkv, md)
+        folded.qkv_out = torch.zeros(ROWS, 2560, dtype=torch.bfloat16)
+        return q, gate, folded
+
+    monkeypatch.setattr(full_attention.FullAppendAttention, "_prep_append_prep", tep4_prep)
+    pool = torch.zeros(10, 4, 32, 64, dtype=torch.float8_e4m3fn)
+    recorded.state["decode"] = dict(
+        kv_cache=(pool, pool),
+        out=torch.zeros(ROWS, 32, 64, dtype=torch.bfloat16),
+        block_tables=torch.zeros(1, 2, 76 * 512, dtype=torch.int32),
+    )
+    out = full(position_ids=None, hidden_states="qkv", attn_metadata="md", preattn_prep=_entry)
+    assert out == "merged-gated"
+    assert recorded.taken == [
+        ("full_attention_split_kv", (2, 76 * 512), 76, True, False, True, 64),
+        ("combine_norm_gate", "part_o", ROWS, "gate", "exit", True),
+    ]
+    assert recorded.state["cng_heads"] == [32]
+    # A tep8 pool, a tep8 operand or a table past 512 pages per split: the built-in FMHA.
+    for change in (
+        dict(kv_cache=(torch.zeros(10, 2, 32, 64, dtype=torch.float8_e4m3fn),) * 2),
+        dict(block_tables=torch.zeros(1, 2, 76 * 512 + 1, dtype=torch.int32)),
+        dict(out=torch.zeros(ROWS, 16, 64, dtype=torch.bfloat16)),
+    ):
+        recorded.taken.clear()
+        recorded.state["decode"] = dict(recorded.state["decode"], **change)
+        assert (
+            full(position_ids=None, hidden_states="qkv", attn_metadata="md", preattn_prep=_entry)
+            == "gated"
+        )
+        assert recorded.taken[0][0] == "builtin_fmha", change
+        recorded.state["decode"] = dict(
+            kv_cache=(pool, pool),
+            out=torch.zeros(ROWS, 32, 64, dtype=torch.bfloat16),
+            block_tables=torch.zeros(1, 2, 76 * 512, dtype=torch.int32),
+        )
+
+
+def test_the_tep4_key_is_its_own():
+    v4 = split_kv_attention._v4
+    assert v4.compiled_key(0, True, False, True, 64, 2) == (0, True, False, True)
+    assert v4.compiled_key(0, True, False, True, 16, 4) == (
+        0,
+        True,
+        False,
+        True,
+        ("rescale_cols", 16),
+        ("kv_heads", 4),
+    )
+    assert v4.build_options(v4.compiled_key(0, True, False, True, 16, 4)[4:]) == {
+        "rescale_cols": 16,
+        "kv_heads": 4,
+    }

@@ -834,3 +834,53 @@ def test_published_drafter_block_decode_in_the_serving_arena():
         for pool, written in ((pool_k, k_expected), (pool_v, v_expected)):
             assert _bitwise_equal(pool[0, :, lo:hi], written), ctx
             assert torch.count_nonzero(pool) == torch.count_nonzero(written), "outside the block"
+
+
+# --------------------------------------------------------------------------
+# Microbenchmark (MODELING_V2_TIMING=1): one drafter layer's block attention
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(
+    not os.environ.get("MODELING_V2_TIMING") or not _has_flash_attn(),
+    reason="MODELING_V2_TIMING unset or no flash_attn",
+)
+@pytest.mark.parametrize("hq, hkv", ((8, 1), (16, 2)), ids=("tep8", "tep4"))
+def test_microbenchmark_block_attention(hq, hkv):
+    """Per drafter layer, B=1, block 8, a 100,770-token context in the 1M arena: the built-in
+    (``index_put`` append + ``flash_attn_with_kvcache``) vs the op with the append fused, each
+    replayed 20 times in one CUDA graph. Printed, never gated."""
+    spec = dict(
+        batch=1, m=8, hq=hq, hkv=hkv, d=128, window=WINDOW, ctx=[100_770],
+        capacity=SERVING_CAPACITY, slots=2, append=True,
+    )  # fmt: skip
+    args = _inputs(spec, 1)
+    k_arena, v_arena = _arenas(args)
+    plain = {k: v for k, v in args.items() if k not in ("k_new", "v_new")}
+
+    def builtin():
+        _index_put(args, k_arena, v_arena)
+        _flash_attn(plain)
+
+    def fused():
+        op(**args, enable_pdl=True)
+
+    times = {}
+    for name, fn in (("builtin index_put+flash_attn", builtin), ("dflash_window_attention", fused)):
+        fn()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(20):
+                fn()
+        graph.replay()
+        torch.cuda.synchronize()
+        samples = []
+        for _ in range(5):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end) * 1000.0 / 20)
+        times[name] = sorted(samples)[2]
+    line = ", ".join(f"{name} {us:.1f} us" for name, us in times.items())
+    print(f"\nTIMING drafter block attention {hq} q / {hkv} kv heads: {line}")

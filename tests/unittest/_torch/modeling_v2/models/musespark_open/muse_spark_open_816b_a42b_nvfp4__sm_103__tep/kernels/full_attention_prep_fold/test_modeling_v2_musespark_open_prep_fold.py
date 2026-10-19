@@ -619,3 +619,58 @@ def test_a_step_the_builtin_chain_runs_in_another_mode_runs_prep_append_and_spli
     assert [e for e in routed.taken if e[0] != "kv_cache_metadata"] == _builtin_route()
     assert full._prep_fold_census.outcomes[3] == ("declined", reason)
     assert full._prep_fold_call is None
+
+
+# --------------------------------------------------------------------------
+# A tep4 rank: 32 query / 4 KV heads
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("permuted", (False, True), ids=("ckpt", "permuted"))
+def test_a_tep4_fold_routed_step_runs_the_tep4_fold(routed, permuted):
+    """At a tep4 rank the route reads the 4608-wide projection, a [blocks, 4, 32, 64] pool and
+    up to 512 pages per split over half the SMs; the merge runs at 32 heads with the gate a
+    view of the projection's 32 gate heads."""
+    model = SPLIT_KV._model()
+    for layer in model.layers:
+        layer.self_attn.num_heads = 32
+        layer.self_attn.num_key_value_heads = 4
+        attn = layer.self_attn.attn
+        attn.quant_mode = 0
+        attn.get_local_layer_idx = lambda md, _i=layer.self_attn.layer_idx: _i
+        attn.predicted_tokens_per_seq = MLAParams().predicted_tokens_per_seq
+        attn.attention_chunk_size = None
+    split_kv_attention.install(model)
+    prep_fold_attention.install(model)
+    full = model.layers[3].self_attn
+    assert full._split_kv_kv_heads == 4 and full._split_kv_splits == 76
+    if permuted:
+        full._qkv_layout_inverse = torch.arange(4608)
+    pool4 = torch.zeros(10, 4, 32, 64, dtype=torch.float8_e4m3fn)
+    tables = torch.zeros(1, 2, 76 * 512, dtype=torch.int32)
+    routed.state["pool"], routed.state["tables"] = pool4, tables
+    qkv = torch.randn(ROWS, 4608).to(torch.bfloat16)
+    assert _step(full, qkv) == "merged-gated"
+    assert routed.taken[1] == (
+        "full_attention_prep_fold", 1e-5, 1.0, permuted, (2, 76 * 512), 76, True, True,
+    )  # fmt: skip
+    name, _, rows, gate, _, _ = routed.taken[2]
+    assert name == "combine_norm_gate" and routed.state["cng_heads"] == [32]
+    want = qkv[:, 2560:] if permuted else qkv[:, :4096].view(ROWS, 32, 2, 64)[:, :, 1, :]
+    assert torch.equal(gate.reshape(ROWS, -1), want.reshape(ROWS, -1))
+    # The tep8 width, a tep8 pool or one page id too many per split: the folded prep and
+    # full_attention_split_kv instead.
+    for change, reason in (
+        ("width", "not a raw projection the fold reads"),
+        ("pool", "another cache view"),
+        ("tables", "more pages per split than the kernel stages"),
+    ):
+        routed.taken.clear()
+        routed.state["pool"], routed.state["tables"] = pool4, tables
+        step_qkv = qkv
+        if change == "width":
+            step_qkv = torch.randn(ROWS, RAW).to(torch.bfloat16)
+        elif change == "pool":
+            routed.state["pool"] = torch.zeros(10, 2, 32, 64, dtype=torch.float8_e4m3fn)
+        else:
+            routed.state["tables"] = torch.zeros(1, 2, 76 * 512 + 1, dtype=torch.int32)
+        _step(full, step_qkv)
+        assert full._prep_fold_census.outcomes[3] == ("declined", reason), change

@@ -38,8 +38,10 @@ from .full_attention_split_kv import MIN_PAGES, PAGE
 
 #: Width of one attention head.
 HEAD_DIM = 64
-#: Query heads of one tep8 rank.
+#: Query heads of one tep8 rank (the default ``heads``).
 HEADS = 16
+#: Query heads of one rank per tensor-parallel size: what ``heads`` may be.
+RANK_HEADS = {8: HEADS, 4: 2 * HEADS}
 #: Rows of a decode step: one request's last token and 7 drafts.
 MAX_ROWS = 8
 #: Largest number of splits the kernel reads.
@@ -119,9 +121,11 @@ def gate_head_stride(gate: torch.Tensor) -> int:
     return gate.stride(1) if gate.ndim == 3 else HEAD_DIM
 
 
-def _launch(out, part_o, part_lse, rows, gate, eps, trigger, combine_only, seq_lens=None):
+def _launch(
+    out, part_o, part_lse, rows, gate, eps, trigger, combine_only, seq_lens=None, heads=HEADS
+):
     splits = part_lse.shape[1]
-    _combine_norm_gate_pdl_kernel[(rows * HEADS,)](
+    _combine_norm_gate_pdl_kernel[(rows * heads,)](
         out,
         part_o,
         part_lse,
@@ -131,7 +135,7 @@ def _launch(out, part_o, part_lse, rows, gate, eps, trigger, combine_only, seq_l
         gate.stride(0) if gate is not None else 0,
         gate_head_stride(gate) if gate is not None else 0,
         eps,
-        HEADS=HEADS,
+        HEADS=heads,
         HEAD_DIM=HEAD_DIM,
         SPLITS_P2=triton.next_power_of_2(splits),
         TRIGGER=TRIGGERS[trigger],
@@ -145,12 +149,13 @@ def _launch(out, part_o, part_lse, rows, gate, eps, trigger, combine_only, seq_l
     return out
 
 
-def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None):
+def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None, heads=HEADS):
     splits = part_lse.shape[1] if part_lse.dim() == 2 else 0
     bad = (
-        part_o.dtype != torch.float16
+        heads not in RANK_HEADS.values()
+        or part_o.dtype != torch.float16
         or part_o.dim() != 3
-        or part_o.shape[0] < rows * HEADS
+        or part_o.shape[0] < rows * heads
         or part_o.shape[2] != HEAD_DIM
         or not part_o.is_contiguous()
         or part_lse.dtype != torch.float32
@@ -167,14 +172,14 @@ def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None):
             or gate.ndim not in (2, 3)
             or gate.stride(-1) != 1
             or gate.shape[0] != rows
-            or gate.numel() != rows * HEADS * HEAD_DIM
+            or gate.numel() != rows * heads * HEAD_DIM
             or (gate.ndim == 3 and gate.shape[-1] != HEAD_DIM)
         )
     if out is not None:
         bad = bad or (
             out.dtype != torch.bfloat16
             or not out.is_contiguous()
-            or tuple(out.shape) != (rows, HEADS * HEAD_DIM)
+            or tuple(out.shape) != (rows, heads * HEAD_DIM)
         )
     if seq_lens is not None:
         bad = bad or (
@@ -184,11 +189,12 @@ def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None):
         )
     if bad:
         raise ValueError(
-            f"combine_norm_gate takes contiguous partials FP16 [>= rows * {HEADS}, splits, "
+            f"combine_norm_gate takes H query heads in {sorted(RANK_HEADS.values())}, contiguous "
+            f"partials FP16 [>= rows * H, splits, "
             f"{HEAD_DIM}] and fp32 [same, splits] (1..{MAX_SPLITS} splits), 1..{MAX_ROWS} rows, "
-            f"a BF16 gate [rows, {HEADS} * {HEAD_DIM}] or [rows, {HEADS}, {HEAD_DIM}] with unit "
+            f"a BF16 gate [rows, H * {HEAD_DIM}] or [rows, H, {HEAD_DIM}] with unit "
             f"last stride, a trigger of {sorted(TRIGGERS)} and optional int32 seq_lens on the "
-            f"partials' device; got part_o {part_o.dtype} "
+            f"partials' device; got H {heads}, part_o {part_o.dtype} "
             f"{tuple(part_o.shape)}, part_lse {part_lse.dtype} {tuple(part_lse.shape)}, rows "
             f"{rows}, gate {None if gate is None else (gate.dtype, tuple(gate.shape))}, "
             f"trigger {trigger!r}, seq_lens "
@@ -199,10 +205,11 @@ def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None):
 class CombineNormGate(OpWrapper):
     """``bf16(rmsnorm(merge(partials)))`` times ``bf16(sigmoid(gate))`` per (row, head), PDL.
 
-    ``part_o`` ``[>= rows * 16, splits, 64]`` FP16 and ``part_lse`` ``[same, splits]`` fp32
-    are ``full_attention_split_kv``'s partials (row = token * 16 + query head); ``gate`` is the gate
-    ``[rows, 16 * 64]`` or ``[rows, 16, 64]`` BF16 with unit last stride. Returns a fresh
-    contiguous ``[rows, 16 * 64]`` BF16 tensor. ``trigger`` names when the dependent may launch;
+    ``heads`` (H) is the rank's query heads: 16 at tep8 (the default), 32 at tep4.
+    ``part_o`` ``[>= rows * H, splits, 64]`` FP16 and ``part_lse`` ``[same, splits]`` fp32
+    are ``full_attention_split_kv``'s partials (row = token * H + query head); ``gate`` is the gate
+    ``[rows, H * 64]`` or ``[rows, H, 64]`` BF16 with unit last stride. Returns a fresh
+    contiguous ``[rows, H * 64]`` BF16 tensor. ``trigger`` names when the dependent may launch;
     it changes nothing the kernel computes. ``seq_lens`` (the int32 tensor ``full_attention_split_kv`` read;
     optional) lets the kernel skip the key-less splits' loads; it changes no bit when the
     partials are ``full_attention_split_kv``'s of that context.
@@ -268,11 +275,12 @@ class CombineNormGate(OpWrapper):
         trigger: str = "after_wait",
         out: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        heads: int = HEADS,
     ) -> torch.Tensor:
-        _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens)
+        _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens, heads)
         if out is None:
-            out = torch.empty(rows, HEADS * HEAD_DIM, dtype=torch.bfloat16, device=part_o.device)
-        return _launch(out, part_o, part_lse, rows, gate, eps, trigger, False, seq_lens)
+            out = torch.empty(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=part_o.device)
+        return _launch(out, part_o, part_lse, rows, gate, eps, trigger, False, seq_lens, heads)
 
     def reference(
         self,
@@ -284,6 +292,7 @@ class CombineNormGate(OpWrapper):
         trigger: str = "after_wait",
         out: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        heads: int = HEADS,
     ) -> torch.Tensor:
         """fp64 merge, rounded to BF16 as the op does, then fp64 between the norm-gate's BF16
         rounding points. ``trigger`` and ``out`` change when and where, not what; with
@@ -293,10 +302,10 @@ class CombineNormGate(OpWrapper):
         if seq_lens is not None:
             keyed = keyed_splits(int(seq_lens[0]), part_lse.shape[1])
             part_o, part_lse = part_o[:, :keyed], part_lse[:, :keyed]
-        x = merge_partials(part_o, part_lse, rows).double().to(torch.bfloat16).double()
-        x = x.reshape(rows, HEADS, HEAD_DIM)
+        x = merge_partials(part_o[: MAX_ROWS * heads], part_lse[: MAX_ROWS * heads], rows)
+        x = x.double().to(torch.bfloat16).double().reshape(rows, heads, HEAD_DIM)
         normed = (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)).to(torch.bfloat16)
-        g = gate.reshape(rows, HEADS, HEAD_DIM).double()
+        g = gate.reshape(rows, heads, HEAD_DIM).double()
         sigmoid = torch.sigmoid(g).to(torch.bfloat16)
         return (normed.double() * sigmoid.double()).to(torch.bfloat16).reshape(rows, -1)
 
@@ -307,12 +316,13 @@ def combine_only(
     rows: int,
     trigger: str = "exit",
     seq_lens: Optional[torch.Tensor] = None,
+    heads: int = HEADS,
 ) -> torch.Tensor:
-    """The merged attention output ``[rows, 16 * 64]`` BF16 of ``full_attention_split_kv``'s partials
-    (``seq_lens`` as in ``combine_norm_gate``)."""
-    _checks(part_o, part_lse, rows, None, trigger, None, seq_lens)
-    out = torch.empty(rows, HEADS * HEAD_DIM, dtype=torch.bfloat16, device=part_o.device)
-    return _launch(out, part_o, part_lse, rows, None, 0.0, trigger, True, seq_lens)
+    """The merged attention output ``[rows, H * 64]`` BF16 of ``full_attention_split_kv``'s partials
+    (``seq_lens`` and ``heads`` as in ``combine_norm_gate``)."""
+    _checks(part_o, part_lse, rows, None, trigger, None, seq_lens, heads)
+    out = torch.empty(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=part_o.device)
+    return _launch(out, part_o, part_lse, rows, None, 0.0, trigger, True, seq_lens, heads)
 
 
 combine_norm_gate = CombineNormGate()

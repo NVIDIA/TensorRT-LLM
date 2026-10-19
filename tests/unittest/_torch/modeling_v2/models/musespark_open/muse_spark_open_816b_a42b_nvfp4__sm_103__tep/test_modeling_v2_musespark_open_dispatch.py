@@ -148,9 +148,10 @@ def test_sm107_tensor_parallel_size_8_serves_every_fast_path():
     )
 
 
-def test_both_architectures_serve_the_same_tep4_set():
+def test_each_architecture_serves_its_own_tep4_set():
     sm103, sm107 = modeling.TARGET_PATHS[103, 4], modeling.TARGET_PATHS[107, 4]
-    assert sm103.served == sm107.served == _TEP4
+    assert sm103.served == _SM103_TEP4 and sm107.served == _TEP4
+    assert dispatch.closure(sm107.served) == sm107.served
     assert sm103.topology is sm107.topology is dispatch.ONE_TRAY_OF_4
     assert dispatch.composition(_config(4, _dflash(7)), modeling.TARGET_PATHS, _SM107) is sm107
 
@@ -211,10 +212,9 @@ def test_sm_of_reads_the_compute_capability():
     assert dispatch.sm_of(None) is None
 
 
-#: TEP4's composition: the fast paths written for any rank count whose output is
-#: bitwise the built-in model's, and the sharded drafter projection.
-_TEP4 = {
-    "drafter_fc_shard",
+#: The fast paths written for any rank count whose output is bitwise the built-in
+#: model's.
+_TEP4_BITWISE = {
     "preattn_prep",
     "full_attention_prep_append",
     "post_attention_hop",
@@ -230,10 +230,24 @@ _TEP4 = {
     "split_sampler",
 }
 
+#: The TEP4 composition on either architecture: the bitwise paths and the sharded
+#: drafter projection.
+_TEP4 = _TEP4_BITWISE | {"drafter_fc_shard"}
+
+#: sm103 TEP4's composition adds the attention paths validated at a tep4 rank's 32
+#: query / 4 KV heads.
+_SM103_TEP4 = _TEP4 | {
+    "swa_paged_decode",
+    "swa_block",
+    "full_attention_split_kv",
+    "full_attention_prep_fold",
+    "drafter_block_decode",
+}
+
 
 def test_tensor_parallel_size_4_serves_the_bitwise_paths_on_one_tray():
     tep4 = modeling.TARGET_PATHS[103, 4]
-    assert tep4.served == _TEP4
+    assert tep4.served == _SM103_TEP4
     assert dispatch.closure(tep4.served) == tep4.served
     assert tep4.topology is dispatch.ONE_TRAY_OF_4
     assert tep4.preconditions == (dispatch.NO_PREFILL_SEQUENCE_PARALLEL,)
@@ -297,11 +311,11 @@ def test_a_tp4_model_without_the_tp8_switches_composes_the_whole_tep4_set(
     model = SimpleNamespace(_prefill_sp_enabled=False)
     for mode in (_AUTO, _REQUIRE):
         plan = dispatch.compose(model, _config(4, _dflash(7)), mode, modeling.TARGET_PATHS, _SM103)
-        assert plan.paths == _TEP4
+        assert plan.paths == _SM103_TEP4
     assert quiet[-1] == (
         "info",
         "[musespark_open] sm103 tep4 on one node of 4 in one NVLink domain: "
-        + dispatch.Plan(_TEP4).describe(),
+        + dispatch.Plan(_SM103_TEP4).describe(),
     )
 
 

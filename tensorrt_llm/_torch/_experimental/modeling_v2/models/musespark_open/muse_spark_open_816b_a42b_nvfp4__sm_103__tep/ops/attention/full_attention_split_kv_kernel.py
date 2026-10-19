@@ -6,13 +6,17 @@ Only ``full_attention_split_kv`` imports this module, and only when the op is ca
 loads with the target. The op module states the contract, the ownership and progress argument
 and the PDL memory-order record; the comments here say what each role does.
 
-Shape per rank: 16 query heads, 2 KV heads of width 64, M <= 8 rows (the decode step and its
-drafts, causal among themselves), FP8 E4M3 paged K/V ``[blocks, 2, 32, 64]`` with separate K
-and V page ids.
+Shape per rank (``kv_heads``, one build per tensor-parallel size of the target): 2 KV heads and
+16 query heads at tep8, 4 KV heads and 32 query heads at tep4, all of width 64; M <= 8 rows (the
+decode step and its drafts, causal among themselves); FP8 E4M3 paged K/V ``[blocks, kv_heads,
+32, 64]`` with separate K and V page ids.
 
-One CTA per SM serves both KV heads of a contiguous range of the sequence's 32-key pages (an
-even split of the pages computed on the device from ``seq_lens``, so one compiled kernel and one
-captured grid serve every context). The 128 query rows of a CTA are the 64 rows of each KV head
+A CTA serves one pair of KV heads (``blockIdx.y``: the pair, heads ``2 pair`` and ``2 pair + 1``
+and their 16 query heads) over a contiguous range of the sequence's 32-key pages (an even split
+of the pages computed on the device from ``seq_lens``, so one compiled kernel and one captured
+grid serve every context); the grid is ``splits x kv_heads / 2``. Everything a CTA computes is
+the tep8 build's computation on its pair's slice of Q, of the pool and of the partials. The 128
+query rows of a CTA are the 64 rows of each KV head of its pair
 (row = head * 64 + token * 8 + q-head-in-group); Q' is block-diagonal over the two 64-wide head
 slices of the 128-wide K dimension, so S = Q' K'^T computes every row against its own head's
 keys in one M=128 MMA per 128-key tile, and O = P V' gives each row its own head's 64 output
@@ -57,16 +61,19 @@ F8 = cutlass.Float8E4M3FN
 BF16 = cutlass.BFloat16
 F16 = cutlass.Float16
 
-#: Tokens per KV page, head width, KV heads and query heads per KV head of one tep8 rank.
+#: Tokens per KV page, head width, KV heads and query heads per KV head of one CTA (one pair
+#: of KV heads: all of one tep8 rank's, half of one tep4 rank's).
 PAGE = 32
 D = 64
 HKV = 2
 G = 8
 HQ = HKV * G
-#: Width of the fused-QKV operand row: 16 query heads, then 2 K heads, then 2 V heads.
+#: KV heads of one rank the kernel is built for: tep8 (2: one pair) and tep4 (4: two pairs).
+RANK_KV_HEADS = (2, 4)
+#: Width of the tep8 fused-QKV operand row: 16 query heads, then 2 K heads, then 2 V heads.
 QKV_WIDTH = (HQ + 2 * HKV) * D
-#: Width of the raw QKV projection row the fold build reads: 16 query heads and their 16 gate
-#: heads, 2 K heads, 2 V heads.
+#: Width of the tep8 raw QKV projection row the fold build reads: 16 query heads and their 16
+#: gate heads, 2 K heads, 2 V heads.
 RAW_WIDTH = 2 * (HQ + HKV) * D
 #: The fold build's append threads (warps 10 and 11): arrivals on its ``app`` barrier.
 APPEND_THREADS = 64
@@ -75,7 +82,8 @@ MAX_ROWS = 8
 PAGES_PER_TILE = 4
 TILE_KEYS = PAGE * PAGES_PER_TILE
 ROWS = HKV * D  # 128 query rows per CTA (64 per KV head)
-#: Page ids one CTA stages in shared memory (per K and per V table).
+#: Page ids one CTA stages in shared memory (per K and per V table) per staging pass; a build
+#: stages ``max_cta_pages``, a multiple of it (the op's builds: one pass at tep8, two at tep4).
 MAX_CTA_PAGES = 256
 #: O columns the rescale may hold in registers at once (``rescale_cols``; D = the whole head).
 RESCALE_COLS = (16, 32, D)
@@ -274,6 +282,8 @@ class FullAttnSplitKvKernel:
         loader_wait: bool = True,
         p_split: bool = True,
         rescale_cols: int = D,
+        kv_heads: int = HKV,
+        max_cta_pages: int = MAX_CTA_PAGES,
     ):
         self.enable_pdl = enable_pdl
         self.prefetch = prefetch and enable_pdl
@@ -303,18 +313,35 @@ class FullAttnSplitKvKernel:
         # projection's row width. None / the fused operand's width: the op's build.
         self.fold = None
         self.app_wait = True
-        self.qkv_width = QKV_WIDTH
+        # The rank's KV heads (their pairs on grid y) and query heads, its operand widths, and
+        # the page ids a CTA stages (whole passes of MAX_CTA_PAGES).
+        assert kv_heads in RANK_KV_HEADS, kv_heads
+        assert max_cta_pages % MAX_CTA_PAGES == 0, max_cta_pages
+        self.kv_heads = kv_heads
+        self.pairs = kv_heads // HKV
+        self.hq = kv_heads * G
+        self.max_cta_pages = max_cta_pages
+        self.qkv_width = (self.hq + 2 * kv_heads) * D
+        self.raw_width = 2 * (self.hq + kv_heads) * D
+
+    def pair_index(self):
+        """This CTA's pair of KV heads: ``blockIdx.y``, or the constant 0 of a one-pair build
+        (tep8), whose index arithmetic then folds to the one-pair kernel's."""
+        if self.pairs == 1:
+            return 0
+        _, pair, _ = cute.arch.block_idx()
+        return pair
 
     @cute.jit
     def __call__(
         self,
-        qkv_ptr: cute.Pointer,  # BF16 [rows, QKV_WIDTH], row stride qkv_stride
-        pool_ptr: cute.Pointer,  # F8 [num_blocks, 2, 32, 64], contiguous
+        qkv_ptr: cute.Pointer,  # BF16 [rows, qkv_width], row stride qkv_stride
+        pool_ptr: cute.Pointer,  # F8 [num_blocks, kv_heads, 32, 64], contiguous
         table_ptr: cute.Pointer,  # Int32 [2, table_width], row stride table_stride
         seq_lens_ptr: cute.Pointer,  # Int32 [1]
         kv_scale_ptr: cute.Pointer,  # Float32 [1] (kv_scale_orig_quant)
-        part_o_ptr: cute.Pointer,  # F16 [HQ * MAX_ROWS rows, num_splits, 64]
-        part_lse_ptr: cute.Pointer,  # Float32 [HQ * MAX_ROWS rows, num_splits]
+        part_o_ptr: cute.Pointer,  # F16 [hq * MAX_ROWS rows, num_splits, 64]
+        part_lse_ptr: cute.Pointer,  # Float32 [hq * MAX_ROWS rows, num_splits]
         rows: Int32,
         qkv_stride: Int32,
         num_blocks: Int32,
@@ -326,17 +353,18 @@ class FullAttnSplitKvKernel:
         qkv = cute.make_tensor(
             qkv_ptr, cute.make_layout((rows, self.qkv_width), stride=(qkv_stride, 1))
         )
+        NKV = self.kv_heads
         pool = cute.make_tensor(
             pool_ptr,
-            cute.make_layout((num_blocks, HKV, PAGE, D), stride=(HKV * PAGE * D, PAGE * D, D, 1)),
+            cute.make_layout((num_blocks, NKV, PAGE, D), stride=(NKV * PAGE * D, PAGE * D, D, 1)),
         )
         table = cute.make_tensor(
             table_ptr, cute.make_layout((2, table_width), stride=(table_stride, 1))
         )
         seq_lens = cute.make_tensor(seq_lens_ptr, cute.make_layout(1))
         kv_scale = cute.make_tensor(kv_scale_ptr, cute.make_layout(1))
-        part_o = cute.make_tensor(part_o_ptr, cute.make_layout(HQ * MAX_ROWS * num_splits * D))
-        part_lse = cute.make_tensor(part_lse_ptr, cute.make_layout(HQ * MAX_ROWS * num_splits))
+        part_o = cute.make_tensor(part_o_ptr, cute.make_layout(self.hq * MAX_ROWS * num_splits * D))
+        part_lse = cute.make_tensor(part_lse_ptr, cute.make_layout(self.hq * MAX_ROWS * num_splits))
 
         one = tcgen05.CtaGroup.ONE
         K = OperandMajorMode.K
@@ -371,28 +399,30 @@ class FullAttnSplitKvKernel:
         # P's layout as the P.V A operand (P itself is in TMEM).
         p_layout = sm100_utils.make_smem_layout_a(pv_mma, pv_tiler, F8, 1)
 
-        # K pool as the QK B operand: (keys 32, dims (64, head 2), block)
+        # K pool as the QK B operand: (keys 32, dims (64, head 2), pair + pairs * block)
         mK = cute.make_tensor(
             pool.iterator,
             cute.make_layout(
-                (PAGE, (D, HKV), num_blocks), stride=(D, (1, PAGE * D), HKV * PAGE * D)
+                (PAGE, (D, HKV), self.pairs * num_blocks),
+                stride=(D, (1, PAGE * D), HKV * PAGE * D),
             ),
         )
-        # V pool as the PV B operand: (dims (64, head 2), keys 32, block)
+        # V pool as the PV B operand: (dims (64, head 2), keys 32, pair + pairs * block)
         mV = cute.make_tensor(
             pool.iterator,
             cute.make_layout(
-                ((D, HKV), PAGE, num_blocks), stride=((1, PAGE * D), D, HKV * PAGE * D)
+                ((D, HKV), PAGE, self.pairs * num_blocks),
+                stride=((1, PAGE * D), D, HKV * PAGE * D),
             ),
         )
         tma_op = cpasync.CopyBulkTensorTileG2SOp(one)
         sV_one = cute.select(sV_layout, mode=[0, 1, 2])
         if cutlass.const_expr(self.k_tile):
             assert cute.cosize(sKb_layout) == cute.cosize(sK_layout)
-            # K pool as one head's B operand: (keys 32, dims 64, head + 2 * block)
+            # K pool as one head's B operand: (keys 32, dims 64, head + kv_heads * block)
             mKb = cute.make_tensor(
                 pool.iterator,
-                cute.make_layout((PAGE, D, HKV * num_blocks), stride=(D, 1, PAGE * D)),
+                cute.make_layout((PAGE, D, NKV * num_blocks), stride=(D, 1, PAGE * D)),
             )
             sKb_one = cute.select(sKb_layout, mode=[0, 1, 2])
             tma_atom_k, tma_k = cute.nvgpu.make_tiled_tma_atom_B(
@@ -411,6 +441,7 @@ class FullAttnSplitKvKernel:
         self.page_bytes = k_bytes + cute.size_in_bytes(F8, sV_one)
 
         stages = self.stages
+        max_cta_pages = self.max_cta_pages
 
         @cute.struct
         class SharedStorage:
@@ -425,7 +456,7 @@ class FullAttnSplitKvKernel:
             misc: cute.struct.MemRange[cutlass.Int64, 2]  # q_full
             tmem_holding_buf: Int32
             sml: cute.struct.MemRange[Float32, 2 * ROWS * 2]
-            ids: cute.struct.MemRange[Int32, 2 * MAX_CTA_PAGES]
+            ids: cute.struct.MemRange[Int32, 2 * max_cta_pages]
             sQ: cute.struct.Align[cute.struct.MemRange[F8, cute.cosize(sQ_layout)], 1024]
             # No role of the op's build uses it; the fold build exchanges its Q half-sums here.
             unused: cute.struct.Align[cute.struct.MemRange[F8, 1024], 1024]
@@ -460,7 +491,7 @@ class FullAttnSplitKvKernel:
             # The fold build's kernel also takes the pool (the append's generic stores).
             args = args + (pool,)
         self.kernel(*args).launch(
-            grid=(num_splits, 1, 1),
+            grid=(num_splits, self.pairs, 1),
             block=[self.threads, 1, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -545,6 +576,7 @@ class FullAttnSplitKvKernel:
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         split, _, _ = cute.arch.block_idx()
+        pair = self.pair_index()
         nsplit, _, _ = cute.arch.grid_dim()
 
         if warp == self.load_warp:
@@ -671,7 +703,7 @@ class FullAttnSplitKvKernel:
         frags = (tSrQ, tSrK, tOrV, s_acc_layout, o_acc_layout, p_layout)
         ids = cute.make_tensor(
             storage.ids.data_ptr(),
-            cute.make_layout((2, MAX_CTA_PAGES), stride=(MAX_CTA_PAGES, 1)),
+            cute.make_layout((2, self.max_cta_pages), stride=(self.max_cta_pages, 1)),
         )
 
         if split < eff:
@@ -740,12 +772,17 @@ class FullAttnSplitKvKernel:
                     )
                 tmem_bar.arrive_and_wait()
         if split >= eff:
-            # A split with no keys: its rows' log2-sum-exp is -inf (weight 0 in the combine).
+            # A split with no keys: its rows' log2-sum-exp is -inf (weight 0 in the combine);
+            # thread i writes the row of token i // 16 and query head 16 pair + i % 16.
             # The store waits for the predecessor like every other global write here.
             if tidx < HQ * M:
                 if cutlass.const_expr(self.enable_pdl):
                     cute.arch.griddepcontrol_wait()
-                part_lse[tidx * nsplit + split] = -Float32.inf
+                if cutlass.const_expr(self.pairs == 1):
+                    row_r = tidx
+                else:
+                    row_r = (tidx // HQ) * self.hq + pair * HQ + tidx % HQ
+                part_lse[row_r * nsplit + split] = -Float32.inf
         if cutlass.const_expr(self.fold is not None and self.enable_pdl):
             # The fold build waits before it exits, on every path of every thread: its
             # predecessor is the QKV projection, which releases it early, and kernels after
@@ -766,21 +803,24 @@ class FullAttnSplitKvKernel:
         (L, M, past, p_lo, p_hi, key_lo, key_hi, n_tiles, last_page_tail, last_idx,
          vfix_tile, split_, nsplit_) = geo  # fmt: skip
         lane = cute.arch.lane_idx()
+        pair = self.pair_index()
         n_mine = p_hi - p_lo
-        # This CTA's page ids, one coalesced pass (all loads first, then the stores): the
-        # block table of the sequence is not written by any kernel of the step.
+        # This CTA's page ids, in coalesced passes of MAX_CTA_PAGES (per pass all loads first,
+        # then the stores): the block table of the sequence is not written by any kernel of the
+        # step.
         nj = MAX_CTA_PAGES // 32
-        rk = cute.make_rmem_tensor((nj,), Int32)
-        rv = cute.make_rmem_tensor((nj,), Int32)
-        for j in cutlass.range_constexpr(nj):
-            src = cutlass.min(p_lo + j * 32 + lane, p_hi - 1)
-            rk[j] = table[0, src]
-            rv[j] = table[1, src]
-        for j in cutlass.range_constexpr(nj):
-            i = j * 32 + lane
-            if i < n_mine:
-                ids[0, i] = rk[j]
-                ids[1, i] = rv[j]
+        for ps in cutlass.range_constexpr(self.max_cta_pages // MAX_CTA_PAGES):
+            rk = cute.make_rmem_tensor((nj,), Int32)
+            rv = cute.make_rmem_tensor((nj,), Int32)
+            for j in cutlass.range_constexpr(nj):
+                src = cutlass.min(p_lo + ps * MAX_CTA_PAGES + j * 32 + lane, p_hi - 1)
+                rk[j] = table[0, src]
+                rv[j] = table[1, src]
+            for j in cutlass.range_constexpr(nj):
+                i = ps * MAX_CTA_PAGES + j * 32 + lane
+                if i < n_mine:
+                    ids[0, i] = rk[j]
+                    ids[1, i] = rv[j]
         cute.arch.sync_warp()
         # Pages from this one on may hold a key of the step's own rows, which the step's prep
         # writes: they are loaded only after the dependency wait.
@@ -814,6 +854,9 @@ class FullAttnSplitKvKernel:
                 vid = cutlass.select_(valid, ids[1, safe], Int32(-1))
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(kv_full + st, self.page_bytes)
+                # This CTA's pair of the page's K and V heads: pool heads 2 pair, 2 pair + 1.
+                kpair = self.pairs * kid + pair
+                vpair = self.pairs * vid + pair
                 if cutlass.const_expr(self.k_tile):
                     # Head h of this page: box (slot * 2 + h) * 4 + page-in-tile of the K slots.
                     box = (st // PAGES_PER_TILE) * (HKV * PAGES_PER_TILE) + st % PAGES_PER_TILE
@@ -821,7 +864,7 @@ class FullAttnSplitKvKernel:
                         if cutlass.const_expr(self.evict_first):
                             cute.copy(
                                 tma_atom_k,
-                                tKgK[None, 0, 0, HKV * kid + h],
+                                tKgK[None, 0, 0, HKV * kpair + h],
                                 tKsK[None, box + h * PAGES_PER_TILE],
                                 tma_bar_ptr=kv_full + st,
                                 cache_policy=policy,
@@ -829,33 +872,39 @@ class FullAttnSplitKvKernel:
                         else:
                             cute.copy(
                                 tma_atom_k,
-                                tKgK[None, 0, 0, HKV * kid + h],
+                                tKgK[None, 0, 0, HKV * kpair + h],
                                 tKsK[None, box + h * PAGES_PER_TILE],
                                 tma_bar_ptr=kv_full + st,
                             )
                 elif cutlass.const_expr(self.evict_first):
                     cute.copy(
                         tma_atom_k,
-                        tKgK[None, 0, 0, kid],
+                        tKgK[None, 0, 0, kpair],
                         tKsK[None, st],
                         tma_bar_ptr=kv_full + st,
                         cache_policy=policy,
                     )
                 else:
                     cute.copy(
-                        tma_atom_k, tKgK[None, 0, 0, kid], tKsK[None, st], tma_bar_ptr=kv_full + st
+                        tma_atom_k,
+                        tKgK[None, 0, 0, kpair],
+                        tKsK[None, st],
+                        tma_bar_ptr=kv_full + st,
                     )
                 if cutlass.const_expr(self.evict_first):
                     cute.copy(
                         tma_atom_v,
-                        tVgV[None, 0, 0, vid],
+                        tVgV[None, 0, 0, vpair],
                         tVsV[None, st],
                         tma_bar_ptr=kv_full + st,
                         cache_policy=policy,
                     )
                 else:
                     cute.copy(
-                        tma_atom_v, tVgV[None, 0, 0, vid], tVsV[None, st], tma_bar_ptr=kv_full + st
+                        tma_atom_v,
+                        tVgV[None, 0, 0, vpair],
+                        tVsV[None, st],
+                        tma_bar_ptr=kv_full + st,
                     )
 
     # ------------------------------------------------------------------ MMA warp
@@ -983,21 +1032,23 @@ class FullAttnSplitKvKernel:
             # 16m .. 16m + 15 of the head = the prep's lanes 2m and 2m + 1, of K and of V. The K
             # norm follows the prep's order: in-lane sequential adds, lane bit 0 locally, bits 1
             # and 2 by butterflies over the item's four threads.
+            pair = self.pair_index()
             t = tidx - 32 * (self.load_warp + 1)
             item = t // 4
             qm = t % 4
             row = item // 2
-            kvh = item % 2
+            # The rank's KV head: head item % 2 of this CTA's pair.
+            kvh = pair * HKV + item % 2
             row_c = cutlass.min(row, M - 1)
             pos = past + row_c
             pg = pos // PAGE
             act = (row < M) & (pg >= p_lo) & (pg < p_hi)
             if cutlass.const_expr(permuted_c):
-                base_kv = HQ * D
+                base_kv = self.hq * D
             else:
-                base_kv = 2 * HQ * D
+                base_kv = 2 * self.hq * D
             src_k = cute.assume(row_c * qkv.stride[0] + base_kv + kvh * D + 16 * qm, divby=8)
-            src_v = cute.assume(src_k + HKV * D, divby=8)
+            src_v = cute.assume(src_k + self.kv_heads * D, divby=8)
             rk = cute.make_rmem_tensor((16,), BF16)
             rk.store(cute.make_tensor(qkv.iterator + src_k, cute.make_layout(16)).load())
             rv = cute.make_rmem_tensor((16,), BF16)
@@ -1020,7 +1071,7 @@ class FullAttnSplitKvKernel:
                 fv.store(rv.load().to(Float32))
                 for kind in cutlass.range_constexpr(2):
                     page_id = table[kind, pg]
-                    w0 = cutlass.Int64(page_id) * (HKV * PAGE * D // 4) + cutlass.Int64(
+                    w0 = cutlass.Int64(page_id) * (self.kv_heads * PAGE * D // 4) + cutlass.Int64(
                         (kvh * PAGE + pos % PAGE) * (D // 4) + 4 * qm
                     )
                     w4 = cute.make_rmem_tensor((4,), Int32)
@@ -1099,11 +1150,14 @@ class FullAttnSplitKvKernel:
         (L, M, past, p_lo, p_hi, key_lo, key_hi, n_tiles, last_page_tail, last_idx,
          vfix_tile, split, nsplit) = geo  # fmt: skip
         wg = warp // 4  # 0 or 1: takes tiles wg, wg + 2, ...
+        pair = self.pair_index()
         r = tidx % 128  # row 0..127 = TMEM lane
         h = r // D
         ri = r % D
         tok = ri // G
         gq = ri % G
+        # The row's query head among the rank's: query gq of head h of this CTA's pair.
+        qh = pair * HQ + h * G + gq
         row_valid = tok < M
         qpos = past + tok
 
@@ -1112,7 +1166,7 @@ class FullAttnSplitKvKernel:
             cute.arch.griddepcontrol_wait()
         tok_c = cutlass.select_(row_valid, tok, 0)
         if cutlass.const_expr(self.fold is None):
-            qoff = cute.assume(tok_c * qkv.stride[0] + (h * G + gq) * D + wg * (D // 2), divby=8)
+            qoff = cute.assume(tok_c * qkv.stride[0] + qh * D + wg * (D // 2), divby=8)
             rqb = cute.make_rmem_tensor((D // 2,), BF16)
             rqb.store(cute.make_tensor(qkv.iterator + qoff, cute.make_layout(D // 2)).load())
         else:
@@ -1127,9 +1181,7 @@ class FullAttnSplitKvKernel:
                 hq_stride = D
             else:
                 hq_stride = 2 * D
-            qoff = cute.assume(
-                tok_c * qkv.stride[0] + (h * G + gq) * hq_stride + wg * (D // 2), divby=8
-            )
+            qoff = cute.assume(tok_c * qkv.stride[0] + qh * hq_stride + wg * (D // 2), divby=8)
             rx = cute.make_rmem_tensor((D // 2,), BF16)
             rx.store(cute.make_tensor(qkv.iterator + qoff, cute.make_layout(D // 2)).load())
             xf = cute.make_rmem_tensor((D // 2,), Float32)
@@ -1449,8 +1501,8 @@ class FullAttnSplitKvKernel:
             x0 = cutlass.select_(n0 > 0, rO0[j], Float32(0.0))
             x1 = cutlass.select_(n1 > 0, rO1[j], Float32(0.0))
             res[j] = a0 * x0 + a1 * x1
-        # Output row of (token, query head): token * 16 + head * 8 + query-in-group.
-        R = tok * HQ + h * G + gq
+        # Output row of (token, query head): token * hq + the rank's query head.
+        R = tok * self.hq + qh
         if row_valid:
             poff = cute.assume((R * nsplit + split) * D + wg * (D // 2), divby=8)
             cute.make_tensor(part_o.iterator + poff, cute.make_layout(D // 2)).store(
@@ -1468,7 +1520,8 @@ class FullAttnSplitKvKernel:
 class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
     """``FullAttnSplitKvKernel`` with the folded prep taken in (the ``full_attention_prep_fold`` op).
 
-    ``qkv`` is the raw QKV projection ``[rows, 2304]`` (checkpoint order, or with ``permuted``
+    ``qkv`` is the raw QKV projection ``[rows, 2 (hq + kv_heads) 64]`` (2304 at tep8, 4608 at
+    tep4; checkpoint order, or with ``permuted``
     the ``[q | k | v | gate]`` layout). The softmax threads normalize their Q dims as
     ``preattn_prep`` does (weightless RMSNorm with ``eps``, BF16, then ``q_scale``, BF16) before
     the unchanged ``Q_hi + Q_lo`` build; warps 10-11 of the CTA whose range holds a page of the
@@ -1497,6 +1550,8 @@ class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
         app_wait: bool = True,
         rescale_cols: int = D,
         rescale_log2: float = 4.0,
+        kv_heads: int = HKV,
+        max_cta_pages: int = MAX_CTA_PAGES,
     ):
         super().__init__(
             enable_pdl=enable_pdl,
@@ -1506,10 +1561,12 @@ class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
             loader_wait=loader_wait,
             rescale_cols=rescale_cols,
             rescale_log2=rescale_log2,
+            kv_heads=kv_heads,
+            max_cta_pages=max_cta_pages,
         )
         self.fold = (float(eps), float(q_scale), bool(permuted))
         self.app_wait = app_wait
-        self.qkv_width = RAW_WIDTH
+        self.qkv_width = self.raw_width
 
     @cute.kernel
     def kernel(

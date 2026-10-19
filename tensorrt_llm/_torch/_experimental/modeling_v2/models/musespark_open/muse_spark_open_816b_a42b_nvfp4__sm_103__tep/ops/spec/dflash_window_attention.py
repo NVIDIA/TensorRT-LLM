@@ -577,6 +577,24 @@ class DflashWindowAttention(OpWrapper):
             spec=_spec(hq=64, hkv=8, ctx=[3_000], capacity=3_100, slots=1, append=True),
         ),
         Cell(
+            why="the serving step at a TP4 rank: 16 query / 2 KV heads, appended, PDL",
+            spec=_spec(hq=16, hkv=2, ctx=[100_770], capacity=1_048_584, pdl=True, append=True),
+        ),
+        Cell(
+            why="TP4 rank: the merge releasing its dependent at entry, appended",
+            spec=_spec(
+                hq=16, hkv=2, ctx=[100_770], capacity=1_048_584, pdl=True, append=True, entry=True
+            ),
+        ),  # fmt: skip
+        Cell(
+            why="TP4 rank: a windowed-arena slot (capacity = window + block + 16), appended",
+            spec=_spec(hq=16, hkv=2, ctx=[2_064], capacity=2_080, append=True),
+        ),
+        Cell(
+            why="TP4 rank: a context shorter than the window, trailing splits empty",
+            spec=_spec(hq=16, hkv=2, ctx=[500], capacity=4_200, pdl=True),
+        ),
+        Cell(
             why="narrow window (single split, merge skipped) and a bounded right side",
             spec=_spec(batch=2, window=(31, 3), ctx=[400, 20], capacity=500),
         ),

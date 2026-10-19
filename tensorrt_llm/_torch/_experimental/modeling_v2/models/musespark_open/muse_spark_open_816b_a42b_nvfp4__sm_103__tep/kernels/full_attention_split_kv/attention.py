@@ -33,6 +33,10 @@ deterministic; no cache byte changes. ``SplitKvCensus`` logs, once per captured 
 many full-attention layers run the partials and merge, and warns about the ones that do not
 at a step the fold covers.
 
+Rank shapes (``install``): a tep8 rank (16 query / 2 KV heads) launches the kernel's one-pair
+build on one CTA per SM; a tep4 rank (32 query / 4 KV heads) launches its two-pair build on
+``SMs / 2`` splits per pair, again one CTA per SM. Any other rank shape is refused.
+
 The spill-free build (``install_spill_free``, after ``install``): those layers launch the
 kernel with ``rescale_cols = full_attention_split_kv.SPILL_FREE_RESCALE_COLS``: the rare O
 rescale runs in 16-column chunks, so the softmax warps do not spill part of S on every tile.
@@ -107,6 +111,7 @@ class SplitKvCall:
     kv_scale: torch.Tensor
     splits: int
     rescale_cols: int = _v4.HEAD_DIM
+    kv_heads: int = _v4.KV_HEADS
     launched: bool = False
     fallback: Optional[str] = None
     pending: Optional[tuple] = None
@@ -126,6 +131,7 @@ class SplitKvCall:
         out = kwargs["out"]
         seq_lens = kwargs["seq_lens"]
         rows = folded.rows
+        kv_heads = self.kv_heads
         checks = (
             (pool is None or kwargs["kv_cache"][1] is not pool, "not one K/V pool"),
             (kwargs["window_left"] != -1, "a sliding window"),
@@ -150,7 +156,7 @@ class SplitKvCall:
                 and (
                     pool.dtype != torch.float8_e4m3fn
                     or pool.dim() != 4
-                    or tuple(pool.shape[1:]) != (_v4.KV_HEADS, _v4.PAGE, _v4.HEAD_DIM)
+                    or tuple(pool.shape[1:]) != (kv_heads, _v4.PAGE, _v4.HEAD_DIM)
                     or not pool.is_contiguous()
                 ),
                 "another cache view",
@@ -160,16 +166,16 @@ class SplitKvCall:
                 "not one sequence's K/V page table",
             ),
             (
-                tables.dim() == 3 and -(-tables.shape[2] // self.splits) > _v4.MAX_CTA_PAGES,
+                tables.dim() == 3 and -(-tables.shape[2] // self.splits) > _v4.cta_pages(kv_heads),
                 "more pages per split than the kernel stages",
             ),
             (
                 out.dtype != torch.bfloat16
-                or out.numel() != rows * _v4.Q_HEADS * _v4.HEAD_DIM
+                or out.numel() != rows * _v4.q_heads(kv_heads) * _v4.HEAD_DIM
                 or not out.is_contiguous(),
                 "another output",
             ),
-            (folded.qkv_out.shape[1] != _v4.QKV_WIDTH, "another fused operand"),
+            (folded.qkv_out.shape[1] != _v4.qkv_width(kv_heads), "another fused operand"),
         )
         for failed, reason in checks:
             if failed:
@@ -180,6 +186,7 @@ class SplitKvCall:
             PREFETCH,
             EVICT_FIRST,
             self.rescale_cols,
+            kv_heads,
         )
         if _capturing() and key not in _v4._compiled_keys:
             return "full_attention_split_kv was not compiled before this capture"
@@ -268,6 +275,8 @@ class FullAttnSplitKvAttention:
     _split_kv_splits: int = 0
     #: The kernel build's ``rescale_cols``: 64 by default, 16 in the spill-free build.
     _split_kv_rescale_cols: int = _v4.HEAD_DIM
+    #: The rank's KV heads, which pick the kernel build: 2 at tep8, 4 at tep4.
+    _split_kv_kv_heads: int = _v4.KV_HEADS
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._split_kv_census
@@ -296,6 +305,7 @@ class FullAttnSplitKvAttention:
             kv_scale=self.attn.kv_scale_orig_quant,
             splits=self._split_kv_splits,
             rescale_cols=self._split_kv_rescale_cols,
+            kv_heads=self._split_kv_kv_heads,
         )
         with intercepting(call):
             result = super()._attn_impl(*args, **kwargs)
@@ -333,6 +343,7 @@ class FullAttnSplitKvAttention:
             self.o_head_norm.variance_epsilon,
             trigger,
             seq_lens=seq_lens,
+            heads=_v4.q_heads(self._split_kv_kv_heads),
         )
 
 
@@ -340,6 +351,17 @@ class FullAttnSplitKvAttention:
 def _split_kv_class(base: type) -> type:
     """``base`` with ``FullAttnSplitKvAttention`` in front, one class per base."""
     return type(f"{base.__name__}V4", (FullAttnSplitKvAttention, base), {})
+
+
+def rank_tp(attention) -> Optional[int]:
+    """The tensor-parallel size whose kernel build serves this attention's per-rank heads: 8
+    for 16 query / 2 KV heads, 4 for 32 query / 4 KV heads, else None (no build)."""
+    for tp, kv_heads in _v4.RANK_KV_HEADS.items():
+        if attention.num_key_value_heads == kv_heads and attention.num_heads == _v4.q_heads(
+            kv_heads
+        ):
+            return tp
+    return None
 
 
 def install(model: torch.nn.Module) -> int:
@@ -352,7 +374,8 @@ def install(model: torch.nn.Module) -> int:
         ValueError: if ``intercepting`` would not reach the built-in decode FMHA
             (``decode_reachable``), the device is not sm_103 or sm_107, or
             a full-attention layer does not carry the prep-append mixin, has no output gate, or is
-            not 2 KV heads / 16 query heads of width 64 with the plain softmax scale.
+            not a tep8 rank's (16 query / 2 KV heads) or a tep4 rank's (32 query / 4 KV heads)
+            heads of width 64 with the plain softmax scale, or the layers differ in rank shape.
     """
     reason = decode_reachable()
     if reason is not None:
@@ -380,9 +403,9 @@ def install(model: torch.nn.Module) -> int:
                 (not getattr(attention, "attn_output_gate", False), "it has no output gate"),
                 (attention.head_dim != _v4.HEAD_DIM, f"head_dim is not {_v4.HEAD_DIM}"),
                 (
-                    attention.num_heads != _v4.Q_HEADS
-                    or attention.num_key_value_heads != _v4.KV_HEADS,
-                    f"not {_v4.Q_HEADS} query / {_v4.KV_HEADS} KV heads per rank",
+                    rank_tp(attention) is None,
+                    f"{attention.num_heads} query / {attention.num_key_value_heads} KV heads per "
+                    "rank: neither a tep8 rank's (16 / 2) nor a tep4 rank's (32 / 4)",
                 ),
                 (
                     get_bmm1_scale(attention.attn) != SOFTMAX_SCALE,
@@ -393,22 +416,37 @@ def install(model: torch.nn.Module) -> int:
         ]
         if reasons:
             refused.append(f"layer {attention.layer_idx}: " + "; ".join(reasons))
+    tps = {rank_tp(attention) for attention in full}
+    if not refused and len(tps) > 1:
+        refused.append(f"the layers mix rank shapes of tp {sorted(tps)}")
     if refused:
         raise ValueError(
             "[musespark_open] full_attention_split_kv cannot replace the full-attention decode FMHA: "
             + " | ".join(refused)
         )
-    splits = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    if not full:
+        return 0
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    (tp,) = tps
+    if tp == 8:
+        kv_heads = _v4.RANK_KV_HEADS[8]
+    elif tp == 4:
+        kv_heads = _v4.RANK_KV_HEADS[4]
+    else:
+        raise ValueError(f"[musespark_open] full_attention_split_kv has no build for tp {tp}")
+    splits = _v4.default_splits(kv_heads, sms)
     census = SplitKvCensus(tuple(attention.layer_idx for attention in full))
     for attention in full:
         attention.__class__ = _split_kv_class(type(attention))
         attention._split_kv_pending = None
         attention._split_kv_census = census
         attention._split_kv_splits = splits
+        attention._split_kv_kv_heads = kv_heads
     logger.info(
         f"[musespark_open] full_attention_split_kv: the decode FMHA of {len(full)} full-attention "
-        f"layers runs as full_attention_split_kv partials over {splits} splits, merged in "
-        "combine_norm_gate, on the steps full_attention_prep_append folds"
+        f"layers runs as full_attention_split_kv partials (the tep{tp} build: "
+        f"{kv_heads} KV heads per rank, {kv_heads // _v4.KV_HEADS} pair(s) x {splits} splits), "
+        "merged in combine_norm_gate, on the steps full_attention_prep_append folds"
     )
     return len(full)
 
