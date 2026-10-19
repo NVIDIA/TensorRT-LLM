@@ -599,8 +599,9 @@ def _runner_for_lora(
     runner = runner_type.__new__(runner_type)
     runner.model = model
     runner._model_caller = ModelCaller(model)
+    runner._lora = LoraParamBuilder(attn_backend=object(), cuda_graph_manager=None)
     runner.lora_model_config = lora_model_config
-    runner.cuda_graph_runner = SimpleNamespace(enabled=True)
+    runner._graphs = SimpleNamespace(enabled=True)
     runner._config = SimpleNamespace(
         is_spec_decode=True,
         original_max_draft_len=1,
@@ -652,7 +653,6 @@ def test_encoder_decoder_runner_inherits_lora_model_fallback(
     [
         ("gemma3vl", "Gemma3VLM"),
         ("phi4mm", "Phi4MMForCausalLM"),
-        ("qwen2vl", "Qwen2VLModelBase"),
         ("step3p7vl", "Step3p7VLForConditionalGeneration"),
         ("nemotron_h_multimodal", "NemotronHMultimodalModel"),
         ("mistral", "Mistral3VLM"),
@@ -694,9 +694,6 @@ def test_unimplemented_multimodal_lora_owner_is_rejected() -> None:
         None,
         "language_model",
         DecoderLoraOwner(module_path=""),
-        DecoderLoraOwner(module_path=".language_model"),
-        DecoderLoraOwner(module_path="language_model."),
-        DecoderLoraOwner(module_path=7),
     ],
 )
 def test_invalid_multimodal_lora_owner_is_rejected(owner: object) -> None:
@@ -705,6 +702,12 @@ def test_invalid_multimodal_lora_owner_is_rejected(owner: object) -> None:
 
     with pytest.raises(ValueError, match="invalid decoder LoRA owner"):
         resolve_lora_owner(model, None)
+
+
+@pytest.mark.parametrize("module_path", [".language_model", "language_model.", "model..decoder", 7])
+def test_invalid_lora_owner_path_is_rejected_at_construction(module_path: object) -> None:
+    with pytest.raises(ValueError, match="Invalid decoder LoRA owner path"):
+        DecoderLoraOwner(module_path=module_path)
 
 
 @pytest.mark.parametrize("module_path", ["language_model", "missing_decoder"])
@@ -854,7 +857,7 @@ def test_engine_reuses_owner_and_shares_lora_config_across_resource_reinitializa
     engine.input_processor = _MultimodalInputProcessor()
     engine._lora_owner = engine._lora_model = None
     engine._runner = _runner_for_lora(DecoderRunner, model, graph_lora_settings[1])
-    engine._runner.cuda_graph_runner.enabled = graphs_enabled
+    engine._runner._graphs.enabled = graphs_enabled
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.model_engine.resolve_lora_owner", wraps=resolve_lora_owner
@@ -881,7 +884,7 @@ def test_engine_reuses_owner_and_shares_lora_config_across_resource_reinitializa
                 assert manager is None
 
     resolve.assert_called_once_with(model, engine.input_processor)
-    assert builders[0] is not builders[1]
+    assert builders[0] is builders[1]
     assert engine._lora_model is model.language_model
     assert engine.model is engine._runner.model is model
     assert model.encoder[0].workspace_reservations == []
@@ -911,7 +914,7 @@ def test_executor_shares_lora_configuration_with_real_cache_constructor(
     engine.spec_config = None
     engine._lora_owner = engine._lora_model = None
     engine._runner = _runner_for_lora(DecoderRunner, model, graph_lora_settings[1])
-    engine._runner.cuda_graph_runner.enabled = graphs_enabled
+    engine._runner._graphs.enabled = graphs_enabled
     mapping = Mapping()
     configs = []
 

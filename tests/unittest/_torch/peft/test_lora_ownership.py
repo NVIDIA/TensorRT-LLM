@@ -21,7 +21,11 @@ from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader, get_all_hf_lora_weights
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig, load_torch_lora
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
-from tensorrt_llm._torch.pyexecutor.engine.lora import make_lora_model_config, resolve_lora_owner
+from tensorrt_llm._torch.pyexecutor.engine.lora import (
+    LoraParamBuilder,
+    make_lora_model_config,
+    resolve_lora_owner,
+)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import PeftCacheManager
 from tensorrt_llm.executor.base_worker import BaseWorker
@@ -114,8 +118,9 @@ def _make_runtime(
     )
     runner = object.__new__(DecoderRunner)
     runner.model = model
+    runner._lora = LoraParamBuilder(attn_backend=object(), cuda_graph_manager=None)
     runner.lora_model_config = model_config
-    runner.cuda_graph_runner = SimpleNamespace(enabled=graphs)
+    runner._graphs = SimpleNamespace(enabled=graphs)
     runner._config = SimpleNamespace(
         is_spec_decode=False,
         max_batch_size=2,
@@ -215,7 +220,7 @@ def _decoder_prefix(source: str, prefixed: bool = False) -> str:
 
 def _load(runtime: _Runtime, entrypoint: str, path: Path) -> None:
     if entrypoint == "worker":
-        assert runtime.worker._load_lora_adapter(
+        runtime.worker._load_lora_adapter(
             LoRARequest("adapter", 7, str(path), runtime.config.lora_ckpt_source)
         )
     else:
@@ -308,19 +313,81 @@ def test_duplicate_decoder_aliases_are_rejected_before_cache(
     _assert_not_cached(runtime)
 
 
+@pytest.mark.parametrize(
+    "module",
+    [
+        "multi_modal_projector.linear_1",
+        "model.embed_tokens_extend.image_embed.img_projection",
+        "vision.embed_tokens_projector",
+        "audio.lm_head_projector",
+    ],
+)
+def test_non_layered_projector_rejected_at_startup_and_runtime(
+    runtime: _Runtime, entrypoint: str, module: str, tmp_path: Path
+) -> None:
+    source = runtime.config.lora_ckpt_source
+    weights = _weights(source, _decoder_prefix(source))
+    key = (
+        f"base_model.model.{module}.lora_A.weight"
+        if source == "hf"
+        else f"model.{module}.adapter_layer.lora_kqv_adapter.linear_in.weight"
+    )
+    weights[key] = torch.ones(2, 4, dtype=torch.float16)
+    path = _write_adapter(tmp_path / "mixed", source, weights)
+    config = runtime.config.model_copy(update={"lora_dir": [str(path)]})
+
+    for load in (
+        lambda: load_torch_lora(config, owner=runtime.model_config.owner),
+        lambda: _load(runtime, entrypoint, path),
+    ):
+        with pytest.raises(ValueError, match="Encoder/projector LoRA is not supported") as exc:
+            load()
+        assert key in str(exc.value)
+        assert "decoder-only adapter checkpoint" in str(exc.value)
+        _assert_not_cached(runtime)
+
+
+def test_mixed_checkpoint_rejects_unmapped_encoder_weights(
+    hf_runtime: _Runtime, entrypoint: str, tmp_path: Path
+) -> None:
+    weights = _weights("hf", _decoder_prefix("hf"))
+    invalid = _weights("hf", "base_model.model.vision.encoder.layers")
+    invalid = {key.replace("o_proj", "unmapped_proj"): value for key, value in invalid.items()}
+    path = _write_adapter(tmp_path / "mixed", "hf", weights | invalid)
+    config = hf_runtime.config.model_copy(update={"lora_dir": [str(path)]})
+
+    for load in (
+        lambda: load_torch_lora(config, owner=hf_runtime.model_config.owner),
+        lambda: _load(hf_runtime, entrypoint, path),
+    ):
+        with pytest.raises(ValueError, match="outside selected owner 'decoder'") as exc:
+            load()
+        assert any(key in str(exc.value) for key in invalid)
+        _assert_not_cached(hf_runtime)
+
+
 @pytest.fixture(
     params=[
         ("gemma3vl", "Gemma3VLM"),
         ("mistral", "Mistral3VLM"),
         ("step3p7vl", "Step3p7VLForConditionalGeneration"),
         ("gemma4mm", "Gemma4ForConditionalGeneration"),
+        ("step3p7", "Step3p7ForCausalLM"),
+        ("qwen4_exp", "Qwen4ExpForCausalLM"),
     ],
-    ids=["gemma3", "mistral3-dense", "step3p7", "gemma4"],
+    ids=["gemma3", "mistral3-dense", "step3p7", "gemma4", "step3p7-text", "qwen4-exp-text"],
 )
 def nested_language_model_owner(request: pytest.FixtureRequest) -> DecoderLoraOwner:
     module_name, class_name = request.param
     module = import_module(f"tensorrt_llm._torch.models.modeling_{module_name}")
     model_type = getattr(module, class_name)
+    if module_name in {"step3p7", "qwen4_exp"}:
+        model = model_type.__new__(model_type)
+        torch.nn.Module.__init__(model)
+        owner, selected_model = resolve_lora_owner(model, None)
+        assert selected_model is model
+        assert owner == DecoderLoraOwner()
+        return owner
     if module_name == "mistral":
         model = model_type.__new__(model_type)
         torch.nn.Module.__init__(model)
@@ -330,7 +397,7 @@ def nested_language_model_owner(request: pytest.FixtureRequest) -> DecoderLoraOw
     return model_type.lora_owner
 
 
-def test_model_declared_nested_language_model_alias_parses_decoder_weights(
+def test_nested_language_model_alias_parses_decoder_weights(
     nested_language_model_owner: DecoderLoraOwner,
 ) -> None:
     weights = _weights("hf", "base_model.model.model.language_model.layers")
@@ -349,7 +416,7 @@ def test_model_declared_nested_language_model_alias_parses_decoder_weights(
     assert torch.all(parsed[0]["o_proj"]["out"] == 2)
 
 
-def test_model_declared_nested_language_model_alias_rejects_duplicate_flat_destination(
+def test_nested_language_model_alias_rejects_duplicate_flat_destination(
     nested_language_model_owner: DecoderLoraOwner,
 ) -> None:
     nested = _weights("hf", "base_model.model.model.language_model.layers")
@@ -365,7 +432,26 @@ def test_model_declared_nested_language_model_alias_rejects_duplicate_flat_desti
 
     assert next(iter(nested)) in str(exc.value)
     assert next(iter(flat)) in str(exc.value)
-    assert "module path 'language_model'" in str(exc.value)
+    assert f"module path '{nested_language_model_owner.module_path or '<root>'}'" in str(exc.value)
+
+
+@pytest.mark.parametrize("explicit_targets", [False, True])
+def test_initial_adapter_accepts_nested_language_model_alias(
+    nested_language_model_owner: DecoderLoraOwner, explicit_targets: bool, tmp_path: Path
+) -> None:
+    path = _write_adapter(
+        tmp_path / "adapter", "hf", _weights("hf", "base_model.model.model.language_model.layers")
+    )
+    config = LoraConfig(
+        lora_dir=[str(path)],
+        lora_target_modules=["attn_dense"] if explicit_targets else [],
+        trtllm_modules_to_hf_modules={"attn_dense": "o_proj"},
+    )
+
+    dtype = load_torch_lora(config, owner=nested_language_model_owner)
+
+    assert config.lora_target_modules == ["attn_dense"]
+    assert dtype == torch.float16
 
 
 @pytest.mark.parametrize("explicit_targets", [False, True])

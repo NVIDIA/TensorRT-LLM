@@ -181,11 +181,7 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     ))
 class Gemma3VLM(PreTrainedModel):
 
-    lora_owner = DecoderLoraOwner(
-        module_path="language_model",
-        hf_prefixes=(*DecoderLoraOwner().hf_prefixes,
-                     "model.language_model.layers"),
-    )
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,

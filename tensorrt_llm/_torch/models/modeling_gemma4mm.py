@@ -603,10 +603,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
     supports_encoder_cache = True
-    lora_owner = DecoderLoraOwner(
-        module_path="language_model",
-        hf_prefixes=(*DecoderLoraOwner().hf_prefixes, "model.language_model.layers"),
-    )
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

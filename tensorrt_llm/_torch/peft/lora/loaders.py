@@ -57,8 +57,16 @@ def _validate_owner_prefix(
         raise ValueError(
             f"LoRA key '{key}' is outside selected owner 'decoder' "
             f"(module path '{owner.module_path or '<root>'}'): "
-            f"unsupported {source} prefix '{prefix}'."
+            f"unsupported {source} prefix '{prefix}'. "
+            "Encoder/projector LoRA is not supported. Use a decoder-only adapter checkpoint."
         )
+
+
+def _validate_unparsed_key_owner(key: str, owner: DecoderLoraOwner, source: str) -> None:
+    normalized = key.removeprefix("base_model.model.") if source == "HF" else key
+    prefixes = owner.hf_prefixes if source == "HF" else owner.nemo_prefixes
+    if not any(normalized.startswith(f"{prefix}.") for prefix in prefixes):
+        _validate_owner_prefix(key, normalized, owner, source)
 
 
 def _check_duplicate_destination(
@@ -96,6 +104,7 @@ def get_all_nemo_lora_weights(
     layer_pattern = re.compile(r"(.*\.layers)\.(\d+)\..*")
     destinations = {}
     for key, weights in lora_weights.items():
+        _validate_unparsed_key_owner(key, owner, "NeMo")
         if adapter_key in key:
             m = layer_pattern.match(key)
             if m is None:
@@ -158,14 +167,14 @@ def iterate_hf_lora(
     module_representations = {}
     pattern = HF_LORA_PATTERN
     for key, weights in lora_weights.items():
-        m = pattern.match(key)
+        m = pattern.fullmatch(key)
         if not m:
-            if "lm_head" not in key and "embed_tokens" not in key:
-                raise KeyError(f"unsupported key {key} from HF LoRA weights")
             saved_module = re.search(r"(?:^|\.)(?:lm_head|embed_tokens)(?:\.|$)", key)
             if saved_module is not None:
                 _validate_owner_prefix(key, key[: saved_module.start()], owner, "HF", layered=False)
-            continue
+                continue
+            _validate_unparsed_key_owner(key, owner, "HF")
+            raise KeyError(f"unsupported key {key} from HF LoRA weights")
         _validate_owner_prefix(key, m.group(1), owner, "HF")
         layer_idx = int(m.group(2))
         expert_idx = m.group(6)

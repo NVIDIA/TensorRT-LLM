@@ -1218,10 +1218,7 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     benchmarks continue to use the original Step3p7 text path.
     """
 
-    lora_owner = DecoderLoraOwner(
-        module_path="language_model",
-        hf_prefixes=(*DecoderLoraOwner().hf_prefixes, "model.language_model.layers"),
-    )
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__()
