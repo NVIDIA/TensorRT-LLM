@@ -103,6 +103,7 @@ def split_docstring_diff(post_source: str, diff: str) -> tuple[str, bool]:
     out: list[str] = []
     pending_deleted: list[str] = []
     old_line = new_line = 0
+    in_hunk = False
     changed = False
     for raw in diff.splitlines(keepends=True):
         match = _HUNK_HEADER_RE.match(raw)
@@ -110,11 +111,12 @@ def split_docstring_diff(post_source: str, diff: str) -> tuple[str, bool]:
             out.extend(pending_deleted)
             pending_deleted.clear()
             old_line, new_line = int(match.group(1)), int(match.group(2))
+            in_hunk = True
             out.append(raw)
             continue
         if raw.startswith("\\ No newline"):
             continue
-        if raw.startswith(("+++", "---")) or not raw:
+        if not raw or (not in_hunk and raw.startswith(("+++", "---"))):
             out.append(raw)
             continue
         sign = raw[0]

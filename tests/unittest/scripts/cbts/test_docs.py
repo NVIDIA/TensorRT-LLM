@@ -415,6 +415,39 @@ def test_docstring_split_preserves_code_line_numbers_after_multiline_addition() 
     assert iter_diff_deleted_post_lines(executable) == {6: ["    return 1"]}
 
 
+@pytest.mark.parametrize(
+    ("old_underline", "new_underline"), (("-----", "====="), ("=====", "+++++"))
+)
+@pytest.mark.parametrize("code_changed", (False, True))
+def test_docstring_underlines_preserve_executable_changes(
+    tmp_path: Path, old_underline: str, new_underline: str, code_changed: bool
+) -> None:
+    path = "tensorrt_llm/example.py"
+    before = f'"""Title\n{old_underline}\n"""\nimport os\n\ndef f():\n    return 1\n'
+    source = (
+        f'"""Title\n{new_underline}\n"""\n'
+        + ("" if code_changed else "import os\n")
+        + f"\ndef f():\n    return {2 if code_changed else 1}\n"
+    )
+
+    pr = _docstring_pr(tmp_path, before, source, path)
+
+    assert pr.docstring_files == {path}
+    assert reconstruct_diff_pre_image(source, pr.raw_diffs[path]) == before
+    assert pr.diffs[path].startswith(f"--- {path}\n+++ {path}\n@@")
+    if code_changed:
+        assert not pr.docstring_only_files
+        assert "-import os\n" in pr.diffs[path]
+        assert iter_diff_post_line_numbers(pr.diffs[path]) == {4, 6}
+        assert iter_diff_deleted_post_lines(pr.diffs[path]) == {
+            4: ["import os"],
+            6: ["    return 1"],
+        }
+    else:
+        assert pr.docstring_only_files == {path}
+        assert not iter_diff_post_line_numbers(pr.diffs[path])
+
+
 def test_docs_rule_falls_back_when_docstring_cpu_checks_are_unavailable(tmp_path: Path) -> None:
     pr = _docstring_pr(tmp_path, '"old docs"\n', '"new docs"\n', "tensorrt_llm/example.py")
 
