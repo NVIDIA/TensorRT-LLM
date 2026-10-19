@@ -259,6 +259,7 @@ def _model_engine_with_runner(
     if runner is None:
         runner = object.__new__(DecoderRunner)
         runner.model = engine.model
+        runner._trtllm_gen_jit_warmup = False
     engine._runner = runner
     engine.enable_spec_decode = False
     engine.runtime_draft_len = 0

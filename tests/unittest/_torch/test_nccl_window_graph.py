@@ -828,3 +828,53 @@ def test_tensor_scope_compilation_metadata_pins_boundaries_to_primary_stream(mon
     assert dag.nodes[begin_node] in dag.nodes[output].in_edges.values()
     assert dag.nodes[output] in dag.nodes[end_node].in_edges.values()
     assert dag.nodes[end_node] in dag.exit_node.in_edges.values()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_decoder_warmup_scope_uses_device_buffer_for_host_only_batch(
+    monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+
+    events: list[str] = []
+
+    def begin(inputs: list[torch.Tensor]) -> int:
+        assert len(inputs) == 1 and inputs[0] is input_buffer
+        events.append("begin")
+        return 0
+
+    def end(
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        failed: bool,
+        entry_depth: int,
+    ) -> None:
+        assert entry_depth == 0 and failed is fails
+        assert len(outputs) == 1 and outputs[0] is input_buffer
+        events.append("end")
+
+    def forward(*args: object, **kwargs: object) -> torch.Tensor:
+        assert events == ["begin"]
+        events.append("forward")
+        if fails:
+            raise RuntimeError("warmup failed")
+        return output
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    graphs = object.__new__(DecoderCudaGraphs)
+    graphs._forward_warmup = forward
+    with FakeTensorMode():
+        input_buffer = torch.empty(4, device="cuda")
+        output = torch.empty(4, device="cuda")
+        graphs._warmup_inputs = input_buffer
+        with (
+            pytest.raises(RuntimeError, match="warmup failed")
+            if fails
+            else contextlib.nullcontext()
+        ):
+            graphs.forward_discarded_warmup(
+                ScheduledRequests(), None, enable_spec_decode=False, runtime_draft_len=0
+            )
+    assert events == ["begin", "forward", "end"]
