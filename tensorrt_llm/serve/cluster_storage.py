@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
+import grpc
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -637,6 +638,18 @@ class Etcd3ClusterStorage(ClusterStorage):
         # nothing to do
         ...
 
+    def _drop_lease(self, key: str) -> None:
+        # An expired lease cannot be revived; forget it so the next
+        # _get_lease() call grants a fresh one.
+        self._leases.pop(key, None)
+
+    def _put(self, key: str, value: str, overwrite_if_exists: bool,
+             lease: Optional[etcd3.Lease]) -> bool:
+        if not overwrite_if_exists:
+            return self.client.put_if_not_exists(key, value, lease=lease)
+        self.client.put(key, value, lease=lease)
+        return True
+
     @handle_etcd_error(return_on_error=False)
     async def set(self,
                   key: str,
@@ -644,11 +657,18 @@ class Etcd3ClusterStorage(ClusterStorage):
                   overwrite_if_exists: bool = False,
                   ttl: int = -1) -> bool:
         lease = self._get_lease(key, ttl)
-        if not overwrite_if_exists:
-            return self.client.put_if_not_exists(key, value, lease=lease)
-        else:
-            self.client.put(key, value, lease=lease)
-            return True
+        try:
+            return self._put(key, value, overwrite_if_exists, lease)
+        except grpc.RpcError as e:
+            if (lease is None or self._one_single_lease
+                    or e.code() != grpc.StatusCode.NOT_FOUND):
+                raise
+            # The cached lease has expired on the server ("requested lease
+            # not found"). Retry once with a freshly granted lease.
+            logger.warning(f"Etcd lease for {key} expired, granting a new one")
+            self._drop_lease(key)
+            return self._put(key, value, overwrite_if_exists,
+                             self._get_lease(key, ttl))
 
     @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
@@ -667,7 +687,16 @@ class Etcd3ClusterStorage(ClusterStorage):
         lease = self._get_lease(key, ttl)
         assert lease is not None, "Lease must be created"
         # TTL will be ignored since it can only be set when creating a lease
-        next(self.client.refresh_lease(lease_id=lease.id), None)
+        response = next(self.client.refresh_lease(lease_id=lease.id), None)
+        if response is None or response.TTL <= 0:
+            # etcd answers a keepalive for an expired lease with TTL=0, and the
+            # keys attached to it are already gone. Report the refresh as
+            # failed so the caller re-registers, and drop the dead lease so
+            # that re-registration is granted a new one.
+            logger.warning(f"Etcd lease for {key} has expired")
+            if not self._one_single_lease:
+                self._drop_lease(key)
+            return False
         return True
 
     @handle_etcd_error(return_on_error={})
