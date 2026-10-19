@@ -407,6 +407,15 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     # this text, special-token strings included, and count differently.
     cmd += ["--extra-inputs", "skip_special_tokens:false"]
 
+    # Prefill-only replay (the perf-sanity ctx_only mode). The trace sets
+    # max_tokens per turn, so a fixed output length cannot be passed the way
+    # benchmark_serving takes --random-output-len. aiperf merges --extra-inputs
+    # into every request body after the turn's own max_completion_tokens, so
+    # this overrides it for every turn, subagent turns included. With the
+    # scenario's forced ignore_eos every request then decodes exactly one token.
+    if args.max_output_tokens is not None:
+        cmd += ["--extra-inputs", f"max_completion_tokens:{args.max_output_tokens}"]
+
     # Plain os.environ.get with a default, mirroring the reference script's
     # `${VAR-default}`: an explicitly empty value must disable the flag, which
     # is how a production (>=900 s) run drops --unsafe-override.
@@ -453,10 +462,6 @@ def check_run_health(export: dict) -> None:
     if export.get("was_cancelled"):
         raise RuntimeError("aiperf reports was_cancelled=true; the measurement is incomplete")
 
-    errors = export.get("error_summary") or []
-    if errors:
-        raise RuntimeError(f"aiperf reported request errors: {json.dumps(errors)[:2000]}")
-
     # Report coverage before the verdict: when submission_valid is false this
     # is the number that says why, so it must be in the log either way.
     for phase in metadata.get("metric_duration_coverage") or []:
@@ -487,16 +492,74 @@ def check_run_health(export: dict) -> None:
     duration = _read_metric(export, "benchmark_duration", "avg", "sec")
     if requests <= 0:
         raise RuntimeError("aiperf completed 0 requests")
+    check_request_errors(export.get("error_summary") or [], requests)
     _log(f"health OK: {int(requests)} requests over {duration:.1f}s, submission_valid=true")
 
 
-def report_metrics(export: dict) -> None:
-    """Print every PERF_METRIC_LOG_QUERIES line from the aiperf export."""
+# A streamed response that closed after the role chunk but before any content.
+# It is a server/transport flake, not a slow or wrong result, and it lands on
+# long-running requests: an e2e lane sees ~1 in 30k, a prefill-only (ctx_only)
+# lane, whose every request is a long prefill before its single token, ~1 in 600.
+EMPTY_CONTENT_ERROR_TYPE = "InvalidInferenceResultError"
+# Largest share of measured requests that may be empty-content before the run
+# fails. Well above the observed ctx_only rate (0.17%), far below anything that
+# could move a throughput or latency statistic.
+MAX_EMPTY_CONTENT_ERROR_RATIO = 0.005
+
+
+def check_request_errors(errors: list, requests: float) -> None:
+    """Fail on request errors, except a small share of empty-content responses.
+
+    Args:
+        errors: ``error_summary`` from the aiperf export: ``{"error_details":
+            {"type": ...}, "count": N}`` entries for the profiling phase.
+        requests: Successful requests in the profiling phase.
+
+    Raises:
+        RuntimeError: On any other error type, or empty-content errors above
+            ``MAX_EMPTY_CONTENT_ERROR_RATIO`` of all measured requests.
+    """
+    if not errors:
+        return
+    other = [
+        e for e in errors if (e.get("error_details") or {}).get("type") != EMPTY_CONTENT_ERROR_TYPE
+    ]
+    if other:
+        raise RuntimeError(f"aiperf reported request errors: {json.dumps(errors)[:2000]}")
+    empty = sum(int(e.get("count", 0)) for e in errors)
+    ratio = empty / (requests + empty)
+    if ratio > MAX_EMPTY_CONTENT_ERROR_RATIO:
+        raise RuntimeError(
+            f"{empty} empty-content responses ({ratio:.2%} of measured requests) exceed the "
+            f"{MAX_EMPTY_CONTENT_ERROR_RATIO:.1%} tolerance: {json.dumps(errors)[:2000]}"
+        )
+    _log(
+        f"tolerating {empty} empty-content responses ({ratio:.3%} of measured requests, "
+        f"limit {MAX_EMPTY_CONTENT_ERROR_RATIO:.1%}); details: {json.dumps(errors)[:500]}"
+    )
+
+
+# Decode-interval metrics. A one-token response has no interval between tokens,
+# so aiperf records none of these for a prefill-only (--max-output-tokens 1) run.
+DECODE_INTERVAL_FIELDS = ("inter_chunk_latency", "inter_token_latency")
+
+
+def report_metrics(export: dict, prefill_only: bool = False) -> None:
+    """Print every PERF_METRIC_LOG_QUERIES line from the aiperf export.
+
+    With ``prefill_only`` every response is one token, so the decode-interval
+    metrics do not exist. They are reported as 0 rather than omitted, because
+    the harness requires every line. The database uses 0 for the same
+    single-token case in benchmark_serving's ctx_only runs, so the series stay
+    comparable. Throughput, TTFT and E2EL are measured normally.
+    """
     for label, field, unit in THROUGHPUT_METRICS:
         _print_metric(label, _read_metric(export, field, "avg", unit))
     for stem, field in LATENCY_METRICS:
+        absent = prefill_only and field in DECODE_INTERVAL_FIELDS and field not in export
         for prefix, stat in (("Mean", "avg"), ("Median", "p50"), ("P99", "p99")):
-            _print_metric(f"{prefix} {stem} (ms)", _read_metric(export, field, stat, "ms"))
+            value = 0.0 if absent else _read_metric(export, field, stat, "ms")
+            _print_metric(f"{prefix} {stem} (ms)", value)
 
 
 def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
@@ -518,7 +581,19 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         default=os.environ.get("TRTLLM_AGENTX_ARTIFACT_DIR", "agentx_artifacts"),
         help="Parent directory for aiperf artifacts; a concurrency_<N> subdir is created in it.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Cap every request's output to this many tokens, overriding the trace's "
+            "per-turn max_tokens. 1 makes the replay prefill-only (perf-sanity ctx_only)."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.max_output_tokens is not None and args.max_output_tokens < 1:
+        parser.error("--max-output-tokens must be >= 1")
+    return args
 
 
 def _run(args: argparse.Namespace, artifact_dir: str) -> int:
@@ -561,7 +636,7 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
         export = json.load(f)
 
     check_run_health(export)
-    report_metrics(export)
+    report_metrics(export, prefill_only=args.max_output_tokens == 1)
     return 0
 
 
