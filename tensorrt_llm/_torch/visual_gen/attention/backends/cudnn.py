@@ -525,31 +525,29 @@ class CuDNNAttention(AttentionBackend):
         shape: _CuDNNProblemShape, sm_scale: float, io_dtype: torch.dtype
     ) -> _CuDNNGraphBundle:
         s = shape
-        io = _torch_to_cudnn_dtype(io_dtype)
+        io_dtype = _torch_to_cudnn_dtype(io_dtype)
         f32, i32 = cudnn.data_type.FLOAT, cudnn.data_type.INT32
         graph = cudnn.pygraph(
-            io_data_type=io,
+            io_data_type=io_dtype,
             intermediate_data_type=f32,
             compute_data_type=f32,
             name="visual_gen_sdpa_paged",
         )
         # cuDNN graph tensors are [batch, heads, seq, dim]; the batch axis here is the
         # causal block axis, one cuDNN sequence per block.
-        # One K/V length per sequence: the same for every head, no seq or feature axis.
-        length_heads, length_seq, length_dim = 1, 1, 1
-        length_dims = [s.b, length_heads, length_seq, length_dim]
-        # One page id per (sequence, page): the same table for every K/V head.
-        table_heads, table_dim = 1, 1
-        table_dims = [s.b, table_heads, s.table_len, table_dim]
         q_dims = [s.b, s.h_q, s.s_q, s.d_qk]
         kv_container_dims = [s.num_pages, s.h_kv, s.tokens_per_page, s.d_qk]
+        # One K/V length per sequence: no axis on input tensors' head, seq, or dim modes.
+        length_dims = [s.b, 1, 1, 1]
+        # One page id per (sequence, page): the same table for every K/V head.
+        table_dims = [s.b, 1, s.table_len, 1]
 
-        q_t = graph.tensor(name="q", dim=q_dims, stride=list(s.q_strides), data_type=io)
+        q_t = graph.tensor(name="q", dim=q_dims, stride=list(s.q_strides), data_type=io_dtype)
         k_t = graph.tensor(
-            name="k", dim=kv_container_dims, stride=list(s.page_strides), data_type=io
+            name="k", dim=kv_container_dims, stride=list(s.page_strides), data_type=io_dtype
         )
         v_t = graph.tensor(
-            name="v", dim=kv_container_dims, stride=list(s.page_strides), data_type=io
+            name="v", dim=kv_container_dims, stride=list(s.page_strides), data_type=io_dtype
         )
         page_table_t = graph.tensor(
             name="page_table",
@@ -581,7 +579,7 @@ class CuDNNAttention(AttentionBackend):
             paged_attention_v_table=page_table_t,
             paged_attention_max_seq_len_kv=s.table_len * s.tokens_per_page,
         )
-        o_t.set_output(True).set_dim(q_dims).set_stride(list(s.o_strides)).set_data_type(io)
+        o_t.set_output(True).set_dim(q_dims).set_stride(list(s.o_strides)).set_data_type(io_dtype)
         graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         inputs = {
             "q": q_t,
