@@ -1188,7 +1188,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         Only drafter-based speculation (NGram, user-provided) attaches draft tokens
         to requests sampled here; a draft token is accepted while it matches the
-        token the target sampled at the same position.
+        token the target sampled at the same position. When
+        TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS is set, up to that many draft
+        tokens are accepted without comparing them.
 
         Returns the number of accepted draft tokens.
         """

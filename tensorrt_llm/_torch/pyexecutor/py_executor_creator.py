@@ -305,13 +305,6 @@ def _enforce_overlap_spec_kv_correction(attn_backend: str,
     raise ValueError(message)
 
 
-def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
-    for engine in model_engines:
-        if engine is None:
-            continue
-        engine.attn_runtime_features.cache_reuse = cache_reuse
-
-
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -773,8 +766,8 @@ def _create_py_executor(
         )
 
     # Model loading can disable reuse after runtime features were created.
-    _set_model_engines_cache_reuse([model_engine],
-                                   kv_cache_config.enable_block_reuse)
+    model_engine.attn_runtime_features.cache_reuse = (
+        kv_cache_config.enable_block_reuse)
     validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
@@ -830,7 +823,7 @@ def _create_py_executor(
                     "FP4 MLA cached-context attention is not supported yet; "
                     "disabling KV cache block reuse.")
                 kv_cache_config.enable_block_reuse = False
-                _set_model_engines_cache_reuse([model_engine], False)
+                model_engine.attn_runtime_features.cache_reuse = False
         elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
@@ -855,7 +848,7 @@ def _create_py_executor(
                            f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
                            f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine], False)
+            model_engine.attn_runtime_features.cache_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         nvfp4_sparse_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
@@ -872,7 +865,7 @@ def _create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine], False)
+            model_engine.attn_runtime_features.cache_reuse = False
         if (enable_chunked_context and sm_version
                 not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
             logger.warning("Chunked Prefill for MLA can only be enabled on "
@@ -892,7 +885,7 @@ def _create_py_executor(
             "the encoder takes feature tensors, so requests carry no "
             "encoder tokens or input discriminator to key cache entries.")
         kv_cache_config.enable_block_reuse = False
-        _set_model_engines_cache_reuse([model_engine], False)
+        model_engine.attn_runtime_features.cache_reuse = False
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
