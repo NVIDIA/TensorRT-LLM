@@ -362,13 +362,17 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         kv_lens: torch.Tensor | None = None,
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
+        max_kv_len: int | None = None,
     ) -> torch.Tensor:
         """Score complete pools into FP32 [rows, pool_capacity].
 
         q is [rows, heads, head_dim], weights is [rows, heads]. Packed context uses
         request_ids; verification repeats generation tables rows_per_request times.
         Both supply per-query kv_lens. Single-token decode uses live metadata lengths.
-        Incomplete/invisible pools receive the FP32 minimum before top-k.
+        Incomplete/invisible pools receive the FP32 minimum before top-k. Eager
+        callers that know a host bound on the visible lengths pass max_kv_len so
+        only reachable pools are scored; columns past it are left unwritten and
+        the top-k must scan only each row's complete pools.
         """
         state = self._cache_state(metadata)
         tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
@@ -386,13 +390,15 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             kpool=self.sparse_params.index_kpool,
             q_scale=q_scale,
             w_scale=w_scale,
-            # bf16 inputs are exact in tf32, so the tensor-core dot is an fp32
-            # accumulation of exact products (measured: identical selections).
-            precision="tf32",
+            # bf16 x bf16 products are exact in fp32, so the bf16 tensor-core
+            # dot is an fp32 accumulation of exact products, like tf32 on the
+            # widened operands (measured: identical selections).
+            precision="bf16",
             # Context rows: the query tokens of a request share its block
             # table, so a program gathers each pool-key block once for 16 rows.
             rows_per_program=1 if request_ids is None else 16,
             request_ids=request_ids,
+            max_kv_len=max_kv_len,
         )
 
     def expand_selection(

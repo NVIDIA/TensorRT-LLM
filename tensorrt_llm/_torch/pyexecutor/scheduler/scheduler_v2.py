@@ -1166,7 +1166,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._free_kv_caches(req)
             return False
 
-        if draft_reuse != common_reuse:
+        # A served prefix is held in both pools even when their reuse policies
+        # commit different depths. Compare the effective prefixes before freeing it.
+        served_prefix = req.py_served_prefix_end
+        if max(draft_reuse, served_prefix) != max(common_reuse, served_prefix):
             # The shorter re-claim can itself fall short, so drop straight to
             # no reuse rather than iterate against an eviction we do not own.
             draft_manager.free_resources(req)
@@ -1531,9 +1534,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
 
-        The draft pool mirrors the target pool (same requests, same block
-        boundaries, same ``tokens_per_block``), so a draft-side failure just
-        means this request does not fit. Roll the target growth back and report
+        The draft pool mirrors the target pool's requests and token counts (a
+        standalone drafter's pool may use its own ``tokens_per_block``), so a
+        draft-side failure just means this request does not fit. Roll the target growth back and report
         a plain allocation failure, letting the caller run the same evict /
         recompute-pause / self-suspend ladder it uses for target-pool pressure.
 

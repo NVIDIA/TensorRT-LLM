@@ -684,6 +684,24 @@ def test_precheck_enabled_helper(monkeypatch):
     assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is True
 
 
+@pytest.mark.parametrize("force_enable", [False, True])
+def test_dwdp_ctx_disables_precheck(monkeypatch, force_enable):
+    # A DWDP ctx side is one MPI step of single-GPU servers, which the gate's
+    # one-srun-per-ctx-server launch cannot reproduce: skip it, even when the
+    # env var forces the precheck on, and without demanding a model root.
+    if force_enable:
+        monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    cfg = _disagg_yaml()
+    cfg["worker_config"]["ctx"]["dwdp_config"] = {"dwdp_size": 4, "num_groups": 1}
+
+    lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
+
+    assert "export ctPrecheckEnabled=0" in lines
+    assert not any(line.startswith("export LLM_MODELS_ROOT=") for line in lines)
+
+
 def test_skip_waived_case_overrides_force_enable(monkeypatch):
     monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "1")
     lines = pcfg.precheck_prefix_lines(

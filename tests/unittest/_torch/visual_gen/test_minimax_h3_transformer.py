@@ -36,7 +36,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
 
     FA4_AVAILABLE = _flash_attn_fwd is not None
 except ImportError:
