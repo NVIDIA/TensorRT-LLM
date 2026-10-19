@@ -6960,50 +6960,58 @@ files = [
 
 [[package]]
 name = "xgrammar"
-version = "0.1.32"
+version = "0.2.7"
 description = "Efficient, Flexible and Portable Structured Generation"
 optional = false
 python-versions = "<4,>=3.8"
 groups = ["main"]
 files = [
-    {file = "xgrammar-0.1.32-cp310-cp310-macosx_10_14_x86_64.whl", hash = "sha256:1d179511a1258b410d1660ed00032da24256072b44d6743f5bd3f49743d90801"},
-    {file = "xgrammar-0.1.32-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:b33d2e8f02ca31b93f3cbfea0ed1df7e706a2bea52d7706793884f92a8c1523a"},
-    {file = "xgrammar-0.1.32-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f7d4f0f2041cdc97bacc096b4c2d1c841e91794b6e7a54e7a4853fc0907956dc"},
-    {file = "xgrammar-0.1.32-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d4f3d18da40cad18e87881925f82d0aed1418cc2fb05886d516e3c9d548db57f"},
-    {file = "xgrammar-0.1.32-cp310-cp310-win_amd64.whl", hash = "sha256:e7baf71bba03a5e734df435b6378da4406b1c15f5511ab4f5d4af9f72775c756"},
-    {file = "xgrammar-0.1.32-cp311-cp311-macosx_10_14_x86_64.whl", hash = "sha256:51b41c47785aa198d19f8d056b394f75b4421deab88c415568f9c588b1f7e238"},
-    {file = "xgrammar-0.1.32-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d7030192cb1d8579699f1f72fd14d31347a402611aab98a2da6a04c3de07e917"},
-    {file = "xgrammar-0.1.32-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a332c0364f665b410a6cfc2ada155c3a6ede430e385ac431015e31735a64fec3"},
-    {file = "xgrammar-0.1.32-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5b8ad132d0fcf3a51dc054ecb0dc9808566b302122de6edaac7b4aca460adbec"},
-    {file = "xgrammar-0.1.32-cp311-cp311-win_amd64.whl", hash = "sha256:b8b1ca6d3f3c2842660458660e494aaf0a6745f1b07ae74e4c2230ab4ff70c11"},
-    {file = "xgrammar-0.1.32-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:9b78d32265f096e5567ab52c72b681855cf473481a48a1e7e6d97d414ba30b82"},
-    {file = "xgrammar-0.1.32-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:23eacaf826c3aeebca0d91fc271417d9d96e157af2bacf6f14277297af7917ef"},
-    {file = "xgrammar-0.1.32-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f9a637d4e0c541149e0d409c24f4ec79cd74d87508ee6a17a7e64a9b9c0cf56f"},
-    {file = "xgrammar-0.1.32-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f96c7a4fcbd68e18b13cb3b6ed5d24b5326b256933f476bdaf2cc8e609c228db"},
-    {file = "xgrammar-0.1.32-cp312-cp312-win_amd64.whl", hash = "sha256:ba6e08c385cce53eda8e9b3bbfba63f100ba3dcb76fa0692a65921a36b20ad0a"},
-    {file = "xgrammar-0.1.32-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:4addb8f5d5699e7df7fca6d299a91b3ef1ad799811c0ab7050d6f96d754c9c21"},
-    {file = "xgrammar-0.1.32-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:028f8d6a105d06549faee0afbebfaada90aa1941c081dcc88f3d5ef373dad934"},
-    {file = "xgrammar-0.1.32-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0c0150c50eb3a56a35d6f0c0af0bce0f113ec5f84f7918bfd46b49e25ecf7fb5"},
-    {file = "xgrammar-0.1.32-cp313-cp313-win_amd64.whl", hash = "sha256:e1072d764705c8e87df6136ce3419f96ab3fd423d85f58c2d81c13a647b78894"},
-    {file = "xgrammar-0.1.32-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:4e6015ad2b941a292562f68b9a2ee1ddae8e28df840dc39232dcc7007fc6f606"},
-    {file = "xgrammar-0.1.32-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:8e8da3e7fc194e098b760bacb2b60ad2227cac70d7be5d2e4f7025b1c360c43d"},
-    {file = "xgrammar-0.1.32-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6588cfd9754f2c46846276a2e8284a46582a74886d7aaea02cf6ce63ccc397ce"},
-    {file = "xgrammar-0.1.32-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7f740ba83b69abb423167a5d5b13a9fcde89747220e191f6a004fae4a834311f"},
-    {file = "xgrammar-0.1.32-cp314-cp314-win_amd64.whl", hash = "sha256:9c0769c3468bd67495c28a03dc5ce3948d83cddaf0a59c6d992b12fc683a1c3e"},
-    {file = "xgrammar-0.1.32-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:da8339b38e96d105868c14b2cb2df4b7c83d7a49f8539c74fd7470d61043e5b1"},
-    {file = "xgrammar-0.1.32-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:b938a9096bccc06c30abb5304b2b39c272a924ca002e19421cce5e6ee9670f4f"},
-    {file = "xgrammar-0.1.32-cp314-cp314t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fe2ee94080d77b84e38cb6643b75a6ca29cf814a3e5d5da8e1176eae4034d662"},
-    {file = "xgrammar-0.1.32-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:70ddbf7216e1e7ec96134a2474a6b84d2b14439a6f6379e079b7c557131be41d"},
-    {file = "xgrammar-0.1.32-cp314-cp314t-win_amd64.whl", hash = "sha256:4f68e591a6e9e121d5f03821ab2c44a7af092dc8bf7c9cde1a776871c6bd4dc5"},
-    {file = "xgrammar-0.1.32-cp39-cp39-macosx_10_14_x86_64.whl", hash = "sha256:88f3a00623b197c6b76dea3c0c7f326702209c1066eb9993b4723929a106c8ba"},
-    {file = "xgrammar-0.1.32-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:0ddf7ca871c7ec8c9ce8c34b8547344fce70ef3faa33b6e29f6826d098bc7714"},
-    {file = "xgrammar-0.1.32-cp39-cp39-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6925258c8e188fbddcf2962c6a0819f71cf664263d2346545feadee92994685e"},
-    {file = "xgrammar-0.1.32-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2691be7077e2eae34cdefce2ef3f88e2f018158ccff0eb4b94bb8725a98e2f27"},
-    {file = "xgrammar-0.1.32-cp39-cp39-win_amd64.whl", hash = "sha256:82b5c3d6b3a6fe01a1957d311473808aee90e946d38bd942c7161f1c4aedce11"},
-    {file = "xgrammar-0.1.32.tar.gz", hash = "sha256:5d424d52779ca2d3ccaf72f2289d6519efe308e933d0d3fc3c292c780825bb12"},
+    {file = "xgrammar-0.2.7-cp310-cp310-macosx_10_14_x86_64.whl", hash = "sha256:00a0ac47cc0cfcce480c7651c14acd3d3ff0d970a745ee75640f0eb6929f9ba2"},
+    {file = "xgrammar-0.2.7-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:bc2bc2fa9ff57bbe7dbebf86db8c5c65228d255566e3d31db44aa6d6c64fef8a"},
+    {file = "xgrammar-0.2.7-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:846c155ae16add86d66083340aa4d2a074abaefbe6d77d1314b85d6043b045d9"},
+    {file = "xgrammar-0.2.7-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ea74cca223e834dfb4b96b25a3a3b8fc983a49d30dba782146420bb4732b8e52"},
+    {file = "xgrammar-0.2.7-cp310-cp310-win_amd64.whl", hash = "sha256:c75433b3a0d313b3f7bb037f4dbda4ca3d82c3508650403113aec893b2717c58"},
+    {file = "xgrammar-0.2.7-cp310-cp310-win_arm64.whl", hash = "sha256:ffd882a5d87e90b8642d9e4c7c0c5e5069c41af2a807a7e313c506d442fdea99"},
+    {file = "xgrammar-0.2.7-cp311-cp311-macosx_10_14_x86_64.whl", hash = "sha256:6f6277aba512ea484a6f441ca0d10229f9dc9b9a3a5fa21cec7db3d3ddcb16d5"},
+    {file = "xgrammar-0.2.7-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:7d0ce000a746cb44e4f3e68f5b0666c68797964087eb28ab07fc707dd709e3a7"},
+    {file = "xgrammar-0.2.7-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:45e8fa9458269d44c5b4c439eb073daa2f4105d3bb2b731ae764231ef2ab1049"},
+    {file = "xgrammar-0.2.7-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e3a4cb4214b228d2fecefe46f46d2f2b0d6c8468fd448319250cae6bccb73339"},
+    {file = "xgrammar-0.2.7-cp311-cp311-win_amd64.whl", hash = "sha256:29efe11e90b7ea7e76d9f4f58b93add95e289fcbf2db7a2ffb26a3c23b0e2820"},
+    {file = "xgrammar-0.2.7-cp311-cp311-win_arm64.whl", hash = "sha256:ef1d18d860ea771c656b7d802e4bf944c8dd31b8a0c0b899b892b96f0b06d68a"},
+    {file = "xgrammar-0.2.7-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:b46d814ae80ebab5b89eb67a18118256bd94afbeace8f5d6ccf0ff396aa4a6a1"},
+    {file = "xgrammar-0.2.7-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4957b0ab6c743ee8e178faa6e7804466f9caadccba551b52600720490d591349"},
+    {file = "xgrammar-0.2.7-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2df1a2292f6b1c5cdc4b176ef2f22c58a837ac99fd854d93856160f31f14a4b0"},
+    {file = "xgrammar-0.2.7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e4397798f73512ab5abccbadf0a7b6aaf0753ccc4f3171c43b14c4d22df1ed28"},
+    {file = "xgrammar-0.2.7-cp312-cp312-win_amd64.whl", hash = "sha256:397edf3dc6d9634eba1127f83f5f16aff4f06a17dff55cd4d441f35fb680ed5b"},
+    {file = "xgrammar-0.2.7-cp312-cp312-win_arm64.whl", hash = "sha256:0a6ca46cfbeb1ab1cb85a6e1a8ff3f24813a27114626813e0432ac54b3a2efe4"},
+    {file = "xgrammar-0.2.7-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8cca1a85d520fd08675cf5a110b1e7c45f308ed3198e45c31ec38ef400f2d55a"},
+    {file = "xgrammar-0.2.7-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3f63948994cdc1bc0733e74bcb15e38e76a39150695cc15b54653c1931295ce6"},
+    {file = "xgrammar-0.2.7-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3a6bc5efcd80cda89da9a887239cc0d02ef22b3770c7372ab0bb4a56034da35f"},
+    {file = "xgrammar-0.2.7-cp313-cp313-win_amd64.whl", hash = "sha256:e2c21c993f72c28dce0de4a6b81c79837d8ddec9f8fce8515b0709b307691dd4"},
+    {file = "xgrammar-0.2.7-cp313-cp313-win_arm64.whl", hash = "sha256:b90b265f4cb443a99083a42bd19d0a6b561f5dfcd389eb27286215715d3c5417"},
+    {file = "xgrammar-0.2.7-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:f762735b814be83f0cfd9b7b2a62160a95f9a89d455d2975af1b95505561e38b"},
+    {file = "xgrammar-0.2.7-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f70e7e45a7f50229a6b25043eec326458e8360a5a29a49eafe78c07cc3dd07b7"},
+    {file = "xgrammar-0.2.7-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a89fe03bed4bb12e98c4dcaf583cd608aab601a401b9e39142d6de3df6eda873"},
+    {file = "xgrammar-0.2.7-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ebb521bcce85dc832b0e5d21fe0acfea0641fdd66baa2c3295600ea22780582d"},
+    {file = "xgrammar-0.2.7-cp314-cp314-win_amd64.whl", hash = "sha256:afd5fad288da5d3320820e2c015aca8f1a17181064ed74012545ef2e824bfbb7"},
+    {file = "xgrammar-0.2.7-cp314-cp314-win_arm64.whl", hash = "sha256:872e0a00655b5aba15e0ee54a16b503320e4b80c135d4a5ef447bf1e8ccca309"},
+    {file = "xgrammar-0.2.7-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:51de2f6b59696e5bba2ac7347e5bf02c967fbeb1095885f0d24642b1d2370b21"},
+    {file = "xgrammar-0.2.7-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d5a8f7e5b7c4039bfd41ff8e7645ecab9e5be077bccf11936601fb799cf40c68"},
+    {file = "xgrammar-0.2.7-cp314-cp314t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a5f5fbe2a244aefe72c3c660f2c7ab575f147ae593371920d0f49c9fc121e03b"},
+    {file = "xgrammar-0.2.7-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8b8bbfeb26995aea634ff6bc6a8eb555e465ee4821da21c684fbab9cfe319413"},
+    {file = "xgrammar-0.2.7-cp314-cp314t-win_amd64.whl", hash = "sha256:32f74c24bb25513a246dd6a02f8fa9e421ca84ccbf09bac8dea08e34b747c0ee"},
+    {file = "xgrammar-0.2.7-cp314-cp314t-win_arm64.whl", hash = "sha256:d230dc7b77c7994583b12731221ccd8de78e844945125681ab7be292cdda7b93"},
+    {file = "xgrammar-0.2.7-cp39-cp39-macosx_10_14_x86_64.whl", hash = "sha256:fdd0971d41b9d99ab8f18862063dd39ffd0852175313d634e948fa45cf514fff"},
+    {file = "xgrammar-0.2.7-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:d7695a87c21315af231ca6160956e5acbba101f9f6051d7ff0dd796be5c1aed8"},
+    {file = "xgrammar-0.2.7-cp39-cp39-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2b78d9ddf89b2da58cb2f06ea0af6b27ee1302fd7b1b2619ecf992c52eee47c0"},
+    {file = "xgrammar-0.2.7-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:239cb2e117ee2ba4128349a1cfc5c56c8b4497eb4ff1ebcba9046f9439a4242e"},
+    {file = "xgrammar-0.2.7-cp39-cp39-win_amd64.whl", hash = "sha256:1d1f3343b1eff6a732e4374501c708a5762c46803bff5449254762da03bcebe2"},
+    {file = "xgrammar-0.2.7-cp39-cp39-win_arm64.whl", hash = "sha256:7eebc2703e09d27c906051a92c6dad50c895c9fdba252b2cf3de627c9da42ec8"},
+    {file = "xgrammar-0.2.7.tar.gz", hash = "sha256:7674afeee5e6eff9672627b62d5ab0aa2347ea51674f4d78a5c160029f92bc3e"},
 ]
 
 [package.dependencies]
+apache-tvm-ffi = ">=0.1.10"
 numpy = "*"
 pydantic = "*"
 torch = ">=1.10.0"
@@ -7013,7 +7021,7 @@ typing-extensions = ">=4.9.0"
 
 [package.extras]
 metal = ["mlx-lm ; platform_system == \"Darwin\" and platform_machine == \"arm64\""]
-test = ["huggingface-hub[cli]", "protobuf", "pytest", "sentencepiece", "tiktoken", "transformers (<4.50.0) ; platform_system == \"Darwin\""]
+test = ["cohere_melody (==0.13.0) ; python_version >= \"3.10\"", "huggingface-hub[cli]", "protobuf", "pytest", "sentencepiece (<0.2.2) ; python_version < \"3.10\"", "sentencepiece ; python_version >= \"3.10\"", "tiktoken"]
 
 [[package]]
 name = "xxhash"
@@ -7425,4 +7433,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6103f794a38fdefaae8f0dbaa957f65683969de0602355b94cd0633d0231493b"
+content-hash = "a6ca7e7c6e23329b6f4556c02e33eea7350dbfa6144cf1406ee0d7943ca3698b"

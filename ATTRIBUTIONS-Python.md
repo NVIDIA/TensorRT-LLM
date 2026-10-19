@@ -63471,7 +63471,7 @@ SOFTWARE.
   - `Homepage`: https://github.com/akshaynagpal/w2n
 
 
-## xgrammar (0.1.32)
+## xgrammar (0.2.7)
 
 ### Licenses
 License: `Apache 2.0`
