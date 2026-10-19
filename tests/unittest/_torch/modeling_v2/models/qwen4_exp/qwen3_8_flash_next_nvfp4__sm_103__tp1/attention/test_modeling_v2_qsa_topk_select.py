@@ -140,10 +140,12 @@ def test_nan_inside_the_window_is_selected() -> None:
     assert {0, 1, 2, 3} <= set(out[0].tolist()), "NaN is no longer selected; update the note"
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    """Captured, then replayed against new scores and a new causal bound."""
+@pytest.mark.parametrize("rows", (8, 256))
+def test_cuda_graph_capture_and_replay(rows) -> None:
+    """Captured, then replayed against new scores and a new causal bound: 8 rows, and the
+    256 rows a verify step of 32 requests carries at max_draft_len 7."""
     gen = torch.Generator(device=DEV).manual_seed(8)
-    rows, cols = 8, 2048
+    cols = 2048
     logits = _logits("relu", rows, cols, gen)
     row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
     row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)

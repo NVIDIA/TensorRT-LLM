@@ -3,8 +3,8 @@
 """GPU test for the qsa_paged_index_scores catalog entry.
 
 The paged state is real: a `[pages, tokens_per_block, 1, dim]` index cache
-sized from the pages the table maps, and an int32 block table whose rows are
-request *slots* -- more of them than the batch has requests, assigned by a
+(a view of a wider page under the NVFP4 cells) sized from the pages the table maps, and an
+int32 block table whose rows are request *slots* -- more of them than the batch has requests, assigned by a
 seeded permutation -- with shuffled physical pages and `-1` past each
 sequence on the serving layouts, which is what the engine's table carries.
 
@@ -186,9 +186,20 @@ def _build(spec, seed):
     for slot, count in zip(slot_of.tolist(), mapped):
         block_table[slot, :count] = page_ids[cursor : cursor + count]
         cursor += count
-    index_cache = torch.randn(
-        pool_pages, spec["tokens_per_block"], 1, head_dim, generator=gen, device=DEV
-    ).to(dtype)
+    tpb = spec["tokens_per_block"]
+    keys = torch.randn(pool_pages, tpb, 1, head_dim, generator=gen, device=DEV).to(dtype)
+    if "page_pad" in spec:
+        # The NVFP4 pool's page: the other index buffers, this layer's, then the position
+        # page, so the plane is a view at page stride buffers * tpb * dim + page_pad.
+        buffers, buffer = spec["pool_buffers"], tpb * head_dim
+        page = torch.zeros(pool_pages, buffers * buffer + spec["page_pad"], dtype=dtype, device=DEV)
+        index_cache = page[:, (buffers - 1) * buffer : buffers * buffer].view(
+            pool_pages, tpb, 1, head_dim
+        )
+        index_cache.copy_(keys)
+        assert index_cache.stride() == (page.stride(0), head_dim, head_dim, 1)
+    else:
+        index_cache = keys
 
     if spec["q_layout"] == "scratch_slice":
         # [T, index heads | 1 k | 1 v, D], q is the first `heads` slots.

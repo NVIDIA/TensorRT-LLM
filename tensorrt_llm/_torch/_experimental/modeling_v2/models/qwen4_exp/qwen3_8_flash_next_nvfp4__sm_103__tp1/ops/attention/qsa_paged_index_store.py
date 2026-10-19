@@ -34,6 +34,10 @@ _CKPT = dict(
 
 _DECODE = ((0, 1), (1, 1), (31, 1), (32, 1), (33, 1), (63, 1), (64, 1), (95, 1))
 
+#: 32 requests of one MTP7 verify block each (8 rows), at starts that put some blocks across a
+#: page edge and some inside one.
+_MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
+
 
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
@@ -82,6 +86,14 @@ class QsaPagedIndexStore(OpWrapper):
             spec=_spec(((10, 2), (31, 2), (63, 2), (5, 2)), pages=16),
         ),
         Cell(
+            why="decode MTP7: 1 request x 8 rows, a block straddling a page",
+            spec=_spec(((28, 8),), pages=8),
+        ),
+        Cell(
+            why="decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
+            spec=_spec(_MTP7_32, pages=1200, slots=40),
+        ),
+        Cell(
             why="prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
             spec=_spec(((0, 256),) * 4, pages=32),
         ),
@@ -108,6 +120,18 @@ class QsaPagedIndexStore(OpWrapper):
         Cell(
             why="index_cache as a role view of a wider allocation",
             spec=_spec(((0, 1), (31, 1), (32, 1), (33, 1)), pages=8, cache_layout="role_view"),
+        ),
+        Cell(
+            why="NVFP4-KV side planes: index and position planes as strided views of one "
+            "per-slot buffer holding 12 index-K pages and the position page",
+            spec=_spec(
+                ((0, 1), (31, 1), (32, 1), (33, 40)),
+                pages=8,
+                cache_layout="shared_page",
+                layers=12,
+                page_stride=49344,
+                position_strides=(24672, 3, 1),
+            ),
         ),
         Cell(
             why="block table as a column slice of a wider one",
@@ -151,13 +175,21 @@ class QsaPagedIndexStore(OpWrapper):
       - duplicate destinations both store, unordered;
       - coordinates wider than the plane's dtype wrap (int64 `2^31 + 5`
         stores as -2147483643); floats truncate toward zero.
+    Under an NVFP4 KV pool the QSA cache manager packs each page's index-K
+    roles and then its position page into one per-slot buffer, so both planes
+    are strided views of one allocation: the trunk's index plane is
+    `[pages, 32, 1, 128]` at page stride 49344 (12 x 4096 + 192) with the
+    position plane `[pages, 32, 3]` at (24672, 3, 1); the cell checks that the
+    other index-K roles of each page survive the call.
+
     Loud rejections are torch's own: a 1-D table, a position plane narrower
     than the coordinates, mixed devices, non-index metadata dtypes.
     `rows == 0` leaves both planes unchanged.
 
     The 8 launches are launch-bound: ~0.15 ms per call flat from 1 to 1024
-    rows. CUDA-graph capturable; a replay follows positions rewritten in
-    place. Repeating a call is idempotent.
+    rows. CUDA-graph capturable (captured at 4 decode rows and at 256, 32 MTP7
+    verify blocks); a replay follows positions rewritten in place. Repeating a
+    call is idempotent.
 
     Hard limits: torch advanced indexing in int64 -- no int32 boundary inside
     the call; the coordinate wrap above is the plane's dtype.

@@ -22,9 +22,10 @@ from tensorrt_llm._torch.modules.mamba import recurrent_state_cache as _recurren
 #: [conv_dim, d_conv - 1] = [10240, 3] convolution window.
 REC_SHAPE = (48, 128, 128)
 CONV_SHAPE = (10240, 3)
-#: Largest slot count the cache manager was seen to allocate both pools at for
-#: this checkpoint (10 .. 461 over twelve runtime-value dumps, batch never above
-#: 32). The target hands both pools over unsliced.
+#: A slot count of a full-size engine run, shared by the recurrent and conv pools. The
+#: kernel addresses a slot by its index alone, so a pool of another size (a bf16 recurrent
+#: pool holds more slots in the same memory) takes the same path. The target hands both
+#: pools over unsliced.
 ENGINE_SLOTS = 461
 
 
@@ -79,6 +80,18 @@ class ResetRecurrentStateRows(OpWrapper):
         Cell(
             why="engine pool 461, 32 requests, slot 0 reset",
             spec=_engine_case(32, flip=True),
+        ),
+        Cell(
+            why="bf16 recurrent pool 461, 4 requests, slot 0 reset",
+            spec=dict(_engine_case(4, flip=False), rec_dtype=torch.bfloat16),
+        ),
+        Cell(
+            why="bf16 recurrent pool 461, 32 requests, slot 0 reset",
+            spec=dict(_engine_case(32, flip=False), rec_dtype=torch.bfloat16),
+        ),
+        Cell(
+            why="bf16 recurrent pool 461, 32 requests, flags flipped: slot 460 reset",
+            spec=dict(_engine_case(32, flip=True), rec_dtype=torch.bfloat16),
         ),
         Cell(
             why="every request continues: pools bitwise unchanged",

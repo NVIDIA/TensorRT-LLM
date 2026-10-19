@@ -17,6 +17,10 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 _CKPT = dict(compress_ratio=4, token_topk=2048)
 
 
+#: First positions of 32 MTP verify blocks in the sparse branch (KV past 2048).
+_VERIFY_STARTS = tuple(2100 + (499 * g) % 6000 for g in range(32))
+
+
 def _spec(batch, **overrides) -> dict:
     """A cell spec at this checkpoint's geometry and the engine's metadata dtypes.
 
@@ -25,6 +29,8 @@ def _spec(batch, **overrides) -> dict:
       ("serving", requests, context_lens)  one packed step: context chunks, then
                                            two MTP rows per remaining request
       ("rows", positions)                  explicit positions, length = position + 1
+      ("verify", starts, p)                one MTP verify block of p rows per start,
+                                           every row's length the block's end
     """
     base = dict(
         batch=batch,
@@ -77,6 +83,24 @@ class QsaExpandBlockIndices(OpWrapper):
         Cell(why="127 rows: the last row count on the column split", spec=_spec(("sweep", 127))),
         Cell(why="128 rows: the first row count on whole-row programs", spec=_spec(("sweep", 128))),
         Cell(why="256 rows on whole-row programs", spec=_spec(("sweep", 256))),
+        # ---- MTP verify blocks (max_draft_len up to 7): p rows per request, every
+        # row's length the block's end, so only the last row has length == position + 1.
+        Cell(
+            why="verify MTP7: one request's 8 rows, column split",
+            spec=_spec(("verify", (6000,), 8)),
+        ),
+        Cell(
+            why="verify MTP7: 15 requests x 8 = 120 rows, column split",
+            spec=_spec(("verify", _VERIFY_STARTS[:15], 8)),
+        ),
+        Cell(
+            why="verify MTP7: 16 requests x 8 = 128 rows, whole-row programs",
+            spec=_spec(("verify", _VERIFY_STARTS[:16], 8)),
+        ),
+        Cell(
+            why="verify MTP7: 32 requests x 8 = 256 rows, whole-row programs",
+            spec=_spec(("verify", _VERIFY_STARTS, 8)),
+        ),
         # ---- serving steps: sequence_lengths > query_position + 1 inside chunks
         Cell(
             why="mixed 1334 rows: 4 chunks + 28 MTP decodes, 32 slots",
@@ -160,8 +184,8 @@ class QsaExpandBlockIndices(OpWrapper):
 
     Launch: one program per (row, 256 columns) below 128 rows, one per row
     from 128 up; 127 and 128 rows agree on their shared rows. No autotune.
-    CUDA-graph capturable; a replay recomputes from the live buffers, and the
-    captured row count fixes the launch shape.
+    CUDA-graph capturable (captured at 4 and at 256 rows); a replay recomputes
+    from the live buffers, and the captured row count fixes the launch shape.
 
     Hard limits (read from the kernel, not probed): the row offset is
     `program_id * stride(0)` in int32, so `rows * stride(0) >= 2^31` (4 Mi
