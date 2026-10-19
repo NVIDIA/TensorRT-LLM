@@ -1361,11 +1361,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                 trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
-                if (coverageShadow) {
-                    def reportedDecision = new groovy.json.JsonSlurper().parseText(output)
-                    reportedDecision.shadow_selection_artifact_path = result.cbts_test_db_artifact_path
-                    output = groovy.json.JsonOutput.toJson(reportedDecision)
-                }
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -1373,6 +1368,17 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             }
         }
         if (coverageShadow) {
+            if (result.cbts_test_db_artifact_path) {
+                try {
+                    def reportedDecision = new groovy.json.JsonSlurper().parseText(output)
+                    reportedDecision.shadow_selection_artifact_path = result.cbts_test_db_artifact_path
+                    output = groovy.json.JsonOutput.toJson(reportedDecision)
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    pipeline.echo("CBTS: shadow artifact path annotation failed (non-fatal): ${e.message}")
+                }
+            }
             pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
                           "stages=${result.affected_stages.size()}; baseline remains active")
             _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
