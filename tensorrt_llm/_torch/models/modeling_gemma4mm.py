@@ -23,7 +23,7 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from itertools import groupby
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
@@ -373,6 +373,73 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             width // patch_size // pooling_kernel_size
         )
         return len(frames) * tokens_per_frame
+
+    def get_mm_max_tokens_per_item(
+        self, max_num_encoder_tokens: int | None = None
+    ) -> dict[str, int]:
+        """Report the vision encoder tokens of one image.
+
+        The image processor pads every image to ``max_soft_tokens * pooling_kernel_size**2``
+        patches, so each image costs exactly that many encoder tokens. Video frames run through the
+        same vision tower in passes under the same token budget, so profiling a full image pass also
+        covers them.
+        """
+        if self._image_processor is None:
+            return {}
+        image_processor = self._image_processor
+        num_tokens = (
+            int(image_processor.max_soft_tokens) * int(image_processor.pooling_kernel_size) ** 2
+        )
+        if max_num_encoder_tokens is not None and num_tokens > max_num_encoder_tokens:
+            logger.warning(
+                f"Gemma4 images take {num_tokens} vision encoder tokens each (max_soft_tokens="
+                f"{image_processor.max_soft_tokens}), more than encoder_max_num_tokens="
+                f"{max_num_encoder_tokens}. The vision tower encodes one image per pass, but memory "
+                "profiling does not reserve memory for that pass. Set encoder_max_num_tokens to "
+                f"at least {num_tokens}."
+            )
+            return {}
+        return {"image": num_tokens}
+
+    def get_dummy_mm_data(
+        self,
+        *,
+        max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
+        dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
+        """Build images whose every patch slot is valid, the most work one image can carry."""
+        num_images = int(mm_counts.get("image", 0))
+        if num_images <= 0:
+            return {}
+        if self._image_processor is None:
+            raise NotImplementedError("Gemma4 memory profiling requires the image processor")
+        image_processor = self._image_processor
+        patch_size = int(image_processor.patch_size)
+        pooling_kernel_size = int(image_processor.pooling_kernel_size)
+        max_soft_tokens = int(image_processor.max_soft_tokens)
+        # Lay the soft tokens out on the most square grid, then expand each one into its pooling
+        # kernel of patches.
+        grid_rows = max(
+            rows
+            for rows in range(1, math.isqrt(max_soft_tokens) + 1)
+            if max_soft_tokens % rows == 0
+        )
+        patch_rows = grid_rows * pooling_kernel_size
+        patch_cols = max_soft_tokens // grid_rows * pooling_kernel_size
+        num_patches = patch_rows * patch_cols
+        # Row-major (x, y) patch coordinates, matching the HF image processor.
+        y, x = torch.meshgrid(torch.arange(patch_rows), torch.arange(patch_cols), indexing="ij")
+        position_ids = torch.stack((x, y), dim=-1).reshape(1, num_patches, 2)
+        return {
+            "image": {
+                "pixel_values": torch.zeros(
+                    num_images, num_patches, 3 * patch_size**2, dtype=dtype or self.dtype
+                ),
+                "image_position_ids": position_ids.expand(num_images, -1, -1).contiguous(),
+                "image_seq_lens": [num_patches] * num_images,
+            }
+        }
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1183,9 +1250,10 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         image_position_ids: Optional[torch.Tensor] = None,
         image_seq_lens: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        # Single batched vision-tower call across all images in this LLM step.
-        # ``Gemma4VisionModel.forward`` flattens valid patches across the
-        # batch and runs FULL attention with per-image ``cu_seqlens`` via
+        # One vision-tower call across all images in this LLM step.
+        # ``Gemma4VisionModel.forward`` encodes them in passes that fit the
+        # encoder token budget; each pass flattens valid patches across its
+        # images and runs FULL attention with per-image ``cu_seqlens`` via
         # varlen ``attn_metadata`` (same pattern as Qwen2VL / LlavaNext).
         # ``pixel_values`` arrives shape ``(B, max_patches, 3*patch_size**2)``
         # already cross-request ``torch.cat``-ed in ``forward``, so all

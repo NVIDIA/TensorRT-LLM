@@ -48,8 +48,10 @@ pytest.importorskip(
     "transformers", minversion="5.5.0", reason="Gemma4 requires transformers>=5.5.0"
 )
 
+from PIL import Image  # noqa: E402
 from transformers import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig  # noqa: E402
 from transformers import Gemma4ForConditionalGeneration as HFGemma4ForConditionalGeneration
+from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor  # noqa: E402
 from transformers.models.gemma4.modeling_gemma4 import (  # noqa: E402
     Gemma4MultimodalEmbedder as HFGemma4MultimodalEmbedder,
 )
@@ -61,6 +63,7 @@ from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
 from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionModel  # noqa: E402
 from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4ForConditionalGeneration,
+    Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
 )
@@ -529,6 +532,73 @@ class TestGemma4VisionTower(unittest.TestCase):
             f"image_seq_lens kwarg path diverges from default-all-valid path: "
             f"max diff={diff.max().item():.6f}",
         )
+
+    @torch.no_grad()
+    def test_forward_splits_images_into_passes_under_token_budget(self):
+        """Images beyond the encoder token budget are encoded in passes with unchanged output.
+
+        One request with many large images used to run the whole batch through
+        the tower at once and OOM. Each pass must hold at most the budget's
+        worth of padded patches, and ``image_seq_lens`` must be sliced with it.
+        """
+        torch.manual_seed(0)
+        vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
+        tower = _build_trt_vision_tower(vision_cfg)
+        tower.load_weights(dict(hf_tower.state_dict()))
+
+        num_images, side = 5, 6
+        num_patches = side * side
+        pv, pos, output_length = _make_dummy_pixel_input(vision_cfg, B=num_images, side=side)
+        # Pad out the second half of image 1 so a wrong per-pass slice of
+        # ``image_seq_lens`` would change the output.
+        pos = pos.clone()
+        pos[1, num_patches // 2 :] = -1
+        image_seq_lens = [num_patches] * num_images
+        image_seq_lens[1] = num_patches // 2
+
+        with torch.inference_mode():
+            single_pass = tower(
+                pv, pos, output_length=output_length, image_seq_lens=image_seq_lens
+            ).last_hidden_state
+
+        tower.setup_attn_metadata(max_num_tokens=2 * num_patches)
+        with (
+            mock.patch.object(
+                tower, "_forward_images", wraps=tower._forward_images
+            ) as forward_images,
+            torch.inference_mode(),
+        ):
+            multi_pass = tower(
+                pv, pos, output_length=output_length, image_seq_lens=image_seq_lens
+            ).last_hidden_state
+
+        self.assertEqual(
+            [call.args[0].shape[0] for call in forward_images.call_args_list], [2, 2, 1]
+        )
+        torch.testing.assert_close(multi_pass, single_pass, atol=1e-4, rtol=0)
+
+    @torch.no_grad()
+    def test_forward_encodes_one_image_per_pass_when_image_exceeds_budget(self):
+        """An image larger than the budget is atomic: it gets a pass of its own."""
+        torch.manual_seed(0)
+        vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        tower = _build_trt_vision_tower(vision_cfg)
+        pv, pos, output_length = _make_dummy_pixel_input(vision_cfg, B=3, side=6)
+        tower.setup_attn_metadata(max_num_tokens=pos.shape[1] - 1)
+
+        with (
+            mock.patch.object(
+                tower, "_forward_images", wraps=tower._forward_images
+            ) as forward_images,
+            torch.inference_mode(),
+        ):
+            output = tower(pv, pos, output_length=output_length).last_hidden_state
+
+        self.assertEqual(
+            [call.args[0].shape[0] for call in forward_images.call_args_list], [1, 1, 1]
+        )
+        self.assertEqual(output.shape[0], 3 * output_length)
 
 
 class TestGemma4VisionTowerClamp(unittest.TestCase):
@@ -1126,6 +1196,85 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         self.assertIsNotNone(model.llm)
         self.assertIsNone(model.vision_tower)
         self.assertIsNone(model.embed_vision)
+
+
+# ---------------------------------------------------------------------------
+# Encoder memory profiling inputs (HF image processor only, no checkpoint)
+# ---------------------------------------------------------------------------
+
+
+def _make_profiling_input_processor(max_soft_tokens: int) -> Gemma4InputProcessor:
+    """Build a ``Gemma4InputProcessor`` around a bare HF image processor."""
+    processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+    processor._image_processor = Gemma4ImageProcessor(max_soft_tokens=max_soft_tokens)
+    processor._dtype = torch.bfloat16
+    return processor
+
+
+class TestGemma4EncoderProfilingInputs(unittest.TestCase):
+    """Startup memory profiling must run one full vision-tower pass."""
+
+    @pytest.mark.cpu_only
+    def test_max_tokens_per_item_is_padded_image_size(self):
+        processor = _make_profiling_input_processor(max_soft_tokens=280)
+
+        self.assertEqual(processor.get_mm_max_tokens_per_item(), {"image": 2520})
+        self.assertEqual(
+            processor.get_mm_max_tokens_per_item(max_num_encoder_tokens=8192), {"image": 2520}
+        )
+
+    @pytest.mark.cpu_only
+    def test_max_tokens_per_item_is_empty_when_image_exceeds_budget(self):
+        processor = _make_profiling_input_processor(max_soft_tokens=1120)
+
+        with mock.patch("tensorrt_llm._torch.models.modeling_gemma4mm.logger") as mock_logger:
+            max_tokens = processor.get_mm_max_tokens_per_item(max_num_encoder_tokens=2048)
+
+        self.assertEqual(max_tokens, {})
+        mock_logger.warning.assert_called_once()
+        self.assertIn("encoder_max_num_tokens", mock_logger.warning.call_args.args[0])
+
+    @pytest.mark.cpu_only
+    def test_dummy_images_match_hf_processor_layout(self):
+        """Dummy images equal what the HF processor emits for a full-budget image."""
+        processor = _make_profiling_input_processor(max_soft_tokens=70)
+        dummy = processor.get_dummy_mm_data(
+            max_num_encoder_tokens=8192, mm_counts={"image": 2}, dtype=torch.bfloat16
+        )["image"]
+
+        # 70 soft tokens lay out as 7 x 10, i.e. 21 x 30 patches of 16 pixels.
+        # The HF processor keeps an image of exactly that size and fills every
+        # patch slot.
+        hf = Gemma4ImageProcessor(max_soft_tokens=70)(
+            images=[Image.new("RGB", (30 * 16, 21 * 16))], return_tensors="pt"
+        )
+        self.assertEqual(dummy["pixel_values"].shape, (2, 630, 768))
+        self.assertEqual(dummy["pixel_values"].dtype, torch.bfloat16)
+        self.assertEqual(dummy["image_seq_lens"], [630, 630])
+        self.assertEqual(hf["pixel_values"].shape[1:], dummy["pixel_values"].shape[1:])
+        for image_position_ids in dummy["image_position_ids"]:
+            torch.testing.assert_close(image_position_ids, hf["image_position_ids"][0])
+
+    @torch.no_grad()
+    def test_dummy_images_fill_every_soft_token(self):
+        processor = _make_profiling_input_processor(max_soft_tokens=70)
+        # bf16 as in production: the fp32 path falls back to unfused attention,
+        # whose workspace for 630-patch images exceeds an 80 GB GPU.
+        dummy = processor.get_dummy_mm_data(
+            max_num_encoder_tokens=8192, mm_counts={"image": 2}, dtype=torch.bfloat16
+        )["image"]
+        tower = _build_trt_vision_tower(
+            Gemma4VisionConfig(**SMALL_VISION_CONFIG), dtype=torch.bfloat16
+        )
+
+        with torch.inference_mode():
+            output = tower(
+                dummy["pixel_values"].cuda(),
+                dummy["image_position_ids"].cuda(),
+                image_seq_lens=dummy["image_seq_lens"],
+            ).last_hidden_state
+
+        self.assertEqual(output.shape[0], 2 * 70)
 
 
 # ---------------------------------------------------------------------------
